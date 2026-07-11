@@ -50,6 +50,10 @@ _Avoid_: reasoning content, chain of thought
 The display-side history of a Session - everything the user saw, in order: user prompts, assistant text, collapsed Thinking, Tool Call and Tool Result summaries, and info lines. Not the Conversation: Thinking and info lines live in the Transcript but never in the Conversation.
 _Avoid_: message list, chat log
 
+**Composer**:
+The input area of the TUI where the user authors the next prompt. Submitting it starts a Turn when the Agent is idle and becomes Steering when a Turn is running. Display-side only: its draft is never part of the Conversation until submitted.
+_Avoid_: input line (it is not a line; drafts may span many), prompt (that's what a submitted draft becomes)
+
 **Project Root**:
 The directory Suspenders was launched from, captured once per Session as a value. Every Tool Call is confined to it: paths must not escape it, and run_command executes in it.
 _Avoid_: cwd (that's ambient process state; the Project Root is captured once and passed explicitly)
@@ -173,6 +177,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - "invocation" previously meant a parsed text-protocol tool request (`extract_invocations`); with native tool calling it is retired in favor of **Tool Call**.
 - "truncation" was used for both server-side context overflow and our own management strategy - resolved: ours is **Eviction**; "truncation" refers only to the server's silent behavior we're preventing.
 - the **Compaction Target** was documented as the full budget target while the code fired at the low-water mark - resolved 2026-07: the trigger is the low-water mark, and the keep level is its own decoupled knob, the **Compaction Keep**.
+- "toggling thinking" was read as enabling/disabling the model's **Thinking** when it means expanding/collapsing settled Thinking items in the **Transcript** - resolved 2026-07: Ctrl-T is a display expansion toggle; whether the model thinks at all is a request-level knob (today fixed: on for the main Conversation, off for **Scouts**) with no user-facing toggle.
 
 ## Compaction
 
