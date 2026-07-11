@@ -1,0 +1,112 @@
+//! Turn Deps - the static-dispatch dependency bundle for a Turn (ADR-0011).
+//!
+//! Every effect the Turn loop performs, as trait methods (baud's `Baud.Turn.Deps`
+//! function captures). The shell builds a `TurnDeps` wiring these to Agent
+//! messages; tests build one whose methods record into fields the test inspects.
+//! The loop itself spawns nothing and holds no pids.
+//!
+//! These are infrastructure, NOT Plugins: control-bearing and NOT fail-open
+//! (ADR-0011). A `TurnDeps` method that panics or returns an error fails the
+//! Turn honestly. Plugins remain the fail-open, tool-scoped unit of extension
+//! (ADR-0007) - that isolation lives in `crate::plugins`, not here.
+//!
+//! ## Static dispatch, no `async_trait`
+//!
+//! The Loop is `async fn run<D: TurnDeps>(...)`; `TurnDeps` is monomorphised per
+//! caller. The methods that do IO (`complete`, `request_approval`,
+//! `drain_steering`, `compact`) return concrete futures via
+//! `impl Future` in return position (edition 2024 RPITIT), so no boxing and no
+//! `async_trait`. The fire-and-forget effects (`emit`, `checkpoint`, `set_plan`)
+//! are synchronous - the Loop never awaits them.
+
+use std::future::Future;
+
+use crate::conversation::Conversation;
+use crate::event::Event;
+use crate::llm::request::LlmRequest;
+use crate::llm::response::Response;
+use crate::llm::stream::StreamEvent;
+
+/// The after-Pass hook's verdict (baud's `after_pass_verdict`). The default
+/// implementation always returns [`AfterPass::Continue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterPass {
+    /// Keep looping.
+    Continue,
+    /// Close the Turn with the stopped marker and this stop reason (an arbitrary
+    /// atom in baud - carried here as a string, e.g. `"budget_hook"`).
+    Stop(String),
+    /// Merge this text into the trailing tool-results user message and loop.
+    Inject(String),
+}
+
+/// The error a `compact` Dep returns when it cannot (or will not) compact. Its
+/// only observable behaviour in the loop is falling through to the exhaustion
+/// path; the reason rides for the caller's own logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactError(pub String);
+
+/// Every effect the Turn loop performs (ADR-0011). Static-dispatch: the Loop is
+/// generic over `D: TurnDeps` and monomorphises per caller. Methods that do IO
+/// are async (return a `Future`); `emit`/`checkpoint`/`set_plan` are
+/// fire-and-forget and synchronous.
+///
+/// `complete` receives the fully-built [`LlmRequest`] (system, messages, tools,
+/// no_think) - the shell renders it to wire JSON and calls the LLM boundary,
+/// forwarding each streaming `StreamEvent` to `on_event`.
+pub trait TurnDeps: Send {
+    /// Calls the model with the built request, forwarding every streaming delta
+    /// snapshot to `on_event`, and yields the [`Response`] (the error algebra
+    /// means this never "fails" - a failure is a `Response` with an `Error`
+    /// stop reason).
+    fn complete(
+        &mut self,
+        request: LlmRequest,
+        on_event: &mut (dyn FnMut(&StreamEvent) + Send),
+    ) -> impl Future<Output = Response> + Send;
+
+    /// Emits a turn Event (fire-and-forget).
+    fn emit(&mut self, event: Event);
+
+    /// Drains any queued Steering, yielding the texts in order.
+    fn drain_steering(&mut self) -> impl Future<Output = Vec<String>> + Send;
+
+    /// Requests the user's Approval for a command Tool Call; blocks until the
+    /// user answers. `id` is the per-call reference (baud's `make_ref()`).
+    fn request_approval(
+        &mut self,
+        id: String,
+        command: String,
+    ) -> impl Future<Output = bool> + Send;
+
+    /// Checkpoints the Conversation (fire-and-forget). Called after every Tool
+    /// Result so a cancel mid-Pass keeps completed work.
+    fn checkpoint(&mut self, conversation: &Conversation);
+
+    /// Stores the Plan text outside the Conversation (fire-and-forget). Called
+    /// on a successful plan Tool Call with the model's verbatim Plan content.
+    fn set_plan(&mut self, plan: String);
+
+    /// The after-Pass control hook. Default: always [`AfterPass::Continue`].
+    fn after_pass(
+        &mut self,
+        _response: &Response,
+        _conversation: &Conversation,
+    ) -> impl Future<Output = AfterPass> + Send {
+        async { AfterPass::Continue }
+    }
+
+    /// Compacts the Conversation. Default: a no-op that reports no compactor
+    /// (ADR-0012 - the real compaction effect is a later phase). A successful
+    /// compaction returns the rewritten Conversation; an error falls through to
+    /// the budget-exhaustion path.
+    fn compact(
+        &mut self,
+        conversation: Conversation,
+    ) -> impl Future<Output = Result<Conversation, CompactError>> + Send {
+        async move {
+            let _ = conversation;
+            Err(CompactError("no_compactor".to_string()))
+        }
+    }
+}

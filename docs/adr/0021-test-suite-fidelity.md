@@ -1,0 +1,5 @@
+# The test suite is the specification
+
+The behaviour specification IS the test suite. Every module carries in-module `#[cfg(test)]` tests, so pure cores can assert on non-`pub` internals. Ordering assertions go through a small `recv_event(&mut rx, timeout)` helper over the broadcast receiver, and golden strings and structures are asserted with exact `assert_eq!` - the expected value is reviewed in the diff, not hidden in a snapshot file. The seams: `FakeLlm` (ADR-0020) and `FakeDeps` (ADR-0011) for logic, a mock HTTP server (wiremock) for the transport tests, and the pure `fold_sse` exercised with raw event vectors (ADR-0002).
+
+Consequence - one explicit no: a small number of decode tests that only assert tolerance of LEGACY log formats from an earlier schema are intentionally OMITTED. This is a greenfield Session Log with no legacy on disk, so those cases would assert a migration that never happened here. Every OTHER test is present. Recording this so a future reader comparing coverage does not mistake the omission for a gap.

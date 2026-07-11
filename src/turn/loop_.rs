@@ -1,0 +1,2897 @@
+//! Turn Loop - the inner tool-call loop of a Turn (baud's `Baud.Turn.Loop`).
+//! (Module name is `loop_` because `loop` is a keyword - ADR-0022.)
+//!
+//! One Pass (CONTEXT.md) = one model response plus the Tool Calls it carries.
+//! Per Pass the loop emits a well-formed message grammar - `MessageStart`,
+//! `MessageUpdate` (delta + accumulated snapshot), `MessageEnd` - on every path,
+//! including errored responses, then acts on the stop reason. See the Elixir
+//! moduledoc (`baud/lib/baud/turn/loop.ex`) for the full narrative; this port
+//! preserves its behaviour exactly, with the Nudge bookkeeping threaded through
+//! a `&mut Nudges` value instead of baud's functional re-binding.
+//!
+//! The Loop owns zero I/O and zero process concerns: every effect goes through
+//! [`TurnDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
+//! over a `plugins` list and a `ToolCtx` the caller supplies - the Rust Session
+//! carries plugin *names*, not `Registered` values, so these ride as explicit
+//! `run` arguments (the shell builds them from the Session).
+
+use serde_json::Value;
+
+use crate::content::ContentBlock;
+use crate::conversation::{self, Conversation};
+use crate::event::{Event, VoicedTag};
+use crate::llm::request::LlmRequest;
+use crate::llm::response::{Response, StopReason};
+use crate::llm::stream::{StreamEvent, MALFORMED_INPUT_SENTINEL};
+use crate::plan::{Plan, Update};
+use crate::plugin::Token;
+use crate::plugins::{self, Registered};
+use crate::session::log;
+use crate::session::Session;
+use crate::tool::ToolCtx;
+use crate::tools;
+use crate::turn::deps::{AfterPass, TurnDeps};
+use crate::turn::endgame;
+use crate::turn::nudges::{Nudges, ToolResult as NudgeResult};
+use crate::voice;
+
+/// The Turn loop's outcome (baud's `outcome`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// The Turn completed; carries the final Conversation and terminal stop
+    /// reason.
+    Ok(Conversation, OutcomeStop),
+    /// The response errored; carries the LLM error reason and the Conversation
+    /// (with the partial text and the failed marker).
+    Failed(String, Conversation),
+    /// The Context Budget was exhausted and Compaction could not recover it: no
+    /// request was ever sent.
+    Error,
+}
+
+/// The terminal stop reason of an `Ok` outcome. Spans the enumerable reasons
+/// ([`log::StopReason`]: `end_turn`, `max_tokens`, `turn_limit`, ...) and the
+/// arbitrary atom an after-Pass `Stop` hook may name (baud's `{:stop, atom()}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutcomeStop {
+    Reason(log::StopReason),
+    Custom(String),
+}
+
+impl OutcomeStop {
+    // Used only by the test module's assertions, not by non-test builds.
+    #[allow(dead_code)]
+    fn end_turn() -> Self {
+        OutcomeStop::Reason(log::StopReason::EndTurn)
+    }
+}
+
+/// Options for [`run`] (baud's `opts`): the restored Plan content and the
+/// durable original task copy from the Compaction state.
+#[derive(Debug, Clone, Default)]
+pub struct RunOpts {
+    pub plan: Option<String>,
+    pub original_task: Option<String>,
+}
+
+// The loop state that spans Passes: the Session's fixed facts, the effect
+// bundle, the Plan/Anchor state, which Pass we are on, and the Nudge
+// bookkeeping. The Conversation stays a separate value the loop folds.
+struct LoopState<'a, D: TurnDeps> {
+    session: &'a Session,
+    deps: &'a mut D,
+    plugins: &'a [Registered],
+    tool_ctx: &'a ToolCtx,
+    nudges: Nudges,
+    plan: Plan,
+    pass: u64,
+    just_compacted: bool,
+}
+
+/// Runs the loop until the model stops asking for tools, the Turn Limit is hit,
+/// or the response errors (baud's `Baud.Turn.Loop.run/4`).
+///
+/// `plugins` and `tool_ctx` supply the Plugin pipeline and Tool execution
+/// context (Session-derived; the Rust Session carries plugin names only).
+pub async fn run<D: TurnDeps>(
+    mut conversation: Conversation,
+    session: &Session,
+    plugins: &[Registered],
+    tool_ctx: &ToolCtx,
+    deps: &mut D,
+    opts: RunOpts,
+) -> Outcome {
+    let plan = Plan::new(opts.plan, opts.original_task).capture_task(&conversation);
+
+    let mut state = LoopState {
+        session,
+        deps,
+        plugins,
+        tool_ctx,
+        nudges: Nudges::new(),
+        plan,
+        pass: 1,
+        just_compacted: false,
+    };
+
+    conversation = maybe_compact_proactive(&mut state, conversation).await;
+    run_loop(&mut state, conversation).await
+}
+
+// Proactive Compaction (ADR-0012): when the Conversation already exceeds the
+// compaction target at Turn start, compact before the first Pass. A failed
+// Compaction falls through to the reactive path at the budget cliff.
+async fn maybe_compact_proactive<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+) -> Conversation {
+    if proactive_compaction_due(&conversation) {
+        match state.deps.compact(conversation.clone()).await {
+            Ok(compacted) => {
+                state.just_compacted = true;
+                compacted
+            }
+            Err(_) => conversation,
+        }
+    } else {
+        conversation
+    }
+}
+
+// baud's `Baud.Compaction.proactive?/1`: the estimate exceeds the Compaction
+// Target (the same low-water mark Eviction settles to).
+fn proactive_compaction_due(conv: &Conversation) -> bool {
+    conv.token_estimate() > conv.compaction_target()
+}
+
+async fn run_loop<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+) -> Outcome {
+    loop {
+        let (request, next_conv) = match build_request(state, conversation).await {
+            Ok(pair) => pair,
+            Err(()) => return Outcome::Error,
+        };
+        conversation = next_conv;
+
+        state.deps.emit(Event::message_start(state.pass as u32));
+
+        let response = complete_and_emit(state, request).await;
+
+        state.deps.emit(Event::message_end(
+            response.content.clone(),
+            response.stop_reason.clone(),
+        ));
+
+        conversation.note_usage(usage_of(&response));
+        emit_context_pressure(state, &conversation);
+
+        match dispatch(state, conversation, response).await {
+            Flow::Done(outcome) => return outcome,
+            Flow::Continue(next) => conversation = next,
+        }
+    }
+}
+
+// Emitting the streaming updates has to borrow `state.deps` mutably for both
+// `complete` and `emit`, which a single closure capturing `state` cannot do.
+// The `complete` Dep forwards each StreamEvent to a callback; we collect the
+// snapshots the callback sees and emit one MessageUpdate per delta after the
+// call returns - order is preserved (deltas arrive before the response, and the
+// Conversation is untouched until MessageEnd).
+async fn complete_and_emit<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    request: LlmRequest,
+) -> Response {
+    let mut updates: Vec<(crate::llm::stream::Delta, Vec<ContentBlock>)> = Vec::new();
+    let response = {
+        let mut sink = |ev: &StreamEvent| {
+            updates.push((ev.delta.clone(), ev.content.clone()));
+        };
+        state.deps.complete(request, &mut sink).await
+    };
+    for (delta, content) in updates {
+        state.deps.emit(Event::message_update(delta, content));
+    }
+    response
+}
+
+// Returns `Ok((request, conversation))` (Compaction may have rewritten the
+// Conversation and set the post-Compaction Anchor flag) or `Err(())` for
+// context-budget exhaustion.
+async fn build_request<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+) -> Result<(LlmRequest, Conversation), ()> {
+    match conversation.for_request() {
+        Ok(req) => {
+            let tools = endgame::tools(state.pass, state.session.turn_limit, &state.nudges);
+            let no_think = state.nudges.rescue_armed();
+            // Consuming the rescue arm here clears it so the Pass after reverts.
+            state.nudges.consume_rescue();
+            let request =
+                LlmRequest::new(req.system, req.messages, tools).with_no_think(no_think);
+            Ok((request, conversation))
+        }
+        Err(_) => {
+            // Compaction recovery: try summarizing before giving up.
+            match state.deps.compact(conversation.clone()).await {
+                Ok(compacted) => {
+                    state.just_compacted = true;
+                    Box::pin(build_request(state, compacted)).await
+                }
+                Err(_) => Err(()),
+            }
+        }
+    }
+}
+
+// The result of a stop-reason dispatch: either the loop continues with an
+// updated Conversation, or the Turn is done.
+enum Flow {
+    Continue(Conversation),
+    Done(Outcome),
+}
+
+async fn dispatch<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    response: Response,
+) -> Flow {
+    match response.stop_reason {
+        StopReason::Error => Flow::Done(fail(state, conversation, response)),
+        StopReason::ToolUse => {
+            // A :tool_use stop with zero tool_use blocks is a server quirk, not
+            // a request for tools; treat it as end_turn (never append an empty
+            // Tool Results message and loop forever).
+            if response.content.iter().any(is_tool_use) {
+                continue_tools(state, conversation, response).await
+            } else {
+                let content = response.content.clone();
+                finish(state, conversation, content, StopReason::ToolUse).await
+            }
+        }
+        StopReason::MaxTokens => {
+            if response.content.iter().any(is_tool_use) {
+                truncated_batch(state, conversation, response).await
+            } else {
+                let content = response.content.clone();
+                finish(state, conversation, content, StopReason::MaxTokens).await
+            }
+        }
+        other => {
+            let content = response.content.clone();
+            finish(state, conversation, content, other).await
+        }
+    }
+}
+
+// The model asked for tools and gets them, in the order it emitted them.
+async fn continue_tools<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    response: Response,
+) -> Flow {
+    let (results, conversation) = execute_tools(state, conversation, &response.content).await;
+    next_pass(state, conversation, response, results).await
+}
+
+// ADR-0009: a max_tokens stop cut the response mid-batch. The streamed
+// arguments may be valid-but-incomplete JSON, so NOTHING executes; every call
+// is answered with the re-issue error and the model retries in-band. The calls
+// never enter the duplicate memory.
+async fn truncated_batch<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    response: Response,
+) -> Flow {
+    let mut results = Vec::new();
+    for block in response.content.iter().filter(|b| is_tool_use(b)) {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            state
+                .deps
+                .emit(Event::tool_call(id.clone(), name.clone(), display_input(input)));
+
+            let content = voice::truncated_call_nudge().to_string();
+            state.deps.emit(Event::tool_result(
+                id.clone(),
+                name.clone(),
+                content.clone(),
+                true,
+                Default::default(),
+            ));
+
+            results.push(ContentBlock::tool_result(id.clone(), content, true));
+        }
+    }
+
+    state.nudges.next_pass();
+    next_pass(state, conversation, response, results).await
+}
+
+// Shared tail of every tool-answering Pass: drain Steering, append the batch
+// (assistant blocks intact, results + Steering as ONE user message),
+// checkpoint, then Turn Limit -> after-Pass hook -> loop.
+async fn next_pass<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    response: Response,
+    results: Vec<ContentBlock>,
+) -> Flow {
+    let steering = state.deps.drain_steering().await;
+
+    conversation.add_assistant_blocks(response.content.clone());
+    conversation.add_tool_results(results, steering.clone());
+
+    for text in &steering {
+        state.deps.emit(Event::steering_delivered(text.clone()));
+    }
+
+    let calls = pass_calls(&response.content);
+
+    // Verify-failed / Verify / Empty re-arm on progress (a Pass that made at
+    // least one Tool Call). This is a tool-answering Pass, so calls is non-empty.
+    state.nudges.note_progress(&calls);
+
+    // Explore Nudge: rides the trailing tool-results user message.
+    maybe_explore_nudge(state, &mut conversation, &calls);
+
+    // Anchor injection: every anchor_interval Passes and after a Compaction.
+    maybe_inject_anchor(state, &mut conversation);
+
+    // The Endgame's tail rider (wrap-up warning / Verification Pass / final-Pass
+    // prompt), riding the results message like Steering and the Anchor.
+    apply_tail_rider(state, &mut conversation);
+
+    state.deps.checkpoint(&conversation);
+
+    if endgame::final_pass(state.pass, state.session.turn_limit) {
+        // Turn Limit: stop calling the model. The marker keeps roles alternating.
+        let reason = endgame::limit_stop_reason(&state.nudges);
+        return Flow::Done(close(state, conversation, voice::turn_limit_marker(), reason));
+    }
+
+    match state.deps.after_pass(&response, &conversation).await {
+        AfterPass::Continue => {
+            state.pass += 1;
+            Flow::Continue(conversation)
+        }
+        AfterPass::Stop(reason) => Flow::Done(close_custom(
+            state,
+            conversation,
+            voice::turn_stopped_marker(),
+            reason,
+        )),
+        AfterPass::Inject(text) => {
+            conversation.merge_user_text(text);
+            state.pass += 1;
+            Flow::Continue(conversation)
+        }
+    }
+}
+
+fn close<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    marker: &str,
+    stop_reason: log::StopReason,
+) -> Outcome {
+    conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
+    state.deps.checkpoint(&conversation);
+    Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
+}
+
+fn close_custom<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    marker: &str,
+    stop_reason: String,
+) -> Outcome {
+    conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
+    state.deps.checkpoint(&conversation);
+    Outcome::Ok(conversation, OutcomeStop::Custom(stop_reason))
+}
+
+// The LLM error algebra: text survives; unanswered tool_use blocks are dropped;
+// the failed marker closes the Turn so roles keep alternating.
+fn fail<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    response: Response,
+) -> Outcome {
+    let mut blocks: Vec<ContentBlock> = response
+        .content
+        .iter()
+        .filter(|b| !is_tool_use(b))
+        .cloned()
+        .collect();
+    blocks.push(ContentBlock::text(voice::turn_failed_marker()));
+    conversation.add_assistant_blocks(blocks);
+    state.deps.checkpoint(&conversation);
+    let reason = response.error.unwrap_or_default();
+    Outcome::Failed(reason, conversation)
+}
+
+// The model stopped without (executable) Tool Calls. Usually the Turn ends here;
+// a finish Nudge may send it back for one more Pass (Verify-failed > Verify >
+// Empty). Any tool_use block in this branch is unanswered and is dropped.
+async fn finish<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    blocks: Vec<ContentBlock>,
+    stop_reason: StopReason,
+) -> Flow {
+    // ADR-0015: on the final Pass a tool-insistent TEXT reply settles on the
+    // turn-limit marker path, and the markup never enters the Conversation.
+    if endgame::final_pass(state.pass, state.session.turn_limit)
+        && endgame::tool_insistent_text(&blocks)
+    {
+        let reason = endgame::limit_stop_reason(&state.nudges);
+        return Flow::Done(close(state, conversation, voice::turn_limit_marker(), reason));
+    }
+
+    do_finish(state, conversation, blocks, stop_reason).await
+}
+
+async fn do_finish<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    blocks: Vec<ContentBlock>,
+    stop_reason: StopReason,
+) -> Flow {
+    conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));
+
+    let closed = close_stop_reason(&stop_reason);
+    let can_loop = endgame::can_loop(state.pass, state.session.turn_limit);
+    let end_turn = closed == StopReason::EndTurn;
+
+    if end_turn && can_loop && state.nudges.verify_failed_nudge() {
+        state.nudges.note_verify_failed_nudged();
+        return nudge_finish(
+            state,
+            conversation,
+            voice::verify_failed_nudge(),
+            VoicedTag::VerifyFailedNudge,
+        )
+        .await;
+    }
+
+    if end_turn && can_loop && state.nudges.verify_nudge() {
+        state.nudges.note_verify_nudged();
+        return nudge_finish(
+            state,
+            conversation,
+            voice::verify_nudge(),
+            VoicedTag::VerifyNudge,
+        )
+        .await;
+    }
+
+    if end_turn && can_loop && empty_content(&blocks) && state.nudges.empty_response_nudge() {
+        // Arm the break-glass no-think rescue for the next Pass, gated by the
+        // Session knob.
+        state.nudges.arm_rescue(state.session.no_think_rescue);
+        state.nudges.note_empty_response_nudged();
+        return nudge_finish(
+            state,
+            conversation,
+            voice::empty_response_nudge(),
+            VoicedTag::EmptyResponseNudge,
+        )
+        .await;
+    }
+
+    Flow::Done(Outcome::Ok(
+        conversation,
+        outcome_stop_of(&close_stop_reason(&stop_reason)),
+    ))
+}
+
+// Shared finish-Nudge mechanic: append the user-role Nudge, announce it, count
+// it as a normal Pass against the Turn Limit, loop.
+async fn nudge_finish<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    nudge: &str,
+    tag: VoicedTag,
+) -> Flow {
+    conversation.add_user_text(nudge);
+    state.deps.emit(Event::voiced(tag, nudge));
+    state.pass += 1;
+    Flow::Continue(conversation)
+}
+
+// An empty response: zero content blocks once tool_use blocks are dropped, OR a
+// parroted empty-response marker.
+fn empty_content(blocks: &[ContentBlock]) -> bool {
+    let kept: Vec<&ContentBlock> = blocks.iter().filter(|b| !is_tool_use(b)).collect();
+    if kept.is_empty() {
+        true
+    } else {
+        marker_parrot(&kept)
+    }
+}
+
+fn marker_parrot(blocks: &[&ContentBlock]) -> bool {
+    let all_text = blocks
+        .iter()
+        .all(|b| matches!(b, ContentBlock::Text { .. }));
+    if !all_text {
+        return false;
+    }
+    let joined = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    joined.trim() == voice::empty_response_marker()
+}
+
+fn close_blocks(blocks: &[ContentBlock], stop_reason: &StopReason) -> Vec<ContentBlock> {
+    let kept: Vec<ContentBlock> = blocks
+        .iter()
+        .filter(|b| !is_tool_use(b))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        if *stop_reason == StopReason::MaxTokens {
+            vec![ContentBlock::text(voice::truncation_marker())]
+        } else {
+            vec![ContentBlock::text(voice::empty_response_marker())]
+        }
+    } else {
+        kept
+    }
+}
+
+// A phantom :tool_use stop ends the Turn like a normal completion.
+fn close_stop_reason(stop_reason: &StopReason) -> StopReason {
+    match stop_reason {
+        StopReason::ToolUse => StopReason::EndTurn,
+        other => other.clone(),
+    }
+}
+
+// Maps a (closed) LLM stop reason to the outcome's terminal reason.
+fn outcome_stop_of(stop_reason: &StopReason) -> OutcomeStop {
+    let reason = match stop_reason {
+        StopReason::EndTurn | StopReason::ToolUse => log::StopReason::EndTurn,
+        StopReason::MaxTokens => log::StopReason::MaxTokens,
+        StopReason::StopSequence => log::StopReason::StopSequence,
+        StopReason::Error => log::StopReason::Error,
+        StopReason::Unknown => log::StopReason::Unknown,
+    };
+    OutcomeStop::Reason(reason)
+}
+
+// Run tool calls in emission order; results keep that order. After each result,
+// checkpoint with only the answered Tool Calls. The Nudge bookkeeping threads
+// through the batch; after the batch the duplicate memory advances.
+async fn execute_tools<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    blocks: &[ContentBlock],
+) -> (Vec<ContentBlock>, Conversation) {
+    let mut results: Vec<ContentBlock> = Vec::new();
+    for block in blocks.iter().filter(|b| is_tool_use(b)) {
+        let result = execute_tool(state, block).await;
+        results.push(result);
+        let checkpoint = build_checkpoint(&conversation, blocks, &results);
+        state.deps.checkpoint(&checkpoint);
+    }
+    state.nudges.next_pass();
+    (results, conversation)
+}
+
+// The checkpoint after a partial batch: only the answered Tool Calls, paired
+// with their results.
+fn build_checkpoint(
+    conversation: &Conversation,
+    blocks: &[ContentBlock],
+    results: &[ContentBlock],
+) -> Conversation {
+    use std::collections::HashSet;
+    let answered: HashSet<&str> = results
+        .iter()
+        .filter_map(|r| match r {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let kept: Vec<ContentBlock> = blocks
+        .iter()
+        .filter(|b| match b {
+            ContentBlock::ToolUse { id, .. } => answered.contains(id.as_str()),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+
+    let mut conv = conversation.clone();
+    conv.add_assistant_blocks(kept);
+    conv.add_tool_results(results.to_vec(), Vec::new());
+    conv
+}
+
+async fn execute_tool<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    block: &ContentBlock,
+) -> ContentBlock {
+    let (id, name, input) = match block {
+        ContentBlock::ToolUse { id, name, input } => (id.clone(), name.clone(), input.clone()),
+        _ => unreachable!("execute_tool only sees tool_use blocks"),
+    };
+
+    state
+        .deps
+        .emit(Event::tool_call(id.clone(), name.clone(), display_input(&input)));
+
+    let (raw_content, is_error, artifacts) = run_block(state, &name, &input).await;
+
+    // Guard content to a String; note the result into the Nudge bookkeeping and
+    // receive the (possibly suffixed) content to record.
+    let content = state.nudges.note_result(
+        &name,
+        &input,
+        &NudgeResult {
+            content: &raw_content,
+            is_error,
+        },
+    );
+
+    maybe_store_plan(state, &name, &input, is_error);
+
+    state.deps.emit(Event::tool_result(
+        id.clone(),
+        name.clone(),
+        content.clone(),
+        is_error,
+        artifacts,
+    ));
+
+    ContentBlock::tool_result(id, content, is_error)
+}
+
+// A successful plan Tool Call updates the Plan value and stores its content
+// through the set_plan Dep; the Loop's copy keeps this Turn's Anchors current.
+fn maybe_store_plan<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    is_error: bool,
+) {
+    if let Update::Updated(plan) = state.plan.update(name, input, is_error) {
+        state.deps.set_plan(plan.content.clone().unwrap_or_default());
+        state.plan = plan;
+    }
+}
+
+// Explore Nudge: folds this Pass's Tool Calls into the exploration streak; on
+// the 3rd/6th/... such Pass the Voice nudge merges into the trailing
+// tool-results user message and an event announces it.
+fn maybe_explore_nudge<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: &mut Conversation,
+    calls: &[(String, Value)],
+) {
+    if state.nudges.note_pass_calls(calls) {
+        let nudge = voice::explore_nudge();
+        state.deps.emit(Event::voiced(VoicedTag::ExploreNudge, nudge));
+        conversation.merge_user_text(nudge);
+    }
+}
+
+// The Endgame's tail rider for this Pass position, announced with its event tag
+// and merged into the trailing tool-results user message.
+fn apply_tail_rider<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &mut Conversation) {
+    use crate::turn::endgame::TailRider;
+    let (tag, text) = match endgame::tail_rider(state.pass, state.session.turn_limit, &state.nudges)
+    {
+        TailRider::VerificationPass(t) => (VoicedTag::VerificationPass, t),
+        TailRider::WrapUpWarning(t) => (VoicedTag::WrapUpWarning, t),
+        TailRider::FinalPass(t) => (VoicedTag::FinalPass, t),
+        TailRider::None => return,
+    };
+    state.deps.emit(Event::voiced(tag, text.clone()));
+    conversation.merge_user_text(text);
+}
+
+// Injects an Anchor when the cadence calls for it: every anchor_interval Passes,
+// or on the first Pass after a Compaction. Clears the flag either way.
+fn maybe_inject_anchor<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &mut Conversation) {
+    let due = anchor_due(state);
+    state.just_compacted = false;
+    if due {
+        let anchor = state.plan.anchor();
+        conversation.inject_anchor(anchor);
+    }
+}
+
+fn anchor_due<D: TurnDeps>(state: &LoopState<'_, D>) -> bool {
+    let interval = state.session.anchor_interval;
+    state.just_compacted || (interval != 0 && state.pass.is_multiple_of(interval))
+}
+
+fn display_input(input: &Value) -> Value {
+    if input.get(MALFORMED_INPUT_SENTINEL).is_some() {
+        Value::Object(Default::default())
+    } else {
+        input.clone()
+    }
+}
+
+// The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs - never
+// run those. Otherwise the Duplicate check, then pre_run, then Approval on the
+// plugin-adjusted command, then execution with post_run and Shaping.
+async fn run_block<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+) -> (String, bool, std::collections::HashMap<String, Value>) {
+    if let Some(raw) = input.get(MALFORMED_INPUT_SENTINEL) {
+        let raw_str = raw.as_str().unwrap_or("");
+        return (voice::malformed_input(raw_str), true, Default::default());
+    }
+
+    if state.nudges.duplicate(name, input) {
+        return (
+            voice::duplicate_call_nudge().to_string(),
+            true,
+            Default::default(),
+        );
+    }
+
+    run_lifecycle(state, name, input).await
+}
+
+async fn run_lifecycle<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+) -> (String, bool, std::collections::HashMap<String, Value>) {
+    let token = Token::new(name, input.clone(), state.tool_ctx.clone());
+    let (token, failures) = plugins::pre_run(state.plugins, token);
+    emit_plugin_errors(state, &failures);
+
+    if token.halted {
+        let reason = token.halt_reason.clone().unwrap_or_default();
+        return (reason, true, token.artifacts.clone());
+    }
+
+    if tools::requires_approval(name) {
+        let command = token
+            .input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = new_ref();
+        if state.deps.request_approval(id, command).await {
+            execute_token(state, token).await
+        } else {
+            (
+                voice::command_denied().to_string(),
+                true,
+                Default::default(),
+            )
+        }
+    } else {
+        execute_token(state, token).await
+    }
+}
+
+async fn execute_token<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    token: Token,
+) -> (String, bool, std::collections::HashMap<String, Value>) {
+    let (result, failures) = plugins::execute(state.plugins, token).await;
+    emit_plugin_errors(state, &failures);
+    (result.content, result.is_error, result.artifacts)
+}
+
+fn emit_plugin_errors<D: TurnDeps>(state: &mut LoopState<'_, D>, failures: &[plugins::Failure]) {
+    for failure in failures {
+        state.deps.emit(Event::plugin_error(
+            failure.plugin.clone(),
+            failure.stage,
+            failure.message.clone(),
+        ));
+    }
+}
+
+// The per-call Approval reference (baud's `make_ref()`), an opaque unique id.
+fn new_ref() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("approval-{n}")
+}
+
+fn is_tool_use(block: &ContentBlock) -> bool {
+    matches!(block, ContentBlock::ToolUse { .. })
+}
+
+// This Pass's Tool Calls as {name, input} pairs, in order.
+fn pass_calls(blocks: &[ContentBlock]) -> Vec<(String, Value)> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { name, input, .. } => Some((name.clone(), input.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+// Live context-pressure indication, once the Pass's usage is noted.
+fn emit_context_pressure<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &Conversation) {
+    state.deps.emit(Event::context_pressure(
+        conversation.token_estimate(),
+        conversation.context_budget,
+        conversation.max_tokens_reserve,
+    ));
+}
+
+// Maps the Response's content::Usage to the Conversation's Usage (only
+// input_tokens is load-bearing for the estimate floor).
+fn usage_of(response: &Response) -> conversation::Usage {
+    match response.usage.input_tokens {
+        Some(tokens) => conversation::Usage::with_input_tokens(tokens),
+        None => conversation::Usage::empty(),
+    }
+}
+
+#[cfg(test)]
+// Test fixtures build SessionOpts by mutating a `default()` value one field at a
+// time; the struct-literal form clippy wants would obscure which knob each test
+// sets. Narrowly scoped to this test module.
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use crate::content::{ContentBlock, Message, Role};
+    use crate::event::Stage;
+    use crate::llm::response::Response;
+    use crate::llm::stream::Delta;
+    use crate::plugin::{Plugin, Token};
+    use crate::plugins::Registered;
+    use crate::session::connection::Connection;
+    use crate::session::{Session, SessionConfig, SessionOpts};
+    use crate::test_support::{FakeDeps, FakeLlm};
+    use crate::turn::deps::CompactError;
+    use crate::test_support::Entry;
+    use crate::tool::ToolCtx;
+    use crate::content::Usage;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    // ---- harness ----------------------------------------------------------
+
+    fn session_with(root: &std::path::Path, opts: SessionOpts) -> Session {
+        let mut opts = opts;
+        opts.root = Some(root.to_string_lossy().into_owned());
+        Session::build(opts, &SessionConfig::test_defaults()).expect("session builds")
+    }
+
+    fn session(root: &std::path::Path) -> Session {
+        session_with(root, SessionOpts::default())
+    }
+
+    fn conversation(session: &Session, prompt: &str) -> Conversation {
+        let mut conv = Conversation::new(
+            "You are a test agent.",
+            crate::conversation::ConversationOpts::new(
+                session.context_budget,
+                session.connection.max_tokens,
+            )
+            .eviction_slack(session.eviction_slack)
+            .compaction_keep(session.compaction_keep),
+        );
+        conv.add_user_text(prompt);
+        conv
+    }
+
+    fn tool_ctx(session: &Session) -> ToolCtx {
+        session.tool_ctx()
+    }
+
+    // Response builders mirroring baud's text_result / tool_use_result.
+    fn text_result(text: &str, stop: StopReason) -> Response {
+        Response {
+            content: vec![ContentBlock::text(text)],
+            stop_reason: stop,
+            usage: Usage::default(),
+            error: None,
+        }
+    }
+
+    fn text_end(text: &str) -> Response {
+        text_result(text, StopReason::EndTurn)
+    }
+
+    fn tool_use_result(id: &str, name: &str, input: Value) -> Response {
+        Response {
+            content: vec![ContentBlock::tool_use(id, name, input)],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            error: None,
+        }
+    }
+
+    fn empty(stop: StopReason) -> Response {
+        Response {
+            content: vec![],
+            stop_reason: stop,
+            usage: Usage::default(),
+            error: None,
+        }
+    }
+
+    fn just(r: Response) -> Entry {
+        Entry::just(r)
+    }
+
+    // Runs the loop to completion with the given script and (optional) deps
+    // customization, on a fresh temp root. Returns (outcome, deps) so the test
+    // can inspect recorded events/checkpoints/requests/plans.
+    async fn run_with(
+        session: &Session,
+        prompt: &str,
+        mut deps: FakeDeps,
+    ) -> (Outcome, FakeDeps) {
+        let conv = conversation(session, prompt);
+        let plugins: Vec<Registered> = Vec::new();
+        let ctx = tool_ctx(session);
+        let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        (outcome, deps)
+    }
+
+    fn deps_for(session: &Session, entries: Vec<Entry>) -> FakeDeps {
+        FakeDeps::new(FakeLlm::script(entries), session.connection.clone())
+    }
+
+    // Inspectors over recorded events.
+    fn events(deps: &FakeDeps) -> Vec<Event> {
+        deps.events.lock().unwrap().clone()
+    }
+
+    fn find_tool_result<'a>(evs: &'a [Event], id: &str) -> Option<&'a Event> {
+        evs.iter().find(
+            |e| matches!(e, Event::ToolResult { id: i, .. } if i == id),
+        )
+    }
+
+    fn count_voiced(evs: &[Event], f: impl Fn(&Event) -> bool) -> usize {
+        evs.iter().filter(|e| f(e)).count()
+    }
+
+    fn last_message(conv: &Conversation) -> &Message {
+        conv.messages.last().expect("has a message")
+    }
+
+    fn ok(outcome: &Outcome) -> (&Conversation, &OutcomeStop) {
+        match outcome {
+            Outcome::Ok(c, s) => (c, s),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    // A test root.
+    fn root() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
+    fn write(root: &TempDir, name: &str, content: &str) {
+        std::fs::write(root.path().join(name), content).unwrap();
+    }
+
+    // ---- tool loop --------------------------------------------------------
+
+    #[tokio::test]
+    async fn runs_the_tool_emits_events_checkpoints_and_feeds_result_back() {
+        let root = root();
+        write(&root, "marker.txt", "");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("tu_1", "list_files", json!({"path": "."}))),
+                just(text_end("Here are the files.")),
+            ],
+        );
+
+        let (outcome, deps) = run_with(&session, "list the files", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+
+        let evs = events(&deps);
+        // tool_call for tu_1
+        assert!(evs.iter().any(|e| matches!(e, Event::ToolCall { id, name, input }
+            if id == "tu_1" && name == "list_files" && input == &json!({"path": "."}))));
+        // tool_result for tu_1, not error, listing contains marker.txt
+        let listing = evs.iter().find_map(|e| match e {
+            Event::ToolResult { id, is_error, content, .. } if id == "tu_1" => {
+                assert!(!is_error);
+                Some(content.clone())
+            }
+            _ => None,
+        });
+        assert!(listing.unwrap().contains("marker.txt"));
+
+        // The checkpoint after the result holds the answered pair.
+        let checkpoints = deps.checkpoints.lock().unwrap();
+        let cp = checkpoints.first().expect("a checkpoint");
+        let tail = &cp.messages[cp.messages.len() - 2..];
+        assert!(matches!(&tail[0].role, Role::Assistant));
+        assert!(matches!(&tail[0].content[0], ContentBlock::ToolUse { id, .. } if id == "tu_1"));
+        assert!(matches!(&tail[1].role, Role::User));
+        assert!(matches!(&tail[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu_1"));
+
+        // The second request carried tools and the tool_result went back.
+        let requests = deps.requests.lock().unwrap();
+        let second = &requests[1];
+        assert!(!second.tools.is_empty());
+        let last = second.messages.last().unwrap();
+        assert!(matches!(&last.role, Role::User));
+        assert!(matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "tu_1" && !is_error));
+
+        // The conversation ends on the model's reply.
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "Here are the files."));
+    }
+
+    #[tokio::test]
+    async fn emits_message_grammar_per_pass_including_errored_responses() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![Entry::response(
+                vec![
+                    Delta::Thinking("hm".into()),
+                    Delta::Text("hi ".into()),
+                    Delta::Text("there".into()),
+                ],
+                text_end("hi there"),
+            )],
+        );
+
+        let (outcome, deps) = run_with(&session, "hello", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+
+        assert!(matches!(evs[0], Event::MessageStart { pass: 1 }));
+        // First update: thinking delta + snapshot with thinking block.
+        assert!(evs.iter().any(|e| matches!(e, Event::MessageUpdate { delta, content }
+            if *delta == Delta::Thinking("hm".into())
+            && matches!(content.first(), Some(ContentBlock::Thinking { text }) if text == "hm"))));
+        // A text delta "hi ".
+        assert!(evs.iter().any(|e| matches!(e, Event::MessageUpdate { delta, .. }
+            if *delta == Delta::Text("hi ".into()))));
+        // "there" update: snapshot has accumulated "hi there".
+        assert!(evs.iter().any(|e| matches!(e, Event::MessageUpdate { delta, content }
+            if *delta == Delta::Text("there".into())
+            && content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "hi there")))));
+        // message_end with text content and end_turn.
+        assert!(evs.iter().any(|e| matches!(e, Event::MessageEnd { content, stop_reason }
+            if stop_reason == &StopReason::EndTurn
+            && matches!(content.first(), Some(ContentBlock::Text { .. })))));
+    }
+
+    // ---- context pressure -------------------------------------------------
+
+    #[tokio::test]
+    async fn emits_live_numbers_after_every_pass_once_usage_noted() {
+        let root = root();
+        write(&root, "marker.txt", "");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "list the files", deps).await;
+        ok(&outcome);
+
+        let evs = events(&deps);
+        let pressures: Vec<(u64, u64, u64)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContextPressure { token_estimate, context_budget, max_tokens_reserve } => {
+                    Some((*token_estimate, *context_budget, *max_tokens_reserve))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pressures.len(), 2);
+        assert_eq!(pressures[0].1, session.context_budget);
+        assert_eq!(pressures[0].2, session.connection.max_tokens);
+        // Pressure grows Pass to Pass.
+        assert!(pressures[1].0 >= pressures[0].0);
+    }
+
+    #[tokio::test]
+    async fn context_pressure_never_enters_the_conversation() {
+        let root = root();
+        write(&root, "marker.txt", "");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "list the files", deps).await;
+        let (conv, _) = ok(&outcome);
+        assert!(!conv.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("context_pressure")))));
+    }
+
+    // ---- steering ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn drained_steering_rides_tool_results_message_and_is_announced() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_steering(vec![vec!["also check the README".to_string()], vec![]]);
+
+        let (outcome, deps) = run_with(&session, "look around", deps).await;
+        ok(&outcome);
+
+        let evs = events(&deps);
+        assert!(evs.iter().any(|e| matches!(e, Event::SteeringDelivered { text } if text == "also check the README")));
+
+        let requests = deps.requests.lock().unwrap();
+        let last = requests[1].messages.last().unwrap();
+        assert!(matches!(&last.role, Role::User));
+        assert!(matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"));
+        assert!(matches!(&last.content[1], ContentBlock::Text { text } if text == "also check the README"));
+    }
+
+    // ---- after-Pass hook --------------------------------------------------
+
+    #[tokio::test]
+    async fn after_pass_stop_closes_the_turn_with_the_stopped_marker() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![just(tool_use_result("t1", "list_files", json!({"path": "."})))],
+        )
+        .with_after_pass(|_r, _c| AfterPass::Stop("budget_hook".to_string()));
+
+        let (outcome, _deps) = run_with(&session, "look", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Custom("budget_hook".to_string()));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn stopped - reply to continue]"));
+    }
+
+    #[tokio::test]
+    async fn after_pass_inject_appends_a_user_message_and_loops() {
+        let root = root();
+        let session = session(root.path());
+        let injected = Arc::new(Mutex::new(vec![
+            AfterPass::Continue,
+            AfterPass::Inject("remember the budget".to_string()),
+        ]));
+        let inj = Arc::clone(&injected);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_after_pass(move |_r, _c| inj.lock().unwrap().pop().unwrap());
+
+        let (outcome, deps) = run_with(&session, "look", deps).await;
+        ok(&outcome);
+        let requests = deps.requests.lock().unwrap();
+        let last = requests[1].messages.last().unwrap();
+        assert!(matches!(&last.role, Role::User));
+        assert!(matches!(&last.content[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(&last.content[1], ContentBlock::Text { text } if text == "remember the budget"));
+    }
+
+    // ---- error algebra ----------------------------------------------------
+
+    #[tokio::test]
+    async fn errored_response_settles_failed_keeping_partial_text() {
+        let root = root();
+        let session = session(root.path());
+        let errored = Response {
+            content: vec![
+                ContentBlock::text("partial thought"),
+                ContentBlock::tool_use("t1", "grep", json!({"pattern": "x"})),
+            ],
+            stop_reason: StopReason::Error,
+            usage: Usage::default(),
+            error: Some("request_failed: closed".to_string()),
+        };
+        let deps = deps_for(&session, vec![just(errored)]);
+
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        let conv = match &outcome {
+            Outcome::Failed(reason, conv) => {
+                assert_eq!(reason, "request_failed: closed");
+                conv
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        // Grammar stays well-formed on the error path.
+        let evs = events(&deps);
+        assert!(evs.iter().any(|e| matches!(e, Event::MessageEnd { stop_reason, .. } if stop_reason == &StopReason::Error)));
+        // Partial text survives; tool_use dropped; failed marker closes.
+        let lm = last_message(conv);
+        assert_eq!(lm.content.len(), 2);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "partial thought"));
+        assert!(matches!(&lm.content[1], ContentBlock::Text { text } if text == "[turn failed]"));
+    }
+
+    // ---- verify nudge -----------------------------------------------------
+
+    #[tokio::test]
+    async fn unverified_write_draws_verify_nudge_once_then_ends() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(text_end("all done")),
+                just(text_end("declining to verify")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        let (conv, _) = ok(&outcome);
+        let evs = events(&deps);
+        assert!(find_tool_result(&evs, "w1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
+        let nudges: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::VerifyNudge { .. })).collect();
+        assert_eq!(nudges.len(), 1);
+        assert!(matches!(nudges[0], Event::VerifyNudge { text } if text.contains("files changed but nothing verified")));
+        assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User) && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("files changed but nothing verified")))));
+    }
+
+    #[tokio::test]
+    async fn editing_pass_after_nudge_rearms_verify_nudge() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(text_end("all done")),
+                just(tool_use_result("w2", "edit_file", json!({"path": "a.txt", "old_str": "hi", "new_str": "ho"}))),
+                just(text_end("done again, still unverified")),
+                just(text_end("concluding")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 2);
+    }
+
+    #[tokio::test]
+    async fn run_command_after_write_suppresses_verify_nudge() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(text_end("verified")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "write and verify", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn denied_run_command_counts_as_made() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result("r1", "run_command", json!({"command": "mix test"}))),
+                just(text_end("stopping here")),
+            ],
+        )
+        .with_approvals(vec![false]);
+        let (outcome, deps) = run_with(&session, "write and verify", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_nudge_skipped_when_turn_limit_reached() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyNudge { .. })), 0);
+    }
+
+    // ---- verification-failing finish gate ---------------------------------
+
+    #[tokio::test]
+    async fn finishing_after_failing_run_command_fires_nudge_once_and_loops() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(text_end("giving up in prose")),
+                just(text_end("ok, fixed it")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        let (conv, _) = ok(&outcome);
+        let evs = events(&deps);
+        assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
+        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::VerifyFailedNudge { .. })).collect();
+        assert_eq!(n.len(), 1);
+        assert!(matches!(n[0], Event::VerifyFailedNudge { text } if text.contains("last command you ran failed")));
+        assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User) && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("last command you ran failed")))));
+    }
+
+    #[tokio::test]
+    async fn passing_run_command_clears_state_and_finishes_without_it() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result("r2", "run_command", json!({"command": "true"}))),
+                just(text_end("verified green")),
+            ],
+        )
+        .with_approvals(vec![true, true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
+        assert!(find_tool_result(&evs, "r2").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn turn_with_no_run_command_never_fires_verify_failed() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("l1", "list_files", json!({"path": "."}))),
+                just(text_end("here they are")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "list files", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_model_capped_at_one_verify_failed() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(text_end("still stuck")),
+                just(text_end("still stuck again")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_call_pass_between_finishes_rearms_verify_failed() {
+        let root = root();
+        write(&root, "a.ex", "content");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(text_end("giving up in prose")),
+                just(tool_use_result("l1", "read_file", json!({"path": "a.ex"}))),
+                just(text_end("finishing again, still red")),
+                just(text_end("third finish, now capped")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(find_tool_result(&evs, "l1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 2);
+    }
+
+    #[tokio::test]
+    async fn immediate_empty_finish_after_firing_does_not_rearm_verify_failed() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(empty(StopReason::EndTurn)),
+                just(empty(StopReason::EndTurn)),
+                just(text_end("finally saying something")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_failed_precedence_over_verify_nudge() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(text_end("done, but tests are red")),
+                just(text_end("second finish")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "write and verify", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_failed_skipped_when_turn_limit_reached() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 0);
+    }
+
+    // ---- empty-response nudge ---------------------------------------------
+
+    #[tokio::test]
+    async fn empty_response_fires_nudge_once_and_loops() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(text_end("here is my next step")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        let (conv, _) = ok(&outcome);
+        let evs = events(&deps);
+        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::EmptyResponseNudge { .. })).collect();
+        assert_eq!(n.len(), 1);
+        assert!(matches!(n[0], Event::EmptyResponseNudge { text } if text.contains("reply was empty")));
+        assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User) && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("reply was empty")))));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "here is my next step"));
+    }
+
+    #[tokio::test]
+    async fn second_consecutive_empty_finishes_with_marker() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![just(empty(StopReason::EndTurn)), just(empty(StopReason::EndTurn))],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        let (conv, _) = ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 1);
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::empty_response_marker()));
+    }
+
+    #[tokio::test]
+    async fn parroted_empty_marker_counts_as_empty_and_gets_nudge() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(text_end(voice::empty_response_marker())),
+                just(text_end("the real conclusion")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        let (conv, _) = ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 1);
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the real conclusion"));
+    }
+
+    #[tokio::test]
+    async fn prose_containing_marker_string_is_a_real_conclusion() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![just(text_end("I kept hitting [empty response] markers; here is my summary."))],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn tool_call_pass_between_empties_rearms_it() {
+        let root = root();
+        write(&root, "a.ex", "content");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(tool_use_result("l1", "read_file", json!({"path": "a.ex"}))),
+                just(empty(StopReason::EndTurn)),
+                just(text_end("the actual answer at last")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        let (conv, _) = ok(&outcome);
+        let evs = events(&deps);
+        assert!(find_tool_result(&evs, "l1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })), 2);
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the actual answer at last"));
+    }
+
+    #[tokio::test]
+    async fn empty_nudge_never_fires_with_content() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(&session, vec![just(text_end("a normal, non-empty reply"))]);
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_failed_precedence_over_empty_response() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(empty(StopReason::EndTurn)),
+                just(text_end("fixed it")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "run the tests", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_nudge_skipped_when_turn_limit_reached() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("l1", "list_files", json!({"path": "."}))),
+                just(empty(StopReason::EndTurn)),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        let (conv, _) = ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::empty_response_marker()));
+    }
+
+    // ---- no-think rescue --------------------------------------------------
+
+    #[tokio::test]
+    async fn pass_after_empty_nudge_carries_no_think_next_does_not() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        ok(&outcome);
+        let requests = deps.requests.lock().unwrap();
+        assert!(!requests[0].no_think);
+        assert!(requests[1].no_think);
+        assert!(!requests[2].no_think);
+    }
+
+    #[tokio::test]
+    async fn second_empty_makes_rescue_sticky() {
+        let root = root();
+        write(&root, "a.ex", "content");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(tool_use_result("l1", "read_file", json!({"path": "a.ex"}))),
+                just(empty(StopReason::EndTurn)),
+                just(tool_use_result("l2", "read_file", json!({"path": "a.ex"}))),
+                just(text_end("the answer")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        let (conv, _) = ok(&outcome);
+        let requests = deps.requests.lock().unwrap();
+        assert!(!requests[0].no_think);
+        assert!(requests[1].no_think);
+        assert!(!requests[2].no_think);
+        assert!(requests[3].no_think);
+        assert!(requests[4].no_think);
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the answer"));
+    }
+
+    #[tokio::test]
+    async fn no_request_carries_no_think_when_knob_off() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.no_think_rescue = Some(false);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(text_end("here is my next step")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })), 1);
+        let requests = deps.requests.lock().unwrap();
+        assert!(!requests[0].no_think);
+        assert!(!requests[1].no_think);
+    }
+
+    #[tokio::test]
+    async fn rearm_case_makes_both_post_nudge_calls_rescue_calls() {
+        let root = root();
+        write(&root, "a.ex", "content");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(tool_use_result("l1", "read_file", json!({"path": "a.ex"}))),
+                just(empty(StopReason::EndTurn)),
+                just(text_end("the actual answer at last")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do something", deps).await;
+        ok(&outcome);
+        let requests = deps.requests.lock().unwrap();
+        assert!(!requests[0].no_think);
+        assert!(requests[1].no_think);
+        assert!(!requests[2].no_think);
+        assert!(requests[3].no_think);
+    }
+
+    // ---- wrap-up warning --------------------------------------------------
+
+    fn request_last_texts(req: &LlmRequest) -> Vec<String> {
+        req.messages.last().map(|m| m.content.iter().filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        }).collect()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn wrap_up_warning_rides_tool_results_when_two_passes_remain() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(4);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end("done, wrapping up")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "big task", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let w: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::WrapUpWarning { .. })).collect();
+        assert_eq!(w.len(), 1);
+        assert!(matches!(w[0], Event::WrapUpWarning { text } if *text == voice::wrap_up_warning(2)));
+        // Pass 3's request (index 2) carries the warning text.
+        let requests = deps.requests.lock().unwrap();
+        assert!(request_last_texts(&requests[2]).iter().any(|t| t.contains("wrap up now")));
+    }
+
+    #[tokio::test]
+    async fn wrap_up_warning_never_fires_far_from_limit() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "small task", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })), 0);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::FinalPass { .. })), 0);
+    }
+
+    // ---- Verification Pass ------------------------------------------------
+
+    #[tokio::test]
+    async fn unverified_writes_verification_prompt_replaces_warning_and_narrows_tools() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(4);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(text_end("Verified and done.")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let v: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::VerificationPass { .. })).collect();
+        assert_eq!(v.len(), 1);
+        assert!(matches!(v[0], Event::VerificationPass { text } if text == voice::verification_pass_prompt()));
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })), 0);
+        let requests = deps.requests.lock().unwrap();
+        // Pass 3's request (index 2): run_command ONLY, and the prompt text.
+        let names: Vec<&str> = requests[2].tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["run_command"]);
+        assert!(request_last_texts(&requests[2]).iter().any(|t| t.contains("run_command ONLY")));
+    }
+
+    #[tokio::test]
+    async fn verified_writes_ordinary_warning_and_full_tool_list() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(4);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(text_end("done and verified")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })), 1);
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerificationPass { .. })), 0);
+        let requests = deps.requests.lock().unwrap();
+        assert!(requests[2].tools.len() > 1);
+    }
+
+    // ---- final Pass -------------------------------------------------------
+
+    #[tokio::test]
+    async fn final_request_no_tools_and_prompt_conclusion_ends_turn() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end("Accomplished: listed files twice. Remains: nothing.")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "big task", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+        let evs = events(&deps);
+        let f: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::FinalPass { .. })).collect();
+        assert_eq!(f.len(), 1);
+        assert!(matches!(f[0], Event::FinalPass { text } if text == voice::final_pass_prompt()));
+        let requests = deps.requests.lock().unwrap();
+        assert!(requests[2].tools.is_empty());
+        assert!(request_last_texts(&requests[2]).iter().any(|t| t.contains("tools are withdrawn")));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text.contains("Accomplished")));
+    }
+
+    #[tokio::test]
+    async fn final_pass_tool_markup_as_text_closes_on_marker() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let markup = "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>";
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end(markup)),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "big task", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker()));
+        assert!(!conv.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("<tool_call")))));
+    }
+
+    #[tokio::test]
+    async fn final_pass_conclusion_mentioning_markup_still_ends_end_turn() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end("Done. I could not run mix test - the <tool_call> was withdrawn.")),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "big task", deps).await;
+        let (_conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+    }
+
+    #[tokio::test]
+    async fn prose_preamble_does_not_launder_final_pass_markup() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let text = "I need to update the DESIGN.md file to reflect the new behavior:\n\n<tool_call>\n<function=edit_file>\n<parameter=path>\ndocs/DESIGN.md\n</parameter>\n</function>\n</tool_call>";
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end(text)),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "big task", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker()));
+    }
+
+    #[tokio::test]
+    async fn model_answers_final_pass_with_tools_still_closes_on_marker() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t3", "list_files", json!({"path": "."}))),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "big task", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker()));
+    }
+
+    // ---- loop guards ------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_use_stop_with_zero_blocks_ends_as_end_turn() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![just(Response {
+                content: vec![ContentBlock::text("hmm")],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+                error: None,
+            })],
+        );
+        let (outcome, _deps) = run_with(&session, "hi", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "hmm"));
+    }
+
+    #[tokio::test]
+    async fn truncated_batch_answers_every_call_executes_nothing() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(Response {
+                    content: vec![
+                        ContentBlock::text("partial answer"),
+                        ContentBlock::tool_use("t1", "write_file", json!({"path": "a.txt", "content": "trunca"})),
+                    ],
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Usage::default(),
+                    error: None,
+                }),
+                just(text_end("re-issued and done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let tr = find_tool_result(&evs, "t1").unwrap();
+        assert!(matches!(tr, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("re-issue")));
+        // Nothing touched disk.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        // The batch went back intact.
+        let requests = deps.requests.lock().unwrap();
+        let msgs = &requests[1].messages;
+        let tail = &msgs[msgs.len() - 2..];
+        assert!(matches!(&tail[0].role, Role::Assistant));
+        assert!(matches!(&tail[0].content[0], ContentBlock::Text { .. }));
+        assert!(matches!(&tail[0].content[1], ContentBlock::ToolUse { id, .. } if id == "t1"));
+        assert!(matches!(&tail[1].content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t1" && *is_error));
+    }
+
+    #[tokio::test]
+    async fn reissued_call_after_truncation_executes_not_duplicate() {
+        let root = root();
+        let session = session(root.path());
+        let input = json!({"path": "a.txt", "content": "hello"});
+        let deps = deps_for(
+            &session,
+            vec![
+                just(Response {
+                    content: vec![ContentBlock::tool_use("t1", "write_file", input.clone())],
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Usage::default(),
+                    error: None,
+                }),
+                just(tool_use_result("t2", "write_file", input.clone())),
+                just(text_end("done")),
+                just(text_end("declining to verify")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "write it", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if *is_error));
+        assert!(matches!(find_tool_result(&evs, "t2").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
+        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_no_tool_use_closes_with_text() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![just(text_result("partial answer", StopReason::MaxTokens))],
+        );
+        let (outcome, _deps) = run_with(&session, "go", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::MaxTokens));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "partial answer"));
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_no_content_closes_with_truncation_marker() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(&session, vec![just(empty(StopReason::MaxTokens))]);
+        let (outcome, _deps) = run_with(&session, "go", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::MaxTokens));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "[response truncated by max_tokens]"));
+    }
+
+    #[tokio::test]
+    async fn turn_limit_stops_the_loop_after_n_passes() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "lib"}))),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "explore", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn limit reached - reply to continue]"));
+        let penult = &conv.messages[conv.messages.len() - 2];
+        assert!(matches!(&penult.role, Role::User));
+        assert!(matches!(&penult.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t2"));
+    }
+
+    #[tokio::test]
+    async fn identical_tool_call_gets_nudge_not_rerun() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "list twice", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
+        let t2 = find_tool_result(&evs, "t2").unwrap();
+        assert!(matches!(t2, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("identical Tool Call repeated")));
+    }
+
+    #[tokio::test]
+    async fn write_clears_duplicate_memory_fix_then_retest() {
+        let root = root();
+        let session = session(root.path());
+        let fix_and_retest = Response {
+            content: vec![
+                ContentBlock::tool_use("w1", "write_file", json!({"path": "a.txt", "content": "fixed"})),
+                ContentBlock::tool_use("r2", "run_command", json!({"command": "true"})),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            error: None,
+        };
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(fix_and_retest),
+                just(text_end("verified")),
+            ],
+        )
+        .with_approvals(vec![true, true]);
+        let (outcome, deps) = run_with(&session, "test, fix, retest", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let r2 = find_tool_result(&evs, "r2").unwrap();
+        assert!(matches!(r2, Event::ToolResult { is_error, content, .. } if !is_error && !content.contains("identical Tool Call repeated")));
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn only_calls_after_last_write_carry_into_next_duplicate_check() {
+        let root = root();
+        let session = session(root.path());
+        let list_write_read = Response {
+            content: vec![
+                ContentBlock::tool_use("l1", "list_files", json!({"path": "."})),
+                ContentBlock::tool_use("w1", "write_file", json!({"path": "a.txt", "content": "hi"})),
+                ContentBlock::tool_use("rd1", "read_file", json!({"path": "a.txt"})),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            error: None,
+        };
+        let list_and_read_again = Response {
+            content: vec![
+                ContentBlock::tool_use("l2", "list_files", json!({"path": "."})),
+                ContentBlock::tool_use("rd2", "read_file", json!({"path": "a.txt"})),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            error: None,
+        };
+        let deps = deps_for(
+            &session,
+            vec![
+                just(list_write_read),
+                just(list_and_read_again),
+                just(text_end("done")),
+                just(text_end("declining to verify")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "explore, write, re-check", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let l2 = find_tool_result(&evs, "l2").unwrap();
+        assert!(matches!(l2, Event::ToolResult { is_error, content, .. } if !is_error && !content.contains("identical Tool Call repeated")));
+        let rd2 = find_tool_result(&evs, "rd2").unwrap();
+        assert!(matches!(rd2, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("identical Tool Call repeated")));
+    }
+
+    #[tokio::test]
+    async fn third_consecutive_failure_gets_step_back_suffix() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("f1", "read_file", json!({"path": "no1.txt"}))),
+                just(tool_use_result("f2", "read_file", json!({"path": "no2.txt"}))),
+                just(tool_use_result("f3", "read_file", json!({"path": "no3.txt"}))),
+                just(text_end("giving up")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "read things", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let c = |id| match find_tool_result(&evs, id).unwrap() {
+            Event::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
+        assert!(!c("f1").contains("consecutive"));
+        assert!(!c("f2").contains("consecutive"));
+        let c3 = c("f3");
+        assert!(c3.contains("enoent"));
+        assert!(c3.contains("[3 consecutive read_file failures - step back:"));
+        assert!(c3.contains("file not found (enoent)"));
+    }
+
+    #[tokio::test]
+    async fn success_resets_failure_counter() {
+        let root = root();
+        write(&root, "ok.txt", "content");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("f1", "read_file", json!({"path": "no1.txt"}))),
+                just(tool_use_result("f2", "read_file", json!({"path": "no2.txt"}))),
+                just(tool_use_result("ok", "read_file", json!({"path": "ok.txt"}))),
+                just(tool_use_result("f3", "read_file", json!({"path": "no3.txt"}))),
+                just(tool_use_result("f4", "read_file", json!({"path": "no4.txt"}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "read things", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(matches!(find_tool_result(&evs, "ok").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
+        let c4 = match find_tool_result(&evs, "f4").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(!c4.contains("consecutive"));
+    }
+
+    #[tokio::test]
+    async fn another_tools_success_does_not_reset_counter() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("f1", "read_file", json!({"path": "no1.txt"}))),
+                just(tool_use_result("f2", "read_file", json!({"path": "no2.txt"}))),
+                just(tool_use_result("ok", "list_files", json!({"path": "."}))),
+                just(tool_use_result("f3", "read_file", json!({"path": "no3.txt"}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "read things", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(matches!(find_tool_result(&evs, "ok").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
+        let c3 = match find_tool_result(&evs, "f3").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(c3.contains("3 consecutive read_file failures"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_nudge_results_count_toward_failure_counter() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t3", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t4", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "list forever", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
+        assert!(matches!(find_tool_result(&evs, "t2").unwrap(), Event::ToolResult { is_error, .. } if *is_error));
+        let c3 = match find_tool_result(&evs, "t3").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        let c4 = match find_tool_result(&evs, "t4").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(!c3.contains("consecutive"));
+        assert!(c4.contains("identical Tool Call repeated"));
+        assert!(c4.contains("3 consecutive list_files failures"));
+    }
+
+    #[tokio::test]
+    async fn context_budget_exhaustion_fails_before_any_request() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.context_budget = Some(60);
+        opts.eviction_slack = Some(0.0);
+        opts.connection = Some(Connection::new("http://localhost:0/v1", "", "", 50));
+        let session = session_with(root.path(), opts);
+        // No script entries: any complete call would surface a different error.
+        let deps = deps_for(&session, vec![]);
+        let prompt = "pad ".repeat(50);
+        let (outcome, _deps) = run_with(&session, &prompt, deps).await;
+        assert_eq!(outcome, Outcome::Error);
+    }
+
+    // ---- malformed tool input ---------------------------------------------
+
+    #[tokio::test]
+    async fn malformed_input_becomes_error_result_never_executes() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(Response {
+                    content: vec![ContentBlock::tool_use(
+                        "t1",
+                        "write_file",
+                        json!({ MALFORMED_INPUT_SENTINEL: "{\"path\": \"oops" }),
+                    )],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error: None,
+                }),
+                just(text_end("ok")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "write something", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { name, .. } if name == "write_file")).unwrap();
+        assert!(matches!(tr, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON")));
+        // The error tool_result went back to the model.
+        let requests = deps.requests.lock().unwrap();
+        let last = requests[1].messages.last().unwrap();
+        assert!(matches!(&last.content[0], ContentBlock::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON")));
+        // Nothing executed.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    // ---- plugin lifecycle (ADR-0007) --------------------------------------
+
+    struct HaltEdits;
+    impl Plugin for HaltEdits {
+        fn pre_run(&self, token: Token, _opts: &Value) -> Token {
+            if token.tool == "edit_file" {
+                token.halt("[edits are frozen by HaltEdits]")
+            } else {
+                token
+            }
+        }
+    }
+
+    struct Artifactor;
+    impl Plugin for Artifactor {
+        fn post_run(&self, token: Token, _opts: &Value) -> Token {
+            let tool = token.tool.clone();
+            token.put_artifact("mark", Value::String(tool))
+        }
+    }
+
+    struct PreBoomer;
+    impl Plugin for PreBoomer {
+        fn pre_run(&self, _token: Token, _opts: &Value) -> Token {
+            panic!("pre boom")
+        }
+    }
+
+    async fn run_with_plugins(
+        session: &Session,
+        prompt: &str,
+        mut deps: FakeDeps,
+        plugins: Vec<Registered>,
+    ) -> (Outcome, FakeDeps) {
+        let conv = conversation(session, prompt);
+        let ctx = tool_ctx(session);
+        let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        (outcome, deps)
+    }
+
+    #[tokio::test]
+    async fn halting_plugin_denies_the_call_with_its_own_wording() {
+        let root = root();
+        let session = session(root.path());
+        let input = json!({"path": "f.txt", "old_str": "a", "new_str": "b"});
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "edit_file", input)),
+                just(text_end("ok")),
+            ],
+        );
+        let plugins = vec![Registered::new("HaltEdits", Box::new(HaltEdits), json!([]))];
+        let (outcome, deps) = run_with_plugins(&session, "edit something", deps, plugins).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+        match tr {
+            Event::ToolResult { is_error, content, artifacts, .. } => {
+                assert!(is_error);
+                assert_eq!(content, "[edits are frozen by HaltEdits]");
+                assert!(artifacts.is_empty());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn artifacts_ride_the_tool_result_event() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("ok")),
+            ],
+        );
+        let plugins = vec![Registered::new("Artifactor", Box::new(Artifactor), json!([]))];
+        let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+        match tr {
+            Event::ToolResult { is_error, artifacts, .. } => {
+                assert!(!is_error);
+                assert_eq!(artifacts.get("mark"), Some(&Value::String("list_files".to_string())));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn crashing_plugin_is_fail_open() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("ok")),
+            ],
+        );
+        let plugins = vec![Registered::new("PreBoomer", Box::new(PreBoomer), json!([]))];
+        let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let pe = evs.iter().find(|e| matches!(e, Event::PluginError { .. })).unwrap();
+        assert!(matches!(pe, Event::PluginError { plugin, stage, message }
+            if plugin == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom")));
+        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+        assert!(matches!(tr, Event::ToolResult { is_error, .. } if !is_error));
+    }
+
+    // ---- Plan storage -----------------------------------------------------
+
+    #[tokio::test]
+    async fn successful_plan_call_stores_plan_via_set_plan() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("p1", "plan", json!({"plan": "Goal: X. 1. read [ ]"}))),
+                just(text_end("planned, done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do X", deps).await;
+        ok(&outcome);
+        let plans = deps.plans.lock().unwrap();
+        assert_eq!(plans.as_slice(), &["Goal: X. 1. read [ ]".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failed_plan_call_does_not_store_a_plan() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("p1", "plan", json!({}))),
+                just(text_end("recovered")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "do X", deps).await;
+        ok(&outcome);
+        assert!(deps.plans.lock().unwrap().is_empty());
+    }
+
+    // ---- Anchor injection -------------------------------------------------
+
+    fn tool_each_pass(count: usize) -> Vec<Entry> {
+        (1..=count)
+            .map(|i| {
+                if i == count {
+                    just(text_end("done"))
+                } else {
+                    just(tool_use_result(&format!("t{i}"), "list_files", json!({"path": "."})))
+                }
+            })
+            .collect()
+    }
+
+    fn anchors_in(conv: &Conversation) -> Vec<String> {
+        conv.messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if voice::is_anchor(b) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn injects_anchor_every_interval_and_not_between() {
+        let root = root();
+        write(&root, "a.txt", "");
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(5);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(&session, tool_each_pass(12));
+        let (outcome, _deps) = run_with(&session, "the original task", deps).await;
+        let (conv, _) = ok(&outcome);
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors.iter().all(|a| a.contains("the original task")));
+    }
+
+    #[tokio::test]
+    async fn injected_anchor_carries_current_plan_verbatim() {
+        let root = root();
+        write(&root, "a.txt", "");
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(2);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("p1", "plan", json!({"plan": "Goal: ship. 1. code [ ]"}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "ship it", deps).await;
+        let (conv, _) = ok(&outcome);
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 1);
+        assert!(anchors[0].contains("Goal: ship. 1. code [ ]"));
+        assert!(anchors[0].contains("ship it"));
+    }
+
+    #[tokio::test]
+    async fn injects_anchor_first_pass_after_compaction_off_interval() {
+        let root = root();
+        write(&root, "a.txt", "");
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(999);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+
+        // Reactive compaction: a big conversation that only fits once the
+        // compactor drops the bulky assistant message, keeping the head.
+        let compacted = Arc::new(Mutex::new(0usize));
+        let c = Arc::clone(&compacted);
+        let mut deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_compact(move |conv: Conversation| {
+            *c.lock().unwrap() += 1;
+            let mut out = conv.clone();
+            out.messages = vec![conv.messages[0].clone()];
+            Ok(out)
+        });
+        let _ = deps.requests_handle();
+
+        let mut conv = Conversation::new(
+            "sys",
+            crate::conversation::ConversationOpts::new(1000, 100),
+        );
+        conv.add_user_text("compact me");
+        conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(4000))]);
+
+        let plugins: Vec<Registered> = Vec::new();
+        let ctx = tool_ctx(&session);
+        let outcome = run(conv, &session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        let (conv, _) = ok(&outcome);
+        assert!(*compacted.lock().unwrap() >= 1);
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 1);
+        assert!(anchors[0].contains("compact me"));
+    }
+
+    // ---- proactive Compaction (ADR-0012) ----------------------------------
+
+    #[tokio::test]
+    async fn proactive_compacts_before_first_pass_and_refreshes_anchor() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(999);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+
+        let compacted = Arc::new(Mutex::new(false));
+        let c = Arc::clone(&compacted);
+        let mut deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_compact(move |conv: Conversation| {
+            *c.lock().unwrap() = true;
+            let mut out = conv.clone();
+            out.messages = vec![conv.messages[0].clone()];
+            Ok(out)
+        });
+
+        // Geometry: budget 4000, reserve 100, slack 0.3. Target = 2700; the big
+        // assistant blob puts the estimate over target but under the cliff.
+        let mut conv = Conversation::new(
+            "sys",
+            crate::conversation::ConversationOpts::new(4000, 100).eviction_slack(0.3),
+        );
+        conv.add_user_text("original task");
+        conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(12_000))]);
+
+        let plugins: Vec<Registered> = Vec::new();
+        let ctx = tool_ctx(&session);
+        let outcome = run(conv, &session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        let (conv, _) = ok(&outcome);
+        assert!(*compacted.lock().unwrap());
+        // Compaction ran before the first model call: the first recorded request
+        // reflects the compacted (single-message) conversation.
+        let requests = deps.requests.lock().unwrap();
+        assert_eq!(requests[0].messages.len(), 1);
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 1);
+        assert!(anchors[0].contains("original task"));
+    }
+
+    #[tokio::test]
+    async fn leaves_conversation_alone_under_the_target() {
+        let root = root();
+        let session = session(root.path());
+        let compacted = Arc::new(Mutex::new(false));
+        let c = Arc::clone(&compacted);
+        let deps = deps_for(&session, vec![just(text_end("done"))]).with_compact(
+            move |_conv: Conversation| {
+                *c.lock().unwrap() = true;
+                Err(CompactError("should_not_run".to_string()))
+            },
+        );
+        let (outcome, _deps) = run_with(&session, "small task", deps).await;
+        ok(&outcome);
+        assert!(!*compacted.lock().unwrap());
+    }
+
+    // ---- Scout isolation (adapted: the real Scout is a later phase) --------
+    //
+    // baud drives the Scout's internal Passes through the same FakeLLM. The Rust
+    // Scout is not yet ported, so we wire the ctx's `scout` capture to return a
+    // canned ScoutOutcome - exercising the SAME loop behaviour (only the explore
+    // Tool Call and its Tool Result enter the Conversation; a Scout failure
+    // becomes an ordinary is_error Tool Result, never failing the Turn).
+
+    fn ctx_with_scout(session: &Session, outcome: crate::scout::ScoutOutcome) -> ToolCtx {
+        use std::sync::Arc;
+        let mut ctx = session.tool_ctx();
+        let out = outcome;
+        ctx.scout = Some(Arc::new(move |_task: String| {
+            let out = out.clone();
+            Box::pin(async move { out })
+        }));
+        ctx
+    }
+
+    async fn run_with_ctx(
+        session: &Session,
+        prompt: &str,
+        mut deps: FakeDeps,
+        ctx: ToolCtx,
+    ) -> (Outcome, FakeDeps) {
+        let conv = conversation(session, prompt);
+        let plugins: Vec<Registered> = Vec::new();
+        let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        (outcome, deps)
+    }
+
+    #[tokio::test]
+    async fn only_explore_call_and_report_enter_the_conversation() {
+        let root = root();
+        write(&root, "widget.ex", "defmodule Widget do\nend\n");
+        let report = "Locations: widget.ex:1. How it works: defines Widget.";
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("ex_1", "explore", json!({"task": "where is Widget"}))),
+                just(text_end("Done: Widget is in widget.ex.")),
+            ],
+        );
+        let ctx = ctx_with_scout(&session, crate::scout::ScoutOutcome::Ok(report.to_string()));
+        let (outcome, deps) = run_with_ctx(&session, "find Widget", deps, ctx).await;
+        let (conv, _) = ok(&outcome);
+
+        // Only the explore Tool Call entered as an assistant tool_use.
+        let tool_uses: Vec<String> = conv
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(tool_uses.contains(&"explore".to_string()));
+        assert!(!tool_uses.contains(&"list_files".to_string()));
+
+        // The report entered as the Tool Result for ex_1.
+        let explore_results: Vec<String> = conv
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "ex_1" => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(explore_results.len(), 1);
+        assert!(explore_results[0].contains("widget.ex:1"));
+
+        let evs = events(&deps);
+        assert!(evs.iter().any(|e| matches!(e, Event::ToolCall { id, name, .. } if id == "ex_1" && name == "explore")));
+        assert!(evs.iter().any(|e| matches!(e, Event::ToolResult { id, name, .. } if id == "ex_1" && name == "explore")));
+        assert!(!evs.iter().any(|e| matches!(e, Event::ToolCall { name, .. } if name == "list_files")));
+    }
+
+    #[tokio::test]
+    async fn scout_failure_becomes_error_result_never_failing_turn() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("ex_1", "explore", json!({"task": "find something"}))),
+                just(text_end("Handled the failed exploration.")),
+            ],
+        );
+        let ctx = ctx_with_scout(&session, crate::scout::ScoutOutcome::LlmError { partial: String::new() });
+        let (outcome, deps) = run_with_ctx(&session, "explore then recover", deps, ctx).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        assert!(evs.iter().any(|e| matches!(e, Event::ToolResult { id, name, is_error, .. } if id == "ex_1" && name == "explore" && *is_error)));
+    }
+
+    // ---- explore nudge ----------------------------------------------------
+
+    fn seed_abc(root: &TempDir) {
+        for f in ["a", "b", "c"] {
+            write(root, &format!("{f}.txt"), "x");
+        }
+    }
+
+    #[tokio::test]
+    async fn explore_nudge_fires_on_third_read_only_pass() {
+        let root = root();
+        seed_abc(&root);
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "read_file", json!({"path": "a.txt"}))),
+                just(tool_use_result("r2", "read_file", json!({"path": "b.txt"}))),
+                just(tool_use_result("r3", "read_file", json!({"path": "c.txt"}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "evaluate this project", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::ExploreNudge { .. })).collect();
+        assert_eq!(n.len(), 1);
+        assert!(matches!(n[0], Event::ExploreNudge { text } if text.contains("explore")));
+        // Rides the 3rd Pass's tool-results user message (request index 3).
+        let requests = deps.requests.lock().unwrap();
+        let last = requests[3].messages.last().unwrap();
+        assert!(matches!(&last.role, Role::User));
+        assert!(last.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("explore"))));
+        assert!(last.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "r3")));
+    }
+
+    #[tokio::test]
+    async fn non_exploration_pass_resets_streak() {
+        let root = root();
+        seed_abc(&root);
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("r1", "read_file", json!({"path": "a.txt"}))),
+                just(tool_use_result("p1", "plan", json!({"plan": "1. read things"}))),
+                just(tool_use_result("r2", "read_file", json!({"path": "b.txt"}))),
+                just(tool_use_result("r3", "read_file", json!({"path": "c.txt"}))),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "look, plan, look again", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn three_search_shaped_run_commands_fire_the_nudge() {
+        let root = root();
+        write(&root, "a.txt", "a\n");
+        write(&root, "b.txt", "b\n");
+        write(&root, "c.txt", "c\n");
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(20);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("c1", "run_command", json!({"command": "grep a a.txt"}))),
+                just(tool_use_result("c2", "run_command", json!({"command": "grep b b.txt"}))),
+                just(tool_use_result("c3", "run_command", json!({"command": "grep c c.txt"}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_approvals(vec![true, true, true]);
+        let (outcome, deps) = run_with(&session, "explore via shell", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::ExploreNudge { .. })).collect();
+        assert_eq!(n.len(), 1);
+        assert!(matches!(n[0], Event::ExploreNudge { text } if text.contains("explore")));
+    }
+
+    #[tokio::test]
+    async fn mix_test_run_command_resets_streak() {
+        let root = root();
+        write(&root, "a.txt", "a\n");
+        write(&root, "b.txt", "b\n");
+        write(&root, "c.txt", "c\n");
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(20);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("c1", "run_command", json!({"command": "grep a a.txt"}))),
+                just(tool_use_result("c2", "run_command", json!({"command": "grep b b.txt"}))),
+                just(tool_use_result("v1", "run_command", json!({"command": "mix test"}))),
+                just(tool_use_result("c3", "run_command", json!({"command": "grep c c.txt"}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_approvals(vec![true, true, true, true]);
+        let (outcome, deps) = run_with(&session, "explore then verify", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn explore_nudge_fires_again_on_sixth_pass() {
+        let root = root();
+        for n in 1..=6 {
+            std::fs::create_dir_all(root.path().join(format!("d{n}"))).unwrap();
+        }
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(20);
+        let session = session_with(root.path(), opts);
+        let mut entries: Vec<Entry> = (1..=6)
+            .map(|n| just(tool_use_result(&format!("l{n}"), "list_files", json!({"path": format!("d{n}")}))))
+            .collect();
+        entries.push(just(text_end("done")));
+        let deps = deps_for(&session, entries);
+        let (outcome, deps) = run_with(&session, "keep exploring", deps).await;
+        ok(&outcome);
+        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })), 2);
+    }
+}
