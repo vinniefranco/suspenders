@@ -1,0 +1,1331 @@
+//! Session Log — the JSONL persistence of a Session (CONTEXT.md, ADR-0010).
+//!
+//! One append-only JSONL file per Session: a header line carrying the
+//! Session's fixed facts, then one line per Conversation event, appended as
+//! each happens. The log records the Conversation, not the Transcript:
+//! Thinking and info lines are never in it.
+//!
+//! This module owns encode/decode/fold and the file handle; the Agent owns
+//! WHEN to append. Entries are event-granular (a checkpoint's assistant
+//! message grows as results land, so message-granular appends would rewrite
+//! history):
+//!
+//!   * `user_text` — submit and Rollover alike
+//!   * `assistant_blocks` — each message-end, tool_use included; the fold
+//!     repairs a dangling batch
+//!   * `tool_result` — per Tool Result
+//!   * `steering` — delivered Steering (user-voiced)
+//!   * `nudge` — a user-role Nudge (Verify Nudge, Explore Nudge). The fold
+//!     merges it into an open tool-results batch when one is open (the Explore
+//!     Nudge rode that message live), else stands it alone (the Verify Nudge)
+//!   * `plan` — the model's Plan; held OUTSIDE the Conversation, so the fold
+//!     never turns it into a message; [`plan`] reads the last one back
+//!   * `message` — a verbatim Conversation message; seeds a fresh log on Resume
+//!   * `settled{outcome, stop_reason, reason}` — Turn Settlement; `reason` is
+//!     forensic only (the fold ignores it)
+//!   * `compacted{summary, skip_count, tokens_before, file_ops, original_task}`
+//!     — Compaction: old messages replaced by a summary. On Resume the fold
+//!     discards everything before this entry and emits just the reconstructed
+//!     summary message.
+//!
+//! The fold ([`resume`]) mirrors the Loop's close rules by construction:
+//! answered tool_use blocks are kept (ADR-0009), unanswered ones dropped
+//! (ADR-0004), and a log that ends mid-Turn settles as failed. A torn last
+//! line is dropped: the expected crash mode of an append-only file.
+
+use std::fmt;
+use std::io::Write;
+
+use serde::{Deserialize, Serialize};
+
+use crate::content::{ContentBlock, Message, Role};
+use crate::session::Session;
+use crate::voice::{self, FileOps};
+
+// ------------------------------------------------------------------
+// Terminal stop reason + settled outcome (shared with Turn Settlement).
+// These types were introduced by the Settlement phase and are BUILT ON
+// here, not redefined.
+// ------------------------------------------------------------------
+
+/// A Turn's terminal stop reason as it enters the Session Log and the
+/// settlement event. Spans the LLM-reported reasons that ride through a
+/// completed Turn (`end_turn`, `max_tokens`, ...) and the Turn-Limit reasons
+/// the Endgame mints (`turn_limit`, `turn_limit_stuck`). `Error`/`Unknown` are
+/// the synthetic reasons Settlement writes for failed/cancelled Turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    StopSequence,
+    /// The Turn ran out of Passes productively (baud `:turn_limit`).
+    TurnLimit,
+    /// The Turn ran out of Passes while stuck in a failure loop.
+    TurnLimitStuck,
+    /// A failed Turn's synthetic reason (baud `:error`).
+    Error,
+    /// A cancelled Turn's synthetic reason (baud `:unknown`).
+    Unknown,
+}
+
+impl StopReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StopReason::EndTurn => "end_turn",
+            StopReason::ToolUse => "tool_use",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::StopSequence => "stop_sequence",
+            StopReason::TurnLimit => "turn_limit",
+            StopReason::TurnLimitStuck => "turn_limit_stuck",
+            StopReason::Error => "error",
+            StopReason::Unknown => "unknown",
+        }
+    }
+
+    // Unknown strings degrade to `Unknown` rather than minting reasons from
+    // disk (baud: `String.to_existing_atom` guarded by a known set).
+    fn from_str(s: &str) -> StopReason {
+        match s {
+            "end_turn" => StopReason::EndTurn,
+            "tool_use" => StopReason::ToolUse,
+            "max_tokens" => StopReason::MaxTokens,
+            "stop_sequence" => StopReason::StopSequence,
+            "turn_limit" => StopReason::TurnLimit,
+            "turn_limit_stuck" => StopReason::TurnLimitStuck,
+            "error" => StopReason::Error,
+            _ => StopReason::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a settled Turn resolved (baud's `:completed | :failed | :cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl Settled {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Settled::Completed => "completed",
+            Settled::Failed => "failed",
+            Settled::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Settled> {
+        match s {
+            "completed" => Some(Settled::Completed),
+            "failed" => Some(Settled::Failed),
+            "cancelled" => Some(Settled::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// The `{settled, outcome, stop_reason, reason}` value a Turn Settlement
+/// produces. `reason` is the failure term formatted to a string; `None` for
+/// completed/cancelled Turns and for failures with no reason. Forensic only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledEntry {
+    pub outcome: Settled,
+    pub stop_reason: StopReason,
+    pub reason: Option<String>,
+}
+
+impl SettledEntry {
+    pub fn new(outcome: Settled, stop_reason: StopReason, reason: Option<String>) -> Self {
+        SettledEntry {
+            outcome,
+            stop_reason,
+            reason,
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// The entry enum
+// ------------------------------------------------------------------
+
+/// One Session Log entry. The fold consumes these; [`append`] serializes them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    UserText(String),
+    AssistantBlocks(Vec<ContentBlock>),
+    ToolResult(ContentBlock),
+    Steering(String),
+    Nudge(String),
+    Plan(String),
+    Message(Message),
+    Settled {
+        outcome: Settled,
+        stop_reason: StopReason,
+        reason: Option<String>,
+    },
+    Compacted {
+        summary: String,
+        skip_count: u64,
+        tokens_before: u64,
+        file_ops: FileOps,
+        original_task: Option<String>,
+    },
+}
+
+// ------------------------------------------------------------------
+// Wire codec (serde JSON with the "e" discriminator + baud's field names).
+// A human can grep/diff the log, the load-bearing thesis of ADR-0010.
+// ------------------------------------------------------------------
+
+impl Entry {
+    fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Entry::UserText(text) => json!({"e": "user_text", "text": text}),
+            Entry::Steering(text) => json!({"e": "steering", "text": text}),
+            Entry::Nudge(text) => json!({"e": "nudge", "text": text}),
+            Entry::Plan(text) => json!({"e": "plan", "text": text}),
+            Entry::AssistantBlocks(blocks) => {
+                json!({"e": "assistant_blocks", "blocks": blocks})
+            }
+            Entry::ToolResult(block) => json!({"e": "tool_result", "block": block}),
+            Entry::Message(message) => json!({
+                "e": "message",
+                "role": role_str(message.role),
+                "content": message.content,
+            }),
+            Entry::Settled {
+                outcome,
+                stop_reason,
+                reason,
+            } => json!({
+                "e": "settled",
+                "outcome": outcome.as_str(),
+                "stop_reason": stop_reason.as_str(),
+                "reason": reason,
+            }),
+            Entry::Compacted {
+                summary,
+                skip_count,
+                tokens_before,
+                file_ops,
+                original_task,
+            } => json!({
+                "e": "compacted",
+                "summary": summary,
+                "skip_count": skip_count,
+                "tokens_before": tokens_before,
+                "read_files": file_ops.read_files,
+                "modified_files": file_ops.modified_files,
+                "original_task": original_task,
+            }),
+        }
+    }
+
+    // Decode a JSON object into an entry. `None` means "valid JSON but not a
+    // valid entry shape" — the fold stops there, like a torn line.
+    fn from_json(m: &serde_json::Value) -> Option<Entry> {
+        let e = m.get("e")?.as_str()?;
+        match e {
+            "user_text" => Some(Entry::UserText(string_field(m, "text")?)),
+            "steering" => Some(Entry::Steering(string_field(m, "text")?)),
+            "nudge" => Some(Entry::Nudge(string_field(m, "text")?)),
+            "plan" => Some(Entry::Plan(string_field(m, "text")?)),
+            "assistant_blocks" => {
+                let blocks = decode_blocks(m.get("blocks")?)?;
+                Some(Entry::AssistantBlocks(blocks))
+            }
+            "tool_result" => {
+                let block: ContentBlock = serde_json::from_value(m.get("block")?.clone()).ok()?;
+                Some(Entry::ToolResult(block))
+            }
+            "message" => {
+                let role = decode_role(m.get("role")?.as_str()?)?;
+                let content = decode_blocks(m.get("content")?)?;
+                Some(Entry::Message(Message { role, content }))
+            }
+            "settled" => {
+                let outcome = Settled::from_str(m.get("outcome")?.as_str()?)?;
+                let stop_reason = StopReason::from_str(m.get("stop_reason")?.as_str()?);
+                // The old 3-element form has no "reason" key; it decodes as
+                // None, the same tolerance the compacted entry took.
+                let reason = m
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Some(Entry::Settled {
+                    outcome,
+                    stop_reason,
+                    reason,
+                })
+            }
+            "compacted" => {
+                let file_ops = FileOps {
+                    read_files: decode_str_list(m.get("read_files")),
+                    modified_files: decode_str_list(m.get("modified_files")),
+                };
+                Some(Entry::Compacted {
+                    summary: string_field(m, "summary").unwrap_or_default(),
+                    skip_count: m.get("skip_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                    tokens_before: m
+                        .get("tokens_before")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    file_ops,
+                    original_task: m
+                        .get("original_task")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+fn decode_role(s: &str) -> Option<Role> {
+    match s {
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        _ => None,
+    }
+}
+
+fn string_field(m: &serde_json::Value, key: &str) -> Option<String> {
+    Some(m.get(key)?.as_str()?.to_string())
+}
+
+fn decode_blocks(v: &serde_json::Value) -> Option<Vec<ContentBlock>> {
+    let arr = v.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        out.push(serde_json::from_value(item.clone()).ok()?);
+    }
+    Some(out)
+}
+
+fn decode_str_list(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v.and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+// ------------------------------------------------------------------
+// Resume errors + drift
+// ------------------------------------------------------------------
+
+/// A header fact that differs from the resuming Session's: `(key, logged,
+/// current)`. The new Session's fact wins; the drift is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    pub key: &'static str,
+    pub logged: String,
+    pub current: String,
+}
+
+/// Why a Resume failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeError {
+    /// The header's Project Root differs from the resuming Session's: the
+    /// Conversation is about another project's files.
+    RootMismatch,
+    /// The file could not be read.
+    Read(String),
+    /// The file was empty or its header did not decode.
+    MalformedLog,
+}
+
+// ------------------------------------------------------------------
+// The Log handle + file lifecycle
+// ------------------------------------------------------------------
+
+/// An open Session Log: its path and the append handle.
+#[derive(Debug)]
+pub struct Log {
+    pub path: String,
+    io: std::fs::File,
+}
+
+impl Log {
+    /// Creates `<session_dir>/<utc-stamp>-<unique>.jsonl` and writes the header
+    /// line. Fresh file (exclusive create).
+    pub fn open(session: &Session) -> std::io::Result<Log> {
+        std::fs::create_dir_all(&session.session_dir)?;
+
+        let stamp = utc_stamp();
+        let unique = next_unique();
+        let path = std::path::Path::new(&session.session_dir)
+            .join(format!("{stamp}-{unique}.jsonl"))
+            .to_string_lossy()
+            .into_owned();
+
+        let mut io = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+
+        let header = header(session);
+        writeln!(io, "{}", serde_json::to_string(&header).unwrap())?;
+        io.flush()?;
+
+        Ok(Log { path, io })
+    }
+
+    /// Appends one entry as one line, flushed through immediately.
+    pub fn append(&mut self, entry: Entry) -> &mut Self {
+        let line = serde_json::to_string(&entry.to_json()).unwrap();
+        let _ = writeln!(self.io, "{line}");
+        let _ = self.io.flush();
+        self
+    }
+}
+
+fn next_unique() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn utc_stamp() -> String {
+    use time::format_description::FormatItem;
+    use time::macros::format_description;
+    const FMT: &[FormatItem<'_>] =
+        format_description!("[year][month][day]-[hour][minute][second]");
+    time::OffsetDateTime::now_utc()
+        .format(FMT)
+        .unwrap_or_else(|_| "00000000-000000".into())
+}
+
+/// The header line's fixed facts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Header {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u32,
+    root: String,
+    model: String,
+    context_budget: u64,
+    turn_limit: u64,
+}
+
+fn header(session: &Session) -> Header {
+    Header {
+        kind: "session".into(),
+        version: 1,
+        root: session.root.clone(),
+        model: session.connection.model.clone(),
+        context_budget: session.context_budget,
+        turn_limit: session.turn_limit,
+    }
+}
+
+/// The newest log file in `dir`, by the sortable timestamp filename. `None`
+/// when the dir has no `.jsonl` files or cannot be read.
+pub fn latest(dir: &str) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".jsonl"))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    Some(
+        std::path::Path::new(dir)
+            .join(names.last().unwrap())
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// The last Plan logged in a Session Log file, or `None` when none was. A torn
+/// or foreign log yields `None` — the Plan is a convenience, never load-bearing
+/// for Resume's correctness.
+pub fn plan(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut last: Option<String> = None;
+    for line in content.lines().filter(|l| !l.is_empty()) {
+        if let Some(Entry::Plan(text)) = decode_line(line).and_then(|v| Entry::from_json(&v)) {
+            last = Some(text);
+        }
+    }
+    last
+}
+
+// ------------------------------------------------------------------
+// Resume: fold a log file into Conversation messages
+// ------------------------------------------------------------------
+
+/// Folds a log file into the messages of a Conversation.
+///
+/// Returns `(messages, drift)` where `drift` lists header facts that differ
+/// from the resuming Session's — the new Session's facts win.
+/// `Err(RootMismatch)` when the Project Root differs.
+pub fn resume(path: &str, session: &Session) -> Result<(Vec<Message>, Vec<Drift>), ResumeError> {
+    let content = std::fs::read_to_string(path).map_err(|e| ResumeError::Read(e.to_string()))?;
+
+    let mut lines = content.lines().filter(|l| !l.is_empty());
+    let header_line = lines.next().ok_or(ResumeError::MalformedLog)?;
+    let header: serde_json::Value = decode_line(header_line).ok_or(ResumeError::MalformedLog)?;
+
+    check_root(&header, session)?;
+
+    // A torn last line (crash mid-write) decodes as an error; stop at the first
+    // undecodable line and drop everything after.
+    let mut entries: Vec<Entry> = Vec::new();
+    for line in lines {
+        match decode_line(line).and_then(|v| Entry::from_json(&v)) {
+            Some(entry) => entries.push(entry),
+            None => break,
+        }
+    }
+
+    Ok((fold(&entries), drift(&header, session)))
+}
+
+fn check_root(header: &serde_json::Value, session: &Session) -> Result<(), ResumeError> {
+    if header.get("root").and_then(|r| r.as_str()) == Some(session.root.as_str()) {
+        Ok(())
+    } else {
+        Err(ResumeError::RootMismatch)
+    }
+}
+
+fn drift(header: &serde_json::Value, session: &Session) -> Vec<Drift> {
+    let mut out = Vec::new();
+
+    let logged_model = header.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if logged_model != session.connection.model {
+        out.push(Drift {
+            key: "model",
+            logged: logged_model.to_string(),
+            current: session.connection.model.clone(),
+        });
+    }
+
+    let logged_budget = header.get("context_budget").and_then(|v| v.as_u64());
+    if logged_budget != Some(session.context_budget) {
+        out.push(Drift {
+            key: "context_budget",
+            logged: opt_num(logged_budget),
+            current: session.context_budget.to_string(),
+        });
+    }
+
+    let logged_limit = header.get("turn_limit").and_then(|v| v.as_u64());
+    if logged_limit != Some(session.turn_limit) {
+        out.push(Drift {
+            key: "turn_limit",
+            logged: opt_num(logged_limit),
+            current: session.turn_limit.to_string(),
+        });
+    }
+
+    out
+}
+
+fn opt_num(n: Option<u64>) -> String {
+    n.map(|v| v.to_string()).unwrap_or_default()
+}
+
+fn decode_line(line: &str) -> Option<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) if v.is_object() => Some(v),
+        _ => None,
+    }
+}
+
+// ------------------------------------------------------------------
+// The fold: entries -> Conversation messages
+// ------------------------------------------------------------------
+
+// The open tool batch: the last assistant_blocks and the results/steering that
+// followed it, pending until the batch closes — mirroring how the Loop builds
+// the live Conversation.
+struct Batch {
+    blocks: Vec<ContentBlock>,
+    results: Vec<ContentBlock>,
+    steering: Vec<String>,
+}
+
+fn fold(entries: &[Entry]) -> Vec<Message> {
+    let mut messages: Vec<Message> = Vec::new();
+    let mut batch: Option<Batch> = None;
+
+    for entry in entries {
+        fold_entry(entry, &mut messages, &mut batch);
+    }
+
+    // A log whose last entry is a settlement (or a Resume seed, written only at
+    // open) is complete; anything else died mid-Turn and settles as failed.
+    match entries.last() {
+        Some(Entry::Settled { .. }) | Some(Entry::Message(_)) => messages,
+        _ => {
+            if messages.is_empty() && batch.is_none() {
+                Vec::new()
+            } else {
+                flush(&mut messages, batch);
+                close_with(&mut messages, voice::turn_failed_marker());
+                messages
+            }
+        }
+    }
+}
+
+fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Batch>) {
+    match entry {
+        Entry::UserText(text) => {
+            flush(messages, batch.take());
+            messages.push(user_message(vec![text_block(text)]));
+        }
+        // A Nudge is user-role text. With an open batch it folds INTO the
+        // tool-results user message via the steering carrier (the Explore
+        // Nudge rode that message live); standing alone (Verify Nudge) with no
+        // results, flush emits `assistant + user([nudge])` identically.
+        Entry::Nudge(text) => match batch {
+            Some(b) => b.steering.push(text.clone()),
+            None => messages.push(user_message(vec![text_block(text)])),
+        },
+        Entry::Message(message) => {
+            flush(messages, batch.take());
+            messages.push(message.clone());
+        }
+        // The Plan is held outside the Conversation, so it never becomes a
+        // message and never disturbs an open tool batch.
+        Entry::Plan(_) => {}
+        Entry::AssistantBlocks(blocks) => {
+            flush(messages, batch.take());
+            *batch = Some(Batch {
+                blocks: blocks.clone(),
+                results: Vec::new(),
+                steering: Vec::new(),
+            });
+        }
+        Entry::ToolResult(block) => {
+            // A stray tool_result with no open batch: corrupt tail; ignore.
+            if let Some(b) = batch {
+                b.results.push(block.clone());
+            }
+        }
+        Entry::Steering(text) => {
+            if let Some(b) = batch {
+                b.steering.push(text.clone());
+            }
+        }
+        Entry::Compacted {
+            summary,
+            file_ops,
+            original_task,
+            ..
+        } => {
+            // Compaction replaces everything folded before this point with the
+            // reconstructed summary; reappend the harness-owned mechanical
+            // facts so the message matches the live one.
+            let composed =
+                compose_summary(summary, original_task.as_deref(), file_ops);
+            messages.clear();
+            *batch = None;
+            messages.push(user_message(vec![voice::summary_block(&composed)]));
+        }
+        Entry::Settled {
+            outcome,
+            stop_reason,
+            ..
+        } => {
+            if let Some(open) = batch.take() {
+                let stop = settle_stop(*outcome, *stop_reason);
+                flush_batch(messages, open, stop);
+            }
+            close_settled(messages, *outcome, *stop_reason);
+        }
+    }
+}
+
+// The reconstructed compaction summary: the model's narrative plus the
+// harness-owned mechanical facts. compose_summary lives here for now; the
+// Compaction module (a later phase) reuses this exact composition.
+pub fn compose_summary(narrative: &str, original_task: Option<&str>, file_ops: &FileOps) -> String {
+    format!(
+        "{narrative}\n{}",
+        voice::compaction_facts(original_task, file_ops)
+    )
+}
+
+fn settle_stop(outcome: Settled, stop_reason: StopReason) -> StopReason {
+    match outcome {
+        Settled::Completed => stop_reason,
+        _ => StopReason::Error, // stand-in for baud's `:failed` batch-close marker path
+    }
+}
+
+fn flush(messages: &mut Vec<Message>, batch: Option<Batch>) {
+    if let Some(batch) = batch {
+        flush_batch(messages, batch, StopReason::EndTurn);
+    }
+}
+
+// Close an open batch the way the Loop would have: keep tool_use blocks a
+// result answered (ADR-0009 error answers included), drop the rest (ADR-0004),
+// and never leave an empty assistant message.
+fn flush_batch(messages: &mut Vec<Message>, batch: Batch, stop: StopReason) {
+    let answered: std::collections::HashSet<&str> = batch
+        .results
+        .iter()
+        .filter_map(|r| match r {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let mut kept: Vec<ContentBlock> = batch
+        .blocks
+        .iter()
+        .filter(|b| match b {
+            ContentBlock::ToolUse { id, .. } => answered.contains(id.as_str()),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+
+    if kept.is_empty() {
+        let marker = if stop == StopReason::MaxTokens {
+            voice::truncation_marker()
+        } else {
+            voice::empty_response_marker()
+        };
+        kept = vec![text_block(marker)];
+    }
+
+    messages.push(Message {
+        role: Role::Assistant,
+        content: kept,
+    });
+
+    let mut content = batch.results;
+    content.extend(batch.steering.iter().map(|s| text_block(s)));
+    if !content.is_empty() {
+        messages.push(user_message(content));
+    }
+}
+
+// A settled Turn that ended on a user-role message (Turn Limit, stop hook)
+// closed with a marker live; restore it so roles keep alternating.
+fn close_settled(messages: &mut Vec<Message>, outcome: Settled, stop_reason: StopReason) {
+    match outcome {
+        Settled::Completed => {
+            if matches!(messages.last(), Some(m) if m.role == Role::User) {
+                let marker = if stop_reason == StopReason::TurnLimit
+                    || stop_reason == StopReason::TurnLimitStuck
+                {
+                    voice::turn_limit_marker()
+                } else {
+                    voice::turn_stopped_marker()
+                };
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: vec![text_block(marker)],
+                });
+            }
+        }
+        Settled::Failed => close_with(messages, voice::turn_failed_marker()),
+        Settled::Cancelled => close_with(messages, voice::turn_cancelled_marker()),
+    }
+}
+
+// Mirror the live fail path: the marker rides the trailing assistant message
+// (the Loop appends kept text and marker as ONE message); a user-role tail gets
+// a fresh assistant message, as Settlement does.
+fn close_with(messages: &mut Vec<Message>, marker: &str) {
+    let marker_block = text_block(marker);
+    match messages.last_mut() {
+        Some(last) if last.role == Role::Assistant => {
+            if last.content.last() != Some(&marker_block) {
+                last.content.push(marker_block);
+            }
+        }
+        _ => messages.push(Message {
+            role: Role::Assistant,
+            content: vec![marker_block],
+        }),
+    }
+}
+
+fn user_message(content: Vec<ContentBlock>) -> Message {
+    Message {
+        role: Role::User,
+        content,
+    }
+}
+
+fn text_block(text: &str) -> ContentBlock {
+    ContentBlock::Text {
+        text: text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Session, SessionConfig, SessionOpts};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    // A Session rooted at `dir`, session_dir under it, no-env config path.
+    fn session_in(dir: &std::path::Path) -> Session {
+        session_with(dir, None, None)
+    }
+
+    fn session_with(
+        dir: &std::path::Path,
+        context_budget: Option<u64>,
+        turn_limit: Option<u64>,
+    ) -> Session {
+        let root = dir.to_string_lossy().into_owned();
+        let session_dir = dir.join("sessions").to_string_lossy().into_owned();
+        Session::build(
+            SessionOpts {
+                root: Some(root),
+                session_dir: Some(session_dir),
+                context_budget,
+                turn_limit,
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .unwrap()
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
+        ContentBlock::tool_use(id, name, input)
+    }
+
+    fn tool_result(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::tool_result(id, content, false)
+    }
+
+    fn tool_result_err(id: &str, content: &str, is_error: bool) -> ContentBlock {
+        ContentBlock::tool_result(id, content, is_error)
+    }
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::text(t)
+    }
+
+    // ---- round trip ----
+
+    #[test]
+    fn a_settled_turn_folds_back_into_the_exact_conversation_shape() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("list the files".into()));
+        log.append(Entry::AssistantBlocks(vec![
+            text("Let me look."),
+            tool_use("t1", "list_files", json!({"path": "."})),
+        ]));
+        log.append(Entry::ToolResult(tool_result("t1", "a.txt\nb.txt")));
+        log.append(Entry::Steering("also check the README".into()));
+        log.append(Entry::AssistantBlocks(vec![text("Two files.")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, drift) = resume(&log.path, &session).unwrap();
+        assert_eq!(drift, Vec::new());
+
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("list the files")]),
+                Message::assistant(vec![
+                    text("Let me look."),
+                    tool_use("t1", "list_files", json!({"path": "."})),
+                ]),
+                user_message(vec![
+                    tool_result("t1", "a.txt\nb.txt"),
+                    text("also check the README"),
+                ]),
+                Message::assistant(vec![text("Two files.")]),
+            ]
+        );
+    }
+
+    // ---- Plan survives Resume ----
+
+    #[test]
+    fn plan_restores_the_last_logged_plan_which_never_enters_the_folded_messages() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("do the thing".into()));
+        log.append(Entry::Plan("Goal: A. 1. read [x] 2. edit [ ]".into()));
+        log.append(Entry::AssistantBlocks(vec![text("planned")]));
+        log.append(Entry::Plan(
+            "Goal: A. 1. read [x] 2. edit [x] 3. verify [ ]".into(),
+        ));
+        log.append(Entry::AssistantBlocks(vec![text("done step 2")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        assert_eq!(
+            plan(&log.path),
+            Some("Goal: A. 1. read [x] 2. edit [x] 3. verify [ ]".to_string())
+        );
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+        assert!(!messages.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text { text } if text.contains("Goal: A.")
+        ))));
+    }
+
+    #[test]
+    fn a_log_with_no_plan_entry_restores_a_nil_plan() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("hi".into()));
+        log.append(Entry::AssistantBlocks(vec![text("hello")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        assert_eq!(plan(&log.path), None);
+    }
+
+    // ---- the fold's close rules ----
+
+    #[test]
+    fn an_adr_0009_truncated_batch_folds_back_intact() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "write_file",
+            json!({"path": "a"}),
+        )]));
+        log.append(Entry::ToolResult(tool_result_err(
+            "t1",
+            "[response was cut...]",
+            true,
+        )));
+        log.append(Entry::AssistantBlocks(vec![text("re-issued")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { id, .. } if id == "t1"));
+        assert_eq!(messages[2].role, Role::User);
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "t1"
+        ));
+        assert_eq!(messages[3].role, Role::Assistant);
+        assert!(matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "re-issued"));
+    }
+
+    #[test]
+    fn a_log_ending_mid_turn_settles_as_failed_dangling_tool_use_dropped_marker_appended() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![
+            text("thinking..."),
+            tool_use("t1", "grep", json!({})),
+        ]));
+        // No tool_result, no settled: the app died mid-batch.
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(
+            messages[1].content,
+            vec![text("thinking..."), text("[turn failed]")]
+        );
+    }
+
+    #[test]
+    fn a_turn_limit_settlement_restores_the_closing_marker() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use("t1", "grep", json!({}))]));
+        log.append(Entry::ToolResult(tool_result("t1", "hits")));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::TurnLimit,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(
+            last.content,
+            vec![text("[turn limit reached - reply to continue]")]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_settlement_closes_with_the_cancelled_marker() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use("t1", "grep", json!({}))]));
+        log.append(Entry::ToolResult(tool_result("t1", "hits")));
+        log.append(Entry::Settled {
+            outcome: Settled::Cancelled,
+            stop_reason: StopReason::Unknown,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, vec![text("[turn cancelled by user]")]);
+    }
+
+    #[test]
+    fn a_failed_settlement_carries_its_reason_string_forensically_the_fold_ignores_it() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![text("partial")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Failed,
+            stop_reason: StopReason::Error,
+            reason: Some(r#"{:llm_error, "connection refused"}"#.into()),
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], user_message(vec![text("go")]));
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(
+            messages[1].content,
+            vec![text("partial"), text("[turn failed]")]
+        );
+    }
+
+    #[test]
+    fn a_verify_nudge_entry_folds_as_a_user_message() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("write it".into()));
+        log.append(Entry::AssistantBlocks(vec![text("wrote it")]));
+        log.append(Entry::Nudge("[files changed but nothing verified - ...]".into()));
+        log.append(Entry::AssistantBlocks(vec![text("verified")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[2].role, Role::User);
+        assert!(matches!(&messages[2].content[0], ContentBlock::Text { text } if text.starts_with("[files changed")));
+        assert_eq!(messages[3].role, Role::Assistant);
+    }
+
+    #[test]
+    fn an_explore_nudge_folds_into_the_tool_results_user_message_it_rode_live() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("evaluate this project".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "read_file",
+            json!({"path": "a.txt"}),
+        )]));
+        log.append(Entry::ToolResult(tool_result("t1", "defmodule A")));
+        log.append(Entry::Nudge(
+            "[reading file after file - dispatch explore instead]".into(),
+        ));
+        log.append(Entry::AssistantBlocks(vec![text("ok, exploring")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0], user_message(vec![text("evaluate this project")]));
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { id, .. } if id == "t1"));
+        assert_eq!(messages[2].role, Role::User);
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
+        ));
+        assert!(matches!(&messages[2].content[1], ContentBlock::Text { text } if text.starts_with("[reading file after file")));
+        assert_eq!(messages[3].role, Role::Assistant);
+        assert!(matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "ok, exploring"));
+    }
+
+    // ---- crash modes ----
+
+    #[test]
+    fn a_torn_last_line_is_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![text("done")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log.path)
+            .unwrap();
+        f.write_all(br#"{"e": "user_text", "tex"#).unwrap();
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    // ---- resume rules ----
+
+    #[test]
+    fn a_different_project_root_refuses_to_resume() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+        log.append(Entry::UserText("go".into()));
+
+        let other_root = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let other = Session::build(
+            SessionOpts {
+                root: Some(other_root.to_string_lossy().into_owned()),
+                session_dir: Some(session.session_dir.clone()),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .unwrap();
+
+        assert_eq!(resume(&log.path, &other), Err(ResumeError::RootMismatch));
+    }
+
+    #[test]
+    fn every_other_fact_yields_reported_as_drift() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+        log.append(Entry::UserText("go".into()));
+
+        let changed = session_with(
+            tmp.path(),
+            Some(session.context_budget * 2),
+            Some(session.turn_limit + 5),
+        );
+
+        let (_messages, drift) = resume(&log.path, &changed).unwrap();
+
+        assert!(drift.contains(&Drift {
+            key: "context_budget",
+            logged: session.context_budget.to_string(),
+            current: changed.context_budget.to_string(),
+        }));
+        assert!(drift.contains(&Drift {
+            key: "turn_limit",
+            logged: session.turn_limit.to_string(),
+            current: changed.turn_limit.to_string(),
+        }));
+    }
+
+    #[test]
+    fn a_compaction_fold_discards_raw_entries_before_the_compacted_marker() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("turn 1".into()));
+        log.append(Entry::AssistantBlocks(vec![text("old response")]));
+        log.append(Entry::UserText("turn 2".into()));
+        log.append(Entry::AssistantBlocks(vec![text("compacted response")]));
+        log.append(Entry::ToolResult(tool_result("t1", "compacted result")));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+        log.append(Entry::Compacted {
+            summary: "Summary of old turns".into(),
+            skip_count: 5,
+            tokens_before: 100,
+            file_ops: FileOps::default(),
+            original_task: Some("the original task".into()),
+        });
+        log.append(Entry::UserText("turn 3".into()));
+        log.append(Entry::AssistantBlocks(vec![text("new response")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, drift) = resume(&log.path, &session).unwrap();
+        assert_eq!(drift, Vec::new());
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text.contains("Summary of old turns")));
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[2].role, Role::Assistant);
+    }
+
+    #[test]
+    fn a_compaction_fold_reconstructs_the_mechanical_facts_task_and_file_ops() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("turn 1".into()));
+        log.append(Entry::AssistantBlocks(vec![text("old response")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+        log.append(Entry::Compacted {
+            summary: "narrative from the model".into(),
+            skip_count: 3,
+            tokens_before: 100,
+            file_ops: FileOps {
+                read_files: vec!["lib/a.ex".into()],
+                modified_files: vec!["lib/b.ex".into()],
+            },
+            original_task: Some("verbatim original task".into()),
+        });
+        log.append(Entry::UserText("turn 2".into()));
+        log.append(Entry::AssistantBlocks(vec![text("new response")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        let summary_text: String = messages[0]
+            .content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(summary_text.contains("narrative from the model"));
+        assert!(summary_text.contains("verbatim original task"));
+        assert!(summary_text.contains("lib/a.ex"));
+        assert!(summary_text.contains("lib/b.ex"));
+    }
+
+    #[test]
+    fn seeded_message_entries_replay_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        let seeded = Message::assistant(vec![text("from a previous life")]);
+        log.append(Entry::Message(seeded.clone()));
+
+        let (messages, drift) = resume(&log.path, &session).unwrap();
+        assert_eq!(messages, vec![seeded]);
+        assert_eq!(drift, Vec::new());
+    }
+
+    // ---- latest/1 ----
+
+    #[test]
+    fn returns_the_newest_log_by_filename_error_when_none() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+
+        assert_eq!(latest(&session.session_dir), None);
+
+        let first = Log::open(&session).unwrap();
+        let second = Log::open(&session).unwrap();
+
+        let got = latest(&session.session_dir).unwrap();
+        assert!(got == first.path || got == second.path);
+
+        let missing = std::path::Path::new(&session.session_dir)
+            .join("missing")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(latest(&missing), None);
+    }
+}
