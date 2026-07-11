@@ -101,7 +101,7 @@ impl SessionConfig {
             compaction_keep: 0.5,
             llm_module: "Baud.LLM".into(),
             command_timeout_ms: 120_000,
-            turn_limit: 25,
+            turn_limit: 32,
             anchor_interval: 5,
             scout_pass_limit: 8,
             scout_no_think: true,
