@@ -9,6 +9,13 @@
 //! preserves its behaviour exactly, with the Nudge bookkeeping threaded through
 //! a `&mut Nudges` value instead of baud's functional re-binding.
 //!
+//! This module keeps the loop skeleton: the Pass cycle (request, stream,
+//! dispatch), proactive Compaction at Turn start, and the riders on a
+//! tool-answering Pass (Steering, Explore Nudge, Anchor, Endgame tail rider,
+//! Turn Limit, after-Pass hook). Executing a Pass's Tool Call batch lives in
+//! [`super::batch`]; how a Turn ends when the model stops calling tools lives
+//! in [`super::finish`].
+//!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
 //! [`TurnDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
 //! over a `plugins` list and a `ToolCtx` the caller supplies — the Rust Session
@@ -22,17 +29,16 @@ use crate::conversation::{self, Conversation};
 use crate::event::{Event, VoicedTag};
 use crate::llm::request::LlmRequest;
 use crate::llm::response::{Response, StopReason};
-use crate::llm::stream::{StreamEvent, MALFORMED_INPUT_SENTINEL};
-use crate::plan::{Plan, Update};
-use crate::plugin::Token;
-use crate::plugins::{self, Registered};
+use crate::llm::stream::StreamEvent;
+use crate::plan::Plan;
+use crate::plugins::Registered;
 use crate::session::log;
 use crate::session::Session;
 use crate::tool::ToolCtx;
-use crate::tools;
-use crate::turn::deps::{AfterPass, TurnDeps};
+use crate::turn::deps::{AfterPass, Emitter, TurnDeps};
 use crate::turn::endgame;
-use crate::turn::nudges::{Nudges, ToolResult as NudgeResult};
+use crate::turn::nudges::Nudges;
+use crate::turn::{batch, finish};
 use crate::voice;
 
 /// The Turn loop's outcome (baud's `outcome`).
@@ -75,17 +81,20 @@ pub struct RunOpts {
 }
 
 // The loop state that spans Passes: the Session's fixed facts, the effect
-// bundle, the Plan/Anchor state, which Pass we are on, and the Nudge
+// bundle, the owned emission handle (obtained once from `deps.emitter()`,
+// ADR-0025), the Plan/Anchor state, which Pass we are on, and the Nudge
 // bookkeeping. The Conversation stays a separate value the loop folds.
-struct LoopState<'a, D: TurnDeps> {
-    session: &'a Session,
-    deps: &'a mut D,
-    plugins: &'a [Registered],
-    tool_ctx: &'a ToolCtx,
-    nudges: Nudges,
-    plan: Plan,
-    pass: u64,
-    just_compacted: bool,
+// Fields are `pub(super)` so `batch` and `finish` work on the state directly.
+pub(super) struct LoopState<'a, D: TurnDeps> {
+    pub(super) session: &'a Session,
+    pub(super) deps: &'a mut D,
+    pub(super) emitter: Emitter,
+    pub(super) plugins: &'a [Registered],
+    pub(super) tool_ctx: &'a ToolCtx,
+    pub(super) nudges: Nudges,
+    pub(super) plan: Plan,
+    pub(super) pass: u64,
+    pub(super) just_compacted: bool,
 }
 
 /// Runs the loop until the model stops asking for tools, the Turn Limit is hit,
@@ -103,9 +112,14 @@ pub async fn run<D: TurnDeps>(
 ) -> Outcome {
     let plan = Plan::new(opts.plan, opts.original_task).capture_task(&conversation);
 
+    // The emission handle, detached from the deps once so the streaming sink
+    // can emit while `complete` borrows them (ADR-0025).
+    let emitter = deps.emitter();
+
     let mut state = LoopState {
         session,
         deps,
+        emitter,
         plugins,
         tool_ctx,
         nudges: Nudges::new(),
@@ -155,11 +169,11 @@ async fn run_loop<D: TurnDeps>(
         };
         conversation = next_conv;
 
-        state.deps.emit(Event::message_start(state.pass as u32));
+        state.emitter.emit(Event::message_start(state.pass as u32));
 
         let response = complete_and_emit(state, request).await;
 
-        state.deps.emit(Event::message_end(
+        state.emitter.emit(Event::message_end(
             response.content.clone(),
             response.stop_reason.clone(),
         ));
@@ -174,27 +188,22 @@ async fn run_loop<D: TurnDeps>(
     }
 }
 
-// Emitting the streaming updates has to borrow `state.deps` mutably for both
-// `complete` and `emit`, which a single closure capturing `state` cannot do.
-// The `complete` Dep forwards each StreamEvent to a callback; we collect the
-// snapshots the callback sees and emit one MessageUpdate per delta after the
-// call returns — order is preserved (deltas arrive before the response, and the
-// Conversation is untouched until MessageEnd).
+// The invariant: streaming deltas are emitted AS THEY STREAM — every
+// MessageUpdate goes out between MessageStart and MessageEnd, DURING the
+// `complete` call, never buffered until it returns. `complete` exclusively
+// borrows `state.deps`, which is exactly why emission is the owned `Emitter`
+// beside the deps (ADR-0025): destructuring `state` borrows the disjoint
+// `deps` and `emitter` fields, so the sink emits live while the model call
+// holds the deps.
 async fn complete_and_emit<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     request: LlmRequest,
 ) -> Response {
-    let mut updates: Vec<(crate::llm::stream::Delta, Vec<ContentBlock>)> = Vec::new();
-    let response = {
-        let mut sink = |ev: &StreamEvent| {
-            updates.push((ev.delta.clone(), ev.content.clone()));
-        };
-        state.deps.complete(request, &mut sink).await
+    let LoopState { deps, emitter, .. } = state;
+    let mut sink = |ev: &StreamEvent| {
+        emitter.emit(Event::message_update(ev.delta.clone(), ev.content.clone()));
     };
-    for (delta, content) in updates {
-        state.deps.emit(Event::message_update(delta, content));
-    }
-    response
+    deps.complete(request, &mut sink).await
 }
 
 // Returns `Ok((request, conversation))` (Compaction may have rewritten the
@@ -229,7 +238,7 @@ async fn build_request<D: TurnDeps>(
 
 // The result of a stop-reason dispatch: either the loop continues with an
 // updated Conversation, or the Turn is done.
-enum Flow {
+pub(super) enum Flow {
     Continue(Conversation),
     Done(Outcome),
 }
@@ -240,7 +249,7 @@ async fn dispatch<D: TurnDeps>(
     response: Response,
 ) -> Flow {
     match response.stop_reason {
-        StopReason::Error => Flow::Done(fail(state, conversation, response)),
+        StopReason::Error => Flow::Done(finish::fail(state, conversation, response)),
         StopReason::ToolUse => {
             // A :tool_use stop with zero tool_use blocks is a server quirk, not
             // a request for tools; treat it as end_turn (never append an empty
@@ -249,7 +258,7 @@ async fn dispatch<D: TurnDeps>(
                 continue_tools(state, conversation, response).await
             } else {
                 let content = response.content.clone();
-                finish(state, conversation, content, StopReason::ToolUse).await
+                finish::finish(state, conversation, content, StopReason::ToolUse).await
             }
         }
         StopReason::MaxTokens => {
@@ -257,12 +266,12 @@ async fn dispatch<D: TurnDeps>(
                 truncated_batch(state, conversation, response).await
             } else {
                 let content = response.content.clone();
-                finish(state, conversation, content, StopReason::MaxTokens).await
+                finish::finish(state, conversation, content, StopReason::MaxTokens).await
             }
         }
         other => {
             let content = response.content.clone();
-            finish(state, conversation, content, other).await
+            finish::finish(state, conversation, content, other).await
         }
     }
 }
@@ -273,7 +282,8 @@ async fn continue_tools<D: TurnDeps>(
     conversation: Conversation,
     response: Response,
 ) -> Flow {
-    let (results, conversation) = execute_tools(state, conversation, &response.content).await;
+    let (results, conversation) =
+        batch::execute_tools(state, conversation, &response.content).await;
     next_pass(state, conversation, response, results).await
 }
 
@@ -290,11 +300,11 @@ async fn truncated_batch<D: TurnDeps>(
     for block in response.content.iter().filter(|b| is_tool_use(b)) {
         if let ContentBlock::ToolUse { id, name, input } = block {
             state
-                .deps
-                .emit(Event::tool_call(id.clone(), name.clone(), display_input(input)));
+                .emitter
+                .emit(Event::tool_call(id.clone(), name.clone(), batch::display_input(input)));
 
             let content = voice::truncated_call_nudge().to_string();
-            state.deps.emit(Event::tool_result(
+            state.emitter.emit(Event::tool_result(
                 id.clone(),
                 name.clone(),
                 content.clone(),
@@ -325,7 +335,7 @@ async fn next_pass<D: TurnDeps>(
     conversation.add_tool_results(results, steering.clone());
 
     for text in &steering {
-        state.deps.emit(Event::steering_delivered(text.clone()));
+        state.emitter.emit(Event::steering_delivered(text.clone()));
     }
 
     let calls = pass_calls(&response.content);
@@ -349,7 +359,12 @@ async fn next_pass<D: TurnDeps>(
     if endgame::final_pass(state.pass, state.session.turn_limit) {
         // Turn Limit: stop calling the model. The marker keeps roles alternating.
         let reason = endgame::limit_stop_reason(&state.nudges);
-        return Flow::Done(close(state, conversation, voice::turn_limit_marker(), reason));
+        return Flow::Done(finish::close(
+            state,
+            conversation,
+            voice::turn_limit_marker(),
+            reason,
+        ));
     }
 
     match state.deps.after_pass(&response, &conversation).await {
@@ -357,7 +372,7 @@ async fn next_pass<D: TurnDeps>(
             state.pass += 1;
             Flow::Continue(conversation)
         }
-        AfterPass::Stop(reason) => Flow::Done(close_custom(
+        AfterPass::Stop(reason) => Flow::Done(finish::close_custom(
             state,
             conversation,
             voice::turn_stopped_marker(),
@@ -371,306 +386,6 @@ async fn next_pass<D: TurnDeps>(
     }
 }
 
-fn close<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    marker: &str,
-    stop_reason: log::StopReason,
-) -> Outcome {
-    conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
-    state.deps.checkpoint(&conversation);
-    Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
-}
-
-fn close_custom<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    marker: &str,
-    stop_reason: String,
-) -> Outcome {
-    conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
-    state.deps.checkpoint(&conversation);
-    Outcome::Ok(conversation, OutcomeStop::Custom(stop_reason))
-}
-
-// The LLM error algebra: text survives; unanswered tool_use blocks are dropped;
-// the failed marker closes the Turn so roles keep alternating.
-fn fail<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    response: Response,
-) -> Outcome {
-    let mut blocks: Vec<ContentBlock> = response
-        .content
-        .iter()
-        .filter(|b| !is_tool_use(b))
-        .cloned()
-        .collect();
-    blocks.push(ContentBlock::text(voice::turn_failed_marker()));
-    conversation.add_assistant_blocks(blocks);
-    state.deps.checkpoint(&conversation);
-    let reason = response.error.unwrap_or_default();
-    Outcome::Failed(reason, conversation)
-}
-
-// The model stopped without (executable) Tool Calls. Usually the Turn ends here;
-// a finish Nudge may send it back for one more Pass (Verify-failed > Verify >
-// Empty). Any tool_use block in this branch is unanswered and is dropped.
-async fn finish<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    conversation: Conversation,
-    blocks: Vec<ContentBlock>,
-    stop_reason: StopReason,
-) -> Flow {
-    // ADR-0015: on the final Pass a tool-insistent TEXT reply settles on the
-    // turn-limit marker path, and the markup never enters the Conversation.
-    if endgame::final_pass(state.pass, state.session.turn_limit)
-        && endgame::tool_insistent_text(&blocks)
-    {
-        let reason = endgame::limit_stop_reason(&state.nudges);
-        return Flow::Done(close(state, conversation, voice::turn_limit_marker(), reason));
-    }
-
-    do_finish(state, conversation, blocks, stop_reason).await
-}
-
-async fn do_finish<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    blocks: Vec<ContentBlock>,
-    stop_reason: StopReason,
-) -> Flow {
-    conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));
-
-    let closed = close_stop_reason(&stop_reason);
-    let can_loop = endgame::can_loop(state.pass, state.session.turn_limit);
-    let end_turn = closed == StopReason::EndTurn;
-
-    if end_turn && can_loop && state.nudges.verify_failed_nudge() {
-        state.nudges.note_verify_failed_nudged();
-        return nudge_finish(
-            state,
-            conversation,
-            voice::verify_failed_nudge(),
-            VoicedTag::VerifyFailedNudge,
-        )
-        .await;
-    }
-
-    if end_turn && can_loop && state.nudges.verify_nudge() {
-        state.nudges.note_verify_nudged();
-        return nudge_finish(
-            state,
-            conversation,
-            voice::verify_nudge(),
-            VoicedTag::VerifyNudge,
-        )
-        .await;
-    }
-
-    if end_turn && can_loop && empty_content(&blocks) && state.nudges.empty_response_nudge() {
-        // Arm the break-glass no-think rescue for the next Pass, gated by the
-        // Session knob.
-        state.nudges.arm_rescue(state.session.no_think_rescue);
-        state.nudges.note_empty_response_nudged();
-        return nudge_finish(
-            state,
-            conversation,
-            voice::empty_response_nudge(),
-            VoicedTag::EmptyResponseNudge,
-        )
-        .await;
-    }
-
-    Flow::Done(Outcome::Ok(
-        conversation,
-        outcome_stop_of(&close_stop_reason(&stop_reason)),
-    ))
-}
-
-// Shared finish-Nudge mechanic: append the user-role Nudge, announce it, count
-// it as a normal Pass against the Turn Limit, loop.
-async fn nudge_finish<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    nudge: &str,
-    tag: VoicedTag,
-) -> Flow {
-    conversation.add_user_text(nudge);
-    state.deps.emit(Event::voiced(tag, nudge));
-    state.pass += 1;
-    Flow::Continue(conversation)
-}
-
-// An empty response: zero content blocks once tool_use blocks are dropped, OR a
-// parroted empty-response marker.
-fn empty_content(blocks: &[ContentBlock]) -> bool {
-    let kept: Vec<&ContentBlock> = blocks.iter().filter(|b| !is_tool_use(b)).collect();
-    if kept.is_empty() {
-        true
-    } else {
-        marker_parrot(&kept)
-    }
-}
-
-fn marker_parrot(blocks: &[&ContentBlock]) -> bool {
-    let all_text = blocks
-        .iter()
-        .all(|b| matches!(b, ContentBlock::Text { .. }));
-    if !all_text {
-        return false;
-    }
-    let joined = blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    joined.trim() == voice::empty_response_marker()
-}
-
-fn close_blocks(blocks: &[ContentBlock], stop_reason: &StopReason) -> Vec<ContentBlock> {
-    let kept: Vec<ContentBlock> = blocks
-        .iter()
-        .filter(|b| !is_tool_use(b))
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        if *stop_reason == StopReason::MaxTokens {
-            vec![ContentBlock::text(voice::truncation_marker())]
-        } else {
-            vec![ContentBlock::text(voice::empty_response_marker())]
-        }
-    } else {
-        kept
-    }
-}
-
-// A phantom :tool_use stop ends the Turn like a normal completion.
-fn close_stop_reason(stop_reason: &StopReason) -> StopReason {
-    match stop_reason {
-        StopReason::ToolUse => StopReason::EndTurn,
-        other => other.clone(),
-    }
-}
-
-// Maps a (closed) LLM stop reason to the outcome's terminal reason.
-fn outcome_stop_of(stop_reason: &StopReason) -> OutcomeStop {
-    let reason = match stop_reason {
-        StopReason::EndTurn | StopReason::ToolUse => log::StopReason::EndTurn,
-        StopReason::MaxTokens => log::StopReason::MaxTokens,
-        StopReason::StopSequence => log::StopReason::StopSequence,
-        StopReason::Error => log::StopReason::Error,
-        StopReason::Unknown => log::StopReason::Unknown,
-    };
-    OutcomeStop::Reason(reason)
-}
-
-// Run tool calls in emission order; results keep that order. After each result,
-// checkpoint with only the answered Tool Calls. The Nudge bookkeeping threads
-// through the batch; after the batch the duplicate memory advances.
-async fn execute_tools<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    conversation: Conversation,
-    blocks: &[ContentBlock],
-) -> (Vec<ContentBlock>, Conversation) {
-    let mut results: Vec<ContentBlock> = Vec::new();
-    for block in blocks.iter().filter(|b| is_tool_use(b)) {
-        let result = execute_tool(state, block).await;
-        results.push(result);
-        let checkpoint = build_checkpoint(&conversation, blocks, &results);
-        state.deps.checkpoint(&checkpoint);
-    }
-    state.nudges.next_pass();
-    (results, conversation)
-}
-
-// The checkpoint after a partial batch: only the answered Tool Calls, paired
-// with their results.
-fn build_checkpoint(
-    conversation: &Conversation,
-    blocks: &[ContentBlock],
-    results: &[ContentBlock],
-) -> Conversation {
-    use std::collections::HashSet;
-    let answered: HashSet<&str> = results
-        .iter()
-        .filter_map(|r| match r {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    let kept: Vec<ContentBlock> = blocks
-        .iter()
-        .filter(|b| match b {
-            ContentBlock::ToolUse { id, .. } => answered.contains(id.as_str()),
-            _ => true,
-        })
-        .cloned()
-        .collect();
-
-    let mut conv = conversation.clone();
-    conv.add_assistant_blocks(kept);
-    conv.add_tool_results(results.to_vec(), Vec::new());
-    conv
-}
-
-async fn execute_tool<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    block: &ContentBlock,
-) -> ContentBlock {
-    let (id, name, input) = match block {
-        ContentBlock::ToolUse { id, name, input } => (id.clone(), name.clone(), input.clone()),
-        _ => unreachable!("execute_tool only sees tool_use blocks"),
-    };
-
-    state
-        .deps
-        .emit(Event::tool_call(id.clone(), name.clone(), display_input(&input)));
-
-    let (raw_content, is_error, artifacts) = run_block(state, &name, &input).await;
-
-    // Guard content to a String; note the result into the Nudge bookkeeping and
-    // receive the (possibly suffixed) content to record.
-    let content = state.nudges.note_result(
-        &name,
-        &input,
-        &NudgeResult {
-            content: &raw_content,
-            is_error,
-        },
-    );
-
-    maybe_store_plan(state, &name, &input, is_error);
-
-    state.deps.emit(Event::tool_result(
-        id.clone(),
-        name.clone(),
-        content.clone(),
-        is_error,
-        artifacts,
-    ));
-
-    ContentBlock::tool_result(id, content, is_error)
-}
-
-// A successful plan Tool Call updates the Plan value and stores its content
-// through the set_plan Dep; the Loop's copy keeps this Turn's Anchors current.
-fn maybe_store_plan<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    name: &str,
-    input: &Value,
-    is_error: bool,
-) {
-    if let Update::Updated(plan) = state.plan.update(name, input, is_error) {
-        state.deps.set_plan(plan.content.clone().unwrap_or_default());
-        state.plan = plan;
-    }
-}
-
 // Explore Nudge: folds this Pass's Tool Calls into the exploration streak; on
 // the 3rd/6th/... such Pass the Voice nudge merges into the trailing
 // tool-results user message and an event announces it.
@@ -681,7 +396,7 @@ fn maybe_explore_nudge<D: TurnDeps>(
 ) {
     if state.nudges.note_pass_calls(calls) {
         let nudge = voice::explore_nudge();
-        state.deps.emit(Event::voiced(VoicedTag::ExploreNudge, nudge));
+        state.emitter.emit(Event::voiced(VoicedTag::ExploreNudge, nudge));
         conversation.merge_user_text(nudge);
     }
 }
@@ -697,7 +412,7 @@ fn apply_tail_rider<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &mu
         TailRider::FinalPass(t) => (VoicedTag::FinalPass, t),
         TailRider::None => return,
     };
-    state.deps.emit(Event::voiced(tag, text.clone()));
+    state.emitter.emit(Event::voiced(tag, text.clone()));
     conversation.merge_user_text(text);
 }
 
@@ -717,99 +432,7 @@ fn anchor_due<D: TurnDeps>(state: &LoopState<'_, D>) -> bool {
     state.just_compacted || (interval != 0 && state.pass.is_multiple_of(interval))
 }
 
-fn display_input(input: &Value) -> Value {
-    if input.get(MALFORMED_INPUT_SENTINEL).is_some() {
-        Value::Object(Default::default())
-    } else {
-        input.clone()
-    }
-}
-
-// The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs — never
-// run those. Otherwise the Duplicate check, then pre_run, then Approval on the
-// plugin-adjusted command, then execution with post_run and Shaping.
-async fn run_block<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    name: &str,
-    input: &Value,
-) -> (String, bool, std::collections::HashMap<String, Value>) {
-    if let Some(raw) = input.get(MALFORMED_INPUT_SENTINEL) {
-        let raw_str = raw.as_str().unwrap_or("");
-        return (voice::malformed_input(raw_str), true, Default::default());
-    }
-
-    if state.nudges.duplicate(name, input) {
-        return (
-            voice::duplicate_call_nudge().to_string(),
-            true,
-            Default::default(),
-        );
-    }
-
-    run_lifecycle(state, name, input).await
-}
-
-async fn run_lifecycle<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    name: &str,
-    input: &Value,
-) -> (String, bool, std::collections::HashMap<String, Value>) {
-    let token = Token::new(name, input.clone(), state.tool_ctx.clone());
-    let (token, failures) = plugins::pre_run(state.plugins, token);
-    emit_plugin_errors(state, &failures);
-
-    if token.halted {
-        let reason = token.halt_reason.clone().unwrap_or_default();
-        return (reason, true, token.artifacts.clone());
-    }
-
-    if tools::requires_approval(name) {
-        // The string the modal shows (the command, or web_fetch's URL) —
-        // extracted from the plugin-adjusted input, as before.
-        let text = tools::approval_text(name, &token.input).unwrap_or_default();
-        let id = new_ref();
-        if state.deps.request_approval(id, text).await {
-            execute_token(state, token).await
-        } else {
-            (
-                voice::command_denied().to_string(),
-                true,
-                Default::default(),
-            )
-        }
-    } else {
-        execute_token(state, token).await
-    }
-}
-
-async fn execute_token<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    token: Token,
-) -> (String, bool, std::collections::HashMap<String, Value>) {
-    let (result, failures) = plugins::execute(state.plugins, token).await;
-    emit_plugin_errors(state, &failures);
-    (result.content, result.is_error, result.artifacts)
-}
-
-fn emit_plugin_errors<D: TurnDeps>(state: &mut LoopState<'_, D>, failures: &[plugins::Failure]) {
-    for failure in failures {
-        state.deps.emit(Event::plugin_error(
-            failure.plugin.clone(),
-            failure.stage,
-            failure.message.clone(),
-        ));
-    }
-}
-
-// The per-call Approval reference (baud's `make_ref()`), an opaque unique id.
-fn new_ref() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("approval-{n}")
-}
-
-fn is_tool_use(block: &ContentBlock) -> bool {
+pub(super) fn is_tool_use(block: &ContentBlock) -> bool {
     matches!(block, ContentBlock::ToolUse { .. })
 }
 
@@ -826,7 +449,7 @@ fn pass_calls(blocks: &[ContentBlock]) -> Vec<(String, Value)> {
 
 // Live context-pressure indication, once the Pass's usage is noted.
 fn emit_context_pressure<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &Conversation) {
-    state.deps.emit(Event::context_pressure(
+    state.emitter.emit(Event::context_pressure(
         conversation.token_estimate(),
         conversation.context_budget,
         conversation.max_tokens_reserve,
@@ -849,142 +472,27 @@ fn usage_of(response: &Response) -> conversation::Usage {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::content::{ContentBlock, Message, Role};
+    use crate::content::{ContentBlock, Role};
     use crate::event::Stage;
     use crate::llm::response::Response;
-    use crate::llm::stream::Delta;
+    use crate::llm::stream::{Delta, MALFORMED_INPUT_SENTINEL};
     use crate::plugin::{Plugin, Token};
     use crate::plugins::Registered;
     use crate::session::connection::Connection;
-    use crate::session::{Session, SessionConfig, SessionOpts};
-    use crate::test_support::{FakeDeps, FakeLlm};
+    use crate::session::{Session, SessionOpts};
+    use crate::test_support::FakeDeps;
     use crate::turn::deps::CompactError;
     use crate::test_support::Entry;
     use crate::tool::ToolCtx;
     use crate::content::Usage;
+    use crate::turn::fixtures::*;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    // ---- harness ----------------------------------------------------------
-
-    fn session_with(root: &std::path::Path, opts: SessionOpts) -> Session {
-        let mut opts = opts;
-        opts.root = Some(root.to_string_lossy().into_owned());
-        Session::build(opts, &SessionConfig::test_defaults()).expect("session builds")
-    }
-
-    fn session(root: &std::path::Path) -> Session {
-        session_with(root, SessionOpts::default())
-    }
-
-    fn conversation(session: &Session, prompt: &str) -> Conversation {
-        let mut conv = Conversation::new(
-            "You are a test agent.",
-            crate::conversation::ConversationOpts::new(
-                session.context_budget,
-                session.connection.max_tokens,
-            )
-            .eviction_slack(session.eviction_slack)
-            .compaction_keep(session.compaction_keep),
-        );
-        conv.add_user_text(prompt);
-        conv
-    }
-
-    fn tool_ctx(session: &Session) -> ToolCtx {
-        session.tool_ctx()
-    }
-
-    // Response builders mirroring baud's text_result / tool_use_result.
-    fn text_result(text: &str, stop: StopReason) -> Response {
-        Response {
-            content: vec![ContentBlock::text(text)],
-            stop_reason: stop,
-            usage: Usage::default(),
-            error: None,
-        }
-    }
-
-    fn text_end(text: &str) -> Response {
-        text_result(text, StopReason::EndTurn)
-    }
-
-    fn tool_use_result(id: &str, name: &str, input: Value) -> Response {
-        Response {
-            content: vec![ContentBlock::tool_use(id, name, input)],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage::default(),
-            error: None,
-        }
-    }
-
-    fn empty(stop: StopReason) -> Response {
-        Response {
-            content: vec![],
-            stop_reason: stop,
-            usage: Usage::default(),
-            error: None,
-        }
-    }
-
-    fn just(r: Response) -> Entry {
-        Entry::just(r)
-    }
-
-    // Runs the loop to completion with the given script and (optional) deps
-    // customization, on a fresh temp root. Returns (outcome, deps) so the test
-    // can inspect recorded events/checkpoints/requests/plans.
-    async fn run_with(
-        session: &Session,
-        prompt: &str,
-        mut deps: FakeDeps,
-    ) -> (Outcome, FakeDeps) {
-        let conv = conversation(session, prompt);
-        let plugins: Vec<Registered> = Vec::new();
-        let ctx = tool_ctx(session);
-        let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
-        (outcome, deps)
-    }
-
-    fn deps_for(session: &Session, entries: Vec<Entry>) -> FakeDeps {
-        FakeDeps::new(FakeLlm::script(entries), session.connection.clone())
-    }
-
-    // Inspectors over recorded events.
-    fn events(deps: &FakeDeps) -> Vec<Event> {
-        deps.events.lock().unwrap().clone()
-    }
-
-    fn find_tool_result<'a>(evs: &'a [Event], id: &str) -> Option<&'a Event> {
-        evs.iter().find(
-            |e| matches!(e, Event::ToolResult { id: i, .. } if i == id),
-        )
-    }
-
-    fn count_voiced(evs: &[Event], f: impl Fn(&Event) -> bool) -> usize {
-        evs.iter().filter(|e| f(e)).count()
-    }
-
-    fn last_message(conv: &Conversation) -> &Message {
-        conv.messages.last().expect("has a message")
-    }
-
-    fn ok(outcome: &Outcome) -> (&Conversation, &OutcomeStop) {
-        match outcome {
-            Outcome::Ok(c, s) => (c, s),
-            other => panic!("expected Ok, got {other:?}"),
-        }
-    }
-
-    // A test root.
-    fn root() -> TempDir {
-        TempDir::new().unwrap()
-    }
-
-    fn write(root: &TempDir, name: &str, content: &str) {
-        std::fs::write(root.path().join(name), content).unwrap();
-    }
+    // The harness fixtures (session builders, Response builders, `run_with`,
+    // event inspectors) live in `crate::turn::fixtures`, one set for the split
+    // Loop's tests (these integration tests cover `batch` and `finish` too).
 
     // ---- tool loop --------------------------------------------------------
 
@@ -1077,6 +585,57 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e, Event::MessageEnd { content, stop_reason }
             if stop_reason == &StopReason::EndTurn
             && matches!(content.first(), Some(ContentBlock::Text { .. })))));
+    }
+
+    #[tokio::test]
+    async fn streaming_updates_are_emitted_live_during_complete_not_after() {
+        let root = root();
+        let session = session(root.path());
+
+        // A shared events log created UP FRONT, so the Dynamic entry can drop a
+        // sentinel into it from INSIDE `complete` — after every delta has gone
+        // through the streaming sink, immediately before `complete` returns.
+        // If the loop buffered deltas and emitted after the call (the defect
+        // ADR-0025 removes), every MessageUpdate would land AFTER the sentinel.
+        let events_log: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let sentinel = "__complete_returning__";
+        let sentinel_log = Arc::clone(&events_log);
+        let entry = Entry::dynamic(
+            vec![Delta::Text("hi ".into()), Delta::Text("there".into())],
+            move |_req| {
+                sentinel_log
+                    .lock()
+                    .unwrap()
+                    .push(Event::steering_delivered(sentinel));
+                text_end("hi there")
+            },
+        );
+
+        let mut deps = deps_for(&session, vec![entry]);
+        // Point the fake's recorder at the pre-shared log; the Emitter it hands
+        // out clones this same Arc, so updates and sentinel share one ordering.
+        deps.events = events_log;
+
+        let (outcome, deps) = run_with(&session, "hello", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+
+        let sentinel_at = evs
+            .iter()
+            .position(|e| matches!(e, Event::SteeringDelivered { text } if text == sentinel))
+            .expect("the sentinel was recorded inside complete");
+        let update_positions: Vec<usize> = evs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| matches!(e, Event::MessageUpdate { .. }).then_some(i))
+            .collect();
+        assert_eq!(update_positions.len(), 2);
+        assert!(
+            update_positions.iter().all(|&i| i < sentinel_at),
+            "every MessageUpdate must precede the sentinel — updates are emitted \
+             DURING complete, not after it returns (updates at {update_positions:?}, \
+             sentinel at {sentinel_at})"
+        );
     }
 
     // ---- context pressure -------------------------------------------------

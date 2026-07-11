@@ -16,8 +16,12 @@
 //! caller. The methods that do IO (`complete`, `request_approval`,
 //! `drain_steering`, `compact`) return concrete futures via
 //! `impl Future` in return position (edition 2024 RPITIT), so no boxing and no
-//! `async_trait`. The fire-and-forget effects (`emit`, `checkpoint`, `set_plan`)
-//! are synchronous — the Loop never awaits them.
+//! `async_trait`. The fire-and-forget effects (`checkpoint`, `set_plan`) are
+//! synchronous — the Loop never awaits them.
+//!
+//! Event emission is NOT a trait method: it is the owned [`Emitter`] handle
+//! [`TurnDeps::emitter`] hands out (ADR-0025), so the streaming sink can emit
+//! while `complete` exclusively borrows the deps.
 
 use std::future::Future;
 
@@ -26,6 +30,28 @@ use crate::event::Event;
 use crate::llm::request::LlmRequest;
 use crate::llm::response::Response;
 use crate::llm::stream::StreamEvent;
+
+/// The detached emission handle (ADR-0025): an owned sink for turn [`Event`]s,
+/// obtained once from [`TurnDeps::emitter`] and carried by the Loop alongside
+/// the deps. Because it is a separate owned value — not a method on the deps —
+/// the streaming sink inside `complete_and_emit` can emit MessageUpdates LIVE
+/// while `complete` holds the exclusive `&mut D` borrow.
+///
+/// One boxed (dynamic) call per event is the accepted cost: an SSE delta
+/// dwarfs a boxed-closure dispatch, so nothing that matters is spent here.
+pub struct Emitter(Box<dyn FnMut(Event) + Send>);
+
+impl Emitter {
+    /// Wraps the sink function every emitted [`Event`] flows through.
+    pub fn new(f: impl FnMut(Event) + Send + 'static) -> Self {
+        Emitter(Box::new(f))
+    }
+
+    /// Emits one turn Event (fire-and-forget).
+    pub fn emit(&mut self, event: Event) {
+        (self.0)(event)
+    }
+}
 
 /// The after-Pass hook's verdict (baud's `after_pass_verdict`). The default
 /// implementation always returns [`AfterPass::Continue`].
@@ -48,8 +74,9 @@ pub struct CompactError(pub String);
 
 /// Every effect the Turn loop performs (ADR-0011). Static-dispatch: the Loop is
 /// generic over `D: TurnDeps` and monomorphises per caller. Methods that do IO
-/// are async (return a `Future`); `emit`/`checkpoint`/`set_plan` are
-/// fire-and-forget and synchronous.
+/// are async (return a `Future`); `checkpoint`/`set_plan` are fire-and-forget
+/// and synchronous. Event emission goes through the [`Emitter`] handle that
+/// [`TurnDeps::emitter`] hands out (ADR-0025).
 ///
 /// `complete` receives the fully-built [`LlmRequest`] (system, messages, tools,
 /// no_think) — the shell renders it to wire JSON and calls the LLM boundary,
@@ -65,8 +92,13 @@ pub trait TurnDeps: Send {
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> impl Future<Output = Response> + Send;
 
-    /// Emits a turn Event (fire-and-forget).
-    fn emit(&mut self, event: Event);
+    /// Hands out the owned emission handle (ADR-0025). Emission alone is a
+    /// handle rather than a trait method because of the borrow split: the
+    /// streaming sink must emit MessageUpdate events WHILE `complete` holds the
+    /// exclusive `&mut self` borrow, and a `deps.emit(..)` call inside the sink
+    /// would be a second `&mut` borrow the compiler rightly rejects. The Loop
+    /// calls this once at start and emits through the handle everywhere.
+    fn emitter(&mut self) -> Emitter;
 
     /// Drains any queued Steering, yielding the texts in order.
     fn drain_steering(&mut self) -> impl Future<Output = Vec<String>> + Send;
