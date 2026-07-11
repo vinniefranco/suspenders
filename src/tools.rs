@@ -16,7 +16,7 @@ pub mod shaping;
 pub mod web_fetch;
 pub mod write_file;
 
-use crate::tool::{validate, Tool, ToolCtx, ToolSpec};
+use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
 use serde_json::Value;
 
 /// A Tool Result: the content that enters the Conversation and whether it was
@@ -66,7 +66,10 @@ pub fn scout_specs() -> Vec<ToolSpec> {
 
 /// Tool specs for the Verification Pass (ADR-0016): run_command only.
 pub fn verification_specs() -> Vec<ToolSpec> {
-    specs().into_iter().filter(|s| s.name == "run_command").collect()
+    specs()
+        .into_iter()
+        .filter(|s| s.name == "run_command")
+        .collect()
 }
 
 /// Whether a Tool Call for this tool needs the user's Approval first:
@@ -118,7 +121,7 @@ pub async fn execute(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
             return ToolResult {
                 content: format!("unknown tool: {name:?}"),
                 is_error: true,
-            }
+            };
         }
     };
 
@@ -229,7 +232,12 @@ mod tests {
             }
             for (_key, prop) in schema["properties"].as_object().unwrap() {
                 assert!(prop["type"].is_string());
-                assert!(prop["description"].as_str().map(|d| !d.is_empty()).unwrap_or(false));
+                assert!(
+                    prop["description"]
+                        .as_str()
+                        .map(|d| !d.is_empty())
+                        .unwrap_or(false)
+                );
             }
             for r in schema["required"].as_array().unwrap() {
                 let key = r.as_str().unwrap();
@@ -277,8 +285,14 @@ mod tests {
 
     #[test]
     fn approval_text_falls_back_to_empty_when_the_field_is_missing_or_non_string() {
-        assert_eq!(approval_text("run_command", &json!({})), Some(String::new()));
-        assert_eq!(approval_text("web_fetch", &json!({"url": 42})), Some(String::new()));
+        assert_eq!(
+            approval_text("run_command", &json!({})),
+            Some(String::new())
+        );
+        assert_eq!(
+            approval_text("web_fetch", &json!({"url": 42})),
+            Some(String::new())
+        );
     }
 
     // ---- execute ----
@@ -288,7 +302,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("big.txt"), "a".repeat(500)).unwrap();
 
-        let result = execute("read_file", &json!({"path": "big.txt"}), &ctx(tmp.path(), 100)).await;
+        let result = execute(
+            "read_file",
+            &json!({"path": "big.txt"}),
+            &ctx(tmp.path(), 100),
+        )
+        .await;
         assert!(!result.is_error);
         assert_eq!(result.content, "a".repeat(500));
     }
@@ -316,7 +335,12 @@ mod tests {
     async fn run_ok_maps_to_is_error_false() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("present.txt"), "").unwrap();
-        let result = run("list_files", &json!({"path": "."}), &ctx(tmp.path(), 10_000)).await;
+        let result = run(
+            "list_files",
+            &json!({"path": "."}),
+            &ctx(tmp.path(), 10_000),
+        )
+        .await;
         assert!(!result.is_error);
         assert!(result.content.contains("present.txt"));
     }
@@ -353,7 +377,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("big.txt"), "a".repeat(500)).unwrap();
 
-        let result = run("read_file", &json!({"path": "big.txt"}), &ctx(tmp.path(), 100)).await;
+        let result = run(
+            "read_file",
+            &json!({"path": "big.txt"}),
+            &ctx(tmp.path(), 100),
+        )
+        .await;
         assert!(!result.is_error);
         assert_eq!(
             result.content,
@@ -375,9 +404,11 @@ mod tests {
         .await;
         assert!(!result.is_error);
         assert!(result.content.contains("START"));
-        assert!(result
-            .content
-            .contains("chars omitted from the middle of this output"));
+        assert!(
+            result
+                .content
+                .contains("chars omitted from the middle of this output")
+        );
         assert!(result.content.contains("[exit code: 0]"));
     }
 }

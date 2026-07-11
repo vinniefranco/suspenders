@@ -32,7 +32,10 @@ impl Default for ApprovalId {
 impl ApprovalId {
     pub fn new() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
-        ApprovalId(format!("approval-{}", COUNTER.fetch_add(1, Ordering::Relaxed)))
+        ApprovalId(format!(
+            "approval-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// Wraps the opaque reference the Turn Loop minted (`request_approval`'s
@@ -148,7 +151,8 @@ mod tests {
         };
         // Reuse the pending id to record it as standing.
         let pending_id = approvals.pending.as_ref().unwrap().id.clone();
-        let Decide::Forward(true, approvals) = approvals.decide(pending_id, Decision::ApproveAlways)
+        let Decide::Forward(true, approvals) =
+            approvals.decide(pending_id, Decision::ApproveAlways)
         else {
             panic!("expected forward true");
         };
@@ -291,7 +295,8 @@ mod tests {
         let Request::Pending(approvals) = Approvals::new().request(r.clone(), "mix test") else {
             panic!();
         };
-        let Decide::Forward(true, approvals) = approvals.decide(r.clone(), Decision::Approve) else {
+        let Decide::Forward(true, approvals) = approvals.decide(r.clone(), Decision::Approve)
+        else {
             panic!();
         };
 

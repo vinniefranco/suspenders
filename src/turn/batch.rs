@@ -5,14 +5,17 @@
 //!
 //! [`execute_tools`] runs a Pass's Tool Calls in emission order. Each call goes
 //! through the gates in sequence: the malformed-input sentinel (the LLM layer
-//! tags inputs that never parsed — those are answered, never run), the
-//! duplicate memory (an identical repeat draws a Nudge result instead of a
+//! tags inputs that never parsed — those are answered, never run), the Tool
+//! Call answering arbiter before execution ([`governor::answer_sent`],
+//! ADR-0026: an identical repeat draws a replacement Tool Result instead of a
 //! rerun), then the Plugin lifecycle (ADR-0007: pre_run — which may halt the
 //! call with the plugin's own wording — execution, post_run/Shaping), with
 //! Approval (ADR-0005) requested between pre_run and execution for the tools
-//! that require it, on the plugin-adjusted input. After every result the
-//! Conversation is checkpointed with only the answered Tool Calls, so a crash
-//! mid-batch never persists an unanswered tool_use block.
+//! that require it, on the plugin-adjusted input; the arbiter is consulted
+//! again after execution ([`governor::answer_read`] — the consecutive-failure
+//! annotation). After every result the Conversation is checkpointed with only
+//! the answered Tool Calls, so a crash mid-batch never persists an unanswered
+//! tool_use block.
 //!
 //! The loop skeleton lives in [`super::loop_`]; how a Turn ends when the model
 //! stops calling tools lives in [`super::finish`].
@@ -28,26 +31,28 @@ use crate::plugin::Token;
 use crate::plugins;
 use crate::tools;
 use crate::turn::deps::TurnDeps;
-use crate::turn::loop_::{is_tool_use, LoopState};
-use crate::turn::nudges::ToolResult as NudgeResult;
+use crate::turn::governor::ledger::ToolResult;
+use crate::turn::governor::{self, AnswerIntervention};
+use crate::turn::loop_::LoopState;
 use crate::voice;
 
 // Run tool calls in emission order; results keep that order. After each result,
-// checkpoint with only the answered Tool Calls. The Nudge bookkeeping threads
-// through the batch; after the batch the duplicate memory advances.
+// checkpoint with only the answered Tool Calls. After the batch the duplicate
+// memory advances and the Ledger's failure-recency clock ticks.
 pub(super) async fn execute_tools<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     blocks: &[ContentBlock],
 ) -> (Vec<ContentBlock>, Conversation) {
     let mut results: Vec<ContentBlock> = Vec::new();
-    for block in blocks.iter().filter(|b| is_tool_use(b)) {
+    for block in blocks.iter().filter(|b| b.is_tool_use()) {
         let result = execute_tool(state, block).await;
         results.push(result);
         let checkpoint = build_checkpoint(&conversation, blocks, &results);
         state.deps.checkpoint(&checkpoint);
     }
-    state.nudges.next_pass();
+    state.governors.next_pass();
+    state.ledger.close_batch();
     (results, conversation)
 }
 
@@ -91,22 +96,33 @@ async fn execute_tool<D: TurnDeps>(
         _ => unreachable!("execute_tool only sees tool_use blocks"),
     };
 
-    state
-        .emitter
-        .emit(Event::tool_call(id.clone(), name.clone(), display_input(&input)));
+    state.emitter.emit(Event::tool_call(
+        id.clone(),
+        name.clone(),
+        display_input(&input),
+    ));
 
     let (raw_content, is_error, artifacts) = run_block(state, &name, &input).await;
 
-    // Guard content to a String; note the result into the Nudge bookkeeping and
-    // receive the (possibly suffixed) content to record.
-    let content = state.nudges.note_result(
-        &name,
-        &input,
-        &NudgeResult {
-            content: &raw_content,
-            is_error,
-        },
-    );
+    // The outcome's facts go on the Ledger first, written once at this firing
+    // site (ADR-0026) — replaced results included: a replaced duplicate still
+    // counts toward the failure tally, and a duplicated write/run_command
+    // still moves the verify state. Then the answering moment's second
+    // consultation: the arbiter judges what the model will READ, possibly
+    // annotating it with the consecutive-failure suffix.
+    let result = ToolResult {
+        content: &raw_content,
+        is_error,
+    };
+    state.ledger.record_result(&name, &result);
+    let content =
+        match governor::answer_read(&state.ledger, &mut state.governors, &name, &input, &result) {
+            Some(AnswerIntervention::AnnotateResult(annotated)) => annotated,
+            Some(AnswerIntervention::ReplaceResult { .. } | AnswerIntervention::RideTail(_)) => {
+                unreachable!("only an annotation issues after execution")
+            }
+            None => raw_content,
+        };
 
     maybe_store_plan(state, &name, &input, is_error);
 
@@ -130,7 +146,9 @@ fn maybe_store_plan<D: TurnDeps>(
     is_error: bool,
 ) {
     if let Update::Updated(plan) = state.plan.update(name, input, is_error) {
-        state.deps.set_plan(plan.content.clone().unwrap_or_default());
+        state
+            .deps
+            .set_plan(plan.content.clone().unwrap_or_default());
         state.plan = plan;
     }
 }
@@ -144,8 +162,10 @@ pub(super) fn display_input(input: &Value) -> Value {
 }
 
 // The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs — never
-// run those. Otherwise the Duplicate check, then pre_run, then Approval on the
-// plugin-adjusted command, then execution with post_run and Shaping.
+// run those (mechanics, not a Governor's judgment). Otherwise the answering
+// arbiter judges what the model SENT (a replaced Tool Result skips execution),
+// then pre_run, Approval on the plugin-adjusted command, and execution with
+// post_run and Shaping.
 async fn run_block<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
@@ -156,12 +176,14 @@ async fn run_block<D: TurnDeps>(
         return (voice::malformed_input(raw_str), true, Default::default());
     }
 
-    if state.nudges.duplicate(name, input) {
-        return (
-            voice::duplicate_call_nudge().to_string(),
-            true,
-            Default::default(),
-        );
+    match governor::answer_sent(&state.governors, name, input) {
+        Some(AnswerIntervention::ReplaceResult { content, is_error }) => {
+            return (content, is_error, Default::default());
+        }
+        Some(AnswerIntervention::AnnotateResult(_) | AnswerIntervention::RideTail(_)) => {
+            unreachable!("only a replacement Tool Result issues before execution")
+        }
+        None => {}
     }
 
     run_lifecycle(state, name, input).await

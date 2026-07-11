@@ -173,9 +173,8 @@ impl Settlement {
             // Cancellation needs both the flag and reason Shutdown.
             Outcome::Down(reason) if self.cancelled && reason == Reason::atom("shutdown") => {
                 let mut conversation = self.latest(base);
-                conversation.add_assistant_blocks(vec![ContentBlock::text(
-                    voice::turn_cancelled_marker(),
-                )]);
+                conversation
+                    .add_assistant_blocks(vec![ContentBlock::text(voice::turn_cancelled_marker())]);
                 (conversation, Event::TurnCancelled)
             }
             Outcome::Down(reason) => (failed(self.latest(base)), Event::TurnError(reason)),
@@ -314,8 +313,11 @@ mod tests {
         final_conv.add_assistant_blocks(vec![ContentBlock::text("done")]);
         let settlement = Settlement::new().note_checkpoint(checkpoint(base()));
 
-        let resolution =
-            settlement.settle(Outcome::Ok(final_conv.clone(), StopReason::EndTurn), &base(), &[]);
+        let resolution = settlement.settle(
+            Outcome::Ok(final_conv.clone(), StopReason::EndTurn),
+            &base(),
+            &[],
+        );
 
         assert_eq!(resolution.conversation, final_conv);
         assert!(matches!(resolution.event, Event::TurnFinished { .. }));
@@ -348,10 +350,15 @@ mod tests {
 
     #[test]
     fn in_turn_error_with_no_checkpoint_closes_the_pre_turn_conversation() {
-        let resolution = Settlement::new().settle(Outcome::Error(Reason::atom("timeout")), &base(), &[]);
+        let resolution =
+            Settlement::new().settle(Outcome::Error(Reason::atom("timeout")), &base(), &[]);
 
         assert_eq!(resolution.event, Event::TurnError(Reason::atom("timeout")));
-        assert_closed_with(&resolution.conversation, &base(), voice::turn_failed_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &base(),
+            voice::turn_failed_marker(),
+        );
     }
 
     #[test]
@@ -369,7 +376,11 @@ mod tests {
             resolution.event,
             Event::TurnError(Reason::atom("context_budget_exhausted"))
         );
-        assert_closed_with(&resolution.conversation, &partial, voice::turn_failed_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &partial,
+            voice::turn_failed_marker(),
+        );
     }
 
     #[test]
@@ -383,18 +394,19 @@ mod tests {
 
         let resolution = settlement.settle(Outcome::Error(Reason::atom("timeout")), &base(), &[]);
 
-        assert_closed_with(&resolution.conversation, &second, voice::turn_failed_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &second,
+            voice::turn_failed_marker(),
+        );
     }
 
     #[test]
     fn a_crash_settles_as_a_failure() {
         let settlement = Settlement::new().note_checkpoint(checkpoint(base()));
 
-        let resolution = settlement.settle(
-            Outcome::Down(Reason::tuple("{:badarg, []}")),
-            &base(),
-            &[],
-        );
+        let resolution =
+            settlement.settle(Outcome::Down(Reason::tuple("{:badarg, []}")), &base(), &[]);
 
         assert_eq!(
             resolution.event,
@@ -413,7 +425,11 @@ mod tests {
             Settlement::new().settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
         assert_eq!(resolution.event, Event::TurnError(Reason::atom("shutdown")));
-        assert_closed_with(&resolution.conversation, &base(), voice::turn_failed_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &base(),
+            voice::turn_failed_marker(),
+        );
     }
 
     #[test]
@@ -423,7 +439,11 @@ mod tests {
         let resolution = settlement.settle(Outcome::Down(Reason::atom("killed")), &base(), &[]);
 
         assert_eq!(resolution.event, Event::TurnError(Reason::atom("killed")));
-        assert_closed_with(&resolution.conversation, &base(), voice::turn_failed_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &base(),
+            voice::turn_failed_marker(),
+        );
     }
 
     // ---- log entry ----
@@ -496,7 +516,10 @@ mod tests {
             &["keep going".to_string()],
         );
 
-        assert_eq!(resolution.rollover, Rollover::Submit("keep going".to_string()));
+        assert_eq!(
+            resolution.rollover,
+            Rollover::Submit("keep going".to_string())
+        );
     }
 
     #[test]
@@ -536,7 +559,11 @@ mod tests {
         let resolution = settlement.settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
         assert_eq!(resolution.event, Event::TurnCancelled);
-        assert_closed_with(&resolution.conversation, &partial, voice::turn_cancelled_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &partial,
+            voice::turn_cancelled_marker(),
+        );
     }
 
     #[test]
@@ -546,6 +573,10 @@ mod tests {
         let resolution = settlement.settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
         assert_eq!(resolution.event, Event::TurnCancelled);
-        assert_closed_with(&resolution.conversation, &base(), voice::turn_cancelled_marker());
+        assert_closed_with(
+            &resolution.conversation,
+            &base(),
+            voice::turn_cancelled_marker(),
+        );
     }
 }

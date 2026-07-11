@@ -96,10 +96,7 @@ mod tests {
     use serde_json::json;
 
     fn conversation() -> Conversation {
-        Conversation::new(
-            "sys",
-            ConversationOpts::new(10_000, 0),
-        )
+        Conversation::new("sys", ConversationOpts::new(10_000, 0))
     }
 
     // ---- capture_task/2 ----
@@ -132,10 +129,14 @@ mod tests {
         let conv = base.apply_compaction("what happened so far", 1);
 
         let fresh = Plan::default().capture_task(&conv);
-        assert!(fresh.original_task.unwrap().contains("what happened so far"));
+        assert!(
+            fresh
+                .original_task
+                .unwrap()
+                .contains("what happened so far")
+        );
 
-        let durable =
-            Plan::new(None, Some("original task".to_string())).capture_task(&conv);
+        let durable = Plan::new(None, Some("original task".to_string())).capture_task(&conv);
         assert_eq!(durable.original_task.as_deref(), Some("original task"));
     }
 

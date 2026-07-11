@@ -91,8 +91,20 @@ fn load_project_context_files(
     sources: &mut Vec<(SourceType, String)>,
 ) {
     for dir in ancestor_dirs(root) {
-        load_context_file(&dir, ".suspenders/AGENTS.md", SourceType::Context, prompt, sources);
-        load_context_file(&dir, ".suspenders/CLAUDE.md", SourceType::Context, prompt, sources);
+        load_context_file(
+            &dir,
+            ".suspenders/AGENTS.md",
+            SourceType::Context,
+            prompt,
+            sources,
+        );
+        load_context_file(
+            &dir,
+            ".suspenders/CLAUDE.md",
+            SourceType::Context,
+            prompt,
+            sources,
+        );
     }
 }
 
@@ -100,8 +112,20 @@ fn load_project_context_files(
 
 fn load_global_context_files(prompt: &mut String, sources: &mut Vec<(SourceType, String)>) {
     let config_dir = global_config_dir();
-    load_context_file(&config_dir, "AGENTS.md", SourceType::Global, prompt, sources);
-    load_context_file(&config_dir, "CLAUDE.md", SourceType::Global, prompt, sources);
+    load_context_file(
+        &config_dir,
+        "AGENTS.md",
+        SourceType::Global,
+        prompt,
+        sources,
+    );
+    load_context_file(
+        &config_dir,
+        "CLAUDE.md",
+        SourceType::Global,
+        prompt,
+        sources,
+    );
 }
 
 // -- Helpers -----------------------------------------------------------------
@@ -236,10 +260,7 @@ mod tests {
 
         let result = load(&root(&tmp));
         assert_eq!(result.system_prompt, "You are a custom agent.");
-        assert!(result
-            .sources
-            .iter()
-            .any(|(t, _)| *t == SourceType::System));
+        assert!(result.sources.iter().any(|(t, _)| *t == SourceType::System));
     }
 
     #[test]
@@ -266,15 +287,16 @@ mod tests {
     #[test]
     fn appends_to_the_default_system_prompt() {
         let tmp = temp_dir();
-        write(&tmp, ".suspenders/APPEND_SYSTEM.md", "Always use strict typing.");
+        write(
+            &tmp,
+            ".suspenders/APPEND_SYSTEM.md",
+            "Always use strict typing.",
+        );
 
         let result = load(&root(&tmp));
         assert!(result.system_prompt.contains(voice::system_prompt()));
         assert!(result.system_prompt.contains("Always use strict typing."));
-        assert!(result
-            .sources
-            .iter()
-            .any(|(t, _)| *t == SourceType::Append));
+        assert!(result.sources.iter().any(|(t, _)| *t == SourceType::Append));
     }
 
     #[test]
@@ -284,7 +306,10 @@ mod tests {
         write(&tmp, ".suspenders/APPEND_SYSTEM.md", "Extra instructions.");
 
         let result = load(&root(&tmp));
-        assert_eq!(result.system_prompt, "Custom prompt.\n\nExtra instructions.");
+        assert_eq!(
+            result.system_prompt,
+            "Custom prompt.\n\nExtra instructions."
+        );
     }
 
     // ---- AGENTS.md / CLAUDE.md ----
@@ -297,8 +322,12 @@ mod tests {
         let result = load(&root(&tmp));
         assert!(result.system_prompt.contains("Project conventions."));
         assert!(result.system_prompt.contains("[Context from"));
-        assert!(result.sources.iter().any(|(t, p)| *t == SourceType::Context
-            && p.ends_with(".suspenders/AGENTS.md")));
+        assert!(
+            result
+                .sources
+                .iter()
+                .any(|(t, p)| *t == SourceType::Context && p.ends_with(".suspenders/AGENTS.md"))
+        );
     }
 
     #[test]
@@ -308,8 +337,12 @@ mod tests {
 
         let result = load(&root(&tmp));
         assert!(result.system_prompt.contains("Claude conventions."));
-        assert!(result.sources.iter().any(|(t, p)| *t == SourceType::Context
-            && p.ends_with(".suspenders/CLAUDE.md")));
+        assert!(
+            result
+                .sources
+                .iter()
+                .any(|(t, p)| *t == SourceType::Context && p.ends_with(".suspenders/CLAUDE.md"))
+        );
     }
 
     #[test]
@@ -339,13 +372,25 @@ mod tests {
     fn loads_from_root_and_ancestors_root_first() {
         let tmp = temp_dir();
         let child = path(&tmp, "parent/child");
-        write(&tmp, "parent/child/.suspenders/AGENTS.md", "Child-specific rules.");
+        write(
+            &tmp,
+            "parent/child/.suspenders/AGENTS.md",
+            "Child-specific rules.",
+        );
         write(&tmp, "parent/.suspenders/AGENTS.md", "Parent-wide rules.");
 
         let result = load(&child);
 
-        let child_start = result.system_prompt.split("Child-specific rules.").next().unwrap();
-        let parent_start = result.system_prompt.split("Parent-wide rules.").next().unwrap();
+        let child_start = result
+            .system_prompt
+            .split("Child-specific rules.")
+            .next()
+            .unwrap();
+        let parent_start = result
+            .system_prompt
+            .split("Parent-wide rules.")
+            .next()
+            .unwrap();
         assert!(
             child_start.len() < parent_start.len(),
             "root dir content should appear before ancestor content"

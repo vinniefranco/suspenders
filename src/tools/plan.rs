@@ -9,7 +9,7 @@
 
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use crate::voice;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct Plan;
 
@@ -93,7 +93,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_plan_tool_is_registered() {
-        let names: Vec<String> = crate::tools::specs().iter().map(|s| s.name.clone()).collect();
+        let names: Vec<String> = crate::tools::specs()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
         assert!(names.contains(&"plan".to_string()));
     }
 

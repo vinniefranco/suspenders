@@ -212,9 +212,9 @@ use eventsource_stream::Eventsource;
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
+    use crate::content::Message;
     use crate::llm::request::{self, LlmRequest};
     use crate::llm::response::StopReason;
-    use crate::content::Message;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -222,7 +222,10 @@ mod tests {
     // --- SSE body helpers (canned Anthropic event stream) ---
 
     fn frame(name: &str, data: Value) -> String {
-        format!("event: {name}\ndata: {}\n\n", serde_json::to_string(&data).unwrap())
+        format!(
+            "event: {name}\ndata: {}\n\n",
+            serde_json::to_string(&data).unwrap()
+        )
     }
 
     fn sse_body(frames: &[String]) -> String {
@@ -317,8 +320,14 @@ mod tests {
             sse_body(&[
                 message_start(json!({ "input_tokens": 11, "output_tokens": 1 })),
                 block_start(json!(0), json!({ "type": "thinking", "thinking": "" })),
-                block_delta(json!(0), json!({ "type": "thinking_delta", "thinking": "pondering" })),
-                block_delta(json!(0), json!({ "type": "thinking_delta", "thinking": " deeply" })),
+                block_delta(
+                    json!(0),
+                    json!({ "type": "thinking_delta", "thinking": "pondering" }),
+                ),
+                block_delta(
+                    json!(0),
+                    json!({ "type": "thinking_delta", "thinking": " deeply" }),
+                ),
                 block_stop(json!(0)),
                 block_start(json!(1), json!({ "type": "text", "text": "" })),
                 block_delta(json!(1), json!({ "type": "text_delta", "text": "Hello" })),
@@ -339,7 +348,9 @@ mod tests {
             .await;
 
         // At least the first delta (a thinking one) arrived through the callback.
-        assert!(matches!(events.first().map(|e| &e.delta), Some(Delta::Thinking(s)) if s == "pondering"));
+        assert!(
+            matches!(events.first().map(|e| &e.delta), Some(Delta::Thinking(s)) if s == "pondering")
+        );
 
         // Final content correct; thinking excluded; usage merged.
         assert_eq!(result.content, vec![ContentBlock::text("Hello world")]);
@@ -404,10 +415,19 @@ mod tests {
             sse_body(&[
                 message_start(json!({ "input_tokens": 5 })),
                 block_start(Value::Null, json!({ "type": "text", "text": "" })),
-                block_delta(Value::Null, json!({ "type": "text_delta", "text": "Let me check." })),
+                block_delta(
+                    Value::Null,
+                    json!({ "type": "text_delta", "text": "Let me check." }),
+                ),
                 block_stop(Value::Null),
-                block_start(Value::Null, json!({ "type": "tool_use", "id": "t1", "name": "list_files" })),
-                block_delta(Value::Null, json!({ "type": "input_json_delta", "partial_json": "{\"path\": \".\"}" })),
+                block_start(
+                    Value::Null,
+                    json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+                ),
+                block_delta(
+                    Value::Null,
+                    json!({ "type": "input_json_delta", "partial_json": "{\"path\": \".\"}" }),
+                ),
                 block_stop(Value::Null),
                 message_delta("tool_use", json!({ "output_tokens": 9 })),
                 message_stop(),
@@ -437,8 +457,14 @@ mod tests {
             &server,
             sse_body(&[
                 message_start(json!({})),
-                block_start(json!(0), json!({ "type": "tool_use", "id": "t1", "name": "list_files" })),
-                block_delta(json!(0), json!({ "type": "input_json_delta", "partial_json": malformed })),
+                block_start(
+                    json!(0),
+                    json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+                ),
+                block_delta(
+                    json!(0),
+                    json!({ "type": "input_json_delta", "partial_json": malformed }),
+                ),
                 block_stop(json!(0)),
                 message_delta("tool_use", json!({})),
                 message_stop(),
@@ -591,7 +617,11 @@ mod tests {
                 ContentBlock::text("Reading it."),
                 ContentBlock::tool_use("toolu_1", "read_file", json!({ "path": "mix.exs" })),
             ]),
-            Message::user(vec![ContentBlock::tool_result("toolu_1", "defmodule ...", false)]),
+            Message::user(vec![ContentBlock::tool_result(
+                "toolu_1",
+                "defmodule ...",
+                false,
+            )]),
         ];
 
         let conn = connection_for(&server);
@@ -618,10 +648,16 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], json!("read_file"));
-        assert_eq!(tools[0]["description"], json!("Reads the contents of a file."));
+        assert_eq!(
+            tools[0]["description"],
+            json!("Reads the contents of a file.")
+        );
         assert_eq!(tools[0]["input_schema"]["type"], json!("object"));
         assert_eq!(tools[0]["input_schema"]["required"], json!(["path"]));
-        assert_eq!(tools[0]["input_schema"]["properties"]["path"]["type"], json!("string"));
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["path"]["type"],
+            json!("string")
+        );
 
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
@@ -663,10 +699,16 @@ mod tests {
 
         let conn = connection_for(&server).with_temperature(Some(0.7));
         let payload = req_to_value_for(
-            LlmRequest::new("You are Baud.", vec![Message::user(vec![ContentBlock::text("hi")])], vec![]),
+            LlmRequest::new(
+                "You are Baud.",
+                vec![Message::user(vec![ContentBlock::text("hi")])],
+                vec![],
+            ),
             &conn,
         );
-        AnthropicLlm::new().complete(payload, &conn, &mut no_op()).await;
+        AnthropicLlm::new()
+            .complete(payload, &conn, &mut no_op())
+            .await;
 
         let received = &server.received_requests().await.unwrap()[0];
         let body: Value = received.body_json().unwrap();
@@ -700,15 +742,24 @@ mod tests {
         let server = capture_body_server().await;
         let conn = connection_for(&server);
         let payload = req_to_value_for(
-            LlmRequest::new("You are Baud.", vec![Message::user(vec![ContentBlock::text("hi")])], vec![])
-                .with_no_think(true),
+            LlmRequest::new(
+                "You are Baud.",
+                vec![Message::user(vec![ContentBlock::text("hi")])],
+                vec![],
+            )
+            .with_no_think(true),
             &conn,
         );
-        AnthropicLlm::new().complete(payload, &conn, &mut no_op()).await;
+        AnthropicLlm::new()
+            .complete(payload, &conn, &mut no_op())
+            .await;
 
         let received = &server.received_requests().await.unwrap()[0];
         let body: Value = received.body_json().unwrap();
-        assert_eq!(body["chat_template_kwargs"], json!({ "enable_thinking": false }));
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({ "enable_thinking": false })
+        );
     }
 
     #[tokio::test]
@@ -716,14 +767,25 @@ mod tests {
         let server = capture_body_server().await;
         let conn = connection_for(&server);
         let payload = req_to_value_for(
-            LlmRequest::new("You are Baud.", vec![Message::user(vec![ContentBlock::text("hi")])], vec![]),
+            LlmRequest::new(
+                "You are Baud.",
+                vec![Message::user(vec![ContentBlock::text("hi")])],
+                vec![],
+            ),
             &conn,
         );
-        AnthropicLlm::new().complete(payload, &conn, &mut no_op()).await;
+        AnthropicLlm::new()
+            .complete(payload, &conn, &mut no_op())
+            .await;
 
         let received = &server.received_requests().await.unwrap()[0];
         let body: Value = received.body_json().unwrap();
-        assert!(body.as_object().unwrap().get("chat_template_kwargs").is_none());
+        assert!(
+            body.as_object()
+                .unwrap()
+                .get("chat_template_kwargs")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -731,15 +793,26 @@ mod tests {
         let server = capture_body_server().await;
         let conn = connection_for(&server);
         let payload = req_to_value_for(
-            LlmRequest::new("You are Baud.", vec![Message::user(vec![ContentBlock::text("hi")])], vec![])
-                .with_no_think(false),
+            LlmRequest::new(
+                "You are Baud.",
+                vec![Message::user(vec![ContentBlock::text("hi")])],
+                vec![],
+            )
+            .with_no_think(false),
             &conn,
         );
-        AnthropicLlm::new().complete(payload, &conn, &mut no_op()).await;
+        AnthropicLlm::new()
+            .complete(payload, &conn, &mut no_op())
+            .await;
 
         let received = &server.received_requests().await.unwrap()[0];
         let body: Value = received.body_json().unwrap();
-        assert!(body.as_object().unwrap().get("chat_template_kwargs").is_none());
+        assert!(
+            body.as_object()
+                .unwrap()
+                .get("chat_template_kwargs")
+                .is_none()
+        );
     }
 
     // Renders a request against a specific connection (so model/temperature/
@@ -770,11 +843,12 @@ mod tests {
         let mut seen: Vec<Delta> = Vec::new();
         let mut on_event = |ev: &StreamEvent| seen.push(ev.delta.clone());
 
-        let result = fake
-            .complete(json!({}), &conn, &mut on_event)
-            .await;
+        let result = fake.complete(json!({}), &conn, &mut on_event).await;
 
-        assert_eq!(seen, vec![Delta::Text("Hel".into()), Delta::Text("lo".into())]);
+        assert_eq!(
+            seen,
+            vec![Delta::Text("Hel".into()), Delta::Text("lo".into())]
+        );
         assert_eq!(result.content, vec![ContentBlock::text("Hello")]);
         assert_eq!(result.stop_reason, StopReason::EndTurn);
     }

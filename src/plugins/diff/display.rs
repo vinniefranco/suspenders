@@ -139,7 +139,10 @@ mod tests {
             removed: 0,
             created: true,
         };
-        assert_eq!(title("write_file", &diff), "write_file new.ex (new file, +5)");
+        assert_eq!(
+            title("write_file", &diff),
+            "write_file new.ex (new file, +5)"
+        );
     }
 
     // ---- lines/2 ----

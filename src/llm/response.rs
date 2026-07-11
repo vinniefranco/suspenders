@@ -75,11 +75,7 @@ impl Response {
 
     /// Wraps a failure with partial content and usage preserved (the error
     /// algebra: partial streamed content survives into the Conversation).
-    pub fn error_with(
-        reason: impl Into<String>,
-        content: Vec<ContentBlock>,
-        usage: Usage,
-    ) -> Self {
+    pub fn error_with(reason: impl Into<String>, content: Vec<ContentBlock>, usage: Usage) -> Self {
         Response {
             content,
             stop_reason: StopReason::Error,

@@ -6,15 +6,19 @@
 //! `MessageUpdate` (delta + accumulated snapshot), `MessageEnd` — on every path,
 //! including errored responses, then acts on the stop reason. See the Elixir
 //! moduledoc (`baud/lib/baud/turn/loop.ex`) for the full narrative; this port
-//! preserves its behaviour exactly, with the Nudge bookkeeping threaded through
-//! a `&mut Nudges` value instead of baud's functional re-binding.
+//! preserves its behaviour exactly, with the Turn Ledger and the Governors'
+//! trigger state threaded as plain values instead of baud's functional
+//! re-binding.
 //!
 //! This module keeps the loop skeleton: the Pass cycle (request, stream,
 //! dispatch), proactive Compaction at Turn start, and the riders on a
 //! tool-answering Pass (Steering, Explore Nudge, Anchor, Endgame tail rider,
 //! Turn Limit, after-Pass hook). Executing a Pass's Tool Call batch lives in
 //! [`super::batch`]; how a Turn ends when the model stops calling tools lives
-//! in [`super::finish`].
+//! in [`super::finish`]. Every heuristic decision — which Tools ride, what
+//! rides the results tail, when the Turn Limit closes — comes from the
+//! arbiter in [`super::governor`] (ADR-0026); this module only translates the
+//! returned Interventions into effects.
 //!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
 //! [`TurnDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
@@ -26,18 +30,20 @@ use serde_json::Value;
 
 use crate::content::ContentBlock;
 use crate::conversation::{self, Conversation};
-use crate::event::{Event, VoicedTag};
+use crate::event::Event;
 use crate::llm::request::LlmRequest;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::stream::StreamEvent;
 use crate::plan::Plan;
 use crate::plugins::Registered;
-use crate::session::log;
 use crate::session::Session;
+use crate::session::log;
 use crate::tool::ToolCtx;
 use crate::turn::deps::{AfterPass, Emitter, TurnDeps};
-use crate::turn::endgame;
-use crate::turn::nudges::Nudges;
+use crate::turn::governor::ledger::Ledger;
+use crate::turn::governor::{
+    self, AnswerIntervention, FinishIntervention, Governors, RequestIntervention, Rider,
+};
 use crate::turn::{batch, finish};
 use crate::voice;
 
@@ -80,21 +86,22 @@ pub struct RunOpts {
     pub original_task: Option<String>,
 }
 
-// The loop state that spans Passes: the Session's fixed facts, the effect
-// bundle, the owned emission handle (obtained once from `deps.emitter()`,
-// ADR-0025), the Plan/Anchor state, which Pass we are on, and the Nudge
-// bookkeeping. The Conversation stays a separate value the loop folds.
-// Fields are `pub(super)` so `batch` and `finish` work on the state directly.
+// The loop state that spans Passes: the effect bundle, the owned emission
+// handle (obtained once from `deps.emitter()`, ADR-0025), the Plan/Anchor
+// state, the Turn Ledger (the Turn's facts, written here and in `batch` at
+// the firing sites — ADR-0026), and the Governors' trigger state + resolved
+// Setpoints. The Session's fixed facts the loop needs are resolved into the
+// Ledger and the Governors once at Turn start, so no Session reference rides.
+// The Conversation stays a separate value the loop folds. Fields are
+// `pub(super)` so `batch` and `finish` work on the state directly.
 pub(super) struct LoopState<'a, D: TurnDeps> {
-    pub(super) session: &'a Session,
     pub(super) deps: &'a mut D,
     pub(super) emitter: Emitter,
     pub(super) plugins: &'a [Registered],
     pub(super) tool_ctx: &'a ToolCtx,
-    pub(super) nudges: Nudges,
+    pub(super) ledger: Ledger,
+    pub(super) governors: Governors,
     pub(super) plan: Plan,
-    pub(super) pass: u64,
-    pub(super) just_compacted: bool,
 }
 
 /// Runs the loop until the model stops asking for tools, the Turn Limit is hit,
@@ -117,15 +124,13 @@ pub async fn run<D: TurnDeps>(
     let emitter = deps.emitter();
 
     let mut state = LoopState {
-        session,
         deps,
         emitter,
         plugins,
         tool_ctx,
-        nudges: Nudges::new(),
+        ledger: Ledger::new(session.turn_limit),
+        governors: Governors::new(session.anchor_interval, session.no_think_rescue),
         plan,
-        pass: 1,
-        just_compacted: false,
     };
 
     conversation = maybe_compact_proactive(&mut state, conversation).await;
@@ -142,7 +147,7 @@ async fn maybe_compact_proactive<D: TurnDeps>(
     if proactive_compaction_due(&conversation) {
         match state.deps.compact(conversation.clone()).await {
             Ok(compacted) => {
-                state.just_compacted = true;
+                state.ledger.note_compacted();
                 compacted
             }
             Err(_) => conversation,
@@ -169,7 +174,9 @@ async fn run_loop<D: TurnDeps>(
         };
         conversation = next_conv;
 
-        state.emitter.emit(Event::message_start(state.pass as u32));
+        state
+            .emitter
+            .emit(Event::message_start(state.ledger.pass() as u32));
 
         let response = complete_and_emit(state, request).await;
 
@@ -215,19 +222,26 @@ async fn build_request<D: TurnDeps>(
 ) -> Result<(LlmRequest, Conversation), ()> {
     match conversation.for_request() {
         Ok(req) => {
-            let tools = endgame::tools(state.pass, state.session.turn_limit, &state.nudges);
-            let no_think = state.nudges.rescue_armed();
-            // Consuming the rescue arm here clears it so the Pass after reverts.
-            state.nudges.consume_rescue();
-            let request =
-                LlmRequest::new(req.system, req.messages, tools).with_no_think(no_think);
+            // The request-shaping moment (ADR-0026): the full registry rides
+            // and Thinking stays on unless an Intervention narrows or
+            // silences them.
+            let mut tools = crate::tools::specs();
+            let mut no_think = false;
+            let shaped = governor::shape_request(&state.ledger, &mut state.governors);
+            for intervention in shaped {
+                match intervention {
+                    RequestIntervention::NarrowTools(narrowed) => tools = narrowed,
+                    RequestIntervention::SilenceThinking => no_think = true,
+                }
+            }
+            let request = LlmRequest::new(req.system, req.messages, tools).with_no_think(no_think);
             Ok((request, conversation))
         }
         Err(_) => {
             // Compaction recovery: try summarizing before giving up.
             match state.deps.compact(conversation.clone()).await {
                 Ok(compacted) => {
-                    state.just_compacted = true;
+                    state.ledger.note_compacted();
                     Box::pin(build_request(state, compacted)).await
                 }
                 Err(_) => Err(()),
@@ -254,24 +268,24 @@ async fn dispatch<D: TurnDeps>(
             // A :tool_use stop with zero tool_use blocks is a server quirk, not
             // a request for tools; treat it as end_turn (never append an empty
             // Tool Results message and loop forever).
-            if response.content.iter().any(is_tool_use) {
+            if response.content.iter().any(ContentBlock::is_tool_use) {
                 continue_tools(state, conversation, response).await
             } else {
                 let content = response.content.clone();
-                finish::finish(state, conversation, content, StopReason::ToolUse).await
+                finish::finish(state, conversation, content, StopReason::ToolUse)
             }
         }
         StopReason::MaxTokens => {
-            if response.content.iter().any(is_tool_use) {
+            if response.content.iter().any(ContentBlock::is_tool_use) {
                 truncated_batch(state, conversation, response).await
             } else {
                 let content = response.content.clone();
-                finish::finish(state, conversation, content, StopReason::MaxTokens).await
+                finish::finish(state, conversation, content, StopReason::MaxTokens)
             }
         }
         other => {
             let content = response.content.clone();
-            finish::finish(state, conversation, content, other).await
+            finish::finish(state, conversation, content, other)
         }
     }
 }
@@ -297,11 +311,13 @@ async fn truncated_batch<D: TurnDeps>(
     response: Response,
 ) -> Flow {
     let mut results = Vec::new();
-    for block in response.content.iter().filter(|b| is_tool_use(b)) {
+    for block in response.content.iter().filter(|b| b.is_tool_use()) {
         if let ContentBlock::ToolUse { id, name, input } = block {
-            state
-                .emitter
-                .emit(Event::tool_call(id.clone(), name.clone(), batch::display_input(input)));
+            state.emitter.emit(Event::tool_call(
+                id.clone(),
+                name.clone(),
+                batch::display_input(input),
+            ));
 
             let content = voice::truncated_call_nudge().to_string();
             state.emitter.emit(Event::tool_result(
@@ -316,7 +332,8 @@ async fn truncated_batch<D: TurnDeps>(
         }
     }
 
-    state.nudges.next_pass();
+    state.governors.next_pass();
+    state.ledger.close_batch();
     next_pass(state, conversation, response, results).await
 }
 
@@ -338,38 +355,48 @@ async fn next_pass<D: TurnDeps>(
         state.emitter.emit(Event::steering_delivered(text.clone()));
     }
 
-    let calls = pass_calls(&response.content);
+    // The Tool Calls this Pass carried are a Ledger fact, recorded once here
+    // (a truncated batch's calls count even though none executed).
+    state
+        .ledger
+        .record_pass_calls(pass_calls(&response.content));
 
     // Verify-failed / Verify / Empty re-arm on progress (a Pass that made at
     // least one Tool Call). This is a tool-answering Pass, so calls is non-empty.
-    state.nudges.note_progress(&calls);
+    state.governors.note_progress(state.ledger.pass_calls());
 
-    // Explore Nudge: rides the trailing tool-results user message.
-    maybe_explore_nudge(state, &mut conversation, &calls);
-
-    // Anchor injection: every anchor_interval Passes and after a Compaction.
-    maybe_inject_anchor(state, &mut conversation);
-
-    // The Endgame's tail rider (wrap-up warning / Verification Pass / final-Pass
-    // prompt), riding the results message like Steering and the Anchor.
-    apply_tail_rider(state, &mut conversation);
+    // The results tail of the Tool Call answering moment (ADR-0026): the
+    // arbiter decides what rides the trailing tool-results user message —
+    // Explore Nudge, Anchor, the Endgame's rider — and this site applies it.
+    let tail = governor::answer_tail(&state.ledger, &mut state.governors);
+    state.ledger.note_tail_delivered();
+    for intervention in tail {
+        apply_tail(state, &mut conversation, intervention);
+    }
 
     state.deps.checkpoint(&conversation);
 
-    if endgame::final_pass(state.pass, state.session.turn_limit) {
-        // Turn Limit: stop calling the model. The marker keeps roles alternating.
-        let reason = endgame::limit_stop_reason(&state.nudges);
-        return Flow::Done(finish::close(
-            state,
-            conversation,
-            voice::turn_limit_marker(),
-            reason,
-        ));
+    // The finish-settlement moment, consulted after a tool-answering Pass: at
+    // the Turn Limit the arbiter closes the Turn on the marker (stop calling
+    // the model; the marker keeps roles alternating).
+    match governor::settle_capped(&state.ledger) {
+        Some(FinishIntervention::Close(reason)) => {
+            return Flow::Done(finish::close(
+                state,
+                conversation,
+                voice::turn_limit_marker(),
+                reason,
+            ));
+        }
+        Some(FinishIntervention::Standalone { .. }) => {
+            unreachable!("only a Close issues at the Turn Limit")
+        }
+        None => {}
     }
 
     match state.deps.after_pass(&response, &conversation).await {
         AfterPass::Continue => {
-            state.pass += 1;
+            state.ledger.advance_pass();
             Flow::Continue(conversation)
         }
         AfterPass::Stop(reason) => Flow::Done(finish::close_custom(
@@ -380,60 +407,34 @@ async fn next_pass<D: TurnDeps>(
         )),
         AfterPass::Inject(text) => {
             conversation.merge_user_text(text);
-            state.pass += 1;
+            state.ledger.advance_pass();
             Flow::Continue(conversation)
         }
     }
 }
 
-// Explore Nudge: folds this Pass's Tool Calls into the exploration streak; on
-// the 3rd/6th/... such Pass the Voice nudge merges into the trailing
-// tool-results user message and an event announces it.
-fn maybe_explore_nudge<D: TurnDeps>(
+// Translates one results-tail Intervention into its effect: Voiced text is
+// announced with its Transcript event and merged into the trailing
+// tool-results user message; the Anchor injects the Plan's current anchor
+// block on the same seam. The per-call Interventions never issue from the
+// tail consultation (they are translated in `super::batch`).
+fn apply_tail<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     conversation: &mut Conversation,
-    calls: &[(String, Value)],
+    intervention: AnswerIntervention,
 ) {
-    if state.nudges.note_pass_calls(calls) {
-        let nudge = voice::explore_nudge();
-        state.emitter.emit(Event::voiced(VoicedTag::ExploreNudge, nudge));
-        conversation.merge_user_text(nudge);
+    match intervention {
+        AnswerIntervention::RideTail(Rider::Voiced { tag, text }) => {
+            state.emitter.emit(Event::voiced(tag, text.clone()));
+            conversation.merge_user_text(text);
+        }
+        AnswerIntervention::RideTail(Rider::Anchor) => {
+            conversation.inject_anchor(state.plan.anchor());
+        }
+        AnswerIntervention::ReplaceResult { .. } | AnswerIntervention::AnnotateResult(_) => {
+            unreachable!("per-call Interventions never ride the results tail")
+        }
     }
-}
-
-// The Endgame's tail rider for this Pass position, announced with its event tag
-// and merged into the trailing tool-results user message.
-fn apply_tail_rider<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &mut Conversation) {
-    use crate::turn::endgame::TailRider;
-    let (tag, text) = match endgame::tail_rider(state.pass, state.session.turn_limit, &state.nudges)
-    {
-        TailRider::VerificationPass(t) => (VoicedTag::VerificationPass, t),
-        TailRider::WrapUpWarning(t) => (VoicedTag::WrapUpWarning, t),
-        TailRider::FinalPass(t) => (VoicedTag::FinalPass, t),
-        TailRider::None => return,
-    };
-    state.emitter.emit(Event::voiced(tag, text.clone()));
-    conversation.merge_user_text(text);
-}
-
-// Injects an Anchor when the cadence calls for it: every anchor_interval Passes,
-// or on the first Pass after a Compaction. Clears the flag either way.
-fn maybe_inject_anchor<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &mut Conversation) {
-    let due = anchor_due(state);
-    state.just_compacted = false;
-    if due {
-        let anchor = state.plan.anchor();
-        conversation.inject_anchor(anchor);
-    }
-}
-
-fn anchor_due<D: TurnDeps>(state: &LoopState<'_, D>) -> bool {
-    let interval = state.session.anchor_interval;
-    state.just_compacted || (interval != 0 && state.pass.is_multiple_of(interval))
-}
-
-pub(super) fn is_tool_use(block: &ContentBlock) -> bool {
-    matches!(block, ContentBlock::ToolUse { .. })
 }
 
 // This Pass's Tool Calls as {name, input} pairs, in order.
@@ -472,6 +473,7 @@ fn usage_of(response: &Response) -> conversation::Usage {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::content::Usage;
     use crate::content::{ContentBlock, Role};
     use crate::event::Stage;
     use crate::llm::response::Response;
@@ -480,13 +482,12 @@ mod tests {
     use crate::plugins::Registered;
     use crate::session::connection::Connection;
     use crate::session::{Session, SessionOpts};
-    use crate::test_support::FakeDeps;
-    use crate::turn::deps::CompactError;
     use crate::test_support::Entry;
+    use crate::test_support::FakeDeps;
     use crate::tool::ToolCtx;
-    use crate::content::Usage;
+    use crate::turn::deps::CompactError;
     use crate::turn::fixtures::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -515,11 +516,19 @@ mod tests {
 
         let evs = events(&deps);
         // tool_call for tu_1
-        assert!(evs.iter().any(|e| matches!(e, Event::ToolCall { id, name, input }
-            if id == "tu_1" && name == "list_files" && input == &json!({"path": "."}))));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::ToolCall { id, name, input }
+            if id == "tu_1" && name == "list_files" && input == &json!({"path": "."})))
+        );
         // tool_result for tu_1, not error, listing contains marker.txt
         let listing = evs.iter().find_map(|e| match e {
-            Event::ToolResult { id, is_error, content, .. } if id == "tu_1" => {
+            Event::ToolResult {
+                id,
+                is_error,
+                content,
+                ..
+            } if id == "tu_1" => {
                 assert!(!is_error);
                 Some(content.clone())
             }
@@ -534,7 +543,9 @@ mod tests {
         assert!(matches!(&tail[0].role, Role::Assistant));
         assert!(matches!(&tail[0].content[0], ContentBlock::ToolUse { id, .. } if id == "tu_1"));
         assert!(matches!(&tail[1].role, Role::User));
-        assert!(matches!(&tail[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu_1"));
+        assert!(
+            matches!(&tail[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu_1")
+        );
 
         // The second request carried tools and the tool_result went back.
         let requests = deps.requests.lock().unwrap();
@@ -542,11 +553,15 @@ mod tests {
         assert!(!second.tools.is_empty());
         let last = second.messages.last().unwrap();
         assert!(matches!(&last.role, Role::User));
-        assert!(matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "tu_1" && !is_error));
+        assert!(
+            matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "tu_1" && !is_error)
+        );
 
         // The conversation ends on the model's reply.
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "Here are the files."));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "Here are the files.")
+        );
     }
 
     #[tokio::test]
@@ -571,20 +586,29 @@ mod tests {
 
         assert!(matches!(evs[0], Event::MessageStart { pass: 1 }));
         // First update: thinking delta + snapshot with thinking block.
-        assert!(evs.iter().any(|e| matches!(e, Event::MessageUpdate { delta, content }
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::MessageUpdate { delta, content }
             if *delta == Delta::Thinking("hm".into())
-            && matches!(content.first(), Some(ContentBlock::Thinking { text }) if text == "hm"))));
+            && matches!(content.first(), Some(ContentBlock::Thinking { text }) if text == "hm")))
+        );
         // A text delta "hi ".
-        assert!(evs.iter().any(|e| matches!(e, Event::MessageUpdate { delta, .. }
-            if *delta == Delta::Text("hi ".into()))));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::MessageUpdate { delta, .. }
+            if *delta == Delta::Text("hi ".into())))
+        );
         // "there" update: snapshot has accumulated "hi there".
         assert!(evs.iter().any(|e| matches!(e, Event::MessageUpdate { delta, content }
             if *delta == Delta::Text("there".into())
             && content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "hi there")))));
         // message_end with text content and end_turn.
-        assert!(evs.iter().any(|e| matches!(e, Event::MessageEnd { content, stop_reason }
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::MessageEnd { content, stop_reason }
             if stop_reason == &StopReason::EndTurn
-            && matches!(content.first(), Some(ContentBlock::Text { .. })))));
+            && matches!(content.first(), Some(ContentBlock::Text { .. }))))
+        );
     }
 
     #[tokio::test]
@@ -659,9 +683,11 @@ mod tests {
         let pressures: Vec<(u64, u64, u64)> = evs
             .iter()
             .filter_map(|e| match e {
-                Event::ContextPressure { token_estimate, context_budget, max_tokens_reserve } => {
-                    Some((*token_estimate, *context_budget, *max_tokens_reserve))
-                }
+                Event::ContextPressure {
+                    token_estimate,
+                    context_budget,
+                    max_tokens_reserve,
+                } => Some((*token_estimate, *context_budget, *max_tokens_reserve)),
                 _ => None,
             })
             .collect();
@@ -686,7 +712,9 @@ mod tests {
         );
         let (outcome, _deps) = run_with(&session, "list the files", deps).await;
         let (conv, _) = ok(&outcome);
-        assert!(!conv.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("context_pressure")))));
+        assert!(!conv.messages.iter().any(|m| m.content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("context_pressure"))
+        )));
     }
 
     // ---- steering ---------------------------------------------------------
@@ -708,13 +736,19 @@ mod tests {
         ok(&outcome);
 
         let evs = events(&deps);
-        assert!(evs.iter().any(|e| matches!(e, Event::SteeringDelivered { text } if text == "also check the README")));
+        assert!(evs.iter().any(
+            |e| matches!(e, Event::SteeringDelivered { text } if text == "also check the README")
+        ));
 
         let requests = deps.requests.lock().unwrap();
         let last = requests[1].messages.last().unwrap();
         assert!(matches!(&last.role, Role::User));
-        assert!(matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"));
-        assert!(matches!(&last.content[1], ContentBlock::Text { text } if text == "also check the README"));
+        assert!(
+            matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")
+        );
+        assert!(
+            matches!(&last.content[1], ContentBlock::Text { text } if text == "also check the README")
+        );
     }
 
     // ---- after-Pass hook --------------------------------------------------
@@ -725,7 +759,11 @@ mod tests {
         let session = session(root.path());
         let deps = deps_for(
             &session,
-            vec![just(tool_use_result("t1", "list_files", json!({"path": "."})))],
+            vec![just(tool_use_result(
+                "t1",
+                "list_files",
+                json!({"path": "."}),
+            ))],
         )
         .with_after_pass(|_r, _c| AfterPass::Stop("budget_hook".to_string()));
 
@@ -733,7 +771,9 @@ mod tests {
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Custom("budget_hook".to_string()));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn stopped - reply to continue]"));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn stopped - reply to continue]")
+        );
     }
 
     #[tokio::test]
@@ -760,7 +800,9 @@ mod tests {
         let last = requests[1].messages.last().unwrap();
         assert!(matches!(&last.role, Role::User));
         assert!(matches!(&last.content[0], ContentBlock::ToolResult { .. }));
-        assert!(matches!(&last.content[1], ContentBlock::Text { text } if text == "remember the budget"));
+        assert!(
+            matches!(&last.content[1], ContentBlock::Text { text } if text == "remember the budget")
+        );
     }
 
     // ---- error algebra ----------------------------------------------------
@@ -807,7 +849,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
                 just(text_end("all done")),
                 just(text_end("declining to verify")),
             ],
@@ -815,10 +861,19 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
         let (conv, _) = ok(&outcome);
         let evs = events(&deps);
-        assert!(find_tool_result(&evs, "w1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
-        let nudges: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::VerifyNudge { .. })).collect();
+        assert!(
+            find_tool_result(&evs, "w1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error))
+                .unwrap_or(false)
+        );
+        let nudges: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::VerifyNudge { .. }))
+            .collect();
         assert_eq!(nudges.len(), 1);
-        assert!(matches!(nudges[0], Event::VerifyNudge { text } if text.contains("files changed but nothing verified")));
+        assert!(
+            matches!(nudges[0], Event::VerifyNudge { text } if text.contains("files changed but nothing verified"))
+        );
         assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User) && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("files changed but nothing verified")))));
     }
 
@@ -829,9 +884,17 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
                 just(text_end("all done")),
-                just(tool_use_result("w2", "edit_file", json!({"path": "a.txt", "old_str": "hi", "new_str": "ho"}))),
+                just(tool_use_result(
+                    "w2",
+                    "edit_file",
+                    json!({"path": "a.txt", "old_str": "hi", "new_str": "ho"}),
+                )),
                 just(text_end("done again, still unverified")),
                 just(text_end("concluding")),
             ],
@@ -839,7 +902,10 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 2);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })),
+            2
+        );
     }
 
     #[tokio::test]
@@ -849,8 +915,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
-                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
                 just(text_end("verified")),
             ],
         )
@@ -858,7 +932,10 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write and verify", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -868,8 +945,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
-                just(tool_use_result("r1", "run_command", json!({"command": "mix test"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "mix test"}),
+                )),
                 just(text_end("stopping here")),
             ],
         )
@@ -877,8 +962,15 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write and verify", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+        assert!(
+            find_tool_result(&evs, "r1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error))
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -901,8 +993,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("f1", "web_fetch", json!({"url": denied_url}))),
-                just(tool_use_result("f2", "web_fetch", json!({"url": url.clone()}))),
+                just(tool_use_result(
+                    "f1",
+                    "web_fetch",
+                    json!({"url": denied_url}),
+                )),
+                just(tool_use_result(
+                    "f2",
+                    "web_fetch",
+                    json!({"url": url.clone()}),
+                )),
                 just(text_end("read the docs")),
             ],
         )
@@ -914,20 +1014,30 @@ mod tests {
 
         // Each fetch requested Approval showing the full URL as the string —
         // the same string Standing Approval would match exactly (ADR-0024).
-        assert!(evs.iter().any(|e| matches!(e, Event::ApprovalRequest { command, .. }
-            if command == denied_url)));
-        assert!(evs.iter().any(|e| matches!(e, Event::ApprovalRequest { command, .. }
-            if command == &url)));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::ApprovalRequest { command, .. }
+            if command == denied_url))
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::ApprovalRequest { command, .. }
+            if command == &url))
+        );
 
         // Denial is the denied is_error result; approval executes the fetch.
-        assert!(find_tool_result(&evs, "f1")
-            .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
+        assert!(
+            find_tool_result(&evs, "f1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
                 if *is_error && content == voice::command_denied()))
-            .unwrap_or(false));
-        assert!(find_tool_result(&evs, "f2")
-            .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
+                .unwrap_or(false)
+        );
+        assert!(
+            find_tool_result(&evs, "f2")
+                .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
                 if !is_error && content.contains("hello from the web")))
-            .unwrap_or(false));
+                .unwrap_or(false)
+        );
     }
 
     #[tokio::test]
@@ -939,13 +1049,20 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
                 just(text_end("done")),
             ],
         );
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(e, Event::VerifyNudge { .. })),
+            0
+        );
     }
 
     // ---- verification-failing finish gate ---------------------------------
@@ -957,7 +1074,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(text_end("giving up in prose")),
                 just(text_end("ok, fixed it")),
             ],
@@ -966,10 +1087,19 @@ mod tests {
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         let (conv, _) = ok(&outcome);
         let evs = events(&deps);
-        assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
-        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::VerifyFailedNudge { .. })).collect();
+        assert!(
+            find_tool_result(&evs, "r1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error))
+                .unwrap_or(false)
+        );
+        let n: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::VerifyFailedNudge { .. }))
+            .collect();
         assert_eq!(n.len(), 1);
-        assert!(matches!(n[0], Event::VerifyFailedNudge { text } if text.contains("last command you ran failed")));
+        assert!(
+            matches!(n[0], Event::VerifyFailedNudge { text } if text.contains("last command you ran failed"))
+        );
         assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User) && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("last command you ran failed")))));
     }
 
@@ -980,8 +1110,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
-                just(tool_use_result("r2", "run_command", json!({"command": "true"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
+                just(tool_use_result(
+                    "r2",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
                 just(text_end("verified green")),
             ],
         )
@@ -989,9 +1127,20 @@ mod tests {
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
-        assert!(find_tool_result(&evs, "r2").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 0);
+        assert!(
+            find_tool_result(&evs, "r1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error))
+                .unwrap_or(false)
+        );
+        assert!(
+            find_tool_result(&evs, "r2")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error))
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1007,7 +1156,13 @@ mod tests {
         );
         let (outcome, deps) = run_with(&session, "list files", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::VerifyFailedNudge { .. }
+            )),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1017,7 +1172,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(text_end("still stuck")),
                 just(text_end("still stuck again")),
             ],
@@ -1025,7 +1184,13 @@ mod tests {
         .with_approvals(vec![true]);
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::VerifyFailedNudge { .. }
+            )),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1036,7 +1201,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(text_end("giving up in prose")),
                 just(tool_use_result("l1", "read_file", json!({"path": "a.ex"}))),
                 just(text_end("finishing again, still red")),
@@ -1047,8 +1216,15 @@ mod tests {
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(find_tool_result(&evs, "l1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 2);
+        assert!(
+            find_tool_result(&evs, "l1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error))
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1058,7 +1234,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(empty(StopReason::EndTurn)),
                 just(empty(StopReason::EndTurn)),
                 just(text_end("finally saying something")),
@@ -1067,7 +1247,13 @@ mod tests {
         .with_approvals(vec![true]);
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::VerifyFailedNudge { .. }
+            )),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1077,8 +1263,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(text_end("done, but tests are red")),
                 just(text_end("second finish")),
             ],
@@ -1087,8 +1281,14 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write and verify", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })),
+            1
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1100,14 +1300,24 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(text_end("done")),
             ],
         )
         .with_approvals(vec![true]);
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::VerifyFailedNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::VerifyFailedNudge { .. }
+            )),
+            0
+        );
     }
 
     // ---- empty-response nudge ---------------------------------------------
@@ -1126,12 +1336,22 @@ mod tests {
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         let (conv, _) = ok(&outcome);
         let evs = events(&deps);
-        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::EmptyResponseNudge { .. })).collect();
+        let n: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::EmptyResponseNudge { .. }))
+            .collect();
         assert_eq!(n.len(), 1);
-        assert!(matches!(n[0], Event::EmptyResponseNudge { text } if text.contains("reply was empty")));
-        assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User) && m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("reply was empty")))));
+        assert!(
+            matches!(n[0], Event::EmptyResponseNudge { text } if text.contains("reply was empty"))
+        );
+        assert!(conv.messages.iter().any(|m| matches!(m.role, Role::User)
+            && m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("reply was empty"))
+            )));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "here is my next step"));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "here is my next step")
+        );
     }
 
     #[tokio::test]
@@ -1140,13 +1360,24 @@ mod tests {
         let session = session(root.path());
         let deps = deps_for(
             &session,
-            vec![just(empty(StopReason::EndTurn)), just(empty(StopReason::EndTurn))],
+            vec![
+                just(empty(StopReason::EndTurn)),
+                just(empty(StopReason::EndTurn)),
+            ],
         );
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         let (conv, _) = ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 1);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::EmptyResponseNudge { .. }
+            )),
+            1
+        );
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::empty_response_marker()));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::empty_response_marker())
+        );
     }
 
     #[tokio::test]
@@ -1162,9 +1393,17 @@ mod tests {
         );
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         let (conv, _) = ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 1);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::EmptyResponseNudge { .. }
+            )),
+            1
+        );
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the real conclusion"));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "the real conclusion")
+        );
     }
 
     #[tokio::test]
@@ -1173,11 +1412,19 @@ mod tests {
         let session = session(root.path());
         let deps = deps_for(
             &session,
-            vec![just(text_end("I kept hitting [empty response] markers; here is my summary."))],
+            vec![just(text_end(
+                "I kept hitting [empty response] markers; here is my summary.",
+            ))],
         );
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::EmptyResponseNudge { .. }
+            )),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1197,10 +1444,19 @@ mod tests {
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         let (conv, _) = ok(&outcome);
         let evs = events(&deps);
-        assert!(find_tool_result(&evs, "l1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error)).unwrap_or(false));
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })), 2);
+        assert!(
+            find_tool_result(&evs, "l1")
+                .map(|e| matches!(e, Event::ToolResult { is_error, .. } if !is_error))
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })),
+            2
+        );
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the actual answer at last"));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "the actual answer at last")
+        );
     }
 
     #[tokio::test]
@@ -1210,7 +1466,13 @@ mod tests {
         let deps = deps_for(&session, vec![just(text_end("a normal, non-empty reply"))]);
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::EmptyResponseNudge { .. }
+            )),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1220,7 +1482,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "false"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
                 just(empty(StopReason::EndTurn)),
                 just(text_end("fixed it")),
             ],
@@ -1229,8 +1495,14 @@ mod tests {
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })), 1);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyFailedNudge { .. })),
+            1
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1248,9 +1520,17 @@ mod tests {
         );
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         let (conv, _) = ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::EmptyResponseNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(
+                e,
+                Event::EmptyResponseNudge { .. }
+            )),
+            0
+        );
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::empty_response_marker()));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::empty_response_marker())
+        );
     }
 
     // ---- no-think rescue --------------------------------------------------
@@ -1318,7 +1598,10 @@ mod tests {
         let (outcome, deps) = run_with(&session, "do something", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })), 1);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::EmptyResponseNudge { .. })),
+            1
+        );
         let requests = deps.requests.lock().unwrap();
         assert!(!requests[0].no_think);
         assert!(!requests[1].no_think);
@@ -1350,10 +1633,18 @@ mod tests {
     // ---- wrap-up warning --------------------------------------------------
 
     fn request_last_texts(req: &LlmRequest) -> Vec<String> {
-        req.messages.last().map(|m| m.content.iter().filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.clone()),
-            _ => None,
-        }).collect()).unwrap_or_default()
+        req.messages
+            .last()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -1373,12 +1664,21 @@ mod tests {
         let (outcome, deps) = run_with(&session, "big task", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        let w: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::WrapUpWarning { .. })).collect();
+        let w: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::WrapUpWarning { .. }))
+            .collect();
         assert_eq!(w.len(), 1);
-        assert!(matches!(w[0], Event::WrapUpWarning { text } if *text == voice::wrap_up_warning(2)));
+        assert!(
+            matches!(w[0], Event::WrapUpWarning { text } if *text == voice::wrap_up_warning(2))
+        );
         // Pass 3's request (index 2) carries the warning text.
         let requests = deps.requests.lock().unwrap();
-        assert!(request_last_texts(&requests[2]).iter().any(|t| t.contains("wrap up now")));
+        assert!(
+            request_last_texts(&requests[2])
+                .iter()
+                .any(|t| t.contains("wrap up now"))
+        );
     }
 
     #[tokio::test]
@@ -1395,8 +1695,14 @@ mod tests {
         let (outcome, deps) = run_with(&session, "small task", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })), 0);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::FinalPass { .. })), 0);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })),
+            0
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::FinalPass { .. })),
+            0
+        );
     }
 
     // ---- Verification Pass ------------------------------------------------
@@ -1410,9 +1716,17 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
                 just(tool_use_result("t1", "list_files", json!({"path": "."}))),
-                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
                 just(text_end("Verified and done.")),
             ],
         )
@@ -1420,15 +1734,27 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        let v: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::VerificationPass { .. })).collect();
+        let v: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::VerificationPass { .. }))
+            .collect();
         assert_eq!(v.len(), 1);
-        assert!(matches!(v[0], Event::VerificationPass { text } if text == voice::verification_pass_prompt()));
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })), 0);
+        assert!(
+            matches!(v[0], Event::VerificationPass { text } if text == voice::verification_pass_prompt())
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })),
+            0
+        );
         let requests = deps.requests.lock().unwrap();
         // Pass 3's request (index 2): run_command ONLY, and the prompt text.
         let names: Vec<&str> = requests[2].tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["run_command"]);
-        assert!(request_last_texts(&requests[2]).iter().any(|t| t.contains("run_command ONLY")));
+        assert!(
+            request_last_texts(&requests[2])
+                .iter()
+                .any(|t| t.contains("run_command ONLY"))
+        );
     }
 
     #[tokio::test]
@@ -1440,8 +1766,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("w1", "write_file", json!({"path": "a.txt", "content": "hi"}))),
-                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
                 just(text_end("done and verified")),
             ],
         )
@@ -1449,8 +1783,14 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })), 1);
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerificationPass { .. })), 0);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::WrapUpWarning { .. })),
+            1
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerificationPass { .. })),
+            0
+        );
         let requests = deps.requests.lock().unwrap();
         assert!(requests[2].tools.len() > 1);
     }
@@ -1468,21 +1808,32 @@ mod tests {
             vec![
                 just(tool_use_result("t1", "list_files", json!({"path": "."}))),
                 just(tool_use_result("t2", "list_files", json!({"path": "."}))),
-                just(text_end("Accomplished: listed files twice. Remains: nothing.")),
+                just(text_end(
+                    "Accomplished: listed files twice. Remains: nothing.",
+                )),
             ],
         );
         let (outcome, deps) = run_with(&session, "big task", deps).await;
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::end_turn());
         let evs = events(&deps);
-        let f: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::FinalPass { .. })).collect();
+        let f: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::FinalPass { .. }))
+            .collect();
         assert_eq!(f.len(), 1);
         assert!(matches!(f[0], Event::FinalPass { text } if text == voice::final_pass_prompt()));
         let requests = deps.requests.lock().unwrap();
         assert!(requests[2].tools.is_empty());
-        assert!(request_last_texts(&requests[2]).iter().any(|t| t.contains("tools are withdrawn")));
+        assert!(
+            request_last_texts(&requests[2])
+                .iter()
+                .any(|t| t.contains("tools are withdrawn"))
+        );
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text.contains("Accomplished")));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text.contains("Accomplished"))
+        );
     }
 
     #[tokio::test]
@@ -1504,8 +1855,14 @@ mod tests {
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker()));
-        assert!(!conv.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("<tool_call")))));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+        );
+        assert!(!conv.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("<tool_call")))
+        }));
     }
 
     #[tokio::test]
@@ -1519,7 +1876,9 @@ mod tests {
             vec![
                 just(tool_use_result("t1", "list_files", json!({"path": "."}))),
                 just(tool_use_result("t2", "list_files", json!({"path": "."}))),
-                just(text_end("Done. I could not run mix test - the <tool_call> was withdrawn.")),
+                just(text_end(
+                    "Done. I could not run mix test - the <tool_call> was withdrawn.",
+                )),
             ],
         );
         let (outcome, _deps) = run_with(&session, "big task", deps).await;
@@ -1546,7 +1905,9 @@ mod tests {
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker()));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+        );
     }
 
     #[tokio::test]
@@ -1567,7 +1928,9 @@ mod tests {
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker()));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+        );
     }
 
     // ---- loop guards ------------------------------------------------------
@@ -1602,7 +1965,11 @@ mod tests {
                 just(Response {
                     content: vec![
                         ContentBlock::text("partial answer"),
-                        ContentBlock::tool_use("t1", "write_file", json!({"path": "a.txt", "content": "trunca"})),
+                        ContentBlock::tool_use(
+                            "t1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "trunca"}),
+                        ),
                     ],
                     stop_reason: StopReason::MaxTokens,
                     usage: Usage::default(),
@@ -1615,7 +1982,9 @@ mod tests {
         ok(&outcome);
         let evs = events(&deps);
         let tr = find_tool_result(&evs, "t1").unwrap();
-        assert!(matches!(tr, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("re-issue")));
+        assert!(
+            matches!(tr, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("re-issue"))
+        );
         // Nothing touched disk.
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         // The batch went back intact.
@@ -1625,7 +1994,9 @@ mod tests {
         assert!(matches!(&tail[0].role, Role::Assistant));
         assert!(matches!(&tail[0].content[0], ContentBlock::Text { .. }));
         assert!(matches!(&tail[0].content[1], ContentBlock::ToolUse { id, .. } if id == "t1"));
-        assert!(matches!(&tail[1].content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t1" && *is_error));
+        assert!(
+            matches!(&tail[1].content[0], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t1" && *is_error)
+        );
     }
 
     #[tokio::test]
@@ -1650,9 +2021,16 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write it", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if *is_error));
-        assert!(matches!(find_tool_result(&evs, "t2").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
-        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "hello");
+        assert!(
+            matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if *is_error)
+        );
+        assert!(
+            matches!(find_tool_result(&evs, "t2").unwrap(), Event::ToolResult { is_error, .. } if !is_error)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[tokio::test]
@@ -1679,7 +2057,9 @@ mod tests {
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::MaxTokens));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "[response truncated by max_tokens]"));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "[response truncated by max_tokens]")
+        );
     }
 
     #[tokio::test]
@@ -1699,10 +2079,14 @@ mod tests {
         let (conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn limit reached - reply to continue]"));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn limit reached - reply to continue]")
+        );
         let penult = &conv.messages[conv.messages.len() - 2];
         assert!(matches!(&penult.role, Role::User));
-        assert!(matches!(&penult.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t2"));
+        assert!(
+            matches!(&penult.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t2")
+        );
     }
 
     #[tokio::test]
@@ -1720,9 +2104,13 @@ mod tests {
         let (outcome, deps) = run_with(&session, "list twice", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
+        assert!(
+            matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if !is_error)
+        );
         let t2 = find_tool_result(&evs, "t2").unwrap();
-        assert!(matches!(t2, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("identical Tool Call repeated")));
+        assert!(
+            matches!(t2, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("identical Tool Call repeated"))
+        );
     }
 
     #[tokio::test]
@@ -1731,7 +2119,11 @@ mod tests {
         let session = session(root.path());
         let fix_and_retest = Response {
             content: vec![
-                ContentBlock::tool_use("w1", "write_file", json!({"path": "a.txt", "content": "fixed"})),
+                ContentBlock::tool_use(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "fixed"}),
+                ),
                 ContentBlock::tool_use("r2", "run_command", json!({"command": "true"})),
             ],
             stop_reason: StopReason::ToolUse,
@@ -1741,7 +2133,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("r1", "run_command", json!({"command": "true"}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
                 just(fix_and_retest),
                 just(text_end("verified")),
             ],
@@ -1751,8 +2147,13 @@ mod tests {
         ok(&outcome);
         let evs = events(&deps);
         let r2 = find_tool_result(&evs, "r2").unwrap();
-        assert!(matches!(r2, Event::ToolResult { is_error, content, .. } if !is_error && !content.contains("identical Tool Call repeated")));
-        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+        assert!(
+            matches!(r2, Event::ToolResult { is_error, content, .. } if !is_error && !content.contains("identical Tool Call repeated"))
+        );
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1762,7 +2163,11 @@ mod tests {
         let list_write_read = Response {
             content: vec![
                 ContentBlock::tool_use("l1", "list_files", json!({"path": "."})),
-                ContentBlock::tool_use("w1", "write_file", json!({"path": "a.txt", "content": "hi"})),
+                ContentBlock::tool_use(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                ),
                 ContentBlock::tool_use("rd1", "read_file", json!({"path": "a.txt"})),
             ],
             stop_reason: StopReason::ToolUse,
@@ -1791,9 +2196,13 @@ mod tests {
         ok(&outcome);
         let evs = events(&deps);
         let l2 = find_tool_result(&evs, "l2").unwrap();
-        assert!(matches!(l2, Event::ToolResult { is_error, content, .. } if !is_error && !content.contains("identical Tool Call repeated")));
+        assert!(
+            matches!(l2, Event::ToolResult { is_error, content, .. } if !is_error && !content.contains("identical Tool Call repeated"))
+        );
         let rd2 = find_tool_result(&evs, "rd2").unwrap();
-        assert!(matches!(rd2, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("identical Tool Call repeated")));
+        assert!(
+            matches!(rd2, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("identical Tool Call repeated"))
+        );
     }
 
     #[tokio::test]
@@ -1803,9 +2212,21 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("f1", "read_file", json!({"path": "no1.txt"}))),
-                just(tool_use_result("f2", "read_file", json!({"path": "no2.txt"}))),
-                just(tool_use_result("f3", "read_file", json!({"path": "no3.txt"}))),
+                just(tool_use_result(
+                    "f1",
+                    "read_file",
+                    json!({"path": "no1.txt"}),
+                )),
+                just(tool_use_result(
+                    "f2",
+                    "read_file",
+                    json!({"path": "no2.txt"}),
+                )),
+                just(tool_use_result(
+                    "f3",
+                    "read_file",
+                    json!({"path": "no3.txt"}),
+                )),
                 just(text_end("giving up")),
             ],
         );
@@ -1832,19 +2253,44 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("f1", "read_file", json!({"path": "no1.txt"}))),
-                just(tool_use_result("f2", "read_file", json!({"path": "no2.txt"}))),
-                just(tool_use_result("ok", "read_file", json!({"path": "ok.txt"}))),
-                just(tool_use_result("f3", "read_file", json!({"path": "no3.txt"}))),
-                just(tool_use_result("f4", "read_file", json!({"path": "no4.txt"}))),
+                just(tool_use_result(
+                    "f1",
+                    "read_file",
+                    json!({"path": "no1.txt"}),
+                )),
+                just(tool_use_result(
+                    "f2",
+                    "read_file",
+                    json!({"path": "no2.txt"}),
+                )),
+                just(tool_use_result(
+                    "ok",
+                    "read_file",
+                    json!({"path": "ok.txt"}),
+                )),
+                just(tool_use_result(
+                    "f3",
+                    "read_file",
+                    json!({"path": "no3.txt"}),
+                )),
+                just(tool_use_result(
+                    "f4",
+                    "read_file",
+                    json!({"path": "no4.txt"}),
+                )),
                 just(text_end("done")),
             ],
         );
         let (outcome, deps) = run_with(&session, "read things", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(matches!(find_tool_result(&evs, "ok").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
-        let c4 = match find_tool_result(&evs, "f4").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(
+            matches!(find_tool_result(&evs, "ok").unwrap(), Event::ToolResult { is_error, .. } if !is_error)
+        );
+        let c4 = match find_tool_result(&evs, "f4").unwrap() {
+            Event::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
         assert!(!c4.contains("consecutive"));
     }
 
@@ -1855,18 +2301,35 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("f1", "read_file", json!({"path": "no1.txt"}))),
-                just(tool_use_result("f2", "read_file", json!({"path": "no2.txt"}))),
+                just(tool_use_result(
+                    "f1",
+                    "read_file",
+                    json!({"path": "no1.txt"}),
+                )),
+                just(tool_use_result(
+                    "f2",
+                    "read_file",
+                    json!({"path": "no2.txt"}),
+                )),
                 just(tool_use_result("ok", "list_files", json!({"path": "."}))),
-                just(tool_use_result("f3", "read_file", json!({"path": "no3.txt"}))),
+                just(tool_use_result(
+                    "f3",
+                    "read_file",
+                    json!({"path": "no3.txt"}),
+                )),
                 just(text_end("done")),
             ],
         );
         let (outcome, deps) = run_with(&session, "read things", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(matches!(find_tool_result(&evs, "ok").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
-        let c3 = match find_tool_result(&evs, "f3").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(
+            matches!(find_tool_result(&evs, "ok").unwrap(), Event::ToolResult { is_error, .. } if !is_error)
+        );
+        let c3 = match find_tool_result(&evs, "f3").unwrap() {
+            Event::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
         assert!(c3.contains("3 consecutive read_file failures"));
     }
 
@@ -1887,10 +2350,20 @@ mod tests {
         let (outcome, deps) = run_with(&session, "list forever", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        assert!(matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if !is_error));
-        assert!(matches!(find_tool_result(&evs, "t2").unwrap(), Event::ToolResult { is_error, .. } if *is_error));
-        let c3 = match find_tool_result(&evs, "t3").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
-        let c4 = match find_tool_result(&evs, "t4").unwrap() { Event::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(
+            matches!(find_tool_result(&evs, "t1").unwrap(), Event::ToolResult { is_error, .. } if !is_error)
+        );
+        assert!(
+            matches!(find_tool_result(&evs, "t2").unwrap(), Event::ToolResult { is_error, .. } if *is_error)
+        );
+        let c3 = match find_tool_result(&evs, "t3").unwrap() {
+            Event::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
+        let c4 = match find_tool_result(&evs, "t4").unwrap() {
+            Event::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
         assert!(!c3.contains("consecutive"));
         assert!(c4.contains("identical Tool Call repeated"));
         assert!(c4.contains("3 consecutive list_files failures"));
@@ -1936,12 +2409,19 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write something", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { name, .. } if name == "write_file")).unwrap();
-        assert!(matches!(tr, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON")));
+        let tr = evs
+            .iter()
+            .find(|e| matches!(e, Event::ToolResult { name, .. } if name == "write_file"))
+            .unwrap();
+        assert!(
+            matches!(tr, Event::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON"))
+        );
         // The error tool_result went back to the model.
         let requests = deps.requests.lock().unwrap();
         let last = requests[1].messages.last().unwrap();
-        assert!(matches!(&last.content[0], ContentBlock::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON")));
+        assert!(
+            matches!(&last.content[0], ContentBlock::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON"))
+        );
         // Nothing executed.
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
@@ -2002,9 +2482,17 @@ mod tests {
         let (outcome, deps) = run_with_plugins(&session, "edit something", deps, plugins).await;
         ok(&outcome);
         let evs = events(&deps);
-        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+        let tr = evs
+            .iter()
+            .find(|e| matches!(e, Event::ToolResult { .. }))
+            .unwrap();
         match tr {
-            Event::ToolResult { is_error, content, artifacts, .. } => {
+            Event::ToolResult {
+                is_error,
+                content,
+                artifacts,
+                ..
+            } => {
                 assert!(is_error);
                 assert_eq!(content, "[edits are frozen by HaltEdits]");
                 assert!(artifacts.is_empty());
@@ -2025,15 +2513,29 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins = vec![Registered::new("Artifactor", Box::new(Artifactor), json!([]))];
+        let plugins = vec![Registered::new(
+            "Artifactor",
+            Box::new(Artifactor),
+            json!([]),
+        )];
         let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
         ok(&outcome);
         let evs = events(&deps);
-        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+        let tr = evs
+            .iter()
+            .find(|e| matches!(e, Event::ToolResult { .. }))
+            .unwrap();
         match tr {
-            Event::ToolResult { is_error, artifacts, .. } => {
+            Event::ToolResult {
+                is_error,
+                artifacts,
+                ..
+            } => {
                 assert!(!is_error);
-                assert_eq!(artifacts.get("mark"), Some(&Value::String("list_files".to_string())));
+                assert_eq!(
+                    artifacts.get("mark"),
+                    Some(&Value::String("list_files".to_string()))
+                );
             }
             _ => unreachable!(),
         }
@@ -2054,10 +2556,16 @@ mod tests {
         let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
         ok(&outcome);
         let evs = events(&deps);
-        let pe = evs.iter().find(|e| matches!(e, Event::PluginError { .. })).unwrap();
+        let pe = evs
+            .iter()
+            .find(|e| matches!(e, Event::PluginError { .. }))
+            .unwrap();
         assert!(matches!(pe, Event::PluginError { plugin, stage, message }
             if plugin == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom")));
-        let tr = evs.iter().find(|e| matches!(e, Event::ToolResult { .. })).unwrap();
+        let tr = evs
+            .iter()
+            .find(|e| matches!(e, Event::ToolResult { .. }))
+            .unwrap();
         assert!(matches!(tr, Event::ToolResult { is_error, .. } if !is_error));
     }
 
@@ -2070,7 +2578,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("p1", "plan", json!({"plan": "Goal: X. 1. read [ ]"}))),
+                just(tool_use_result(
+                    "p1",
+                    "plan",
+                    json!({"plan": "Goal: X. 1. read [ ]"}),
+                )),
                 just(text_end("planned, done")),
             ],
         );
@@ -2104,7 +2616,11 @@ mod tests {
                 if i == count {
                     just(text_end("done"))
                 } else {
-                    just(tool_use_result(&format!("t{i}"), "list_files", json!({"path": "."})))
+                    just(tool_use_result(
+                        &format!("t{i}"),
+                        "list_files",
+                        json!({"path": "."}),
+                    ))
                 }
             })
             .collect()
@@ -2149,7 +2665,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("p1", "plan", json!({"plan": "Goal: ship. 1. code [ ]"}))),
+                just(tool_use_result(
+                    "p1",
+                    "plan",
+                    json!({"plan": "Goal: ship. 1. code [ ]"}),
+                )),
                 just(tool_use_result("t2", "list_files", json!({"path": "."}))),
                 just(text_end("done")),
             ],
@@ -2190,16 +2710,22 @@ mod tests {
         });
         let _ = deps.requests_handle();
 
-        let mut conv = Conversation::new(
-            "sys",
-            crate::conversation::ConversationOpts::new(1000, 100),
-        );
+        let mut conv =
+            Conversation::new("sys", crate::conversation::ConversationOpts::new(1000, 100));
         conv.add_user_text("compact me");
         conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(4000))]);
 
         let plugins: Vec<Registered> = Vec::new();
         let ctx = tool_ctx(&session);
-        let outcome = run(conv, &session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        let outcome = run(
+            conv,
+            &session,
+            &plugins,
+            &ctx,
+            &mut deps,
+            RunOpts::default(),
+        )
+        .await;
         let (conv, _) = ok(&outcome);
         assert!(*compacted.lock().unwrap() >= 1);
         let anchors = anchors_in(conv);
@@ -2244,7 +2770,15 @@ mod tests {
 
         let plugins: Vec<Registered> = Vec::new();
         let ctx = tool_ctx(&session);
-        let outcome = run(conv, &session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        let outcome = run(
+            conv,
+            &session,
+            &plugins,
+            &ctx,
+            &mut deps,
+            RunOpts::default(),
+        )
+        .await;
         let (conv, _) = ok(&outcome);
         assert!(*compacted.lock().unwrap());
         // Compaction ran before the first model call: the first recorded request
@@ -2313,7 +2847,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("ex_1", "explore", json!({"task": "where is Widget"}))),
+                just(tool_use_result(
+                    "ex_1",
+                    "explore",
+                    json!({"task": "where is Widget"}),
+                )),
                 just(text_end("Done: Widget is in widget.ex.")),
             ],
         );
@@ -2342,7 +2880,11 @@ mod tests {
             .filter(|m| matches!(m.role, Role::User))
             .flat_map(|m| m.content.iter())
             .filter_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "ex_1" => Some(content.clone()),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "ex_1" => Some(content.clone()),
                 _ => None,
             })
             .collect();
@@ -2350,9 +2892,16 @@ mod tests {
         assert!(explore_results[0].contains("widget.ex:1"));
 
         let evs = events(&deps);
-        assert!(evs.iter().any(|e| matches!(e, Event::ToolCall { id, name, .. } if id == "ex_1" && name == "explore")));
-        assert!(evs.iter().any(|e| matches!(e, Event::ToolResult { id, name, .. } if id == "ex_1" && name == "explore")));
-        assert!(!evs.iter().any(|e| matches!(e, Event::ToolCall { name, .. } if name == "list_files")));
+        assert!(evs.iter().any(
+            |e| matches!(e, Event::ToolCall { id, name, .. } if id == "ex_1" && name == "explore")
+        ));
+        assert!(evs.iter().any(
+            |e| matches!(e, Event::ToolResult { id, name, .. } if id == "ex_1" && name == "explore")
+        ));
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, Event::ToolCall { name, .. } if name == "list_files"))
+        );
     }
 
     #[tokio::test]
@@ -2362,11 +2911,20 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("ex_1", "explore", json!({"task": "find something"}))),
+                just(tool_use_result(
+                    "ex_1",
+                    "explore",
+                    json!({"task": "find something"}),
+                )),
                 just(text_end("Handled the failed exploration.")),
             ],
         );
-        let ctx = ctx_with_scout(&session, crate::scout::ScoutOutcome::LlmError { partial: String::new() });
+        let ctx = ctx_with_scout(
+            &session,
+            crate::scout::ScoutOutcome::LlmError {
+                partial: String::new(),
+            },
+        );
         let (outcome, deps) = run_with_ctx(&session, "explore then recover", deps, ctx).await;
         ok(&outcome);
         let evs = events(&deps);
@@ -2398,15 +2956,24 @@ mod tests {
         let (outcome, deps) = run_with(&session, "evaluate this project", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::ExploreNudge { .. })).collect();
+        let n: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::ExploreNudge { .. }))
+            .collect();
         assert_eq!(n.len(), 1);
         assert!(matches!(n[0], Event::ExploreNudge { text } if text.contains("explore")));
         // Rides the 3rd Pass's tool-results user message (request index 3).
         let requests = deps.requests.lock().unwrap();
         let last = requests[3].messages.last().unwrap();
         assert!(matches!(&last.role, Role::User));
-        assert!(last.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("explore"))));
-        assert!(last.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "r3")));
+        assert!(
+            last.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("explore")))
+        );
+        assert!(last.content.iter().any(
+            |b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "r3")
+        ));
     }
 
     #[tokio::test]
@@ -2418,7 +2985,11 @@ mod tests {
             &session,
             vec![
                 just(tool_use_result("r1", "read_file", json!({"path": "a.txt"}))),
-                just(tool_use_result("p1", "plan", json!({"plan": "1. read things"}))),
+                just(tool_use_result(
+                    "p1",
+                    "plan",
+                    json!({"plan": "1. read things"}),
+                )),
                 just(tool_use_result("r2", "read_file", json!({"path": "b.txt"}))),
                 just(tool_use_result("r3", "read_file", json!({"path": "c.txt"}))),
                 just(text_end("done")),
@@ -2426,7 +2997,10 @@ mod tests {
         );
         let (outcome, deps) = run_with(&session, "look, plan, look again", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2441,9 +3015,21 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("c1", "run_command", json!({"command": "grep a a.txt"}))),
-                just(tool_use_result("c2", "run_command", json!({"command": "grep b b.txt"}))),
-                just(tool_use_result("c3", "run_command", json!({"command": "grep c c.txt"}))),
+                just(tool_use_result(
+                    "c1",
+                    "run_command",
+                    json!({"command": "grep a a.txt"}),
+                )),
+                just(tool_use_result(
+                    "c2",
+                    "run_command",
+                    json!({"command": "grep b b.txt"}),
+                )),
+                just(tool_use_result(
+                    "c3",
+                    "run_command",
+                    json!({"command": "grep c c.txt"}),
+                )),
                 just(text_end("done")),
             ],
         )
@@ -2451,7 +3037,10 @@ mod tests {
         let (outcome, deps) = run_with(&session, "explore via shell", deps).await;
         ok(&outcome);
         let evs = events(&deps);
-        let n: Vec<&Event> = evs.iter().filter(|e| matches!(e, Event::ExploreNudge { .. })).collect();
+        let n: Vec<&Event> = evs
+            .iter()
+            .filter(|e| matches!(e, Event::ExploreNudge { .. }))
+            .collect();
         assert_eq!(n.len(), 1);
         assert!(matches!(n[0], Event::ExploreNudge { text } if text.contains("explore")));
     }
@@ -2468,17 +3057,36 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("c1", "run_command", json!({"command": "grep a a.txt"}))),
-                just(tool_use_result("c2", "run_command", json!({"command": "grep b b.txt"}))),
-                just(tool_use_result("v1", "run_command", json!({"command": "mix test"}))),
-                just(tool_use_result("c3", "run_command", json!({"command": "grep c c.txt"}))),
+                just(tool_use_result(
+                    "c1",
+                    "run_command",
+                    json!({"command": "grep a a.txt"}),
+                )),
+                just(tool_use_result(
+                    "c2",
+                    "run_command",
+                    json!({"command": "grep b b.txt"}),
+                )),
+                just(tool_use_result(
+                    "v1",
+                    "run_command",
+                    json!({"command": "mix test"}),
+                )),
+                just(tool_use_result(
+                    "c3",
+                    "run_command",
+                    json!({"command": "grep c c.txt"}),
+                )),
                 just(text_end("done")),
             ],
         )
         .with_approvals(vec![true, true, true, true]);
         let (outcome, deps) = run_with(&session, "explore then verify", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })), 0);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2491,12 +3099,21 @@ mod tests {
         opts.turn_limit = Some(20);
         let session = session_with(root.path(), opts);
         let mut entries: Vec<Entry> = (1..=6)
-            .map(|n| just(tool_use_result(&format!("l{n}"), "list_files", json!({"path": format!("d{n}")}))))
+            .map(|n| {
+                just(tool_use_result(
+                    &format!("l{n}"),
+                    "list_files",
+                    json!({"path": format!("d{n}")}),
+                ))
+            })
             .collect();
         entries.push(just(text_end("done")));
         let deps = deps_for(&session, entries);
         let (outcome, deps) = run_with(&session, "keep exploring", deps).await;
         ok(&outcome);
-        assert_eq!(count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })), 2);
+        assert_eq!(
+            count_voiced(&events(&deps), |e| matches!(e, Event::ExploreNudge { .. })),
+            2
+        );
     }
 }

@@ -4,8 +4,8 @@
 //! continues a truncated read — `start_line` is windowing (WHICH part), the
 //! cap stays the size authority (HOW MUCH).
 
-use crate::tool::{file_error, with_path, FileError, Tool, ToolCtx, ToolSpec};
-use serde_json::{json, Value};
+use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};
+use serde_json::{Value, json};
 
 pub struct ReadFile;
 
@@ -14,11 +14,12 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read the contents of a text file. Always read a file before you edit it. \
+            description:
+                "Read the contents of a text file. Always read a file before you edit it. \
                 Long output is truncated with a note naming the start_line that continues \
                 the read - pass it to page through a large file. \
                 If you are unsure the file exists, use list_files or grep first."
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -214,7 +215,11 @@ mod tests {
         std::fs::write(tmp.path().join("lines.txt"), "one\ntwo\nthree\nfour\n").unwrap();
 
         assert_eq!(
-            run(json!({"path": "lines.txt", "start_line": 3}), &ctx(tmp.path())).await,
+            run(
+                json!({"path": "lines.txt", "start_line": 3}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("three\nfour\n".into())
         );
     }
@@ -225,7 +230,11 @@ mod tests {
         std::fs::write(tmp.path().join("lines.txt"), "one\ntwo\n").unwrap();
 
         assert_eq!(
-            run(json!({"path": "lines.txt", "start_line": 1}), &ctx(tmp.path())).await,
+            run(
+                json!({"path": "lines.txt", "start_line": 1}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("one\ntwo\n".into())
         );
     }
@@ -241,7 +250,11 @@ mod tests {
             Ok("two\n".into())
         );
         assert_eq!(
-            run(json!({"path": "no_nl.txt", "start_line": 2}), &ctx(tmp.path())).await,
+            run(
+                json!({"path": "no_nl.txt", "start_line": 2}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("two".into())
         );
     }
@@ -251,9 +264,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("lines.txt"), "one\ntwo\n").unwrap();
 
-        let err = run(json!({"path": "lines.txt", "start_line": 3}), &ctx(tmp.path()))
-            .await
-            .unwrap_err();
+        let err = run(
+            json!({"path": "lines.txt", "start_line": 3}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("past the end"));
         assert!(err.contains("2 lines"));
     }
@@ -266,8 +282,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("start_line"));
-        assert!(run(json!({"path": "x.txt", "start_line": "3"}), &c)
-            .await
-            .is_err());
+        assert!(
+            run(json!({"path": "x.txt", "start_line": "3"}), &c)
+                .await
+                .is_err()
+        );
     }
 }

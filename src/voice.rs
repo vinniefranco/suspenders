@@ -14,7 +14,8 @@
 
 use crate::content::{ContentBlock, Message, Role};
 
-const SYSTEM_PROMPT: &str = "You are Suspenders, an expert coding agent. You work inside the user's project \
+const SYSTEM_PROMPT: &str =
+    "You are Suspenders, an expert coding agent. You work inside the user's project \
 directory and complete coding tasks by calling tools.
 
 Follow this workflow for every task:
@@ -263,7 +264,8 @@ pub fn omitted_middle(omitted: usize, total: usize) -> String {
     format!("\n[{omitted} of {total} chars omitted from the middle of this output]\n")
 }
 
-const SCOUT_SYSTEM_PROMPT: &str = "You are a Scout: a disposable, read-only explorer working inside the \
+const SCOUT_SYSTEM_PROMPT: &str =
+    "You are a Scout: a disposable, read-only explorer working inside the \
 user's project directory. Another agent dispatched you to answer one \
 focused question about the codebase. You cannot edit files, run \
 commands, or dispatch further Scouts - your only tools are read_file, \

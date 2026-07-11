@@ -275,10 +275,7 @@ impl Entry {
                 Some(Entry::Compacted {
                     summary: string_field(m, "summary").unwrap_or_default(),
                     skip_count: m.get("skip_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                    tokens_before: m
-                        .get("tokens_before")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    tokens_before: m.get("tokens_before").and_then(|v| v.as_u64()).unwrap_or(0),
                     file_ops,
                     original_task: m
                         .get("original_task")
@@ -408,8 +405,7 @@ fn next_unique() -> u64 {
 fn utc_stamp() -> String {
     use time::format_description::FormatItem;
     use time::macros::format_description;
-    const FMT: &[FormatItem<'_>] =
-        format_description!("[year][month][day]-[hour][minute][second]");
+    const FMT: &[FormatItem<'_>] = format_description!("[year][month][day]-[hour][minute][second]");
     time::OffsetDateTime::now_utc()
         .format(FMT)
         .unwrap_or_else(|_| "00000000-000000".into())
@@ -745,8 +741,7 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             // Compaction replaces everything folded before this point with the
             // reconstructed summary; reappend the harness-owned mechanical
             // facts so the message matches the live one.
-            let composed =
-                compose_summary(summary, original_task.as_deref(), file_ops);
+            let composed = compose_summary(summary, original_task.as_deref(), file_ops);
             messages.clear();
             *batch = None;
             messages.push(user_message(vec![voice::summary_block(&composed)]));
@@ -1065,7 +1060,9 @@ mod tests {
             ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "t1"
         ));
         assert_eq!(messages[3].role, Role::Assistant);
-        assert!(matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "re-issued"));
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "re-issued")
+        );
     }
 
     #[test]
@@ -1099,7 +1096,11 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use("t1", "grep", json!({}))]));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "grep",
+            json!({}),
+        )]));
         log.append(Entry::ToolResult(tool_result("t1", "hits")));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
@@ -1124,7 +1125,11 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use("t1", "grep", json!({}))]));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "grep",
+            json!({}),
+        )]));
         log.append(Entry::ToolResult(tool_result("t1", "hits")));
         log.append(Entry::Settled {
             outcome: Settled::Cancelled,
@@ -1172,7 +1177,9 @@ mod tests {
 
         log.append(Entry::UserText("write it".into()));
         log.append(Entry::AssistantBlocks(vec![text("wrote it")]));
-        log.append(Entry::Nudge("[files changed but nothing verified - ...]".into()));
+        log.append(Entry::Nudge(
+            "[files changed but nothing verified - ...]".into(),
+        ));
         log.append(Entry::AssistantBlocks(vec![text("verified")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
@@ -1186,7 +1193,9 @@ mod tests {
         assert_eq!(messages[0].role, Role::User);
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[2].role, Role::User);
-        assert!(matches!(&messages[2].content[0], ContentBlock::Text { text } if text.starts_with("[files changed")));
+        assert!(
+            matches!(&messages[2].content[0], ContentBlock::Text { text } if text.starts_with("[files changed"))
+        );
         assert_eq!(messages[3].role, Role::Assistant);
     }
 
@@ -1216,7 +1225,10 @@ mod tests {
         let (messages, _) = resume(&log.path, &session).unwrap();
 
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0], user_message(vec![text("evaluate this project")]));
+        assert_eq!(
+            messages[0],
+            user_message(vec![text("evaluate this project")])
+        );
         assert_eq!(messages[1].role, Role::Assistant);
         assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { id, .. } if id == "t1"));
         assert_eq!(messages[2].role, Role::User);
@@ -1224,9 +1236,13 @@ mod tests {
             &messages[2].content[0],
             ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
         ));
-        assert!(matches!(&messages[2].content[1], ContentBlock::Text { text } if text.starts_with("[reading file after file")));
+        assert!(
+            matches!(&messages[2].content[1], ContentBlock::Text { text } if text.starts_with("[reading file after file"))
+        );
         assert_eq!(messages[3].role, Role::Assistant);
-        assert!(matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "ok, exploring"));
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "ok, exploring")
+        );
     }
 
     // ---- crash modes ----
@@ -1342,7 +1358,9 @@ mod tests {
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, Role::User);
-        assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text.contains("Summary of old turns")));
+        assert!(
+            matches!(&messages[0].content[0], ContentBlock::Text { text } if text.contains("Summary of old turns"))
+        );
         assert_eq!(messages[1].role, Role::User);
         assert_eq!(messages[2].role, Role::Assistant);
     }
@@ -1527,7 +1545,11 @@ mod tests {
     #[test]
     fn list_skips_torn_headers_and_foreign_files_without_panicking() {
         let tmp = TempDir::new().unwrap();
-        write_log(tmp.path(), "20260101-000000-1.jsonl", &[r#"{"type": "sess"#]);
+        write_log(
+            tmp.path(),
+            "20260101-000000-1.jsonl",
+            &[r#"{"type": "sess"#],
+        );
         write_log(tmp.path(), "20260102-000000-1.jsonl", &["not json at all"]);
         write_log(
             tmp.path(),

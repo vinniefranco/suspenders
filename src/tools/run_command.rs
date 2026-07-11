@@ -9,7 +9,7 @@
 //! "simplify" this to `child.kill()`.
 
 use crate::tool::{Tool, ToolCtx, ToolSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::process::Stdio;
 
 pub struct RunCommand;
@@ -21,11 +21,12 @@ impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_command".into(),
-            description: "Run a shell command (sh -c) in the project root and return stdout and stderr \
+            description:
+                "Run a shell command (sh -c) in the project root and return stdout and stderr \
                 merged, followed by the exit code. Use this to compile, run tests, or inspect \
                 the project after making changes. Long-running commands are killed when they \
                 exceed the configured timeout. The user must approve each command before it runs."
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -45,7 +46,7 @@ impl Tool for RunCommand {
             _ => {
                 return Err(
                     "invalid input: run_command requires a non-empty string \"command\"".into(),
-                )
+                );
             }
         };
 
@@ -166,7 +167,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("marker.txt"), "").unwrap();
 
-        let out = run(json!({"command": "ls"}), &ctx(tmp.path())).await.unwrap();
+        let out = run(json!({"command": "ls"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
         assert!(out.contains("marker.txt"));
         assert!(out.contains("[exit code: 0]"));
     }

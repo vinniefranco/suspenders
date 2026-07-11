@@ -10,8 +10,8 @@
 //! redirect — as non-exploration, resetting the streak. `mix test` MUST reset:
 //! it is verification, the behavior the harness wants.
 //!
-//! This is policy, not wording: it lives beside the Nudge bookkeeping, never in
-//! [`crate::voice`].
+//! This is policy, not wording: it lives beside the explore Governor's
+//! trigger bookkeeping ([`super`]), never in [`crate::voice`].
 //!
 //! ## Classification
 //!

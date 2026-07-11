@@ -63,7 +63,10 @@ pub enum Entry {
     Error { reason: String },
     /// A closure that inspects the request and returns a Response. May block
     /// (e.g. on a barrier) to drive busy/cancel handshakes.
-    Dynamic { deltas: Vec<Delta>, respond: ResponseFn },
+    Dynamic {
+        deltas: Vec<Delta>,
+        respond: ResponseFn,
+    },
     /// The tokio analog of baud's blocking script closure: on `complete`, sends
     /// an [`InFlight`] (the request + a release oneshot) to `signal` so the test
     /// observes the Turn parked mid-call, then awaits the [`Release`]. The test
@@ -257,7 +260,9 @@ pub struct FakeDeps {
     /// Optional mid-flight approval channel: the ask goes out here and the
     /// answer comes back on the paired oneshot. When set, it takes precedence
     /// over the canned queue.
-    approval_tx: Option<tokio::sync::mpsc::UnboundedSender<(ApprovalAsk, tokio::sync::oneshot::Sender<bool>)>>,
+    approval_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(ApprovalAsk, tokio::sync::oneshot::Sender<bool>)>,
+    >,
 
     /// Canned Steering batches, one popped per `drain_steering`. Exhausted ⇒
     /// empty.
@@ -321,7 +326,8 @@ impl FakeDeps {
     /// letting the run block in `request_approval` until answered.
     pub fn approval_channel(
         &mut self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<(ApprovalAsk, tokio::sync::oneshot::Sender<bool>)> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(ApprovalAsk, tokio::sync::oneshot::Sender<bool>)>
+    {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.approval_tx = Some(tx);
         rx
@@ -354,7 +360,9 @@ impl TurnDeps for FakeDeps {
         let wire = request::build_request(&req, &self.connection);
         // `FakeLlm::complete` wants an `OnEvent` (FnMut); adapt the &dyn.
         let mut adapter = |ev: &StreamEvent| on_event(ev);
-        self.llm.complete(wire, &self.connection, &mut adapter).await
+        self.llm
+            .complete(wire, &self.connection, &mut adapter)
+            .await
     }
 
     fn emitter(&mut self) -> Emitter {
@@ -367,7 +375,11 @@ impl TurnDeps for FakeDeps {
     }
 
     async fn drain_steering(&mut self) -> Vec<String> {
-        self.steering.lock().unwrap().pop_front().unwrap_or_default()
+        self.steering
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default()
     }
 
     async fn request_approval(&mut self, id: String, command: String) -> bool {

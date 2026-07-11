@@ -27,7 +27,7 @@
 
 pub mod diff;
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use serde_json::Value;
 
@@ -418,9 +418,7 @@ mod tests {
             _opts: &Value,
         ) -> TranscriptItem {
             match (&item, artifacts.get("mark")) {
-                (TranscriptItem::ToolResult { name, .. }, Some(mark))
-                    if mark == &json!("seen") =>
-                {
+                (TranscriptItem::ToolResult { name, .. }, Some(mark)) if mark == &json!("seen") => {
                     TranscriptItem::Block {
                         title: format!("presented {name}"),
                         lines: vec![StyledLine::new(LineStyle::Added, "+ line")],
@@ -518,7 +516,11 @@ mod tests {
     fn pre_run_halted_token_short_circuits_the_remaining_plugins() {
         let plugins = vec![
             reg("Halter", Box::new(Halter), json!({})),
-            reg("Recorder", Box::new(Recorder), json!({ "id": "after_halt" })),
+            reg(
+                "Recorder",
+                Box::new(Recorder),
+                json!({ "id": "after_halt" }),
+            ),
         ];
 
         let (token, failures) = pre_run(&plugins, token());
@@ -582,7 +584,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_runs_the_tool_and_returns_the_shaped_result_with_artifacts() {
-        let plugins = vec![reg("ArtifactPresenter", Box::new(ArtifactPresenter), json!({}))];
+        let plugins = vec![reg(
+            "ArtifactPresenter",
+            Box::new(ArtifactPresenter),
+            json!({}),
+        )];
 
         let (result, failures) = execute(&plugins, token()).await;
 
@@ -597,8 +603,16 @@ mod tests {
     #[tokio::test]
     async fn execute_post_run_folds_in_reverse_registration_order_onion() {
         let plugins = vec![
-            reg("ContentTagger", Box::new(ContentTagger), json!({ "id": "outer" })),
-            reg("ContentTagger", Box::new(ContentTagger), json!({ "id": "inner" })),
+            reg(
+                "ContentTagger",
+                Box::new(ContentTagger),
+                json!({ "id": "outer" }),
+            ),
+            reg(
+                "ContentTagger",
+                Box::new(ContentTagger),
+                json!({ "id": "inner" }),
+            ),
         ];
 
         let (result, failures) = execute(&plugins, token()).await;
@@ -610,7 +624,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_post_run_output_is_shaped_to_the_result_cap() {
-        let plugins = vec![reg("ContentTagger", Box::new(ContentTagger), json!({ "id": "tag" }))];
+        let plugins = vec![reg(
+            "ContentTagger",
+            Box::new(ContentTagger),
+            json!({ "id": "tag" }),
+        )];
         let token = Token::new("bogus", json!({}), ctx_with_cap(10));
 
         let (result, failures) = execute(&plugins, token).await;
@@ -622,7 +640,11 @@ mod tests {
     #[tokio::test]
     async fn execute_a_crashing_post_run_is_skipped_and_reported() {
         let plugins = vec![
-            reg("ContentTagger", Box::new(ContentTagger), json!({ "id": "kept" })),
+            reg(
+                "ContentTagger",
+                Box::new(ContentTagger),
+                json!({ "id": "kept" }),
+            ),
             reg("Crasher", Box::new(Crasher), json!({})),
         ];
 
@@ -652,7 +674,11 @@ mod tests {
             summary: "edited x".to_string(),
             is_error: false,
         };
-        let plugins = vec![reg("ArtifactPresenter", Box::new(ArtifactPresenter), json!({}))];
+        let plugins = vec![reg(
+            "ArtifactPresenter",
+            Box::new(ArtifactPresenter),
+            json!({}),
+        )];
 
         // Empty artifacts: ArtifactPresenter's present leaves the item unchanged.
         let (presented, failures) = present(&plugins, item.clone(), &HashMap::new());
@@ -668,7 +694,11 @@ mod tests {
             summary: "edited x".to_string(),
             is_error: false,
         };
-        let plugins = vec![reg("ArtifactPresenter", Box::new(ArtifactPresenter), json!({}))];
+        let plugins = vec![reg(
+            "ArtifactPresenter",
+            Box::new(ArtifactPresenter),
+            json!({}),
+        )];
         let mut artifacts = HashMap::new();
         artifacts.insert("mark".to_string(), json!("seen"));
 

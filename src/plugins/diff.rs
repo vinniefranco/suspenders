@@ -56,11 +56,7 @@ impl Plugin for Diff {
     }
 
     fn post_run(&self, token: Token, _opts: &Value) -> Token {
-        let is_error = token
-            .result
-            .as_ref()
-            .map(|r| r.is_error)
-            .unwrap_or(true);
+        let is_error = token.result.as_ref().map(|r| r.is_error).unwrap_or(true);
 
         match token.tool.as_str() {
             "edit_file" if !is_error => {
@@ -285,17 +281,15 @@ mod tests {
 
         assert_eq!(diff.hunks.len(), 1);
         let lines = &diff.hunks[0].lines;
-        assert!(lines
-            .iter()
-            .any(|l| *l == hunks::Line {
+        assert!(lines.iter().any(|l| *l
+            == hunks::Line {
                 tag: hunks::Tag::Removed,
                 old: Some(2),
                 new: None,
                 text: "two".to_string()
             }));
-        assert!(lines
-            .iter()
-            .any(|l| *l == hunks::Line {
+        assert!(lines.iter().any(|l| *l
+            == hunks::Line {
                 tag: hunks::Tag::Added,
                 old: None,
                 new: Some(2),
@@ -321,9 +315,11 @@ mod tests {
             "def foo do\n  y = 2\nend\n"
         );
 
-        assert!(result
-            .content
-            .contains("[the match was fuzzy - what was actually written:]"));
+        assert!(
+            result
+                .content
+                .contains("[the match was fuzzy - what was actually written:]")
+        );
         assert!(result.content.contains("-  x = 1"));
         assert!(result.content.contains("+  y = 2"));
 

@@ -84,6 +84,22 @@ The user aborting a running Turn; the Conversation records a clean partial state
 How an ended Turn enters the Conversation. Every Turn settles exactly one way: completed, failed, or cancelled (a crash settles as a failure). A Turn that did not complete settles on its partial state, closed with a marker so roles keep alternating.
 _Avoid_: completion (reserved for the model's response), turn management
 
+**Governor**:
+A tunable rule that watches the Pass cycle and intervenes to keep the model on course. Each Governor owns its trigger and its setpoints - the thresholds and cadences tuned from observed model behavior - and acts only through an Intervention. Nudges, Anchors, and the Endgame schedule are all issued by Governors. Compaction and Eviction are budget mechanics, not Governors: they are correct or incorrect, never tuned.
+_Avoid_: rider (one delivery shape of a Nudge, not the rule that sends it), heuristic (the informal name; a Governor is the thing itself), rule, policy
+
+**Intervention**:
+One of the closed set of actions a Governor may take: replace a Tool Result, annotate one, stand alone as a user message, ride the results tail, narrow the offered Tools, silence Thinking for a Pass, or close the Turn on a marker. The set is deliberately closed: a new Governor is routine, a new kind of Intervention is a visible design decision.
+_Avoid_: action (too generic), effect (mechanism, not meaning)
+
+**Setpoint**:
+A Governor's tunable value - a threshold, cadence, or cap that encodes a learning about how small models drift. Every Setpoint belongs to exactly one Governor and carries a default; the Session resolves them once at launch, and a Setpoint becomes user-configurable only when a real model has demanded a different value.
+_Avoid_: constant (a Setpoint is tuned, not fixed), config option (most are never exposed), magic number
+
+**Turn Ledger**:
+The record of facts about the running Turn, written once as each thing happens: the Tool Calls each Pass carried, per-Tool failure tallies, writes and whether a verification has run since, Passes remaining. The Ledger holds facts, never opinions or setpoints - Governors read it and judge; no Governor reads another Governor's state.
+_Avoid_: nudge state (the legacy state bag), shared state, blackboard
+
 **Nudge**:
 Suspenders-voiced text the Turn injects into the Conversation to redirect a drifting model: replacing a Tool Result (identical Tool Call repeated), annotating one (repeated failures of the same Tool), standing alone as a user message (changes left unverified, the model finishing while its last run_command failed, or the model's reply arriving empty), or riding the tool-results user message (consecutive Passes spent hand-exploring inline - reading files or shelling out to search - instead of dispatching a Scout). A Nudge never enters the system prompt.
 _Avoid_: hint, warning
@@ -144,7 +160,14 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - **Eviction** fires in waves: once triggered it elides past the target down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
 - When **Eviction** cannot fit the **Conversation** within the **Context Budget**, the **Turn** fails loudly; an over-budget request is never sent
 - Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** once per **Session**
-- The system prompt, every **Nudge**, and every marker belong to the **Voice**; the modules that fire them own the when, not the wording
+- The system prompt, every **Nudge**, and every marker belong to the **Voice**; the **Governors** that fire them own the when, not the wording
+- Every **Nudge**, every **Anchor** placement, and every **Endgame** step is issued by a **Governor**; **Compaction** and **Eviction** are not
+- A **Governor** acts only through an **Intervention**; when several **Governors** fire at the same moment, one explicit precedence decides which speaks
+- Every **Intervention** belongs to exactly one of the three moments of a **Pass** - shaping the request, answering a **Tool Call**, settling a finish - and precedence is decided within a moment, never across moments
+- Facts live in the **Turn Ledger**, opinions in exactly one **Governor**; a **Governor** reads the Ledger and its own trigger state, never a sibling's
+- A **Governor** judges the Turn's trajectory; a **Plugin** acts on one **Tool Call** in isolation - a decision that needs Turn history belongs to a **Governor**, never a Plugin
+- At the Tool Call moment, **Governors** judge what the model sent and what the model will read; **Plugins** shape what actually runs in between
+- The **Approval** gate is neither **Governor** nor **Plugin**: it encodes the user's judgment, not a tuned learning
 - A **Plugin** wraps every **Tool Call** at three points: before execution, after execution, and at **Presentment**; Plugins wrap one another, first-registered outermost
 - A **Plugin** may adjust or deny a **Tool Call** before execution: the **Nudge** for duplicates keys on what the model sent, and an **Approval** always shows the final, plugin-adjusted command
 - A **Plugin** denial still produces exactly one **Tool Result**, voiced by that Plugin

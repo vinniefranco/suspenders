@@ -2,8 +2,8 @@
 //! Sorted, directories first. Empty dir → `"[empty directory]"` (an
 //! empty-string result confuses small models).
 
-use crate::tool::{file_error, with_path, FileError, Tool, ToolCtx, ToolSpec};
-use serde_json::{json, Value};
+use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};
+use serde_json::{Value, json};
 
 pub struct ListFiles;
 
@@ -12,10 +12,11 @@ impl Tool for ListFiles {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_files".into(),
-            description: "List the entries of a directory, one per line. Directories end with a trailing / \
+            description:
+                "List the entries of a directory, one per line. Directories end with a trailing / \
                 and are listed first; everything is sorted. Omit path to list the project root. \
                 Use this to explore the project before reading or editing files."
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -109,7 +110,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("only.txt"), "").unwrap();
 
-        assert_eq!(run(json!({}), &ctx(tmp.path())).await, Ok("only.txt".into()));
+        assert_eq!(
+            run(json!({}), &ctx(tmp.path())).await,
+            Ok("only.txt".into())
+        );
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::content::{ContentBlock, Usage};
 use crate::llm::response::{Response, StopReason};
@@ -67,9 +67,17 @@ pub enum Delta {
 /// a tool_use accumulates raw partial JSON here and is decoded at stop.
 #[derive(Debug, Clone, PartialEq)]
 enum OpenBlock {
-    Text { text: String },
-    Thinking { text: String },
-    ToolUse { id: String, name: String, json: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
     Other,
 }
 
@@ -200,7 +208,9 @@ impl StreamState {
     pub fn finalize(self) -> Response {
         let mut by_index = self.done;
         for (index, block) in self.open {
-            by_index.entry(index).or_insert_with(|| finalize_block(block));
+            by_index
+                .entry(index)
+                .or_insert_with(|| finalize_block(block));
         }
 
         let content: Vec<ContentBlock> = by_index
@@ -256,7 +266,11 @@ fn open_block(cb: &Value) -> OpenBlock {
             text: String::new(),
         },
         Some("tool_use") => OpenBlock::ToolUse {
-            id: cb.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            id: cb
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             name: cb
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -419,12 +433,16 @@ mod tests {
     fn snapshot_includes_open_thinking_blocks() {
         let s = state(vec![
             bs(0, json!({ "type": "thinking" })),
-            bd(0, json!({ "type": "thinking_delta", "thinking": "thinking" })),
+            bd(
+                0,
+                json!({ "type": "thinking_delta", "thinking": "thinking" }),
+            ),
         ]);
-        assert!(s
-            .snapshot()
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Thinking { .. })));
+        assert!(
+            s.snapshot()
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+        );
     }
 
     // --- tool_use ---
@@ -432,15 +450,28 @@ mod tests {
     #[test]
     fn assembles_input_from_partial_json_deltas() {
         let r = fold(vec![
-            bs(0, json!({ "type": "tool_use", "id": "t1", "name": "read_file" })),
-            bd(0, json!({ "type": "input_json_delta", "partial_json": "{\"path\": \".ex" })),
-            bd(0, json!({ "type": "input_json_delta", "partial_json": "\"}" })),
+            bs(
+                0,
+                json!({ "type": "tool_use", "id": "t1", "name": "read_file" }),
+            ),
+            bd(
+                0,
+                json!({ "type": "input_json_delta", "partial_json": "{\"path\": \".ex" }),
+            ),
+            bd(
+                0,
+                json!({ "type": "input_json_delta", "partial_json": "\"}" }),
+            ),
             bstop(0),
             md("tool_use", json!({})),
         ]);
         assert_eq!(
             r.content,
-            vec![ContentBlock::tool_use("t1", "read_file", json!({ "path": ".ex" }))]
+            vec![ContentBlock::tool_use(
+                "t1",
+                "read_file",
+                json!({ "path": ".ex" })
+            )]
         );
     }
 
@@ -448,8 +479,14 @@ mod tests {
     fn malformed_json_marked_with_sentinel() {
         let malformed = "{\"path\": tru";
         let r = fold(vec![
-            bs(0, json!({ "type": "tool_use", "id": "t1", "name": "list_files" })),
-            bd(0, json!({ "type": "input_json_delta", "partial_json": malformed })),
+            bs(
+                0,
+                json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+            ),
+            bd(
+                0,
+                json!({ "type": "input_json_delta", "partial_json": malformed }),
+            ),
             bstop(0),
             md("tool_use", json!({})),
         ]);
@@ -466,7 +503,10 @@ mod tests {
     #[test]
     fn empty_accumulated_json_becomes_empty_map() {
         let r = fold(vec![
-            bs(0, json!({ "type": "tool_use", "id": "t1", "name": "list_files" })),
+            bs(
+                0,
+                json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+            ),
             bstop(0),
             md("tool_use", json!({})),
         ]);
@@ -481,8 +521,14 @@ mod tests {
     #[test]
     fn blocks_without_index_do_not_collapse() {
         let r = fold(vec![
-            nm("content_block_start", json!({ "content_block": { "type": "text", "text": "" } })),
-            nm("content_block_delta", json!({ "delta": { "type": "text_delta", "text": "Let me " } })),
+            nm(
+                "content_block_start",
+                json!({ "content_block": { "type": "text", "text": "" } }),
+            ),
+            nm(
+                "content_block_delta",
+                json!({ "delta": { "type": "text_delta", "text": "Let me " } }),
+            ),
             nm("content_block_stop", json!({})),
             nm(
                 "content_block_start",
@@ -507,10 +553,22 @@ mod tests {
     #[test]
     fn delta_without_index_targets_last_opened_block() {
         let r = fold(vec![
-            nm("content_block_start", json!({ "content_block": { "type": "text", "text": "" } })),
-            nm("content_block_delta", json!({ "delta": { "type": "text_delta", "text": "m1" } })),
-            nm("content_block_start", json!({ "content_block": { "type": "text", "text": "" } })),
-            nm("content_block_delta", json!({ "delta": { "type": "text_delta", "text": "m2" } })),
+            nm(
+                "content_block_start",
+                json!({ "content_block": { "type": "text", "text": "" } }),
+            ),
+            nm(
+                "content_block_delta",
+                json!({ "delta": { "type": "text_delta", "text": "m1" } }),
+            ),
+            nm(
+                "content_block_start",
+                json!({ "content_block": { "type": "text", "text": "" } }),
+            ),
+            nm(
+                "content_block_delta",
+                json!({ "delta": { "type": "text_delta", "text": "m2" } }),
+            ),
             nm("content_block_stop", json!({})),
             nm("content_block_stop", json!({})),
             md("end_turn", json!({})),
@@ -528,7 +586,10 @@ mod tests {
         let r = fold(vec![
             bs(0, json!({ "type": "text", "text": "" })),
             bd(0, json!({ "type": "text_delta", "text": "partial" })),
-            nm("error", json!({ "type": "error", "error": { "type": "overloaded" } })),
+            nm(
+                "error",
+                json!({ "type": "error", "error": { "type": "overloaded" } }),
+            ),
         ]);
         assert_eq!(r.stop_reason, StopReason::Error);
         assert_eq!(r.content, vec![ContentBlock::text("partial")]);

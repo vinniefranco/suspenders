@@ -37,7 +37,13 @@ pub fn shape(tool_name: &str, content: &str, cap: usize, start_line: Option<i64>
     }
 }
 
-fn cut(tool_name: &str, content: &str, cap: usize, total: usize, start_line: Option<i64>) -> String {
+fn cut(
+    tool_name: &str,
+    content: &str,
+    cap: usize,
+    total: usize,
+    start_line: Option<i64>,
+) -> String {
     match tool_name {
         "run_command" => {
             let head = cap / HEAD_QUARTER;
@@ -194,8 +200,9 @@ mod tests {
         let shaped = shape("read_file", &content, 100, Some(21));
 
         // The content is the slice from line 21 on, so its 10th line is 30.
-        assert!(shaped
-            .contains("[truncated at line 30 of 50 - continue with read_file start_line 31]"));
+        assert!(
+            shaped.contains("[truncated at line 30 of 50 - continue with read_file start_line 31]")
+        );
     }
 
     #[test]
@@ -207,8 +214,9 @@ mod tests {
 
         let shaped = shape("read_file", &content, 100, None);
 
-        assert!(shaped
-            .contains("[truncated at line 10 of 30 - continue with read_file start_line 11]"));
+        assert!(
+            shaped.contains("[truncated at line 10 of 30 - continue with read_file start_line 11]")
+        );
     }
 
     #[test]

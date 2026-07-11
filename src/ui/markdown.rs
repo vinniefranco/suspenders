@@ -196,7 +196,8 @@ impl Fold {
                     }
                     _ => "• ".to_string(),
                 };
-                self.cont_stack.push(indent.chars().count() + glyph.chars().count());
+                self.cont_stack
+                    .push(indent.chars().count() + glyph.chars().count());
                 for _ in 0..self.quote_depth {
                     self.current.push(MdSpan {
                         text: "▎ ".to_string(),
@@ -478,10 +479,7 @@ mod tests {
     fn multi_paragraph_document_separates_every_top_level_block() {
         let lines = to_lines("# Title\n\npara\n\n- item\n\n```\ncode\n```");
         let flats: Vec<String> = lines.iter().map(flat).collect();
-        assert_eq!(
-            flats,
-            vec!["Title", "", "para", "", "• item", "", "code"]
-        );
+        assert_eq!(flats, vec!["Title", "", "para", "", "• item", "", "code"]);
     }
 
     #[test]
@@ -580,8 +578,14 @@ mod tests {
         assert_eq!(
             to_lines("- first\n- second"),
             vec![
-                line(vec![span("• ", MdStyle::Bullet), span("first", MdStyle::Plain)]),
-                line(vec![span("• ", MdStyle::Bullet), span("second", MdStyle::Plain)]),
+                line(vec![
+                    span("• ", MdStyle::Bullet),
+                    span("first", MdStyle::Plain)
+                ]),
+                line(vec![
+                    span("• ", MdStyle::Bullet),
+                    span("second", MdStyle::Plain)
+                ]),
             ]
         );
     }
@@ -770,7 +774,12 @@ mod tests {
     fn non_code_lines_carry_no_code_lang() {
         let lines = to_lines("# Title\n\npara\n\n- item\n\n> quote");
         for l in &lines {
-            assert_eq!(l.code_lang, None, "non-code line {:?} carries a lang", flat(l));
+            assert_eq!(
+                l.code_lang,
+                None,
+                "non-code line {:?} carries a lang",
+                flat(l)
+            );
         }
     }
 

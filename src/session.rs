@@ -295,11 +295,11 @@ impl Session {
             scout_pass_limit: opts.scout_pass_limit.unwrap_or(config.scout_pass_limit),
             scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
-            command_timeout_ms: opts
-                .command_timeout_ms
-                .unwrap_or(config.command_timeout_ms),
+            command_timeout_ms: opts.command_timeout_ms.unwrap_or(config.command_timeout_ms),
             result_cap: crate::tools::shaping::cap_for(context_budget, connection.max_tokens),
-            session_dir: opts.session_dir.unwrap_or_else(|| config.session_dir.clone()),
+            session_dir: opts
+                .session_dir
+                .unwrap_or_else(|| config.session_dir.clone()),
             connection,
         };
 
@@ -412,7 +412,9 @@ fn fraction_left_closed(value: f64, name: &str) -> Result<(), SessionError> {
     if (0.0..1.0).contains(&value) {
         Ok(())
     } else {
-        Err(SessionError(format!("{name} must be a float in [0.0, 1.0)")))
+        Err(SessionError(format!(
+            "{name} must be a float in [0.0, 1.0)"
+        )))
     }
 }
 
@@ -420,7 +422,9 @@ fn fraction_open(value: f64, name: &str) -> Result<(), SessionError> {
     if value > 0.0 && value < 1.0 {
         Ok(())
     } else {
-        Err(SessionError(format!("{name} must be a float in (0.0, 1.0)")))
+        Err(SessionError(format!(
+            "{name} must be a float in (0.0, 1.0)"
+        )))
     }
 }
 
@@ -542,49 +546,64 @@ mod tests {
     fn out_of_range_values_raise() {
         let with = |o: SessionOpts| Session::build(o, &cfg());
 
-        assert!(with(SessionOpts {
-            context_budget: Some(0),
-            connection: Some(connection()),
-            ..opts()
-        })
-        .unwrap_err()
-        .0
-        .contains(":context_budget"));
+        assert!(
+            with(SessionOpts {
+                context_budget: Some(0),
+                connection: Some(connection()),
+                ..opts()
+            })
+            .unwrap_err()
+            .0
+            .contains(":context_budget")
+        );
 
-        assert!(with(SessionOpts {
-            eviction_slack: Some(1.0),
-            connection: Some(connection()),
-            ..opts()
-        })
-        .unwrap_err()
-        .0
-        .contains(":eviction_slack"));
+        assert!(
+            with(SessionOpts {
+                eviction_slack: Some(1.0),
+                connection: Some(connection()),
+                ..opts()
+            })
+            .unwrap_err()
+            .0
+            .contains(":eviction_slack")
+        );
 
-        assert!(with(SessionOpts {
-            turn_limit: Some(0),
-            connection: Some(connection()),
-            ..opts()
-        })
-        .unwrap_err()
-        .0
-        .contains(":turn_limit"));
+        assert!(
+            with(SessionOpts {
+                turn_limit: Some(0),
+                connection: Some(connection()),
+                ..opts()
+            })
+            .unwrap_err()
+            .0
+            .contains(":turn_limit")
+        );
 
-        assert!(with(SessionOpts {
-            command_timeout_ms: Some(0),
-            connection: Some(connection()),
-            ..opts()
-        })
-        .unwrap_err()
-        .0
-        .contains(":command_timeout_ms"));
+        assert!(
+            with(SessionOpts {
+                command_timeout_ms: Some(0),
+                connection: Some(connection()),
+                ..opts()
+            })
+            .unwrap_err()
+            .0
+            .contains(":command_timeout_ms")
+        );
 
-        assert!(with(SessionOpts {
-            connection: Some(Connection::new("http://localhost:0/v1", "", "test-model", 0)),
-            ..opts()
-        })
-        .unwrap_err()
-        .0
-        .contains("max_tokens"));
+        assert!(
+            with(SessionOpts {
+                connection: Some(Connection::new(
+                    "http://localhost:0/v1",
+                    "",
+                    "test-model",
+                    0
+                )),
+                ..opts()
+            })
+            .unwrap_err()
+            .0
+            .contains("max_tokens")
+        );
     }
 
     #[test]
@@ -614,7 +633,12 @@ mod tests {
                 context_budget: Some(10_000),
                 eviction_slack: Some(0.1),
                 compaction_keep: Some(0.95),
-                connection: Some(Connection::new("http://localhost:0/v1", "", "test-model", 1_000)),
+                connection: Some(Connection::new(
+                    "http://localhost:0/v1",
+                    "",
+                    "test-model",
+                    1_000,
+                )),
                 ..opts()
             },
             &cfg(),
@@ -631,7 +655,12 @@ mod tests {
                 context_budget: Some(10_000),
                 eviction_slack: Some(0.1),
                 compaction_keep: Some(0.5),
-                connection: Some(Connection::new("http://localhost:0/v1", "", "test-model", 1_000)),
+                connection: Some(Connection::new(
+                    "http://localhost:0/v1",
+                    "",
+                    "test-model",
+                    1_000,
+                )),
                 ..opts()
             },
             &cfg(),
@@ -660,17 +689,19 @@ mod tests {
         .unwrap();
         assert_eq!(session.scout_pass_limit, 3);
 
-        assert!(Session::build(
-            SessionOpts {
-                scout_pass_limit: Some(0),
-                connection: Some(connection()),
-                ..opts()
-            },
-            &cfg()
-        )
-        .unwrap_err()
-        .0
-        .contains(":scout_pass_limit"));
+        assert!(
+            Session::build(
+                SessionOpts {
+                    scout_pass_limit: Some(0),
+                    connection: Some(connection()),
+                    ..opts()
+                },
+                &cfg()
+            )
+            .unwrap_err()
+            .0
+            .contains(":scout_pass_limit")
+        );
     }
 
     // ---- scout_no_think ----
@@ -724,45 +755,70 @@ mod tests {
             parse_positive_int("0").unwrap_err().0,
             "SUSPENDERS_MAX_TOKENS must be a positive integer, got: \"0\""
         );
-        assert!(parse_positive_int("-5")
-            .unwrap_err()
-            .0
-            .contains("must be a positive integer"));
-        assert!(parse_positive_int("nope")
-            .unwrap_err()
-            .0
-            .contains("must be a positive integer"));
+        assert!(
+            parse_positive_int("-5")
+                .unwrap_err()
+                .0
+                .contains("must be a positive integer")
+        );
+        assert!(
+            parse_positive_int("nope")
+                .unwrap_err()
+                .0
+                .contains("must be a positive integer")
+        );
     }
 
     #[test]
     fn env_temperature_bounds() {
         assert_eq!(parse_temperature("0.0").unwrap(), 0.0);
         assert_eq!(parse_temperature("2.0").unwrap(), 2.0);
-        assert!(parse_temperature("2.1")
-            .unwrap_err()
-            .0
-            .contains("SUSPENDERS_TEMPERATURE must be a float in [0.0, 2.0]"));
-        assert!(parse_temperature("-0.1").unwrap_err().0.contains("[0.0, 2.0]"));
-        assert!(parse_temperature("hot").unwrap_err().0.contains("[0.0, 2.0]"));
+        assert!(
+            parse_temperature("2.1")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_TEMPERATURE must be a float in [0.0, 2.0]")
+        );
+        assert!(
+            parse_temperature("-0.1")
+                .unwrap_err()
+                .0
+                .contains("[0.0, 2.0]")
+        );
+        assert!(
+            parse_temperature("hot")
+                .unwrap_err()
+                .0
+                .contains("[0.0, 2.0]")
+        );
     }
 
     #[test]
     fn env_eviction_slack_left_closed() {
         assert_eq!(parse_eviction_slack("0.0").unwrap(), 0.0);
-        assert!(parse_eviction_slack("1.0")
-            .unwrap_err()
-            .0
-            .contains("SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0)"));
+        assert!(
+            parse_eviction_slack("1.0")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0)")
+        );
     }
 
     #[test]
     fn env_compaction_keep_open_interval() {
         assert_eq!(parse_compaction_keep("0.5").unwrap(), 0.5);
-        assert!(parse_compaction_keep("0.0")
-            .unwrap_err()
-            .0
-            .contains("SUSPENDERS_COMPACTION_KEEP must be a fraction in (0.0, 1.0)"));
-        assert!(parse_compaction_keep("1.0").unwrap_err().0.contains("(0.0, 1.0)"));
+        assert!(
+            parse_compaction_keep("0.0")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_COMPACTION_KEEP must be a fraction in (0.0, 1.0)")
+        );
+        assert!(
+            parse_compaction_keep("1.0")
+                .unwrap_err()
+                .0
+                .contains("(0.0, 1.0)")
+        );
     }
 
     #[test]
@@ -770,18 +826,25 @@ mod tests {
         assert!(parse_bool("true", "SUSPENDERS_SCOUT_NO_THINK").unwrap());
         assert!(!parse_bool("false", "SUSPENDERS_SCOUT_NO_THINK").unwrap());
         assert_eq!(
-            parse_bool("yes", "SUSPENDERS_SCOUT_NO_THINK").unwrap_err().0,
+            parse_bool("yes", "SUSPENDERS_SCOUT_NO_THINK")
+                .unwrap_err()
+                .0,
             "SUSPENDERS_SCOUT_NO_THINK must be \"true\" or \"false\", got: \"yes\""
         );
     }
 
     #[test]
     fn env_context_budget_integer() {
-        assert_eq!(parse_int("64000", "SUSPENDERS_CONTEXT_BUDGET").unwrap(), 64_000);
-        assert!(parse_int("x", "SUSPENDERS_CONTEXT_BUDGET")
-            .unwrap_err()
-            .0
-            .contains("SUSPENDERS_CONTEXT_BUDGET must be an integer"));
+        assert_eq!(
+            parse_int("64000", "SUSPENDERS_CONTEXT_BUDGET").unwrap(),
+            64_000
+        );
+        assert!(
+            parse_int("x", "SUSPENDERS_CONTEXT_BUDGET")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_CONTEXT_BUDGET must be an integer")
+        );
     }
 
     // ---- tool_ctx/1 ----

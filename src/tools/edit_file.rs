@@ -17,8 +17,8 @@
 //! matches whole trimmed lines, so its span is always line-aligned and cannot
 //! split an identifier.
 
-use crate::tool::{file_error, jaro_distance, with_path, FileError, Tool, ToolCtx, ToolSpec};
-use serde_json::{json, Value};
+use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, jaro_distance, with_path};
+use serde_json::{Value, json};
 
 pub struct EditFile;
 
@@ -213,7 +213,9 @@ fn matched_line_range(lines: &[&str], start: usize, len: usize) -> String {
 }
 
 fn ambiguous(n: usize, path: &str) -> String {
-    format!("old_str matches {n} locations in {path}; include more surrounding lines to make it unique")
+    format!(
+        "old_str matches {n} locations in {path}; include more surrounding lines to make it unique"
+    )
 }
 
 const PLAIN_NOT_FOUND_SUFFIX: &str =
@@ -421,12 +423,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("code.ex"), "def run do\n  :ok\nend\n").unwrap();
 
-        assert!(run(
-            json!({"path": "code.ex", "old_str": "  :ok\n", "new_str": "  :error\n"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "code.ex", "old_str": "  :ok\n", "new_str": "  :error\n"}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "code.ex"), "def run do\n  :error\nend\n");
     }
 
@@ -466,12 +470,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "keep DROP keep").unwrap();
 
-        assert!(run(
-            json!({"path": "a.txt", "old_str": "DROP ", "new_str": ""}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "a.txt", "old_str": "DROP ", "new_str": ""}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.txt"), "keep keep");
     }
 
@@ -501,12 +507,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "x = 1   \ny = 2\n").unwrap();
 
-        assert!(run(
-            json!({"path": "a.txt", "old_str": "x = 1\ny = 2", "new_str": "x = 3\ny = 2"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "a.txt", "old_str": "x = 1\ny = 2", "new_str": "x = 3\ny = 2"}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.txt"), "x = 3\ny = 2\n");
     }
 
@@ -515,16 +523,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("code.ex"), "def run do\n    :ok\nend\n").unwrap();
 
-        assert!(run(
-            json!({
-                "path": "code.ex",
-                "old_str": "      :ok",
-                "new_str": "      if go?() do\n        :yes\n      end"
-            }),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({
+                    "path": "code.ex",
+                    "old_str": "      :ok",
+                    "new_str": "      if go?() do\n        :yes\n      end"
+                }),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(
             read(tmp.path(), "code.ex"),
             "def run do\n    if go?() do\n      :yes\n    end\nend\n"
@@ -542,7 +552,10 @@ mod tests {
         )
         .await
         .is_ok());
-        assert_eq!(read(tmp.path(), "code.ex"), "def run do\n    :a\n\n    :b\nend\n");
+        assert_eq!(
+            read(tmp.path(), "code.ex"),
+            "def run do\n    :a\n\n    :b\nend\n"
+        );
     }
 
     #[tokio::test]
@@ -550,12 +563,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("code.ex"), "def run do\n\t:ok\nend\n").unwrap();
 
-        assert!(run(
-            json!({"path": "code.ex", "old_str": "  :ok", "new_str": "  :done"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "code.ex", "old_str": "  :ok", "new_str": "  :done"}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "code.ex"), "def run do\n\t:done\nend\n");
     }
 
@@ -564,12 +579,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("code.ex"), "def run do\n\t:ok\nend\n").unwrap();
 
-        assert!(run(
-            json!({"path": "code.ex", "old_str": "  :ok", "new_str": "\t:done"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "code.ex", "old_str": "  :ok", "new_str": "\t:done"}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "code.ex"), "def run do\n\t:done\nend\n");
     }
 
@@ -578,12 +595,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "a\n  DROP\nb\n").unwrap();
 
-        assert!(run(
-            json!({"path": "a.txt", "old_str": "    DROP", "new_str": ""}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "a.txt", "old_str": "    DROP", "new_str": ""}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.txt"), "a\nb\n");
     }
 
@@ -648,12 +667,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.ex"), "fee(subtotal)\n").unwrap();
 
-        assert!(run(
-            json!({"path": "a.ex", "old_str": "subtotal", "new_str": "grand_total"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "a.ex", "old_str": "subtotal", "new_str": "grand_total"}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.ex"), "fee(grand_total)\n");
     }
 
@@ -662,16 +683,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.ex"), "  def amount_off(base, code) do\n").unwrap();
 
-        assert!(run(
-            json!({
-                "path": "a.ex",
-                "old_str": "  def amount_off(base, code) do",
-                "new_str": "  def amount_off(base) do"
-            }),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({
+                    "path": "a.ex",
+                    "old_str": "  def amount_off(base, code) do",
+                    "new_str": "  def amount_off(base) do"
+                }),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.ex"), "  def amount_off(base) do\n");
     }
 
@@ -680,16 +703,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.ex"), "def run do\n  :ok\nend\n").unwrap();
 
-        assert!(run(
-            json!({
-                "path": "a.ex",
-                "old_str": "def run do\n  :ok\nend",
-                "new_str": "def run do\n  :error\nend"
-            }),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({
+                    "path": "a.ex",
+                    "old_str": "def run do\n  :ok\nend",
+                    "new_str": "def run do\n  :error\nend"
+                }),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.ex"), "def run do\n  :error\nend\n");
     }
 
@@ -698,12 +723,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.ex"), "hello world\n").unwrap();
 
-        assert!(run(
-            json!({"path": "a.ex", "old_str": "hello", "new_str": "goodbye"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
+        assert!(
+            run(
+                json!({"path": "a.ex", "old_str": "hello", "new_str": "goodbye"}),
+                &ctx(tmp.path())
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(read(tmp.path(), "a.ex"), "goodbye world\n");
     }
 
