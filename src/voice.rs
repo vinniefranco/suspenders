@@ -111,6 +111,19 @@ pub fn anchor(task: &str, plan: Option<&str>) -> String {
     )
 }
 
+/// The stale-plan line the anchor Governor appends below an Anchor it is
+/// already placing, when the Plan has not changed in more than
+/// `plan_stale_after` Passes while writes landed (PROPOSALS.md #4: the f5
+/// audit's stale "Next step" refreshed as authoritative guidance for 20
+/// Passes). Deliberately conditional and low-pressure — a 9B over-reads
+/// imperatives (LOG.md cycle 002); "if it no longer matches reality" leaves
+/// the model free to conclude it still matches.
+pub fn stale_plan_line(passes: u64) -> String {
+    format!(
+        "[this plan has not changed in {passes} passes - if it no longer matches reality, update it with the plan tool]"
+    )
+}
+
 /// The marker a superseded Anchor is elided to when Eviction reclaims it.
 /// Distinct from the tool-result elision marker so the two never collide, and
 /// still recognized by [`is_anchor`] so Eviction never re-elides it.
@@ -564,6 +577,22 @@ mod tests {
         let marker = anchor_elision_marker();
         assert!(is_anchor(&ContentBlock::text(marker)));
         assert!(marker.contains('['));
+    }
+
+    // ---- stale_plan_line/1 ----
+
+    #[test]
+    fn stale_plan_line_is_conditional_and_carries_the_pass_count() {
+        assert_eq!(
+            stale_plan_line(9),
+            "[this plan has not changed in 9 passes - if it no longer matches reality, update it with the plan tool]"
+        );
+    }
+
+    #[test]
+    fn an_anchor_with_the_stale_plan_line_appended_is_still_an_anchor() {
+        let text = format!("{}\n\n{}", anchor("task", Some("plan")), stale_plan_line(9));
+        assert!(is_anchor(&ContentBlock::text(text)));
     }
 
     // ---- write_input_husk/1 ----

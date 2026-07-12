@@ -1,7 +1,8 @@
 //! The Session's fixed facts (CONTEXT.md: Session), resolved and validated
 //! once at launch: the Project Root, the Context Budget, the Eviction slack,
 //! the Dead Mass fraction, the Compaction Keep, the Result Cap, the Turn
-//! Limit, the Scout Pass cap, the no-think knobs, the command timeout, the
+//! Limit, the Anchor cadence and stale-plan threshold, the Scout Pass cap,
+//! the no-think knobs, the command timeout, the
 //! Plugin list, the LLM module, and the model connection.
 //!
 //! This is the composition seam for configuration. [`Session::new`] is the
@@ -44,6 +45,10 @@ pub struct Session {
     pub compaction_keep: f64,
     pub turn_limit: u64,
     pub anchor_interval: u64,
+    /// The anchor Governor's stale-plan Setpoint: the Passes a Plan may sit
+    /// unchanged — while writes land — before each Anchor carries the
+    /// stale-plan line.
+    pub plan_stale_after: u64,
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
@@ -85,6 +90,7 @@ pub struct SessionConfig {
     pub command_timeout_ms: u64,
     pub turn_limit: u64,
     pub anchor_interval: u64,
+    pub plan_stale_after: u64,
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
@@ -109,6 +115,7 @@ impl SessionConfig {
             command_timeout_ms: 120_000,
             turn_limit: 32,
             anchor_interval: 5,
+            plan_stale_after: 8,
             scout_pass_limit: 8,
             scout_no_think: true,
             no_think_rescue: true,
@@ -186,6 +193,11 @@ impl SessionConfig {
             cfg.compaction_keep = parse_compaction_keep(&v)?;
         }
 
+        // Positive integer.
+        if let Ok(v) = std::env::var("SUSPENDERS_PLAN_STALE_AFTER") {
+            cfg.plan_stale_after = parse_plan_stale_after(&v)?;
+        }
+
         // Booleans.
         if let Ok(v) = std::env::var("SUSPENDERS_SCOUT_NO_THINK") {
             cfg.scout_no_think = parse_bool(&v, "SUSPENDERS_SCOUT_NO_THINK")?;
@@ -242,6 +254,15 @@ fn parse_dead_mass_fraction(raw: &str) -> Result<f64, SessionError> {
     }
 }
 
+fn parse_plan_stale_after(raw: &str) -> Result<u64, SessionError> {
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(SessionError(format!(
+            "SUSPENDERS_PLAN_STALE_AFTER must be a positive integer, got: {raw:?}"
+        ))),
+    }
+}
+
 fn parse_compaction_keep(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
         Ok(v) if v > 0.0 && v < 1.0 => Ok(v),
@@ -274,6 +295,7 @@ pub struct SessionOpts {
     pub compaction_keep: Option<f64>,
     pub turn_limit: Option<u64>,
     pub anchor_interval: Option<u64>,
+    pub plan_stale_after: Option<u64>,
     pub scout_pass_limit: Option<u64>,
     pub scout_no_think: Option<bool>,
     pub no_think_rescue: Option<bool>,
@@ -314,6 +336,7 @@ impl Session {
             compaction_keep: opts.compaction_keep.unwrap_or(config.compaction_keep),
             turn_limit: opts.turn_limit.unwrap_or(config.turn_limit),
             anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
+            plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
             scout_pass_limit: opts.scout_pass_limit.unwrap_or(config.scout_pass_limit),
             scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
@@ -371,6 +394,7 @@ fn validate_scalars(s: &Session) -> Result<(), SessionError> {
     pos_int(s.connection.max_tokens, "connection :max_tokens")?;
     pos_int(s.turn_limit, ":turn_limit")?;
     pos_int(s.anchor_interval, ":anchor_interval")?;
+    pos_int(s.plan_stale_after, ":plan_stale_after")?;
     pos_int(s.scout_pass_limit, ":scout_pass_limit")?;
     pos_int(s.command_timeout_ms, ":command_timeout_ms")?;
 
@@ -576,6 +600,37 @@ mod tests {
                 .contains(":dead_mass_fraction")
         );
         assert_eq!(with_fraction(0.15).unwrap().dead_mass_fraction, 0.15);
+    }
+
+    #[test]
+    fn plan_stale_after_defaults_to_8_and_opts_override() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.plan_stale_after, 8);
+
+        let session = Session::build(
+            SessionOpts {
+                plan_stale_after: Some(12),
+                connection: Some(connection()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        assert_eq!(session.plan_stale_after, 12);
+    }
+
+    #[test]
+    fn plan_stale_after_must_be_positive() {
+        let err = Session::build(
+            SessionOpts {
+                plan_stale_after: Some(0),
+                connection: Some(connection()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap_err();
+        assert!(err.0.contains(":plan_stale_after"));
     }
 
     #[test]
@@ -886,6 +941,19 @@ mod tests {
                 .0
                 .contains("(0.0, 1.0)")
         );
+    }
+
+    #[test]
+    fn env_plan_stale_after_positive_integer() {
+        assert_eq!(parse_plan_stale_after("12").unwrap(), 12);
+        assert_eq!(parse_plan_stale_after(" 8 ").unwrap(), 8);
+        assert!(
+            parse_plan_stale_after("0")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_PLAN_STALE_AFTER must be a positive integer")
+        );
+        assert!(parse_plan_stale_after("eight").is_err());
     }
 
     #[test]
