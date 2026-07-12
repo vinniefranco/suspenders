@@ -429,7 +429,12 @@ fn apply_tail<D: TurnDeps>(
             conversation.merge_user_text(text);
         }
         AnswerIntervention::RideTail(Rider::Anchor) => {
-            conversation.inject_anchor(state.plan.anchor());
+            // The Anchor crosses the same emit seam as the Voiced riders so
+            // the Session Log records what the model read (CONTEXT.md: every
+            // rider is logged); the Transcript ignores the event.
+            let anchor = state.plan.anchor();
+            state.emitter.emit(Event::anchor(anchor.clone()));
+            conversation.inject_anchor(anchor);
         }
         AnswerIntervention::ReplaceResult { .. } | AnswerIntervention::AnnotateResult(_) => {
             unreachable!("per-call Interventions never ride the results tail")

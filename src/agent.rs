@@ -41,7 +41,7 @@ use crate::event::Event;
 use crate::llm::Llm;
 use crate::llm::response::StopReason as RespStopReason;
 use crate::session::Session;
-use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
+use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
 use crate::turn::AgentDeps;
 use crate::turn::loop_::{Outcome as LoopOutcome, OutcomeStop};
 use crate::turn::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
@@ -621,8 +621,25 @@ fn log_event(state: &mut AgentState, event: &Event) {
         | Event::ExploreNudge { text } => {
             log_entry(state, LogEntry::Nudge(text.clone()));
         }
+        // Anchors and Endgame prompts are Conversation events the model read:
+        // they persist like Nudges, tagged, so Resume rebuilds the same bytes
+        // (CONTEXT.md: every rider is logged to the Session Log).
+        Event::Anchor { text } => log_rider(state, RiderTag::Anchor, text),
+        Event::WrapUpWarning { text } => log_rider(state, RiderTag::WrapUpWarning, text),
+        Event::VerificationPass { text } => log_rider(state, RiderTag::VerificationPass, text),
+        Event::FinalPass { text } => log_rider(state, RiderTag::FinalPass, text),
         _ => {}
     }
+}
+
+fn log_rider(state: &mut AgentState, tag: RiderTag, text: &str) {
+    log_entry(
+        state,
+        LogEntry::Rider {
+            tag,
+            text: text.to_string(),
+        },
+    );
 }
 
 // ---- Turn start (submit + Rollover) ----------------------------------------
@@ -1634,6 +1651,182 @@ mod tests {
         let info = resumed.resume_info().await.expect("resume info");
         assert_eq!(info.path, path);
         assert_eq!(info.drift, vec![]);
+    }
+
+    // ---- riders in the Session Log (Anchors + Endgame prompts) ------------
+
+    // Session facts tuned so riders fire: turn_limit 4 puts the wrap-up
+    // warning on Pass 2 and the final-Pass prompt on Pass 3; anchor_interval 2
+    // places an Anchor on Pass 2.
+    fn rider_session(dir: &TempDir) -> Session {
+        let root = dir.path().to_string_lossy().into_owned();
+        let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+        Session::build(
+            SessionOpts {
+                root: Some(root),
+                session_dir: Some(session_dir),
+                turn_limit: Some(4),
+                anchor_interval: Some(2),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .expect("session builds")
+    }
+
+    // Three exploration Passes then a conclusion: crosses the anchor cadence,
+    // the Endgame schedule, and (on Pass 3) the Explore Nudge.
+    fn exploring_script() -> Vec<Entry> {
+        vec![
+            Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
+            Entry::just(tool_use_result("t2", "list_files", json!({ "path": "." }))),
+            Entry::just(tool_use_result("t3", "list_files", json!({ "path": "." }))),
+            Entry::just(text_end("done")),
+        ]
+    }
+
+    // The (entry, tag) shape of a Session Log file, header line skipped.
+    fn log_shape(path: &str) -> Vec<(String, Option<String>)> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                (
+                    v["e"].as_str().unwrap().to_string(),
+                    v.get("tag").and_then(|t| t.as_str()).map(String::from),
+                )
+            })
+            .collect()
+    }
+
+    fn shape(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(e, t)| (e.to_string(), t.map(String::from)))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn riders_are_logged_in_linear_position_as_they_are_injected() {
+        let dir = TempDir::new().unwrap();
+        let session = rider_session(&dir);
+        let session_dir = session.session_dir.clone();
+        let agent = start(session, FakeLlm::script(exploring_script()));
+        let mut rx = agent.subscribe();
+
+        agent.submit("look around").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+        drop(agent);
+
+        let path = log::latest(&session_dir).expect("a log file");
+        assert_eq!(
+            log_shape(&path),
+            shape(&[
+                ("user_text", None),
+                // Pass 1: an ordinary tool Pass, nothing rides.
+                ("assistant_blocks", None),
+                ("tool_result", None),
+                // Pass 2: the Anchor (interval 2) and the wrap-up warning
+                // (2 Passes remaining) ride the results tail, in merge order.
+                ("assistant_blocks", None),
+                ("tool_result", None),
+                ("rider", Some("anchor")),
+                ("rider", Some("wrap_up_warning")),
+                // Pass 3: the Explore Nudge (3rd exploration Pass) rides
+                // before the final-Pass prompt (1 remaining).
+                ("assistant_blocks", None),
+                ("tool_result", None),
+                ("nudge", None),
+                ("rider", Some("final_pass")),
+                // Pass 4: the tool-less final Pass concludes.
+                ("assistant_blocks", None),
+                ("settled", None),
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_carried_riders_resumes_byte_for_byte() {
+        let dir = TempDir::new().unwrap();
+        let session = rider_session(&dir);
+        let session_dir = session.session_dir.clone();
+        let agent = start(session.clone(), FakeLlm::script(exploring_script()));
+        let mut rx = agent.subscribe();
+
+        agent.submit("look around").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+
+        let live = agent.conversation().await;
+        drop(agent);
+
+        let path = log::latest(&session_dir).expect("a log file");
+        let resumed = AgentHandle::start(
+            StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+                .with_system_prompt("You are a test agent.")
+                .with_resume(Resume::Path(path)),
+        )
+        .expect("resumes");
+
+        // The reconstructed Conversation carries the same bytes the model
+        // read live — Anchor and Endgame prompts included.
+        assert_eq!(resumed.conversation().await.messages, live.messages);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverified_write_logs_the_verification_pass_prompt_and_resumes_byte_for_byte() {
+        let dir = TempDir::new().unwrap();
+        let session = rider_session(&dir);
+        let session_dir = session.session_dir.clone();
+        // A successful write and no run_command: the Verification Pass prompt
+        // subsumes the wrap-up warning at 2 remaining, and the Verify Nudge
+        // (a standalone finish Nudge, not a rider) fires on the early finish.
+        let script = vec![
+            Entry::just(tool_use_result(
+                "w1",
+                "write_file",
+                json!({ "path": "new.txt", "content": "hello" }),
+            )),
+            Entry::just(tool_use_result("t2", "list_files", json!({ "path": "." }))),
+            Entry::just(text_end("not verified yet")),
+            Entry::just(text_end("done")),
+        ];
+        let agent = start(session.clone(), FakeLlm::script(script));
+        let mut rx = agent.subscribe();
+
+        agent.submit("write it").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+
+        let live = agent.conversation().await;
+        drop(agent);
+
+        let path = log::latest(&session_dir).expect("a log file");
+        assert_eq!(
+            log_shape(&path),
+            shape(&[
+                ("user_text", None),
+                ("assistant_blocks", None),
+                ("tool_result", None),
+                ("assistant_blocks", None),
+                ("tool_result", None),
+                ("rider", Some("anchor")),
+                ("rider", Some("verification_pass")),
+                ("assistant_blocks", None),
+                ("nudge", None),
+                ("assistant_blocks", None),
+                ("settled", None),
+            ])
+        );
+
+        let resumed = AgentHandle::start(
+            StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+                .with_system_prompt("You are a test agent.")
+                .with_resume(Resume::Path(path)),
+        )
+        .expect("resumes");
+        assert_eq!(resumed.conversation().await.messages, live.messages);
     }
 
     #[tokio::test(flavor = "multi_thread")]
