@@ -18,6 +18,11 @@
 //!   * `nudge` — a user-role Nudge (Verify Nudge, Explore Nudge). The fold
 //!     merges it into an open tool-results batch when one is open (the Explore
 //!     Nudge rode that message live), else stands it alone (the Verify Nudge)
+//!   * `rider{tag, text}` — a results-tail rider the model read: the Anchor or
+//!     an Endgame prompt (wrap-up warning, Verification Pass prompt, final-Pass
+//!     prompt), logged as injected. The fold closes the open batch (every
+//!     result of the Pass precedes its riders) and re-injects the text through
+//!     the same merge seam the live Turn used
 //!   * `plan` — the model's Plan; held OUTSIDE the Conversation, so the fold
 //!     never turns it into a message; [`plan`] reads the last one back
 //!   * `message` — a verbatim Conversation message; seeds a fresh log on Resume
@@ -39,6 +44,7 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentBlock, Message, Role};
+use crate::conversation;
 use crate::session::Session;
 use crate::voice::{self, FileOps};
 
@@ -152,6 +158,38 @@ impl SettledEntry {
     }
 }
 
+/// Which rider a `rider` entry carries: the Anchor or one of the Endgame's
+/// tail prompts. Forensic — every kind replays through the one tail-merge
+/// seam it rode live, so the tag never changes the fold's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiderTag {
+    Anchor,
+    WrapUpWarning,
+    VerificationPass,
+    FinalPass,
+}
+
+impl RiderTag {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RiderTag::Anchor => "anchor",
+            RiderTag::WrapUpWarning => "wrap_up_warning",
+            RiderTag::VerificationPass => "verification_pass",
+            RiderTag::FinalPass => "final_pass",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<RiderTag> {
+        match s {
+            "anchor" => Some(RiderTag::Anchor),
+            "wrap_up_warning" => Some(RiderTag::WrapUpWarning),
+            "verification_pass" => Some(RiderTag::VerificationPass),
+            "final_pass" => Some(RiderTag::FinalPass),
+            _ => None,
+        }
+    }
+}
+
 // ------------------------------------------------------------------
 // The entry enum
 // ------------------------------------------------------------------
@@ -164,6 +202,10 @@ pub enum Entry {
     ToolResult(ContentBlock),
     Steering(String),
     Nudge(String),
+    Rider {
+        tag: RiderTag,
+        text: String,
+    },
     Plan(String),
     Message(Message),
     Settled {
@@ -192,6 +234,9 @@ impl Entry {
             Entry::UserText(text) => json!({"e": "user_text", "text": text}),
             Entry::Steering(text) => json!({"e": "steering", "text": text}),
             Entry::Nudge(text) => json!({"e": "nudge", "text": text}),
+            Entry::Rider { tag, text } => {
+                json!({"e": "rider", "tag": tag.as_str(), "text": text})
+            }
             Entry::Plan(text) => json!({"e": "plan", "text": text}),
             Entry::AssistantBlocks(blocks) => {
                 json!({"e": "assistant_blocks", "blocks": blocks})
@@ -238,6 +283,10 @@ impl Entry {
             "user_text" => Some(Entry::UserText(string_field(m, "text")?)),
             "steering" => Some(Entry::Steering(string_field(m, "text")?)),
             "nudge" => Some(Entry::Nudge(string_field(m, "text")?)),
+            "rider" => Some(Entry::Rider {
+                tag: RiderTag::from_str(m.get("tag")?.as_str()?)?,
+                text: string_field(m, "text")?,
+            }),
             "plan" => Some(Entry::Plan(string_field(m, "text")?)),
             "assistant_blocks" => {
                 let blocks = decode_blocks(m.get("blocks")?)?;
@@ -706,6 +755,15 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             Some(b) => b.steering.push(text.clone()),
             None => messages.push(user_message(vec![text_block(text)])),
         },
+        // A rider rode the trailing tool-results user message live, after
+        // every result of its Pass — the open batch is complete, so it can
+        // flush before the rider re-injects through the same merge seam
+        // `apply_tail` used ([`conversation::merge_user_text`]; the Anchor's
+        // `inject_anchor` IS that seam). The tag never varies the shape.
+        Entry::Rider { text, .. } => {
+            flush(messages, batch.take());
+            conversation::merge_user_text(messages, text.clone());
+        }
         Entry::Message(message) => {
             flush(messages, batch.take());
             messages.push(message.clone());
@@ -1242,6 +1300,150 @@ mod tests {
         assert_eq!(messages[3].role, Role::Assistant);
         assert!(
             matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "ok, exploring")
+        );
+    }
+
+    // ---- riders (the Anchor + the Endgame's tail prompts) ----
+
+    #[test]
+    fn riders_fold_into_the_tool_results_user_message_they_rode_live() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "list_files",
+            json!({"path": "."}),
+        )]));
+        log.append(Entry::ToolResult(tool_result("t1", "a.txt")));
+        log.append(Entry::Rider {
+            tag: RiderTag::Anchor,
+            text: "[anchor] the goal: go".into(),
+        });
+        log.append(Entry::Rider {
+            tag: RiderTag::WrapUpWarning,
+            text: "[2 passes remain - wrap up]".into(),
+        });
+        log.append(Entry::AssistantBlocks(vec![text("wrapping")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("go")]),
+                Message::assistant(vec![tool_use("t1", "list_files", json!({"path": "."}))]),
+                user_message(vec![
+                    tool_result("t1", "a.txt"),
+                    text("[anchor] the goal: go"),
+                    text("[2 passes remain - wrap up]"),
+                ]),
+                Message::assistant(vec![text("wrapping")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_verification_and_final_pass_prompts_fold_on_the_same_seam() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("edit it".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "edit_file",
+            json!({"path": "a.ex"}),
+        )]));
+        log.append(Entry::ToolResult(tool_result("t1", "edited")));
+        log.append(Entry::Rider {
+            tag: RiderTag::VerificationPass,
+            text: "[verify your changes now]".into(),
+        });
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t2",
+            "run_command",
+            json!({"command": "mix test"}),
+        )]));
+        log.append(Entry::ToolResult(tool_result("t2", "0 failures")));
+        log.append(Entry::Rider {
+            tag: RiderTag::FinalPass,
+            text: "[final pass - conclude]".into(),
+        });
+        log.append(Entry::AssistantBlocks(vec![text("done, verified")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("edit it")]),
+                Message::assistant(vec![tool_use("t1", "edit_file", json!({"path": "a.ex"}))]),
+                user_message(vec![
+                    tool_result("t1", "edited"),
+                    text("[verify your changes now]"),
+                ]),
+                Message::assistant(vec![tool_use(
+                    "t2",
+                    "run_command",
+                    json!({"command": "mix test"}),
+                )]),
+                user_message(vec![
+                    tool_result("t2", "0 failures"),
+                    text("[final pass - conclude]"),
+                ]),
+                Message::assistant(vec![text("done, verified")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_rider_tag_survives_the_file_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        for (tag, text) in [
+            (RiderTag::Anchor, "[a]"),
+            (RiderTag::WrapUpWarning, "[w]"),
+            (RiderTag::VerificationPass, "[v]"),
+            (RiderTag::FinalPass, "[f]"),
+        ] {
+            log.append(Entry::Rider {
+                tag,
+                text: text.into(),
+            });
+        }
+
+        // No open batch: each rider merges into the trailing user message —
+        // the same role-alternation rule the live seam applies. The log ends
+        // mid-Turn, so the fold settles it as failed.
+        let (messages, _) = resume(&log.path, &session).unwrap();
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![
+                    text("go"),
+                    text("[a]"),
+                    text("[w]"),
+                    text("[v]"),
+                    text("[f]"),
+                ]),
+                Message::assistant(vec![text("[turn failed]")]),
+            ]
         );
     }
 
