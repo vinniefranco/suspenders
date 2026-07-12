@@ -18,7 +18,7 @@ use crate::llm::response::{Response, StopReason};
 use crate::llm::stream::{Delta, StreamEvent};
 use crate::llm::{Llm, OnEvent};
 use crate::session::connection::Connection;
-use crate::turn::deps::{AfterPass, CompactError, TurnDeps};
+use crate::turn::deps::{AfterPass, CompactError, Emitter, TurnDeps};
 
 /// A callback that inspects the outgoing request and produces a [`Response`].
 /// The extension point for Phase 5 request-inspecting / barrier-blocking
@@ -357,8 +357,13 @@ impl TurnDeps for FakeDeps {
         self.llm.complete(wire, &self.connection, &mut adapter).await
     }
 
-    fn emit(&mut self, event: Event) {
-        self.events.lock().unwrap().push(event);
+    fn emitter(&mut self) -> Emitter {
+        // The handle shares the SAME `Arc<Mutex<Vec<Event>>>` the fake records
+        // into directly (approval request/resolved below), so a test sees one
+        // ordered log regardless of which path emitted (ADR-0025) - and the
+        // existing `deps.events` inspectors keep working unchanged.
+        let events = Arc::clone(&self.events);
+        Emitter::new(move |event| events.lock().unwrap().push(event))
     }
 
     async fn drain_steering(&mut self) -> Vec<String> {
@@ -368,7 +373,10 @@ impl TurnDeps for FakeDeps {
     async fn request_approval(&mut self, id: String, command: String) -> bool {
         // The shell (and baud's fake) emit the request/resolved events around
         // the block; mirror that so message-grammar assertions hold.
-        self.emit(Event::approval_request(id.clone(), command.clone()));
+        self.events
+            .lock()
+            .unwrap()
+            .push(Event::approval_request(id.clone(), command.clone()));
 
         let approved = if let Some(tx) = &self.approval_tx {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -386,7 +394,10 @@ impl TurnDeps for FakeDeps {
             self.approvals.lock().unwrap().pop_front().unwrap_or(false)
         };
 
-        self.emit(Event::approval_resolved(id, approved));
+        self.events
+            .lock()
+            .unwrap()
+            .push(Event::approval_resolved(id, approved));
         approved
     }
 

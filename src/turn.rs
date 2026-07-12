@@ -4,16 +4,25 @@
 //! [`TurnDeps`] that wires each effect to the Agent's channels and the Session's
 //! injected [`Llm`] (ADR-0011, ADR-0017). It runs INSIDE the spawned Turn task,
 //! so its effects talk back to the Agent over an `mpsc` (fire-and-forget for
-//! `emit`/`checkpoint`/`set_plan`; request/reply `oneshot` for `drain_steering`
+//! the [`Emitter`](deps::Emitter) handle, `checkpoint`, and `set_plan`;
+//! request/reply `oneshot` for `drain_steering`
 //! and `request_approval`). `complete` and `compact` call the injected `Llm`
 //! directly - in the Turn task, NEVER on the Agent (ADR-0012): an Agent-side
 //! summarization call would block every caller for its duration.
 
+mod batch;
 pub mod deps;
 pub mod endgame;
+mod finish;
 pub mod loop_;
 pub mod nudges;
 pub mod settlement;
+
+// Shared test fixtures for the split Loop (today only `loop_`'s tests; any
+// test module `batch`/`finish` grow shares this set instead of drifting
+// copies). Private suffices: descendants reach a private ancestor module.
+#[cfg(test)]
+mod fixtures;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -31,7 +40,7 @@ use crate::llm::Llm;
 use crate::scout::{Scout, ScoutOpts};
 use crate::session::connection::Connection;
 use crate::session::Session;
-use crate::turn::deps::{CompactError, TurnDeps};
+use crate::turn::deps::{CompactError, Emitter, TurnDeps};
 use crate::turn::loop_::{Outcome, RunOpts};
 use crate::plugins;
 
@@ -85,10 +94,16 @@ impl TurnDeps for AgentDeps {
         }
     }
 
-    fn emit(&mut self, event: Event) {
+    fn emitter(&mut self) -> Emitter {
         // Fire-and-forget to the Agent, which broadcasts AND logs - routing
-        // through the single owner keeps Event order deterministic (ADR-0017).
-        self.send(TurnMsg::Emit(event));
+        // through the single owner keeps Event order deterministic (ADR-0017):
+        // the handle and the Turn task feed the SAME mpsc channel from the SAME
+        // task, so detaching emission into a handle (ADR-0025) changes nothing
+        // about ordering.
+        let tx = self.tx.clone();
+        Emitter::new(move |event| {
+            let _ = tx.send(Msg::Turn(TurnMsg::Emit(event)));
+        })
     }
 
     fn drain_steering(&mut self) -> impl Future<Output = Vec<String>> + Send {

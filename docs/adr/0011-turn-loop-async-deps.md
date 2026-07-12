@@ -1,5 +1,9 @@
 # The Turn loop is a pure async function over a Deps trait
 
+> Amended by ADR-0025: event emission moved from an `emit` trait method to the
+> detachable `Emitter` handle obtained via `TurnDeps::emitter`, so the
+> streaming sink can emit while `complete` holds `&mut D`.
+
 The Turn loop is `async fn run<D: TurnDeps>(conv, session, deps: &mut D) -> Outcome`, generic over a `TurnDeps` trait whose methods **are** every effect the loop needs: `complete` (a model request), `emit` (an event), `drain_steering`, `request_approval`, `checkpoint`, `set_plan`, and an optional `after_pass` control hook returning continue, stop, or inject.
 
 The real implementation wires these methods to the Agent's channels and the Session. Tests supply a `FakeDeps` that records calls and returns canned values. Static dispatch via generic monomorphization means no `dyn` and no async-trait crate on the 2024 edition.
