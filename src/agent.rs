@@ -38,13 +38,13 @@ use crate::compaction::Compaction;
 use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
-use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::Llm;
-use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
+use crate::llm::response::StopReason as RespStopReason;
 use crate::session::Session;
+use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
+use crate::turn::AgentDeps;
 use crate::turn::loop_::{Outcome as LoopOutcome, OutcomeStop};
 use crate::turn::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
-use crate::turn::AgentDeps;
 use crate::{tools, voice};
 
 /// The default system prompt (baud's `Baud.Agent.system_prompt/0`). Public for
@@ -235,9 +235,7 @@ impl AgentHandle {
 
         // The Plan is held outside the Conversation; a Resume restores the last
         // logged Plan so the model keeps its goal across a restart.
-        let plan = resume_info
-            .as_ref()
-            .and_then(|ri| log::plan(&ri.path));
+        let plan = resume_info.as_ref().and_then(|ri| log::plan(&ri.path));
 
         // The tool specs ride with every request but live outside the messages;
         // the estimate has to count them or Eviction fires late (baud's
@@ -366,7 +364,9 @@ impl AgentHandle {
 
     /// The Session's fixed facts (baud's `session/1`).
     pub async fn session(&self) -> Session {
-        self.query(Command::SessionQuery).await.expect("agent alive")
+        self.query(Command::SessionQuery)
+            .await
+            .expect("agent alive")
     }
 
     /// The current Plan, or `None` (baud's `plan/1`).
@@ -605,7 +605,11 @@ fn log_event(state: &mut AgentState, event: &Event) {
         } => {
             log_entry(
                 state,
-                LogEntry::ToolResult(ContentBlock::tool_result(id.clone(), content.clone(), *is_error)),
+                LogEntry::ToolResult(ContentBlock::tool_result(
+                    id.clone(),
+                    content.clone(),
+                    *is_error,
+                )),
             );
         }
         Event::SteeringDelivered { text } => {
@@ -706,10 +710,9 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     // `cancel`); the outcome only needs mapping into the settlement vocabulary.
     let settle_outcome = to_settlement_outcome(outcome);
 
-    let resolution =
-        state
-            .settlement
-            .settle(settle_outcome, &state.conversation, &state.steering);
+    let resolution = state
+        .settlement
+        .settle(settle_outcome, &state.conversation, &state.steering);
 
     state.task = None;
     state.conversation = resolution.conversation;
@@ -807,21 +810,12 @@ fn maybe_resume(
         None => return Ok((Vec::new(), None)),
         Some(Resume::Path(p)) => p,
         Some(Resume::Latest) => log::latest(&session.session_dir).ok_or_else(|| {
-            StartError::ResumeFailed(format!(
-                "no Session Log found in {}",
-                session.session_dir
-            ))
+            StartError::ResumeFailed(format!("no Session Log found in {}", session.session_dir))
         })?,
     };
 
     match log::resume(&path, session) {
-        Ok((messages, drift)) => Ok((
-            messages,
-            Some(ResumeInfo {
-                path,
-                drift,
-            }),
-        )),
+        Ok((messages, drift)) => Ok((messages, Some(ResumeInfo { path, drift }))),
         Err(ResumeError::RootMismatch) => Err(StartError::ResumeRootMismatch(path)),
         Err(e) => Err(StartError::ResumeFailed(format!(
             "cannot resume {path}: {e:?}"
@@ -848,7 +842,7 @@ mod tests {
     use crate::session::connection::Connection;
     use crate::session::{Session, SessionConfig, SessionOpts};
     use crate::test_support::{Entry, FakeLlm, InFlight, Release};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::broadcast::error::RecvError;
@@ -933,10 +927,7 @@ mod tests {
 
     // Asserts NO matching event arrives within a short window (baud's
     // refute_receive / refute_received).
-    async fn refute_match(
-        rx: &mut broadcast::Receiver<Event>,
-        pred: impl Fn(&Event) -> bool,
-    ) {
+    async fn refute_match(rx: &mut broadcast::Receiver<Event>, pred: impl Fn(&Event) -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -990,20 +981,28 @@ mod tests {
             matches!(e, Event::MessageUpdate { delta: Delta::Thinking(t), .. } if t == "let me think")
         })
         .await;
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::MessageUpdate { delta: Delta::Text(t), .. } if t == "Hel")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::MessageUpdate { delta: Delta::Text(t), .. } if t == "Hel"),
+        )
         .await;
-        let last_update = recv_match(&mut rx, |e| {
-            matches!(e, Event::MessageUpdate { delta: Delta::Text(t), .. } if t == "lo")
-        })
+        let last_update = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::MessageUpdate { delta: Delta::Text(t), .. } if t == "lo"),
+        )
         .await;
         if let Event::MessageUpdate { content, .. } = last_update {
             assert_eq!(content.last(), Some(&ContentBlock::text("Hello")));
         }
 
         recv_match(&mut rx, |e| {
-            matches!(e, Event::MessageEnd { stop_reason: RStop::EndTurn, .. })
+            matches!(
+                e,
+                Event::MessageEnd {
+                    stop_reason: RStop::EndTurn,
+                    ..
+                }
+            )
         })
         .await;
 
@@ -1114,9 +1113,11 @@ mod tests {
         let conv = agent.conversation().await;
         assert!(conv.messages.iter().any(|m| {
             m.role == Role::User
-                && m.content.iter().any(|b| matches!(b,
+                && m.content.iter().any(|b| {
+                    matches!(b,
                     ContentBlock::ToolResult { tool_use_id, is_error: true, content }
-                        if tool_use_id == "tu_run" && content == "[command denied by user]"))
+                        if tool_use_id == "tu_run" && content == "[command denied by user]")
+                })
         }));
     }
 
@@ -1136,9 +1137,10 @@ mod tests {
 
         agent.submit("say hi").await.unwrap();
 
-        let req = recv_match(&mut rx, |e| {
-            matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi")
-        })
+        let req = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
+        )
         .await;
         let id = match req {
             Event::ApprovalRequest { approval_id, .. } => approval_id,
@@ -1150,9 +1152,10 @@ mod tests {
             matches!(e, Event::ApprovalResolved { approval_id, approved: true } if *approval_id == id)
         })
         .await;
-        let result = recv_match(&mut rx, |e| {
-            matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "tu_run")
-        })
+        let result = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "tu_run"),
+        )
         .await;
         if let Event::ToolResult { content, .. } = result {
             assert!(content.contains("hi"));
@@ -1166,9 +1169,17 @@ mod tests {
     async fn approve_always_records_the_command_the_identical_command_is_auto_approved() {
         let dir = TempDir::new().unwrap();
         let script = vec![
-            Entry::just(tool_use_result("r1", "run_command", json!({ "command": "echo hi" }))),
+            Entry::just(tool_use_result(
+                "r1",
+                "run_command",
+                json!({ "command": "echo hi" }),
+            )),
             Entry::just(tool_use_result("ls", "list_files", json!({ "path": "." }))),
-            Entry::just(tool_use_result("r2", "run_command", json!({ "command": "echo hi" }))),
+            Entry::just(tool_use_result(
+                "r2",
+                "run_command",
+                json!({ "command": "echo hi" }),
+            )),
             Entry::just(text_end("done")),
         ];
         let agent = start(session_in(&dir), FakeLlm::script(script));
@@ -1176,9 +1187,10 @@ mod tests {
 
         agent.submit("run it twice").await.unwrap();
 
-        let req = recv_match(&mut rx, |e| {
-            matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi")
-        })
+        let req = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
+        )
         .await;
         let id = match req {
             Event::ApprovalRequest { approval_id, .. } => approval_id,
@@ -1189,19 +1201,22 @@ mod tests {
             matches!(e, Event::ApprovalResolved { approval_id, approved: true } if *approval_id == id)
         })
         .await;
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r1")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r1"),
+        )
         .await;
 
         // The identical second command: no modal, an approval_auto, still runs.
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::ApprovalAuto { command } if command == "echo hi")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalAuto { command } if command == "echo hi"),
+        )
         .await;
-        let r2 = recv_match(&mut rx, |e| {
-            matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r2")
-        })
+        let r2 = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r2"),
+        )
         .await;
         if let Event::ToolResult { content, .. } = r2 {
             assert!(content.contains("hi"));
@@ -1213,8 +1228,16 @@ mod tests {
     async fn a_standing_approval_never_widens_beyond_the_identical_string() {
         let dir = TempDir::new().unwrap();
         let script = vec![
-            Entry::just(tool_use_result("r1", "run_command", json!({ "command": "echo hi" }))),
-            Entry::just(tool_use_result("r2", "run_command", json!({ "command": "echo  hi" }))),
+            Entry::just(tool_use_result(
+                "r1",
+                "run_command",
+                json!({ "command": "echo hi" }),
+            )),
+            Entry::just(tool_use_result(
+                "r2",
+                "run_command",
+                json!({ "command": "echo  hi" }),
+            )),
             Entry::just(text_end("done")),
         ];
         let agent = start(session_in(&dir), FakeLlm::script(script));
@@ -1222,24 +1245,27 @@ mod tests {
 
         agent.submit("run variants").await.unwrap();
 
-        let req1 = recv_match(&mut rx, |e| {
-            matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi")
-        })
+        let req1 = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
+        )
         .await;
         let id1 = match req1 {
             Event::ApprovalRequest { approval_id, .. } => approval_id,
             _ => unreachable!(),
         };
         agent.approve(id1, Decision::ApproveAlways).await;
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r1")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r1"),
+        )
         .await;
 
         // Two spaces is a different command: the modal comes back.
-        let req2 = recv_match(&mut rx, |e| {
-            matches!(e, Event::ApprovalRequest { command, .. } if command == "echo  hi")
-        })
+        let req2 = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo  hi"),
+        )
         .await;
         let id2 = match req2 {
             Event::ApprovalRequest { approval_id, .. } => approval_id,
@@ -1283,9 +1309,10 @@ mod tests {
         // First call is parked; steer, then release into a tool_use.
         let InFlight { release, .. } = inflight.recv().await.expect("first call parked");
         agent.steer("also check the README").await.unwrap();
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::SteeringQueued { text } if text == "also check the README")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::SteeringQueued { text } if text == "also check the README"),
+        )
         .await;
 
         release
@@ -1295,9 +1322,10 @@ mod tests {
             })
             .ok();
 
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::SteeringDelivered { text } if text == "also check the README")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::SteeringDelivered { text } if text == "also check the README"),
+        )
         .await;
 
         // Unadorned, riding the SAME user message as the tool results.
@@ -1438,9 +1466,10 @@ mod tests {
         agent.submit("explore then hang").await.unwrap();
 
         // The tool ran; only then cancel (its result is on disk/in the conv).
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "t1")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "t1"),
+        )
         .await;
         let _inflight = inflight.recv().await.expect("second call parked");
         agent.cancel().await;
@@ -1467,14 +1496,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_error_emits_turn_error_keeps_user_message_and_closes_with_failure_marker() {
         let dir = TempDir::new().unwrap();
-        let agent = start(session_in(&dir), FakeLlm::script(vec![Entry::error("boom")]));
+        let agent = start(
+            session_in(&dir),
+            FakeLlm::script(vec![Entry::error("boom")]),
+        );
         let mut rx = agent.subscribe();
 
         agent.submit("hello?").await.unwrap();
 
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::TurnError { reason } if reason == "boom")
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::TurnError { reason } if reason == "boom"),
+        )
         .await;
         assert_eq!(agent.status().await, Status::Idle);
 
@@ -1508,7 +1541,11 @@ mod tests {
 
         agent.submit("explore then die").await.unwrap();
 
-        recv_match(&mut rx, |e| matches!(e, Event::TurnError { reason } if reason == "boom")).await;
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::TurnError { reason } if reason == "boom"),
+        )
+        .await;
 
         let conv = agent.conversation().await;
         let tail: Vec<_> = conv.messages.iter().rev().take(3).rev().cloned().collect();
@@ -1539,9 +1576,10 @@ mod tests {
 
         agent.submit("evaluate this project").await.unwrap();
 
-        recv_match(&mut rx, |e| {
-            matches!(e, Event::TurnError { reason } if reason.contains("connection refused"))
-        })
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::TurnError { reason } if reason.contains("connection refused")),
+        )
         .await;
         assert_eq!(agent.status().await, Status::Idle);
 
@@ -1556,10 +1594,12 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0]["outcome"], "failed");
         assert_eq!(settled[0]["stop_reason"], "error");
-        assert!(settled[0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("connection refused"));
+        assert!(
+            settled[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("connection refused")
+        );
     }
 
     // ---- session log + resume --------------------------------------------
@@ -1602,7 +1642,11 @@ mod tests {
         let session = session_in(&dir);
         let session_dir = session.session_dir.clone();
         let script = vec![
-            Entry::just(tool_use_result("p1", "plan", json!({ "plan": "Goal: Y. 1. do [ ]" }))),
+            Entry::just(tool_use_result(
+                "p1",
+                "plan",
+                json!({ "plan": "Goal: Y. 1. do [ ]" }),
+            )),
             Entry::just(text_end("planned")),
         ];
         let first = start(session.clone(), FakeLlm::script(script));
@@ -1694,10 +1738,12 @@ mod tests {
             .filter(|v| v["e"] == "compacted")
             .collect();
         assert_eq!(compacted.len(), 1);
-        assert!(compacted[0]["summary"]
-            .as_str()
-            .unwrap()
-            .contains("Compaction narrative"));
+        assert!(
+            compacted[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Compaction narrative")
+        );
         assert_eq!(compacted[0]["original_task"], "step 1");
 
         // Resume folds to the COMPACTED view, not the raw pre-compaction msgs.
@@ -1719,9 +1765,11 @@ mod tests {
             .join("\n");
         assert!(resumed_head.contains("Compaction narrative"));
         assert!(resumed_head.contains("step 1"));
-        assert!(!resumed_msgs.iter().any(|m| m.content.iter().any(|b| {
-            matches!(b, ContentBlock::Text { text } if text == "step 1")
-        })));
+        assert!(!resumed_msgs.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "step 1"))
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1773,7 +1821,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent = start(
             session_in(&dir),
-            FakeLlm::script(vec![Entry::response(vec![Delta::Text("ok".into())], text_end("ok"))]),
+            FakeLlm::script(vec![Entry::response(
+                vec![Delta::Text("ok".into())],
+                text_end("ok"),
+            )]),
         );
 
         // A subscriber that immediately goes away.
@@ -1814,7 +1865,10 @@ mod tests {
 
         release
             .send(Release {
-                deltas: vec![Delta::Text("Thinking".into()), Delta::Text(" carefully".into())],
+                deltas: vec![
+                    Delta::Text("Thinking".into()),
+                    Delta::Text(" carefully".into()),
+                ],
                 response: tool_use_result("t1", "list_files", json!({ "path": "." })),
             })
             .ok();

@@ -454,14 +454,18 @@ mod tests {
         let changed = changed_lines.join("\n");
         let hunks = compute(&before, &changed);
         assert_eq!(hunks.len(), 2);
-        assert!(hunks[0]
-            .lines
-            .iter()
-            .any(|l| *l == Line::new(Tag::Added, None, Some(2), "CHANGED2")));
-        assert!(hunks[1]
-            .lines
-            .iter()
-            .any(|l| *l == Line::new(Tag::Added, None, Some(18), "CHANGED18")));
+        assert!(
+            hunks[0]
+                .lines
+                .iter()
+                .any(|l| *l == Line::new(Tag::Added, None, Some(2), "CHANGED2"))
+        );
+        assert!(
+            hunks[1]
+                .lines
+                .iter()
+                .any(|l| *l == Line::new(Tag::Added, None, Some(18), "CHANGED18"))
+        );
     }
 
     #[test]
@@ -474,12 +478,16 @@ mod tests {
         let hunks = compute(&before_lines.join("\n"), &changed_lines.join("\n"));
         assert_eq!(hunks.len(), 1);
         let lines = &hunks[0].lines;
-        assert!(lines
-            .iter()
-            .any(|l| *l == Line::new(Tag::Added, None, Some(4), "CHANGED4")));
-        assert!(lines
-            .iter()
-            .any(|l| *l == Line::new(Tag::Added, None, Some(8), "CHANGED8")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == Line::new(Tag::Added, None, Some(4), "CHANGED4"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == Line::new(Tag::Added, None, Some(8), "CHANGED8"))
+        );
     }
 
     #[test]
@@ -490,9 +498,11 @@ mod tests {
         let hunks = compute(&before, &changed);
         assert_eq!(hunks.len(), 1);
         let lines = &hunks[0].lines;
-        assert!(lines
-            .iter()
-            .any(|l| *l == Line::new(Tag::Added, None, Some(2), "new")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == Line::new(Tag::Added, None, Some(2), "new"))
+        );
         assert!(!lines.iter().any(|l| l.tag == Tag::Removed));
     }
 
@@ -526,7 +536,13 @@ mod tests {
 
         let hunks = compute(&before_lines.join("\n"), &changed_lines.join("\n"));
         let stats = stats(&hunks);
-        assert_eq!(stats, Stats { added: 1, removed: 2 });
+        assert_eq!(
+            stats,
+            Stats {
+                added: 1,
+                removed: 2
+            }
+        );
     }
 
     // ---- to_unified/2 ----

@@ -247,8 +247,7 @@ impl Conversation {
             .iter()
             .enumerate()
             .filter(|(_, m)| {
-                m.role == Role::User
-                    && matches!(m.content.first(), Some(ContentBlock::Text { .. }))
+                m.role == Role::User && matches!(m.content.first(), Some(ContentBlock::Text { .. }))
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -492,7 +491,11 @@ fn block_chars(block: &ContentBlock) -> usize {
         ContentBlock::Text { text } => text.chars().count(),
         ContentBlock::ToolResult { content, .. } => content.chars().count(),
         ContentBlock::ToolUse { name, input, .. } => {
-            name.chars().count() + serde_json::to_string(input).unwrap_or_default().chars().count()
+            name.chars().count()
+                + serde_json::to_string(input)
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
         }
         ContentBlock::Thinking { .. } => 0,
     }
@@ -620,10 +623,7 @@ mod tests {
 
     #[test]
     fn add_tool_results_appends_all_results_as_one_user_message() {
-        let results = vec![
-            tool_result("t1", "one"),
-            tool_result_err("t2", "two", true),
-        ];
+        let results = vec![tool_result("t1", "one"), tool_result_err("t2", "two", true)];
         let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
         conv.add_user_text("hi");
         conv.add_assistant_blocks(vec![tool_use("t1", "grep"), tool_use("t2", "grep")]);
@@ -886,10 +886,8 @@ mod tests {
         let contents = [big.clone(), big.clone(), "r3".to_string(), "r4".to_string()];
 
         let build = |budget: u64| -> Conversation {
-            let mut conv = Conversation::new(
-                "sys",
-                ConversationOpts::new(budget, 7).eviction_slack(0.0),
-            );
+            let mut conv =
+                Conversation::new("sys", ConversationOpts::new(budget, 7).eviction_slack(0.0));
             conv.add_user_text("go");
             conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
             conv.add_tool_results(vec![tool_result("t1", &contents[0])], vec![]);
@@ -996,7 +994,12 @@ mod tests {
         let evicted = conv.evict();
         assert_eq!(
             result_contents(&evicted),
-            vec![ELISION.to_string(), "b".repeat(100), "c".to_string(), "d".to_string()]
+            vec![
+                ELISION.to_string(),
+                "b".repeat(100),
+                "c".to_string(),
+                "d".to_string()
+            ]
         );
     }
 
@@ -1050,8 +1053,7 @@ mod tests {
 
     #[test]
     fn prepare_compaction_finds_cutoff_across_turns() {
-        let mut conv =
-            Conversation::new("sys", ConversationOpts::new(200, 0).eviction_slack(0.0));
+        let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0).eviction_slack(0.0));
         for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
             conv.add_user_text(u.repeat(100));
             conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(100))]);
@@ -1064,14 +1066,19 @@ mod tests {
 
         let cutoff_msg = &conv.messages[cutoff_idx];
         assert_eq!(cutoff_msg.role, Role::User);
-        assert!(matches!(cutoff_msg.content.first(), Some(ContentBlock::Text { .. })));
+        assert!(matches!(
+            cutoff_msg.content.first(),
+            Some(ContentBlock::Text { .. })
+        ));
     }
 
     #[test]
     fn prepare_compaction_keep_is_compaction_keep_of_window() {
         let build = |keep: f64| -> Conversation {
-            let mut conv =
-                Conversation::new("sys", ConversationOpts::new(10_000, 0).compaction_keep(keep));
+            let mut conv = Conversation::new(
+                "sys",
+                ConversationOpts::new(10_000, 0).compaction_keep(keep),
+            );
             for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
                 conv.add_user_text(u.repeat(700));
                 conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(700))]);
@@ -1108,7 +1115,12 @@ mod tests {
     #[test]
     fn prepare_compaction_cutoff_lands_on_turn_start_user_message() {
         let mut conv = Conversation::new("sys", ConversationOpts::new(1, 0));
-        for (u, a) in [("turn 1", "a"), ("turn 2", "b"), ("turn 3", "c"), ("turn 4", "d")] {
+        for (u, a) in [
+            ("turn 1", "a"),
+            ("turn 2", "b"),
+            ("turn 3", "c"),
+            ("turn 4", "d"),
+        ] {
             conv.add_user_text(u);
             conv.add_assistant_blocks(vec![ContentBlock::text(a)]);
         }
@@ -1116,7 +1128,10 @@ mod tests {
         let (_, cutoff_idx, _) = conv.prepare_compaction().unwrap();
         let cutoff_msg = &conv.messages[cutoff_idx];
         assert_eq!(cutoff_msg.role, Role::User);
-        assert!(matches!(cutoff_msg.content.first(), Some(ContentBlock::Text { .. })));
+        assert!(matches!(
+            cutoff_msg.content.first(),
+            Some(ContentBlock::Text { .. })
+        ));
     }
 
     // ---- apply_compaction/3 ----
@@ -1223,9 +1238,10 @@ mod tests {
             if m.role == Role::User {
                 for b in &m.content {
                     if let ContentBlock::Text { text } = b
-                        && voice::is_anchor(b) {
-                            out.push(text.clone());
-                        }
+                        && voice::is_anchor(b)
+                    {
+                        out.push(text.clone());
+                    }
                 }
             }
         }

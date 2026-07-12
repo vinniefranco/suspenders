@@ -40,7 +40,9 @@ pub fn open(path: &str) -> Result<History, String> {
         .create(true)
         .append(true)
         .open(path);
-    Ok(History { path: path.to_string() })
+    Ok(History {
+        path: path.to_string(),
+    })
 }
 
 impl History {

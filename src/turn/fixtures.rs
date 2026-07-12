@@ -16,7 +16,7 @@ use crate::plugins::Registered;
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::test_support::{Entry, FakeDeps, FakeLlm};
 use crate::tool::ToolCtx;
-use crate::turn::loop_::{run, Outcome, OutcomeStop, RunOpts};
+use crate::turn::loop_::{Outcome, OutcomeStop, RunOpts, run};
 
 pub(super) fn session_with(root: &std::path::Path, opts: SessionOpts) -> Session {
     let mut opts = opts;
@@ -107,9 +107,8 @@ pub(super) fn events(deps: &FakeDeps) -> Vec<Event> {
 }
 
 pub(super) fn find_tool_result<'a>(evs: &'a [Event], id: &str) -> Option<&'a Event> {
-    evs.iter().find(
-        |e| matches!(e, Event::ToolResult { id: i, .. } if i == id),
-    )
+    evs.iter()
+        .find(|e| matches!(e, Event::ToolResult { id: i, .. } if i == id))
 }
 
 pub(super) fn count_voiced(evs: &[Event], f: impl Fn(&Event) -> bool) -> usize {

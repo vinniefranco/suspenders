@@ -207,7 +207,11 @@ mod tests {
     fn the_cursor_column_is_always_inside_the_width() {
         for cur in 0..=12 {
             let l = layout("abcd\nefghijkl", cur, 4);
-            assert!(l.cursor_col < 4, "cursor {cur} produced col {}", l.cursor_col);
+            assert!(
+                l.cursor_col < 4,
+                "cursor {cur} produced col {}",
+                l.cursor_col
+            );
             assert!(l.cursor_row < l.rows.len());
         }
     }

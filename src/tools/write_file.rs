@@ -4,8 +4,8 @@
 //! stops a small model from destroying a file by rewriting it (each
 //! reproduction shorter than the last) instead of making a targeted edit.
 
-use crate::tool::{file_error, with_path, FileError, Tool, ToolCtx, ToolSpec};
-use serde_json::{json, Value};
+use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};
+use serde_json::{Value, json};
 
 pub struct WriteFile;
 
@@ -14,10 +14,11 @@ impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Create a new file with the given content. Fails if the file already exists; \
+            description:
+                "Create a new file with the given content. Fails if the file already exists; \
                 change an existing file with edit_file. Parent directories are created \
                 automatically."
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -100,9 +101,12 @@ mod tests {
     #[tokio::test]
     async fn creates_a_new_file_and_reports_it_as_created() {
         let tmp = TempDir::new().unwrap();
-        let msg = run(json!({"path": "new.txt", "content": "hello"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let msg = run(
+            json!({"path": "new.txt", "content": "hello"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert!(msg.contains("created new.txt"));
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
@@ -145,9 +149,14 @@ mod tests {
     #[tokio::test]
     async fn empty_content_is_allowed() {
         let tmp = TempDir::new().unwrap();
-        assert!(run(json!({"path": "empty.txt", "content": ""}), &ctx(tmp.path()))
+        assert!(
+            run(
+                json!({"path": "empty.txt", "content": ""}),
+                &ctx(tmp.path())
+            )
             .await
-            .is_ok());
+            .is_ok()
+        );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap(),
             ""
@@ -169,7 +178,11 @@ mod tests {
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            run(json!({"path": "../escape.txt", "content": "x"}), &ctx(tmp.path())).await,
+            run(
+                json!({"path": "../escape.txt", "content": "x"}),
+                &ctx(tmp.path())
+            )
+            .await,
             Err("path escapes project root".into())
         );
         assert_eq!(

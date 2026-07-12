@@ -9,7 +9,7 @@
 //! By factoring request-building out of the boundary, the module is tested
 //! without a mock server: feed in the project's shapes, assert the output.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::content::Message;
 use crate::session::connection::Connection;

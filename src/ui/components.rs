@@ -11,13 +11,13 @@
 
 use std::sync::OnceLock;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use ratatui::Frame;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -60,7 +60,9 @@ pub fn md_style(style: MdStyle) -> Style {
         MdStyle::BoldItalic => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
         MdStyle::Code => Style::default().fg(Color::Yellow),
         MdStyle::CodeBlock => Style::default().fg(Color::Rgb(185, 215, 180)).bg(CODE_BG),
-        MdStyle::Heading => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        MdStyle::Heading => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
         MdStyle::Bullet => Style::default().fg(Color::Cyan),
         MdStyle::Quote => Style::default()
             .fg(Color::DarkGray)
@@ -153,8 +155,8 @@ pub fn render(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),    // transcript viewport
-            Constraint::Length(1), // status bar
+            Constraint::Min(1),                         // transcript viewport
+            Constraint::Length(1),                      // status bar
             Constraint::Length(composer_height as u16), // composer (grows with the draft)
         ])
         .split(area);
@@ -219,8 +221,11 @@ pub fn render_viewport(
     // One (lines, wrapped-count) entry per window "item": every settled
     // message, then the streaming tail - a single indexing shared by the
     // window selection and the slice assembly below.
-    let mut item_lines: Vec<&[Line<'static>]> =
-        cache.items.iter().map(|item| item.lines.as_slice()).collect();
+    let mut item_lines: Vec<&[Line<'static>]> = cache
+        .items
+        .iter()
+        .map(|item| item.lines.as_slice())
+        .collect();
     let mut counts: Vec<usize> = cache.items.iter().map(|item| item.wrapped).collect();
     if !thinking_lines.is_empty() {
         counts.push(wrapped_count(thinking_lines.clone(), text_area.width));
@@ -352,7 +357,11 @@ impl RenderCache {
             return;
         }
         let char_len = text.chars().count();
-        if self.streaming.as_ref().is_some_and(|s| s.char_len == char_len) {
+        if self
+            .streaming
+            .as_ref()
+            .is_some_and(|s| s.char_len == char_len)
+        {
             return;
         }
         let lines = markdown_lines(text);
@@ -418,7 +427,9 @@ fn message_lines(item: &TranscriptItem, thinking_expanded: bool) -> Vec<Line<'st
         // User prompts: the "› " gutter on the first row, continuation rows
         // aligned under it. Multi-line input renders as multiple rows.
         TranscriptItem::User { text } => {
-            let gutter = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let gutter = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
             text_rows(text)
                 .into_iter()
                 .enumerate()
@@ -442,7 +453,11 @@ fn message_lines(item: &TranscriptItem, thinking_expanded: bool) -> Vec<Line<'st
                 .add_modifier(Modifier::ITALIC);
             if thinking_expanded {
                 let mut out = vec![Line::styled("🧠 thought:", style)];
-                out.extend(text_rows(text).into_iter().map(|row| Line::styled(row, style)));
+                out.extend(
+                    text_rows(text)
+                        .into_iter()
+                        .map(|row| Line::styled(row, style)),
+                );
                 out
             } else {
                 vec![Line::styled(
@@ -726,7 +741,10 @@ pub fn render_status_bar(
         spans.push(Span::styled(text.clone(), segment_style(*kind)));
         // The separator wears THIS segment's bg over the NEXT one's (the base
         // bg after the last segment) - that is what draws the triangle.
-        let next_bg = left.get(i + 1).map(|(_, k)| segment_bg(*k)).unwrap_or(BAR_BG);
+        let next_bg = left
+            .get(i + 1)
+            .map(|(_, k)| segment_bg(*k))
+            .unwrap_or(BAR_BG);
         spans.push(Span::styled(
             SEP_RIGHT,
             Style::default().fg(segment_bg(*kind)).bg(next_bg),
@@ -859,7 +877,9 @@ pub fn render_composer(frame: &mut Frame, area: Rect, t: &Transcript, layout: &C
         return;
     }
     let top = composer::first_visible_row(layout.cursor_row, visible);
-    let gutter = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let gutter = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let lines: Vec<Line> = layout
         .rows
         .iter()
@@ -886,7 +906,9 @@ pub fn render_composer(frame: &mut Frame, area: Rect, t: &Transcript, layout: &C
 /// The Approval modal for a run_command Tool Call: `y` approves, `n` denies,
 /// `a` approves-always. Key handling lives in the Transcript core; this draws it.
 pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str) {
-    let width = (command.chars().count() as u16 + 8).max(44).min(area.width.saturating_sub(4));
+    let width = (command.chars().count() as u16 + 8)
+        .max(44)
+        .min(area.width.saturating_sub(4));
     let height = 8u16.min(area.height.saturating_sub(2));
     let modal = centered_rect(width, height, area);
 
@@ -896,15 +918,31 @@ pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str) {
     frame.render_widget(block, modal);
 
     let body = Paragraph::new(vec![
-        Line::styled("Run command?", Style::default().add_modifier(Modifier::BOLD)),
+        Line::styled(
+            "Run command?",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Line::styled(command.to_string(), Style::default().fg(Color::Yellow)),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("[y]es", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[y]es",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" / "),
-            Span::styled("[n]o", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[n]o",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" / "),
-            Span::styled("[a]lways", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[a]lways",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
     ])
     .wrap(Wrap { trim: false });
@@ -926,7 +964,9 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker) {
         .max()
         .unwrap_or(0) as u16;
     // rows + footer + borders; both dimensions capped to the terminal.
-    let width = (content_width + 4).max(44).min(area.width.saturating_sub(2));
+    let width = (content_width + 4)
+        .max(44)
+        .min(area.width.saturating_sub(2));
     let height = (picker.entries.len() as u16 + 3).min(area.height.saturating_sub(2));
     let modal = centered_rect(width, height, area);
 
@@ -950,10 +990,7 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker) {
             Line::styled(format!("{}  {}", entry.stamp, entry.label), style)
         })
         .collect();
-    lines.push(Line::styled(
-        FOOTER,
-        Style::default().fg(Color::DarkGray),
-    ));
+    lines.push(Line::styled(FOOTER, Style::default().fg(Color::DarkGray)));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1043,8 +1080,8 @@ mod tests {
     #[test]
     fn highlight_code_carries_parse_state_across_lines() {
         // A block comment opened on line 1 must color line 2 as comment, not code.
-        let lines = highlight_code(&["/* comment", "still comment */", "let x = 1;"], "rust")
-            .unwrap();
+        let lines =
+            highlight_code(&["/* comment", "still comment */", "let x = 1;"], "rust").unwrap();
         let comment = color_of(&lines[..1], "comment");
         assert_eq!(color_of(&lines[1..2], "still comment"), comment);
         assert_ne!(color_of(&lines[2..], "let"), comment);
@@ -1158,7 +1195,10 @@ mod tests {
         assert_eq!(kinds(&left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
             kinds(&right),
-            vec![SegmentKind::Tokens(PressureLevel::Ok), SegmentKind::Position]
+            vec![
+                SegmentKind::Tokens(PressureLevel::Ok),
+                SegmentKind::Position
+            ]
         );
 
         let (left, right) = segments_at(20);
@@ -1217,15 +1257,26 @@ mod tests {
     #[test]
     fn the_running_mode_segment_carries_the_spinner_frame() {
         let mode = |spinner: u64| {
-            status_segments(200, Status::Running, spinner, "u", false, None, "Bot".into())
-                .0
-                .remove(0)
-                .0
+            status_segments(
+                200,
+                Status::Running,
+                spinner,
+                "u",
+                false,
+                None,
+                "Bot".into(),
+            )
+            .0
+            .remove(0)
+            .0
         };
         assert_eq!(mode(0), format!(" {} RUNNING ", SPINNER[0]));
         assert_eq!(mode(1), format!(" {} RUNNING ", SPINNER[1]));
         // The counter wraps around the frame set.
-        assert_eq!(mode(SPINNER.len() as u64), format!(" {} RUNNING ", SPINNER[0]));
+        assert_eq!(
+            mode(SPINNER.len() as u64),
+            format!(" {} RUNNING ", SPINNER[0])
+        );
     }
 
     #[test]
@@ -1394,18 +1445,27 @@ mod tests {
     fn streaming_cache_reparses_only_when_the_char_length_moves() {
         let mut cache = RenderCache::new();
         cache.sync_streaming("hello", 80);
-        assert_eq!(line_text(&cache.streaming.as_ref().unwrap().lines[0]), "hello");
+        assert_eq!(
+            line_text(&cache.streaming.as_ref().unwrap().lines[0]),
+            "hello"
+        );
 
         // Same length, different text: the monotonic-key contract - within a
         // message the snapshot only GROWS, so an equal length means unchanged
         // and the cached lines are reused as-is.
         cache.sync_streaming("world", 80);
-        assert_eq!(line_text(&cache.streaming.as_ref().unwrap().lines[0]), "hello");
+        assert_eq!(
+            line_text(&cache.streaming.as_ref().unwrap().lines[0]),
+            "hello"
+        );
 
         // Growth re-parses; the end of streaming clears, so the next
         // message can never collide with a stale entry of the same length.
         cache.sync_streaming("hello more", 80);
-        assert_eq!(line_text(&cache.streaming.as_ref().unwrap().lines[0]), "hello more");
+        assert_eq!(
+            line_text(&cache.streaming.as_ref().unwrap().lines[0]),
+            "hello more"
+        );
         cache.sync_streaming("", 80);
         assert!(cache.streaming.is_none());
     }

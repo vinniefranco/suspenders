@@ -12,10 +12,9 @@
 
 mod batch;
 pub mod deps;
-pub mod endgame;
 mod finish;
+pub mod governor;
 pub mod loop_;
-pub mod nudges;
 pub mod settlement;
 
 // Shared test fixtures for the split Loop (today only `loop_`'s tests; any
@@ -33,16 +32,16 @@ use crate::agent::{Msg, TurnMsg};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::event::Event;
+use crate::llm::Llm;
 use crate::llm::request::{self, LlmRequest};
 use crate::llm::response::Response;
 use crate::llm::stream::StreamEvent;
-use crate::llm::Llm;
+use crate::plugins;
 use crate::scout::{Scout, ScoutOpts};
-use crate::session::connection::Connection;
 use crate::session::Session;
+use crate::session::connection::Connection;
 use crate::turn::deps::{CompactError, Emitter, TurnDeps};
 use crate::turn::loop_::{Outcome, RunOpts};
-use crate::plugins;
 
 /// The Turn shell's [`TurnDeps`]: every effect wired
 /// to the Agent's mpsc + the Session's Llm.
@@ -173,7 +172,10 @@ impl TurnDeps for AgentDeps {
         let compaction = self.compaction.clone();
         async move {
             let tokens_before = conversation.token_estimate();
-            match compaction.run(&conversation, llm.as_ref(), &connection).await {
+            match compaction
+                .run(&conversation, llm.as_ref(), &connection)
+                .await
+            {
                 Ok((compacted, new_state)) => {
                     let skip_count = Compaction::skip_count(&conversation, &compacted);
                     let _ = tx.send(Msg::Turn(TurnMsg::Compacted {

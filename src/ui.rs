@@ -33,8 +33,7 @@ use crate::session::Session;
 use crate::session::log::SessionEntry;
 use picker::{Picker, PickerOutcome};
 use transcript::{
-    AgentCommand, Busy, Decision, Effect, Idle, Key, ScrollStep, Status, Transcript,
-    TranscriptOpts,
+    AgentCommand, Busy, Decision, Effect, Idle, Key, ScrollStep, Status, Transcript, TranscriptOpts,
 };
 use viewport::{Viewport, WHEEL_LINES};
 
@@ -146,7 +145,10 @@ async fn run_loop(
     // lives beside the Session Logs; the pure core keeps the in-memory ring -
     // the adapter loads it at mount and appends on each submit (HistoryAppend).
     let history_store = history_path(session).and_then(|p| crate::history::open(&p).ok());
-    let history = history_store.as_ref().map(History::read).unwrap_or_default();
+    let history = history_store
+        .as_ref()
+        .map(History::read)
+        .unwrap_or_default();
 
     let mut transcript = Some(Transcript::new(TranscriptOpts {
         context_budget: Some(session.context_budget),
@@ -171,7 +173,14 @@ async fn run_loop(
 
     // Initial paint; `geometry` tracks the last draw's measure for the scroll
     // effects (see [`Geometry`]).
-    let mut geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
+    let mut geometry = draw(
+        terminal,
+        transcript.as_ref().unwrap(),
+        &viewport,
+        &base_url,
+        spinner,
+        &mut cache,
+    )?;
 
     loop {
         tokio::select! {
@@ -263,7 +272,14 @@ async fn run_loop(
             }
         }
 
-        geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
+        geometry = draw(
+            terminal,
+            transcript.as_ref().unwrap(),
+            &viewport,
+            &base_url,
+            spinner,
+            &mut cache,
+        )?;
     }
 }
 
@@ -414,13 +430,19 @@ async fn run_effect(
             // retries as steer) and may emit MORE effects.
             let outcome = result.map_err(|_| Busy);
             let (core, effects) = transcript.submitted(prompt, outcome);
-            Box::pin(run_effects(core, effects, agent, viewport, geometry, history)).await
+            Box::pin(run_effects(
+                core, effects, agent, viewport, geometry, history,
+            ))
+            .await
         }
         Effect::Agent(AgentCommand::Steer(text)) => {
             let result = agent.steer(text.clone()).await;
             let outcome = result.map_err(|_| Idle);
             let (core, effects) = transcript.steered(text, outcome);
-            Box::pin(run_effects(core, effects, agent, viewport, geometry, history)).await
+            Box::pin(run_effects(
+                core, effects, agent, viewport, geometry, history,
+            ))
+            .await
         }
         Effect::Agent(AgentCommand::Approve(id, decision)) => {
             agent.approve(id, to_agent_decision(decision)).await;
@@ -545,10 +567,22 @@ mod tests {
 
     #[test]
     fn cursor_navigation_keys_map_to_their_named_variants() {
-        assert_eq!(map_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), Key::Left);
-        assert_eq!(map_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), Key::Right);
-        assert_eq!(map_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)), Key::Home);
-        assert_eq!(map_key(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE)), Key::End);
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Key::Left
+        );
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Key::Right
+        );
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            Key::Home
+        );
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Key::End
+        );
     }
 
     fn mouse(kind: MouseEventKind) -> MouseEvent {
@@ -562,10 +596,18 @@ mod tests {
 
     #[test]
     fn wheel_maps_to_wheel_keys_other_mouse_kinds_are_ignored() {
-        assert_eq!(map_mouse(&mouse(MouseEventKind::ScrollUp)), Some(Key::WheelUp));
-        assert_eq!(map_mouse(&mouse(MouseEventKind::ScrollDown)), Some(Key::WheelDown));
         assert_eq!(
-            map_mouse(&mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left))),
+            map_mouse(&mouse(MouseEventKind::ScrollUp)),
+            Some(Key::WheelUp)
+        );
+        assert_eq!(
+            map_mouse(&mouse(MouseEventKind::ScrollDown)),
+            Some(Key::WheelDown)
+        );
+        assert_eq!(
+            map_mouse(&mouse(MouseEventKind::Down(
+                crossterm::event::MouseButton::Left
+            ))),
             None
         );
         assert_eq!(map_mouse(&mouse(MouseEventKind::Moved)), None);

@@ -1,5 +1,18 @@
-//! The Endgame: how a Turn ends at its Turn Limit, as one pure decision
-//! module (CONTEXT.md: Turn Limit; ADR-0015, ADR-0016).
+//! The Endgame Governor: the mechanical schedule by which a Turn ends at its
+//! Turn Limit (CONTEXT.md: Endgame, Governor; ADR-0015, ADR-0016, ADR-0026).
+//!
+//! * **Trigger**: the Pass position against the Turn Limit - Passes remaining
+//!   - plus the Ledger's unverified-writes fact (a principled cross-read:
+//!   verification state is a Ledger fact, never a sibling Governor's state).
+//! * **Interventions**: uniquely, this Governor speaks at all three moments of
+//!   a Pass - it narrows the offered Tools at the request-shaping moment
+//!   ([`narrowed_tools`]), rides the results tail at the answering moment
+//!   ([`tail_rider`]), and closes the Turn on the turn-limit marker at the
+//!   finish settlement ([`final_pass`], [`tool_insistent_text`],
+//!   [`limit_stop_reason`]).
+//! * **Setpoints**: none of its own - the schedule's offsets (2, 1, 0 Passes
+//!   remaining) ARE the mechanics, and the Turn Limit is a Session fact read
+//!   from the Ledger's Pass position, not a value this Governor tunes.
 //!
 //! The endgame is mechanical because small models comply with mechanics, not
 //! requests (the lesson learned at every scale: the Explore Nudge's
@@ -18,14 +31,17 @@
 //!     real tool_use blocks or as serialized markup in plain text - closes on
 //!     the turn-limit marker instead of passing as a conclusion.
 //!
-//! Every query is a pure function over the Pass position and the Nudge state;
-//! `crate::turn::loop_` owns when to ask and applies the answers, and
-//! `crate::voice` owns the wording the answers carry.
+//! Every query is a pure function over the Pass position and the Turn
+//! Ledger's facts (ADR-0026: Governors read the Ledger and judge); the
+//! arbiter in [`super`] owns when to ask, the firing sites in
+//! `crate::turn::loop_` apply the answers, and `crate::voice` owns the
+//! wording the answers carry.
 
 use crate::content::ContentBlock;
 use crate::session::log::StopReason;
 use crate::tool::ToolSpec;
-use crate::turn::nudges::Nudges;
+use crate::turn::governor::failure;
+use crate::turn::governor::ledger::Ledger;
 use crate::voice;
 
 /// The Voice text riding a tool-results tail, tagged with the Transcript event
@@ -38,21 +54,23 @@ pub enum TailRider {
     None,
 }
 
-/// The Tool specs this Pass's request offers: none on the final Pass
-/// (ADR-0015), run_command only on the Verification Pass (ADR-0016 - one Pass
-/// before the limit with unverified writes), the full registry otherwise.
+/// The Endgame's narrowing of the offered Tools, answered directly: `Some` of
+/// no specs on the final Pass (ADR-0015), `Some` of run_command only on the
+/// Verification Pass (ADR-0016 - one Pass before the limit with unverified
+/// writes), and `None` outside the schedule - no narrowing, the full registry
+/// rides (which is the firing site's default, never built here).
 ///
 /// The unverified state cannot drift between the Verification Pass prompt (the
 /// previous Pass's tail) and this request - no tool runs in between. A path
 /// that never carried the prompt (a verify-nudged finish) still narrows here;
 /// the nudge's own wording is the prompt in that path.
-pub fn tools(pass: u64, turn_limit: u64, nudges: &Nudges) -> Vec<ToolSpec> {
+pub fn narrowed_tools(pass: u64, turn_limit: u64, ledger: &Ledger) -> Option<Vec<ToolSpec>> {
     if final_pass(pass, turn_limit) {
-        Vec::new()
-    } else if verification_pass(pass, turn_limit, nudges) {
-        crate::tools::verification_specs()
+        Some(Vec::new())
+    } else if verification_pass(pass, turn_limit, ledger) {
+        Some(crate::tools::verification_specs())
     } else {
-        crate::tools::specs()
+        None
     }
 }
 
@@ -64,9 +82,9 @@ pub fn tools(pass: u64, turn_limit: u64, nudges: &Nudges) -> Vec<ToolSpec> {
 /// `turn_limit` with no answer delivered; the warning alone is ignored
 /// (observed live 2/2), so the final-Pass prompt precedes the mechanical
 /// ending.
-pub fn tail_rider(pass: u64, turn_limit: u64, nudges: &Nudges) -> TailRider {
+pub fn tail_rider(pass: u64, turn_limit: u64, ledger: &Ledger) -> TailRider {
     let remaining = turn_limit.saturating_sub(pass);
-    if remaining == 2 && nudges.unverified_writes() {
+    if remaining == 2 && ledger.unverified_writes() {
         TailRider::VerificationPass(voice::verification_pass_prompt().to_string())
     } else if remaining == 2 {
         TailRider::WrapUpWarning(voice::wrap_up_warning(2))
@@ -89,11 +107,13 @@ pub fn can_loop(pass: u64, turn_limit: u64) -> bool {
 }
 
 /// The stop reason for a Turn closing at its limit: `TurnLimitStuck` when the
-/// Turn has been stuck in a recent failure loop ([`Nudges::stuck`]),
-/// `TurnLimit` otherwise - so Settlement and the UI can distinguish "ran out of
-/// turns productively" from "ran out of turns while stuck."
-pub fn limit_stop_reason(nudges: &Nudges) -> StopReason {
-    if nudges.stuck() {
+/// Turn has been stuck in a recent failure loop ([`failure::stuck`] - the
+/// failure Governor's one exported predicate over the Ledger's failure
+/// tallies; one set of setpoints, two readers - ADR-0026), `TurnLimit`
+/// otherwise - so Settlement and the UI can distinguish "ran out of turns
+/// productively" from "ran out of turns while stuck."
+pub fn limit_stop_reason(ledger: &Ledger) -> StopReason {
+    if failure::stuck(ledger) {
         StopReason::TurnLimitStuck
     } else {
         StopReason::TurnLimit
@@ -124,55 +144,56 @@ pub fn tool_insistent_text(blocks: &[ContentBlock]) -> bool {
 
 // The Verification Pass (ADR-0016): exactly one Pass before the limit, with
 // successful writes and no run_command since.
-fn verification_pass(pass: u64, turn_limit: u64, nudges: &Nudges) -> bool {
-    pass == turn_limit - 1 && nudges.unverified_writes()
+fn verification_pass(pass: u64, turn_limit: u64, ledger: &Ledger) -> bool {
+    pass == turn_limit - 1 && ledger.unverified_writes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
-    use crate::turn::nudges::{Nudges, ToolResult};
-    use serde_json::json;
+    use crate::turn::governor::ledger::ToolResult;
 
     // One successful edit_file leaves the Turn with unverified writes.
-    fn unverified() -> Nudges {
-        let mut nudges = Nudges::new();
-        nudges.note_result(
+    fn unverified() -> Ledger {
+        let mut ledger = Ledger::new(25);
+        ledger.record_result(
             "edit_file",
-            &json!({ "path": "a.ex" }),
             &ToolResult {
                 content: "edited a.ex",
                 is_error: false,
             },
         );
-        nudges
+        ledger
     }
 
-    // ---- tools/3 ----
+    // ---- narrowed_tools/3 ----
 
     #[test]
     fn the_final_pass_offers_no_tools() {
-        assert_eq!(tools(25, 25, &Nudges::new()), Vec::new());
-        assert_eq!(tools(26, 25, &Nudges::new()), Vec::new());
+        assert_eq!(narrowed_tools(25, 25, &Ledger::new(25)), Some(Vec::new()));
+        assert_eq!(narrowed_tools(26, 25, &Ledger::new(25)), Some(Vec::new()));
     }
 
     #[test]
     fn the_verification_pass_offers_run_command_only() {
-        let specs = tools(24, 25, &unverified());
+        let specs = narrowed_tools(24, 25, &unverified()).expect("narrows");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "run_command");
     }
 
+    // "The full registry rides" is now answered directly as no narrowing
+    // (`None`), instead of being asserted equal to a freshly built registry.
+
     #[test]
-    fn one_before_the_limit_with_verified_writes_offers_the_full_registry() {
-        assert_eq!(tools(24, 25, &Nudges::new()), crate::tools::specs());
+    fn one_before_the_limit_with_verified_writes_narrows_nothing() {
+        assert_eq!(narrowed_tools(24, 25, &Ledger::new(25)), None);
     }
 
     #[test]
-    fn any_earlier_pass_offers_the_full_registry_unverified_or_not() {
-        assert_eq!(tools(1, 25, &unverified()), crate::tools::specs());
-        assert_eq!(tools(23, 25, &unverified()), crate::tools::specs());
+    fn any_earlier_pass_narrows_nothing_unverified_or_not() {
+        assert_eq!(narrowed_tools(1, 25, &unverified()), None);
+        assert_eq!(narrowed_tools(23, 25, &unverified()), None);
     }
 
     // ---- tail_rider/3 ----
@@ -180,7 +201,7 @@ mod tests {
     #[test]
     fn two_remaining_the_wrap_up_warning() {
         assert_eq!(
-            tail_rider(23, 25, &Nudges::new()),
+            tail_rider(23, 25, &Ledger::new(25)),
             TailRider::WrapUpWarning(voice::wrap_up_warning(2))
         );
     }
@@ -196,7 +217,7 @@ mod tests {
     #[test]
     fn one_remaining_the_final_pass_prompt_unverified_or_not() {
         assert_eq!(
-            tail_rider(24, 25, &Nudges::new()),
+            tail_rider(24, 25, &Ledger::new(25)),
             TailRider::FinalPass(voice::final_pass_prompt().to_string())
         );
         assert!(matches!(
@@ -207,9 +228,9 @@ mod tests {
 
     #[test]
     fn outside_the_endgame_none() {
-        assert_eq!(tail_rider(1, 25, &Nudges::new()), TailRider::None);
+        assert_eq!(tail_rider(1, 25, &Ledger::new(25)), TailRider::None);
         assert_eq!(tail_rider(22, 25, &unverified()), TailRider::None);
-        assert_eq!(tail_rider(25, 25, &Nudges::new()), TailRider::None);
+        assert_eq!(tail_rider(25, 25, &Ledger::new(25)), TailRider::None);
     }
 
     // ---- final_pass?/2 and can_loop?/2 ----
@@ -228,13 +249,12 @@ mod tests {
 
     #[test]
     fn distinguishes_a_stuck_turn_from_a_productive_one() {
-        assert_eq!(limit_stop_reason(&Nudges::new()), StopReason::TurnLimit);
+        assert_eq!(limit_stop_reason(&Ledger::new(25)), StopReason::TurnLimit);
 
-        let mut stuck = Nudges::new();
+        let mut stuck = Ledger::new(25);
         for _ in 0..3 {
-            stuck.note_result(
+            stuck.record_result(
                 "grep",
-                &json!({ "pattern": "x" }),
                 &ToolResult {
                     content: "boom",
                     is_error: true,

@@ -286,15 +286,13 @@ fn normalize(p: &Path) -> PathBuf {
     for comp in p.components() {
         match comp {
             Component::CurDir => {}
-            Component::ParentDir => {
-                match out.last() {
-                    Some(Component::Normal(_)) => {
-                        out.pop();
-                    }
-                    Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
-                    _ => out.push(comp),
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
                 }
-            }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(comp),
+            },
             other => out.push(other),
         }
     }
@@ -349,7 +347,10 @@ pub fn validate(
     }
 
     // 2. Missing required fields.
-    let missing: Vec<&String> = required.iter().filter(|r| !input.contains_key(*r)).collect();
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|r| !input.contains_key(*r))
+        .collect();
     if !missing.is_empty() {
         return Err(format!(
             "missing required field(s): {}. Required: {}",

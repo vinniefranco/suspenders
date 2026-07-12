@@ -8,9 +8,9 @@
 //! meaning the literal characters; bouncing that back costs a full model
 //! response on a slow local server.
 
-use crate::tool::{file_error, resolve_path, with_path, FileError, Tool, ToolCtx, ToolSpec};
+use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, resolve_path, with_path};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 pub struct Grep;
@@ -226,7 +226,11 @@ mod tests {
     async fn returns_relative_path_line_text_matches() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
-        std::fs::write(tmp.path().join("lib/a.ex"), "defmodule A do\n  # needle here\nend\n").unwrap();
+        std::fs::write(
+            tmp.path().join("lib/a.ex"),
+            "defmodule A do\n  # needle here\nend\n",
+        )
+        .unwrap();
         std::fs::write(tmp.path().join("other.txt"), "nothing to see\n").unwrap();
 
         assert_eq!(
@@ -283,7 +287,11 @@ mod tests {
         std::fs::write(tmp.path().join("other/b.ex"), "needle\n").unwrap();
 
         assert_eq!(
-            run(json!({"pattern": "needle", "path": "lib"}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "needle", "path": "lib"}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("lib/a.ex:1: needle".into())
         );
     }
@@ -294,7 +302,11 @@ mod tests {
         std::fs::write(tmp.path().join("single.txt"), "one needle\n").unwrap();
 
         assert_eq!(
-            run(json!({"pattern": "needle", "path": "single.txt"}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "needle", "path": "single.txt"}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("single.txt:1: one needle".into())
         );
     }
@@ -391,9 +403,9 @@ mod tests {
         let out = run(json!({"pattern": "foo(bar"}), &ctx(tmp.path()))
             .await
             .unwrap();
-        assert!(out.starts_with(
-            "[pattern is not valid regex - searched for it as literal text]\n"
-        ));
+        assert!(
+            out.starts_with("[pattern is not valid regex - searched for it as literal text]\n")
+        );
         assert!(out.contains("code.ex:1: def foo(bar) do"));
     }
 
@@ -404,7 +416,10 @@ mod tests {
 
         assert_eq!(
             run(json!({"pattern": "missing(thing"}), &ctx(tmp.path())).await,
-            Ok("[pattern is not valid regex - searched for it as literal text]\n[no matches]".into())
+            Ok(
+                "[pattern is not valid regex - searched for it as literal text]\n[no matches]"
+                    .into()
+            )
         );
     }
 
@@ -422,9 +437,12 @@ mod tests {
     #[tokio::test]
     async fn missing_search_path_is_an_error() {
         let tmp = TempDir::new().unwrap();
-        let err = run(json!({"pattern": "x", "path": "no_such_dir"}), &ctx(tmp.path()))
-            .await
-            .unwrap_err();
+        let err = run(
+            json!({"pattern": "x", "path": "no_such_dir"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("enoent"));
     }
 
@@ -432,7 +450,11 @@ mod tests {
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            run(json!({"pattern": "root", "path": "../.."}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "root", "path": "../.."}),
+                &ctx(tmp.path())
+            )
+            .await,
             Err("path escapes project root".into())
         );
     }

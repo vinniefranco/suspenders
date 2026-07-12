@@ -134,7 +134,10 @@ mod tests {
 
     #[test]
     fn q_quits() {
-        assert_eq!(picker(3).handle_key(Key::Char('q')), Some(PickerOutcome::Quit));
+        assert_eq!(
+            picker(3).handle_key(Key::Char('q')),
+            Some(PickerOutcome::Quit)
+        );
     }
 
     #[test]

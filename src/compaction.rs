@@ -29,9 +29,9 @@
 //! `previous_summary`.
 
 use crate::conversation::Conversation;
+use crate::llm::Llm;
 use crate::llm::request;
 use crate::llm::response::StopReason;
-use crate::llm::Llm;
 use crate::session::connection::Connection;
 use crate::session::log::compose_summary;
 use crate::voice::{self, FileOps};
@@ -364,17 +364,21 @@ mod tests {
 
         let summary_msg = &compacted.messages[0];
         assert_eq!(summary_msg.role, Role::User);
-        assert!(summary_msg
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Text { .. })));
+        assert!(
+            summary_msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }))
+        );
 
         assert!(new_state.previous_summary.is_some());
-        assert!(new_state
-            .previous_summary
-            .as_deref()
-            .unwrap()
-            .contains("Goal"));
+        assert!(
+            new_state
+                .previous_summary
+                .as_deref()
+                .unwrap()
+                .contains("Goal")
+        );
         assert_eq!(new_state.file_ops, FileOps::default());
     }
 

@@ -43,8 +43,7 @@ use crate::llm::response::StopReason;
 use crate::plugins::{self, Registered};
 
 /// The greeting line a fresh Transcript opens with.
-const GREETING: &str =
-    "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
+const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
 
 /// The in-memory prompt-history ring cap.
 const MAX_HISTORY: usize = 100;
@@ -348,10 +347,14 @@ impl Transcript {
             // snapshot - the final content never carries it) first, then the
             // assistant text (from the final content).
             Event::MessageEnd { content, .. } => {
-                let thinking = blocks_text(self.streaming.as_deref().unwrap_or(&[]), BlockKind::Thinking);
+                let thinking = blocks_text(
+                    self.streaming.as_deref().unwrap_or(&[]),
+                    BlockKind::Thinking,
+                );
                 let text = blocks_text(&content, BlockKind::Text);
                 if !thinking.is_empty() {
-                    self.messages.push(TranscriptItem::Thinking { text: thinking });
+                    self.messages
+                        .push(TranscriptItem::Thinking { text: thinking });
                 }
                 if !text.is_empty() {
                     self.messages.push(TranscriptItem::Assistant { text });
@@ -426,12 +429,10 @@ impl Transcript {
                 (self, vec![Effect::FocusModal])
             }
 
-            Event::ApprovalResolved { approval_id, .. } => {
-                match &self.pending_approval {
-                    Some(pending) if pending.approval_id == approval_id => self.clear_approval(),
-                    _ => (self, vec![]),
-                }
-            }
+            Event::ApprovalResolved { approval_id, .. } => match &self.pending_approval {
+                Some(pending) if pending.approval_id == approval_id => self.clear_approval(),
+                _ => (self, vec![]),
+            },
 
             // A Standing Approval covered the command: no modal was ever shown.
             Event::ApprovalAuto { command } => {
@@ -497,9 +498,7 @@ impl Transcript {
 
             Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
 
-            Event::TurnError { reason } => {
-                self.close_abnormally(format!("turn error: {reason}"))
-            }
+            Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
 
             // Unknown / display-irrelevant events are ignored.
             _ => (self, vec![]),
@@ -539,8 +538,10 @@ impl Transcript {
                 }
                 Key::Char('a') => {
                     let (t, mut effects) = self.clear_approval();
-                    let mut out =
-                        vec![Effect::Agent(AgentCommand::Approve(id, Decision::ApproveAlways))];
+                    let mut out = vec![Effect::Agent(AgentCommand::Approve(
+                        id,
+                        Decision::ApproveAlways,
+                    ))];
                     out.append(&mut effects);
                     (t, out)
                 }
@@ -570,15 +571,13 @@ impl Transcript {
 
             // Enter submits when idle, steers when running - the composer never
             // locks.
-            Key::Enter if self.status == Status::Running => {
-                match self.input_value.trim() {
-                    "" => (self, vec![]),
-                    text => {
-                        let text = text.to_string();
-                        (self, vec![Effect::Agent(AgentCommand::Steer(text))])
-                    }
+            Key::Enter if self.status == Status::Running => match self.input_value.trim() {
+                "" => (self, vec![]),
+                text => {
+                    let text = text.to_string();
+                    (self, vec![Effect::Agent(AgentCommand::Steer(text))])
                 }
-            }
+            },
             Key::Enter => match self.input_value.trim() {
                 "" => (self, vec![]),
                 prompt => {
@@ -739,7 +738,11 @@ impl Transcript {
     /// Records how the `Submit` effect went: `Ok` appends the user line and
     /// clears the composer; `Err(Busy)` means the submit raced a starting Turn
     /// - retry as Steering.
-    pub fn submitted(mut self, prompt: impl Into<String>, result: Result<(), Busy>) -> (Self, Vec<Effect>) {
+    pub fn submitted(
+        mut self,
+        prompt: impl Into<String>,
+        result: Result<(), Busy>,
+    ) -> (Self, Vec<Effect>) {
         let prompt = prompt.into();
         match result {
             Ok(()) => {
@@ -749,10 +752,7 @@ impl Transcript {
                 self.record_submit(&prompt);
                 self.input_value = String::new();
                 self.input_cursor = 0;
-                (
-                    self,
-                    vec![Effect::PinBottom, Effect::HistoryAppend(prompt)],
-                )
+                (self, vec![Effect::PinBottom, Effect::HistoryAppend(prompt)])
             }
             Err(Busy) => {
                 self.status = Status::Running;
@@ -764,7 +764,11 @@ impl Transcript {
     /// Records how the `Steer` effect went: `Ok` clears the composer (the
     /// pending line arrives via `steering_queued`); `Err(Idle)` means the Turn
     /// ended between keypress and call - retry as a submit.
-    pub fn steered(mut self, text: impl Into<String>, result: Result<(), Idle>) -> (Self, Vec<Effect>) {
+    pub fn steered(
+        mut self,
+        text: impl Into<String>,
+        result: Result<(), Idle>,
+    ) -> (Self, Vec<Effect>) {
         let text = text.into();
         match result {
             Ok(()) => {
@@ -798,7 +802,10 @@ impl Transcript {
 
     /// The in-flight Thinking text, from the latest streaming snapshot.
     pub fn streaming_thinking(&self) -> String {
-        blocks_text(self.streaming.as_deref().unwrap_or(&[]), BlockKind::Thinking)
+        blocks_text(
+            self.streaming.as_deref().unwrap_or(&[]),
+            BlockKind::Thinking,
+        )
     }
 
     /// The in-flight assistant text, from the latest streaming snapshot.
@@ -837,7 +844,8 @@ impl Transcript {
         let thinking = blocks_text(&snapshot, BlockKind::Thinking);
         let text = blocks_text(&snapshot, BlockKind::Text);
         if !thinking.is_empty() {
-            self.messages.push(TranscriptItem::Thinking { text: thinking });
+            self.messages
+                .push(TranscriptItem::Thinking { text: thinking });
         }
         if !text.is_empty() {
             self.messages.push(TranscriptItem::Assistant { text });
@@ -1079,7 +1087,7 @@ mod tests {
     use super::*;
     use crate::content::ContentBlock;
     use crate::plugin::Plugin;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
 
     // --- helpers mirroring transcript_test.exs -----------------------------
@@ -1266,7 +1274,10 @@ mod tests {
             false,
             HashMap::new(),
         ));
-        assert_eq!(items(&t), vec![tool_result_item("grep", "a (+2 more lines)", false)]);
+        assert_eq!(
+            items(&t),
+            vec![tool_result_item("grep", "a (+2 more lines)", false)]
+        );
         assert_eq!(effects, vec![]);
     }
 
@@ -1448,7 +1459,10 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::Agent(AgentCommand::Approve(a.approval_id, Decision::ApproveAlways)),
+                Effect::Agent(AgentCommand::Approve(
+                    a.approval_id,
+                    Decision::ApproveAlways
+                )),
                 Effect::FocusComposer,
             ]
         );
@@ -1503,11 +1517,16 @@ mod tests {
                 Event::message_end(vec![text_block("all done")], StopReason::EndTurn),
             ],
         );
-        let (t, effects) =
-            t.apply_event(Event::voiced(crate::event::VoicedTag::VerifyNudge, "[files changed but not verified]"));
+        let (t, effects) = t.apply_event(Event::voiced(
+            crate::event::VoicedTag::VerifyNudge,
+            "[files changed but not verified]",
+        ));
         assert_eq!(
             items(&t),
-            vec![assistant("all done"), info("[files changed but not verified]")]
+            vec![
+                assistant("all done"),
+                info("[files changed but not verified]")
+            ]
         );
         assert_eq!(effects, vec![]);
     }
@@ -1515,8 +1534,10 @@ mod tests {
     #[test]
     fn wrap_up_warning_shows_as_info_line() {
         let warning = crate::voice::wrap_up_warning(2);
-        let (t, effects) =
-            fresh().apply_event(Event::voiced(crate::event::VoicedTag::WrapUpWarning, warning.clone()));
+        let (t, effects) = fresh().apply_event(Event::voiced(
+            crate::event::VoicedTag::WrapUpWarning,
+            warning.clone(),
+        ));
         assert_eq!(items(&t), vec![info(&warning)]);
         assert_eq!(effects, vec![]);
     }
@@ -1524,8 +1545,10 @@ mod tests {
     #[test]
     fn verification_pass_shows_as_info_line() {
         let prompt = crate::voice::verification_pass_prompt();
-        let (t, effects) =
-            fresh().apply_event(Event::voiced(crate::event::VoicedTag::VerificationPass, prompt));
+        let (t, effects) = fresh().apply_event(Event::voiced(
+            crate::event::VoicedTag::VerificationPass,
+            prompt,
+        ));
         assert_eq!(items(&t), vec![info(prompt)]);
         assert_eq!(effects, vec![]);
     }
@@ -1575,7 +1598,10 @@ mod tests {
         assert_eq!(t.history, vec!["fix the bug".to_string()]);
         assert_eq!(
             effects,
-            vec![Effect::PinBottom, Effect::HistoryAppend("fix the bug".into())]
+            vec![
+                Effect::PinBottom,
+                Effect::HistoryAppend("fix the bug".into())
+            ]
         );
     }
 
@@ -1599,7 +1625,9 @@ mod tests {
         let (_t, effects) = t.handle_key(Key::Enter);
         assert_eq!(
             effects,
-            vec![Effect::Agent(AgentCommand::Steer("also check the README".into()))]
+            vec![Effect::Agent(AgentCommand::Steer(
+                "also check the README".into()
+            ))]
         );
     }
 
@@ -1652,7 +1680,9 @@ mod tests {
         assert_eq!(t.status, Status::Idle);
         assert_eq!(
             effects,
-            vec![Effect::Agent(AgentCommand::Submit("check the README".into()))]
+            vec![Effect::Agent(AgentCommand::Submit(
+                "check the README".into()
+            ))]
         );
     }
 
@@ -1920,7 +1950,10 @@ mod tests {
             ..Default::default()
         });
         let t = fold(t, vec![tool_result_event(HashMap::new())]);
-        assert_eq!(items(&t), vec![tool_result_item("edit_file", "edited x", false)]);
+        assert_eq!(
+            items(&t),
+            vec![tool_result_item("edit_file", "edited x", false)]
+        );
     }
 
     #[test]
@@ -1931,9 +1964,18 @@ mod tests {
         });
         let t = fold(
             t,
-            vec![Event::tool_result("t2", "grep", "no matches", false, HashMap::new())],
+            vec![Event::tool_result(
+                "t2",
+                "grep",
+                "no matches",
+                false,
+                HashMap::new(),
+            )],
         );
-        assert_eq!(items(&t), vec![tool_result_item("grep", "no matches", false)]);
+        assert_eq!(
+            items(&t),
+            vec![tool_result_item("grep", "no matches", false)]
+        );
     }
 
     #[test]
@@ -1972,7 +2014,11 @@ mod tests {
     fn plugin_error_events_become_info_lines() {
         let t = fold(
             fresh(),
-            vec![Event::plugin_error("Baud.Plugins.Diff", Stage::PreRun, "boom")],
+            vec![Event::plugin_error(
+                "Baud.Plugins.Diff",
+                Stage::PreRun,
+                "boom",
+            )],
         );
         let items = items(&t);
         assert_eq!(items.len(), 1);
@@ -2237,7 +2283,15 @@ mod tests {
     fn typed_chars_do_not_edit_the_composer_while_modal_open() {
         let t = with_pending_approval(fresh(), &approval()).input_changed("draft", 5);
         let pending_before = t.pending_approval.clone();
-        let t = press(t, vec![Key::Char('x'), Key::Backspace, Key::InsertNewline, Key::Left]);
+        let t = press(
+            t,
+            vec![
+                Key::Char('x'),
+                Key::Backspace,
+                Key::InsertNewline,
+                Key::Left,
+            ],
+        );
         assert_eq!(t.input_value, "draft");
         assert_eq!(t.input_cursor, 5);
         assert_eq!(t.pending_approval, pending_before);
@@ -2278,13 +2332,19 @@ mod tests {
     fn a_backslash_anywhere_else_still_submits() {
         let t = fresh().input_changed("a\\b", 3);
         let (_t, effects) = t.handle_key(Key::Enter);
-        assert_eq!(effects, vec![Effect::Agent(AgentCommand::Submit("a\\b".into()))]);
+        assert_eq!(
+            effects,
+            vec![Effect::Agent(AgentCommand::Submit("a\\b".into()))]
+        );
 
         // Trailing whitespace after the backslash: the backslash is not the
         // last char, so Enter submits (trimmed).
         let t = fresh().input_changed("a\\ ", 3);
         let (_t, effects) = t.handle_key(Key::Enter);
-        assert_eq!(effects, vec![Effect::Agent(AgentCommand::Submit("a\\".into()))]);
+        assert_eq!(
+            effects,
+            vec![Effect::Agent(AgentCommand::Submit("a\\".into()))]
+        );
     }
 
     #[test]

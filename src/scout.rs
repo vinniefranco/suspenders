@@ -47,9 +47,9 @@ use serde_json::Value;
 
 use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
+use crate::llm::Llm;
 use crate::llm::request;
 use crate::llm::response::StopReason;
-use crate::llm::Llm;
 use crate::session::connection::Connection;
 use crate::tool::ToolCtx;
 use crate::tools;
@@ -234,7 +234,7 @@ impl Scout {
                     };
                     return ScoutOutcome::LlmError { partial };
                 }
-                StopReason::ToolUse if response.content.iter().any(is_tool_use) => {
+                StopReason::ToolUse if response.content.iter().any(ContentBlock::is_tool_use) => {
                     // The Scout asked for read-only tools: run them
                     // (plugin-free, Shaped like any Tool Result), feed the
                     // results back, and loop for another Pass. The accumulated
@@ -245,8 +245,7 @@ impl Scout {
                         state.last_text = text;
                     }
 
-                    let results =
-                        Self::run_tools(&response.content, &state.ctx).await;
+                    let results = Self::run_tools(&response.content, &state.ctx).await;
 
                     conversation.add_assistant_blocks(response.content);
                     conversation.add_tool_results(results, Vec::new());
@@ -270,7 +269,11 @@ impl Scout {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 let input = display_input(input);
                 let result = tools::run(name, &input, ctx).await;
-                results.push(ContentBlock::tool_result(id, result.content, result.is_error));
+                results.push(ContentBlock::tool_result(
+                    id,
+                    result.content,
+                    result.is_error,
+                ));
             }
         }
         results
@@ -312,10 +315,6 @@ fn display_input(input: &Value) -> Value {
         return Value::Object(serde_json::Map::new());
     }
     input.clone()
-}
-
-fn is_tool_use(block: &ContentBlock) -> bool {
-    matches!(block, ContentBlock::ToolUse { .. })
 }
 
 #[cfg(test)]
@@ -492,15 +491,11 @@ mod tests {
         let s2 = Arc::clone(&seen);
         let fake = FakeLlm::script(vec![
             Entry::dynamic(vec![], move |req: &Value| {
-                s1.lock()
-                    .unwrap()
-                    .push(has_no_think(req));
+                s1.lock().unwrap().push(has_no_think(req));
                 tool_use_response("t1", "list_files", json!({}))
             }),
             Entry::dynamic(vec![], move |req: &Value| {
-                s2.lock()
-                    .unwrap()
-                    .push(has_no_think(req));
+                s2.lock().unwrap().push(has_no_think(req));
                 text_response("done")
             }),
         ]);

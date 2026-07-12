@@ -15,7 +15,7 @@
 use crate::scout::ScoutOutcome;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use crate::voice;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct Explore;
 
@@ -65,9 +65,7 @@ impl Tool for Explore {
 fn dispatch(outcome: ScoutOutcome) -> Result<String, String> {
     match outcome {
         ScoutOutcome::Ok(report) => Ok(report),
-        ScoutOutcome::LlmError { partial } => {
-            Err(with_partial(voice::scout_llm_error(), &partial))
-        }
+        ScoutOutcome::LlmError { partial } => Err(with_partial(voice::scout_llm_error(), &partial)),
         ScoutOutcome::PassCap { limit, partial } => {
             Err(with_partial(&voice::scout_pass_cap(limit), &partial))
         }

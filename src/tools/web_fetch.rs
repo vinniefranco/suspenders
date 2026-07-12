@@ -9,7 +9,7 @@
 //! guard keeps a huge file from streaming into memory first.
 
 use crate::tool::{Tool, ToolCtx, ToolSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct WebFetch;
 
@@ -72,7 +72,11 @@ async fn fetch(url: reqwest::Url, timeout_ms: u64) -> Result<String, String> {
         .build()
         .map_err(|err| format!("could not build http client: {err}"))?;
 
-    let response = client.get(url.clone()).send().await.map_err(|err| err.to_string())?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
 
     let status = response.status();
     if !status.is_success() {
@@ -178,23 +182,27 @@ mod tests {
         )
         .await;
 
-        let out = run(json!({"url": format!("{}/page", server.uri())}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"url": format!("{}/page", server.uri())}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, "hello plain text");
     }
 
     #[tokio::test]
     async fn json_passes_through_raw() {
         let tmp = TempDir::new().unwrap();
-        let server = serve(
-            ResponseTemplate::new(200).set_body_raw(r#"{"a": 1}"#, "application/json"),
-        )
-        .await;
+        let server =
+            serve(ResponseTemplate::new(200).set_body_raw(r#"{"a": 1}"#, "application/json")).await;
 
-        let out = run(json!({"url": format!("{}/page", server.uri())}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"url": format!("{}/page", server.uri())}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, r#"{"a": 1}"#);
     }
 
@@ -207,9 +215,12 @@ mod tests {
         let server =
             serve(ResponseTemplate::new(200).set_body_raw(html, "text/html; charset=utf-8")).await;
 
-        let out = run(json!({"url": format!("{}/page", server.uri())}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"url": format!("{}/page", server.uri())}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         // Tags stripped, link text preserved.
         assert!(!out.contains("<h1>"));
         assert!(!out.contains("<a href"));
@@ -223,7 +234,9 @@ mod tests {
         let server = serve(ResponseTemplate::new(404)).await;
         let url = format!("{}/page", server.uri());
 
-        let err = run(json!({"url": url.clone()}), &ctx(tmp.path())).await.unwrap_err();
+        let err = run(json!({"url": url.clone()}), &ctx(tmp.path()))
+            .await
+            .unwrap_err();
         assert!(err.contains("HTTP 404"));
         assert!(err.contains("/page"));
     }
@@ -261,7 +274,9 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_url_is_an_error() {
         let tmp = TempDir::new().unwrap();
-        let err = run(json!({"url": "not a url"}), &ctx(tmp.path())).await.unwrap_err();
+        let err = run(json!({"url": "not a url"}), &ctx(tmp.path()))
+            .await
+            .unwrap_err();
         assert!(err.contains("invalid URL"));
     }
 
@@ -282,9 +297,12 @@ mod tests {
         )
         .await;
 
-        let err = run(json!({"url": format!("{}/page", server.uri())}), &ctx(tmp.path()))
-            .await
-            .unwrap_err();
+        let err = run(
+            json!({"url": format!("{}/page", server.uri())}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, "unsupported content type: application/octet-stream");
     }
 
