@@ -764,14 +764,11 @@ async fn run_lifecycle<D: TurnDeps>(
     }
 
     if tools::requires_approval(name) {
-        let command = token
-            .input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        // The string the modal shows (the command, or web_fetch's URL) -
+        // extracted from the plugin-adjusted input, as before.
+        let text = tools::approval_text(name, &token.input).unwrap_or_default();
         let id = new_ref();
-        if state.deps.request_approval(id, command).await {
+        if state.deps.request_approval(id, text).await {
             execute_token(state, token).await
         } else {
             (
@@ -1323,6 +1320,55 @@ mod tests {
         let evs = events(&deps);
         assert!(find_tool_result(&evs, "r1").map(|e| matches!(e, Event::ToolResult { is_error, .. } if *is_error)).unwrap_or(false));
         assert_eq!(count_voiced(&evs, |e| matches!(e, Event::VerifyNudge { .. })), 0);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_passes_the_approval_gate_showing_the_url() {
+        let root = root();
+        let session = session(root.path());
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/docs"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("hello from the web", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        let url = format!("{}/docs", server.uri());
+
+        let denied_url = "https://denied.example/secret";
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("f1", "web_fetch", json!({"url": denied_url}))),
+                just(tool_use_result("f2", "web_fetch", json!({"url": url.clone()}))),
+                just(text_end("read the docs")),
+            ],
+        )
+        .with_approvals(vec![false, true]);
+
+        let (outcome, deps) = run_with(&session, "look up the docs", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+
+        // Each fetch requested Approval showing the full URL as the string -
+        // the same string Standing Approval would match exactly (ADR-0024).
+        assert!(evs.iter().any(|e| matches!(e, Event::ApprovalRequest { command, .. }
+            if command == denied_url)));
+        assert!(evs.iter().any(|e| matches!(e, Event::ApprovalRequest { command, .. }
+            if command == &url)));
+
+        // Denial is the denied is_error result; approval executes the fetch.
+        assert!(find_tool_result(&evs, "f1")
+            .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
+                if *is_error && content == voice::command_denied()))
+            .unwrap_or(false));
+        assert!(find_tool_result(&evs, "f2")
+            .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
+                if !is_error && content.contains("hello from the web")))
+            .unwrap_or(false));
     }
 
     #[tokio::test]

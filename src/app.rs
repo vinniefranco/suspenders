@@ -18,13 +18,35 @@ use crate::approvals::Decision;
 use crate::event::Event;
 use crate::llm::AnthropicLlm;
 use crate::session::{Session, SessionOpts};
+use crate::ui::picker::PickerOutcome;
 
 /// Launches the interactive ratatui frontend (ADR-0001, ADR-0019). Builds the
 /// Session from config/env (a real `AnthropicLlm` + `Connection`), starts the
 /// Agent, and hands the terminal to [`crate::ui::run`] (which enters/leaves raw
 /// mode + the alternate screen around itself).
+/// Bare `--resume` (no value) arrives as this sentinel and opens the picker.
+const PICK: &str = "pick";
+
 pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::Result<()> {
     let session = build_session(root)?;
+    let resume = if resume.as_deref() == Some(PICK) {
+        // The picker needs the Session first: the logs live in its
+        // session_dir. No sessions to pick from is silently a fresh start -
+        // we're pre-alt-screen, and a note would just flash and vanish.
+        let entries = crate::session::log::list(&session.session_dir);
+        if entries.is_empty() {
+            None
+        } else {
+            match crate::ui::pick_session(entries).await? {
+                PickerOutcome::Resume(path) => Some(path),
+                PickerOutcome::FreshSession => None,
+                // Leave without starting the Agent.
+                PickerOutcome::Quit => return Ok(()),
+            }
+        }
+    } else {
+        resume
+    };
     let agent = start_agent(session.clone(), resume)?;
     crate::ui::run(agent, &session).await
 }
@@ -40,6 +62,10 @@ pub async fn run_headless(
     resume: Option<String>,
     prompts: Vec<String>,
 ) -> anyhow::Result<()> {
+    if resume.as_deref() == Some(PICK) {
+        anyhow::bail!(r#"--resume without a value needs the TUI; pass a path or "latest""#);
+    }
+
     let prompts = if prompts.is_empty() {
         vec!["evaluate this project".to_string()]
     } else {

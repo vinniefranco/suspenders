@@ -8,8 +8,11 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 
-# TUI (confined to the `ui` module - ADR-0001, ADR-0019)
-ratatui = "0.29"
+# TUI (confined to the `ui` module - ADR-0001, ADR-0019).
+# unstable-rendered-line-info: `Paragraph::line_count(width)` gives the exact
+# wrap-aware line total from the SAME wrapping code that draws, which the
+# bottom-anchored viewport (ui::viewport) needs to follow the tail.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # LLM boundary: Anthropic wire protocol over SSE (ADR-0002)
@@ -19,6 +22,9 @@ async-trait = "0.1" # only the object-safe `Llm` trait needs this; TurnDeps stay
 
 # markdown → semantic terminal lines (ui::markdown is the pure fold; colors stay in ui::components, ADR-0008)
 pulldown-cmark = { version = "0.12", default-features = false }
+# code-fence syntax highlighting at render time (ui::components only, ADR-0008);
+# "default-fancy" = pure-Rust fancy-regex engine + bundled syntaxes/themes, no onig C dep
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 # serde-tagged domain model + JSONL Session Log (ADR-0010)
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +39,7 @@ anyhow = "1"
 
 # tools & platform
 nix = { version = "0.29", features = ["signal", "process"] } # killpg for run_command (ADR-0023)
+html2text = "0.12"                                           # web_fetch HTML → readable text (ADR-0024)
 regex = "1"                                                  # grep, edit_file fuzzy matching
 directories = "5"                                            # XDG session_dir default
 time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UTC filenames

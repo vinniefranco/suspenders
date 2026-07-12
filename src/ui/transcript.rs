@@ -24,6 +24,11 @@
 //! * Enter submits when idle and STEERS when running (the composer never
 //!   locks). The submit/steer race at the Turn boundary is retried the other
 //!   way via [`Transcript::submitted`] and [`Transcript::steered`].
+//! * The Composer is edited HERE, not in the adapter: chars insert at the
+//!   cursor (a char index), Alt-Enter and a trailing-backslash Enter insert
+//!   hard newlines, Home/End work within the current line, and Up/Down are
+//!   edge-triggered - history recall only from the draft's first/last line,
+//!   cursor movement everywhere else.
 //! * A pending Approval swallows every key except `y`, `n`, `a`, and `Escape`;
 //!   `a` is approve-always (Standing Approval); Escape means Cancellation,
 //!   which wins over the Approval.
@@ -39,7 +44,7 @@ use crate::plugins::{self, Registered};
 
 /// The greeting line a fresh Transcript opens with.
 const GREETING: &str =
-    "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-C quits";
+    "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
 
 /// The in-memory prompt-history ring cap.
 const MAX_HISTORY: usize = 100;
@@ -161,9 +166,30 @@ pub enum Key {
     Escape,
     PageUp,
     PageDown,
+    /// Mouse wheel up - scrolls by a few lines where [`Key::PageUp`] scrolls
+    /// by a whole page; otherwise handled identically in every state.
+    WheelUp,
+    /// Mouse wheel down - scrolls by a few lines where [`Key::PageDown`]
+    /// scrolls by a whole page; otherwise handled identically in every state.
+    WheelDown,
     ArrowUp,
     ArrowDown,
     Backspace,
+    /// Move the Composer cursor one char left (clamped at the start).
+    Left,
+    /// Move the Composer cursor one char right (clamped at the end).
+    Right,
+    /// Jump to the start of the CURRENT LINE of the draft (readline behavior
+    /// within a line, not the whole draft).
+    Home,
+    /// Jump to the end of the CURRENT LINE of the draft.
+    End,
+    /// Alt-Enter: insert a hard newline into the draft at the cursor. Named
+    /// (rather than `Char('\n')`) so the modal's swallow-everything rule and
+    /// the adapter's mapping both read as intent.
+    InsertNewline,
+    /// Ctrl-T: toggle the expanded rendering of settled Thinking items.
+    ToggleThinking,
     Char(char),
     /// A key the core does not act on (function keys, etc.).
     Other,
@@ -193,6 +219,18 @@ pub enum Decision {
     ApproveAlways,
 }
 
+/// How far one scroll Effect moves: the wheel steps by [`ScrollStep::Line`]s,
+/// the page keys by whole viewport [`ScrollStep::Page`]s. The core only names
+/// the granularity - the adapter's `ui::viewport` knows the geometry and turns
+/// it into an actual line count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollStep {
+    /// A few lines (one mouse-wheel tick).
+    Line,
+    /// One viewport page (PageUp/PageDown).
+    Page,
+}
+
 /// An Effect the adapter carries out after a fold (baud's `effect` type).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -204,10 +242,10 @@ pub enum Effect {
     FocusComposer,
     /// Pin the viewport to the bottom (follow the tail).
     PinBottom,
-    /// Scroll the viewport up one page.
-    ScrollUp,
-    /// Scroll the viewport down one page.
-    ScrollDown,
+    /// Scroll the viewport up by one [`ScrollStep`].
+    ScrollUp(ScrollStep),
+    /// Scroll the viewport down by one [`ScrollStep`].
+    ScrollDown(ScrollStep),
     /// Persist a submitted prompt into the on-disk history file.
     HistoryAppend(String),
 }
@@ -235,6 +273,17 @@ pub struct Transcript {
     pub history: Vec<String>,
     pub history_idx: Option<usize>,
     pub history_draft: String,
+    /// Whether settled [`TranscriptItem::Thinking`] items render expanded (the
+    /// full text) instead of the collapsed one-line form. Toggled by
+    /// [`Key::ToggleThinking`] (Ctrl-T); defaults collapsed.
+    pub thinking_expanded: bool,
+    /// Bumped whenever `messages` changes OTHER than by appending (today only
+    /// `SteeringDelivered`, which removes its pending info line from wherever
+    /// it sits). The frontend's per-item render cache extends incrementally
+    /// while this holds still and rebuilds when it moves - appends are the hot
+    /// path, structural edits the rare one. Every other `messages` mutation is
+    /// a push and must stay one (or bump this).
+    pub messages_revision: u64,
 }
 
 /// The options a fresh Transcript is opened with (baud's `new/1` keyword opts).
@@ -266,6 +315,8 @@ impl Transcript {
             history: opts.history,
             history_idx: None,
             history_draft: String::new(),
+            thinking_expanded: false,
+            messages_revision: 0,
         }
     }
 
@@ -401,6 +452,9 @@ impl Transcript {
                 };
                 if let Some(pos) = self.messages.iter().position(|m| m == &pending) {
                     self.messages.remove(pos);
+                    // A non-append edit: settled items shifted, so any cached
+                    // per-item render state upstream is stale.
+                    self.messages_revision += 1;
                 }
                 self.messages.push(TranscriptItem::User { text });
                 (self, vec![])
@@ -454,12 +508,19 @@ impl Transcript {
 
     // ---- User intents ------------------------------------------------------
 
-    /// Folds one key press into the Transcript.
+    /// Folds one key press into the Transcript. ALL keys route through here -
+    /// Composer editing included - so every rule lives in the pure core
+    /// (ADR-0001); the adapter only maps crossterm events to [`Key`]s.
     ///
     /// While an Approval is pending, only `y`, `n`, `a` and `Escape` do
-    /// anything; every other key is swallowed. Escape is Cancellation, which
-    /// wins over the Approval.
-    pub fn handle_key(self, key: Key) -> (Self, Vec<Effect>) {
+    /// anything; every other key is swallowed - in particular, plain chars
+    /// must NOT edit the Composer while the modal is open. Escape is
+    /// Cancellation, which wins over the Approval.
+    ///
+    /// The Composer cursor (`input_cursor`) is a CHAR index into
+    /// `input_value` - the codebase counts chars, not bytes, so multi-byte
+    /// input never splits or panics.
+    pub fn handle_key(mut self, key: Key) -> (Self, Vec<Effect>) {
         // Modal-open handling swallows everything but y/n/a/Escape.
         if let Some(pending) = self.pending_approval.clone() {
             let id = pending.approval_id;
@@ -495,6 +556,18 @@ impl Transcript {
         }
 
         match key {
+            // Trailing-backslash continuation: Enter on a draft whose LAST
+            // char is a literal `\` replaces that backslash with a hard
+            // newline (cursor to the end) instead of submitting - the
+            // fallback for terminals whose Alt-Enter never reaches us. Checked
+            // before the submit/steer arms so it applies in both states.
+            Key::Enter if self.input_value.ends_with('\\') => {
+                self.input_value.pop();
+                self.input_value.push('\n');
+                self.input_cursor = self.input_value.chars().count();
+                (self, vec![])
+            }
+
             // Enter submits when idle, steers when running - the composer never
             // locks.
             Key::Enter if self.status == Status::Running => {
@@ -518,11 +591,86 @@ impl Transcript {
                 (self, vec![Effect::Agent(AgentCommand::Cancel)])
             }
 
-            Key::PageUp => (self, vec![Effect::ScrollUp]),
-            Key::PageDown => (self, vec![Effect::ScrollDown]),
+            // Both scroll in every non-modal state; the wheel steps by lines,
+            // the page keys by whole pages.
+            Key::PageUp => (self, vec![Effect::ScrollUp(ScrollStep::Page)]),
+            Key::PageDown => (self, vec![Effect::ScrollDown(ScrollStep::Page)]),
+            Key::WheelUp => (self, vec![Effect::ScrollUp(ScrollStep::Line)]),
+            Key::WheelDown => (self, vec![Effect::ScrollDown(ScrollStep::Line)]),
 
-            Key::ArrowUp => self.history_up(),
-            Key::ArrowDown => self.history_down(),
+            // Edge-triggered history: Up on the FIRST hard line of the draft
+            // recalls history (the pre-multi-line behavior, draft stashing
+            // included); anywhere else it moves the cursor up one line, the
+            // column clamped to that line's length. Down mirrors from the
+            // LAST line. No goal-column memory - a simple clamp, on purpose.
+            Key::ArrowUp => {
+                let (line, col) = line_col(&self.input_value, self.input_cursor);
+                if line == 0 {
+                    self.history_up()
+                } else {
+                    let clamped = col.min(line_lengths(&self.input_value)[line - 1]);
+                    self.input_cursor = cursor_at(&self.input_value, line - 1, clamped);
+                    (self, vec![])
+                }
+            }
+            Key::ArrowDown => {
+                let (line, col) = line_col(&self.input_value, self.input_cursor);
+                let last = line_lengths(&self.input_value).len() - 1;
+                if line >= last {
+                    self.history_down()
+                } else {
+                    let clamped = col.min(line_lengths(&self.input_value)[line + 1]);
+                    self.input_cursor = cursor_at(&self.input_value, line + 1, clamped);
+                    (self, vec![])
+                }
+            }
+
+            // -- Composer editing (cursor is a char index; see the fn doc) --
+            Key::Char(c) => {
+                self.input_value = insert_char(&self.input_value, self.input_cursor, c);
+                self.input_cursor += 1;
+                (self, vec![])
+            }
+            Key::InsertNewline => {
+                self.input_value = insert_char(&self.input_value, self.input_cursor, '\n');
+                self.input_cursor += 1;
+                (self, vec![])
+            }
+            Key::Backspace => {
+                if self.input_cursor > 0 {
+                    self.input_cursor -= 1;
+                    self.input_value = remove_char(&self.input_value, self.input_cursor);
+                }
+                (self, vec![])
+            }
+            Key::Left => {
+                self.input_cursor = self.input_cursor.saturating_sub(1);
+                (self, vec![])
+            }
+            Key::Right => {
+                let len = self.input_value.chars().count();
+                self.input_cursor = (self.input_cursor + 1).min(len);
+                (self, vec![])
+            }
+            Key::Home => {
+                let (line, _) = line_col(&self.input_value, self.input_cursor);
+                self.input_cursor = cursor_at(&self.input_value, line, 0);
+                (self, vec![])
+            }
+            Key::End => {
+                let (line, _) = line_col(&self.input_value, self.input_cursor);
+                let len = line_lengths(&self.input_value)[line];
+                self.input_cursor = cursor_at(&self.input_value, line, len);
+                (self, vec![])
+            }
+
+            // Ctrl-T: flip the Thinking expansion; a pure display toggle, no
+            // effects. The status bar's thinking segment renders this flag,
+            // so the flip is visible even with no Thinking items on screen.
+            Key::ToggleThinking => {
+                self.thinking_expanded = !self.thinking_expanded;
+                (self, vec![])
+            }
 
             _ => (self, vec![]),
         }
@@ -848,6 +996,73 @@ fn truncate(text: &str, width: usize) -> String {
     }
 }
 
+// -- Composer draft editing (char-index string surgery) --
+//
+// The Composer cursor is a CHAR index (the codebase counts chars, not bytes);
+// these helpers translate it to a byte offset exactly once, at the mutation
+// site, so multi-byte input never splits a char or panics. Lines are HARD
+// lines (split on '\n') - width-wrapping is the view's concern
+// (`ui::composer`), not the core's.
+
+/// The byte offset of char index `cursor` (the string's length when the
+/// cursor sits past the last char).
+fn byte_of(value: &str, cursor: usize) -> usize {
+    value
+        .char_indices()
+        .nth(cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(value.len())
+}
+
+/// `value` with `c` inserted at char index `cursor`.
+fn insert_char(value: &str, cursor: usize, c: char) -> String {
+    let mut out = value.to_string();
+    out.insert(byte_of(value, cursor), c);
+    out
+}
+
+/// `value` with the char at char index `cursor` removed. `cursor` must be in
+/// range (the Backspace arm guards it).
+fn remove_char(value: &str, cursor: usize) -> String {
+    let mut out = value.to_string();
+    out.remove(byte_of(value, cursor));
+    out
+}
+
+/// The `(hard line, column)` of char index `cursor` - both in chars. A cursor
+/// sitting ON a '\n' counts as the end of the line before it.
+fn line_col(value: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+    for c in value.chars().take(cursor) {
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Each hard line's length in chars. Never empty: an empty draft is one
+/// zero-length line.
+fn line_lengths(value: &str) -> Vec<usize> {
+    value.split('\n').map(|l| l.chars().count()).collect()
+}
+
+/// The char index of `(line, col)` - the inverse of [`line_col`], counting
+/// one char per '\n' between lines. `col` must already be clamped to the
+/// line's length.
+fn cursor_at(value: &str, line: usize, col: usize) -> usize {
+    line_lengths(value)
+        .iter()
+        .take(line)
+        .map(|len| len + 1)
+        .sum::<usize>()
+        + col
+}
+
 fn append_history(history: &mut Vec<String>, prompt: &str) {
     if history.last().map(|s| s.as_str()) == Some(prompt) {
         return;
@@ -953,7 +1168,10 @@ mod tests {
         });
         assert_eq!(t.messages.len(), 1);
         match &t.messages[0] {
-            TranscriptItem::Info { text } => assert!(text.contains("suspenders ready")),
+            TranscriptItem::Info { text } => {
+                assert!(text.contains("suspenders ready"));
+                assert!(text.contains("Ctrl-T toggles thinking"));
+            }
             other => panic!("expected greeting info, got {other:?}"),
         }
         assert_eq!(t.status, Status::Idle);
@@ -1394,6 +1612,31 @@ mod tests {
         assert_eq!(items(&t), vec![user("check the README")]);
     }
 
+    // The render cache's append-only contract: pushes leave the revision
+    // alone; the ONE non-append edit (delivered steering removing its pending
+    // line) bumps it. A delivery whose pending line was never queued removes
+    // nothing and must not bump.
+    #[test]
+    fn only_a_delivered_steering_removal_bumps_the_messages_revision() {
+        let t = fresh();
+        assert_eq!(t.messages_revision, 0);
+
+        // Appends (user submit, info) do not bump.
+        let (t, _) = t.submitted("hello", Ok(()));
+        let t = t.info("adapter news");
+        assert_eq!(t.messages_revision, 0);
+
+        // Queued (a push) does not bump; delivered (the remove) does.
+        let t = fold(t, vec![Event::steering_queued("check the README")]);
+        assert_eq!(t.messages_revision, 0);
+        let t = fold(t, vec![Event::steering_delivered("check the README")]);
+        assert_eq!(t.messages_revision, 1);
+
+        // Delivered with no matching pending line removes nothing: no bump.
+        let t = fold(t, vec![Event::steering_delivered("never queued")]);
+        assert_eq!(t.messages_revision, 1);
+    }
+
     #[test]
     fn successful_steer_clears_composer() {
         let t = fresh().input_changed("check the README", 16);
@@ -1523,11 +1766,89 @@ mod tests {
     // --- PageUp/PageDown ---------------------------------------------------
 
     #[test]
-    fn page_keys_map_to_scroll_effects() {
+    fn page_keys_map_to_page_scroll_effects() {
         let (_t, effects) = fresh().handle_key(Key::PageUp);
-        assert_eq!(effects, vec![Effect::ScrollUp]);
+        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Page)]);
         let (_t, effects) = fresh().handle_key(Key::PageDown);
-        assert_eq!(effects, vec![Effect::ScrollDown]);
+        assert_eq!(effects, vec![Effect::ScrollDown(ScrollStep::Page)]);
+    }
+
+    // --- mouse wheel (line steps, where the page keys step pages) ------------
+
+    #[test]
+    fn wheel_keys_map_to_line_scroll_effects_while_idle() {
+        let (_t, effects) = fresh().handle_key(Key::WheelUp);
+        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Line)]);
+        let (_t, effects) = fresh().handle_key(Key::WheelDown);
+        assert_eq!(effects, vec![Effect::ScrollDown(ScrollStep::Line)]);
+    }
+
+    #[test]
+    fn wheel_keys_scroll_while_running() {
+        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let (t, effects) = t.handle_key(Key::WheelUp);
+        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Line)]);
+        let (_t, effects) = t.handle_key(Key::WheelDown);
+        assert_eq!(effects, vec![Effect::ScrollDown(ScrollStep::Line)]);
+    }
+
+    #[test]
+    fn wheel_keys_swallowed_while_modal_open() {
+        let a = approval();
+        for key in [Key::WheelUp, Key::WheelDown] {
+            let t = with_pending_approval(fresh(), &a);
+            let pending_before = t.pending_approval.clone();
+            let (t, effects) = t.handle_key(key);
+            assert_eq!(effects, vec![]);
+            assert_eq!(t.pending_approval, pending_before);
+        }
+    }
+
+    // --- Ctrl-T thinking toggle ----------------------------------------------
+
+    #[test]
+    fn thinking_starts_collapsed() {
+        assert!(!fresh().thinking_expanded);
+    }
+
+    #[test]
+    fn toggle_thinking_flips_on_and_off_with_no_effects() {
+        let (t, effects) = fresh().handle_key(Key::ToggleThinking);
+        assert!(t.thinking_expanded);
+        assert_eq!(effects, vec![]);
+
+        let (t, effects) = t.handle_key(Key::ToggleThinking);
+        assert!(!t.thinking_expanded);
+        assert_eq!(effects, vec![]);
+    }
+
+    #[test]
+    fn modal_swallows_toggle_thinking() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let pending_before = t.pending_approval.clone();
+        let (t, effects) = t.handle_key(Key::ToggleThinking);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.pending_approval, pending_before);
+        assert!(!t.thinking_expanded);
+    }
+
+    #[test]
+    fn toggle_thinking_leaves_composer_and_history_untouched() {
+        let t = fresh_opts(TranscriptOpts {
+            history: vec!["a".into(), "b".into()],
+            ..Default::default()
+        })
+        .input_changed("typing...", 9);
+        let (t, _) = t.handle_key(Key::ArrowUp); // park mid-history with a draft
+        let (t, effects) = t.handle_key(Key::ToggleThinking);
+        assert_eq!(effects, vec![]);
+        assert!(t.thinking_expanded);
+        assert_eq!(t.input_value, "b");
+        assert_eq!(t.input_cursor, 1);
+        assert_eq!(t.history, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(t.history_idx, Some(1));
+        assert_eq!(t.history_draft, "typing...");
     }
 
     // --- presentment -------------------------------------------------------
@@ -1810,6 +2131,243 @@ mod tests {
         assert_eq!(t.history_idx, None);
         assert_eq!(t.input_value, "my draft");
         assert_eq!(t.history_draft, "");
+    }
+
+    // --- Composer editing ----------------------------------------------------
+    //
+    // All editing lives in the pure core (the adapter's `edit_composer` was
+    // deleted): chars insert at the cursor, Backspace deletes before it, and
+    // the arrows/Home/End move it. Migrated regressions from ui.rs keep their
+    // intent: a typed char edits the Composer, Backspace edits it, and Enter
+    // still reaches the submit rule below (`enter_with_text_asks_adapter_to_
+    // submit_trimmed_prompt`); Ctrl-T maps to ToggleThinking in ui.rs's
+    // `map_key` tests and toggles here (`toggle_thinking_flips_on_and_off`).
+
+    // Folds keys through handle_key, discarding effects.
+    fn press(mut t: Transcript, keys: Vec<Key>) -> Transcript {
+        for key in keys {
+            let (next, _effects) = t.handle_key(key);
+            t = next;
+        }
+        t
+    }
+
+    #[test]
+    fn a_typed_char_appends_at_the_end_of_the_draft() {
+        let t = press(fresh(), vec![Key::Char('h'), Key::Char('i')]);
+        assert_eq!(t.input_value, "hi");
+        assert_eq!(t.input_cursor, 2);
+    }
+
+    #[test]
+    fn a_typed_char_inserts_at_the_cursor_mid_draft() {
+        let t = fresh().input_changed("hllo", 1);
+        let t = press(t, vec![Key::Char('e')]);
+        assert_eq!(t.input_value, "hello");
+        assert_eq!(t.input_cursor, 2);
+    }
+
+    #[test]
+    fn backspace_deletes_the_char_before_the_cursor() {
+        let t = fresh().input_changed("hello", 3);
+        let t = press(t, vec![Key::Backspace]);
+        assert_eq!(t.input_value, "helo");
+        assert_eq!(t.input_cursor, 2);
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_the_draft_is_a_noop() {
+        let t = fresh().input_changed("hi", 0);
+        let t = press(t, vec![Key::Backspace]);
+        assert_eq!(t.input_value, "hi");
+        assert_eq!(t.input_cursor, 0);
+    }
+
+    // The cursor is a CHAR index: multi-byte chars must neither split nor
+    // panic under insert/delete around them.
+    #[test]
+    fn multibyte_chars_insert_and_delete_without_splitting() {
+        let t = fresh().input_changed("héllo", 2);
+        let t = press(t, vec![Key::Char('🎩')]);
+        assert_eq!(t.input_value, "hé🎩llo");
+        assert_eq!(t.input_cursor, 3);
+
+        let t = press(t, vec![Key::Backspace, Key::Backspace]);
+        assert_eq!(t.input_value, "hllo");
+        assert_eq!(t.input_cursor, 1);
+    }
+
+    #[test]
+    fn left_and_right_move_the_cursor_clamped_at_both_ends() {
+        let t = fresh().input_changed("ab", 1);
+        let t = press(t, vec![Key::Left]);
+        assert_eq!(t.input_cursor, 0);
+        let t = press(t, vec![Key::Left]);
+        assert_eq!(t.input_cursor, 0); // clamped at the start
+
+        let t = press(t, vec![Key::Right, Key::Right]);
+        assert_eq!(t.input_cursor, 2);
+        let t = press(t, vec![Key::Right]);
+        assert_eq!(t.input_cursor, 2); // clamped at the end
+        assert_eq!(t.input_value, "ab"); // movement never edits
+    }
+
+    #[test]
+    fn home_and_end_jump_within_the_current_line_not_the_whole_draft() {
+        // "ab\ncdef\ng", cursor mid second line (index 5, on 'e').
+        let t = fresh().input_changed("ab\ncdef\ng", 5);
+        let t = press(t, vec![Key::Home]);
+        assert_eq!(t.input_cursor, 3); // start of "cdef"
+        let t = press(t, vec![Key::End]);
+        assert_eq!(t.input_cursor, 7); // end of "cdef", before its '\n'
+    }
+
+    #[test]
+    fn home_and_end_on_a_single_line_draft_reach_both_ends() {
+        let t = fresh().input_changed("hello", 3);
+        let t = press(t, vec![Key::Home]);
+        assert_eq!(t.input_cursor, 0);
+        let t = press(t, vec![Key::End]);
+        assert_eq!(t.input_cursor, 5);
+    }
+
+    // The Approval modal must keep swallowing everything except y/n/a/Escape:
+    // in particular a typed char must NOT edit the Composer while it is open.
+    #[test]
+    fn typed_chars_do_not_edit_the_composer_while_modal_open() {
+        let t = with_pending_approval(fresh(), &approval()).input_changed("draft", 5);
+        let pending_before = t.pending_approval.clone();
+        let t = press(t, vec![Key::Char('x'), Key::Backspace, Key::InsertNewline, Key::Left]);
+        assert_eq!(t.input_value, "draft");
+        assert_eq!(t.input_cursor, 5);
+        assert_eq!(t.pending_approval, pending_before);
+    }
+
+    // --- multi-line drafts ---------------------------------------------------
+
+    #[test]
+    fn insert_newline_adds_a_hard_newline_at_the_cursor() {
+        let t = fresh().input_changed("ab", 1);
+        let (t, effects) = t.handle_key(Key::InsertNewline);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "a\nb");
+        assert_eq!(t.input_cursor, 2);
+    }
+
+    #[test]
+    fn enter_on_a_trailing_backslash_continues_the_draft_instead_of_submitting() {
+        let t = fresh().input_changed("first line\\", 11);
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "first line\n");
+        assert_eq!(t.input_cursor, 11); // cursor to the end
+    }
+
+    #[test]
+    fn enter_on_a_trailing_backslash_continues_while_running_too() {
+        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let t = t.input_changed("steer me\\", 9);
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "steer me\n");
+    }
+
+    // Only a LITERAL trailing backslash - the LAST char of the draft -
+    // triggers the continuation.
+    #[test]
+    fn a_backslash_anywhere_else_still_submits() {
+        let t = fresh().input_changed("a\\b", 3);
+        let (_t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(effects, vec![Effect::Agent(AgentCommand::Submit("a\\b".into()))]);
+
+        // Trailing whitespace after the backslash: the backslash is not the
+        // last char, so Enter submits (trimmed).
+        let t = fresh().input_changed("a\\ ", 3);
+        let (_t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(effects, vec![Effect::Agent(AgentCommand::Submit("a\\".into()))]);
+    }
+
+    #[test]
+    fn enter_submits_a_multi_line_draft_whole() {
+        let t = fresh().input_changed("first\nsecond", 12);
+        let (_t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Agent(AgentCommand::Submit("first\nsecond".into()))]
+        );
+    }
+
+    // --- edge-triggered history (Up/Down on a multi-line draft) --------------
+
+    #[test]
+    fn arrow_up_off_the_first_line_moves_the_cursor_not_history() {
+        // Cursor on the second line: Up is cursor movement, history untouched.
+        let t = fresh_opts(TranscriptOpts {
+            history: vec!["old".into()],
+            ..Default::default()
+        })
+        .input_changed("ab\ncd", 4); // on 'd' (line 1, col 1)
+        let (t, effects) = t.handle_key(Key::ArrowUp);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "ab\ncd");
+        assert_eq!(t.input_cursor, 1); // line 0, col 1
+        assert_eq!(t.history_idx, None);
+    }
+
+    #[test]
+    fn arrow_up_on_the_first_line_of_a_multi_line_draft_recalls_history() {
+        let t = fresh_opts(TranscriptOpts {
+            history: vec!["old".into()],
+            ..Default::default()
+        })
+        .input_changed("ab\ncd", 1); // line 0
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "old");
+        assert_eq!(t.input_cursor, 3); // recall puts the cursor at the end
+        assert_eq!(t.history_idx, Some(0));
+        assert_eq!(t.history_draft, "ab\ncd"); // the draft is stashed
+    }
+
+    #[test]
+    fn arrow_down_off_the_last_line_moves_the_cursor_not_history() {
+        let t = fresh_opts(TranscriptOpts {
+            history: vec!["old".into()],
+            ..Default::default()
+        })
+        .input_changed("ab\ncd", 1); // line 0, col 1 - not the last line
+        let (t, effects) = t.handle_key(Key::ArrowDown);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_cursor, 4); // line 1, col 1
+        assert_eq!(t.history_idx, None);
+    }
+
+    #[test]
+    fn arrow_down_on_the_last_line_of_a_multi_line_draft_recalls_history() {
+        // Recall history, then Down from the recalled entry's last line
+        // restores the stashed draft - the pre-multi-line behavior.
+        let t = fresh_opts(TranscriptOpts {
+            history: vec!["old".into()],
+            ..Default::default()
+        })
+        .input_changed("draft", 5);
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "old");
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(t.input_value, "draft");
+        assert_eq!(t.history_idx, None);
+    }
+
+    #[test]
+    fn up_and_down_clamp_the_column_to_the_target_lines_length() {
+        // "long line\nab\nlonger": from the end of "longer", Up lands at the
+        // end of the shorter "ab"; Up again keeps col 2 into "long line".
+        let t = fresh().input_changed("long line\nab\nlonger", 19);
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_cursor, 12); // end of "ab" (col clamped 6 → 2)
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_cursor, 2); // "long line", col 2
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(t.input_cursor, 12); // back down: "ab" clamps col 2 → 2
     }
 
     #[test]

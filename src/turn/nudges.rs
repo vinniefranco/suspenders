@@ -826,6 +826,25 @@ mod tests {
     }
 
     #[test]
+    fn a_web_fetch_pass_resets_the_streak_like_any_non_exploration_tool() {
+        // Doc-reading over the network is not local exploration: it must not
+        // count toward the Explore Nudge, and it resets the streak (ADR-0024).
+        let mut nudges = Nudges::new();
+        note_pass(&mut nudges, &["read_file"]);
+        note_pass(&mut nudges, &["grep"]);
+        let fired = note_pass_pairs(
+            &mut nudges,
+            &[("web_fetch", json!({"url": "https://docs.rs/tokio"}))],
+        );
+        assert!(!fired);
+
+        // The streak restarted: three fresh exploration Passes fire again.
+        assert!(!note_pass(&mut nudges, &["read_file"]));
+        assert!(!note_pass(&mut nudges, &["read_file"]));
+        assert!(note_pass(&mut nudges, &["read_file"]));
+    }
+
+    #[test]
     fn a_search_shaped_run_command_counts_as_exploration() {
         let grep = ("run_command", json!({"command": "grep -rn foo lib"}));
         let find = (

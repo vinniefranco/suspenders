@@ -2,20 +2,26 @@
 //!
 //! The submodules split by testability: [`transcript`] is the PURE TEA core
 //! (The Elm Architecture, ADR-0001) with all the rules and all the tests;
-//! [`components`] is the ONE semantic→terminal color mapping (ADR-0008); and
-//! this file - the `run` adapter - is the untested-by-design driver that owns
-//! the terminal, maps crossterm input to the core's pure [`transcript::Key`],
-//! carries out the [`transcript::Effect`]s the core returns, and renders via
-//! [`components`]. Only this module and [`components`] `use ratatui` /
-//! `use crossterm` (ADR-0019 invariant).
+//! [`viewport`] is the pure, tested scroll state (bottom-anchored, clamped,
+//! only user actions re-pin); [`components`] is the ONE semantic→terminal
+//! color mapping (ADR-0008); and this file - the `run` adapter - is the
+//! untested-by-design driver that owns the terminal, maps crossterm input to
+//! the core's pure [`transcript::Key`], carries out the [`transcript::Effect`]s
+//! the core returns, and renders via [`components`]. Only this module and
+//! [`components`] `use ratatui` / `use crossterm` (ADR-0019 invariant).
 
 pub mod components;
+pub mod composer;
+pub mod markdown;
+pub mod picker;
 pub mod transcript;
+pub mod viewport;
 
 use crossterm::event::{
-    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::broadcast::error::RecvError;
@@ -24,47 +30,25 @@ use crate::agent::AgentHandle;
 use crate::approvals::Decision as AgentDecision;
 use crate::history::History;
 use crate::session::Session;
+use crate::session::log::SessionEntry;
+use picker::{Picker, PickerOutcome};
 use transcript::{
-    AgentCommand, Busy, Decision, Effect, Idle, Key, Status, Transcript, TranscriptOpts,
+    AgentCommand, Busy, Decision, Effect, Idle, Key, ScrollStep, Status, Transcript,
+    TranscriptOpts,
 };
+use viewport::{Viewport, WHEEL_LINES};
 
 /// How often the status-bar spinner advances while a Turn is running (~10 fps).
 const TICK_MS: u64 = 100;
 
-/// Viewport scroll state the adapter tracks (the pure core only emits
-/// [`Effect::ScrollUp`]/[`Effect::ScrollDown`]/[`Effect::PinBottom`]).
-struct Viewport {
-    /// Top-line offset; `0` follows the tail (pinned to bottom).
-    scroll: u16,
-    /// Whether the viewport is pinned to the tail.
-    pinned: bool,
-}
-
-impl Viewport {
-    fn new() -> Self {
-        Viewport {
-            scroll: 0,
-            pinned: true,
-        }
-    }
-
-    fn scroll_up(&mut self) {
-        self.pinned = false;
-        self.scroll = self.scroll.saturating_add(4);
-    }
-
-    fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_sub(4);
-        if self.scroll == 0 {
-            self.pinned = true;
-        }
-    }
-
-    fn pin_bottom(&mut self) {
-        self.pinned = true;
-        self.scroll = 0;
-    }
-}
+/// The last draw's measured viewport geometry: `(total wrapped lines,
+/// viewport height)`. Scroll effects execute BETWEEN draws, and the adapter
+/// cannot know the wrap-aware line total outside one (only the render path
+/// measures the built `Paragraph`), so it feeds the pure [`Viewport`] the
+/// previous frame's numbers. At worst one frame stale - harmless, because the
+/// draw-time [`Viewport::top_offset`] clamp against the fresh measure is
+/// authoritative.
+type Geometry = (usize, usize);
 
 /// Runs the ratatui frontend against a live [`AgentHandle`], returning when the
 /// user quits (Ctrl-C / Ctrl-Q). Enters raw mode + the alternate screen for the
@@ -74,11 +58,76 @@ impl Viewport {
 /// Agent's broadcast [`Receiver`](tokio::sync::broadcast::Receiver): key presses
 /// fold through the Transcript core, agent events fold through it too, and the
 /// returned [`Effect`]s are executed here (Agent calls, scroll/focus, history).
+///
+/// Mouse capture is enabled for the duration so the wheel scrolls the viewport
+/// ([`Key::WheelUp`]/[`Key::WheelDown`]). A deliberate trade: capturing the
+/// mouse disables the terminal's native text selection (shift-click usually
+/// bypasses the capture). Capture is released before the terminal is restored,
+/// on the error path too.
 pub async fn run(agent: AgentHandle, session: &Session) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    // Best-effort: a terminal without mouse support still gets a working TUI.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run_loop(&mut terminal, agent, session).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// Runs the `--resume` Session Picker full-screen and returns how it resolved.
+/// Same terminal lifecycle as [`run`] - raw mode + alternate screen entered and
+/// restored around the loop, mouse capture enabled/released symmetrically -
+/// because the picker runs BEFORE the Agent starts, on its own screen.
+///
+/// Crossterm input folds through the pure [`picker::Picker`] core via the same
+/// [`map_key`]/[`map_mouse`] mappings the Transcript uses; Ctrl-C/Ctrl-Q
+/// ([`is_quit`]) resolve as [`PickerOutcome::Quit`].
+pub async fn pick_session(entries: Vec<SessionEntry>) -> anyhow::Result<PickerOutcome> {
+    let mut terminal = ratatui::init();
+    // Best-effort, like `run`: no mouse support still means a working picker.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let result = pick_loop(&mut terminal, entries).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+    result
+}
+
+async fn pick_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    entries: Vec<SessionEntry>,
+) -> anyhow::Result<PickerOutcome> {
+    let mut input = EventStream::new();
+    let mut picker = Picker::new(entries);
+
+    terminal.draw(|frame| components::render_picker(frame, &picker))?;
+
+    loop {
+        // An ended input stream means the terminal is gone: quit, don't spin.
+        let Some(event) = input.next().await else {
+            return Ok(PickerOutcome::Quit);
+        };
+        let outcome = match event {
+            Ok(CtEvent::Key(key_event)) => {
+                if is_quit(&key_event) {
+                    return Ok(PickerOutcome::Quit);
+                }
+                if key_event.kind == KeyEventKind::Release {
+                    continue;
+                }
+                picker.handle_key(map_key(&key_event))
+            }
+            Ok(CtEvent::Mouse(mouse)) => match map_mouse(&mouse) {
+                Some(key) => picker.handle_key(key),
+                None => continue,
+            },
+            Ok(_) => None,  // resize/etc.: repaint below
+            Err(_) => None, // read error; keep going
+        };
+        if let Some(outcome) = outcome {
+            return Ok(outcome);
+        }
+        terminal.draw(|frame| components::render_picker(frame, &picker))?;
+    }
 }
 
 async fn run_loop(
@@ -107,6 +156,12 @@ async fn run_loop(
     }));
     let mut viewport = Viewport::new();
 
+    // The per-item render cache: settled items' lines and wrapped counts are
+    // built once (per width / Ctrl-T state) instead of on every frame. Owned
+    // here - it holds ratatui `Line`s, so it lives in the adapter/components
+    // layer (ADR-0019), never in the pure core.
+    let mut cache = components::RenderCache::new();
+
     // Drives the running-spinner animation: the event loop is otherwise idle
     // while the model thinks, so nothing would repaint. `spinner` is the frame
     // counter (only meaningful while running).
@@ -114,8 +169,9 @@ async fn run_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut spinner: u64 = 0;
 
-    // Initial paint.
-    draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner)?;
+    // Initial paint; `geometry` tracks the last draw's measure for the scroll
+    // effects (see [`Geometry`]).
+    let mut geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
 
     loop {
         tokio::select! {
@@ -124,36 +180,61 @@ async fn run_loop(
             _ = ticker.tick() => {
                 if transcript.as_ref().unwrap().status == Status::Running {
                     spinner = spinner.wrapping_add(1);
-                    draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner)?;
+                    geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
                 }
                 continue;
             }
 
-            // Terminal input.
+            // Terminal input. Bursts (wheel ticks, paste, held keys) are
+            // coalesced: after handling one event, any IMMEDIATELY-available
+            // events drain through the exact same path - quit checks, key
+            // mapping, effects - and the batch pays for ONE draw, not one per
+            // event. `dirty` mirrors the old per-event behavior: only
+            // Release-kind keys skipped the repaint.
             maybe_input = input.next() => {
-                match maybe_input {
-                    Some(Ok(CtEvent::Key(key_event))) => {
-                        if is_quit(&key_event) {
-                            return Ok(());
-                        }
-                        if key_event.kind == KeyEventKind::Release {
-                            continue;
-                        }
-                        // Text input edits the composer directly; named keys go
-                        // through the pure core. `edit_composer` hands the
-                        // Transcript back (Err) when the key is not a composer
-                        // edit, so it is never dropped.
-                        match edit_composer(transcript.take().unwrap(), &key_event) {
-                            Ok(edited) => transcript = Some(edited),
-                            Err(core) => {
+                let mut pending = maybe_input;
+                let mut dirty = false;
+                loop {
+                    match pending {
+                        Some(Ok(CtEvent::Key(key_event))) => {
+                            if is_quit(&key_event) {
+                                return Ok(());
+                            }
+                            if key_event.kind != KeyEventKind::Release {
+                                // EVERY key folds through the pure core - Composer
+                                // editing included - so all the rules (modal gating,
+                                // edge-triggered history, cursor editing) live in one
+                                // tested place.
+                                let core = transcript.take().unwrap();
                                 let (core, effects) = core.handle_key(map_key(&key_event));
-                                transcript = Some(run_effects(core, effects, &agent, &mut viewport, history_store.as_ref()).await);
+                                transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
+                                dirty = true;
                             }
                         }
+                        // Wheel scroll folds through the pure core like
+                        // PageUp/PageDown (line steps rather than page steps);
+                        // other mouse kinds are ignored.
+                        Some(Ok(CtEvent::Mouse(mouse))) => {
+                            if let Some(key) = map_mouse(&mouse) {
+                                let core = transcript.take().unwrap();
+                                let (core, effects) = core.handle_key(key);
+                                transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
+                            }
+                            dirty = true;
+                        }
+                        Some(Ok(_)) => dirty = true, // resize/etc.
+                        Some(Err(_)) => dirty = true, // read error; keep going
+                        None => return Ok(()), // input stream ended
                     }
-                    Some(Ok(_)) => {} // resize/mouse/etc.
-                    Some(Err(_)) => {} // read error; keep going
-                    None => return Ok(()), // input stream ended
+                    // Drain whatever is already buffered; the first
+                    // not-yet-ready poll ends the batch.
+                    match next_if_ready(&mut input).await {
+                        Some(next) => pending = next,
+                        None => break,
+                    }
+                }
+                if !dirty {
+                    continue;
                 }
             }
 
@@ -163,7 +244,7 @@ async fn run_loop(
                     Ok(event) => {
                         let core = transcript.take().unwrap();
                         let (core, effects) = core.apply_event(event);
-                        transcript = Some(run_effects(core, effects, &agent, &mut viewport, history_store.as_ref()).await);
+                        transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
                     }
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
@@ -173,16 +254,16 @@ async fn run_loop(
                     Err(RecvError::Closed) => {
                         let core = transcript.take().unwrap();
                         let (core, effects) = core.agent_down();
-                        transcript = Some(run_effects(core, effects, &agent, &mut viewport, history_store.as_ref()).await);
-                        draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner)?;
+                        transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
+                        let geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
                         // Nothing more will arrive; wait only on input now.
-                        return drain_input(terminal, input, transcript.take().unwrap(), viewport, base_url).await;
+                        return drain_input(terminal, input, transcript.take().unwrap(), viewport, geometry, base_url, cache).await;
                     }
                 }
             }
         }
 
-        draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner)?;
+        geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
     }
 }
 
@@ -190,28 +271,62 @@ async fn run_loop(
 async fn drain_input(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut input: EventStream,
-    mut transcript: Transcript,
+    transcript: Transcript,
     mut viewport: Viewport,
+    mut geometry: Geometry,
     base_url: String,
+    mut cache: components::RenderCache,
 ) -> anyhow::Result<()> {
     loop {
+        let (total_lines, height) = geometry;
         match input.next().await {
             Some(Ok(CtEvent::Key(key_event))) => {
                 if is_quit(&key_event) {
                     return Ok(());
                 }
                 match map_key(&key_event) {
-                    Key::PageUp => viewport.scroll_up(),
-                    Key::PageDown => viewport.scroll_down(),
+                    Key::PageUp => viewport.page_up(total_lines, height),
+                    Key::PageDown => viewport.page_down(total_lines, height),
                     _ => {}
                 }
-                draw(terminal, &transcript, &viewport, &base_url, 0)?;
-                let _ = &mut transcript;
+                geometry = draw(terminal, &transcript, &viewport, &base_url, 0, &mut cache)?;
+            }
+            // The wheel still scrolls after the Agent is gone; other mouse
+            // kinds are ignored.
+            Some(Ok(CtEvent::Mouse(mouse))) => {
+                match map_mouse(&mouse) {
+                    Some(Key::WheelUp) => viewport.scroll_up(WHEEL_LINES, total_lines, height),
+                    Some(Key::WheelDown) => viewport.scroll_down(WHEEL_LINES, total_lines, height),
+                    _ => continue,
+                }
+                geometry = draw(terminal, &transcript, &viewport, &base_url, 0, &mut cache)?;
             }
             Some(_) => {}
             None => return Ok(()),
         }
     }
+}
+
+/// Polls `stream` ONCE with the real task context and returns immediately:
+/// `Some(item)` when something was ready, `None` when it was not (the inner
+/// `Option` is the stream's own end-of-stream signal).
+///
+/// This deliberately is NOT `FutureExt::now_or_never`. Crossterm's
+/// [`EventStream`] hands the FIRST Pending poll's waker to its wake-up thread
+/// and DISCARDS wakers from later polls until that thread fires - and
+/// `now_or_never` polls with a no-op waker. A batch-ending `now_or_never`
+/// poll therefore parked a waker that wakes nobody: the next keystroke woke
+/// nothing and sat buffered until the 100ms animation tick happened to
+/// re-poll the stream, so typing felt quantized/choppy. Polling with the real
+/// context parks the run loop's own waker instead.
+async fn next_if_ready<S: Stream + Unpin>(stream: &mut S) -> Option<Option<S::Item>> {
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(match std::pin::Pin::new(&mut *stream).poll_next(cx) {
+            std::task::Poll::Ready(item) => Some(item),
+            std::task::Poll::Pending => None,
+        })
+    })
+    .await
 }
 
 /// Ctrl-C / Ctrl-Q quit the app (baud's global keybindings).
@@ -220,51 +335,48 @@ fn is_quit(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
 }
 
-/// Applies plain text editing directly to the composer (character insert /
-/// backspace), returning `Ok(updated)`. Returns `Err(transcript)` - the value
-/// handed back unchanged - when the key is not a composer edit, so the caller
-/// routes it through the pure core WITHOUT losing the Transcript.
-///
-/// While an Approval modal is open, NOTHING edits the composer - every key must
-/// reach the pure core so it can swallow all but y/n/a/Escape.
-// `Err` intentionally carries the whole Transcript back (ownership hand-off, not
-// a propagating error), so a large Err variant is exactly what we want here.
-#[allow(clippy::result_large_err)]
-fn edit_composer(transcript: Transcript, key: &KeyEvent) -> Result<Transcript, Transcript> {
-    if transcript.pending_approval.is_some() {
-        return Err(transcript);
-    }
-    match key.code {
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let mut value = transcript.input_value.clone();
-            value.push(c);
-            let cursor = value.chars().count();
-            Ok(transcript.input_changed(value, cursor))
-        }
-        KeyCode::Backspace => {
-            let mut value = transcript.input_value.clone();
-            value.pop();
-            let cursor = value.chars().count();
-            Ok(transcript.input_changed(value, cursor))
-        }
-        _ => Err(transcript),
-    }
-}
-
 /// Maps a crossterm [`KeyEvent`] to the pure core's [`Key`]. Text characters
-/// (`y`/`n`/`a` matter to the modal) come through as [`Key::Char`]; the
-/// navigation/control keys map to their named variants.
+/// (`y`/`n`/`a` matter to the modal; everything else edits the Composer) come
+/// through as [`Key::Char`]; the navigation/edit keys map to their named
+/// variants. The core handles ALL of them - the adapter never edits the
+/// Composer itself.
 fn map_key(key: &KeyEvent) -> Key {
     match key.code {
+        // Alt-Enter inserts a newline into the draft. Terminals that send
+        // Esc-prefixed Enter for Alt-Enter are normalized by crossterm, so
+        // matching the ALT modifier is enough.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => Key::InsertNewline,
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Escape,
         KeyCode::PageUp => Key::PageUp,
         KeyCode::PageDown => Key::PageDown,
         KeyCode::Up => Key::ArrowUp,
         KeyCode::Down => Key::ArrowDown,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
         KeyCode::Backspace => Key::Backspace,
+        // Modifier-aware arms come BEFORE the generic Char arm, which would
+        // otherwise swallow the keypress as a plain character.
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleThinking,
+        // Any other Ctrl chord is a command, never text: since the core now
+        // inserts every `Key::Char` into the Composer, letting e.g. Ctrl-X
+        // through as Char('x') would type an 'x'.
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => Key::Other,
         KeyCode::Char(c) => Key::Char(c),
         _ => Key::Other,
+    }
+}
+
+/// Maps a crossterm [`MouseEvent`] to the pure core's [`Key`]: the wheel
+/// becomes [`Key::WheelUp`]/[`Key::WheelDown`]; every other mouse kind
+/// (clicks, drags, moves) is ignored.
+fn map_mouse(mouse: &MouseEvent) -> Option<Key> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(Key::WheelUp),
+        MouseEventKind::ScrollDown => Some(Key::WheelDown),
+        _ => None,
     }
 }
 
@@ -275,10 +387,11 @@ async fn run_effects(
     effects: Vec<Effect>,
     agent: &AgentHandle,
     viewport: &mut Viewport,
+    geometry: Geometry,
     history: Option<&History>,
 ) -> Transcript {
     for effect in effects {
-        transcript = run_effect(transcript, effect, agent, viewport, history).await;
+        transcript = run_effect(transcript, effect, agent, viewport, geometry, history).await;
     }
     transcript
 }
@@ -288,8 +401,12 @@ async fn run_effect(
     effect: Effect,
     agent: &AgentHandle,
     viewport: &mut Viewport,
+    geometry: Geometry,
     history: Option<&History>,
 ) -> Transcript {
+    // Scroll effects clamp against the LAST draw's measure (see [`Geometry`]);
+    // the draw-time `top_offset` clamp corrects any staleness.
+    let (total_lines, height) = geometry;
     match effect {
         Effect::Agent(AgentCommand::Submit(prompt)) => {
             let result = agent.submit(prompt.clone()).await;
@@ -297,13 +414,13 @@ async fn run_effect(
             // retries as steer) and may emit MORE effects.
             let outcome = result.map_err(|_| Busy);
             let (core, effects) = transcript.submitted(prompt, outcome);
-            Box::pin(run_effects(core, effects, agent, viewport, history)).await
+            Box::pin(run_effects(core, effects, agent, viewport, geometry, history)).await
         }
         Effect::Agent(AgentCommand::Steer(text)) => {
             let result = agent.steer(text.clone()).await;
             let outcome = result.map_err(|_| Idle);
             let (core, effects) = transcript.steered(text, outcome);
-            Box::pin(run_effects(core, effects, agent, viewport, history)).await
+            Box::pin(run_effects(core, effects, agent, viewport, geometry, history)).await
         }
         Effect::Agent(AgentCommand::Approve(id, decision)) => {
             agent.approve(id, to_agent_decision(decision)).await;
@@ -317,12 +434,20 @@ async fn run_effect(
             viewport.pin_bottom();
             transcript
         }
-        Effect::ScrollUp => {
-            viewport.scroll_up();
+        Effect::ScrollUp(ScrollStep::Line) => {
+            viewport.scroll_up(WHEEL_LINES, total_lines, height);
             transcript
         }
-        Effect::ScrollDown => {
-            viewport.scroll_down();
+        Effect::ScrollUp(ScrollStep::Page) => {
+            viewport.page_up(total_lines, height);
+            transcript
+        }
+        Effect::ScrollDown(ScrollStep::Line) => {
+            viewport.scroll_down(WHEEL_LINES, total_lines, height);
+            transcript
+        }
+        Effect::ScrollDown(ScrollStep::Page) => {
+            viewport.page_down(total_lines, height);
             transcript
         }
         // Focus effects are a no-op in the ratatui adapter: there is no separate
@@ -358,34 +483,25 @@ fn to_agent_decision(decision: Decision) -> AgentDecision {
     }
 }
 
+/// Draws one frame and returns the measured viewport [`Geometry`]: the render
+/// path syncs the [`components::RenderCache`] (settled items build once, per
+/// width), sums the cached wrap-aware total, asks the pure [`Viewport`] for
+/// the clamped offset, and draws only the visible slice + scrollbar - all
+/// inside [`components::render`]; the adapter only stores the measure for the
+/// scroll effects that arrive before the next draw.
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     transcript: &Transcript,
     viewport: &Viewport,
     base_url: &str,
     spinner: u64,
-) -> anyhow::Result<()> {
-    let scroll = if viewport.pinned { u16::MAX } else { viewport.scroll };
+    cache: &mut components::RenderCache,
+) -> anyhow::Result<Geometry> {
+    let mut geometry: Geometry = (0, 0);
     terminal.draw(|frame| {
-        components::render(frame, transcript, base_url, spinner, tail_scroll(frame, transcript, scroll))
+        geometry = components::render(frame, transcript, base_url, spinner, viewport, cache);
     })?;
-    Ok(())
-}
-
-// When pinned, scroll so the tail is visible; ratatui's Paragraph scroll is a
-// top-offset, so we approximate "follow the tail" by scrolling past the top by
-// the overflow. A conservative estimate keeps the newest lines on screen.
-fn tail_scroll(
-    frame: &ratatui::Frame,
-    transcript: &Transcript,
-    scroll: u16,
-) -> u16 {
-    if scroll != u16::MAX {
-        return scroll;
-    }
-    let height = frame.area().height.saturating_sub(2); // status + input rows
-    let lines = transcript.messages.len() as u16;
-    lines.saturating_sub(height)
+    Ok(geometry)
 }
 
 #[cfg(test)]
@@ -393,41 +509,87 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    fn empty_transcript() -> Transcript {
-        Transcript::new(TranscriptOpts {
-            context_budget: Some(64_000),
-            eviction_slack: 0.0,
-            plugins: Vec::new(),
-            history: Vec::new(),
-        })
-    }
+    // The composer-editing rules themselves (insert/backspace/modal gating)
+    // live in the pure core and are tested there; these tests only guard the
+    // crossterm→Key mapping the adapter owns.
 
-    // Regression: on Enter (and any non-edit key) `edit_composer` must hand the
-    // Transcript BACK as Err, never consume/drop it - the caller then routes the
-    // key through the pure core. Dropping it made the adapter panic on the next
-    // `transcript.take().unwrap()` when the user pressed Enter to submit.
+    // Regression: Ctrl-T must map to ToggleThinking, not be swallowed by the
+    // generic Char arm as a plain 't' - the modifier arms must come first.
     #[test]
-    fn enter_returns_the_transcript_unconsumed() {
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(edit_composer(empty_transcript(), &key).is_err());
+    fn ctrl_t_maps_to_toggle_thinking() {
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(&key), Key::ToggleThinking);
     }
 
     #[test]
-    fn a_typed_char_edits_the_composer() {
-        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
-        match edit_composer(empty_transcript(), &key) {
-            Ok(t) => assert_eq!(t.input_value, "h"),
-            Err(_) => panic!("a char edits the composer"),
+    fn plain_t_is_still_a_typed_char() {
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert_eq!(map_key(&key), Key::Char('t'));
+    }
+
+    // Since the core inserts every Key::Char into the Composer, a Ctrl chord
+    // leaking through as Char would TYPE its letter.
+    #[test]
+    fn other_ctrl_chords_are_commands_not_text() {
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(&key), Key::Other);
+    }
+
+    #[test]
+    fn alt_enter_maps_to_insert_newline_plain_enter_to_enter() {
+        let alt = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(map_key(&alt), Key::InsertNewline);
+        let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(map_key(&plain), Key::Enter);
+    }
+
+    #[test]
+    fn cursor_navigation_keys_map_to_their_named_variants() {
+        assert_eq!(map_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), Key::Left);
+        assert_eq!(map_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), Key::Right);
+        assert_eq!(map_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)), Key::Home);
+        assert_eq!(map_key(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE)), Key::End);
+    }
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
         }
     }
 
     #[test]
-    fn backspace_edits_the_composer() {
-        let seeded = empty_transcript().input_changed("hi".to_string(), 2);
-        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
-        match edit_composer(seeded, &key) {
-            Ok(t) => assert_eq!(t.input_value, "h"),
-            Err(_) => panic!("backspace edits the composer"),
-        }
+    fn wheel_maps_to_wheel_keys_other_mouse_kinds_are_ignored() {
+        assert_eq!(map_mouse(&mouse(MouseEventKind::ScrollUp)), Some(Key::WheelUp));
+        assert_eq!(map_mouse(&mouse(MouseEventKind::ScrollDown)), Some(Key::WheelDown));
+        assert_eq!(
+            map_mouse(&mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left))),
+            None
+        );
+        assert_eq!(map_mouse(&mouse(MouseEventKind::Moved)), None);
+    }
+
+    // next_if_ready must return without suspending in ALL three stream states -
+    // a ready item, an ended stream, and (the one that matters) a stream with
+    // nothing buffered. Suspending on the empty case would stall the input
+    // batch loop until the next event instead of ending the batch.
+    #[tokio::test]
+    async fn next_if_ready_returns_a_buffered_item() {
+        let mut stream = futures_util::stream::iter(vec![1u8]);
+        assert_eq!(next_if_ready(&mut stream).await, Some(Some(1)));
+    }
+
+    #[tokio::test]
+    async fn next_if_ready_reports_an_ended_stream() {
+        let mut stream = futures_util::stream::iter(Vec::<u8>::new());
+        assert_eq!(next_if_ready(&mut stream).await, Some(None));
+    }
+
+    #[tokio::test]
+    async fn next_if_ready_returns_none_without_suspending_when_nothing_is_buffered() {
+        let mut stream = futures_util::stream::pending::<u8>();
+        assert_eq!(next_if_ready(&mut stream).await, None);
     }
 }

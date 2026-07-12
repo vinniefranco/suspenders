@@ -459,6 +459,109 @@ pub fn latest(dir: &str) -> Option<String> {
     )
 }
 
+/// One row of the `--resume` picker: a Session Log file, its filename-derived
+/// timestamp (human-trimmed), and a label taken from the first user prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub path: String,
+    pub stamp: String,
+    pub label: String,
+}
+
+/// Every Session Log in `dir`, NEWEST first - keyed by the sortable stamp
+/// filename, the same source [`latest`] sorts on. Unreadable or foreign files
+/// (a torn header included) are skipped, never a panic: the picker shows what
+/// it can and stays quiet about the rest.
+pub fn list(dir: &str) -> Vec<SessionEntry> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.reverse();
+    names
+        .into_iter()
+        .filter_map(|name| list_entry(dir, &name))
+        .collect()
+}
+
+// One picker row, or `None` for a file that cannot be read or whose header is
+// not a Session Log header (foreign/torn - the same decode tolerance resume
+// takes, minus the error reporting: the picker just skips it).
+fn list_entry(dir: &str, name: &str) -> Option<SessionEntry> {
+    let path = std::path::Path::new(dir)
+        .join(name)
+        .to_string_lossy()
+        .into_owned();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut lines = content.lines().filter(|l| !l.is_empty());
+    let header = decode_line(lines.next()?)?;
+    if header.get("type").and_then(|v| v.as_str()) != Some("session") {
+        return None;
+    }
+    Some(SessionEntry {
+        path,
+        stamp: human_stamp(name),
+        label: first_user_label(lines),
+    })
+}
+
+// The first user_text entry's text as a one-line label; "(empty session)" when
+// the log holds none. A torn line stops the scan, like resume's fold.
+fn first_user_label<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    for line in lines {
+        match decode_line(line).and_then(|v| Entry::from_json(&v)) {
+            Some(Entry::UserText(text)) => return label_from(&text),
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    "(empty session)".to_string()
+}
+
+/// How many label chars the picker shows before truncating with `…`.
+const LABEL_CHARS: usize = 60;
+
+fn label_from(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.chars().count() > LABEL_CHARS {
+        let mut out: String = first.chars().take(LABEL_CHARS).collect();
+        out.push('…');
+        out
+    } else {
+        first.to_string()
+    }
+}
+
+// `20260711-140205-3.jsonl` → `2026-07-11 14:02` (the [`utc_stamp`] shape,
+// seconds and the uniquifier dropped). A name that doesn't carry that shape
+// falls back to its bare stem.
+fn human_stamp(name: &str) -> String {
+    let stem = name.strip_suffix(".jsonl").unwrap_or(name);
+    let raw = stem.as_bytes();
+    let stamped = raw.len() >= 15
+        && raw[8] == b'-'
+        && raw[..15]
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 8 || b.is_ascii_digit());
+    if !stamped {
+        return stem.to_string();
+    }
+    format!(
+        "{}-{}-{} {}:{}",
+        &stem[0..4],
+        &stem[4..6],
+        &stem[6..8],
+        &stem[9..11],
+        &stem[11..13]
+    )
+}
+
 /// The last Plan logged in a Session Log file, or `None` when none was. A torn
 /// or foreign log yields `None` - the Plan is a convenience, never load-bearing
 /// for Resume's correctness.
@@ -1327,5 +1430,129 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(latest(&missing), None);
+    }
+
+    // ---- list/1 ----
+
+    const TEST_HEADER: &str = r#"{"type":"session","version":1,"root":"/r","model":"m","context_budget":1,"turn_limit":1}"#;
+
+    fn write_log(dir: &std::path::Path, name: &str, lines: &[&str]) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn list_returns_newest_first_by_the_filename_stamp_latest_sorts_on() {
+        let tmp = TempDir::new().unwrap();
+        let older = write_log(
+            tmp.path(),
+            "20260101-090000-1.jsonl",
+            &[TEST_HEADER, r#"{"e":"user_text","text":"older"}"#],
+        );
+        let newer = write_log(
+            tmp.path(),
+            "20260711-140205-1.jsonl",
+            &[TEST_HEADER, r#"{"e":"user_text","text":"newer"}"#],
+        );
+
+        let entries = list(&tmp.path().to_string_lossy());
+
+        assert_eq!(
+            entries,
+            vec![
+                SessionEntry {
+                    path: newer,
+                    stamp: "2026-07-11 14:02".into(),
+                    label: "newer".into(),
+                },
+                SessionEntry {
+                    path: older,
+                    stamp: "2026-01-01 09:00".into(),
+                    label: "older".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_labels_with_the_first_user_text_first_line_only() {
+        let tmp = TempDir::new().unwrap();
+        write_log(
+            tmp.path(),
+            "20260101-000000-1.jsonl",
+            &[
+                TEST_HEADER,
+                r#"{"e":"plan","text":"not a label"}"#,
+                "{\"e\":\"user_text\",\"text\":\"fix the bug\\nwith much more detail below\"}",
+                r#"{"e":"user_text","text":"a later prompt"}"#,
+            ],
+        );
+
+        let entries = list(&tmp.path().to_string_lossy());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "fix the bug");
+    }
+
+    #[test]
+    fn list_char_truncates_long_labels_with_an_ellipsis() {
+        let tmp = TempDir::new().unwrap();
+        let long = "é".repeat(70);
+        write_log(
+            tmp.path(),
+            "20260101-000000-1.jsonl",
+            &[
+                TEST_HEADER,
+                &format!(r#"{{"e":"user_text","text":"{long}"}}"#),
+            ],
+        );
+
+        let entries = list(&tmp.path().to_string_lossy());
+        assert_eq!(entries[0].label.chars().count(), 61);
+        assert!(entries[0].label.ends_with('…'));
+        assert!(entries[0].label.starts_with(&"é".repeat(60)));
+    }
+
+    #[test]
+    fn list_labels_a_log_with_no_user_text_as_an_empty_session() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        Log::open(&session).unwrap();
+
+        let entries = list(&session.session_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "(empty session)");
+    }
+
+    #[test]
+    fn list_skips_torn_headers_and_foreign_files_without_panicking() {
+        let tmp = TempDir::new().unwrap();
+        write_log(tmp.path(), "20260101-000000-1.jsonl", &[r#"{"type": "sess"#]);
+        write_log(tmp.path(), "20260102-000000-1.jsonl", &["not json at all"]);
+        write_log(
+            tmp.path(),
+            "20260103-000000-1.jsonl",
+            &[r#"{"type":"something_else"}"#],
+        );
+        write_log(tmp.path(), "notes.txt", &["a non-jsonl file"]);
+        let good = write_log(
+            tmp.path(),
+            "20260104-000000-1.jsonl",
+            &[TEST_HEADER, r#"{"e":"user_text","text":"survivor"}"#],
+        );
+
+        let entries = list(&tmp.path().to_string_lossy());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, good);
+        assert_eq!(entries[0].label, "survivor");
+    }
+
+    #[test]
+    fn list_of_an_empty_or_missing_dir_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(list(&tmp.path().to_string_lossy()), Vec::new());
+
+        let missing = tmp.path().join("missing").to_string_lossy().into_owned();
+        assert_eq!(list(&missing), Vec::new());
     }
 }
