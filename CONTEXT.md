@@ -32,6 +32,17 @@ _Avoid_: iteration cap, loop limit
 The mechanical schedule by which a Turn ends at its Turn Limit, counted in Passes remaining: at 2, the wrap-up warning rides the results tail (or the Verification Pass prompt in its place when writes are unverified); at 1, the Verification Pass narrows the offered Tools to run_command when writes are unverified, and the final-Pass prompt rides the tail; at 0, the final Pass offers no Tools and a tool-insistent reply (real Tool Calls or serialized markup in text) closes on the turn-limit marker instead of passing as a conclusion. Mechanical because small models comply with mechanics, not requests.
 _Avoid_: wind-down, wrap-up phase (the wrap-up warning is one step of the Endgame, not its name)
 
+**Recovery Turn**:
+A Turn the harness opens itself when the previous Turn settled at its Turn Limit with unverified writes or a failing last verification - the work is demonstrably unfinished, so one more bounded attempt is issued rather than leaving a broken state. Issued by the Endgame Governor through the close-and-open-a-Recovery-Turn Intervention; a Setpoint bounds how many may follow one user request. Its prompt belongs to the Voice - the only Turn whose prompt Suspenders authors - and it still serves the original user request. Two shapes: Continuation and Handoff.
+_Avoid_: retry (nothing is re-attempted from scratch; unfinished work continues), auto-continue (that's the Continuation shape, not the umbrella)
+
+**Continuation**:
+The Recovery Turn shape that keeps the Conversation: the recovery prompt is appended and the model continues with everything it saw before.
+
+**Handoff**:
+The Recovery Turn shape that retires the Conversation: Compaction seeds a fresh one - the original task verbatim, the Plan verbatim, files touched, the model's narrative - plus the final failing verification result verbatim, and the recovery prompt starts it clean. The default shape: a fresh context with a structured handoff beats continuing a degraded one, and the gap widens as models shrink.
+_Avoid_: restart (the work and its facts carry over; only the rot is left behind)
+
 **Tool**:
 A named capability with a JSON schema that the model can invoke (v1: read_file, list_files, edit_file, write_file, grep, run_command).
 
@@ -70,8 +81,16 @@ _Avoid_: allowlist (implementation term), whitelist
 The token allowance the Conversation must fit within for the configured model.
 
 **Eviction**:
-Replacing the contents of old Tool Results (and superseded Anchors) with an elision marker to bring the Conversation back under the Context Budget. Once triggered, Eviction overshoots to a low-water mark below the budget target, so elisions arrive in rare waves and the request prefix stays stable for server-side prompt caching between them.
+Replacing the contents of dead Conversation blocks with an elision marker: old Tool Results, superseded Anchors, results made dead by Supersession, and the input bodies of successful writes. A wave fires when the Conversation presses the Context Budget or when Dead Mass crosses its threshold; once triggered, Eviction overshoots to a low-water mark, so elisions arrive in rare waves and the request prefix stays byte-stable for server-side prompt caching between them.
 _Avoid_: truncation (that's what the server does when we fail), compaction
+
+**Dead Mass**:
+The total size of Conversation content whose information is already superseded — the input bodies of successful writes (the file on disk holds the result), older results of repeated identical Tool Calls, redundant re-reads, stale Anchors. Dead Mass rots a small model's attention long before the Context Budget is threatened, so it has its own Eviction trigger: when it exceeds its threshold fraction of the Context Budget, a wave fires even with budget to spare.
+_Avoid_: bloat, garbage (both too vague to trigger on)
+
+**Supersession**:
+The rule that classifies Conversation content as dead: a newer result of an identical Tool Call supersedes the older ones (the newest survives verbatim), and a successful write supersedes its own input body — the file on disk is the truth. Identity is the full Tool Call (name and input), never a judgment call. A failed edit's input is not superseded by its failure; only a later successful write to the same file supersedes the attempt chain.
+_Avoid_: deduplication (mechanism, not meaning), pruning
 
 **Result Cap**:
 The size ceiling one Tool Result may occupy in the Conversation, derived from the Context Budget once per Session. Oversized Tool Results are cut before they enter the Conversation: run_command keeps its start and end (the exit code lives at the end), every other Tool keeps its start.
@@ -85,15 +104,15 @@ How an ended Turn enters the Conversation. Every Turn settles exactly one way: c
 _Avoid_: completion (reserved for the model's response), turn management
 
 **Governor**:
-A tunable rule that watches the Pass cycle and intervenes to keep the model on course. Each Governor owns its trigger and its setpoints - the thresholds and cadences tuned from observed model behavior - and acts only through an Intervention. Nudges, Anchors, and the Endgame schedule are all issued by Governors. Compaction and Eviction are budget mechanics, not Governors: they are correct or incorrect, never tuned.
+A tunable rule that watches the Pass cycle and intervenes to keep the model on course. Each Governor owns its trigger and its setpoints - the thresholds and cadences tuned from observed model behavior - and acts only through an Intervention. Nudges, Anchors, and the Endgame schedule are all issued by Governors. Compaction and Eviction are budget mechanics, not Governors: what they elide is correct or incorrect, never an opinion - though the cadence of their waves carries tuned thresholds.
 _Avoid_: rider (one delivery shape of a Nudge, not the rule that sends it), heuristic (the informal name; a Governor is the thing itself), rule, policy
 
 **Intervention**:
-One of the closed set of actions a Governor may take: replace a Tool Result, annotate one, stand alone as a user message, ride the results tail, narrow the offered Tools, silence Thinking for a Pass, or close the Turn on a marker. The set is deliberately closed: a new Governor is routine, a new kind of Intervention is a visible design decision.
+One of the closed set of actions a Governor may take: replace a Tool Result, annotate one, stand alone as a user message, ride the results tail, narrow the offered Tools, silence Thinking for a Pass, close the Turn on a marker, or close the Turn and open a Recovery Turn. The set is deliberately closed: a new Governor is routine, a new kind of Intervention is a visible design decision.
 _Avoid_: action (too generic), effect (mechanism, not meaning)
 
 **Setpoint**:
-A Governor's tunable value - a threshold, cadence, or cap that encodes a learning about how small models drift. Every Setpoint belongs to exactly one Governor and carries a default; the Session resolves them once at launch, and a Setpoint becomes user-configurable only when a real model has demanded a different value.
+A tunable value - a threshold, cadence, or cap that encodes a learning about how small models drift. Every Setpoint belongs to exactly one owner - a Governor or a named mechanic - and carries a default; the Session resolves them once at launch, and a Setpoint becomes user-configurable only when a real model has demanded a different value.
 _Avoid_: constant (a Setpoint is tuned, not fixed), config option (most are never exposed), magic number
 
 **Turn Ledger**:
@@ -156,8 +175,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Turn** ends at its **Turn Limit** even if the model is still asking for Tools; the **Endgame** schedules how it ends, counted in **Passes** remaining
 - A **Tool Call** for run_command requires an **Approval** before execution, unless a **Standing Approval** covers its exact command string
 - A **Standing Approval** belongs to the **Session** - it does not survive restart and never widens beyond the identical command string
-- **Eviction** targets **Tool Results** and superseded **Anchors**, oldest first, and never the system prompt, recent Turns, or the most recent **Anchor**
-- **Eviction** fires in waves: once triggered it elides past the target down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
+- **Eviction** targets dead content — old **Tool Results**, blocks dead by **Supersession**, the input bodies of successful writes, superseded **Anchors** — oldest first, and never the system prompt, the two most recent tool-result exchanges, or the most recent **Anchor**
+- **Eviction** fires in waves on either of two triggers — Context Budget pressure, or **Dead Mass** crossing its threshold; once triggered it elides down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
 - When **Eviction** cannot fit the **Conversation** within the **Context Budget**, the **Turn** fails loudly; an over-budget request is never sent
 - Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** once per **Session**
 - The system prompt, every **Nudge**, and every marker belong to the **Voice**; the **Governors** that fire them own the when, not the wording
@@ -174,6 +193,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - An **Artifact** travels with its **Tool Result** to **Presentment** and appears only in the **Transcript**, never the **Conversation**
 - A **Plugin** failure never fails the **Turn** and never reaches the model; the **Transcript** records it as an info line and the Tool Call proceeds without that Plugin
 - A **Turn** ends in exactly one **Turn Settlement**: completed, failed, or cancelled
+- A **Recovery Turn** opens only off a Turn that settled at its **Turn Limit** with unverified writes or a failing verification; its prompt belongs to the **Voice**, and a **Setpoint** bounds how many may serve one user request
+- A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the final failing verification; a **Continuation** keeps the whole **Conversation**
 - **Steering** is delivered after a Tool Call batch completes and before the next model call; a Turn that ends first triggers **Rollover**, a **Cancellation** discards it
 - **Steering** belongs to the user's voice and is never part of the **Voice**
 - A **Scout** runs its own fresh **Conversation** against the same model connection; its report is an ordinary **Tool Result**, subject to the **Result Cap**, and its exploration never enters the main **Conversation**
@@ -201,6 +222,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - "truncation" was used for both server-side context overflow and our own management strategy - resolved: ours is **Eviction**; "truncation" refers only to the server's silent behavior we're preventing.
 - the **Compaction Target** was documented as the full budget target while the code fired at the low-water mark - resolved 2026-07: the trigger is the low-water mark, and the keep level is its own decoupled knob, the **Compaction Keep**.
 - "toggling thinking" was read as enabling/disabling the model's **Thinking** when it means expanding/collapsing settled Thinking items in the **Transcript** - resolved 2026-07: Ctrl-T is a display expansion toggle; whether the model thinks at all is a request-level knob (today fixed: on for the main Conversation, off for **Scouts**) with no user-facing toggle.
+- **Anchors** and Endgame prompts are Conversation events the model actually read, but only Nudges were persisted, so **Resume** rebuilt a Conversation the model never saw - resolved 2026-07: every rider is logged to the **Session Log** like a Nudge.
 
 ## Compaction
 
