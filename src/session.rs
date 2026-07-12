@@ -1,8 +1,8 @@
 //! The Session's fixed facts (CONTEXT.md: Session), resolved and validated
 //! once at launch: the Project Root, the Context Budget, the Eviction slack,
-//! the Compaction Keep, the Result Cap, the Turn Limit, the Scout Pass cap,
-//! the no-think knobs, the command timeout, the Plugin list, the LLM module,
-//! and the model connection.
+//! the Dead Mass fraction, the Compaction Keep, the Result Cap, the Turn
+//! Limit, the Scout Pass cap, the no-think knobs, the command timeout, the
+//! Plugin list, the LLM module, and the model connection.
 //!
 //! This is the composition seam for configuration. [`Session::new`] is the
 //! only place Suspenders reads the environment for these keys (via
@@ -37,6 +37,10 @@ pub struct Session {
     pub plugins: Vec<String>,
     pub context_budget: u64,
     pub eviction_slack: f64,
+    /// The Eviction mechanic's Dead Mass Setpoint: the fraction of the
+    /// Context Budget that elidable dead content may occupy before a wave
+    /// fires without budget pressure.
+    pub dead_mass_fraction: f64,
     pub compaction_keep: f64,
     pub turn_limit: u64,
     pub anchor_interval: u64,
@@ -75,6 +79,7 @@ pub struct SessionConfig {
     pub temperature: Option<f64>,
     pub context_budget: u64,
     pub eviction_slack: f64,
+    pub dead_mass_fraction: f64,
     pub compaction_keep: f64,
     pub llm_module: String,
     pub command_timeout_ms: u64,
@@ -98,6 +103,7 @@ impl SessionConfig {
             temperature: Some(0.7),
             context_budget: 64_000,
             eviction_slack: 0.2,
+            dead_mass_fraction: 0.15,
             compaction_keep: 0.5,
             llm_module: "Baud.LLM".into(),
             command_timeout_ms: 120_000,
@@ -171,6 +177,11 @@ impl SessionConfig {
         }
 
         // Fraction in (0.0, 1.0).
+        if let Ok(v) = std::env::var("SUSPENDERS_DEAD_MASS_FRACTION") {
+            cfg.dead_mass_fraction = parse_dead_mass_fraction(&v)?;
+        }
+
+        // Fraction in (0.0, 1.0).
         if let Ok(v) = std::env::var("SUSPENDERS_COMPACTION_KEEP") {
             cfg.compaction_keep = parse_compaction_keep(&v)?;
         }
@@ -222,6 +233,15 @@ fn parse_eviction_slack(raw: &str) -> Result<f64, SessionError> {
     }
 }
 
+fn parse_dead_mass_fraction(raw: &str) -> Result<f64, SessionError> {
+    match raw.trim().parse::<f64>() {
+        Ok(v) if v > 0.0 && v < 1.0 => Ok(v),
+        _ => Err(SessionError(format!(
+            "SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0), got: {raw:?}"
+        ))),
+    }
+}
+
 fn parse_compaction_keep(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
         Ok(v) if v > 0.0 && v < 1.0 => Ok(v),
@@ -250,6 +270,7 @@ pub struct SessionOpts {
     pub plugins: Option<Vec<String>>,
     pub context_budget: Option<u64>,
     pub eviction_slack: Option<f64>,
+    pub dead_mass_fraction: Option<f64>,
     pub compaction_keep: Option<f64>,
     pub turn_limit: Option<u64>,
     pub anchor_interval: Option<u64>,
@@ -289,6 +310,7 @@ impl Session {
             plugins: opts.plugins.unwrap_or_else(|| config.plugins.clone()),
             context_budget,
             eviction_slack: opts.eviction_slack.unwrap_or(config.eviction_slack),
+            dead_mass_fraction: opts.dead_mass_fraction.unwrap_or(config.dead_mass_fraction),
             compaction_keep: opts.compaction_keep.unwrap_or(config.compaction_keep),
             turn_limit: opts.turn_limit.unwrap_or(config.turn_limit),
             anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
@@ -353,6 +375,7 @@ fn validate_scalars(s: &Session) -> Result<(), SessionError> {
     pos_int(s.command_timeout_ms, ":command_timeout_ms")?;
 
     fraction_left_closed(s.eviction_slack, ":eviction_slack")?;
+    fraction_open(s.dead_mass_fraction, ":dead_mass_fraction")?;
     fraction_open(s.compaction_keep, ":compaction_keep")?;
     temperature(s.connection.temperature)?;
     Ok(())
@@ -509,6 +532,50 @@ mod tests {
     fn compaction_keep_defaults_from_config() {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.compaction_keep, cfg().compaction_keep);
+    }
+
+    #[test]
+    fn dead_mass_fraction_defaults_to_015_and_opts_override() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.dead_mass_fraction, 0.15);
+
+        let session = Session::build(
+            SessionOpts {
+                dead_mass_fraction: Some(0.3),
+                connection: Some(connection()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        assert_eq!(session.dead_mass_fraction, 0.3);
+    }
+
+    #[test]
+    fn dead_mass_fraction_must_be_strictly_inside_open_interval() {
+        let with_fraction = |f: f64| {
+            Session::build(
+                SessionOpts {
+                    dead_mass_fraction: Some(f),
+                    connection: Some(connection()),
+                    ..opts()
+                },
+                &cfg(),
+            )
+        };
+        assert!(
+            with_fraction(0.0)
+                .unwrap_err()
+                .0
+                .contains(":dead_mass_fraction")
+        );
+        assert!(
+            with_fraction(1.0)
+                .unwrap_err()
+                .0
+                .contains(":dead_mass_fraction")
+        );
+        assert_eq!(with_fraction(0.15).unwrap().dead_mass_fraction, 0.15);
     }
 
     #[test]
@@ -801,6 +868,23 @@ mod tests {
                 .unwrap_err()
                 .0
                 .contains("SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0)")
+        );
+    }
+
+    #[test]
+    fn env_dead_mass_fraction_open_interval() {
+        assert_eq!(parse_dead_mass_fraction("0.15").unwrap(), 0.15);
+        assert!(
+            parse_dead_mass_fraction("0.0")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0)")
+        );
+        assert!(
+            parse_dead_mass_fraction("1.0")
+                .unwrap_err()
+                .0
+                .contains("(0.0, 1.0)")
         );
     }
 

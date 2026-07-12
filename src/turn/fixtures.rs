@@ -36,6 +36,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
             session.connection.max_tokens,
         )
         .eviction_slack(session.eviction_slack)
+        .dead_mass_fraction(session.dead_mass_fraction)
         .compaction_keep(session.compaction_keep),
     );
     conv.add_user_text(prompt);
