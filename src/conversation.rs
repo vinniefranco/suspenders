@@ -538,6 +538,35 @@ pub fn extract_file_ops(messages: &[Message]) -> FileOps {
     }
 }
 
+/// The newest run_command Tool Result in `messages`, verbatim — the Handoff's
+/// final-verification fact (CONTEXT.md: Handoff; the simplest correct rule:
+/// the last run_command Tool Result of the Turn is the single highest-value
+/// artifact for a debugging continuation). `None` when no run_command ever
+/// produced a result.
+pub fn last_command_result(messages: &[Message]) -> Option<&str> {
+    let command_ids: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, name, .. } if name == "run_command" => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.content.iter().rev())
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if command_ids.contains(tool_use_id.as_str()) => Some(content.as_str()),
+            _ => None,
+        })
+}
+
 // ceil(chars / 3.5) — a 3.5 ratio, not a div_ceil by 7, so keep as-is.
 fn tokens_for_chars(chars: u64) -> u64 {
     #[allow(clippy::manual_div_ceil)]
@@ -1341,6 +1370,52 @@ mod tests {
         ])];
         let ops = extract_file_ops(&messages);
         assert_eq!(ops.read_files, vec!["foo.ex"]);
+    }
+
+    // ---- last_command_result/1 ----
+
+    #[test]
+    fn last_command_result_returns_the_newest_run_command_result_verbatim() {
+        let messages = vec![
+            Message::assistant(vec![tool_use_input(
+                "r1",
+                "run_command",
+                json!({"command": "mix test"}),
+            )]),
+            Message::user(vec![tool_result_err("r1", "exit 1\n5 tests failed", true)]),
+            Message::assistant(vec![tool_use_input(
+                "l1",
+                "read_file",
+                json!({"path": "a.ex"}),
+            )]),
+            Message::user(vec![tool_result("l1", "defmodule A")]),
+            Message::assistant(vec![tool_use_input(
+                "r2",
+                "run_command",
+                json!({"command": "mix test"}),
+            )]),
+            Message::user(vec![tool_result_err("r2", "exit 1\n2 tests failed", true)]),
+        ];
+
+        assert_eq!(
+            last_command_result(&messages),
+            Some("exit 1\n2 tests failed")
+        );
+    }
+
+    #[test]
+    fn last_command_result_is_none_without_a_run_command_result() {
+        assert_eq!(last_command_result(&[]), None);
+
+        let read_only = vec![
+            Message::assistant(vec![tool_use_input(
+                "l1",
+                "read_file",
+                json!({"path": "a.ex"}),
+            )]),
+            Message::user(vec![tool_result("l1", "defmodule A")]),
+        ];
+        assert_eq!(last_command_result(&read_only), None);
     }
 
     // ---- inject_anchor/2 ----

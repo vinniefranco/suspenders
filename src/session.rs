@@ -26,6 +26,35 @@ use crate::conversation;
 use crate::tool::ToolCtx;
 use connection::Connection;
 
+/// The shape of a Recovery Turn (CONTEXT.md: Recovery Turn, Continuation,
+/// Handoff): [`RecoveryShape::Handoff`] retires the Conversation and seeds a
+/// fresh one from the compaction machinery; [`RecoveryShape::Continuation`]
+/// keeps it and appends the recovery prompt. A Setpoint value the Endgame
+/// Governor owns; defined here beside the Session facts that resolve it (the
+/// same direction as [`log::StopReason`], which the Endgame also reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryShape {
+    Handoff,
+    Continuation,
+}
+
+impl RecoveryShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveryShape::Handoff => "handoff",
+            RecoveryShape::Continuation => "continuation",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RecoveryShape> {
+        match s {
+            "handoff" => Some(RecoveryShape::Handoff),
+            "continuation" => Some(RecoveryShape::Continuation),
+            _ => None,
+        }
+    }
+}
+
 /// The Session's fixed facts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -49,6 +78,12 @@ pub struct Session {
     /// unchanged — while writes land — before each Anchor carries the
     /// stale-plan line.
     pub plan_stale_after: u64,
+    /// The Endgame Governor's recovery Setpoint: at most this many Recovery
+    /// Turns may serve one user request. `0` disables the mechanic entirely.
+    pub recovery_limit: u64,
+    /// The Endgame Governor's recovery-shape Setpoint: which arm a Recovery
+    /// Turn takes (CONTEXT.md: Handoff is the default shape).
+    pub recovery_shape: RecoveryShape,
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
@@ -91,6 +126,8 @@ pub struct SessionConfig {
     pub turn_limit: u64,
     pub anchor_interval: u64,
     pub plan_stale_after: u64,
+    pub recovery_limit: u64,
+    pub recovery_shape: RecoveryShape,
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
@@ -116,6 +153,8 @@ impl SessionConfig {
             turn_limit: 32,
             anchor_interval: 5,
             plan_stale_after: 8,
+            recovery_limit: 1,
+            recovery_shape: RecoveryShape::Handoff,
             scout_pass_limit: 8,
             scout_no_think: true,
             no_think_rescue: true,
@@ -198,6 +237,16 @@ impl SessionConfig {
             cfg.plan_stale_after = parse_plan_stale_after(&v)?;
         }
 
+        // Non-negative integer; 0 disables the Recovery Turn mechanic.
+        if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_LIMIT") {
+            cfg.recovery_limit = parse_int(&v, "SUSPENDERS_RECOVERY_LIMIT")?;
+        }
+
+        // "handoff" | "continuation".
+        if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_SHAPE") {
+            cfg.recovery_shape = parse_recovery_shape(&v)?;
+        }
+
         // Booleans.
         if let Ok(v) = std::env::var("SUSPENDERS_SCOUT_NO_THINK") {
             cfg.scout_no_think = parse_bool(&v, "SUSPENDERS_SCOUT_NO_THINK")?;
@@ -263,6 +312,14 @@ fn parse_plan_stale_after(raw: &str) -> Result<u64, SessionError> {
     }
 }
 
+fn parse_recovery_shape(raw: &str) -> Result<RecoveryShape, SessionError> {
+    RecoveryShape::parse(raw.trim()).ok_or_else(|| {
+        SessionError(format!(
+            "SUSPENDERS_RECOVERY_SHAPE must be \"handoff\" or \"continuation\", got: {raw:?}"
+        ))
+    })
+}
+
 fn parse_compaction_keep(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
         Ok(v) if v > 0.0 && v < 1.0 => Ok(v),
@@ -296,6 +353,8 @@ pub struct SessionOpts {
     pub turn_limit: Option<u64>,
     pub anchor_interval: Option<u64>,
     pub plan_stale_after: Option<u64>,
+    pub recovery_limit: Option<u64>,
+    pub recovery_shape: Option<RecoveryShape>,
     pub scout_pass_limit: Option<u64>,
     pub scout_no_think: Option<bool>,
     pub no_think_rescue: Option<bool>,
@@ -337,6 +396,8 @@ impl Session {
             turn_limit: opts.turn_limit.unwrap_or(config.turn_limit),
             anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
             plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
+            recovery_limit: opts.recovery_limit.unwrap_or(config.recovery_limit),
+            recovery_shape: opts.recovery_shape.unwrap_or(config.recovery_shape),
             scout_pass_limit: opts.scout_pass_limit.unwrap_or(config.scout_pass_limit),
             scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
@@ -789,6 +850,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session.compaction_keep, 0.5);
+    }
+
+    // ---- recovery_limit / recovery_shape ----
+
+    #[test]
+    fn recovery_limit_defaults_to_1_and_opts_override_including_the_off_value() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.recovery_limit, 1);
+
+        let with_limit = |n: u64| {
+            Session::build(
+                SessionOpts {
+                    recovery_limit: Some(n),
+                    connection: Some(connection()),
+                    ..opts()
+                },
+                &cfg(),
+            )
+            .unwrap()
+        };
+        assert_eq!(with_limit(3).recovery_limit, 3);
+        // 0 is valid: it disables the Recovery Turn mechanic entirely.
+        assert_eq!(with_limit(0).recovery_limit, 0);
+    }
+
+    #[test]
+    fn recovery_shape_defaults_to_handoff_and_opts_override() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.recovery_shape, RecoveryShape::Handoff);
+
+        let session = Session::build(
+            SessionOpts {
+                recovery_shape: Some(RecoveryShape::Continuation),
+                connection: Some(connection()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        assert_eq!(session.recovery_shape, RecoveryShape::Continuation);
+    }
+
+    #[test]
+    fn env_recovery_limit_is_a_non_negative_integer() {
+        assert_eq!(parse_int("0", "SUSPENDERS_RECOVERY_LIMIT").unwrap(), 0);
+        assert_eq!(parse_int("2", "SUSPENDERS_RECOVERY_LIMIT").unwrap(), 2);
+        assert!(
+            parse_int("-1", "SUSPENDERS_RECOVERY_LIMIT")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_RECOVERY_LIMIT must be an integer")
+        );
+    }
+
+    #[test]
+    fn env_recovery_shape_names_the_two_arms_only() {
+        assert_eq!(
+            parse_recovery_shape("handoff").unwrap(),
+            RecoveryShape::Handoff
+        );
+        assert_eq!(
+            parse_recovery_shape(" continuation ").unwrap(),
+            RecoveryShape::Continuation
+        );
+        assert_eq!(
+            parse_recovery_shape("retry").unwrap_err().0,
+            "SUSPENDERS_RECOVERY_SHAPE must be \"handoff\" or \"continuation\", got: \"retry\""
+        );
     }
 
     // ---- scout_pass_limit ----
