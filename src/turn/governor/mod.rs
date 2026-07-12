@@ -84,9 +84,13 @@ pub enum Rider {
     /// The Anchor (CONTEXT.md): its placement rides the same seam
     /// ([`Conversation::inject_anchor`](crate::conversation::Conversation::inject_anchor)
     /// merges into the trailing user message), but its content is the Plan's —
-    /// the model's voice, never authored here — so no text rides with the
-    /// Intervention.
-    Anchor,
+    /// the model's voice, never authored here — so the Plan text never rides
+    /// with the Intervention. The one exception is `stale_line`: the anchor
+    /// Governor's Voiced stale-plan line, appended BELOW the Anchor when the
+    /// Plan has sat unchanged past its Setpoint while writes landed
+    /// (PROPOSALS.md #4); it rides every Anchor placed while the condition
+    /// holds.
+    Anchor { stale_line: Option<String> },
 }
 
 /// Interventions at the Tool Call answering moment.
@@ -124,13 +128,14 @@ pub struct Governors {
 impl Governors {
     /// Resolves the Governors for one Turn: the unexposed Setpoints are their
     /// defaults, and the Session's resolved knobs feed the Governors that
-    /// carry them (`anchor_interval` feeds the anchor Governor,
-    /// `no_think_rescue` the empty Governor — CONTEXT.md: "the Session
-    /// resolves them once at launch").
-    pub fn new(anchor_interval: u64, no_think_rescue: bool) -> Self {
+    /// carry them (`anchor_interval` and `plan_stale_after` feed the anchor
+    /// Governor, `no_think_rescue` the empty Governor — CONTEXT.md: "the
+    /// Session resolves them once at launch").
+    pub fn new(anchor_interval: u64, plan_stale_after: u64, no_think_rescue: bool) -> Self {
         Governors {
             anchor: anchor::Anchor::new(anchor::Setpoints {
                 interval: anchor_interval,
+                plan_stale_after,
             }),
             duplicate: duplicate::Duplicate::new(),
             empty: empty::Empty::new(empty::Setpoints { no_think_rescue }),
@@ -238,7 +243,9 @@ pub fn answer_read(
 ///
 ///   1. the Explore Nudge — every 3rd consecutive exploration Pass,
 ///   2. the Anchor — every `anchor_interval` Passes, and the first Pass after
-///      a Compaction (the anchor Governor's cadence),
+///      a Compaction (the anchor Governor's cadence), carrying the Voiced
+///      stale-plan line whenever the anchor Governor's stale-plan opinion
+///      holds ([`anchor::Anchor::stale_plan`]),
 ///   3. the Endgame's rider (wrap-up warning / Verification Pass prompt /
 ///      final-Pass prompt) — last, nearest the model's attention.
 pub fn answer_tail(ledger: &Ledger, governors: &mut Governors) -> Vec<AnswerIntervention> {
@@ -252,7 +259,11 @@ pub fn answer_tail(ledger: &Ledger, governors: &mut Governors) -> Vec<AnswerInte
     }
 
     if governors.anchor.due(ledger) {
-        interventions.push(AnswerIntervention::RideTail(Rider::Anchor));
+        let stale_line = governors
+            .anchor
+            .stale_plan(ledger)
+            .map(voice::stale_plan_line);
+        interventions.push(AnswerIntervention::RideTail(Rider::Anchor { stale_line }));
     }
 
     if let Some((tag, text)) = endgame_rider(ledger) {
@@ -410,7 +421,7 @@ mod tests {
     #[test]
     fn the_final_pass_withdraws_every_tool() {
         assert_eq!(
-            shape_request(&ledger_at(25, 25), &mut Governors::new(5, true)),
+            shape_request(&ledger_at(25, 25), &mut Governors::new(5, 8, true)),
             vec![RequestIntervention::NarrowTools(Vec::new())]
         );
     }
@@ -421,7 +432,7 @@ mod tests {
         // at the limit must still yield the tool-less final Pass, never the
         // run_command narrowing.
         assert_eq!(
-            shape_request(&unverified_at(25, 25), &mut Governors::new(5, true)),
+            shape_request(&unverified_at(25, 25), &mut Governors::new(5, 8, true)),
             vec![RequestIntervention::NarrowTools(Vec::new())]
         );
     }
@@ -429,7 +440,7 @@ mod tests {
     #[test]
     fn the_verification_pass_narrows_to_run_command() {
         assert_eq!(
-            shape_request(&unverified_at(24, 25), &mut Governors::new(5, true)),
+            shape_request(&unverified_at(24, 25), &mut Governors::new(5, 8, true)),
             vec![RequestIntervention::NarrowTools(
                 crate::tools::verification_specs()
             )]
@@ -439,18 +450,18 @@ mod tests {
     #[test]
     fn an_ordinary_pass_issues_nothing() {
         assert_eq!(
-            shape_request(&ledger_at(1, 25), &mut Governors::new(5, true)),
+            shape_request(&ledger_at(1, 25), &mut Governors::new(5, 8, true)),
             Vec::new()
         );
         assert_eq!(
-            shape_request(&ledger_at(23, 25), &mut Governors::new(5, true)),
+            shape_request(&ledger_at(23, 25), &mut Governors::new(5, 8, true)),
             Vec::new()
         );
     }
 
     #[test]
     fn an_armed_rescue_silences_thinking_for_exactly_one_pass() {
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
         governors.empty.note_fired();
 
         assert_eq!(
@@ -463,7 +474,7 @@ mod tests {
 
     #[test]
     fn a_sticky_rescue_keeps_silencing() {
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
         governors.empty.note_fired();
         governors.empty.note_fired(); // the second empty makes it sticky
 
@@ -496,7 +507,7 @@ mod tests {
     fn a_still_fresh_repeat_draws_a_replacement() {
         let input = json!({"path": "a.ex"});
         let mut ledger = Ledger::new(25);
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
         read_outcome(&mut ledger, &mut governors, "read_file", &input, &ok());
         governors.next_pass();
 
@@ -511,7 +522,7 @@ mod tests {
 
     #[test]
     fn a_fresh_call_issues_nothing() {
-        let governors = Governors::new(5, true);
+        let governors = Governors::new(5, 8, true);
         assert_eq!(
             answer_sent(&governors, "read_file", &json!({"path": "a.ex"})),
             None
@@ -521,7 +532,7 @@ mod tests {
     #[test]
     fn the_third_consecutive_failure_earns_the_annotation() {
         let mut ledger = Ledger::new(25);
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
         assert_eq!(
             read_outcome(&mut ledger, &mut governors, "read_file", &json!({}), &err()),
             None
@@ -543,7 +554,7 @@ mod tests {
     #[test]
     fn a_success_issues_nothing_and_resets_the_tally() {
         let mut ledger = Ledger::new(25);
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
         read_outcome(&mut ledger, &mut governors, "read_file", &json!({}), &err());
         read_outcome(&mut ledger, &mut governors, "read_file", &json!({}), &err());
         assert_eq!(
@@ -563,7 +574,7 @@ mod tests {
     fn every_due_rider_rides_in_merge_order() {
         // Third consecutive exploration Pass + anchor cadence hit + two
         // Passes remaining: all three ride, Explore -> Anchor -> Endgame.
-        let mut governors = Governors::new(6, true);
+        let mut governors = Governors::new(6, 8, true);
         let read = vec![("read_file".to_string(), json!({"path": "a.ex"}))];
         governors.explore.note_pass_calls(&read);
         governors.explore.note_pass_calls(&read);
@@ -579,7 +590,7 @@ mod tests {
                     tag: VoicedTag::ExploreNudge,
                     text: voice::explore_nudge().to_string(),
                 }),
-                AnswerIntervention::RideTail(Rider::Anchor),
+                AnswerIntervention::RideTail(Rider::Anchor { stale_line: None }),
                 AnswerIntervention::RideTail(Rider::Voiced {
                     tag: VoicedTag::WrapUpWarning,
                     text: voice::wrap_up_warning(2),
@@ -593,7 +604,7 @@ mod tests {
         let mut ledger = ledger_at(1, 25);
         ledger.record_pass_calls(vec![("edit_file".to_string(), json!({"path": "a.ex"}))]);
         assert_eq!(
-            answer_tail(&ledger, &mut Governors::new(0, true)),
+            answer_tail(&ledger, &mut Governors::new(0, 8, true)),
             Vec::new()
         );
     }
@@ -604,8 +615,88 @@ mod tests {
         ledger.note_compacted();
         ledger.record_pass_calls(vec![("edit_file".to_string(), json!({"path": "a.ex"}))]);
         assert_eq!(
-            answer_tail(&ledger, &mut Governors::new(999, true)),
-            vec![AnswerIntervention::RideTail(Rider::Anchor)]
+            answer_tail(&ledger, &mut Governors::new(999, 8, true)),
+            vec![AnswerIntervention::RideTail(Rider::Anchor {
+                stale_line: None
+            })]
+        );
+    }
+
+    #[test]
+    fn a_stale_plan_line_rides_the_anchor_and_every_later_one() {
+        // Plan on Pass 1, a write since, anchor cadence 5: the Anchors at
+        // Pass 10 and Pass 15 both carry the line (9 then 14 Passes since),
+        // freshly parameterized — never a one-shot.
+        let mut governors = Governors::new(5, 8, true);
+        let mut ledger = ledger_at(1, 50);
+        ledger.note_plan_updated();
+        ledger.record_result("edit_file", &ok());
+        for _ in 1..10 {
+            ledger.advance_pass();
+        }
+
+        assert_eq!(
+            answer_tail(&ledger, &mut governors),
+            vec![AnswerIntervention::RideTail(Rider::Anchor {
+                stale_line: Some(voice::stale_plan_line(9)),
+            })]
+        );
+
+        for _ in 10..15 {
+            ledger.advance_pass();
+        }
+        assert_eq!(
+            answer_tail(&ledger, &mut governors),
+            vec![AnswerIntervention::RideTail(Rider::Anchor {
+                stale_line: Some(voice::stale_plan_line(14)),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_fresh_plan_or_a_writeless_stretch_rides_a_bare_anchor() {
+        // Same cadence hit, but the Plan is within its threshold — and a
+        // stale Plan with zero writes since (pure reading) stays bare too.
+        let mut fresh = ledger_at(1, 50);
+        fresh.note_plan_updated();
+        fresh.record_result("edit_file", &ok());
+        for _ in 1..5 {
+            fresh.advance_pass();
+        }
+        assert_eq!(
+            answer_tail(&fresh, &mut Governors::new(5, 8, true)),
+            vec![AnswerIntervention::RideTail(Rider::Anchor {
+                stale_line: None
+            })]
+        );
+
+        let mut reading = ledger_at(1, 50);
+        reading.note_plan_updated();
+        for _ in 1..10 {
+            reading.advance_pass();
+        }
+        assert_eq!(
+            answer_tail(&reading, &mut Governors::new(5, 8, true)),
+            vec![AnswerIntervention::RideTail(Rider::Anchor {
+                stale_line: None
+            })]
+        );
+    }
+
+    #[test]
+    fn no_plan_never_draws_the_stale_line() {
+        // Deep in the Turn with writes but no Plan ever set: the Anchor rides
+        // bare (its no-plan fallback already asks for a Plan).
+        let mut ledger = ledger_at(1, 50);
+        ledger.record_result("edit_file", &ok());
+        for _ in 1..20 {
+            ledger.advance_pass();
+        }
+        assert_eq!(
+            answer_tail(&ledger, &mut Governors::new(5, 8, true)),
+            vec![AnswerIntervention::RideTail(Rider::Anchor {
+                stale_line: None
+            })]
         );
     }
 
@@ -650,7 +741,7 @@ mod tests {
         assert_eq!(
             settle_finish(
                 &ledger,
-                &mut Governors::new(5, true),
+                &mut Governors::new(5, 8, true),
                 &text("<tool_call>x</tool_call>"),
                 &StopReason::EndTurn
             ),
@@ -664,7 +755,7 @@ mod tests {
         let mut ledger = ledger_at(2, 25);
         ledger.record_result("run_command", &err());
         ledger.record_result("edit_file", &ok());
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
 
         assert_eq!(
             settle_finish(&ledger, &mut governors, &text("done"), &StopReason::EndTurn),
@@ -697,7 +788,7 @@ mod tests {
         assert_eq!(
             settle_finish(
                 &ledger,
-                &mut Governors::new(5, true),
+                &mut Governors::new(5, 8, true),
                 &[],
                 &StopReason::EndTurn
             ),
@@ -710,7 +801,7 @@ mod tests {
 
     #[test]
     fn an_empty_reply_draws_the_empty_nudge_and_arms_the_rescue() {
-        let mut governors = Governors::new(5, true);
+        let mut governors = Governors::new(5, 8, true);
         assert_eq!(
             settle_finish(&ledger_at(2, 25), &mut governors, &[], &StopReason::EndTurn),
             Some(FinishIntervention::Standalone {
@@ -723,7 +814,7 @@ mod tests {
 
     #[test]
     fn the_off_knob_still_nudges_but_never_arms() {
-        let mut governors = Governors::new(5, false);
+        let mut governors = Governors::new(5, 8, false);
         let settled = settle_finish(&ledger_at(2, 25), &mut governors, &[], &StopReason::EndTurn);
         assert!(matches!(
             settled,
@@ -739,7 +830,7 @@ mod tests {
     fn a_parroted_empty_marker_counts_as_empty() {
         let settled = settle_finish(
             &ledger_at(2, 25),
-            &mut Governors::new(5, true),
+            &mut Governors::new(5, 8, true),
             &text(voice::empty_response_marker()),
             &StopReason::EndTurn,
         );
@@ -757,7 +848,7 @@ mod tests {
         assert_eq!(
             settle_finish(
                 &ledger_at(2, 25),
-                &mut Governors::new(5, true),
+                &mut Governors::new(5, 8, true),
                 &text("I kept hitting [empty response] markers; here is my summary."),
                 &StopReason::EndTurn,
             ),
@@ -770,7 +861,7 @@ mod tests {
         assert_eq!(
             settle_finish(
                 &command_failing_at(2, 25),
-                &mut Governors::new(5, true),
+                &mut Governors::new(5, 8, true),
                 &text("partial"),
                 &StopReason::MaxTokens
             ),
@@ -785,7 +876,7 @@ mod tests {
         assert_eq!(
             settle_finish(
                 &command_failing_at(2, 2),
-                &mut Governors::new(5, true),
+                &mut Governors::new(5, 8, true),
                 &text("done"),
                 &StopReason::EndTurn
             ),
