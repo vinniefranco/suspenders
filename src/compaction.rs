@@ -105,8 +105,95 @@ impl Compaction {
             .clone()
             .or_else(|| conv.original_task().map(|s| s.to_string()));
 
+        let narrative = self.summarize(&to_summarize, llm, connection).await?;
+        // The model writes narrative; the harness appends the verbatim task
+        // and accumulated file_ops mechanically, outside the LLM output.
+        // compose_summary is the SINGLE source (reused by the log fold).
+        let summary = compose_summary(&narrative, original_task.as_deref(), &merged_ops);
+        let compacted = conv.apply_compaction(&summary, cutoff_index);
+
+        let new_state = Compaction {
+            previous_summary: Some(narrative),
+            original_task,
+            file_ops: merged_ops,
+        };
+
+        Ok((compacted, new_state))
+    }
+
+    /// Seeds a Handoff (CONTEXT.md: Handoff — the Recovery Turn shape that
+    /// retires the Conversation): the model narrative over the WHOLE dying
+    /// Conversation, the mechanical facts appended outside the LLM exactly as
+    /// Compaction does, the final verification result verbatim, and `prompt`
+    /// merged onto the seed message so it starts the fresh Conversation.
+    ///
+    /// Never fails: a failed summarization degrades to the mechanical
+    /// skeleton alone (facts + final verification + prompt) — bounded
+    /// downside, the recovery still happens. The Plan is harness-owned and
+    /// never enters the seed; it survives verbatim outside the Conversation.
+    pub async fn seed_handoff(
+        &self,
+        conv: &Conversation,
+        prompt: &str,
+        llm: &dyn Llm,
+        connection: &Connection,
+    ) -> Handoff {
+        let merged_ops = merge_ops(
+            &self.file_ops,
+            &crate::conversation::extract_file_ops(&conv.messages),
+        );
+        let original_task: Option<String> = self
+            .original_task
+            .clone()
+            .or_else(|| conv.original_task().map(|s| s.to_string()));
+        let verification =
+            crate::conversation::last_command_result(&conv.messages).map(|s| s.to_string());
+
+        let narrative = self.summarize(&conv.messages, llm, connection).await.ok();
+
+        let seed = crate::session::log::compose_handoff(
+            narrative.as_deref(),
+            original_task.as_deref(),
+            &merged_ops,
+            verification.as_deref(),
+        );
+        // Retire every message; the seed message replaces them all, and the
+        // recovery prompt merges onto it (one user message — strict chat
+        // templates on small models choke on two user messages in a row).
+        let mut conversation = conv.apply_compaction(&seed, conv.messages.len());
+        conversation.merge_user_text(prompt);
+        // The input-tokens floor belongs to the retired Conversation; keeping
+        // it would make the near-empty seed look budget-pressed.
+        conversation.last_usage = None;
+
+        let state = Compaction {
+            // A failed summarization keeps the previous narrative: degraded
+            // either way, but the older telescoped view beats nothing.
+            previous_summary: narrative.clone().or_else(|| self.previous_summary.clone()),
+            original_task,
+            file_ops: merged_ops,
+        };
+
+        Handoff {
+            conversation,
+            state,
+            narrative,
+            verification,
+        }
+    }
+
+    // The one summarization call (ADR-0012's silent LLM call): serialize the
+    // messages behind the previous summary, ask for the structured narrative,
+    // and extract it. Shared by [`run`](Compaction::run) and
+    // [`seed_handoff`](Compaction::seed_handoff).
+    async fn summarize(
+        &self,
+        messages: &[crate::content::Message],
+        llm: &dyn Llm,
+        connection: &Connection,
+    ) -> Result<String, String> {
         let serialized =
-            voice::serialize_for_compaction(&to_summarize, self.previous_summary.as_deref());
+            voice::serialize_for_compaction(messages, self.previous_summary.as_deref());
 
         let prompt = format!(
             "You are a summarization assistant. Summarize the coding session below. \
@@ -128,20 +215,7 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
             return Err(response.error.unwrap_or_else(|| "llm_error".to_string()));
         }
 
-        let narrative = extract_summary(&response.content);
-        // The model writes narrative; the harness appends the verbatim task
-        // and accumulated file_ops mechanically, outside the LLM output.
-        // compose_summary is the SINGLE source (reused by the log fold).
-        let summary = compose_summary(&narrative, original_task.as_deref(), &merged_ops);
-        let compacted = conv.apply_compaction(&summary, cutoff_index);
-
-        let new_state = Compaction {
-            previous_summary: Some(narrative),
-            original_task,
-            file_ops: merged_ops,
-        };
-
-        Ok((compacted, new_state))
+        Ok(extract_summary(&response.content))
     }
 
     /// Convenience wrapper for use as a Turn `compact` Dep capture: runs and
@@ -187,6 +261,19 @@ impl Default for Compaction {
     fn default() -> Self {
         Compaction::new()
     }
+}
+
+/// A seeded Handoff (CONTEXT.md: Handoff): the fresh Conversation (seed
+/// message + recovery prompt, everything else retired), the updated
+/// compaction state the recovery Turn carries forward, and the two facts the
+/// Session Log entry needs beyond the state — the narrative actually used
+/// (`None` when degraded) and the final verification result verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Handoff {
+    pub conversation: Conversation,
+    pub state: Compaction,
+    pub narrative: Option<String>,
+    pub verification: Option<String>,
 }
 
 /// The `{:compacted, ...}` Session Log entry for a completed compaction. The
@@ -503,6 +590,103 @@ mod tests {
 
         let summary_text = message_text(&compacted2.messages[0]);
         assert!(summary_text.contains(task));
+    }
+
+    // ---- seed_handoff ----
+
+    fn dying_conversation() -> Conversation {
+        let mut conv = Conversation::new("You are Baud.", opts());
+        conv.add_user_text("fix the failing glob tests");
+        conv.add_assistant_blocks(vec![
+            ContentBlock::tool_use("e1", "edit_file", serde_json::json!({"path": "lib/glob.ex"})),
+            ContentBlock::tool_use(
+                "r1",
+                "run_command",
+                serde_json::json!({"command": "mix test"}),
+            ),
+        ]);
+        conv.add_tool_results(
+            vec![
+                ContentBlock::tool_result("e1", "edited", false),
+                ContentBlock::tool_result("r1", "exit 1\n2 tests failed", true),
+            ],
+            Vec::new(),
+        );
+        conv.add_assistant_blocks(vec![ContentBlock::text("[turn limit reached]")]);
+        conv
+    }
+
+    #[tokio::test]
+    async fn seed_handoff_retires_the_conversation_and_seeds_task_narrative_and_verification() {
+        let fake = FakeLlm::script(vec![Entry::just(ok_response("## Task\nglob narrative"))]);
+        let conv = dying_conversation();
+
+        let handoff = Compaction::new()
+            .seed_handoff(&conv, "[recovery prompt]", &fake, &connection())
+            .await;
+
+        // One user message: the seed with the prompt merged onto it.
+        assert_eq!(handoff.conversation.messages.len(), 1);
+        let seed_text = message_text(&handoff.conversation.messages[0]);
+        assert!(seed_text.contains("fix the failing glob tests")); // task verbatim
+        assert!(seed_text.contains("glob narrative")); // model narrative
+        assert!(seed_text.contains("lib/glob.ex")); // file ops
+        assert!(seed_text.contains("exit 1\n2 tests failed")); // final verification verbatim
+        assert!(seed_text.contains("[recovery prompt]"));
+
+        // The updated state telescopes forward like a compaction's.
+        assert_eq!(
+            handoff.state.previous_summary.as_deref(),
+            Some("## Task\nglob narrative")
+        );
+        assert_eq!(
+            handoff.state.original_task.as_deref(),
+            Some("fix the failing glob tests")
+        );
+        assert_eq!(handoff.verification.as_deref(), Some("exit 1\n2 tests failed"));
+        assert_eq!(handoff.conversation.last_usage, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_summarization_degrades_to_the_mechanical_skeleton() {
+        let fake = FakeLlm::script(vec![Entry::error("server_busy")]);
+        let conv = dying_conversation();
+
+        let prev = Compaction {
+            previous_summary: Some("older telescoped view".to_string()),
+            original_task: None,
+            file_ops: FileOps::default(),
+        };
+        let handoff = prev
+            .seed_handoff(&conv, "[recovery prompt]", &fake, &connection())
+            .await;
+
+        assert_eq!(handoff.narrative, None);
+        let seed_text = message_text(&handoff.conversation.messages[0]);
+        assert!(seed_text.contains(crate::voice::handoff_no_narrative()));
+        assert!(seed_text.contains("fix the failing glob tests"));
+        assert!(seed_text.contains("exit 1\n2 tests failed"));
+        assert!(seed_text.contains("[recovery prompt]"));
+        // The previous narrative survives the failed call.
+        assert_eq!(
+            handoff.state.previous_summary.as_deref(),
+            Some("older telescoped view")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_handoff_without_a_run_command_names_the_absence() {
+        let fake = FakeLlm::script(vec![Entry::just(ok_response("narrative"))]);
+        let mut conv = Conversation::new("You are Baud.", opts());
+        conv.add_user_text("just edit");
+        conv.add_assistant_blocks(vec![ContentBlock::text("[turn limit reached]")]);
+
+        let handoff = Compaction::new()
+            .seed_handoff(&conv, "[recovery prompt]", &fake, &connection())
+            .await;
+
+        assert_eq!(handoff.verification, None);
+        assert!(message_text(&handoff.conversation.messages[0]).contains("- none was run"));
     }
 
     // ---- recovery_capture ----

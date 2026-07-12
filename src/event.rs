@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::content::ContentBlock;
 use crate::llm::response::StopReason;
 use crate::llm::stream::Delta;
+use crate::session::RecoveryShape;
 
 /// The `plugin_error` stage: which point in the Plugin lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
@@ -173,6 +174,14 @@ pub enum Event {
         text: String,
     },
 
+    /// A Recovery Turn opened (CONTEXT.md: Recovery Turn): carries the arm
+    /// taken and the Voice-authored prompt that starts it — the prompt enters
+    /// the Conversation, so the Transcript must show it.
+    RecoveryTurn {
+        shape: RecoveryShape,
+        text: String,
+    },
+
     // ---- Settlement ----
     TurnFinished {
         stop_reason: StopReason,
@@ -253,6 +262,13 @@ impl Event {
 
     pub fn anchor(text: impl Into<String>) -> Self {
         Event::Anchor { text: text.into() }
+    }
+
+    pub fn recovery_turn(shape: RecoveryShape, text: impl Into<String>) -> Self {
+        Event::RecoveryTurn {
+            shape,
+            text: text.into(),
+        }
     }
 
     // ---- Steering ----

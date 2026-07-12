@@ -496,6 +496,14 @@ impl Transcript {
                 (self, vec![])
             }
 
+            // A Recovery Turn opened: its Voice prompt entered the
+            // Conversation, so the Transcript shows it like every Nudge.
+            Event::RecoveryTurn { text, .. } => {
+                self.push_info(text);
+                self.status = Status::Running;
+                (self, vec![Effect::PinBottom])
+            }
+
             Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
 
             Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
@@ -1529,6 +1537,18 @@ mod tests {
             ]
         );
         assert_eq!(effects, vec![]);
+    }
+
+    #[test]
+    fn recovery_turn_shows_its_prompt_as_info_and_marks_running() {
+        let prompt = crate::voice::recovery_prompt(true);
+        let (t, effects) = fresh().apply_event(Event::recovery_turn(
+            crate::session::RecoveryShape::Handoff,
+            prompt,
+        ));
+        assert_eq!(items(&t), vec![info(prompt)]);
+        assert_eq!(t.status, Status::Running);
+        assert_eq!(effects, vec![Effect::PinBottom]);
     }
 
     #[test]

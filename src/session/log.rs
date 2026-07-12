@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentBlock, Message, Role};
 use crate::conversation;
-use crate::session::Session;
+use crate::session::{RecoveryShape, Session};
 use crate::voice::{self, FileOps};
 
 // ------------------------------------------------------------------
@@ -220,6 +220,23 @@ pub enum Entry {
         file_ops: FileOps,
         original_task: Option<String>,
     },
+    /// A Handoff seeded a fresh Conversation (CONTEXT.md: Handoff): the
+    /// model's narrative (`None` when the summarization call failed and the
+    /// seed degraded to the mechanical skeleton), the harness-owned facts,
+    /// and the final verification result verbatim. Like `Compacted`, the fold
+    /// discards everything before it and emits the recomposed seed message.
+    Handoff {
+        summary: Option<String>,
+        file_ops: FileOps,
+        original_task: Option<String>,
+        verification: Option<String>,
+    },
+    /// The Voice-authored prompt that opened a Recovery Turn (CONTEXT.md:
+    /// Recovery Turn) — a Turn-starting prompt like `user_text`, but
+    /// distinguishable as Suspenders' voice; `shape` is forensic. The fold
+    /// merges it through the same seam the live path used, and
+    /// [`recoveries_used`] counts these to restore the per-request bound.
+    Recovery { shape: RecoveryShape, text: String },
 }
 
 // ------------------------------------------------------------------
@@ -272,6 +289,22 @@ impl Entry {
                 "modified_files": file_ops.modified_files,
                 "original_task": original_task,
             }),
+            Entry::Handoff {
+                summary,
+                file_ops,
+                original_task,
+                verification,
+            } => json!({
+                "e": "handoff",
+                "summary": summary,
+                "read_files": file_ops.read_files,
+                "modified_files": file_ops.modified_files,
+                "original_task": original_task,
+                "verification": verification,
+            }),
+            Entry::Recovery { shape, text } => {
+                json!({"e": "recovery", "shape": shape.as_str(), "text": text})
+            }
         }
     }
 
@@ -332,6 +365,19 @@ impl Entry {
                         .map(|s| s.to_string()),
                 })
             }
+            "handoff" => Some(Entry::Handoff {
+                summary: string_field(m, "summary"),
+                file_ops: FileOps {
+                    read_files: decode_str_list(m.get("read_files")),
+                    modified_files: decode_str_list(m.get("modified_files")),
+                },
+                original_task: string_field(m, "original_task"),
+                verification: string_field(m, "verification"),
+            }),
+            "recovery" => Some(Entry::Recovery {
+                shape: RecoveryShape::parse(m.get("shape")?.as_str()?)?,
+                text: string_field(m, "text")?,
+            }),
             _ => None,
         }
     }
@@ -621,6 +667,29 @@ pub fn plan(path: &str) -> Option<String> {
     last
 }
 
+/// Recovery Turns the logged Session consumed serving its CURRENT user
+/// request: `recovery` entries since the last `user_text` (a genuine or
+/// rolled-over prompt resets the count exactly as the live Agent's does on a
+/// submit). Restores the per-request bound on Resume so a resumed Session
+/// cannot re-trigger recoveries unboundedly. A torn line stops the scan, like
+/// the fold.
+pub fn recoveries_used(path: &str) -> u64 {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let mut used = 0;
+    // Skip the header line: it is not an entry.
+    for line in content.lines().filter(|l| !l.is_empty()).skip(1) {
+        match decode_line(line).and_then(|v| Entry::from_json(&v)) {
+            Some(Entry::UserText(_)) => used = 0,
+            Some(Entry::Recovery { .. }) => used += 1,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    used
+}
+
 // ------------------------------------------------------------------
 // Resume: fold a log file into Conversation messages
 // ------------------------------------------------------------------
@@ -804,6 +873,34 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             *batch = None;
             messages.push(user_message(vec![voice::summary_block(&composed)]));
         }
+        // A Handoff retired the Conversation and seeded a fresh one: like
+        // Compacted, everything folded before this point is discarded and the
+        // seed message is recomposed byte-identically to the live one. The
+        // recovery prompt follows as its own `recovery` entry.
+        Entry::Handoff {
+            summary,
+            file_ops,
+            original_task,
+            verification,
+        } => {
+            let composed = compose_handoff(
+                summary.as_deref(),
+                original_task.as_deref(),
+                file_ops,
+                verification.as_deref(),
+            );
+            messages.clear();
+            *batch = None;
+            messages.push(user_message(vec![voice::summary_block(&composed)]));
+        }
+        // The recovery prompt entered the Conversation on the same seam a
+        // rider crosses: merged into a trailing user message (the Handoff's
+        // seed) or standing as a fresh one (a Continuation, after the
+        // turn-limit marker).
+        Entry::Recovery { text, .. } => {
+            flush(messages, batch.take());
+            conversation::merge_user_text(messages, text.clone());
+        }
         Entry::Settled {
             outcome,
             stop_reason,
@@ -825,6 +922,29 @@ pub fn compose_summary(narrative: &str, original_task: Option<&str>, file_ops: &
     format!(
         "{narrative}\n{}",
         voice::compaction_facts(original_task, file_ops)
+    )
+}
+
+/// The Handoff seed (CONTEXT.md: Handoff): the compaction composition plus the
+/// final verification result verbatim. A `None` narrative is the degraded
+/// mechanical skeleton (the summarization call failed — bounded downside, the
+/// recovery still happens). One author for the live seeding
+/// ([`crate::compaction::Compaction::seed_handoff`]) and the fold's
+/// reconstruction, so Resume rebuilds the same bytes.
+pub fn compose_handoff(
+    narrative: Option<&str>,
+    original_task: Option<&str>,
+    file_ops: &FileOps,
+    verification: Option<&str>,
+) -> String {
+    format!(
+        "{}{}",
+        compose_summary(
+            narrative.unwrap_or(voice::handoff_no_narrative()),
+            original_task,
+            file_ops
+        ),
+        voice::handoff_verification(verification)
     )
 }
 
@@ -1614,6 +1734,228 @@ mod tests {
         assert!(summary_text.contains("verbatim original task"));
         assert!(summary_text.contains("lib/a.ex"));
         assert!(summary_text.contains("lib/b.ex"));
+    }
+
+    // ---- Recovery Turn entries (Continuation + Handoff) ----
+
+    #[test]
+    fn a_continuation_recovery_prompt_folds_as_a_fresh_user_message_after_the_marker() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("fix the tests".into()));
+        log.append(Entry::AssistantBlocks(vec![tool_use(
+            "t1",
+            "edit_file",
+            json!({"path": "a.ex"}),
+        )]));
+        log.append(Entry::ToolResult(tool_result("t1", "edited")));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::TurnLimit,
+            reason: None,
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            text: "[recovery prompt]".into(),
+        });
+        log.append(Entry::AssistantBlocks(vec![text("recovered")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("fix the tests")]),
+                Message::assistant(vec![tool_use("t1", "edit_file", json!({"path": "a.ex"}))]),
+                user_message(vec![tool_result("t1", "edited")]),
+                Message::assistant(vec![text("[turn limit reached - reply to continue]")]),
+                user_message(vec![text("[recovery prompt]")]),
+                Message::assistant(vec![text("recovered")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_handoff_fold_discards_history_and_recomposes_the_seed_with_the_prompt_merged() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("fix the tests".into()));
+        log.append(Entry::AssistantBlocks(vec![text("failing attempt")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::TurnLimit,
+            reason: None,
+        });
+        log.append(Entry::Handoff {
+            summary: Some("narrative of the dying turn".into()),
+            file_ops: FileOps {
+                read_files: vec!["lib/a.ex".into()],
+                modified_files: vec!["lib/b.ex".into()],
+            },
+            original_task: Some("fix the tests".into()),
+            verification: Some("exit 1\n2 tests failed".into()),
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Handoff,
+            text: "[recovery prompt]".into(),
+        });
+        log.append(Entry::AssistantBlocks(vec![text("recovered")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        // Everything before the handoff is gone; the seed message is the
+        // composed handoff plus the prompt merged onto the same message —
+        // byte-identical to the live seeding path.
+        assert_eq!(messages.len(), 2);
+        let composed = compose_handoff(
+            Some("narrative of the dying turn"),
+            Some("fix the tests"),
+            &FileOps {
+                read_files: vec!["lib/a.ex".into()],
+                modified_files: vec!["lib/b.ex".into()],
+            },
+            Some("exit 1\n2 tests failed"),
+        );
+        assert_eq!(
+            messages[0],
+            user_message(vec![
+                voice::summary_block(&composed),
+                text("[recovery prompt]"),
+            ])
+        );
+        assert_eq!(messages[1], Message::assistant(vec![text("recovered")]));
+
+        // The composed seed carries every mechanical fact.
+        let seed = match &messages[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(seed.contains("fix the tests"));
+        assert!(seed.contains("narrative of the dying turn"));
+        assert!(seed.contains("lib/a.ex"));
+        assert!(seed.contains("lib/b.ex"));
+        assert!(seed.contains("exit 1\n2 tests failed"));
+    }
+
+    #[test]
+    fn a_degraded_handoff_folds_without_a_narrative() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::Handoff {
+            summary: None,
+            file_ops: FileOps::default(),
+            original_task: Some("go".into()),
+            verification: None,
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Handoff,
+            text: "[recovery prompt]".into(),
+        });
+        log.append(Entry::AssistantBlocks(vec![text("done")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+        let seed = match &messages[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(seed.contains(voice::handoff_no_narrative()));
+        assert!(seed.contains("go"));
+        assert!(seed.contains("- none was run"));
+    }
+
+    #[test]
+    fn recovery_entries_round_trip_the_file_with_their_shape() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            text: "[c]".into(),
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Handoff,
+            text: "[h]".into(),
+        });
+
+        let content = std::fs::read_to_string(&log.path).unwrap();
+        let entries: Vec<Entry> = content
+            .lines()
+            .skip(1)
+            .filter_map(|l| decode_line(l).and_then(|v| Entry::from_json(&v)))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                Entry::Recovery {
+                    shape: RecoveryShape::Continuation,
+                    text: "[c]".into(),
+                },
+                Entry::Recovery {
+                    shape: RecoveryShape::Handoff,
+                    text: "[h]".into(),
+                },
+            ]
+        );
+    }
+
+    // ---- recoveries_used/1 ----
+
+    #[test]
+    fn recoveries_used_counts_recovery_entries_since_the_last_user_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        assert_eq!(recoveries_used(&log.path), 0);
+
+        log.append(Entry::UserText("first request".into()));
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            text: "[r1]".into(),
+        });
+        assert_eq!(recoveries_used(&log.path), 1);
+
+        // A genuine user prompt starts a new request: the count resets.
+        log.append(Entry::UserText("second request".into()));
+        assert_eq!(recoveries_used(&log.path), 0);
+
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Handoff,
+            text: "[r2]".into(),
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Handoff,
+            text: "[r3]".into(),
+        });
+        assert_eq!(recoveries_used(&log.path), 2);
+    }
+
+    #[test]
+    fn recoveries_used_is_zero_for_missing_or_foreign_files() {
+        assert_eq!(recoveries_used("/definitely/not/here.jsonl"), 0);
     }
 
     #[test]

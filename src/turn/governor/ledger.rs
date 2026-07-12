@@ -98,6 +98,10 @@ pub struct Ledger {
     unverified_writes: bool,
     // The most recent run_command that actually RAN this Turn failed.
     command_failing: bool,
+    // Recovery Turns already consumed serving the current user request — a
+    // fact the Agent owns across Turns and stamps once at Turn start (the
+    // Agent resets it when a genuine user prompt starts a new request).
+    recoveries_used: u64,
     // Plan recency (see [`PlanRecency`]): `None` until a Plan exists.
     plan: Option<PlanRecency>,
 }
@@ -113,6 +117,7 @@ impl Ledger {
             failures: Vec::new(),
             unverified_writes: false,
             command_failing: false,
+            recoveries_used: 0,
             plan: None,
         }
     }
@@ -166,6 +171,12 @@ impl Ledger {
         self.note_plan_updated();
     }
 
+    /// Stamped once at Turn start: the Recovery Turns already consumed
+    /// serving the current user request (an Agent-owned cross-Turn count).
+    pub fn note_recoveries_used(&mut self, n: u64) {
+        self.recoveries_used = n;
+    }
+
     /// A successful plan Tool Call landed: the Plan just changed, so the
     /// recency clock and the writes-since counter reset.
     pub fn note_plan_updated(&mut self) {
@@ -205,6 +216,11 @@ impl Ledger {
     /// Did the most recent run_command this Turn fail?
     pub fn command_failing(&self) -> bool {
         self.command_failing
+    }
+
+    /// Recovery Turns already consumed serving the current user request.
+    pub fn recoveries_used(&self) -> u64 {
+        self.recoveries_used
     }
 
     /// Passes since the Plan last changed (since Turn start for a Plan
@@ -439,6 +455,17 @@ mod tests {
         );
 
         assert!(ledger.command_failing());
+    }
+
+    // ----- recoveries used -----
+
+    #[test]
+    fn recoveries_used_starts_at_zero_and_holds_the_stamped_count() {
+        let mut ledger = Ledger::new(25);
+        assert_eq!(ledger.recoveries_used(), 0);
+
+        ledger.note_recoveries_used(2);
+        assert_eq!(ledger.recoveries_used(), 2);
     }
 
     // ----- plan recency -----

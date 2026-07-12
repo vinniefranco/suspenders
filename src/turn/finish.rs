@@ -40,6 +40,22 @@ pub(super) fn close<D: TurnDeps>(
     Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
 }
 
+// The close-and-open-a-Recovery-Turn Intervention's close half: identical to
+// [`close`] — the turn-limit marker keeps roles alternating — but the outcome
+// carries the Endgame Governor's directive out to the Agent, which executes
+// the opening (CONTEXT.md: Recovery Turn).
+pub(super) fn close_recover<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    marker: &str,
+    stop_reason: log::StopReason,
+    recovery: governor::endgame::Recovery,
+) -> Outcome {
+    conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
+    state.deps.checkpoint(&conversation);
+    Outcome::Recover(conversation, stop_reason, recovery)
+}
+
 pub(super) fn close_custom<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
@@ -92,6 +108,13 @@ pub(super) fn finish<D: TurnDeps>(
             conversation,
             voice::turn_limit_marker(),
             reason,
+        )),
+        Some(FinishIntervention::CloseRecover { reason, recovery }) => Flow::Done(close_recover(
+            state,
+            conversation,
+            voice::turn_limit_marker(),
+            reason,
+            recovery,
         )),
         Some(FinishIntervention::Standalone { tag, text }) => {
             conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));

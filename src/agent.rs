@@ -40,10 +40,11 @@ use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
 use crate::llm::Llm;
 use crate::llm::response::StopReason as RespStopReason;
-use crate::session::Session;
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
+use crate::session::{RecoveryShape, Session};
 use crate::turn::AgentDeps;
-use crate::turn::loop_::{Outcome as LoopOutcome, OutcomeStop};
+use crate::turn::governor::endgame::Recovery;
+use crate::turn::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::turn::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
 use crate::{tools, voice};
 
@@ -181,6 +182,17 @@ pub enum TurnMsg {
         skip_count: u64,
         tokens_before: u64,
     },
+    /// A Handoff finished seeding inside the Recovery Turn task (CONTEXT.md:
+    /// Handoff): the fresh Conversation replaces the retired one, the
+    /// compaction state updates, and the `handoff` + `recovery` entries are
+    /// logged so Resume rebuilds the same seed.
+    HandoffSeeded {
+        conversation: Conversation,
+        new_state: Compaction,
+        narrative: Option<String>,
+        verification: Option<String>,
+        prompt: String,
+    },
 }
 
 /// A public API Command (baud's `handle_call`s). Queries carry a `oneshot` reply
@@ -237,6 +249,13 @@ impl AgentHandle {
         // logged Plan so the model keeps its goal across a restart.
         let plan = resume_info.as_ref().and_then(|ri| log::plan(&ri.path));
 
+        // A Resume also restores the recoveries consumed by the logged
+        // request, so a resumed Session cannot re-trigger them unboundedly.
+        let recoveries_used = resume_info
+            .as_ref()
+            .map(|ri| log::recoveries_used(&ri.path))
+            .unwrap_or(0);
+
         // The tool specs ride with every request but live outside the messages;
         // the estimate has to count them or Eviction fires late (baud's
         // `String.length(JSON.encode!(Baud.Tools.specs()))`). Serialize each
@@ -289,6 +308,7 @@ impl AgentHandle {
             approval_replies: HashMap::new(),
             steering: Vec::new(),
             compaction: Compaction::new(),
+            recoveries_used,
             self_tx: tx.clone(),
         };
 
@@ -415,6 +435,12 @@ struct AgentState {
     approval_replies: HashMap<String, oneshot::Sender<bool>>,
     steering: Vec<String>,
     compaction: Compaction,
+    // Recovery Turns consumed serving the CURRENT user request (CONTEXT.md:
+    // Recovery Turn — the Setpoint bounds recoveries per user request, not
+    // per Turn). Cross-Turn state lives with the Agent: reset when a genuine
+    // user prompt starts a new request (`Command::Submit`), NOT by Rollover
+    // or a Recovery Turn; a Resume restores it from the folded log.
+    recoveries_used: u64,
     // A clone of the mpsc sender, handed to the Turn's AgentDeps so the Turn
     // talks back over the same channel, and used to post the Turn's outcome.
     self_tx: mpsc::UnboundedSender<Msg>,
@@ -437,6 +463,11 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             if state.task.is_some() {
                 let _ = reply.send(Err(Busy));
             } else {
+                // A genuine user prompt starts a new request: the recovery
+                // budget resets. Rollover starts its Turn via `start_turn`
+                // directly and keeps the count — its Steering missed a Turn
+                // of the SAME request.
+                state.recoveries_used = 0;
                 start_turn(state, prompt);
                 let _ = reply.send(Ok(()));
             }
@@ -526,6 +557,39 @@ fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
             );
             broadcast(state, Event::compaction_progress("done"));
             state.compaction = new_state;
+        }
+        TurnMsg::HandoffSeeded {
+            conversation,
+            new_state,
+            narrative,
+            verification,
+            prompt,
+        } => {
+            // The seed and its prompt enter the log the way Compaction does:
+            // the narrative alone plus the mechanical facts as their own
+            // fields, so the fold recomposes a byte-identical seed message,
+            // then the `recovery` entry merges the prompt onto it.
+            log_entry(
+                state,
+                LogEntry::Handoff {
+                    summary: narrative,
+                    file_ops: new_state.file_ops.clone(),
+                    original_task: new_state.original_task.clone(),
+                    verification,
+                },
+            );
+            log_entry(
+                state,
+                LogEntry::Recovery {
+                    shape: RecoveryShape::Handoff,
+                    text: prompt,
+                },
+            );
+            state.compaction = new_state;
+            // The fresh Conversation is the new base: a cancel before any
+            // checkpoint must settle on the seeded state the log now holds,
+            // not on the retired one.
+            state.conversation = conversation;
         }
     }
 }
@@ -643,20 +707,19 @@ fn log_rider(state: &mut AgentState, tag: RiderTag, text: &str) {
     );
 }
 
-// ---- Turn start (submit + Rollover) ----------------------------------------
+// ---- Turn start (submit + Rollover + Recovery) ------------------------------
 
 // One Turn start for submit and Rollover alike (baud's start_turn).
 fn start_turn(state: &mut AgentState, prompt: String) {
     log_entry(state, LogEntry::UserText(prompt.clone()));
     state.conversation.add_user_text(prompt);
+    spawn_turn(state);
+}
 
-    state.settlement = Settlement::new();
-    state.approvals = std::mem::take(&mut state.approvals).reset();
-    state.approval_replies.clear();
-    state.cancel_flag = false;
-
-    let reference = mint_turn_ref();
-
+// Spawns a Turn over the Agent's CURRENT Conversation (the prompt — user or
+// Voice — is already appended and logged by the caller).
+fn spawn_turn(state: &mut AgentState) {
+    reset_turn_state(state);
     // The AgentDeps wires each effect to the Agent's mpsc + the Session's Llm.
     let deps = AgentDeps::new(
         state.self_tx.clone(),
@@ -664,22 +727,40 @@ fn start_turn(state: &mut AgentState, prompt: String) {
         state.session.connection.clone(),
         state.compaction.clone(),
     );
-
     let conversation = state.conversation.clone();
     let session = state.session.clone();
-    let plan = state.plan.clone();
-    let original_task = state.compaction.original_task.clone();
-    let out_tx = state.self_tx.clone();
+    let opts = run_opts(state, state.compaction.original_task.clone());
 
-    // The Turn task. The Agent holds only its AbortHandle (for `cancel`); a
-    // spawned watcher OWNS the JoinHandle, awaits it, and posts the outcome
-    // back through the mpsc (baud's `{ref, outcome}` / `:DOWN`). This lets the
-    // Agent both abort (cancel) and observe the outcome without co-owning one
-    // handle.
-    let turn = tokio::spawn(async move {
-        crate::turn::run(conversation, session, deps, plan, original_task).await
-    });
+    let turn =
+        tokio::spawn(async move { crate::turn::run(conversation, session, deps, opts).await });
+    watch_turn(state, turn);
+}
+
+// Resets the per-Turn state before a Turn task spawns.
+fn reset_turn_state(state: &mut AgentState) {
+    state.settlement = Settlement::new();
+    state.approvals = std::mem::take(&mut state.approvals).reset();
+    state.approval_replies.clear();
+    state.cancel_flag = false;
+}
+
+fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {
+    RunOpts {
+        plan: state.plan.clone(),
+        original_task,
+        recoveries_used: state.recoveries_used,
+    }
+}
+
+// The Turn task's watcher. The Agent holds only the AbortHandle (for
+// `cancel`); the spawned watcher OWNS the JoinHandle, awaits it, and posts the
+// outcome back through the mpsc (baud's `{ref, outcome}` / `:DOWN`). This lets
+// the Agent both abort (cancel) and observe the outcome without co-owning one
+// handle.
+fn watch_turn(state: &mut AgentState, turn: tokio::task::JoinHandle<LoopOutcome>) {
+    let reference = mint_turn_ref();
     let abort = turn.abort_handle();
+    let out_tx = state.self_tx.clone();
 
     tokio::spawn(async move {
         match turn.await {
@@ -704,6 +785,81 @@ fn start_turn(state: &mut AgentState, prompt: String) {
     broadcast(state, Event::turn_started(reference));
 }
 
+// ---- Recovery Turn (CONTEXT.md: Recovery Turn) -------------------------------
+
+// Executes the Endgame Governor's close-and-open-a-Recovery-Turn Intervention:
+// the Governor judged (trigger + both Setpoints); the Agent — owner of the
+// Conversation and the Turn lifecycle — opens the next Turn. The prompt is the
+// Voice's: the only Turn whose prompt Suspenders authors.
+fn start_recovery(state: &mut AgentState, recovery: Recovery) {
+    state.recoveries_used += 1;
+    let prompt = voice::recovery_prompt(recovery.verification_failing).to_string();
+    broadcast(state, Event::recovery_turn(recovery.shape, prompt.clone()));
+
+    match recovery.shape {
+        // Continuation keeps the Conversation: the recovery prompt is the
+        // next Turn's prompt, mechanically like Rollover's auto-submit but
+        // logged as the Voice's, not the user's.
+        RecoveryShape::Continuation => {
+            log_entry(
+                state,
+                LogEntry::Recovery {
+                    shape: RecoveryShape::Continuation,
+                    text: prompt.clone(),
+                },
+            );
+            state.conversation.merge_user_text(prompt);
+            spawn_turn(state);
+        }
+        RecoveryShape::Handoff => spawn_handoff_turn(state, prompt),
+    }
+}
+
+// The Handoff arm: the Recovery Turn task first seeds the fresh Conversation
+// (the compaction machinery's LLM narrative + mechanical facts + the final
+// verification verbatim + the prompt — a long LLM call, so it runs in the Turn
+// task, never on the Agent actor, per ADR-0012), posts the seed back
+// (`HandoffSeeded` logs it and retires the old Conversation), then runs the
+// Turn over the seeded Conversation. The Plan is harness-owned and rides
+// RunOpts verbatim — it survives the retirement untouched.
+fn spawn_handoff_turn(state: &mut AgentState, prompt: String) {
+    reset_turn_state(state);
+    let dying = state.conversation.clone();
+    let compaction = state.compaction.clone();
+    let llm = Arc::clone(&state.llm);
+    let connection = state.session.connection.clone();
+    let session = state.session.clone();
+    let opts = run_opts(state, None);
+    let tx = state.self_tx.clone();
+
+    let turn = tokio::spawn(async move {
+        let seeded = compaction
+            .seed_handoff(&dying, &prompt, llm.as_ref(), &connection)
+            .await;
+        let _ = tx.send(Msg::Turn(TurnMsg::HandoffSeeded {
+            conversation: seeded.conversation.clone(),
+            new_state: seeded.state.clone(),
+            narrative: seeded.narrative,
+            verification: seeded.verification,
+            prompt,
+        }));
+        // Built here, not before the spawn: the Turn's deps must carry the
+        // SEEDED compaction state so a later compaction telescopes from it.
+        let deps = AgentDeps::new(
+            tx.clone(),
+            Arc::clone(&llm),
+            connection.clone(),
+            seeded.state.clone(),
+        );
+        let opts = RunOpts {
+            original_task: seeded.state.original_task.clone(),
+            ..opts
+        };
+        crate::turn::run(seeded.conversation, session, deps, opts).await
+    });
+    watch_turn(state, turn);
+}
+
 fn mint_turn_ref() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -723,6 +879,15 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     if state.task.is_none() {
         return;
     }
+
+    // The Endgame Governor's recovery directive, held aside: the Turn settles
+    // exactly like an Ok limit close first, then the Agent executes the
+    // opening. A cancel that raced the close wins — cancel means stop
+    // everything, recovery included.
+    let recovery = match (&outcome, state.cancel_flag) {
+        (LoopOrDown::Loop(LoopOutcome::Recover(_, _, recovery)), false) => Some(*recovery),
+        _ => None,
+    };
 
     // The cancel flag rides the Settlement (note_cancelled was called on
     // `cancel`); the outcome only needs mapping into the settlement vocabulary.
@@ -750,8 +915,16 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     );
     broadcast(state, settle_event_to_event(&resolution.event));
 
-    if let Rollover::Submit(prompt) = resolution.rollover {
-        start_turn(state, prompt);
+    // Rollover outranks recovery: rolled-over Steering is the user's voice
+    // continuing the same request, which is itself the bounded continuation
+    // the recovery would have bought — and the recovery budget stays unspent.
+    match resolution.rollover {
+        Rollover::Submit(prompt) => start_turn(state, prompt),
+        Rollover::None => {
+            if let Some(recovery) = recovery {
+                start_recovery(state, recovery);
+            }
+        }
     }
 }
 
@@ -762,6 +935,9 @@ fn to_settlement_outcome(outcome: LoopOrDown) -> Outcome {
         LoopOrDown::Loop(LoopOutcome::Ok(conv, stop)) => {
             Outcome::Ok(conv, outcome_stop_to_log(stop))
         }
+        // A recovery close settles exactly like an Ok limit close (the marker
+        // is already appended); the directive was held aside by `settle`.
+        LoopOrDown::Loop(LoopOutcome::Recover(conv, reason, _)) => Outcome::Ok(conv, reason),
         // The Loop already closed the Conversation with the failure marker and
         // kept the errored response's partial text (the LLM error algebra).
         LoopOrDown::Loop(LoopOutcome::Failed(reason, conv)) => {
@@ -1652,6 +1828,289 @@ mod tests {
         let info = resumed.resume_info().await.expect("resume info");
         assert_eq!(info.path, path);
         assert_eq!(info.drift, vec![]);
+    }
+
+    // ---- Recovery Turns (Continuation + Handoff) ---------------------------
+
+    // A Session whose every Turn caps on Pass 1, so any unfinished work
+    // triggers the Endgame Governor's recovery judgment immediately.
+    fn recovery_session(dir: &TempDir, shape: crate::session::RecoveryShape) -> Session {
+        let root = dir.path().to_string_lossy().into_owned();
+        let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+        Session::build(
+            SessionOpts {
+                root: Some(root),
+                session_dir: Some(session_dir),
+                turn_limit: Some(1),
+                recovery_shape: Some(shape),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .expect("session builds")
+    }
+
+    fn write_tool(id: &str, path: &str) -> Response {
+        tool_use_result(id, "write_file", json!({ "path": path, "content": "x" }))
+    }
+
+    fn is_recovery_turn(e: &Event) -> bool {
+        matches!(e, Event::RecoveryTurn { .. })
+    }
+
+    // All user-role text blocks of a conversation, flattened.
+    fn user_texts(conv: &Conversation) -> Vec<String> {
+        conv.messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capped_unfinished_turn_opens_a_continuation_recovery_turn() {
+        let dir = TempDir::new().unwrap();
+        let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
+        let session_dir = session.session_dir.clone();
+        let script = vec![
+            Entry::just(write_tool("w1", "a.txt")), // Turn 1 caps unverified.
+            Entry::just(text_end("recovered and done")), // The Recovery Turn.
+        ];
+        let agent = start(session, FakeLlm::script(script));
+        let mut rx = agent.subscribe();
+
+        agent.submit("write the file").await.unwrap();
+
+        // The capped Turn settles, then the harness opens the Recovery Turn.
+        recv_match(&mut rx, is_turn_finished).await;
+        let recovery = recv_match(&mut rx, is_recovery_turn).await;
+        let prompt = match &recovery {
+            Event::RecoveryTurn { shape, text } => {
+                assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
+                text.clone()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(prompt, voice::recovery_prompt(false));
+        recv_match(&mut rx, is_turn_started).await;
+        recv_match(&mut rx, is_turn_finished).await;
+        assert_eq!(agent.status().await, Status::Idle);
+
+        // The Conversation was KEPT: the original prompt and the Voice's
+        // recovery prompt both ride it, and the recovery's conclusion closes.
+        let conv = agent.conversation().await;
+        let texts = user_texts(&conv);
+        assert!(texts.iter().any(|t| t == "write the file"));
+        assert!(texts.contains(&prompt));
+        assert!(conv.messages.iter().any(|m| {
+            m.role == Role::Assistant
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text == "recovered and done"))
+        }));
+
+        // The Session Log knows one recovery served this request.
+        let path = log::latest(&session_dir).expect("a log file");
+        assert_eq!(log::recoveries_used(&path), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_turn_never_resets_it() {
+        let dir = TempDir::new().unwrap();
+        let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
+        // Turn 1 caps unverified -> one recovery; the Recovery Turn ALSO caps
+        // unverified, but the request's budget (limit 1) is spent.
+        let script = vec![
+            Entry::just(write_tool("w1", "a.txt")),
+            Entry::just(write_tool("w2", "b.txt")),
+        ];
+        let agent = start(session, FakeLlm::script(script));
+        let mut rx = agent.subscribe();
+
+        agent.submit("write the files").await.unwrap();
+
+        recv_match(&mut rx, is_turn_finished).await;
+        recv_match(&mut rx, is_recovery_turn).await;
+        recv_match(&mut rx, is_turn_finished).await;
+
+        // No third Turn: the capped Recovery Turn settles and the Agent idles.
+        refute_match(&mut rx, is_recovery_turn).await;
+        refute_match(&mut rx, is_turn_started).await;
+        assert_eq!(agent.status().await, Status::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_genuine_user_prompt_resets_the_recovery_count() {
+        let dir = TempDir::new().unwrap();
+        let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
+        let script = vec![
+            // Request 1: cap -> recovery -> cap (budget spent).
+            Entry::just(write_tool("w1", "a.txt")),
+            Entry::just(write_tool("w2", "b.txt")),
+            // Request 2: cap -> the reset budget grants a fresh recovery.
+            Entry::just(write_tool("w3", "c.txt")),
+            Entry::just(text_end("second request recovered")),
+        ];
+        let agent = start(session, FakeLlm::script(script));
+        let mut rx = agent.subscribe();
+
+        agent.submit("first request").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+        recv_match(&mut rx, is_recovery_turn).await;
+        recv_match(&mut rx, is_turn_finished).await;
+        assert_eq!(agent.status().await, Status::Idle);
+
+        agent.submit("second request").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+        recv_match(&mut rx, is_recovery_turn).await;
+        recv_match(&mut rx, is_turn_finished).await;
+        assert_eq!(agent.status().await, Status::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts() {
+        let dir = TempDir::new().unwrap();
+        let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
+        let session_dir = session.session_dir.clone();
+        let script = vec![
+            // Turn 1's single Pass: set the Plan and run a failing verification.
+            Entry::just(Response {
+                content: vec![
+                    ContentBlock::tool_use("p1", "plan", json!({ "plan": "Goal: fix. 1. run [ ]" })),
+                    ContentBlock::tool_use("r1", "run_command", json!({ "command": "false" })),
+                ],
+                stop_reason: RStop::ToolUse,
+                usage: Usage::default(),
+                error: None,
+            }),
+            // The Handoff's summarize call.
+            Entry::just(text_end("## Task\nnarrative-of-dying-turn")),
+            // The Recovery Turn over the seeded Conversation.
+            Entry::just(text_end("handoff recovered")),
+        ];
+        let agent = start(session.clone(), FakeLlm::script(script));
+        let mut rx = agent.subscribe();
+
+        agent.submit("fix the failing tests").await.unwrap();
+
+        // Approve the failing verification.
+        let req = recv_match(&mut rx, |e| matches!(e, Event::ApprovalRequest { .. })).await;
+        let id = match req {
+            Event::ApprovalRequest { approval_id, .. } => approval_id,
+            _ => unreachable!(),
+        };
+        agent.approve(id, Decision::Approve).await;
+
+        // The verification result the seed must carry verbatim.
+        let result = recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ToolResult { id, .. } if id == "r1"),
+        )
+        .await;
+        let verification = match result {
+            Event::ToolResult { content, .. } => content,
+            _ => unreachable!(),
+        };
+
+        recv_match(&mut rx, is_turn_finished).await;
+        let recovery = recv_match(&mut rx, is_recovery_turn).await;
+        assert!(matches!(
+            &recovery,
+            Event::RecoveryTurn { shape, text }
+                if *shape == crate::session::RecoveryShape::Handoff
+                    && text == voice::recovery_prompt(true)
+        ));
+        recv_match(&mut rx, is_turn_started).await;
+        recv_match(&mut rx, is_turn_finished).await;
+        assert_eq!(agent.status().await, Status::Idle);
+
+        // The Conversation was RETIRED: one seed message (task verbatim,
+        // narrative, final verification verbatim, recovery prompt) plus the
+        // recovery's conclusion.
+        let conv = agent.conversation().await;
+        assert_eq!(conv.messages.len(), 2);
+        let seed = user_texts(&conv).join("\n");
+        assert!(seed.contains("fix the failing tests"));
+        assert!(seed.contains("narrative-of-dying-turn"));
+        assert!(seed.contains(&verification));
+        assert!(seed.contains(voice::recovery_prompt(true)));
+        assert_eq!(
+            conv.messages[1],
+            Message::assistant(vec![ContentBlock::text("handoff recovered")])
+        );
+
+        // The Plan is harness-owned and survives the retirement verbatim.
+        assert_eq!(agent.plan().await.as_deref(), Some("Goal: fix. 1. run [ ]"));
+
+        // The whole session round-trips: a Resume rebuilds the seeded
+        // Conversation byte-identically, and the recovery count survives.
+        let live = agent.conversation().await;
+        drop(agent);
+        let path = log::latest(&session_dir).expect("a log file");
+        assert_eq!(log::recoveries_used(&path), 1);
+        let resumed = AgentHandle::start(
+            StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+                .with_system_prompt("You are a test agent.")
+                .with_resume(Resume::Path(path)),
+        )
+        .expect("resumes");
+        assert_eq!(resumed.conversation().await.messages, live.messages);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
+        let dir = TempDir::new().unwrap();
+        let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
+        let script = vec![
+            Entry::just(write_tool("w1", "a.txt")), // Turn 1 caps unverified.
+            Entry::error("summarizer down"),        // The Handoff's LLM call fails.
+            Entry::just(text_end("recovered anyway")),
+        ];
+        let agent = start(session, FakeLlm::script(script));
+        let mut rx = agent.subscribe();
+
+        agent.submit("write the file").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+        recv_match(&mut rx, is_recovery_turn).await;
+        recv_match(&mut rx, is_turn_finished).await;
+
+        // The recovery still happened, on the mechanical skeleton alone.
+        let conv = agent.conversation().await;
+        assert_eq!(conv.messages.len(), 2);
+        let seed = user_texts(&conv).join("\n");
+        assert!(seed.contains(voice::handoff_no_narrative()));
+        assert!(seed.contains("write the file")); // task verbatim
+        assert!(seed.contains(voice::recovery_prompt(false)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+        let session = Session::build(
+            SessionOpts {
+                root: Some(root),
+                session_dir: Some(session_dir),
+                turn_limit: Some(1),
+                recovery_limit: Some(0),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .unwrap();
+        let agent = start(session, FakeLlm::script(vec![Entry::just(write_tool("w1", "a.txt"))]));
+        let mut rx = agent.subscribe();
+
+        agent.submit("write the file").await.unwrap();
+        recv_match(&mut rx, is_turn_finished).await;
+        refute_match(&mut rx, is_recovery_turn).await;
+        refute_match(&mut rx, is_turn_started).await;
+        assert_eq!(agent.status().await, Status::Idle);
     }
 
     // ---- riders in the Session Log (Anchors + Endgame prompts) ------------
