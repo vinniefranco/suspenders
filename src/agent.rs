@@ -254,6 +254,7 @@ impl AgentHandle {
             ConversationOpts::new(session.context_budget, session.connection.max_tokens)
                 .overhead_chars(overhead)
                 .eviction_slack(session.eviction_slack)
+                .dead_mass_fraction(session.dead_mass_fraction)
                 .compaction_keep(session.compaction_keep),
         );
         // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.

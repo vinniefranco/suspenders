@@ -52,6 +52,40 @@ pub fn elision_marker() -> &'static str {
     "[result elided - re-run the tool if needed]"
 }
 
+// The husk text for a landed write's input body (CONTEXT.md: Supersession).
+// Bracketed so the model reads it as the Voice, never as a shape to imitate
+// when composing new edit_file calls.
+const WRITE_INPUT_ELISION: &str = "[edit body elided - the file on disk holds the result]";
+
+/// Eviction's husk for a dead write input: valid JSON keeping the narrative
+/// spine — the path survives, the edit body does not. Replaces the `input` of
+/// a successful edit_file/write_file Tool Call once its result has landed.
+pub fn write_input_husk(path: Option<&str>) -> serde_json::Value {
+    match path {
+        Some(p) => serde_json::json!({ "path": p, "elided": WRITE_INPUT_ELISION }),
+        None => serde_json::json!({ "elided": WRITE_INPUT_ELISION }),
+    }
+}
+
+/// Whether a tool_use input is already the write-input husk, so Eviction never
+/// re-husks it and the request prefix stays byte-stable between waves.
+pub fn is_write_input_husk(input: &serde_json::Value) -> bool {
+    input.get("elided").and_then(|v| v.as_str()) == Some(WRITE_INPUT_ELISION)
+}
+
+/// Marker replacing a run_command Tool Result superseded by an identical later
+/// run in the same Turn (CONTEXT.md: Supersession — the newest result always
+/// survives verbatim).
+pub fn superseded_command_marker() -> &'static str {
+    "[superseded by a newer run of this command below]"
+}
+
+/// Marker replacing a read_file Tool Result superseded by an identical later
+/// read in the same Turn.
+pub fn superseded_read_marker() -> &'static str {
+    "[superseded by a newer read of this file below]"
+}
+
 /// Tool Result for a run_command Tool Call the user denied.
 pub fn command_denied() -> &'static str {
     "[command denied by user]"
@@ -530,6 +564,52 @@ mod tests {
         let marker = anchor_elision_marker();
         assert!(is_anchor(&ContentBlock::text(marker)));
         assert!(marker.contains('['));
+    }
+
+    // ---- write_input_husk/1 ----
+
+    #[test]
+    fn write_input_husk_is_valid_json_preserving_the_path() {
+        let husk = write_input_husk(Some("src/lib.rs"));
+        assert_eq!(
+            husk,
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "elided": "[edit body elided - the file on disk holds the result]"
+            })
+        );
+    }
+
+    #[test]
+    fn write_input_husk_without_a_path_still_carries_the_marker() {
+        let husk = write_input_husk(None);
+        assert!(husk.get("path").is_none());
+        assert!(is_write_input_husk(&husk));
+    }
+
+    #[test]
+    fn is_write_input_husk_recognizes_only_the_husk() {
+        assert!(is_write_input_husk(&write_input_husk(Some("a.rs"))));
+        assert!(!is_write_input_husk(&serde_json::json!({
+            "path": "a.rs",
+            "old_str": "x",
+            "new_str": "y"
+        })));
+        assert!(!is_write_input_husk(&serde_json::json!({
+            "elided": "some other text"
+        })));
+    }
+
+    // ---- superseded result markers ----
+
+    #[test]
+    fn superseded_markers_are_bracketed_and_distinct_from_the_elision_marker() {
+        for marker in [superseded_command_marker(), superseded_read_marker()] {
+            assert!(marker.starts_with('['));
+            assert!(marker.ends_with(']'));
+            assert_ne!(marker, elision_marker());
+        }
+        assert_ne!(superseded_command_marker(), superseded_read_marker());
     }
 
     // ---- plan_confirmation/0 ----
