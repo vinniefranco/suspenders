@@ -1681,8 +1681,9 @@ mod tests {
                 // Tuned so THREE small Turns cross the Compaction Target and
                 // two do not: the tool-spec overhead rides the estimate, so
                 // this number tracks the registry (web_fetch, ADR-0024, moved
-                // it from 4000).
-                context_budget: Some(4200),
+                // it from 4000; run_command's pipefail description moved it
+                // from 4200).
+                context_budget: Some(4230),
                 eviction_slack: Some(0.3),
                 compaction_keep: Some(0.1),
                 ..Default::default()

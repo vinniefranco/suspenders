@@ -1,4 +1,4 @@
-//! `run_command(command)`: runs `sh -c command` in the Project Root with
+//! `run_command(command)`: runs `bash -o pipefail -c command` in the Project Root with
 //! stdout and stderr merged, reporting the exit code. The only tool that
 //! requires the user's Approval (see [`crate::tools::requires_approval`]).
 //!
@@ -22,10 +22,12 @@ impl Tool for RunCommand {
         ToolSpec {
             name: "run_command".into(),
             description:
-                "Run a shell command (sh -c) in the project root and return stdout and stderr \
-                merged, followed by the exit code. Use this to compile, run tests, or inspect \
-                the project after making changes. Long-running commands are killed when they \
-                exceed the configured timeout. The user must approve each command before it runs."
+                "Run a shell command (bash -o pipefail -c) in the project root and return stdout \
+                and stderr merged, followed by the exit code. Use this to compile, run tests, or \
+                inspect the project after making changes. Long-running commands are killed when \
+                they exceed the configured timeout. The user must approve each command before it \
+                runs. Do not pipe long output through head or tail; output is trimmed \
+                automatically."
                     .into(),
             input_schema: json!({
                 "type": "object",
@@ -66,8 +68,14 @@ async fn spawn_and_wait(
     root: &std::path::Path,
     timeout_ms: u64,
 ) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c")
+    // bash with pipefail: a piped command must report the producer's failure,
+    // not the consumer's success — the Verify and failure Governors key on the
+    // exit code, and `cargo test | head` must not launder a red suite into
+    // is_error=false.
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-o")
+        .arg("pipefail")
+        .arg("-c")
         .arg(command)
         .current_dir(root)
         .stdin(Stdio::null())
@@ -201,6 +209,15 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("boom"));
         assert!(err.contains("[exit code: 3]"));
+    }
+
+    #[tokio::test]
+    async fn pipefail_reports_the_producers_failure_not_the_consumers_success() {
+        let tmp = TempDir::new().unwrap();
+        let err = run(json!({"command": "false | cat"}), &ctx(tmp.path()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("[exit code: 1]"));
     }
 
     #[tokio::test]
