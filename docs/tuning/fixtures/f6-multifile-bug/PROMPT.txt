@@ -1,0 +1,1 @@
+Bug report: customers are being charged roughly 100x the correct amount at checkout. A cart with one $2.50 item (250 cents) produces a checkout total of ~27000 cents instead of ~270. Find the root cause, fix it, add a regression test that mirrors this bug report, and verify all tests pass.
