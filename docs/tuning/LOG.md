@@ -723,7 +723,12 @@ line per spec bullet), a recovery-rider that forbids full-file
 rewrites, and the hang/malformed-tool-call parked insights above.
 (2) A broader-codebase fixture class (f8: feature-add in a
 several-module crate) once f7 stabilizes. Artifacts in
-/tmp/fixture-logs/ (c008–c013), fixtures in /tmp/f{4,5,6,7}-*,
-drive via /tmp/drive.sh, vet via /tmp/vet.sh (both /tmp — recreate
-from LOG if rebooted; vet.sh's event grammar is documented by its
-own comments and log.rs).
+/tmp/fixture-logs/ (c008–c013).
+
+**Fixtures now live in-repo** (the deferred in-repo-vs-/tmp decision,
+decided by losing them to a reboot once): exact bytes of
+f4/f5/f6/f7 plus drive.sh and vet.sh are vendored under
+`docs/tuning/fixtures/`; run `docs/tuning/fixtures/restore.sh` to
+reinstall everything to /tmp with baseline commits. Scorecards stay
+comparable across sessions — no more "-v2, treat old numbers as
+approximate."

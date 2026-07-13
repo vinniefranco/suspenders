@@ -1,0 +1,1 @@
+Implement decode in src/lib.rs so that all tests in tests/oracle.rs pass. The input mini-language is documented in the doc comment on decode. Do not modify the tests. Run the test suite to verify your work.
