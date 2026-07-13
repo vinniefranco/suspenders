@@ -151,6 +151,33 @@ pub fn turn_limit_marker() -> &'static str {
     "[turn limit reached - reply to continue]"
 }
 
+/// The Recovery Turn's prompt (CONTEXT.md: Recovery Turn - the only Turn
+/// whose prompt Suspenders authors). Parameterized on the Ledger fact that
+/// triggered it: the last verification failing, or writes left unverified.
+/// Deliberately short and mechanical - a 9B over-reads long imperatives
+/// (LOG.md cycle 002).
+pub fn recovery_prompt(verification_failing: bool) -> &'static str {
+    if verification_failing {
+        "[the previous turn hit its pass limit with the last verification failing - continue the task: fix the failure with minimal changes and re-run the verification until it passes]"
+    } else {
+        "[the previous turn hit its pass limit with unverified changes - continue the task: run the verification, fix failures with minimal changes, and finish only when it passes]"
+    }
+}
+
+/// The Handoff seed's final-verification section (CONTEXT.md: Handoff): the
+/// newest run_command Tool Result of the dying Conversation, verbatim -
+/// appended mechanically outside the LLM output, like every compaction fact.
+pub fn handoff_verification(result: Option<&str>) -> String {
+    let body = result.unwrap_or("- none was run");
+    format!("\n## Final verification result (verbatim)\n{body}")
+}
+
+/// The narrative stand-in when the Handoff's summarization call failed and
+/// the seed degrades to the mechanical skeleton alone.
+pub fn handoff_no_narrative() -> &'static str {
+    "- no narrative (the summarization call failed)"
+}
+
 /// One-shot warning riding the tool-results user message when the Turn Limit
 /// is `passes_left` Passes away.
 pub fn wrap_up_warning(passes_left: u64) -> String {
@@ -646,6 +673,33 @@ mod tests {
     #[test]
     fn plan_confirmation_is_a_short_confirmation_string() {
         assert!(plan_confirmation().chars().count() < 120);
+    }
+
+    // ---- recovery_prompt/1 + handoff sections ----
+
+    #[test]
+    fn recovery_prompt_names_the_triggering_fact() {
+        let failing = recovery_prompt(true);
+        assert!(failing.contains("verification failing"));
+
+        let unverified = recovery_prompt(false);
+        assert!(unverified.contains("unverified changes"));
+
+        for prompt in [failing, unverified] {
+            assert!(prompt.starts_with('['));
+            assert!(prompt.ends_with(']'));
+            assert!(prompt.contains("continue the task"));
+            assert!(prompt.contains("minimal changes"));
+        }
+    }
+
+    #[test]
+    fn handoff_verification_carries_the_result_verbatim_or_names_its_absence() {
+        let section = handoff_verification(Some("exit 1\n2 tests failed"));
+        assert!(section.contains("## Final verification result (verbatim)"));
+        assert!(section.contains("exit 1\n2 tests failed"));
+
+        assert!(handoff_verification(None).contains("- none was run"));
     }
 
     // ---- compaction_prompt/0 ----

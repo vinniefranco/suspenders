@@ -198,8 +198,7 @@ pub async fn run(
     conversation: Conversation,
     session: Session,
     mut deps: AgentDeps,
-    plan: Option<String>,
-    original_task: Option<String>,
+    opts: RunOpts,
 ) -> Outcome {
     // Resolve the Session's ordered Plugin names into the live pipeline. The
     // shipped config carries `["diff"]`, so the live app runs the Turn with the
@@ -221,18 +220,7 @@ pub async fn run(
         session.command_timeout_ms,
     ));
 
-    loop_::run(
-        conversation,
-        &session,
-        &plugins,
-        &tool_ctx,
-        &mut deps,
-        RunOpts {
-            plan,
-            original_task,
-        },
-    )
-    .await
+    loop_::run(conversation, &session, &plugins, &tool_ctx, &mut deps, opts).await
 }
 
 // Builds the `scout` capture on the Tool ctx: an effect that dispatches a Scout

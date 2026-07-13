@@ -53,6 +53,13 @@ pub enum Outcome {
     /// The Turn completed; carries the final Conversation and terminal stop
     /// reason.
     Ok(Conversation, OutcomeStop),
+    /// The Turn closed at its Turn Limit with demonstrably unfinished work and
+    /// the Endgame Governor issued the close-and-open-a-Recovery-Turn
+    /// Intervention (CONTEXT.md: Recovery Turn). The Conversation is closed on
+    /// the turn-limit marker exactly like an `Ok` limit close; the directive
+    /// rides out so the Agent - which owns the Turn lifecycle - executes the
+    /// opening.
+    Recover(Conversation, log::StopReason, governor::endgame::Recovery),
     /// The response errored; carries the LLM error reason and the Conversation
     /// (with the partial text and the failed marker).
     Failed(String, Conversation),
@@ -78,12 +85,15 @@ impl OutcomeStop {
     }
 }
 
-/// Options for [`run`] (baud's `opts`): the restored Plan content and the
-/// durable original task copy from the Compaction state.
+/// Options for [`run`] (baud's `opts`): the restored Plan content, the
+/// durable original task copy from the Compaction state, and the Recovery
+/// Turns already consumed serving the current user request (an Agent-owned
+/// cross-Turn fact the Ledger starts with).
 #[derive(Debug, Clone, Default)]
 pub struct RunOpts {
     pub plan: Option<String>,
     pub original_task: Option<String>,
+    pub recoveries_used: u64,
 }
 
 // The loop state that spans Passes: the effect bundle, the owned emission
@@ -133,9 +143,18 @@ pub async fn run<D: TurnDeps>(
             session.anchor_interval,
             session.plan_stale_after,
             session.no_think_rescue,
-        ),
+        )
+        .with_recovery(governor::endgame::RecoverySetpoints {
+            limit: session.recovery_limit,
+            shape: session.recovery_shape,
+        }),
         plan,
     };
+
+    // Recovery Turns already consumed serving this user request: an Agent-
+    // owned cross-Turn fact the Ledger starts with, read by the Endgame
+    // Governor's recovery judgment.
+    state.ledger.note_recoveries_used(opts.recoveries_used);
 
     // A Plan carried in from a previous Turn is a fact the Ledger starts
     // with: its recency clock runs from Turn start (a Plan set THIS Turn
@@ -389,14 +408,24 @@ async fn next_pass<D: TurnDeps>(
 
     // The finish-settlement moment, consulted after a tool-answering Pass: at
     // the Turn Limit the arbiter closes the Turn on the marker (stop calling
-    // the model; the marker keeps roles alternating).
-    match governor::settle_capped(&state.ledger) {
+    // the model; the marker keeps roles alternating) - carrying the Endgame
+    // Governor's recovery directive out when the work is unfinished.
+    match governor::settle_capped(&state.ledger, &state.governors) {
         Some(FinishIntervention::Close(reason)) => {
             return Flow::Done(finish::close(
                 state,
                 conversation,
                 voice::turn_limit_marker(),
                 reason,
+            ));
+        }
+        Some(FinishIntervention::CloseRecover { reason, recovery }) => {
+            return Flow::Done(finish::close_recover(
+                state,
+                conversation,
+                voice::turn_limit_marker(),
+                reason,
+                recovery,
             ));
         }
         Some(FinishIntervention::Standalone { .. }) => {
@@ -1955,6 +1984,153 @@ mod tests {
         );
     }
 
+    // ---- Recovery Turn (the close-and-recover Intervention) ----------------
+
+    use crate::session::RecoveryShape;
+    use crate::turn::governor::endgame::Recovery;
+
+    fn recover(outcome: &Outcome) -> (&Conversation, log::StopReason, Recovery) {
+        match outcome {
+            Outcome::Recover(c, reason, recovery) => (c, *reason, *recovery),
+            other => panic!("expected Recover, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cap_with_unverified_writes_carries_the_recovery_directive_out() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(1);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![just(tool_use_result(
+                "w1",
+                "write_file",
+                json!({"path": "a.txt", "content": "hi"}),
+            ))],
+        );
+
+        let (outcome, _deps) = run_with(&session, "write it", deps).await;
+        let (conv, reason, recovery) = recover(&outcome);
+
+        assert_eq!(reason, log::StopReason::TurnLimit);
+        assert_eq!(
+            recovery,
+            Recovery {
+                shape: RecoveryShape::Handoff,
+                verification_failing: false,
+            }
+        );
+        // The Conversation closed on the turn-limit marker like any limit close.
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cap_with_a_failing_verification_recovers_naming_the_failure() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(1);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![just(tool_use_result(
+                "r1",
+                "run_command",
+                json!({"command": "false"}),
+            ))],
+        )
+        .with_approvals(vec![true]);
+
+        let (outcome, _deps) = run_with(&session, "run it", deps).await;
+        let (_conv, _reason, recovery) = recover(&outcome);
+        assert!(recovery.verification_failing);
+    }
+
+    #[tokio::test]
+    async fn the_shape_setpoint_rides_the_directive() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(1);
+        opts.recovery_shape = Some(RecoveryShape::Continuation);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![just(tool_use_result(
+                "w1",
+                "write_file",
+                json!({"path": "a.txt", "content": "hi"}),
+            ))],
+        );
+
+        let (outcome, _deps) = run_with(&session, "write it", deps).await;
+        let (_conv, _reason, recovery) = recover(&outcome);
+        assert_eq!(recovery.shape, RecoveryShape::Continuation);
+    }
+
+    #[tokio::test]
+    async fn a_spent_recovery_budget_settles_a_plain_turn_limit() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(1);
+        let session = session_with(root.path(), opts);
+        let mut deps = deps_for(
+            &session,
+            vec![just(tool_use_result(
+                "w1",
+                "write_file",
+                json!({"path": "a.txt", "content": "hi"}),
+            ))],
+        );
+
+        // The Agent stamps the recoveries this user request already consumed.
+        let conv = conversation(&session, "write it");
+        let plugins: Vec<Registered> = Vec::new();
+        let ctx = tool_ctx(&session);
+        let outcome = run(
+            conv,
+            &session,
+            &plugins,
+            &ctx,
+            &mut deps,
+            RunOpts {
+                recoveries_used: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (_conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+    }
+
+    #[tokio::test]
+    async fn recovery_limit_zero_disables_the_mechanic() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(1);
+        opts.recovery_limit = Some(0);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![just(tool_use_result(
+                "w1",
+                "write_file",
+                json!({"path": "a.txt", "content": "hi"}),
+            ))],
+        );
+
+        let (outcome, _deps) = run_with(&session, "write it", deps).await;
+        let (_conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+    }
+
+    // A clean cap (no writes, no failing command) settling Ok is covered by
+    // `turn_limit_stops_the_loop_after_n_passes` below.
+
     // ---- loop guards ------------------------------------------------------
 
     #[tokio::test]
@@ -2856,6 +3032,7 @@ mod tests {
             RunOpts {
                 plan: Some("Goal: ship. 1. code [ ]".to_string()),
                 original_task: Some("ship it".to_string()),
+                ..Default::default()
             },
         )
         .await;

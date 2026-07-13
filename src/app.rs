@@ -88,7 +88,10 @@ pub async fn run_headless(
             continue;
         }
 
-        // Drain events until this Turn settles.
+        // Drain events until this Turn settles - including any Recovery Turn
+        // the settlement opens (the Agent starts it before answering the
+        // status query, so Running here means recovery is underway; ADR-0019:
+        // headless drives the same Agent seam, recovery included).
         loop {
             match events.recv().await {
                 Ok(event) => {
@@ -96,6 +99,10 @@ pub async fn run_headless(
                     handle_event(&agent, &event, started).await;
                     if settled {
                         print_estimate(&agent).await;
+                        if agent.status().await == crate::agent::Status::Running {
+                            println!("   .. recovery turn running; draining until it settles");
+                            continue;
+                        }
                         break;
                     }
                 }

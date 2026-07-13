@@ -10,9 +10,19 @@
 //!   ([`tail_rider`]), and closes the Turn on the turn-limit marker at the
 //!   finish settlement ([`final_pass`], [`tool_insistent_text`],
 //!   [`limit_stop_reason`]).
-//! * **Setpoints**: none of its own - the schedule's offsets (2, 1, 0 Passes
-//!   remaining) ARE the mechanics, and the Turn Limit is a Session fact read
-//!   from the Ledger's Pass position, not a value this Governor tunes.
+//! * **Setpoints**: the recovery pair ([`RecoverySetpoints`]) - `recovery_limit`
+//!   (at most N Recovery Turns per user request, `0` disables the mechanic) and
+//!   `recovery_shape` (Handoff or Continuation). The schedule itself carries
+//!   none: its offsets (2, 1, 0 Passes remaining) ARE the mechanics, and the
+//!   Turn Limit is a Session fact read from the Ledger's Pass position.
+//!
+//! The Recovery Turn (CONTEXT.md): when this Governor closes a Turn at its
+//! Turn Limit and the Ledger says the work is demonstrably unfinished
+//! (unverified writes, or the last verification failing), it issues the
+//! close-and-open-a-Recovery-Turn Intervention instead of the plain close
+//! ([`recovery`]) - evidence: 12 of 15 hard f5 runs died AT the cap, several
+//! one honest debugging turn from green (LOG.md cycles 005-006). The Agent
+//! executes the Intervention; this Governor only judges.
 //!
 //! The endgame is mechanical because small models comply with mechanics, not
 //! requests (the lesson learned at every scale: the Explore Nudge's
@@ -38,11 +48,65 @@
 //! wording the answers carry.
 
 use crate::content::ContentBlock;
+use crate::session::RecoveryShape;
 use crate::session::log::StopReason;
 use crate::tool::ToolSpec;
 use crate::turn::governor::failure;
 use crate::turn::governor::ledger::Ledger;
 use crate::voice;
+
+/// The Endgame Governor's recovery Setpoints (CONTEXT.md: Setpoint -
+/// resolved by the Session once at launch and fed to the Governor that owns
+/// them). Defaults mirror the shipped config: one Recovery Turn per user
+/// request, Handoff-shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoverySetpoints {
+    /// At most this many Recovery Turns per user request; `0` disables the
+    /// mechanic entirely.
+    pub limit: u64,
+    /// Which arm a Recovery Turn takes.
+    pub shape: RecoveryShape,
+}
+
+impl Default for RecoverySetpoints {
+    fn default() -> Self {
+        RecoverySetpoints {
+            limit: 1,
+            shape: RecoveryShape::Handoff,
+        }
+    }
+}
+
+/// The close-and-recover directive: the payload of
+/// [`super::FinishIntervention::CloseRecover`], carried out of the Turn to the
+/// Agent (which executes the Intervention - opening the next Turn, or seeding
+/// the fresh Conversation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recovery {
+    /// The arm to take, from the shape Setpoint.
+    pub shape: RecoveryShape,
+    /// Why the work is unfinished: `true` when the last verification failed,
+    /// `false` when writes went unverified - the fact the Voice's recovery
+    /// prompt is parameterized with.
+    pub verification_failing: bool,
+}
+
+/// The recovery judgment, consulted only when this Governor is already
+/// closing the Turn at its Turn Limit: `Some` when the Ledger says the work
+/// is demonstrably unfinished (unverified writes, or the last verification
+/// failing) and the request's recovery budget is not spent. A capped Turn
+/// that settled green gets no recovery; `limit` 0 disables the mechanic.
+pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recovery> {
+    let unfinished = ledger.command_failing() || ledger.unverified_writes();
+    if unfinished && ledger.recoveries_used() < setpoints.limit {
+        Some(Recovery {
+            shape: setpoints.shape,
+            verification_failing: ledger.command_failing(),
+        })
+    } else {
+        None
+    }
+}
 
 /// The Voice text riding a tool-results tail, tagged with the Transcript event
 /// announcing it (baud's `tail_rider` type). `None` when no rider is due.
@@ -263,6 +327,85 @@ mod tests {
         }
 
         assert_eq!(limit_stop_reason(&stuck), StopReason::TurnLimitStuck);
+    }
+
+    // ---- recovery/2 ----
+
+    // The most recent run_command this Turn failed.
+    fn command_failing() -> Ledger {
+        let mut ledger = Ledger::new(25);
+        ledger.record_result(
+            "run_command",
+            &ToolResult {
+                content: "exit 1",
+                is_error: true,
+            },
+        );
+        ledger
+    }
+
+    #[test]
+    fn unverified_writes_draw_a_recovery() {
+        assert_eq!(
+            recovery(&RecoverySetpoints::default(), &unverified()),
+            Some(Recovery {
+                shape: RecoveryShape::Handoff,
+                verification_failing: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_failing_verification_draws_a_recovery_naming_the_failure() {
+        assert_eq!(
+            recovery(&RecoverySetpoints::default(), &command_failing()),
+            Some(Recovery {
+                shape: RecoveryShape::Handoff,
+                verification_failing: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_clean_cap_gets_no_recovery() {
+        assert_eq!(recovery(&RecoverySetpoints::default(), &Ledger::new(25)), None);
+    }
+
+    #[test]
+    fn the_shape_setpoint_picks_the_arm() {
+        let setpoints = RecoverySetpoints {
+            limit: 1,
+            shape: RecoveryShape::Continuation,
+        };
+        assert_eq!(
+            recovery(&setpoints, &unverified()).map(|r| r.shape),
+            Some(RecoveryShape::Continuation)
+        );
+    }
+
+    #[test]
+    fn the_limit_bounds_recoveries_per_user_request() {
+        let mut spent = unverified();
+        spent.note_recoveries_used(1);
+        assert_eq!(recovery(&RecoverySetpoints::default(), &spent), None);
+
+        let mut room = unverified();
+        room.note_recoveries_used(1);
+        let setpoints = RecoverySetpoints {
+            limit: 2,
+            shape: RecoveryShape::Handoff,
+        };
+        assert!(recovery(&setpoints, &room).is_some());
+    }
+
+    #[test]
+    fn limit_zero_disables_the_mechanic() {
+        let setpoints = RecoverySetpoints {
+            limit: 0,
+            shape: RecoveryShape::Handoff,
+        };
+        assert_eq!(recovery(&setpoints, &unverified()), None);
+        assert_eq!(recovery(&setpoints, &command_failing()), None);
     }
 
     // ---- tool_insistent_text?/1 ----

@@ -3,11 +3,13 @@
 //!
 //! A Governor is a tunable rule that watches the Pass cycle and intervenes to
 //! keep the model on course; it acts only through an **Intervention**, one of
-//! the seven closed actions: replace a Tool Result, annotate one, stand alone
+//! the eight closed actions: replace a Tool Result, annotate one, stand alone
 //! as a user message, ride the results tail, narrow the offered Tools, silence
-//! Thinking for a Pass, close the Turn on a marker. The set is deliberately
-//! closed: a new Governor is routine, a new KIND of Intervention is a visible
-//! design decision (ADR-0026 - do not generalize these enums away).
+//! Thinking for a Pass, close the Turn on a marker, or close the Turn and open
+//! a Recovery Turn. The set is deliberately closed: a new Governor is routine,
+//! a new KIND of Intervention is a visible design decision (ADR-0026 - do not
+//! generalize these enums away; the eighth variant, the Endgame Governor's
+//! close-and-recover, deliberately touched the firing sites).
 //!
 //! Every Intervention belongs to exactly one of the three moments of a Pass,
 //! and precedence is decided within a moment, never across moments
@@ -121,6 +123,7 @@ pub struct Governors {
     anchor: anchor::Anchor,
     duplicate: duplicate::Duplicate,
     empty: empty::Empty,
+    endgame: endgame::RecoverySetpoints,
     explore: explore::Explore,
     verify: verify::Verify,
 }
@@ -129,8 +132,9 @@ impl Governors {
     /// Resolves the Governors for one Turn: the unexposed Setpoints are their
     /// defaults, and the Session's resolved knobs feed the Governors that
     /// carry them (`anchor_interval` and `plan_stale_after` feed the anchor
-    /// Governor, `no_think_rescue` the empty Governor - CONTEXT.md: "the
-    /// Session resolves them once at launch").
+    /// Governor, `no_think_rescue` the empty Governor, and
+    /// [`with_recovery`](Governors::with_recovery) the endgame Governor -
+    /// CONTEXT.md: "the Session resolves them once at launch").
     pub fn new(anchor_interval: u64, plan_stale_after: u64, no_think_rescue: bool) -> Self {
         Governors {
             anchor: anchor::Anchor::new(anchor::Setpoints {
@@ -139,9 +143,17 @@ impl Governors {
             }),
             duplicate: duplicate::Duplicate::new(),
             empty: empty::Empty::new(empty::Setpoints { no_think_rescue }),
+            endgame: endgame::RecoverySetpoints::default(),
             explore: explore::Explore::new(),
             verify: verify::Verify::new(),
         }
+    }
+
+    /// Feeds the endgame Governor its Session-resolved recovery Setpoints
+    /// (the defaults otherwise mirror the shipped config).
+    pub fn with_recovery(mut self, recovery: endgame::RecoverySetpoints) -> Self {
+        self.endgame = recovery;
+        self
     }
 
     /// A Tool Call batch closed: the duplicate Governor's freshness memory
@@ -164,6 +176,14 @@ impl Governors {
 pub enum FinishIntervention {
     /// Close the Turn on the turn-limit marker with this stop reason.
     Close(log::StopReason),
+    /// Close the Turn on the turn-limit marker AND open a Recovery Turn
+    /// (CONTEXT.md: the eighth Intervention): issued by the Endgame Governor
+    /// when a Turn caps with demonstrably unfinished work and the request's
+    /// recovery budget is not spent. The Agent executes the opening.
+    CloseRecover {
+        reason: log::StopReason,
+        recovery: endgame::Recovery,
+    },
     /// Stand alone as a user message - a finish Nudge; the model gets one
     /// more Pass to act on it.
     Standalone { tag: VoicedTag, text: String },
@@ -275,16 +295,26 @@ pub fn answer_tail(ledger: &Ledger, governors: &mut Governors) -> Vec<AnswerInte
 
 /// The finish-settlement moment, consulted after a tool-answering Pass: at
 /// the Turn Limit the Turn closes on the marker even though the model is
-/// still asking for Tools (CONTEXT.md: a Turn ends at its Turn Limit). Only
-/// [`FinishIntervention::Close`] (or nothing) issues from this consultation;
-/// the stop reason distinguishes a stuck Turn from a productive one.
-pub fn settle_capped(ledger: &Ledger) -> Option<FinishIntervention> {
+/// still asking for Tools (CONTEXT.md: a Turn ends at its Turn Limit). The
+/// close is plain, or - when the Ledger says the work is demonstrably
+/// unfinished and the endgame Governor's recovery budget allows - the
+/// close-and-open-a-Recovery-Turn Intervention; the stop reason distinguishes
+/// a stuck Turn from a productive one either way.
+pub fn settle_capped(ledger: &Ledger, governors: &Governors) -> Option<FinishIntervention> {
     if endgame::final_pass(ledger.pass(), ledger.turn_limit()) {
-        Some(FinishIntervention::Close(endgame::limit_stop_reason(
-            ledger,
-        )))
+        Some(limit_close(ledger, governors))
     } else {
         None
+    }
+}
+
+// The Endgame Governor's close at the Turn Limit: plain, or with a Recovery
+// Turn when its recovery judgment fires. One author for both settle paths.
+fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
+    let reason = endgame::limit_stop_reason(ledger);
+    match endgame::recovery(&governors.endgame, ledger) {
+        Some(recovery) => FinishIntervention::CloseRecover { reason, recovery },
+        None => FinishIntervention::Close(reason),
     }
 }
 
@@ -295,7 +325,9 @@ pub fn settle_capped(ledger: &Ledger) -> Option<FinishIntervention> {
 ///
 ///   1. the final-Pass tool-insistence Close (ADR-0015): a reply that still
 ///      insists on tools as serialized markup closes on the turn-limit marker
-///      - it outranks every Nudge because no Pass is left to grant;
+///      - it outranks every Nudge because no Pass is left to grant; it is a
+///      Turn-Limit close, so the endgame Governor's recovery judgment applies
+///      exactly as at [`settle_capped`];
 ///   2. the Verify-failed Nudge - the last run_command this Turn failed;
 ///   3. the Verify Nudge - files changed but nothing was verified;
 ///   4. the Empty-response Nudge - no content, or a parroted empty marker.
@@ -317,9 +349,7 @@ pub fn settle_finish(
     if endgame::final_pass(ledger.pass(), ledger.turn_limit())
         && endgame::tool_insistent_text(blocks)
     {
-        return Some(FinishIntervention::Close(endgame::limit_stop_reason(
-            ledger,
-        )));
+        return Some(limit_close(ledger, governors));
     }
 
     let end_turn = *stop_reason == StopReason::EndTurn;
@@ -704,13 +734,21 @@ mod tests {
 
     #[test]
     fn below_the_limit_the_turn_runs_on() {
-        assert_eq!(settle_capped(&ledger_at(24, 25)), None);
+        assert_eq!(
+            settle_capped(&ledger_at(24, 25), &Governors::new(5, 8, true)),
+            None
+        );
+        // Unfinished work below the limit never triggers a recovery either.
+        assert_eq!(
+            settle_capped(&unverified_at(24, 25), &Governors::new(5, 8, true)),
+            None
+        );
     }
 
     #[test]
-    fn at_the_limit_the_turn_closes_on_the_marker() {
+    fn at_the_limit_a_clean_turn_closes_on_the_marker_no_recovery() {
         assert_eq!(
-            settle_capped(&ledger_at(25, 25)),
+            settle_capped(&ledger_at(25, 25), &Governors::new(5, 8, true)),
             Some(FinishIntervention::Close(log::StopReason::TurnLimit))
         );
     }
@@ -722,8 +760,58 @@ mod tests {
             stuck.record_result("grep", &err());
         }
         assert_eq!(
-            settle_capped(&stuck),
+            settle_capped(&stuck, &Governors::new(5, 8, true)),
             Some(FinishIntervention::Close(log::StopReason::TurnLimitStuck))
+        );
+    }
+
+    #[test]
+    fn a_cap_with_unverified_writes_closes_and_recovers() {
+        assert_eq!(
+            settle_capped(&unverified_at(25, 25), &Governors::new(5, 8, true)),
+            Some(FinishIntervention::CloseRecover {
+                reason: log::StopReason::TurnLimit,
+                recovery: endgame::Recovery {
+                    shape: crate::session::RecoveryShape::Handoff,
+                    verification_failing: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_cap_with_a_failing_verification_closes_and_recovers() {
+        assert_eq!(
+            settle_capped(&command_failing_at(25, 25), &Governors::new(5, 8, true)),
+            Some(FinishIntervention::CloseRecover {
+                reason: log::StopReason::TurnLimit,
+                recovery: endgame::Recovery {
+                    shape: crate::session::RecoveryShape::Handoff,
+                    verification_failing: true,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_spent_recovery_budget_closes_plain() {
+        let mut ledger = unverified_at(25, 25);
+        ledger.note_recoveries_used(1);
+        assert_eq!(
+            settle_capped(&ledger, &Governors::new(5, 8, true)),
+            Some(FinishIntervention::Close(log::StopReason::TurnLimit))
+        );
+    }
+
+    #[test]
+    fn recovery_limit_zero_disables_the_mechanic_at_the_arbiter() {
+        let governors = Governors::new(5, 8, true).with_recovery(endgame::RecoverySetpoints {
+            limit: 0,
+            shape: crate::session::RecoveryShape::Handoff,
+        });
+        assert_eq!(
+            settle_capped(&unverified_at(25, 25), &governors),
+            Some(FinishIntervention::Close(log::StopReason::TurnLimit))
         );
     }
 
@@ -736,11 +824,32 @@ mod tests {
     #[test]
     fn the_tool_insistence_close_outranks_every_nudge() {
         // Verify-failed is armed, but on the final Pass a tool-insistent
-        // reply closes: no Pass is left to grant the Nudge.
+        // reply closes: no Pass is left to grant the Nudge. It is a
+        // Turn-Limit close with a failing verification, so the endgame
+        // Governor's recovery rides it.
         let ledger = command_failing_at(3, 3);
         assert_eq!(
             settle_finish(
                 &ledger,
+                &mut Governors::new(5, 8, true),
+                &text("<tool_call>x</tool_call>"),
+                &StopReason::EndTurn
+            ),
+            Some(FinishIntervention::CloseRecover {
+                reason: log::StopReason::TurnLimit,
+                recovery: endgame::Recovery {
+                    shape: crate::session::RecoveryShape::Handoff,
+                    verification_failing: true,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_clean_tool_insistence_close_recovers_nothing() {
+        assert_eq!(
+            settle_finish(
+                &ledger_at(3, 3),
                 &mut Governors::new(5, 8, true),
                 &text("<tool_call>x</tool_call>"),
                 &StopReason::EndTurn
