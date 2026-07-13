@@ -138,7 +138,9 @@ async fn execute_tool<D: TurnDeps>(
 }
 
 // A successful plan Tool Call updates the Plan value and stores its content
-// through the set_plan Dep; the Loop's copy keeps this Turn's Anchors current.
+// through the set_plan Dep; the Loop's copy keeps this Turn's Anchors current,
+// and the Ledger's plan-recency fact resets at the same firing site (written
+// once as it happens - ADR-0026).
 fn maybe_store_plan<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
@@ -150,6 +152,7 @@ fn maybe_store_plan<D: TurnDeps>(
             .deps
             .set_plan(plan.content.clone().unwrap_or_default());
         state.plan = plan;
+        state.ledger.note_plan_updated();
     }
 }
 

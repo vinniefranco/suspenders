@@ -2,7 +2,9 @@
 //! Turn Ledger; ADR-0026). Facts are written once as each thing happens: the
 //! Tool Calls the Pass carried, per-Tool consecutive-failure tallies (with
 //! error categories and a recency stamp for the last failure), writes and
-//! whether a verification has run since, and the Pass position (current Pass,
+//! whether a verification has run since, the Plan's recency (Passes and
+//! successful writes since it last changed - absent while no Plan exists),
+//! and the Pass position (current Pass,
 //! Turn Limit). The Ledger holds facts, never opinions or setpoints -
 //! Governors read it and judge; no Governor reads another Governor's state.
 //!
@@ -58,6 +60,17 @@ impl FailureStreak {
     }
 }
 
+// Plan recency: the Pass the Plan last changed on (the Turn's start Pass when
+// the Plan was carried in from a previous Turn), and the successful writes
+// since. Absent while no Plan exists - a Turn with no Plan has nothing to go
+// stale, so the recency facts read as `None` rather than counting from Turn
+// start.
+#[derive(Debug, Clone)]
+struct PlanRecency {
+    updated_at_pass: u64,
+    writes_since: u64,
+}
+
 /// The Turn Ledger. A plain value the loop owns beside the Governors' trigger
 /// state: methods either write a fact once at its firing site (`&mut self`,
 /// loop-only) or read one (`&self`, Governors and the arbiter).
@@ -85,6 +98,8 @@ pub struct Ledger {
     unverified_writes: bool,
     // The most recent run_command that actually RAN this Turn failed.
     command_failing: bool,
+    // Plan recency (see [`PlanRecency`]): `None` until a Plan exists.
+    plan: Option<PlanRecency>,
 }
 
 impl Ledger {
@@ -98,6 +113,7 @@ impl Ledger {
             failures: Vec::new(),
             unverified_writes: false,
             command_failing: false,
+            plan: None,
         }
     }
 
@@ -143,6 +159,22 @@ impl Ledger {
         self.batches += 1;
     }
 
+    /// The Turn began with a Plan carried in from a previous Turn: the
+    /// recency clock starts at Turn start - nothing changed the Plan THIS
+    /// Turn yet, but a Plan exists to go stale.
+    pub fn note_plan_carried(&mut self) {
+        self.note_plan_updated();
+    }
+
+    /// A successful plan Tool Call landed: the Plan just changed, so the
+    /// recency clock and the writes-since counter reset.
+    pub fn note_plan_updated(&mut self) {
+        self.plan = Some(PlanRecency {
+            updated_at_pass: self.pass,
+            writes_since: 0,
+        });
+    }
+
     // ---- reads: Governors and the arbiter --------------------------------
 
     /// The current Pass (1-based).
@@ -173,6 +205,19 @@ impl Ledger {
     /// Did the most recent run_command this Turn fail?
     pub fn command_failing(&self) -> bool {
         self.command_failing
+    }
+
+    /// Passes since the Plan last changed (since Turn start for a Plan
+    /// carried in from a previous Turn). `None` while no Plan exists - a
+    /// missing Plan cannot be stale.
+    pub fn passes_since_plan_update(&self) -> Option<u64> {
+        self.plan.as_ref().map(|p| self.pass - p.updated_at_pass)
+    }
+
+    /// Successful writes since the Plan last changed. `None` while no Plan
+    /// exists.
+    pub fn writes_since_plan_update(&self) -> Option<u64> {
+        self.plan.as_ref().map(|p| p.writes_since)
     }
 
     /// One Tool's consecutive-failure streak: the count and the per-category
@@ -221,6 +266,9 @@ impl Ledger {
             self.unverified_writes = false;
         } else if WRITE_TOOLS.contains(&name) && !is_error {
             self.unverified_writes = true;
+            if let Some(plan) = &mut self.plan {
+                plan.writes_since += 1;
+            }
         }
     }
 
@@ -391,6 +439,64 @@ mod tests {
         );
 
         assert!(ledger.command_failing());
+    }
+
+    // ----- plan recency -----
+
+    #[test]
+    fn plan_recency_is_absent_while_no_plan_exists() {
+        let mut ledger = Ledger::new(25);
+        assert_eq!(ledger.passes_since_plan_update(), None);
+        assert_eq!(ledger.writes_since_plan_update(), None);
+
+        // Writes before any Plan exists do not start a counter.
+        ledger.record_result("edit_file", &ok());
+        ledger.advance_pass();
+        assert_eq!(ledger.passes_since_plan_update(), None);
+        assert_eq!(ledger.writes_since_plan_update(), None);
+    }
+
+    #[test]
+    fn a_carried_plan_counts_passes_since_turn_start() {
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried();
+        assert_eq!(ledger.passes_since_plan_update(), Some(0));
+
+        ledger.advance_pass();
+        ledger.advance_pass();
+        assert_eq!(ledger.passes_since_plan_update(), Some(2));
+    }
+
+    #[test]
+    fn a_plan_update_resets_both_counters_to_its_pass() {
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried();
+        ledger.record_result("edit_file", &ok());
+        ledger.advance_pass();
+        ledger.advance_pass();
+        assert_eq!(ledger.passes_since_plan_update(), Some(2));
+        assert_eq!(ledger.writes_since_plan_update(), Some(1));
+
+        ledger.note_plan_updated();
+        assert_eq!(ledger.passes_since_plan_update(), Some(0));
+        assert_eq!(ledger.writes_since_plan_update(), Some(0));
+
+        ledger.advance_pass();
+        assert_eq!(ledger.passes_since_plan_update(), Some(1));
+    }
+
+    #[test]
+    fn only_successful_writes_count_since_the_plan_update() {
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_updated();
+
+        ledger.record_result("edit_file", &ok());
+        ledger.record_result("write_file", &ok());
+        ledger.record_result("edit_file", &err());
+        ledger.record_result("run_command", &ok());
+        ledger.record_result("read_file", &ok());
+
+        assert_eq!(ledger.writes_since_plan_update(), Some(2));
     }
 
     // ----- compaction -----

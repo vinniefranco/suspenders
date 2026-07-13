@@ -129,9 +129,20 @@ pub async fn run<D: TurnDeps>(
         plugins,
         tool_ctx,
         ledger: Ledger::new(session.turn_limit),
-        governors: Governors::new(session.anchor_interval, session.no_think_rescue),
+        governors: Governors::new(
+            session.anchor_interval,
+            session.plan_stale_after,
+            session.no_think_rescue,
+        ),
         plan,
     };
+
+    // A Plan carried in from a previous Turn is a fact the Ledger starts
+    // with: its recency clock runs from Turn start (a Plan set THIS Turn
+    // starts its clock at `batch`'s firing site instead).
+    if state.plan.content.is_some() {
+        state.ledger.note_plan_carried();
+    }
 
     conversation = maybe_compact_proactive(&mut state, conversation).await;
     run_loop(&mut state, conversation).await
@@ -428,11 +439,17 @@ fn apply_tail<D: TurnDeps>(
             state.emitter.emit(Event::voiced(tag, text.clone()));
             conversation.merge_user_text(text);
         }
-        AnswerIntervention::RideTail(Rider::Anchor) => {
+        AnswerIntervention::RideTail(Rider::Anchor { stale_line }) => {
             // The Anchor crosses the same emit seam as the Voiced riders so
             // the Session Log records what the model read (CONTEXT.md: every
-            // rider is logged); the Transcript ignores the event.
-            let anchor = state.plan.anchor();
+            // rider is logged); the Transcript ignores the event. The anchor
+            // Governor's stale-plan line is appended before the emit, so the
+            // logged text and the injected text stay one string.
+            let mut anchor = state.plan.anchor();
+            if let Some(line) = stale_line {
+                anchor.push_str("\n\n");
+                anchor.push_str(&line);
+            }
             state.emitter.emit(Event::anchor(anchor.clone()));
             conversation.inject_anchor(anchor);
         }
@@ -2685,6 +2702,171 @@ mod tests {
         assert_eq!(anchors.len(), 1);
         assert!(anchors[0].contains("Goal: ship. 1. code [ ]"));
         assert!(anchors[0].contains("ship it"));
+    }
+
+    #[tokio::test]
+    async fn stale_plan_line_rides_every_qualifying_anchor_and_is_logged_as_injected() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(2);
+        opts.plan_stale_after = Some(2);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+
+        // Pass 1 sets the Plan; Passes 2-8 keep writing without touching it -
+        // the audited f5 shape (a pass-5 plan re-injected verbatim while the
+        // model debugged 20 passes deep).
+        let mut script = vec![just(tool_use_result(
+            "p1",
+            "plan",
+            json!({"plan": "Goal: ship. 1. code [ ]"}),
+        ))];
+        for i in 2..=8 {
+            script.push(just(tool_use_result(
+                &format!("w{i}"),
+                "write_file",
+                json!({"path": format!("f{i}.txt"), "content": "x"}),
+            )));
+        }
+        script.push(just(text_end("done")));
+        // The unverified writes draw the verify Nudge one extra Pass.
+        script.push(just(text_end("done, unverified")));
+
+        let deps = deps_for(&session, script);
+        let (outcome, deps) = run_with(&session, "ship it", deps).await;
+        let (conv, _) = ok(&outcome);
+
+        // Anchors ride Passes 2, 4, 6, 8. Passes since the Pass-1 update are
+        // 1, 3, 5, 7: past the threshold of 2 from the second Anchor on, and
+        // the line rides EVERY qualifying Anchor with a fresh count.
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 4);
+        assert!(!anchors[0].contains("has not changed"));
+        assert!(anchors[1].ends_with(&voice::stale_plan_line(3)));
+        assert!(anchors[2].ends_with(&voice::stale_plan_line(5)));
+        assert!(anchors[3].ends_with(&voice::stale_plan_line(7)));
+
+        // Rider persistence: the emitted Anchor events (what the Session Log
+        // records) are byte-for-byte the injected blocks, stale line included.
+        let logged: Vec<String> = events(&deps)
+            .iter()
+            .filter_map(|e| match e {
+                Event::Anchor { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logged, anchors);
+    }
+
+    #[tokio::test]
+    async fn a_plan_updated_as_it_goes_is_never_called_stale() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(2);
+        opts.plan_stale_after = Some(2);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+
+        // Writes land every Pass, but the model refreshes its Plan on Pass 4
+        // - inside the window every Anchor would otherwise go stale in.
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("p1", "plan", json!({"plan": "1. a [ ]"}))),
+                just(tool_use_result(
+                    "w2",
+                    "write_file",
+                    json!({"path": "f2.txt", "content": "x"}),
+                )),
+                just(tool_use_result(
+                    "w3",
+                    "write_file",
+                    json!({"path": "f3.txt", "content": "x"}),
+                )),
+                just(tool_use_result("p4", "plan", json!({"plan": "1. a [x]"}))),
+                just(tool_use_result(
+                    "w5",
+                    "write_file",
+                    json!({"path": "f5.txt", "content": "x"}),
+                )),
+                just(text_end("done")),
+                // The unverified writes draw the verify Nudge one extra Pass.
+                just(text_end("done, unverified")),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "ship it", deps).await;
+        let (conv, _) = ok(&outcome);
+
+        // Anchors on Passes 2 and 4: 1 Pass since the Pass-1 plan, then 0
+        // since the Pass-4 refresh - the update reset the clock.
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors.iter().all(|a| !a.contains("has not changed")));
+    }
+
+    #[tokio::test]
+    async fn a_plan_carried_from_a_previous_turn_goes_stale_from_turn_start() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.anchor_interval = Some(2);
+        opts.plan_stale_after = Some(2);
+        opts.turn_limit = Some(50);
+        let session = session_with(root.path(), opts);
+
+        // The Plan rides in through RunOpts (a previous Turn set it) and this
+        // Turn only writes: the recency clock runs from Turn start.
+        let mut deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "f1.txt", "content": "x"}),
+                )),
+                just(tool_use_result(
+                    "w2",
+                    "write_file",
+                    json!({"path": "f2.txt", "content": "x"}),
+                )),
+                just(tool_use_result(
+                    "w3",
+                    "write_file",
+                    json!({"path": "f3.txt", "content": "x"}),
+                )),
+                just(tool_use_result(
+                    "w4",
+                    "write_file",
+                    json!({"path": "f4.txt", "content": "x"}),
+                )),
+                just(text_end("done")),
+                // The unverified writes draw the verify Nudge one extra Pass.
+                just(text_end("done, unverified")),
+            ],
+        );
+
+        let conv = conversation(&session, "keep going");
+        let plugins: Vec<Registered> = Vec::new();
+        let ctx = tool_ctx(&session);
+        let outcome = run(
+            conv,
+            &session,
+            &plugins,
+            &ctx,
+            &mut deps,
+            RunOpts {
+                plan: Some("Goal: ship. 1. code [ ]".to_string()),
+                original_task: Some("ship it".to_string()),
+            },
+        )
+        .await;
+        let (conv, _) = ok(&outcome);
+
+        // Anchors on Passes 2 and 4: 1 then 3 Passes since Turn start - the
+        // carried Plan crosses the threshold without ever being set this Turn.
+        let anchors = anchors_in(conv);
+        assert_eq!(anchors.len(), 2);
+        assert!(!anchors[0].contains("has not changed"));
+        assert!(anchors[1].ends_with(&voice::stale_plan_line(3)));
     }
 
     #[tokio::test]
