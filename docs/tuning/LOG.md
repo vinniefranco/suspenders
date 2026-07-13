@@ -421,3 +421,119 @@ the c007 protocol as a three-way arm comparison — recovery off vs
 Continuation vs Handoff (`SUSPENDERS_RECOVERY_LIMIT=0` /
 `SUSPENDERS_RECOVERY_SHAPE`) — and vet dead-mass wave behavior in the
 session logs (waves fired? husks imitated? cache churn acceptable?).
+
+---
+
+## 008 — Recovery Turn arm comparison: trigger almost never fired (two holes found and fixed)
+
+**Fixtures rebuilt after the reboot** (specs from LOG.md/PROPOSALS.md):
+f4-analysis (tasktrack, 8 tests green), f5-hard-algo v2 (globber, 16
+oracle tests incl. backtracking `a*b*c` vs `aXbXbc` and a greedy-trap
+`*aa` vs `aaa` — treat pre-reboot f5 scorecards as approximate),
+f6-multifile-bug (shopcart, 8 tests green, 100x checkout bug). Smoke:
+f6 solved clean in 16 passes/57s at the landed config (9 tests green,
+regression test added).
+
+**Protocol:** f5 × 5 runs × three arms on the post-proposals build —
+off (`SUSPENDERS_RECOVERY_LIMIT=0`), Continuation, Handoff. Arms ran
+concurrently against the one model server from separate fixture copies
+and separate `XDG_DATA_HOME`s; two runs died to server-side 500
+"Context size has been exceeded" under concurrent KV load (off-run4 at
+pass 4, cont-run3's recovery turn) — contention artifacts, not harness
+failures; casualties re-run serially.
+
+**Scorecard (green suites):**
+
+| arm | green | recovery fired | end states (red runs) |
+|-----|-------|----------------|------------------------|
+| off | 0/5 | — | 14/16, 7/16, 15/16, (500 casualty), 13/16 |
+| continuation | 0/5 | 1/5 | 15/16, 2/14, 10/16 (T2 died to 500), 5/11, 12/16 |
+| handoff | 2/5 | 4/5 | run1 16/16 in 18p single-turn; **run2 capped red → Handoff turn → 16/16 in 14p**; 14/16; 12/16 |
+
+**The vet's real finding — the Recovery Turn's trigger almost never
+fires.** All 13 completed T1s ended at the 32-pass cap with a red
+suite; recovery fired in only 5. Two holes, both confirmed in code:
+
+1. **Final-pass text settles bypass the judgment.** ADR-0015 strips
+   all tools on the final pass, so a capped model settles `end_turn`
+   with plain text — and `settle_finish` consulted the recovery
+   judgment only on the tool-insistent-markup path. The mechanic's
+   designed trigger (`settle_capped`) is nearly unreachable: the
+   fires we saw were the runs whose final reply happened to insist on
+   tools. The off/cont vs hand firing asymmetry (1/5 vs 4/5) was
+   coin-flip tool-insistence, not design.
+2. **Filtered-rerun laundering.** `command_failing()` is
+   last-command-only; models end capped turns with
+   `cargo test one_test_name` (exit 0) after a red full-suite run, so
+   the ledger reads green (cont-run1: last command
+   `cargo test character_class_range -- --nocapture` after a 15/16
+   suite). Cycle-006's exit-code laundering, one level up.
+
+**Tweak (surface: Governor behavior), commit 5a9d6a3:**
+`settle_finish` now consults the recovery judgment on the final-pass
+text-settle path (the reply enters the Conversation — Handoff seeding
+keeps the model's own wrap-up); the judgment's failing arm is now
+**Dangling Failure** — any command string whose most recent run this
+Turn failed — so a filtered green rerun no longer clears a red suite.
+ADR-0028 addendum + CONTEXT.md glossary. 975 tests, clippy clean.
+Also landed: Eviction waves now emit `## EVICTION wave:` to headless
+stdout — request-time waves were invisible to the vet (found while
+building vet.sh; nothing in stdout or the Session Log showed them).
+
+**Evidence the mechanic works when it fires:** hand-run2 converted a
+capped 32-pass red T1 into 16/16 green in a 14-pass Handoff turn.
+That is the conversion PROPOSALS.md #3 predicted.
+
+**Not credited:** c008 is an invalid arm comparison (the arms differed
+by trigger luck, not shape). c009 re-runs cont/hand at the fixed
+trigger; off keeps the c008 baseline (recovery-disabled behavior is
+unchanged by the fix) with the 500-casualty run re-run.
+
+---
+
+## 009 — Recovery Turn arm comparison at the fixed trigger: CREDITED, Handoff confirmed as default
+
+**Fixture:** f5-hard-algo v2. **Config:** commit 5a9d6a3 (fixed
+trigger + Dangling Failure). Arms as in 008; off baseline carried
+from c008 with the 500 casualty re-run serially (13/16 at cap —
+off stays 0/5).
+
+**N=5 per arm:**
+
+| arm | green | trigger | detail |
+|-----|-------|---------|--------|
+| off (c008+redo) | 0/5 | — | 14/16, 7/16, 15/16, 13/16, 13/16 — every run capped red |
+| continuation | 3/5 | 4/4 capped-red T1s | conversions: 20p, 18p; non-conversions: T2 capped at 14/16, 15/16; plus one clean single-turn 16/16 in 31p (recovery rightly not consulted) |
+| handoff | 4/5 | 5/5 capped-red T1s | conversions: 15p, **8p**, 28p, **5p**; one T2 capped at 15/16 |
+
+**Verdict: CREDITED.** Two separable claims, both proven:
+1. **The trigger fix (008) cleared its failure mode 9/9** — every
+   capped-red T1 across both arms opened a Recovery Turn (c008: 5/13).
+2. **The Recovery Turn converts, and Handoff is the right default
+   shape.** f5-v2 goes 0/5 → 4/5 with a single Handoff turn. Handoff
+   conversions are also cheap — two finished in ≤8 passes, where
+   Continuation needed 18–20 and failed twice by plateauing in its own
+   bloated context. Fresh-context restart with the compaction skeleton
+   beats continuing in place, as PROPOSALS.md #3 predicted; the shipped
+   default (`recovery_shape=handoff`) stands.
+
+**Dead-mass vet (008's open item):** waves fire and are visible via
+the new stdout event; steady state elides ~32% of the budget per
+request view, dominated by husked edit inputs (10+ per run) — exactly
+the dead mass PROPOSALS.md #1 targeted. No husk-marker imitation in
+any c009 run's assistant text (the ADR-0027 risk). Reading note for
+future vets: the printed counts are cumulative view-state per request
+(the stored Conversation is never rewritten; `for_request` elides a
+clone), so "a wave every pass" past the 15% threshold is the designed
+request-time behavior, not churn — an entry elides once and stays
+elided in every later view.
+
+**Residual failure mode (the next front):** the plateau — three T2s
+(cont 14/16, 15/16; hand 15/16) burned a full extra 32 passes without
+closing the last one-or-two oracles. The model converts when its
+fresh start finds a sound design fast (5–8 passes) and plateaus when
+it re-enters the same debugging tunnel. Candidates, in surface order:
+Voice (failure-nudge escalation when the same tests fail across many
+passes), Setpoints (`recovery_limit=2` — a second Handoff is another
+fresh draw at ~5–28 passes), or fixture-audit first (which oracle
+stalls the plateau runs, and is the miss conceptual or mechanical).
