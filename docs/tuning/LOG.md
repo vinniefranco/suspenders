@@ -639,8 +639,91 @@ T1s) but conversions that took 5–28 passes on f5 plateau far from
 green here (7–9 of 18). The gap between "memorized recursion shape"
 (f5's `*` backtracking passed everywhere) and "novel stateful spec"
 (definitions-inside-repeats, error precedence) is the capability
-boundary to tune against next. Forensic audit of runs 1–3 queued;
-candidates after diagnosis: Plan-quality Governor (does the model
-decompose the spec before coding?), Voice on spec-reading, or a
-smaller-oracle-first strategy nudge (make the simplest test pass
-before the integration case).
+boundary to tune against next.
+
+**Forensic audit (runs 1–3):** not a comprehension failure — every
+run read the doc comment AND all 18 tests before coding, and every
+run used the plan tool. The shared sink is **one-shot monolith, then
+flail**: ~250 lines written in a single pass, then compile-error
+whack-a-mole (run2's T1 never got one test to execute in 32 passes;
+run3's T2 did two full heredoc rewrites via `rm && cat > EOF`,
+ignored the recovery rider's "minimal changes", and shipped an
+infinite loop that its own `timeout 60 cargo test | grep` masked).
+Identical cursor-contract bugs (helper assumes pos past the sigil,
+caller disagrees) in runs 1 and 3 — the kind a two-test increment
+catches instantly. No plan mentioned the spec's tricky clauses
+(digit-not-followed-by-paren, escape-aware paren scanning).
+
+---
+
+## 013 — Voice "grow it in verified steps": kept, NOT credited (f7 remains open)
+
+**Fixture:** f7-hard-algo-2, default config. **Tweak (surface:
+Voice):** system-prompt rule — "When building something new from a
+spec, grow it in verified steps: start with the smallest slice that
+compiles and passes at least one test, then add one behavior at a
+time, re-running the tests after each addition, until every behavior
+in the spec is covered. If the code stops compiling, fix that before
+adding anything else - a tree that will not build makes every other
+step blind." Worded as sequencing with an explicit full-coverage
+clause so it cannot be over-read as a scope cap (cycle-002 lesson).
+
+**N=5:**
+
+| run | end state | verdict |
+|-----|-----------|---------|
+| 1 | T1 capped → Handoff T2 → **18/18 in 21p** | **GREEN — first f7 green ever** |
+| 2 | T1 died pass 9: `api_stream_error: Failed to generate a valid tool call` | invalid (server-side casualty) |
+| 3 | both turns capped, 7/18 | fail |
+| 4 | both turns capped, decode hangs (t02 60s+) | fail (hang again) |
+| 5 | both turns capped, compile error (`is_some_and` on `char`) | fail |
+
+**Verdict: kept, not credited.** 1/4 valid green vs c012's 0/3 — one
+run cannot separate the rule from a lucky draw, and first-test timing
+did not move (batch 5–8 both cycles). f7 stays the open front. The
+rule stays: harmless by the evidence, and it encodes the audited
+failure honestly.
+
+### Parked insight — malformed tool calls kill the whole Turn
+
+c013-run2: one "Failed to generate a valid tool call" api_stream_error
+at pass 9 ended the run — no retry, no recovery (a TURN ERROR is not a
+settle, so the Endgame never judges it). A single bad generation
+should cost one Pass, not the Turn. Promote to a cycle if it recurs.
+
+### Parked insight — hang end states are a class now
+
+Two of eight f7 runs ended with `decode` in an infinite loop, shipped
+as "done" (the model's truncated/grepped verification hid the hang;
+c012-run3, c013-run4). The drive script's `timeout 180 cargo test`
+catches it at vet time; the harness has no equivalent guard at
+verification time. Candidate: run_command already has a timeout —
+classify a timed-out verification as a failing one in the Ledger
+(does it already?), and/or a Voice line about hangs. Needs a design
+look before a cycle.
+
+---
+
+## Session close 2026-07-13 — state and handoff
+
+Config: all committed through 9585f95 + the c013 Voice rule
+(uncommitted at cycle close — commit with this entry). 977 tests,
+clippy clean. Serial batches only (concurrent runs trip the server's
+KV pool: 500 "Context size has been exceeded").
+
+Scorecard at close: f4 analysis 5/5 substantive (line-citation
+fabrication fixed in 011; residual: `unwrap_or(0)+1` comprehension
+slips), f6 multi-file bug fix 5/5, f5 hard implementation 8/10
+(Recovery trigger 14/14, Handoff credited in 009), f7 hard
+implementation 1/4 valid — the open front.
+
+Next session, in order: (1) f7 — the monolith habit survived the
+Voice rule; next levers are the plan-template idea (one checklist
+line per spec bullet), a recovery-rider that forbids full-file
+rewrites, and the hang/malformed-tool-call parked insights above.
+(2) A broader-codebase fixture class (f8: feature-add in a
+several-module crate) once f7 stabilizes. Artifacts in
+/tmp/fixture-logs/ (c008–c013), fixtures in /tmp/f{4,5,6,7}-*,
+drive via /tmp/drive.sh, vet via /tmp/vet.sh (both /tmp — recreate
+from LOG if rebooted; vet.sh's event grammar is documented by its
+own comments and log.rs).
