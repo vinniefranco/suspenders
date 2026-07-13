@@ -537,3 +537,51 @@ Voice (failure-nudge escalation when the same tests fail across many
 passes), Setpoints (`recovery_limit=2` — a second Handoff is another
 fresh draw at ~5–28 passes), or fixture-audit first (which oracle
 stalls the plateau runs, and is the miss conceptual or mechanical).
+
+**Regression batches at the credited config:** f6 5/5 green (11–17
+passes, regression test every run), f4 5/5 delivered ANALYSIS.md
+without touching source. A stricter frontier audit of the f4 analyses
+than cycle 005's: zero invented functions/modules across all runs,
+sorting located correctly 5/5, trace order right in 4/5 — but 3/5
+runs fabricate line-number citations (~90% of cited numbers wrong)
+and three wrong-caller claims appeared. Parked as its own cycle:
+the model cites `file.rs:NN` it can never have seen.
+
+---
+
+## 010 — Voice grounding-first failure nudge: kept (behavior moved, green rate didn't)
+
+**Fixture:** f5-hard-algo v2, default config (Handoff, limit 1).
+
+**Diagnosis (plateau audit of c009-cont-1/4, hand-3, all three
+MECHANICAL misses in bracket-class parsing while the memorized `*`
+backtracking passed everywhere):** the model debugs its mental model,
+not the file — it traces its *intended* code, edits a dead copy of a
+function while the live inlined copy executes (hand-3), and when a
+debug print fails to appear it concludes "file corruption" instead of
+re-reading (cont-1, hand-3). The c005 strategy nudge asks for a trace
+but not for grounding, so it changed activity, not outcome.
+
+**Tweak (surface: Voice):** the CommandError-dominant failure nudge
+now opens "Stop editing. Re-read the function you are changing with
+read_file - after several edits your memory of it is stale and the
+file on disk is the only truth." and closes "If a debug print does
+not show up in the output, the code you edited is not the code that
+runs - find what actually executes before editing again."
+
+**N=5:** 4/5 green — conversions in 7, 23, 28, 12 passes; one T2
+plateau at 15/16. Two server-500 casualties (concurrent batches)
+re-run serially per protocol; **all batches run serially from now
+on** — even two concurrent runs can trip the server's KV pool late
+in deep turns.
+
+**Verdict: kept, not credited as an improvement.** Green rate matches
+c009-hand (4/5); N=5 cannot resolve a delta. But the prescription
+demonstrably lands — in 5 of 6 sampled firings the model's next call
+after the nudge is read_file — and the wording encodes a durable
+truth about how this model fails. Harmless, plausibly right, kept.
+
+**Capability scorecard at commit 5a9d6a3 + this tweak:** f4 analysis
+5/5 (line-number fabrication parked), f6 multi-file bug fix 5/5,
+f5 hard implementation 8/10 across c009-hand+c010 with the Recovery
+trigger 14/14 on capped-red turns.
