@@ -379,3 +379,45 @@ f5-hard-algo,f6-multifile-bug} (git repos, PROMPT.txt in each root);
 drive scripts /tmp/run-batch.sh and /tmp/run-batch2.sh; per-run artifacts
 in /tmp/fixture-logs/. /tmp does not survive a reboot - the fixture specs
 are recoverable from this log and PROPOSALS.md.
+
+---
+
+## Implementation session 2026-07-12 - PROPOSALS.md #1–#5 landed
+
+The reboot happened: all /tmp fixtures and drive scripts are gone
+(specs recoverable from this log). The model server is back
+(qwen/qwen3.5-9b at studio-win.local:8888). Rather than rebuild
+fixtures first, the five proposals were designed in a grilling session
+and implemented in four sequential agent passes, each gated on
+cargo test + clippy:
+
+1. **Rider persistence (#5)** - Entry::Rider logged at injection;
+   Resume replays anchors/endgame prompts through the same merge seam
+   the live turn uses. Commit 71a5289.
+2. **Dead-mass eviction (#1+#2, unified)** - second wave trigger
+   (`dead_mass_fraction`, default 0.15) + Supersession classifiers
+   (landed write inputs husked; repeated identical run_command/
+   read_file results superseded, newest verbatim). ADR-0027.
+   Commit 90fae00.
+3. **Stale-plan anchor line (#4)** - Ledger plan-recency facts; Anchor
+   Governor appends the conditional line when plan exists, passes >
+   `plan_stale_after` (default 8), writes since update > 0.
+   Commit dc4eb46.
+4. **Recovery Turn (#3, both arms)** - eighth Intervention: cap close
+   with unverified/failing work opens a Voice-prompted Recovery Turn,
+   bounded by `recovery_limit` (default 1). Shapes: Handoff (default,
+   compaction-seeded fresh Conversation + final verification verbatim)
+   and Continuation. ADR-0028. Commit faf7cb3.
+
+Glossary grew: Dead Mass, Supersession, Recovery Turn, Continuation,
+Handoff; Setpoints may now be mechanic-owned; Eviction redefined for
+quality-triggered waves. End state: 960 tests green, clippy clean.
+
+**None of these is credited yet.** Every change above is design-
+validated only (cycle-006 evidence motivated it; no N=5 has confirmed
+it). Next session: rebuild the fixtures (f5-v2 - treat old scorecards
+as approximate), re-baseline single-turn at the new config, then run
+the c007 protocol as a three-way arm comparison - recovery off vs
+Continuation vs Handoff (`SUSPENDERS_RECOVERY_LIMIT=0` /
+`SUSPENDERS_RECOVERY_SHAPE`) - and vet dead-mass wave behavior in the
+session logs (waves fired? husks imitated? cache churn acceptable?).
