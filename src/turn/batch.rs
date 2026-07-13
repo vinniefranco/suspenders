@@ -114,7 +114,7 @@ async fn execute_tool<D: TurnDeps>(
         content: &raw_content,
         is_error,
     };
-    state.ledger.record_result(&name, &result);
+    state.ledger.record_result(&name, &input, &result);
     let content =
         match governor::answer_read(&state.ledger, &mut state.governors, &name, &input, &result) {
             Some(AnswerIntervention::AnnotateResult(annotated)) => annotated,

@@ -176,13 +176,20 @@ impl Governors {
 pub enum FinishIntervention {
     /// Close the Turn on the turn-limit marker with this stop reason.
     Close(log::StopReason),
-    /// Close the Turn on the turn-limit marker AND open a Recovery Turn
-    /// (CONTEXT.md: the eighth Intervention): issued by the Endgame Governor
-    /// when a Turn caps with demonstrably unfinished work and the request's
-    /// recovery budget is not spent. The Agent executes the opening.
+    /// Close the Turn AND open a Recovery Turn (CONTEXT.md: the eighth
+    /// Intervention): issued by the Endgame Governor when a Turn caps with
+    /// demonstrably unfinished work and the request's recovery budget is not
+    /// spent. The Agent executes the opening.
     CloseRecover {
         reason: log::StopReason,
         recovery: endgame::Recovery,
+        /// Whether the model's reply enters the Conversation before the
+        /// close. True on the final-Pass text settle — the reply is the
+        /// model's genuine wrap-up (the tools were withdrawn, ADR-0015), so
+        /// Handoff compaction-seeding and Continuation both read it. False
+        /// at the tool-answering cap and on the tool-insistent close, where
+        /// the turn-limit marker stands in for the reply.
+        keep_reply: bool,
     },
     /// Stand alone as a user message — a finish Nudge; the model gets one
     /// more Pass to act on it.
@@ -313,7 +320,11 @@ pub fn settle_capped(ledger: &Ledger, governors: &Governors) -> Option<FinishInt
 fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
     let reason = endgame::limit_stop_reason(ledger);
     match endgame::recovery(&governors.endgame, ledger) {
-        Some(recovery) => FinishIntervention::CloseRecover { reason, recovery },
+        Some(recovery) => FinishIntervention::CloseRecover {
+            reason,
+            recovery,
+            keep_reply: false,
+        },
         None => FinishIntervention::Close(reason),
     }
 }
@@ -328,13 +339,20 @@ fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
 ///      — it outranks every Nudge because no Pass is left to grant; it is a
 ///      Turn-Limit close, so the endgame Governor's recovery judgment applies
 ///      exactly as at [`settle_capped`];
-///   2. the Verify-failed Nudge — the last run_command this Turn failed;
-///   3. the Verify Nudge — files changed but nothing was verified;
-///   4. the Empty-response Nudge — no content, or a parroted empty marker.
+///   2. the final-Pass text-settle recovery (ADR-0028 addendum): ADR-0015
+///      withdraws every tool on the final Pass, so a capped Turn nearly
+///      always ends here — a plain reply, end_turn — and the recovery
+///      judgment applies exactly as at the marker closes. When it fires, the
+///      reply (the model's genuine wrap-up) enters the Conversation before
+///      the close (`keep_reply`); when it does not (a green settle, or the
+///      budget spent), the Turn concludes on the reply as before;
+///   3. the Verify-failed Nudge — the last run_command this Turn failed;
+///   4. the Verify Nudge — files changed but nothing was verified;
+///   5. the Empty-response Nudge — no content, or a parroted empty marker.
 ///      The strict Verify-failed > Verify > Empty order, each gated on
 ///      end_turn, room under the Turn Limit ([`endgame::can_loop`] — the
 ///      limit bounds every Nudge), and its own re-arm bookkeeping;
-///   5. nothing — the Turn concludes on the model's reply.
+///   6. nothing — the Turn concludes on the model's reply.
 ///
 /// A firing Nudge updates its trigger bookkeeping here (the once-per-Turn
 /// caps, the no-think rescue arm, and the duplicate Governor's memory clear —
@@ -353,6 +371,18 @@ pub fn settle_finish(
     }
 
     let end_turn = *stop_reason == StopReason::EndTurn;
+
+    if end_turn
+        && endgame::final_pass(ledger.pass(), ledger.turn_limit())
+        && let Some(recovery) = endgame::recovery(&governors.endgame, ledger)
+    {
+        return Some(FinishIntervention::CloseRecover {
+            reason: endgame::limit_stop_reason(ledger),
+            recovery,
+            keep_reply: true,
+        });
+    }
+
     if !end_turn || !endgame::can_loop(ledger.pass(), ledger.turn_limit()) {
         return None;
     }
@@ -435,14 +465,14 @@ mod tests {
     // One successful edit_file leaves the Turn with unverified writes.
     fn unverified_at(pass: u64, turn_limit: u64) -> Ledger {
         let mut ledger = ledger_at(pass, turn_limit);
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
         ledger
     }
 
     // The most recent run_command this Turn failed.
     fn command_failing_at(pass: u64, turn_limit: u64) -> Ledger {
         let mut ledger = ledger_at(pass, turn_limit);
-        ledger.record_result("run_command", &err());
+        ledger.record_result("run_command", &json!({}), &err());
         ledger
     }
 
@@ -529,7 +559,7 @@ mod tests {
         input: &Value,
         result: &ToolResult,
     ) -> Option<AnswerIntervention> {
-        ledger.record_result(name, result);
+        ledger.record_result(name, input, result);
         answer_read(ledger, governors, name, input, result)
     }
 
@@ -660,7 +690,7 @@ mod tests {
         let mut governors = Governors::new(5, 8, true);
         let mut ledger = ledger_at(1, 50);
         ledger.note_plan_updated();
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
         for _ in 1..10 {
             ledger.advance_pass();
         }
@@ -689,7 +719,7 @@ mod tests {
         // stale Plan with zero writes since (pure reading) stays bare too.
         let mut fresh = ledger_at(1, 50);
         fresh.note_plan_updated();
-        fresh.record_result("edit_file", &ok());
+        fresh.record_result("edit_file", &json!({}), &ok());
         for _ in 1..5 {
             fresh.advance_pass();
         }
@@ -718,7 +748,7 @@ mod tests {
         // Deep in the Turn with writes but no Plan ever set: the Anchor rides
         // bare (its no-plan fallback already asks for a Plan).
         let mut ledger = ledger_at(1, 50);
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
         for _ in 1..20 {
             ledger.advance_pass();
         }
@@ -757,7 +787,7 @@ mod tests {
     fn a_stuck_turn_closes_with_the_stuck_reason() {
         let mut stuck = ledger_at(25, 25);
         for _ in 0..3 {
-            stuck.record_result("grep", &err());
+            stuck.record_result("grep", &json!({}), &err());
         }
         assert_eq!(
             settle_capped(&stuck, &Governors::new(5, 8, true)),
@@ -775,6 +805,7 @@ mod tests {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: false,
                 },
+                keep_reply: false,
             })
         );
     }
@@ -789,6 +820,7 @@ mod tests {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
                 },
+                keep_reply: false,
             })
         );
     }
@@ -841,6 +873,7 @@ mod tests {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
                 },
+                keep_reply: false,
             })
         );
     }
@@ -862,8 +895,8 @@ mod tests {
     fn verify_failed_speaks_before_verify() {
         // Both armed: a failing run_command, then an unverified write.
         let mut ledger = ledger_at(2, 25);
-        ledger.record_result("run_command", &err());
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("run_command", &json!({}), &err());
+        ledger.record_result("edit_file", &json!({}), &ok());
         let mut governors = Governors::new(5, 8, true);
 
         assert_eq!(
@@ -981,13 +1014,102 @@ mod tests {
     #[test]
     fn the_turn_limit_bounds_every_nudge() {
         // At the limit no Pass is left to grant, so an armed gate stays quiet
-        // and the Turn concludes on the model's reply.
+        // and the Turn concludes on the model's reply (the recovery budget is
+        // spent here, so the text-settle recovery stays out of the way).
+        let mut ledger = command_failing_at(2, 2);
+        ledger.note_recoveries_used(1);
         assert_eq!(
             settle_finish(
-                &command_failing_at(2, 2),
+                &ledger,
                 &mut Governors::new(5, 8, true),
                 &text("done"),
                 &StopReason::EndTurn
+            ),
+            None
+        );
+    }
+
+    // ---- settle_finish: the final-Pass text settle (ADR-0028 addendum) ------
+
+    #[test]
+    fn a_final_pass_text_settle_with_a_dangling_failure_closes_and_recovers() {
+        // ADR-0015 withdrew the tools, so the capped Turn ends on a plain
+        // reply — the recovery judgment applies, and the reply (not the
+        // marker) enters the Conversation.
+        assert_eq!(
+            settle_finish(
+                &command_failing_at(3, 3),
+                &mut Governors::new(5, 8, true),
+                &text("half done; the tests are still red"),
+                &StopReason::EndTurn
+            ),
+            Some(FinishIntervention::CloseRecover {
+                reason: log::StopReason::TurnLimit,
+                recovery: endgame::Recovery {
+                    shape: crate::session::RecoveryShape::Handoff,
+                    verification_failing: true,
+                },
+                keep_reply: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_final_pass_text_settle_with_unverified_writes_closes_and_recovers() {
+        assert_eq!(
+            settle_finish(
+                &unverified_at(3, 3),
+                &mut Governors::new(5, 8, true),
+                &text("edited but never ran the tests"),
+                &StopReason::EndTurn
+            ),
+            Some(FinishIntervention::CloseRecover {
+                reason: log::StopReason::TurnLimit,
+                recovery: endgame::Recovery {
+                    shape: crate::session::RecoveryShape::Handoff,
+                    verification_failing: false,
+                },
+                keep_reply: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_green_final_pass_text_settle_concludes_on_the_reply() {
+        assert_eq!(
+            settle_finish(
+                &ledger_at(3, 3),
+                &mut Governors::new(5, 8, true),
+                &text("all green; done"),
+                &StopReason::EndTurn
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_concludes_the_text_settle_plain() {
+        let mut ledger = command_failing_at(3, 3);
+        ledger.note_recoveries_used(1);
+        assert_eq!(
+            settle_finish(
+                &ledger,
+                &mut Governors::new(5, 8, true),
+                &text("still red, out of recoveries"),
+                &StopReason::EndTurn
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_non_end_turn_final_pass_settle_never_recovers() {
+        assert_eq!(
+            settle_finish(
+                &command_failing_at(3, 3),
+                &mut Governors::new(5, 8, true),
+                &text("cut off mid-"),
+                &StopReason::MaxTokens
             ),
             None
         );

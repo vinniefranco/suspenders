@@ -59,3 +59,29 @@ Two shapes, chosen by the `recovery_shape` Setpoint:
   session cannot re-trigger unboundedly.
 - Validation pending fixture rebuild: re-run the c007 protocol
   (LOG.md 007) as Continuation-vs-Handoff-vs-off on the f5 scorecard.
+
+## Addendum (2026-07-13): two implementation holes, found live, closed
+
+The stated trigger — a Turn closing at its Turn Limit with unfinished
+work — was implemented only for the tool-answering cap and the
+tool-insistent reply. But ADR-0015 withdraws every tool on the final
+Pass, so a capped Turn nearly always ends as a plain text settle with
+`end_turn`, and that path never consulted the recovery judgment: in a
+5-run batch with every run capped and red, recovery fired once (the
+one tool-insistent reply). The final-Pass text settle now consults the
+same judgment, restoring the intent above. One difference in the
+close: the reply is the model's genuine wrap-up, not insistent markup,
+so it enters the Conversation before the close — Handoff's
+compaction-seeding and Continuation both read it. A green settle at
+the cap, or a spent budget, still concludes on the reply as before.
+
+The judgment's failing arm was `command_failing` — last-command-only —
+and models were observed laundering it: a red full-suite run followed
+by a green filtered rerun (`cargo test one_test_name`, exit 0) read as
+green at the cap. The failing arm is now the Dangling Failure: the
+Ledger records the most recent outcome per distinct command string
+this Turn, and the judgment (and the `verification_failing` fact the
+recovery prompt is parameterized with) fires when any command string's
+most recent run failed — a passing run clears only its own string.
+`command_failing` and its other consumers (the Verify-failed Nudge)
+are untouched.

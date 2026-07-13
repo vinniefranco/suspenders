@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::content::ContentBlock;
+use crate::conversation::WaveStats;
 use crate::llm::response::StopReason;
 use crate::llm::stream::Delta;
 use crate::session::RecoveryShape;
@@ -136,6 +137,14 @@ pub enum Event {
         token_estimate: u64,
         context_budget: u64,
         max_tokens_reserve: u64,
+    },
+    /// An Eviction wave fired while shaping a request (CONTEXT.md: Eviction,
+    /// Dead Mass): the counts by kind and the Dead Mass share at wave time.
+    /// Display-side only — a wave rewrites the request copy, never the
+    /// Session Log (the log's schema is replay-sensitive; Resume re-applies
+    /// waves request-time), so this event is how wave behavior gets vetted.
+    EvictionWave {
+        stats: WaveStats,
     },
     CompactionProgress {
         status: String,
@@ -329,6 +338,10 @@ impl Event {
             context_budget,
             max_tokens_reserve,
         }
+    }
+
+    pub fn eviction_wave(stats: WaveStats) -> Self {
+        Event::EvictionWave { stats }
     }
 
     pub fn compaction_progress(status: impl Into<String>) -> Self {
