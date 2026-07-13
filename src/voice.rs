@@ -278,10 +278,12 @@ pub fn failure_nudge(count: u64, tool_name: &str, categories: &[(FailureCategory
     let categories_desc = describe_categories(&sorted);
     // A CommandError streak means the code under test keeps failing, not the
     // tool call itself, so "step back" alone tends to produce another blind
-    // re-run; this variant prescribes the narrow debug loop instead.
+    // re-run. After many edits the model debugs its mental model of the code,
+    // not the bytes on disk, so this variant grounds first (re-read, then
+    // trace the lines just read) before prescribing the narrow debug loop.
     if let Some((FailureCategory::CommandError, _)) = sorted.first() {
         format!(
-            "\n[{count} consecutive {tool_name} failures - {categories_desc}. Pick the single simplest failing case, trace its exact input through your code step by step, and make one targeted fix for it before re-running]"
+            "\n[{count} consecutive {tool_name} failures - {categories_desc}. Stop editing. Re-read the function you are changing with read_file - after several edits your memory of it is stale and the file on disk is the only truth. Then pick the single simplest failing test and trace its exact input through the lines you just read, one line at a time, and make one targeted fix. If a debug print does not show up in the output, the code you edited is not the code that runs - find what actually executes before editing again]"
         )
     } else {
         format!("\n[{count} consecutive {tool_name} failures - step back: {categories_desc}]")
@@ -832,8 +834,12 @@ mod tests {
         );
 
         assert!(nudge.contains("3 consecutive run_command failures"));
-        assert!(nudge.contains("Pick the single simplest failing case"));
-        assert!(nudge.contains("one targeted fix for it before re-running"));
+        assert!(
+            nudge.contains("Stop editing. Re-read the function you are changing with read_file")
+        );
+        assert!(nudge.contains("the file on disk is the only truth"));
+        assert!(nudge.contains("make one targeted fix"));
+        assert!(nudge.contains("the code you edited is not the code that runs"));
         assert!(!nudge.contains("step back"));
     }
 
@@ -849,7 +855,7 @@ mod tests {
         );
 
         assert!(nudge.contains("3 consecutive read_file failures - step back:"));
-        assert!(!nudge.contains("Pick the single simplest failing case"));
+        assert!(!nudge.contains("Stop editing"));
     }
 
     #[test]
@@ -858,7 +864,7 @@ mod tests {
 
         assert!(nudge.contains("3 consecutive read_file failures - step back:"));
         assert!(nudge.contains("re-read the file or try a different approach"));
-        assert!(!nudge.contains("Pick the single simplest failing case"));
+        assert!(!nudge.contains("Stop editing"));
     }
 
     // ---- explore_nudge/0 ----
