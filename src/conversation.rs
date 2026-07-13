@@ -138,14 +138,7 @@ impl Conversation {
     /// user-role message gains a text block; otherwise a new user message is
     /// appended.
     pub fn merge_user_text(&mut self, text: impl Into<String>) -> &mut Self {
-        match self.messages.last_mut() {
-            Some(last) if last.role == Role::User => {
-                last.content.push(ContentBlock::text(text));
-            }
-            _ => {
-                self.add_user_text(text);
-            }
-        }
+        merge_user_text(&mut self.messages, text);
         self
     }
 
@@ -433,6 +426,20 @@ pub struct Request {
 /// doesn't fit: an over-budget request is never sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudgetExhausted;
+
+/// [`Conversation::merge_user_text`] over bare messages: a trailing user-role
+/// message gains a text block; otherwise a fresh user message is appended.
+/// The one seam every tail rider crosses - Steering, Nudges, Endgame prompts,
+/// and Anchors alike - shared with Resume's fold so a logged rider replays
+/// through the same code that placed it live.
+pub fn merge_user_text(messages: &mut Vec<Message>, text: impl Into<String>) {
+    match messages.last_mut() {
+        Some(last) if last.role == Role::User => {
+            last.content.push(ContentBlock::text(text));
+        }
+        _ => messages.push(Message::user(vec![ContentBlock::text(text)])),
+    }
+}
 
 /// `compaction_target` over plain numbers, for callers that hold the Session
 /// facts but no Conversation:

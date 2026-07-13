@@ -165,6 +165,13 @@ pub enum Event {
     FinalPass {
         text: String,
     },
+    /// An Anchor entered the Conversation (CONTEXT.md: Anchor). Placement is
+    /// the anchor Governor's; the content is the Plan's - the model's voice,
+    /// so it carries no [`VoicedTag`]. Routine rather than corrective, the
+    /// Transcript ignores it; the Session Log persists it like every rider.
+    Anchor {
+        text: String,
+    },
 
     // ---- Settlement ----
     TurnFinished {
@@ -242,6 +249,10 @@ impl Event {
             VoicedTag::VerificationPass => Event::VerificationPass { text },
             VoicedTag::FinalPass => Event::FinalPass { text },
         }
+    }
+
+    pub fn anchor(text: impl Into<String>) -> Self {
+        Event::Anchor { text: text.into() }
     }
 
     // ---- Steering ----
