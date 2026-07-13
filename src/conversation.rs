@@ -5,13 +5,19 @@
 //!
 //! ## Eviction
 //!
-//! When the estimate goes over `context_budget - max_tokens_reserve`,
-//! [`Conversation::evict`] replaces the contents of old Tool Results, oldest
-//! first, with the elision marker. The last two tool-result-bearing user
-//! messages, the system prompt, and everything that is not a `tool_result` are
-//! never touched. Running it twice changes nothing. Eviction also reclaims
-//! stale Anchors (never the most recent) and overshoots to the low-water mark
-//! (hysteresis, ADR-0006).
+//! A wave fires on either of two triggers (CONTEXT.md: Eviction). On budget
+//! pressure - the estimate over `context_budget - max_tokens_reserve` -
+//! [`Conversation::evict`] reclaims dead content first, then replaces the
+//! contents of old Tool Results, oldest first, with the elision marker,
+//! overshooting to the low-water mark (hysteresis, ADR-0006). On Dead Mass -
+//! elidable dead content (Supersession, [`supersession`]) exceeding
+//! `dead_mass_fraction` of the Context Budget - a wave reclaims all dead
+//! content and nothing live, even with budget to spare. The last two
+//! tool-result-bearing user messages and their paired tool_use blocks, the
+//! system prompt, and live non-`tool_result` blocks are never touched.
+//! Running it twice changes nothing.
+
+mod supersession;
 
 use crate::content::{ContentBlock, Message, Role};
 use crate::voice::{self, FileOps};
@@ -27,6 +33,7 @@ pub struct Conversation {
     pub overhead_chars: u64,
     pub eviction_slack: f64,
     pub compaction_keep: f64,
+    pub dead_mass_fraction: f64,
 }
 
 /// A usage signal from the API. Only `input_tokens` is load-bearing for the
@@ -51,7 +58,8 @@ impl Usage {
 /// The explicit options a Conversation is built from. `context_budget` and
 /// `max_tokens_reserve` are required (baud raised `KeyError` when they were
 /// absent; here the type system requires them). The rest carry baud's
-/// defaults via [`Default`].
+/// defaults via [`Default`]; `dead_mass_fraction` is Suspenders' own (no baud
+/// counterpart), the Eviction mechanic's Setpoint.
 #[derive(Debug, Clone)]
 pub struct ConversationOpts {
     pub context_budget: u64,
@@ -59,11 +67,13 @@ pub struct ConversationOpts {
     pub overhead_chars: u64,
     pub eviction_slack: f64,
     pub compaction_keep: f64,
+    pub dead_mass_fraction: f64,
 }
 
 impl ConversationOpts {
     /// The two required knobs, with baud's defaults for the rest
-    /// (`overhead_chars: 0`, `eviction_slack: 0.0`, `compaction_keep: 0.5`).
+    /// (`overhead_chars: 0`, `eviction_slack: 0.0`, `compaction_keep: 0.5`)
+    /// and `dead_mass_fraction: 0.15`.
     pub fn new(context_budget: u64, max_tokens_reserve: u64) -> Self {
         ConversationOpts {
             context_budget,
@@ -71,6 +81,7 @@ impl ConversationOpts {
             overhead_chars: 0,
             eviction_slack: 0.0,
             compaction_keep: 0.5,
+            dead_mass_fraction: 0.15,
         }
     }
 
@@ -86,6 +97,11 @@ impl ConversationOpts {
 
     pub fn compaction_keep(mut self, v: f64) -> Self {
         self.compaction_keep = v;
+        self
+    }
+
+    pub fn dead_mass_fraction(mut self, v: f64) -> Self {
+        self.dead_mass_fraction = v;
         self
     }
 }
@@ -105,6 +121,7 @@ impl Conversation {
             overhead_chars: opts.overhead_chars,
             eviction_slack: opts.eviction_slack,
             compaction_keep: opts.compaction_keep,
+            dead_mass_fraction: opts.dead_mass_fraction,
         }
     }
 
@@ -207,20 +224,65 @@ impl Conversation {
         }
     }
 
-    /// Evicts old Tool Results (and stale Anchors) once `token_estimate`
-    /// exceeds `context_budget - max_tokens_reserve`, eliding down to the
-    /// low-water mark. Oldest first; idempotent.
+    /// Applies an Eviction wave when either trigger fires: budget pressure
+    /// (`token_estimate` over `context_budget - max_tokens_reserve`) or Dead
+    /// Mass over its threshold fraction of the Context Budget. Without a
+    /// trigger the messages come back byte-identical. A wave reclaims all
+    /// dead content outside the recency guard - zero value by definition -
+    /// and only a budget-pressure wave continues into the oldest-first live
+    /// walk, eliding down to the low-water mark. Idempotent.
     pub fn evict(&self) -> Conversation {
         let target = self.context_budget.saturating_sub(self.max_tokens_reserve);
-        if self.token_estimate() <= target {
-            self.clone()
-        } else {
+        let over_budget = self.token_estimate() > target;
+        let dead = supersession::dead_blocks(&self.messages);
+        if !over_budget && !self.dead_mass_exceeded(&dead) {
+            return self.clone();
+        }
+
+        let mut conv = self.clone();
+        conv.elide_dead(&dead);
+        if over_budget {
             // Hysteresis: overshoot to the low-water mark (the Compaction
-            // Target - one number, one definition).
-            let mut conv = self.clone();
+            // Target - one number, one definition). Dead content already
+            // reclaimed above may have done the whole job.
             let low_water = conv.compaction_target();
             conv.do_evict(low_water);
-            conv
+        }
+        conv
+    }
+
+    // The Dead Mass trigger (CONTEXT.md: Dead Mass): dead content rots a
+    // small model's attention long before the Context Budget is threatened,
+    // so elidable dead mass over `dead_mass_fraction` of the budget fires a
+    // wave even with budget to spare.
+    fn dead_mass_exceeded(&self, dead: &[supersession::Dead]) -> bool {
+        let dead_tokens = tokens_for_chars(supersession::dead_chars(&self.messages, dead));
+        dead_tokens as f64 > self.dead_mass_fraction * self.context_budget as f64
+    }
+
+    // Replaces every dead block with its husk: a superseded Tool Result takes
+    // its marker; a dead write input takes the valid-JSON husk that keeps the
+    // path (the narrative spine) and drops the edit body.
+    fn elide_dead(&mut self, dead: &[supersession::Dead]) {
+        for block in dead {
+            match block {
+                supersession::Dead::Result {
+                    msg_index,
+                    block_index,
+                    marker,
+                } => self.elide(*msg_index, *block_index, marker),
+                supersession::Dead::WriteInput {
+                    msg_index,
+                    block_index,
+                    path,
+                } => {
+                    if let ContentBlock::ToolUse { input, .. } =
+                        &mut self.messages[*msg_index].content[*block_index]
+                    {
+                        *input = voice::write_input_husk(path.as_deref());
+                    }
+                }
+            }
         }
     }
 
@@ -304,26 +366,21 @@ impl Conversation {
                 .iter()
                 .map(|m| message_chars(m) as u64)
                 .sum::<u64>();
-        // ceil(chars / 3.5) - a 3.5 ratio, not a div_ceil by 7, so keep as-is.
-        #[allow(clippy::manual_div_ceil)]
-        {
-            (2 * chars + 6) / 7
-        }
+        tokens_for_chars(chars)
     }
 
     fn input_tokens(&self) -> Option<u64> {
         self.last_usage.as_ref().and_then(|u| u.input_tokens)
     }
 
+    // The oldest-first live walk. Checks before eliding: a wave whose dead
+    // reclamation already reached the target touches nothing live.
     fn do_evict(&mut self, target: u64) {
-        loop {
+        while self.char_estimate() > target {
             match self.next_evictable() {
                 None => break,
                 Some((msg_index, block_index, marker)) => {
                     self.elide(msg_index, block_index, &marker);
-                    if self.char_estimate() <= target {
-                        break;
-                    }
                 }
             }
         }
@@ -481,12 +538,25 @@ pub fn extract_file_ops(messages: &[Message]) -> FileOps {
     }
 }
 
+// ceil(chars / 3.5) - a 3.5 ratio, not a div_ceil by 7, so keep as-is.
+fn tokens_for_chars(chars: u64) -> u64 {
+    #[allow(clippy::manual_div_ceil)]
+    {
+        (2 * chars + 6) / 7
+    }
+}
+
 fn is_tool_result(block: &ContentBlock) -> bool {
     matches!(block, ContentBlock::ToolResult { .. })
 }
 
+// A superseded-result husk is already reclaimed; re-eliding it to the general
+// marker would rewrite bytes for nothing.
 fn is_evictable_tool_result(block: &ContentBlock) -> bool {
-    matches!(block, ContentBlock::ToolResult { content, .. } if content != voice::elision_marker())
+    matches!(block, ContentBlock::ToolResult { content, .. }
+        if content != voice::elision_marker()
+            && content != voice::superseded_command_marker()
+            && content != voice::superseded_read_marker())
 }
 
 fn message_chars(msg: &Message) -> usize {
@@ -533,14 +603,28 @@ mod tests {
     }
 
     // Three tool-result-bearing user messages, so the oldest is evictable.
+    // Distinct inputs: these model three different reads, not a repeated
+    // identical call (which Supersession would classify dead instead).
     fn three_result_conv(opts: ConversationOpts, contents: [&str; 3]) -> Conversation {
         let mut conv = Conversation::new("sys", opts);
         conv.add_user_text("go");
-        conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t1",
+            "read_file",
+            json!({"path": "a"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t1", contents[0])], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t2",
+            "read_file",
+            json!({"path": "b"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t2", contents[1])], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t3", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t3",
+            "read_file",
+            json!({"path": "c"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t3", contents[2])], vec![]);
         conv
     }
@@ -763,7 +847,7 @@ mod tests {
     #[test]
     fn for_request_applies_eviction_before_returning() {
         let big = "x".repeat(400);
-        let conv = three_result_conv(ConversationOpts::new(30, 0), [&big, "small2", "small3"]);
+        let conv = three_result_conv(ConversationOpts::new(50, 0), [&big, "small2", "small3"]);
         let req = conv.for_request().unwrap();
         assert_eq!(req.system, "sys");
         let contents: Vec<String> = req
@@ -896,13 +980,29 @@ mod tests {
             let mut conv =
                 Conversation::new("sys", ConversationOpts::new(budget, 7).eviction_slack(0.0));
             conv.add_user_text("go");
-            conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t1",
+                "read_file",
+                json!({"path": "a"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t1", &contents[0])], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t2",
+                "read_file",
+                json!({"path": "b"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t2", &contents[1])], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t3", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t3",
+                "read_file",
+                json!({"path": "c"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t3", &contents[2])], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t4", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t4",
+                "read_file",
+                json!({"path": "d"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t4", &contents[3])], vec![]);
             conv
         };
@@ -930,15 +1030,35 @@ mod tests {
                 ConversationOpts::new(budget, 7).eviction_slack(slack),
             );
             conv.add_user_text("go");
-            conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t1",
+                "read_file",
+                json!({"path": "a"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t1", &big)], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t2",
+                "read_file",
+                json!({"path": "b"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t2", &big)], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t3", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t3",
+                "read_file",
+                json!({"path": "c"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t3", &m100)], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t4", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t4",
+                "read_file",
+                json!({"path": "d"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t4", "r4")], vec![]);
-            conv.add_assistant_blocks(vec![tool_use("t5", "read_file")]);
+            conv.add_assistant_blocks(vec![tool_use_input(
+                "t5",
+                "read_file",
+                json!({"path": "e"}),
+            )]);
             conv.add_tool_results(vec![tool_result("t5", "r5")], vec![]);
             conv
         };
@@ -988,13 +1108,29 @@ mod tests {
     fn evict_stale_input_tokens_floor_does_not_force_all_or_nothing() {
         let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0));
         conv.add_user_text("go");
-        conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t1",
+            "read_file",
+            json!({"path": "a"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t1", &"a".repeat(4000))], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t2",
+            "read_file",
+            json!({"path": "b"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t2", &"b".repeat(100))], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t3", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t3",
+            "read_file",
+            json!({"path": "c"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t3", "c")], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t4", "read_file")]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t4",
+            "read_file",
+            json!({"path": "d"}),
+        )]);
         conv.add_tool_results(vec![tool_result("t4", "d")], vec![]);
         conv.note_usage(Usage::with_input_tokens(1_000_000));
 
@@ -1287,6 +1423,209 @@ mod tests {
 
         let evicted = conv.evict();
         assert_eq!(anchor_texts(&evicted), vec![anchor]);
+    }
+
+    // ---- dead-mass waves (CONTEXT.md: Dead Mass, Supersession) ----
+
+    #[test]
+    fn new_dead_mass_fraction_defaults_and_is_settable() {
+        let base = Conversation::new("sys", ConversationOpts::new(123, 0));
+        let tuned = Conversation::new("sys", ConversationOpts::new(123, 0).dead_mass_fraction(0.4));
+        assert_eq!(base.dead_mass_fraction, 0.15);
+        assert_eq!(tuned.dead_mass_fraction, 0.4);
+    }
+
+    // A landed edit, then two fresher exchanges so the edit sits outside the
+    // recency guard.
+    fn conv_with_landed_edit(opts: ConversationOpts, edit_body: &str) -> Conversation {
+        let mut conv = Conversation::new("sys", opts);
+        conv.add_user_text("go");
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "e1",
+            "edit_file",
+            json!({"path": "src/lib.rs", "old_str": edit_body, "new_str": "y"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("e1", "ok")], vec![]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t2",
+            "read_file",
+            json!({"path": "b"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t2", "r2")], vec![]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t3",
+            "read_file",
+            json!({"path": "c"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t3", "r3")], vec![]);
+        conv
+    }
+
+    fn edit_input(conv: &Conversation) -> &serde_json::Value {
+        match &conv.messages[1].content[0] {
+            ContentBlock::ToolUse { input, .. } => input,
+            other => panic!("expected the edit tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dead_mass_wave_fires_below_budget_pressure_and_husks_the_landed_edit() {
+        let conv = conv_with_landed_edit(ConversationOpts::new(10_000, 0), &"x".repeat(8_000));
+
+        // No budget pressure: the wave is about context quality, not overflow.
+        let target = conv.context_budget - conv.max_tokens_reserve;
+        assert!(conv.token_estimate() <= target);
+
+        let evicted = conv.evict();
+        assert_eq!(
+            edit_input(&evicted),
+            &voice::write_input_husk(Some("src/lib.rs"))
+        );
+        // Live Tool Results survive verbatim: a dead-mass wave never touches
+        // them.
+        assert_eq!(result_contents(&evicted), vec!["ok", "r2", "r3"]);
+        // Idempotent: the husk is not classified again.
+        assert_eq!(evicted.evict(), evicted);
+    }
+
+    #[test]
+    fn no_trigger_means_byte_stable_messages_even_with_dead_content() {
+        // The landed edit is dead, but below the threshold and under budget:
+        // no wave, no rewrite.
+        let conv = conv_with_landed_edit(ConversationOpts::new(10_000, 0), &"x".repeat(100));
+        assert_eq!(conv.evict(), conv);
+    }
+
+    #[test]
+    fn dead_mass_wave_husks_superseded_command_results_newest_survives() {
+        let dump = "FAILED ".repeat(80);
+        let cmd = json!({"command": "cargo test"});
+        let mut conv = Conversation::new(
+            "sys",
+            ConversationOpts::new(10_000, 0).dead_mass_fraction(0.01),
+        );
+        conv.add_user_text("go");
+        for id in ["c1", "c2", "c3"] {
+            conv.add_assistant_blocks(vec![tool_use_input(id, "run_command", cmd.clone())]);
+            conv.add_tool_results(vec![tool_result_err(id, &dump, true)], vec![]);
+        }
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t4",
+            "read_file",
+            json!({"path": "b"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t4", "r4")], vec![]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t5",
+            "read_file",
+            json!({"path": "c"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t5", "r5")], vec![]);
+
+        let evicted = conv.evict();
+        assert_eq!(
+            result_contents(&evicted),
+            vec![
+                voice::superseded_command_marker().to_string(),
+                voice::superseded_command_marker().to_string(),
+                dump.clone(),
+                "r4".to_string(),
+                "r5".to_string(),
+            ]
+        );
+        assert_eq!(evicted.evict(), evicted);
+    }
+
+    #[test]
+    fn budget_pressure_wave_reclaims_dead_content_before_live_results() {
+        let live = "l".repeat(200);
+        let mut conv = Conversation::new("sys", ConversationOpts::new(300, 0));
+        conv.add_user_text("go");
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t1",
+            "read_file",
+            json!({"path": "a"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t1", &live)], vec![]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "e1",
+            "edit_file",
+            json!({"path": "src/lib.rs", "old_str": "x".repeat(800), "new_str": "y"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("e1", "ok")], vec![]);
+        // Two fresher exchanges keep the guard off the edit and the old live
+        // result alike.
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t3",
+            "read_file",
+            json!({"path": "c"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t3", "r3")], vec![]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t4",
+            "read_file",
+            json!({"path": "d"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t4", "r4")], vec![]);
+
+        let target = conv.context_budget - conv.max_tokens_reserve;
+        assert!(conv.token_estimate() > target);
+
+        let evicted = conv.evict();
+        // The dead edit body paid the whole bill; the older live result was
+        // never touched.
+        assert_eq!(
+            edit_input_at(&evicted, 3),
+            &voice::write_input_husk(Some("src/lib.rs"))
+        );
+        assert_eq!(
+            result_contents(&evicted),
+            vec![live.as_str(), "ok", "r3", "r4"]
+        );
+    }
+
+    fn edit_input_at(conv: &Conversation, msg_index: usize) -> &serde_json::Value {
+        match &conv.messages[msg_index].content[0] {
+            ContentBlock::ToolUse { input, .. } => input,
+            other => panic!("expected a tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_pressure_wave_still_elides_live_results_when_dead_content_is_not_enough() {
+        // No dead content at all: the wave falls through to the oldest-first
+        // live walk exactly as before.
+        let big = "b".repeat(400);
+        let conv = three_result_conv(ConversationOpts::new(50, 0), [&big, "keep2", "keep3"]);
+        let evicted = conv.evict();
+        assert_eq!(result_contents(&evicted), vec![ELISION, "keep2", "keep3"]);
+    }
+
+    #[test]
+    fn recency_guard_protects_the_paired_tool_use_of_the_last_two_exchanges() {
+        // The landed edit sits in the second-to-last exchange: its input is
+        // untouchable even when a budget wave fires.
+        let mut conv = Conversation::new("sys", ConversationOpts::new(120, 0));
+        conv.add_user_text("go");
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t1",
+            "read_file",
+            json!({"path": "a"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t1", &"r".repeat(400))], vec![]);
+        let edit = json!({"path": "src/lib.rs", "old_str": "x".repeat(200), "new_str": "y"});
+        conv.add_assistant_blocks(vec![tool_use_input("e1", "edit_file", edit.clone())]);
+        conv.add_tool_results(vec![tool_result("e1", "ok")], vec![]);
+        conv.add_assistant_blocks(vec![tool_use_input(
+            "t3",
+            "read_file",
+            json!({"path": "c"}),
+        )]);
+        conv.add_tool_results(vec![tool_result("t3", "r3")], vec![]);
+
+        let evicted = conv.evict();
+        assert_eq!(edit_input_at(&evicted, 3), &edit);
+        assert_eq!(result_contents(&evicted), vec![ELISION, "ok", "r3"]);
     }
 
     #[test]
