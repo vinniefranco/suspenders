@@ -250,7 +250,14 @@ async fn build_request<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Result<(LlmRequest, Conversation), ()> {
-    match conversation.for_request() {
+    let (request, wave) = conversation.for_request_traced();
+    if let Some(stats) = wave {
+        // An Eviction wave fired while shaping this request; it leaves no
+        // other trace (waves rewrite the request copy, never the Session
+        // Log), so announce it (ADR-0027).
+        state.emitter.emit(Event::eviction_wave(stats));
+    }
+    match request {
         Ok(req) => {
             // The request-shaping moment (ADR-0026): the full registry rides
             // and Thinking stays on unless an Intervention narrows or
@@ -419,11 +426,14 @@ async fn next_pass<D: TurnDeps>(
                 reason,
             ));
         }
-        Some(FinishIntervention::CloseRecover { reason, recovery }) => {
+        Some(FinishIntervention::CloseRecover {
+            reason, recovery, ..
+        }) => {
+            // A tool-answering cap has no reply to keep: the marker closes.
             return Flow::Done(finish::close_recover(
                 state,
                 conversation,
-                voice::turn_limit_marker(),
+                vec![ContentBlock::text(voice::turn_limit_marker())],
                 reason,
                 recovery,
             ));
@@ -1109,7 +1119,9 @@ mod tests {
             ],
         );
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
-        ok(&outcome);
+        // No Nudge at the limit; the unverified cap settles as a recovery
+        // close instead (ADR-0028 addendum).
+        recover(&outcome);
         assert_eq!(
             count_voiced(&events(&deps), |e| matches!(e, Event::VerifyNudge { .. })),
             0
@@ -1361,7 +1373,9 @@ mod tests {
         )
         .with_approvals(vec![true]);
         let (outcome, deps) = run_with(&session, "run the tests", deps).await;
-        ok(&outcome);
+        // No Nudge at the limit; the failing cap settles as a recovery close
+        // instead (ADR-0028 addendum).
+        recover(&outcome);
         assert_eq!(
             count_voiced(&events(&deps), |e| matches!(
                 e,
@@ -2126,6 +2140,75 @@ mod tests {
         let (outcome, _deps) = run_with(&session, "write it", deps).await;
         let (_conv, stop) = ok(&outcome);
         assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+    }
+
+    #[tokio::test]
+    async fn a_final_pass_text_settle_with_a_dangling_failure_recovers_on_the_reply() {
+        // ADR-0015 withdrew the tools on the final Pass, so the capped Turn
+        // ends on a plain reply — the recovery judgment applies there too
+        // (ADR-0028 addendum), and the reply (the model's genuine wrap-up),
+        // NOT the turn-limit marker, closes the Conversation.
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
+                just(text_end("half done; the tests are still red")),
+            ],
+        )
+        .with_approvals(vec![true]);
+
+        let (outcome, _deps) = run_with(&session, "run the tests", deps).await;
+        let (conv, reason, recovery) = recover(&outcome);
+
+        assert_eq!(reason, log::StopReason::TurnLimit);
+        assert!(recovery.verification_failing);
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "half done; the tests are still red")
+        );
+        assert!(!conv.messages.iter().any(|m| m.content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text == voice::turn_limit_marker())
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_filtered_green_rerun_does_not_launder_the_recovery_judgment() {
+        // Observed live: a red full run, a green FILTERED rerun, then the
+        // final-Pass wrap-up. The first command string's failure dangles, so
+        // the text settle still recovers, naming the failure.
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "false"}),
+                )),
+                just(tool_use_result(
+                    "r2",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
+                just(text_end("the filtered test passes; calling it done")),
+            ],
+        )
+        .with_approvals(vec![true, true]);
+
+        let (outcome, _deps) = run_with(&session, "run the tests", deps).await;
+        let (_conv, _reason, recovery) = recover(&outcome);
+        assert!(recovery.verification_failing);
     }
 
     // A clean cap (no writes, no failing command) settling Ok is covered by

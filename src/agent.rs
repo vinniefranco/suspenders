@@ -2134,6 +2134,27 @@ mod tests {
         .expect("session builds")
     }
 
+    // [`rider_session`] with the Recovery Turn disabled: a Turn that caps
+    // with unverified writes now settles as a recovery close (ADR-0028
+    // addendum), which has its own coverage — the test on this fixture
+    // asserts rider logging and byte-for-byte Resume only.
+    fn rider_session_no_recovery(dir: &TempDir) -> Session {
+        let root = dir.path().to_string_lossy().into_owned();
+        let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+        Session::build(
+            SessionOpts {
+                root: Some(root),
+                session_dir: Some(session_dir),
+                turn_limit: Some(4),
+                anchor_interval: Some(2),
+                recovery_limit: Some(0),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .expect("session builds")
+    }
+
     // Three exploration Passes then a conclusion: crosses the anchor cadence,
     // the Endgame schedule, and (on Pass 3) the Explore Nudge.
     fn exploring_script() -> Vec<Entry> {
@@ -2238,7 +2259,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unverified_write_logs_the_verification_pass_prompt_and_resumes_byte_for_byte() {
         let dir = TempDir::new().unwrap();
-        let session = rider_session(&dir);
+        let session = rider_session_no_recovery(&dir);
         let session_dir = session.session_dir.clone();
         // A successful write and no run_command: the Verification Pass prompt
         // subsumes the wrap-up warning at 2 remaining, and the Verify Nudge

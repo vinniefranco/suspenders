@@ -22,6 +22,40 @@ mod supersession;
 use crate::content::{ContentBlock, Message, Role};
 use crate::voice::{self, FileOps};
 
+/// What one Eviction wave reclaimed, counted by kind, with the Dead Mass
+/// share at wave time (CONTEXT.md: Eviction, Dead Mass, Supersession).
+/// Returned beside the evicted Conversation by
+/// [`Conversation::evict_traced`] so the request path can announce the wave —
+/// waves rewrite the request copy only and would otherwise leave no trace.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WaveStats {
+    /// Live Tool Results elided by the budget-pressure walk.
+    pub results_elided: u64,
+    /// Older run_command results superseded by an identical later call.
+    pub cmd_superseded: u64,
+    /// Older read_file results superseded by an identical later call.
+    pub read_superseded: u64,
+    /// Successful writes' input bodies replaced with the path-keeping husk.
+    pub edits_husked: u64,
+    /// Superseded Anchors elided.
+    pub anchors_elided: u64,
+    /// The Dead Mass at wave time, as a fraction of the Context Budget.
+    pub dead_mass: f64,
+}
+
+impl WaveStats {
+    // Did the wave actually rewrite anything? A trigger with nothing
+    // reclaimable (all dead already husked, nothing evictable) is not a wave.
+    fn fired(&self) -> bool {
+        self.results_elided
+            + self.cmd_superseded
+            + self.read_superseded
+            + self.edits_husked
+            + self.anchors_elided
+            > 0
+    }
+}
+
 /// The Conversation and its Context Budget bookkeeping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conversation {
@@ -210,18 +244,25 @@ impl Conversation {
     /// estimate under `context_budget - max_tokens_reserve`. The fit check
     /// uses the char estimate, not `token_estimate`.
     pub fn for_request(&self) -> Result<Request, ContextBudgetExhausted> {
-        let evicted = self.evict();
+        self.for_request_traced().0
+    }
+
+    /// [`Conversation::for_request`], reporting the Eviction wave it applied:
+    /// `None` when no wave fired (the messages went out byte-identical).
+    pub fn for_request_traced(&self) -> (Result<Request, ContextBudgetExhausted>, Option<WaveStats>) {
+        let (evicted, wave) = self.evict_traced();
         let target = evicted
             .context_budget
             .saturating_sub(evicted.max_tokens_reserve);
-        if evicted.char_estimate() <= target {
+        let request = if evicted.char_estimate() <= target {
             Ok(Request {
                 system: evicted.system_prompt,
                 messages: evicted.messages,
             })
         } else {
             Err(ContextBudgetExhausted)
-        }
+        };
+        (request, wave)
     }
 
     /// Applies an Eviction wave when either trigger fires: budget pressure
@@ -232,23 +273,35 @@ impl Conversation {
     /// and only a budget-pressure wave continues into the oldest-first live
     /// walk, eliding down to the low-water mark. Idempotent.
     pub fn evict(&self) -> Conversation {
+        self.evict_traced().0
+    }
+
+    /// [`Conversation::evict`], reporting what the wave reclaimed: `None`
+    /// when no wave fired — or when a trigger found nothing to rewrite.
+    pub fn evict_traced(&self) -> (Conversation, Option<WaveStats>) {
         let target = self.context_budget.saturating_sub(self.max_tokens_reserve);
         let over_budget = self.token_estimate() > target;
         let dead = supersession::dead_blocks(&self.messages);
         if !over_budget && !self.dead_mass_exceeded(&dead) {
-            return self.clone();
+            return (self.clone(), None);
         }
 
+        let mut stats = WaveStats {
+            dead_mass: tokens_for_chars(supersession::dead_chars(&self.messages, &dead)) as f64
+                / self.context_budget.max(1) as f64,
+            ..WaveStats::default()
+        };
         let mut conv = self.clone();
-        conv.elide_dead(&dead);
+        conv.elide_dead(&dead, &mut stats);
         if over_budget {
             // Hysteresis: overshoot to the low-water mark (the Compaction
             // Target — one number, one definition). Dead content already
             // reclaimed above may have done the whole job.
             let low_water = conv.compaction_target();
-            conv.do_evict(low_water);
+            conv.do_evict(low_water, &mut stats);
         }
-        conv
+        let fired = stats.fired().then_some(stats);
+        (conv, fired)
     }
 
     // The Dead Mass trigger (CONTEXT.md: Dead Mass): dead content rots a
@@ -262,15 +315,23 @@ impl Conversation {
 
     // Replaces every dead block with its husk: a superseded Tool Result takes
     // its marker; a dead write input takes the valid-JSON husk that keeps the
-    // path (the narrative spine) and drops the edit body.
-    fn elide_dead(&mut self, dead: &[supersession::Dead]) {
+    // path (the narrative spine) and drops the edit body. Each replacement is
+    // tallied by kind on the wave's stats.
+    fn elide_dead(&mut self, dead: &[supersession::Dead], stats: &mut WaveStats) {
         for block in dead {
             match block {
                 supersession::Dead::Result {
                     msg_index,
                     block_index,
                     marker,
-                } => self.elide(*msg_index, *block_index, marker),
+                } => {
+                    if *marker == voice::superseded_command_marker() {
+                        stats.cmd_superseded += 1;
+                    } else {
+                        stats.read_superseded += 1;
+                    }
+                    self.elide(*msg_index, *block_index, marker)
+                }
                 supersession::Dead::WriteInput {
                     msg_index,
                     block_index,
@@ -280,6 +341,7 @@ impl Conversation {
                         &mut self.messages[*msg_index].content[*block_index]
                     {
                         *input = voice::write_input_husk(path.as_deref());
+                        stats.edits_husked += 1;
                     }
                 }
             }
@@ -374,12 +436,18 @@ impl Conversation {
     }
 
     // The oldest-first live walk. Checks before eliding: a wave whose dead
-    // reclamation already reached the target touches nothing live.
-    fn do_evict(&mut self, target: u64) {
+    // reclamation already reached the target touches nothing live. Each
+    // elision is tallied on the wave's stats.
+    fn do_evict(&mut self, target: u64, stats: &mut WaveStats) {
         while self.char_estimate() > target {
             match self.next_evictable() {
                 None => break,
                 Some((msg_index, block_index, marker)) => {
+                    if marker == voice::anchor_elision_marker() {
+                        stats.anchors_elided += 1;
+                    } else {
+                        stats.results_elided += 1;
+                    }
                     self.elide(msg_index, block_index, &marker);
                 }
             }
@@ -1701,6 +1769,56 @@ mod tests {
         let evicted = conv.evict();
         assert_eq!(edit_input_at(&evicted, 3), &edit);
         assert_eq!(result_contents(&evicted), vec![ELISION, "ok", "r3"]);
+    }
+
+    // ---- evict_traced / for_request_traced: wave observability ----
+
+    #[test]
+    fn a_budget_pressure_wave_reports_the_live_results_it_elided() {
+        let big = "a".repeat(400);
+        let conv = three_result_conv(ConversationOpts::new(50, 0), [&big, "keep2", "keep3"]);
+
+        let (evicted, stats) = conv.evict_traced();
+        let stats = stats.expect("a wave fired");
+        assert_eq!(stats.results_elided, 1);
+        assert_eq!(stats.cmd_superseded, 0);
+        assert_eq!(stats.read_superseded, 0);
+        assert_eq!(stats.edits_husked, 0);
+        assert_eq!(stats.anchors_elided, 0);
+        assert_eq!(result_contents(&evicted), vec![ELISION, "keep2", "keep3"]);
+    }
+
+    #[test]
+    fn a_dead_mass_wave_reports_counts_by_kind_and_the_dead_mass_share() {
+        let conv = conv_with_landed_edit(ConversationOpts::new(10_000, 0), &"x".repeat(8_000));
+
+        let (_, stats) = conv.evict_traced();
+        let stats = stats.expect("a wave fired");
+        assert_eq!(stats.edits_husked, 1);
+        assert_eq!(stats.results_elided, 0);
+        // The dead edit body crossed the default 0.15 threshold.
+        assert!(stats.dead_mass > 0.15);
+    }
+
+    #[test]
+    fn no_trigger_reports_no_wave() {
+        let conv = three_result_conv(ConversationOpts::new(10_000, 100), ["r1", "r2", "r3"]);
+        assert_eq!(conv.evict_traced().1, None);
+
+        // An already-settled wave reports nothing on the second run.
+        let big = "a".repeat(400);
+        let once = three_result_conv(ConversationOpts::new(50, 0), [&big, "k2", "k3"]).evict();
+        assert_eq!(once.evict_traced().1, None);
+    }
+
+    #[test]
+    fn for_request_traced_reports_the_wave_it_applied() {
+        let big = "x".repeat(400);
+        let conv = three_result_conv(ConversationOpts::new(50, 0), [&big, "small2", "small3"]);
+
+        let (request, stats) = conv.for_request_traced();
+        assert!(request.is_ok());
+        assert_eq!(stats.expect("a wave fired").results_elided, 1);
     }
 
     #[test]
