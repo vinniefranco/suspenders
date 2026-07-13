@@ -196,8 +196,22 @@ pub enum FailureCategory {
 /// `(category, tally)` pairs, so the nudge can tell the model *what kind* of
 /// failure pattern it is in.
 pub fn failure_nudge(count: u64, tool_name: &str, categories: &[(FailureCategory, u64)]) -> String {
-    let categories_desc = describe_categories(categories);
-    format!("\n[{count} consecutive {tool_name} failures - step back: {categories_desc}]")
+    // Sort by tally descending (stable, as Enum.sort_by/-tally in baud); the
+    // dominant category is whatever this sort puts first.
+    let mut sorted: Vec<(FailureCategory, u64)> = categories.to_vec();
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+    let categories_desc = describe_categories(&sorted);
+    // A CommandError streak means the code under test keeps failing, not the
+    // tool call itself, so "step back" alone tends to produce another blind
+    // re-run; this variant prescribes the narrow debug loop instead.
+    if let Some((FailureCategory::CommandError, _)) = sorted.first() {
+        format!(
+            "\n[{count} consecutive {tool_name} failures - {categories_desc}. Pick the single simplest failing case, trace its exact input through your code step by step, and make one targeted fix for it before re-running]"
+        )
+    } else {
+        format!("\n[{count} consecutive {tool_name} failures - step back: {categories_desc}]")
+    }
 }
 
 fn describe_category(cat: FailureCategory, n: u64) -> String {
@@ -213,16 +227,14 @@ fn describe_category(cat: FailureCategory, n: u64) -> String {
     }
 }
 
+// Expects `categories` already sorted by tally descending (failure_nudge owns
+// the sort so the dominant-category check and this description agree).
 fn describe_categories(categories: &[(FailureCategory, u64)]) -> String {
     if categories.is_empty() {
         return "re-read the file or try a different approach".to_string();
     }
 
-    // Sort by tally descending (stable, as Enum.sort_by/-tally in baud).
-    let mut sorted: Vec<(FailureCategory, u64)> = categories.to_vec();
-    sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
-
-    let parts: Vec<String> = sorted
+    let parts: Vec<String> = categories
         .iter()
         .map(|(cat, n)| describe_category(*cat, *n))
         .collect();
@@ -641,6 +653,49 @@ mod tests {
         let m = scout_pass_cap(8);
         assert!(m.contains('['));
         assert!(m.contains('8'));
+    }
+
+    // ---- failure_nudge/3 ----
+
+    #[test]
+    fn failure_nudge_command_error_dominant_prescribes_the_debug_loop() {
+        let nudge = failure_nudge(
+            3,
+            "run_command",
+            &[
+                (FailureCategory::CommandError, 2),
+                (FailureCategory::Enoent, 1),
+            ],
+        );
+
+        assert!(nudge.contains("3 consecutive run_command failures"));
+        assert!(nudge.contains("Pick the single simplest failing case"));
+        assert!(nudge.contains("one targeted fix for it before re-running"));
+        assert!(!nudge.contains("step back"));
+    }
+
+    #[test]
+    fn failure_nudge_enoent_dominant_keeps_the_step_back_wording() {
+        let nudge = failure_nudge(
+            3,
+            "read_file",
+            &[
+                (FailureCategory::Enoent, 2),
+                (FailureCategory::CommandError, 1),
+            ],
+        );
+
+        assert!(nudge.contains("3 consecutive read_file failures - step back:"));
+        assert!(!nudge.contains("Pick the single simplest failing case"));
+    }
+
+    #[test]
+    fn failure_nudge_empty_categories_keeps_the_step_back_wording() {
+        let nudge = failure_nudge(3, "read_file", &[]);
+
+        assert!(nudge.contains("3 consecutive read_file failures - step back:"));
+        assert!(nudge.contains("re-read the file or try a different approach"));
+        assert!(!nudge.contains("Pick the single simplest failing case"));
     }
 
     // ---- explore_nudge/0 ----

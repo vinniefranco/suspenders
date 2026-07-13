@@ -208,3 +208,174 @@ excellent for testing this capability.
 
 **Status:** This fixture confirms the current config (Verify-tweak +
 turn_limit=32) is working well for the "write tests for new behavior" aspect.
+
+---
+
+## 005 - Fixtures: capability-class baseline (f4/f5/f6)
+
+**Fixtures (new):**
+- `f4-analysis` - 5-module CLI task-tracker; task: write ANALYSIS.md
+  (purpose, module responsibilities, trace of `add`, where sorting lives)
+  without modifying source. Tests codebase analysis.
+- `f5-hard-algo` - glob matcher (`*`, `?`, classes, ranges, negation,
+  escapes) from a stub against 16 oracle tests; tests may not be modified.
+  Tests hard iterative implementation.
+- `f6-multifile-bug` - shopcart crate where checkout re-converts an
+  already-cents subtotal (100x); symptom given, root cause two modules away.
+  Tests cross-module bug fixing.
+
+**Config:** cycle-003 (Verify-tweak + turn_limit=32). No tweak this cycle -
+this entry is the baseline for the new capability classes.
+
+**N=5 per fixture:**
+
+| fixture | result | passes used | notes |
+|---------|--------|-------------|-------|
+| f4-analysis | **5/5 PASS** | 10–15 | frontier audit: zero hallucinated claims in any run; all traces name real functions in true call order |
+| f5-hard-algo | **2/5 PASS** | 13–32 | passes: one clean 16/16 in 13 passes, one 16/16 at the 32 cap; fails: 12/16 at cap, and 2 runs left the crate UNCOMPILABLE |
+| f6-multifile-bug | **5/5 PASS** | 13–20 | every run fixed checkout.rs (root cause), removed the double conversion, added a regression test mirroring the bug report |
+
+**Verdict:** codebase analysis and multi-file bug fixing are reliable at the
+current config. Hard iterative implementation (f5) is the open front: the
+model demonstrably has the capability (13-pass clean run) but convergence is
+high-variance, and the worst outcomes end broken at the cap.
+
+**Diagnosis (f5 run1, full context-composition audit of the session log):**
+- Dead edit inputs dominate: ~66k chars of the final conversation were
+  tool_use INPUT payloads (old_str/new_str bodies) - bigger than all tool
+  results combined, and worthless once each edit lands. Eviction only
+  targets Tool Results, so these never leave.
+- Failure-dump pileup: 11/11 cargo test runs failed; four near-identical
+  2,660-char failure dumps sat unevicted at the tail third. Signal fraction
+  of cargo output ≈ 40% (rest: warnings/Compiling boilerplate, repeated
+  verbatim across ~8 runs).
+- Stale plan: plan tool called once (pass 5), never updated; all 6 anchors
+  re-injected the same outdated "Next step" for the rest of the turn.
+- The failure Governor fired 5x ("step back: Nx command exited with error")
+  and the model thrashed anyway - the wording names the category but gives
+  no strategy; the final third was 5 edits to the same function with the
+  same 4 tests failing.
+- No eviction/compaction fired (peak ~38k of 64k): this is context QUALITY,
+  not overflow.
+
+### Parked insight - Anchors are not persisted to the Session Log
+
+`agent.rs::log_event` records only the 4 nudge event types; `Rider::Anchor`
+and endgame riders are live-only. A Resume therefore reconstructs a
+Conversation that never contained the anchors the model actually saw.
+Fidelity gap; becomes an ADR candidate if a resume-related cycle proves it
+matters.
+
+### Parked insight - tool_use inputs are invisible to Eviction
+
+Eviction hollows out Tool Results, but on edit-heavy turns the assistant's
+own edit_file inputs are the largest context consumer and never age out.
+Candidate mechanics: elide superseded edit inputs the way stale anchors are
+elided. Needs a design decision (rewriting assistant history is a bigger
+step than rewriting tool results); promote only if a cycle shows wins.
+
+---
+
+## 006 - Voice failure-nudge strategy (inconclusive) → Tool shape: pipefail
+
+**Fixture:** `f5-hard-algo`.
+
+**Tweak A (surface: Voice), cycle 005:** when the dominant failure category
+is CommandError, `failure_nudge` now gives a strategy instead of "step back":
+"Pick the single simplest failing case, trace its exact input through your
+code step by step, and make one targeted fix for it before re-running."
+
+**N=5 (tweak A):** 0/5 - 15/16, 11/16, 2x uncompilable, 9/16, all at the
+32-pass cap. BUT the nudge fired only once across all five runs (baseline
+run1: five times). **Verdict on A: inconclusive, not credited - the trigger
+was blinded, so the wording was never tested.** Kept in place (harmless,
+plausibly right) pending a fair test.
+
+**What blinded it (found by auditing the session logs):** the model
+habitually verifies with `cargo test 2>&1 | head -N`. Under `sh -c`, the
+pipeline's exit code is `head`'s - success. So a red suite arrives as
+`is_error: false`: no failure streak (failure Governor silent), and the
+Verify Governor counts the run as a PASSING verification. Exit-code
+laundering. Piping through `head` also chops cargo's `failures:` section
+off the tail - the model hides its own signal, then "verifies" against it.
+
+**Tweak B (surface: Tool shape), this cycle:**
+- run_command now executes `bash -o pipefail -c` - a piped command reports
+  the producer's failure, not the consumer's success. Mechanical
+  correctness for both Governors.
+- run_command's description appends: "Do not pipe long output through head
+  or tail; output is trimmed automatically."
+
+**N=5 (tweak B, i.e. pipefail + no-pipe hint, with A still in place):**
+
+| run | end state | verdict |
+|-----|-----------|---------|
+| 1 | COMPILE ERROR (E0308 if/else types) at cap | fail |
+| 2 | COMPILE ERROR (E0308 mismatched types) at cap | fail |
+| 3 | 16 passed, 0 failed (at cap) | correct |
+| 4 | 12 passed, 4 failed at cap | fail |
+| 5 | 16 passed, 0 failed (at cap) | correct |
+
+**Verdict: IMPROVEMENT, kept - 3/5 vs baseline 2/5, and verification is now
+honest (the new failure-nudge fired 6x in one run vs ~never when blinded).
+Not credited as clearing the fixture: the residual failure mode is
+convergence at the 32-pass cap - runs that die mid-refactor with type
+errors, or plateaued at 12/16. Wording tweak A remains unproven on its own
+(rode along in both c005-blinded and c006 runs); it stays because it is
+plausibly right and demonstrably harmless.**
+
+**Vet-harness bug (recorded for honesty):** the drive script captured only
+`tail -20` of cargo test output, which sometimes lost the unit-test result
+line and made green runs look broken (c006 initially scored 1/5; true score
+3/5 confirmed by re-applying every run's diff to the clean baseline and
+re-running the suite). Also corrected: baseline run4 was a stack-overflow
+CRASH (unbounded recursion), not a compile failure. Drive scripts now keep
+full cargo output. Frontier-grade judgment applies to the vet half too.
+
+### Corrected f5 scorecard (all runs re-vetted from diffs)
+
+| config | green | failure modes |
+|--------|-------|---------------|
+| baseline (003 config) | 2/5 | 12/16 plateau; compile error; stack-overflow crash |
+| c005 (nudge, blinded) | 0/5 | 15/16 near-miss; 11/16; 2x compile error; 9/16 |
+| c006 (+pipefail) | 3/5 | 2x compile error at cap; 12/16 plateau |
+
+12 of 15 runs ended AT the 32-pass cap: for hard implementation tasks the
+Turn budget, not ability, is the binding constraint. The near-misses
+(15/16, 12/16) are one honest debugging turn away from green.
+
+---
+
+## 007 - Two-turn recovery experiment: INVALID (server shut down mid-batch)
+
+Protocol: same session, turn 1 = the f5 task, turn 2 = "continue until every
+test passes" - designed to measure what an auto-continuation/Handoff
+mechanic would buy, given that 12/15 f5 runs died at the 32-pass cap.
+The model server was turned off during run 1; all c007-* run dirs in
+/tmp/fixture-logs are connection failures, not data. Re-run when the server
+is back: `TAG=c007 /tmp/run-batch2.sh f5-hard-algo`.
+
+---
+
+## Session close 2026-07-12 - state and handoff
+
+Working config: 003 config + failure-nudge strategy wording (unproven,
+harmless) + run_command `bash -o pipefail -c` + no-pipe hint (credited,
+006). All changes uncommitted in the working tree; `cargo test` green
+(867), clippy clean.
+
+Capability scorecard: codebase analysis (f4) 5/5 audited-clean; multi-file
+bug fix (f6) 5/5; hard implementation (f5) 3/5 with the residual failure
+being convergence at the 32-pass cap.
+
+Larger fixes written up with evidence in `PROPOSALS.md` (this directory) -
+priority order: tool-call input eviction, repeated-result supersession,
+auto-continuation/Handoff (validation pre-scripted:
+`TAG=c007 /tmp/run-batch2.sh f5-hard-algo`), stale-plan anchor line,
+rider persistence, cargo noise shaping.
+
+Fixtures live in /tmp/{f2-csv-comments,f3-semantic-bug,f4-analysis,
+f5-hard-algo,f6-multifile-bug} (git repos, PROMPT.txt in each root);
+drive scripts /tmp/run-batch.sh and /tmp/run-batch2.sh; per-run artifacts
+in /tmp/fixture-logs/. /tmp does not survive a reboot - the fixture specs
+are recoverable from this log and PROPOSALS.md.
