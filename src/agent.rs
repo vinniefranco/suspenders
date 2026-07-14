@@ -2356,8 +2356,9 @@ mod tests {
                 // two do not: the tool-spec overhead rides the estimate, so
                 // this number tracks the registry (web_fetch, ADR-0024, moved
                 // it from 4000; run_command's pipefail description moved it
-                // from 4200).
-                context_budget: Some(4230),
+                // from 4200; the no-invented-line-numbers Voice rule moved it
+                // from 4230).
+                context_budget: Some(4320),
                 eviction_slack: Some(0.3),
                 compaction_keep: Some(0.1),
                 ..Default::default()

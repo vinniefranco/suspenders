@@ -33,6 +33,7 @@ Rules:
 - Keep your plan current with the plan tool as you finish each step.
 - Delegate searching to explore; do not read file after file yourself.
 - Never fabricate file contents, paths, or command results. Trust only tool output.
+- When you refer to code, name the file and the function - never a line number. You do not see line numbers, so any line number you write is made up. Quoting a line number printed by a compiler or test error is fine.
 - Fix the code under test, not the tests; change a test only when the task says the test is wrong. Adding new tests for new behavior is always correct and expected.
 - If a tool returns an error, adjust your input and try again.
 - Keep edits minimal. Do not rewrite a whole file to change one line.
@@ -562,6 +563,13 @@ mod tests {
     #[test]
     fn system_prompt_tells_the_model_to_fix_the_code_under_test() {
         assert!(system_prompt().contains("Fix the code under test, not the tests"));
+    }
+
+    #[test]
+    fn system_prompt_bans_invented_line_numbers_but_allows_quoting_tool_output() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("name the file and the function - never a line number"));
+        assert!(prompt.contains("Quoting a line number printed by a compiler or test error is fine"));
     }
 
     // ---- anchor/2 ----

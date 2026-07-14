@@ -585,3 +585,62 @@ truth about how this model fails. Harmless, plausibly right, kept.
 5/5 (line-number fabrication parked), f6 multi-file bug fix 5/5,
 f5 hard implementation 8/10 across c009-hand+c010 with the Recovery
 trigger 14/14 on capped-red turns.
+
+---
+
+## 011 - Voice rule: never cite a line number you didn't see - CREDITED
+
+**Fixture:** f4-analysis. **Diagnosis:** read_file returns raw content
+with no line numbers, so every `file.rs:NN` the model writes is
+structurally a guess - the c009 audit found 3/5 runs fabricating ~90%
+of their citations. Tool-shape alternative (numbering read_file lines)
+rejected: a 9B would paste numbered lines into edit_file old_str.
+
+**Tweak (surface: Voice):** system-prompt rule - "When you refer to
+code, name the file and the function - never a line number. You do
+not see line numbers, so any line number you write is made up.
+Quoting a line number printed by a compiler or test error is fine."
+The carve-out keeps the cycle-002 over-reading failure at bay.
+
+**N=5, same strict frontier audit as c009:** citations dropped 24+ →
+1 (run4's "line 39", still wrong); zero invented functions, zero
+wrong-caller claims, trace order correct 5/5, sorting placed
+correctly 5/5. False claims per run: 0/1/1/2/1 (was ~12/4/1/8/9).
+One fully-clean PASS (was zero). **Credited.**
+
+**Residual (capability floor, not guidance):** 3/5 runs claim
+`next_id` "returns 0 if empty" - the code is `max().unwrap_or(0) + 1`.
+Pattern-matching `unwrap_or(0)` without applying the `+1` is an
+arithmetic-comprehension slip; no prompt rule cheaply fixes it.
+Parked unless a cycle finds a mechanical angle.
+
+---
+
+## 012 - New fixture f7 baseline: hard-implementation does NOT generalize yet
+
+**Fixture (new):** `f7-hard-algo-2` - run-length + dictionary text
+decoder (`N(...)` repeats with nesting, `!k=V;` definitions, `&k;`
+substitution, six escapes, seven DecodeError variants) from a stub
+against 18 oracle tests; reference implementation verified 18/18
+before stubbing. Deliberately different in shape from f5's glob
+matcher: stateful bindings + error taxonomy, not just index-walking.
+
+**Config:** c011 config (Handoff default). **N=5:** 0/5 green, and
+only 3 valid runs - run1 7/18 (T2 capped), run2 9/18 (T2 capped),
+run3 ended with an INFINITE LOOP in decode (oracle tests hung; the
+drive script's `timeout 180` caught it - vet lesson: hangs are an end
+state cargo alone won't show), run4 2/18 (T2 killed at pass 27 by a
+transport error as the model server degraded), run5 invalid (server
+gone - the host stopped resolving mid-batch, cycle-007 style).
+
+**Verdict: f5's 8/10 does not transfer to f7 - this is the new open
+front.** The Recovery Turn fired every time (3/3 valid capped-red
+T1s) but conversions that took 5–28 passes on f5 plateau far from
+green here (7–9 of 18). The gap between "memorized recursion shape"
+(f5's `*` backtracking passed everywhere) and "novel stateful spec"
+(definitions-inside-repeats, error precedence) is the capability
+boundary to tune against next. Forensic audit of runs 1–3 queued;
+candidates after diagnosis: Plan-quality Governor (does the model
+decompose the spec before coding?), Voice on spec-reading, or a
+smaller-oracle-first strategy nudge (make the simplest test pass
+before the integration case).
