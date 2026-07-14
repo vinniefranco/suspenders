@@ -18,7 +18,8 @@
 //!
 //! The Recovery Turn (CONTEXT.md): when this Governor closes a Turn at its
 //! Turn Limit and the Ledger says the work is demonstrably unfinished
-//! (unverified writes, or the last verification failing), it issues the
+//! (unverified writes, or a Dangling Failure - a command string whose most
+//! recent run this Turn failed), it issues the
 //! close-and-open-a-Recovery-Turn Intervention instead of the plain close
 //! ([`recovery`]) - evidence: 12 of 15 hard f5 runs died AT the cap, several
 //! one honest debugging turn from green (LOG.md cycles 005-006). The Agent
@@ -85,23 +86,27 @@ impl Default for RecoverySetpoints {
 pub struct Recovery {
     /// The arm to take, from the shape Setpoint.
     pub shape: RecoveryShape,
-    /// Why the work is unfinished: `true` when the last verification failed,
-    /// `false` when writes went unverified - the fact the Voice's recovery
-    /// prompt is parameterized with.
+    /// Why the work is unfinished: `true` when a verification is failing (a
+    /// Dangling Failure - a command string whose most recent run this Turn
+    /// failed), `false` when writes went unverified - the fact the Voice's
+    /// recovery prompt is parameterized with.
     pub verification_failing: bool,
 }
 
 /// The recovery judgment, consulted only when this Governor is already
 /// closing the Turn at its Turn Limit: `Some` when the Ledger says the work
-/// is demonstrably unfinished (unverified writes, or the last verification
-/// failing) and the request's recovery budget is not spent. A capped Turn
-/// that settled green gets no recovery; `limit` 0 disables the mechanic.
+/// is demonstrably unfinished (unverified writes, or a Dangling Failure) and
+/// the request's recovery budget is not spent. The failing arm is
+/// dangling-failure-based, not last-command-only - a red full-suite run
+/// followed by a green filtered rerun (observed live) must not read as
+/// green. A capped Turn that settled green gets no recovery; `limit` 0
+/// disables the mechanic.
 pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recovery> {
-    let unfinished = ledger.command_failing() || ledger.unverified_writes();
+    let unfinished = ledger.dangling_failure() || ledger.unverified_writes();
     if unfinished && ledger.recoveries_used() < setpoints.limit {
         Some(Recovery {
             shape: setpoints.shape,
-            verification_failing: ledger.command_failing(),
+            verification_failing: ledger.dangling_failure(),
         })
     } else {
         None
@@ -217,12 +222,14 @@ mod tests {
     use super::*;
     use crate::content::ContentBlock;
     use crate::turn::governor::ledger::ToolResult;
+    use serde_json::json;
 
     // One successful edit_file leaves the Turn with unverified writes.
     fn unverified() -> Ledger {
         let mut ledger = Ledger::new(25);
         ledger.record_result(
             "edit_file",
+            &json!({"path": "a.ex"}),
             &ToolResult {
                 content: "edited a.ex",
                 is_error: false,
@@ -319,6 +326,7 @@ mod tests {
         for _ in 0..3 {
             stuck.record_result(
                 "grep",
+                &json!({}),
                 &ToolResult {
                     content: "boom",
                     is_error: true,
@@ -336,6 +344,7 @@ mod tests {
         let mut ledger = Ledger::new(25);
         ledger.record_result(
             "run_command",
+            &json!({"command": "cargo test"}),
             &ToolResult {
                 content: "exit 1",
                 is_error: true,
@@ -359,6 +368,30 @@ mod tests {
     fn a_failing_verification_draws_a_recovery_naming_the_failure() {
         assert_eq!(
             recovery(&RecoverySetpoints::default(), &command_failing()),
+            Some(Recovery {
+                shape: RecoveryShape::Handoff,
+                verification_failing: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_green_filtered_rerun_does_not_launder_the_failure() {
+        // Observed live: a red full-suite run, then `cargo test one_test`
+        // green. The full suite's failure dangles, so the judgment still
+        // fires, naming the failure.
+        let mut ledger = command_failing();
+        ledger.record_result(
+            "run_command",
+            &json!({"command": "cargo test one_test"}),
+            &ToolResult {
+                content: "ok",
+                is_error: false,
+            },
+        );
+
+        assert_eq!(
+            recovery(&RecoverySetpoints::default(), &ledger),
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
                 verification_failing: true,

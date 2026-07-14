@@ -212,6 +212,17 @@ async fn handle_event(agent: &AgentHandle, event: &Event, started: std::time::In
                 "   ## pressure token_estimate={token_estimate} context_budget={context_budget} max_tokens_reserve={max_tokens_reserve} (t={t}s)"
             );
         }
+        Event::EvictionWave { stats } => {
+            println!(
+                "   ## EVICTION wave: results={} cmd_superseded={} read_superseded={} edit_husked={} anchors={} (dead_mass={:.0}%) (t={t}s)",
+                stats.results_elided,
+                stats.cmd_superseded,
+                stats.read_superseded,
+                stats.edits_husked,
+                stats.anchors_elided,
+                stats.dead_mass * 100.0
+            );
+        }
         Event::CompactionProgress { status } => {
             println!("\n   ## COMPACTION {status} (t={t}s)");
         }

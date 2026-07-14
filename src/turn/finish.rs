@@ -40,18 +40,21 @@ pub(super) fn close<D: TurnDeps>(
     Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
 }
 
-// The close-and-open-a-Recovery-Turn Intervention's close half: identical to
-// [`close`] - the turn-limit marker keeps roles alternating - but the outcome
-// carries the Endgame Governor's directive out to the Agent, which executes
-// the opening (CONTEXT.md: Recovery Turn).
+// The close-and-open-a-Recovery-Turn Intervention's close half: like
+// [`close`], but the outcome carries the Endgame Governor's directive out to
+// the Agent, which executes the opening (CONTEXT.md: Recovery Turn). One
+// author for both recovery closes: `closing` is the turn-limit marker at the
+// tool-answering cap and on the tool-insistent reply (roles keep
+// alternating; the insistent markup never enters), or the model's own
+// final-Pass reply on the text settle (ADR-0028 addendum).
 pub(super) fn close_recover<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
-    marker: &str,
+    closing: Vec<ContentBlock>,
     stop_reason: log::StopReason,
     recovery: governor::endgame::Recovery,
 ) -> Outcome {
-    conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
+    conversation.add_assistant_blocks(closing);
     state.deps.checkpoint(&conversation);
     Outcome::Recover(conversation, stop_reason, recovery)
 }
@@ -90,8 +93,10 @@ pub(super) fn fail<D: TurnDeps>(
 // The model stopped without (executable) Tool Calls. The finish-settlement
 // arbiter (ADR-0026) decides how the finish settles; this site translates:
 // a Close appends the turn-limit marker (the reply - ADR-0015's insistent
-// markup - never enters the Conversation), a Standalone Nudge appends the
-// reply and then the user-role Nudge for one more Pass, and no Intervention
+// markup - never enters the Conversation), a CloseRecover appends the marker
+// or - `keep_reply`, the final-Pass text settle - the reply itself before
+// carrying the recovery directive out, a Standalone Nudge appends the reply
+// and then the user-role Nudge for one more Pass, and no Intervention
 // concludes the Turn on the reply. Any tool_use block in this branch is
 // unanswered and is dropped.
 pub(super) fn finish<D: TurnDeps>(
@@ -109,13 +114,18 @@ pub(super) fn finish<D: TurnDeps>(
             voice::turn_limit_marker(),
             reason,
         )),
-        Some(FinishIntervention::CloseRecover { reason, recovery }) => Flow::Done(close_recover(
-            state,
-            conversation,
-            voice::turn_limit_marker(),
+        Some(FinishIntervention::CloseRecover {
             reason,
             recovery,
-        )),
+            keep_reply,
+        }) => {
+            let closing = if keep_reply {
+                close_blocks(&blocks, &stop_reason)
+            } else {
+                vec![ContentBlock::text(voice::turn_limit_marker())]
+            };
+            Flow::Done(close_recover(state, conversation, closing, reason, recovery))
+        }
         Some(FinishIntervention::Standalone { tag, text }) => {
             conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));
             nudge_finish(state, conversation, &text, tag)

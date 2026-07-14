@@ -2,7 +2,9 @@
 //! Turn Ledger; ADR-0026). Facts are written once as each thing happens: the
 //! Tool Calls the Pass carried, per-Tool consecutive-failure tallies (with
 //! error categories and a recency stamp for the last failure), writes and
-//! whether a verification has run since, the Plan's recency (Passes and
+//! whether a verification has run since, the run_command outcomes (the most
+//! recent run, and the most recent outcome per distinct command string),
+//! the Plan's recency (Passes and
 //! successful writes since it last changed - absent while no Plan exists),
 //! and the Pass position (current Pass,
 //! Turn Limit). The Ledger holds facts, never opinions or setpoints -
@@ -98,6 +100,10 @@ pub struct Ledger {
     unverified_writes: bool,
     // The most recent run_command that actually RAN this Turn failed.
     command_failing: bool,
+    // The most recent outcome per distinct run_command command string that
+    // actually RAN this Turn: `true` records a failure not yet followed by a
+    // rerun of the SAME string.
+    command_outcomes: Vec<(String, bool)>,
     // Recovery Turns already consumed serving the current user request - a
     // fact the Agent owns across Turns and stamps once at Turn start (the
     // Agent resets it when a genuine user prompt starts a new request).
@@ -117,6 +123,7 @@ impl Ledger {
             failures: Vec::new(),
             unverified_writes: false,
             command_failing: false,
+            command_outcomes: Vec::new(),
             recoveries_used: 0,
             plan: None,
         }
@@ -150,13 +157,14 @@ impl Ledger {
 
     /// Records one executed (or replaced) Tool Call's outcome: the
     /// consecutive-failure tally for its Tool (a success resets it), the
-    /// write/verification state, and the run_command outcome. Record EVERY
-    /// outcome - a replaced duplicate still counts toward the failure tally,
-    /// and a duplicated write/run_command still moves the verify state.
-    pub fn record_result(&mut self, name: &str, result: &ToolResult) {
+    /// write/verification state, and the run_command outcomes - the last run
+    /// and the per-command-string record. Record EVERY outcome - a replaced
+    /// duplicate still counts toward the failure tally, and a duplicated
+    /// write/run_command still moves the verify state.
+    pub fn record_result(&mut self, name: &str, input: &Value, result: &ToolResult) {
         self.record_failure(name, result);
         self.record_write(name, result.is_error);
-        self.record_command(name, result);
+        self.record_command(name, input, result);
     }
 
     /// A Tool Call batch closed: the failure-recency clock advances.
@@ -216,6 +224,12 @@ impl Ledger {
     /// Did the most recent run_command this Turn fail?
     pub fn command_failing(&self) -> bool {
         self.command_failing
+    }
+
+    /// Is there a command string whose most recent run this Turn failed? A
+    /// passing run clears only its own command string.
+    pub fn dangling_failure(&self) -> bool {
+        self.command_outcomes.iter().any(|(_, failing)| *failing)
     }
 
     /// Recovery Turns already consumed serving the current user request.
@@ -289,17 +303,25 @@ impl Ledger {
     }
 
     // The most recent run_command this Turn: a failing one sets the fact, a
-    // passing one clears it. Exactly one exemption: an Approval-denied
-    // command never ran, so it leaves the fact untouched. A plugin-halted
-    // run_command also never ran, but its halt DOES set the fact - the halt
-    // reads as a failed run and the verify-failed gate follows suit. Only
-    // run_command outcomes touch this.
-    fn record_command(&mut self, name: &str, result: &ToolResult) {
-        if name == "run_command" {
-            if result.content == voice::command_denied() {
-                return;
-            }
-            self.command_failing = result.is_error;
+    // passing one clears it. The per-command-string record moves the same
+    // way, keyed by the call's command string - a passing run clears only
+    // its own entry. Exactly one exemption: an Approval-denied command never
+    // ran, so it leaves the facts untouched. A plugin-halted run_command
+    // also never ran, but its halt DOES set the facts - the halt reads as a
+    // failed run and the verify-failed gate follows suit. Only run_command
+    // outcomes touch this.
+    fn record_command(&mut self, name: &str, input: &Value, result: &ToolResult) {
+        if name != "run_command" || result.content == voice::command_denied() {
+            return;
+        }
+        self.command_failing = result.is_error;
+
+        let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+        match self.command_outcomes.iter_mut().find(|(c, _)| c == command) {
+            Some((_, failing)) => *failing = result.is_error,
+            None => self
+                .command_outcomes
+                .push((command.to_string(), result.is_error)),
         }
     }
 }
@@ -307,6 +329,7 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn ok() -> ToolResult<'static> {
         ToolResult {
@@ -339,9 +362,9 @@ mod tests {
     #[test]
     fn consecutive_failures_tally_per_tool() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &err());
-        ledger.record_result("read_file", &err());
-        ledger.record_result("grep", &err());
+        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record_result("grep", &json!({}), &err());
 
         assert_eq!(ledger.failure_streak("read_file").map(|(n, _)| n), Some(2));
         assert_eq!(ledger.failure_streak("grep").map(|(n, _)| n), Some(1));
@@ -351,9 +374,9 @@ mod tests {
     #[test]
     fn a_success_for_the_tool_resets_its_streak() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &err());
-        ledger.record_result("read_file", &err());
-        ledger.record_result("read_file", &ok());
+        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record_result("read_file", &json!({}), &ok());
 
         assert_eq!(ledger.failure_streak("read_file"), None);
     }
@@ -361,9 +384,10 @@ mod tests {
     #[test]
     fn failures_carry_their_error_categories() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &err());
+        ledger.record_result("read_file", &json!({}), &err());
         ledger.record_result(
             "read_file",
+            &json!({}),
             &ToolResult {
                 content: "enoent: no such file",
                 is_error: true,
@@ -381,7 +405,7 @@ mod tests {
     #[test]
     fn tallies_stamp_their_recency_against_the_batch_clock() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &err());
+        ledger.record_result("read_file", &json!({}), &err());
         ledger.close_batch();
         ledger.close_batch();
 
@@ -394,38 +418,38 @@ mod tests {
     #[test]
     fn a_successful_write_arms_unverified_a_failed_one_doesnt() {
         let mut a = Ledger::new(25);
-        a.record_result("write_file", &ok());
+        a.record_result("write_file", &json!({}), &ok());
         assert!(a.unverified_writes());
 
         let mut b = Ledger::new(25);
-        b.record_result("edit_file", &ok());
+        b.record_result("edit_file", &json!({}), &ok());
         assert!(b.unverified_writes());
 
         let mut c = Ledger::new(25);
-        c.record_result("write_file", &err());
+        c.record_result("write_file", &json!({}), &err());
         assert!(!c.unverified_writes());
     }
 
     #[test]
     fn any_run_command_verifies() {
         let mut base = Ledger::new(25);
-        base.record_result("edit_file", &ok());
+        base.record_result("edit_file", &json!({}), &ok());
 
         let mut a = base.clone();
-        a.record_result("run_command", &ok());
+        a.record_result("run_command", &json!({}), &ok());
         assert!(!a.unverified_writes());
 
         let mut b = base.clone();
-        b.record_result("run_command", &err());
+        b.record_result("run_command", &json!({}), &err());
         assert!(!b.unverified_writes());
     }
 
     #[test]
     fn a_write_after_the_run_command_is_unverified_again() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("edit_file", &ok());
-        ledger.record_result("run_command", &ok());
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record_result("run_command", &json!({}), &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
 
         assert!(ledger.unverified_writes());
     }
@@ -435,19 +459,20 @@ mod tests {
     #[test]
     fn a_failing_run_command_sets_the_fact_a_passing_one_clears_it() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &err());
+        ledger.record_result("run_command", &json!({}), &err());
         assert!(ledger.command_failing());
 
-        ledger.record_result("run_command", &ok());
+        ledger.record_result("run_command", &json!({}), &ok());
         assert!(!ledger.command_failing());
     }
 
     #[test]
     fn a_denied_command_never_ran_so_the_fact_stands() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &err());
+        ledger.record_result("run_command", &json!({}), &err());
         ledger.record_result(
             "run_command",
+            &json!({"command": "cargo test"}),
             &ToolResult {
                 content: crate::voice::command_denied(),
                 is_error: true,
@@ -455,6 +480,41 @@ mod tests {
         );
 
         assert!(ledger.command_failing());
+    }
+
+    // ----- dangling failures per command string -----
+
+    #[test]
+    fn a_green_filtered_rerun_leaves_the_failure_dangling() {
+        let mut ledger = Ledger::new(25);
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        ledger.record_result(
+            "run_command",
+            &json!({"command": "cargo test one_test_name"}),
+            &ok(),
+        );
+
+        assert!(!ledger.command_failing());
+        assert!(ledger.dangling_failure());
+    }
+
+    #[test]
+    fn a_green_rerun_of_the_same_command_clears_its_failure() {
+        let mut ledger = Ledger::new(25);
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
+
+        assert!(!ledger.dangling_failure());
+    }
+
+    #[test]
+    fn a_turn_without_commands_dangles_nothing() {
+        let mut ledger = Ledger::new(25);
+        assert!(!ledger.dangling_failure());
+
+        // Only run_command outcomes touch the record.
+        ledger.record_result("edit_file", &json!({"path": "a.ex"}), &err());
+        assert!(!ledger.dangling_failure());
     }
 
     // ----- recoveries used -----
@@ -477,7 +537,7 @@ mod tests {
         assert_eq!(ledger.writes_since_plan_update(), None);
 
         // Writes before any Plan exists do not start a counter.
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
         ledger.advance_pass();
         assert_eq!(ledger.passes_since_plan_update(), None);
         assert_eq!(ledger.writes_since_plan_update(), None);
@@ -498,7 +558,7 @@ mod tests {
     fn a_plan_update_resets_both_counters_to_its_pass() {
         let mut ledger = Ledger::new(25);
         ledger.note_plan_carried();
-        ledger.record_result("edit_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
         ledger.advance_pass();
         ledger.advance_pass();
         assert_eq!(ledger.passes_since_plan_update(), Some(2));
@@ -517,11 +577,11 @@ mod tests {
         let mut ledger = Ledger::new(25);
         ledger.note_plan_updated();
 
-        ledger.record_result("edit_file", &ok());
-        ledger.record_result("write_file", &ok());
-        ledger.record_result("edit_file", &err());
-        ledger.record_result("run_command", &ok());
-        ledger.record_result("read_file", &ok());
+        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record_result("write_file", &json!({}), &ok());
+        ledger.record_result("edit_file", &json!({}), &err());
+        ledger.record_result("run_command", &json!({}), &ok());
+        ledger.record_result("read_file", &json!({}), &ok());
 
         assert_eq!(ledger.writes_since_plan_update(), Some(2));
     }
