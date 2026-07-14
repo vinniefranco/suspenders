@@ -13,8 +13,10 @@
 pub mod components;
 pub mod composer;
 pub mod draft;
+pub mod history;
 pub mod markdown;
 pub mod picker;
+pub mod streaming;
 pub mod transcript;
 pub mod viewport;
 
