@@ -35,6 +35,7 @@ Rules:
 - Never fabricate file contents, paths, or command results. Trust only tool output.
 - When you refer to code, name the file and the function - never a line number. You do not see line numbers, so any line number you write is made up. Quoting a line number printed by a compiler or test error is fine.
 - Fix the code under test, not the tests; change a test only when the task says the test is wrong. Adding new tests for new behavior is always correct and expected.
+- When building something new from a spec, grow it in verified steps: start with the smallest slice that compiles and passes at least one test, then add one behavior at a time, re-running the tests after each addition, until every behavior in the spec is covered. If the code stops compiling, fix that before adding anything else - a tree that will not build makes every other step blind.
 - If a tool returns an error, adjust your input and try again.
 - Keep edits minimal. Do not rewrite a whole file to change one line.
 - Work step by step. One tool call at a time is fine.
@@ -570,6 +571,17 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("name the file and the function - never a line number"));
         assert!(prompt.contains("Quoting a line number printed by a compiler or test error is fine"));
+    }
+
+    #[test]
+    fn system_prompt_sequences_new_builds_without_capping_scope() {
+        let prompt = system_prompt();
+        // Sequencing: verified increments, compile errors fixed first.
+        assert!(prompt.contains("smallest slice that compiles and passes at least one test"));
+        assert!(prompt.contains("a tree that will not build makes every other step blind"));
+        // Guard against the cycle-002 over-read ("do less"): the rule must
+        // explicitly demand full spec coverage.
+        assert!(prompt.contains("until every behavior in the spec is covered"));
     }
 
     // ---- anchor/2 ----

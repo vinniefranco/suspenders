@@ -2357,8 +2357,9 @@ mod tests {
                 // this number tracks the registry (web_fetch, ADR-0024, moved
                 // it from 4000; run_command's pipefail description moved it
                 // from 4200; the no-invented-line-numbers Voice rule moved it
-                // from 4230).
-                context_budget: Some(4320),
+                // from 4230; the grow-in-verified-steps Voice rule moved it
+                // from 4320).
+                context_budget: Some(4480),
                 eviction_slack: Some(0.3),
                 compaction_keep: Some(0.1),
                 ..Default::default()
