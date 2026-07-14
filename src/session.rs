@@ -84,6 +84,11 @@ pub struct Session {
     /// The Endgame Governor's recovery-shape Setpoint: which arm a Recovery
     /// Turn takes (CONTEXT.md: Handoff is the default shape).
     pub recovery_shape: RecoveryShape,
+    /// The malformed-tool-call re-draw Setpoint (ADR-0030): at most this many
+    /// in-band re-draws may follow a retryable generation error within one
+    /// Turn. `0` disables the mechanic entirely (the loud failure runs
+    /// immediately, as before).
+    pub malformed_retry_budget: u64,
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
@@ -128,6 +133,7 @@ pub struct SessionConfig {
     pub plan_stale_after: u64,
     pub recovery_limit: u64,
     pub recovery_shape: RecoveryShape,
+    pub malformed_retry_budget: u64,
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
@@ -155,6 +161,7 @@ impl SessionConfig {
             plan_stale_after: 8,
             recovery_limit: 1,
             recovery_shape: RecoveryShape::Handoff,
+            malformed_retry_budget: 3,
             scout_pass_limit: 8,
             scout_no_think: true,
             no_think_rescue: true,
@@ -245,6 +252,11 @@ impl SessionConfig {
         // "handoff" | "continuation".
         if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_SHAPE") {
             cfg.recovery_shape = parse_recovery_shape(&v)?;
+        }
+
+        // Non-negative integer; 0 disables the malformed-retry re-draw.
+        if let Ok(v) = std::env::var("SUSPENDERS_MALFORMED_RETRY_BUDGET") {
+            cfg.malformed_retry_budget = parse_int(&v, "SUSPENDERS_MALFORMED_RETRY_BUDGET")?;
         }
 
         // Booleans.
@@ -355,6 +367,7 @@ pub struct SessionOpts {
     pub plan_stale_after: Option<u64>,
     pub recovery_limit: Option<u64>,
     pub recovery_shape: Option<RecoveryShape>,
+    pub malformed_retry_budget: Option<u64>,
     pub scout_pass_limit: Option<u64>,
     pub scout_no_think: Option<bool>,
     pub no_think_rescue: Option<bool>,
@@ -398,6 +411,9 @@ impl Session {
             plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
             recovery_limit: opts.recovery_limit.unwrap_or(config.recovery_limit),
             recovery_shape: opts.recovery_shape.unwrap_or(config.recovery_shape),
+            malformed_retry_budget: opts
+                .malformed_retry_budget
+                .unwrap_or(config.malformed_retry_budget),
             scout_pass_limit: opts.scout_pass_limit.unwrap_or(config.scout_pass_limit),
             scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
@@ -901,6 +917,47 @@ mod tests {
                 .unwrap_err()
                 .0
                 .contains("SUSPENDERS_RECOVERY_LIMIT must be an integer")
+        );
+    }
+
+    // ---- malformed_retry_budget ----
+
+    #[test]
+    fn malformed_retry_budget_defaults_to_3_and_opts_override_including_the_off_value() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.malformed_retry_budget, 3);
+
+        let with_budget = |n: u64| {
+            Session::build(
+                SessionOpts {
+                    malformed_retry_budget: Some(n),
+                    connection: Some(connection()),
+                    ..opts()
+                },
+                &cfg(),
+            )
+            .unwrap()
+        };
+        assert_eq!(with_budget(5).malformed_retry_budget, 5);
+        // 0 is valid: it disables the in-band re-draw entirely.
+        assert_eq!(with_budget(0).malformed_retry_budget, 0);
+    }
+
+    #[test]
+    fn env_malformed_retry_budget_is_a_non_negative_integer() {
+        assert_eq!(
+            parse_int("0", "SUSPENDERS_MALFORMED_RETRY_BUDGET").unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_int("3", "SUSPENDERS_MALFORMED_RETRY_BUDGET").unwrap(),
+            3
+        );
+        assert!(
+            parse_int("-1", "SUSPENDERS_MALFORMED_RETRY_BUDGET")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_MALFORMED_RETRY_BUDGET must be an integer")
         );
     }
 

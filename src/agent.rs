@@ -696,6 +696,22 @@ fn log_event(state: &mut AgentState, event: &Event) {
         Event::WrapUpWarning { text } => log_rider(state, RiderTag::WrapUpWarning, text),
         Event::VerificationPass { text } => log_rider(state, RiderTag::VerificationPass, text),
         Event::FinalPass { text } => log_rider(state, RiderTag::FinalPass, text),
+        // A malformed-tool-call re-draw (ADR-0030): silent to the Conversation
+        // but durable in the log, so a resumed Session can be audited for it.
+        Event::Retry {
+            error,
+            attempt,
+            budget,
+        } => {
+            log_entry(
+                state,
+                LogEntry::Retry {
+                    error: error.clone(),
+                    attempt: *attempt,
+                    budget: *budget,
+                },
+            );
+        }
         _ => {}
     }
 }

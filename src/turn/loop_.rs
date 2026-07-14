@@ -112,6 +112,11 @@ pub(super) struct LoopState<'a, D: TurnDeps> {
     pub(super) ledger: Ledger,
     pub(super) governors: Governors,
     pub(super) plan: Plan,
+    // The malformed-tool-call re-draw Setpoint (ADR-0030), resolved once from
+    // the Session at Turn start: how many in-band re-draws a retryable
+    // generation error may trigger this Turn (0 disables it). A Session fact,
+    // not a Ledger field — the Ledger holds only how many retries were USED.
+    pub(super) malformed_retry_budget: u64,
 }
 
 /// Runs the loop until the model stops asking for tools, the Turn Limit is hit,
@@ -149,6 +154,7 @@ pub async fn run<D: TurnDeps>(
             shape: session.recovery_shape,
         }),
         plan,
+        malformed_retry_budget: session.malformed_retry_budget,
     };
 
     // Recovery Turns already consumed serving this user request: an Agent-
@@ -221,6 +227,11 @@ async fn run_loop<D: TurnDeps>(
         match dispatch(state, conversation, response).await {
             Flow::Done(outcome) => return outcome,
             Flow::Continue(next) => conversation = next,
+            // A malformed-tool-call re-draw (ADR-0030): re-issue the request
+            // from the SAME, unmutated Conversation without advancing the
+            // Pass — the failed draw produced nothing to keep and nothing for
+            // the model to correct, so the retry is silent to the model.
+            Flow::Retry(same) => conversation = same,
         }
     }
 }
@@ -292,6 +303,12 @@ async fn build_request<D: TurnDeps>(
 pub(super) enum Flow {
     Continue(Conversation),
     Done(Outcome),
+    /// A malformed-tool-call generation is re-drawn in-band (ADR-0030): the
+    /// SAME, unmutated Conversation is re-requested without advancing the Pass
+    /// — no batch to answer (no tool_use blocks were produced), so nothing
+    /// enters the Conversation. The loop's third path beside Continue and Done
+    /// (ADR-0018's third fault path: a bounded re-draw beside settle and fail).
+    Retry(Conversation),
 }
 
 async fn dispatch<D: TurnDeps>(
@@ -300,7 +317,7 @@ async fn dispatch<D: TurnDeps>(
     response: Response,
 ) -> Flow {
     match response.stop_reason {
-        StopReason::Error => Flow::Done(finish::fail(state, conversation, response)),
+        StopReason::Error => error_flow(state, conversation, response),
         StopReason::ToolUse => {
             // A :tool_use stop with zero tool_use blocks is a server quirk, not
             // a request for tools; treat it as end_turn (never append an empty
@@ -324,6 +341,33 @@ async fn dispatch<D: TurnDeps>(
             let content = response.content.clone();
             finish::finish(state, conversation, content, other)
         }
+    }
+}
+
+// ADR-0030: a StopReason::Error whose error string classifies as retryable —
+// the malformed-tool-call class only — re-draws the generation in-band while
+// the per-Turn budget holds, instead of failing the whole Turn. The re-draw
+// is a mechanical response to a wire event (it lives here, not in a Governor,
+// and carries no trajectory judgment): increment the Ledger, emit the visible
+// info event (the Agent folds it to a durable `retry` Session Log entry, never
+// into the Conversation), and re-request the SAME, unmutated Conversation. On
+// a non-retryable error, or once the budget is spent (default 3, 0 disables),
+// the existing loud `finish::fail` runs — preserved exactly, only deferred.
+fn error_flow<D: TurnDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    response: Response,
+) -> Flow {
+    if response.is_retryable() && state.ledger.retries_used() < state.malformed_retry_budget {
+        state.ledger.note_retry();
+        let attempt = state.ledger.retries_used();
+        let error = response.error.clone().unwrap_or_default();
+        state
+            .emitter
+            .emit(Event::retry(error, attempt, state.malformed_retry_budget));
+        Flow::Retry(conversation)
+    } else {
+        Flow::Done(finish::fail(state, conversation, response))
     }
 }
 
@@ -899,6 +943,152 @@ mod tests {
         assert_eq!(lm.content.len(), 2);
         assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "partial thought"));
         assert!(matches!(&lm.content[1], ContentBlock::Text { text } if text == "[turn failed]"));
+    }
+
+    // ---- malformed-tool-call re-draw (ADR-0030) ---------------------------
+
+    // The server's constrained-decoding miss, as `llm/stream.rs` wraps it.
+    fn malformed_error() -> Response {
+        Response {
+            content: vec![],
+            stop_reason: StopReason::Error,
+            usage: Usage::default(),
+            error: Some("api_stream_error: Failed to generate a valid tool call".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retryable_error_re_draws_in_band_and_the_turn_completes() {
+        let root = root();
+        let session = session(root.path());
+        // A retryable draw fails, then the re-draw succeeds — the Turn
+        // continues and completes rather than failing.
+        let deps = deps_for(
+            &session,
+            vec![just(malformed_error()), just(text_end("the good answer"))],
+        );
+
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+
+        // The Conversation ends on the re-drawn reply; the failed draw left
+        // nothing behind (no [turn failed] marker).
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "the good answer")
+        );
+        assert!(!conv.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text == "[turn failed]"))));
+
+        let evs = events(&deps);
+        // A retry event was produced (visible + durable), naming attempt 1/3.
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            Event::Retry { attempt: 1, budget: 3, error }
+            if error.contains("Failed to generate a valid tool call")
+        )));
+
+        // The re-draw did NOT advance the Pass: both the failed draw and the
+        // successful re-draw carry MessageStart { pass: 1 } — no extra Pass.
+        let starts: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Event::MessageStart { pass } => Some(*pass),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![1, 1]);
+        // Two model calls: the failed draw and its re-draw.
+        assert_eq!(deps.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_budget_falls_to_finish_fail_as_before() {
+        let root = root();
+        // Budget 1: the first draw fails and re-draws once; a second failure
+        // has no budget left, so it fails loud exactly as today.
+        let session = session_with(
+            root.path(),
+            SessionOpts {
+                malformed_retry_budget: Some(1),
+                ..Default::default()
+            },
+        );
+        let deps = deps_for(
+            &session,
+            vec![just(malformed_error()), just(malformed_error())],
+        );
+
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        match &outcome {
+            Outcome::Failed(reason, _) => {
+                assert!(reason.contains("Failed to generate a valid tool call"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let evs = events(&deps);
+        // Exactly one re-draw was spent before the budget ran out.
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::Retry { .. })),
+            1
+        );
+        assert_eq!(deps.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_disables_the_re_draw_entirely() {
+        let root = root();
+        let session = session_with(
+            root.path(),
+            SessionOpts {
+                malformed_retry_budget: Some(0),
+                ..Default::default()
+            },
+        );
+        let deps = deps_for(&session, vec![just(malformed_error())]);
+
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        assert!(matches!(&outcome, Outcome::Failed(_, _)));
+        let evs = events(&deps);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::Retry { .. })),
+            0
+        );
+        assert_eq!(deps.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_retryable_error_fails_immediately_without_re_drawing() {
+        let root = root();
+        let session = session(root.path());
+        // Context-exceeded is fail-loud by default: no re-draw, even with
+        // budget to spare.
+        let context_exceeded = Response {
+            content: vec![],
+            stop_reason: StopReason::Error,
+            usage: Usage::default(),
+            error: Some("api_stream_error: Context size has been exceeded".to_string()),
+        };
+        let deps = deps_for(&session, vec![just(context_exceeded)]);
+
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        match &outcome {
+            Outcome::Failed(reason, _) => {
+                assert!(reason.contains("Context size has been exceeded"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let evs = events(&deps);
+        assert_eq!(
+            count_voiced(&evs, |e| matches!(e, Event::Retry { .. })),
+            0
+        );
+        // Failed on the first draw: no re-request.
+        assert_eq!(deps.requests.lock().unwrap().len(), 1);
     }
 
     // ---- verify nudge -----------------------------------------------------

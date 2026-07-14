@@ -493,6 +493,18 @@ impl Transcript {
                 (self, vec![Effect::PinBottom])
             }
 
+            // A malformed-tool-call re-draw (ADR-0030): silent to the model's
+            // Conversation, never silent to the operator — an info line marks
+            // each bounded re-draw.
+            Event::Retry {
+                attempt, budget, ..
+            } => {
+                self.push_info(format!(
+                    "malformed tool call - re-drawing ({attempt}/{budget})"
+                ));
+                (self, vec![])
+            }
+
             Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
 
             Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
