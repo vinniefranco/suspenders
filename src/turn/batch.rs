@@ -22,6 +22,7 @@
 
 use serde_json::Value;
 
+use crate::approvals;
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
@@ -29,7 +30,6 @@ use crate::llm::stream::MALFORMED_INPUT_SENTINEL;
 use crate::plan::Update;
 use crate::plugin::Token;
 use crate::plugins;
-use crate::tools;
 use crate::turn::deps::TurnDeps;
 use crate::turn::governor::ledger::ToolResult;
 use crate::turn::governor::{self, AnswerIntervention};
@@ -206,22 +206,23 @@ async fn run_lifecycle<D: TurnDeps>(
         return (reason, true, token.artifacts.clone());
     }
 
-    if tools::requires_approval(name) {
-        // The string the modal shows (the command, or web_fetch's URL) —
-        // extracted from the plugin-adjusted input, as before.
-        let text = tools::approval_text(name, &token.input).unwrap_or_default();
-        let id = new_ref();
-        if state.deps.request_approval(id, text).await {
-            execute_token(state, token).await
-        } else {
-            (
-                voice::command_denied().to_string(),
-                true,
-                Default::default(),
-            )
+    // The one Approval seam: Some(text) gates and text is exactly what the
+    // user reads (the command, or web_fetch's URL), read from the
+    // plugin-adjusted input; None means no gate (approvals::gate_text).
+    match approvals::gate_text(name, &token.input) {
+        Some(text) => {
+            let id = new_ref();
+            if state.deps.request_approval(id, text).await {
+                execute_token(state, token).await
+            } else {
+                (
+                    voice::command_denied().to_string(),
+                    true,
+                    Default::default(),
+                )
+            }
         }
-    } else {
-        execute_token(state, token).await
+        None => execute_token(state, token).await,
     }
 }
 

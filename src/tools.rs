@@ -72,31 +72,6 @@ pub fn verification_specs() -> Vec<ToolSpec> {
         .collect()
 }
 
-/// Whether a Tool Call for this tool needs the user's Approval first:
-/// run_command (arbitrary code) and web_fetch (the one tool that reaches
-/// outside the Project Root, ADR-0024).
-pub fn requires_approval(name: &str) -> bool {
-    matches!(name, "run_command" | "web_fetch")
-}
-
-/// The string the Approval modal shows (and Standing Approval matches, by
-/// exact string equality — ADR-0005): the command for run_command, the URL
-/// for web_fetch. `None` for tools that need no Approval.
-pub fn approval_text(name: &str, input: &Value) -> Option<String> {
-    let field = match name {
-        "run_command" => "command",
-        "web_fetch" => "url",
-        _ => return None,
-    };
-    Some(
-        input
-            .get(field)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-    )
-}
-
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
 /// result to the Result Cap: the plugin-free dispatch path.
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
@@ -244,55 +219,6 @@ mod tests {
                 assert!(schema["properties"].get(key).is_some());
             }
         }
-    }
-
-    #[test]
-    fn requires_approval_is_true_only_for_run_command_and_web_fetch() {
-        assert!(requires_approval("run_command"));
-        assert!(requires_approval("web_fetch"));
-        for name in EXPECTED_NAMES
-            .iter()
-            .filter(|n| **n != "run_command" && **n != "web_fetch")
-        {
-            assert!(!requires_approval(name));
-        }
-        assert!(!requires_approval("no_such_tool"));
-    }
-
-    // ---- approval_text ----
-
-    #[test]
-    fn approval_text_is_the_command_for_run_command() {
-        assert_eq!(
-            approval_text("run_command", &json!({"command": "mix test"})),
-            Some("mix test".to_string())
-        );
-    }
-
-    #[test]
-    fn approval_text_is_the_url_for_web_fetch() {
-        assert_eq!(
-            approval_text("web_fetch", &json!({"url": "https://docs.rs/tokio"})),
-            Some("https://docs.rs/tokio".to_string())
-        );
-    }
-
-    #[test]
-    fn approval_text_is_none_for_tools_that_need_no_approval() {
-        assert_eq!(approval_text("read_file", &json!({"path": "a.ex"})), None);
-        assert_eq!(approval_text("no_such_tool", &json!({})), None);
-    }
-
-    #[test]
-    fn approval_text_falls_back_to_empty_when_the_field_is_missing_or_non_string() {
-        assert_eq!(
-            approval_text("run_command", &json!({})),
-            Some(String::new())
-        );
-        assert_eq!(
-            approval_text("web_fetch", &json!({"url": 42})),
-            Some(String::new())
-        );
     }
 
     // ---- execute ----
