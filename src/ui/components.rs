@@ -683,9 +683,194 @@ const SEGMENT_DARK_BG: Color = Color::Rgb(40, 44, 58);
 const SEP_RIGHT: &str = "\u{e0b0}"; //
 const SEP_LEFT: &str = "\u{e0b2}"; //
 
-/// The semantic kind of one status bar segment. The pure assembly
-/// ([`status_segments`]) speaks kinds; [`segment_style`] is the single place
-/// they become colors (ADR-0008).
+/// The Agent's mode as the status bar conveys it — the semantic distinction
+/// the leftmost block draws. Carries no spinner frame: the animation glyph is
+/// a drawing concern the painter injects, not part of what the bar *means*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeState {
+    /// The Agent is idle — no Turn running.
+    Idle,
+    /// The Agent is running a Turn.
+    Running,
+}
+
+/// One status bar segment's MEANING, ratatui-free (ADR-0019). The pure
+/// assembly ([`status_bar`]) emits these carrying only the display state they
+/// convey — no colors (that is [`segment_style`], ADR-0008), no glyphs, no
+/// padding, no label formatting (all [`StatusSegment::paint`]'s job). This is
+/// the testable seam: the semantics of the bar can be asserted without drawing
+/// a frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusSegment {
+    /// The Agent's mode. Idle vs. Running is the semantic decision; the
+    /// spinner frame the running block animates is supplied at paint time.
+    Mode(ModeState),
+    /// The brand + endpoint the Session connects to.
+    Connection {
+        /// The model connection's base URL.
+        base_url: String,
+    },
+    /// The Ctrl-T Thinking-expansion state. Carries the boolean meaning; the
+    /// `▾`/`▸` marker is chosen by the painter. Always assembled so the toggle
+    /// has feedback even when no Thinking items are on screen.
+    Thinking {
+        /// Whether settled Thinking items are currently expanded.
+        expanded: bool,
+    },
+    /// The Context Budget estimate and how close the Conversation sits to it.
+    /// Carries the [`PressureLevel`] verbatim so the Critical-renders-red rule
+    /// (ADR-0008) is a semantic fact the painter merely routes to a color.
+    Tokens {
+        /// The token estimate for the Conversation.
+        estimate: u64,
+        /// The Context Budget the estimate is measured against.
+        budget: u64,
+        /// How close to the budget the Conversation sits.
+        level: PressureLevel,
+    },
+    /// The viewport scroll position label (`Bot`/`Top`/`NN%`), already derived
+    /// from this frame's geometry by [`scroll_position_label`].
+    Position {
+        /// The vim-ruler style position label.
+        label: String,
+    },
+}
+
+impl StatusSegment {
+    /// The painter's [`SegmentKind`] for this segment — the key into
+    /// [`segment_style`] (ADR-0008). Pure classification, no ratatui: it just
+    /// carries the [`PressureLevel`] through for the Tokens segment so the
+    /// single pressure→color mapping (Critical renders red) still decides the
+    /// style, now provably fed the right level.
+    fn kind(&self) -> SegmentKind {
+        match self {
+            StatusSegment::Mode(ModeState::Idle) => SegmentKind::ModeIdle,
+            StatusSegment::Mode(ModeState::Running) => SegmentKind::ModeRunning,
+            StatusSegment::Connection { .. } => SegmentKind::Connection,
+            StatusSegment::Thinking { .. } => SegmentKind::Thinking,
+            StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
+            StatusSegment::Position { .. } => SegmentKind::Position,
+        }
+    }
+
+    /// The columns this segment occupies once painted, ratatui-free. Kept in
+    /// lockstep with [`StatusSegment::paint`] so the pure fit policy
+    /// ([`StatusBar::fit`]) measures exactly what the painter will draw. The
+    /// spinner glyph and `▾`/`▸` marker are each one column, so the width does
+    /// not depend on the frame the painter later chooses. Exhaustive so a new
+    /// segment kind is a compile error here as well as in the painter.
+    fn cells(&self) -> usize {
+        match self {
+            // " X RUNNING " / " IDLE " — the running spinner glyph is one col.
+            StatusSegment::Mode(ModeState::Running) => " X RUNNING ".chars().count(),
+            StatusSegment::Mode(ModeState::Idle) => " IDLE ".chars().count(),
+            StatusSegment::Connection { base_url } => {
+                format!(" suspenders · {base_url} ").chars().count()
+            }
+            // " M thinking " — the marker is one col in either state.
+            StatusSegment::Thinking { .. } => " M thinking ".chars().count(),
+            StatusSegment::Tokens {
+                estimate, budget, ..
+            } => format!(" ~{estimate}tok / {budget} ").chars().count(),
+            StatusSegment::Position { label } => format!(" {label} ").chars().count(),
+        }
+    }
+}
+
+/// The status bar's assembled MEANING: an ordered left group (mode, then
+/// connection) and right group (thinking, tokens, position), already fitted to
+/// the terminal width. Pure and ratatui-free — this is what the new colocated
+/// tests assert against without drawing a frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusBar {
+    /// Left-anchored segments, highest priority first.
+    pub left: Vec<StatusSegment>,
+    /// Right-anchored segments, in display order.
+    pub right: Vec<StatusSegment>,
+}
+
+impl StatusBar {
+    /// Drops segments until the bar fits `width`, lowest-value first:
+    /// connection, then thinking, then tokens — mode and position survive
+    /// longest. Which segments to show at a given width is a SEMANTIC decision,
+    /// so it lives here in the pure layer; the width arithmetic reads each
+    /// segment's own [`StatusSegment::cells`]. Simple on purpose: a
+    /// partially-truncated segment would garble the powerline blocks.
+    fn fit(mut self, width: usize) -> StatusBar {
+        let drop_order: [fn(&StatusSegment) -> bool; 3] = [
+            |s| matches!(s, StatusSegment::Connection { .. }),
+            |s| matches!(s, StatusSegment::Thinking { .. }),
+            |s| matches!(s, StatusSegment::Tokens { .. }),
+        ];
+        for dropped in drop_order {
+            if self.cells() <= width {
+                break;
+            }
+            self.left.retain(|s| !dropped(s));
+            self.right.retain(|s| !dropped(s));
+        }
+        self
+    }
+
+    /// The columns the segments occupy: their painted widths plus one
+    /// powerline separator glyph per segment (left segments each trail one,
+    /// right segments each lead with one).
+    fn cells(&self) -> usize {
+        let text: usize = self
+            .left
+            .iter()
+            .chain(&self.right)
+            .map(StatusSegment::cells)
+            .sum();
+        text + self.left.len() + self.right.len()
+    }
+}
+
+/// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
+/// ordered semantic segments the bar conveys, fitted to `width`. `tokens` is
+/// `None` when no Context Budget estimate exists yet. No colors, glyphs, or
+/// label strings are decided here — that is the painter's job
+/// ([`render_status_bar`]) — so every rule this expresses (segment order, the
+/// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
+/// tokens-absent-until-estimate rule) is a semantic fact assertable without a
+/// frame.
+pub fn status_bar(
+    width: usize,
+    status: Status,
+    base_url: &str,
+    thinking_expanded: bool,
+    tokens: Option<(u64, u64, PressureLevel)>,
+    position: String,
+) -> StatusBar {
+    let mode = match status {
+        Status::Idle => ModeState::Idle,
+        Status::Running => ModeState::Running,
+    };
+    let left = vec![
+        StatusSegment::Mode(mode),
+        StatusSegment::Connection {
+            base_url: base_url.to_string(),
+        },
+    ];
+
+    let mut right = vec![StatusSegment::Thinking {
+        expanded: thinking_expanded,
+    }];
+    if let Some((estimate, budget, level)) = tokens {
+        right.push(StatusSegment::Tokens {
+            estimate,
+            budget,
+            level,
+        });
+    }
+    right.push(StatusSegment::Position { label: position });
+
+    StatusBar { left, right }.fit(width)
+}
+
+/// The semantic kind of one status bar segment. The painter classifies each
+/// [`StatusSegment`] into a kind ([`StatusSegment::kind`]); [`segment_style`]
+/// is the single place kinds become colors (ADR-0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentKind {
     /// Agent idle — calm green mode block.
@@ -703,14 +888,43 @@ pub enum SegmentKind {
     Position,
 }
 
-/// One assembled segment: its text (padding included) and its kind.
-type Segment = (String, SegmentKind);
+impl StatusSegment {
+    /// Paints this segment into its display text (padding included). The ONLY
+    /// place the drawing details live: the spinner glyph (chosen from the
+    /// adapter's animation `spinner` tick), the `▾`/`▸` Thinking marker, the
+    /// `~Ntok / budget` label, and the block padding. Semantics-in,
+    /// terminal-text-out — the seam ADR-0019 wants.
+    fn paint(&self, spinner: u64) -> String {
+        match self {
+            // While running, the animated braille spinner lives inside the
+            // mode block; the frame counter comes from the adapter's tick.
+            StatusSegment::Mode(ModeState::Running) => {
+                format!(" {} RUNNING ", SPINNER[(spinner as usize) % SPINNER.len()])
+            }
+            StatusSegment::Mode(ModeState::Idle) => " IDLE ".to_string(),
+            StatusSegment::Connection { base_url } => format!(" suspenders · {base_url} "),
+            StatusSegment::Thinking { expanded } => {
+                let marker = if *expanded { "▾" } else { "▸" };
+                format!(" {marker} thinking ")
+            }
+            StatusSegment::Tokens {
+                estimate, budget, ..
+            } => format!(" ~{estimate}tok / {budget} "),
+            StatusSegment::Position { label } => format!(" {label} "),
+        }
+    }
+}
 
 /// The bottom status bar, powerline style: left segments (mode, connection)
 /// fading into the base bg, right segments (thinking, tokens, position)
 /// growing out of it, each block joined by triangle separators. `geometry` is
 /// the `(total_lines, height)` the viewport was measured at THIS frame — the
 /// position segment must agree with what is actually drawn above it.
+///
+/// A thin painter over the pure [`status_bar`] assembly: the semantics (which
+/// segments, in what order, at what [`PressureLevel`]) are decided there; this
+/// turns each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
+/// and [`segment_style`].
 pub fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
@@ -726,120 +940,49 @@ pub fn render_status_bar(
         total_lines,
         height,
     );
-    let (left, right) = status_segments(
+    let bar = status_bar(
         area.width as usize,
         t.status,
-        spinner,
         base_url,
         t.thinking_expanded,
-        tokens_label(t.token_estimate, t.context_budget).map(|label| (label, t.pressure_level)),
+        match (t.token_estimate, t.context_budget) {
+            (Some(estimate), Some(budget)) => Some((estimate, budget, t.pressure_level)),
+            _ => None,
+        },
         position,
     );
 
     let mut spans: Vec<Span> = Vec::new();
-    for (i, (text, kind)) in left.iter().enumerate() {
-        spans.push(Span::styled(text.clone(), segment_style(*kind)));
+    for (i, segment) in bar.left.iter().enumerate() {
+        let kind = segment.kind();
+        spans.push(Span::styled(segment.paint(spinner), segment_style(kind)));
         // The separator wears THIS segment's bg over the NEXT one's (the base
         // bg after the last segment) — that is what draws the triangle.
-        let next_bg = left
+        let next_bg = bar
+            .left
             .get(i + 1)
-            .map(|(_, k)| segment_bg(*k))
+            .map(|s| segment_bg(s.kind()))
             .unwrap_or(BAR_BG);
         spans.push(Span::styled(
             SEP_RIGHT,
-            Style::default().fg(segment_bg(*kind)).bg(next_bg),
+            Style::default().fg(segment_bg(kind)).bg(next_bg),
         ));
     }
-    let gap = (area.width as usize).saturating_sub(segments_width(&left, &right));
+    let gap = (area.width as usize).saturating_sub(bar.cells());
     spans.push(Span::styled(" ".repeat(gap), Style::default().bg(BAR_BG)));
     let mut prev_bg = BAR_BG;
-    for (text, kind) in &right {
+    for segment in &bar.right {
+        let kind = segment.kind();
         spans.push(Span::styled(
             SEP_LEFT,
-            Style::default().fg(segment_bg(*kind)).bg(prev_bg),
+            Style::default().fg(segment_bg(kind)).bg(prev_bg),
         ));
-        spans.push(Span::styled(text.clone(), segment_style(*kind)));
-        prev_bg = segment_bg(*kind);
+        spans.push(Span::styled(segment.paint(spinner), segment_style(kind)));
+        prev_bg = segment_bg(kind);
     }
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(BAR_BG));
     frame.render_widget(bar, area);
-}
-
-/// Assembles the status bar's segments, pure: `(left, right)`, already
-/// fitted to `width` by [`fit_segments`]. The thinking segment reads the
-/// core's `thinking_expanded` directly — Ctrl-T flips it on the next draw,
-/// which is the whole point (the toggle used to be invisible when no Thinking
-/// items were on screen). `tokens` is `None` when no estimate exists yet.
-fn status_segments(
-    width: usize,
-    status: Status,
-    spinner: u64,
-    base_url: &str,
-    thinking_expanded: bool,
-    tokens: Option<(String, PressureLevel)>,
-    position: String,
-) -> (Vec<Segment>, Vec<Segment>) {
-    // While running, the animated braille spinner lives inside the mode
-    // block; the frame counter comes from the adapter's animation tick.
-    let mode = match status {
-        Status::Idle => (" IDLE ".to_string(), SegmentKind::ModeIdle),
-        Status::Running => (
-            format!(" {} RUNNING ", SPINNER[(spinner as usize) % SPINNER.len()]),
-            SegmentKind::ModeRunning,
-        ),
-    };
-    let left = vec![
-        mode,
-        (
-            format!(" suspenders · {base_url} "),
-            SegmentKind::Connection,
-        ),
-    ];
-
-    let marker = if thinking_expanded { "▾" } else { "▸" };
-    let mut right = vec![(format!(" {marker} thinking "), SegmentKind::Thinking)];
-    if let Some((label, level)) = tokens {
-        right.push((format!(" {label} "), SegmentKind::Tokens(level)));
-    }
-    right.push((format!(" {position} "), SegmentKind::Position));
-
-    fit_segments(left, right, width)
-}
-
-/// Drops segments until the bar fits `width`, lowest-value first: connection,
-/// then thinking, then tokens — mode and position survive longest. Simple
-/// width arithmetic on purpose; a partially-truncated segment would garble
-/// the powerline blocks.
-fn fit_segments(
-    mut left: Vec<Segment>,
-    mut right: Vec<Segment>,
-    width: usize,
-) -> (Vec<Segment>, Vec<Segment>) {
-    let drop_order: [fn(SegmentKind) -> bool; 3] = [
-        |k| k == SegmentKind::Connection,
-        |k| k == SegmentKind::Thinking,
-        |k| matches!(k, SegmentKind::Tokens(_)),
-    ];
-    for dropped in drop_order {
-        if segments_width(&left, &right) <= width {
-            break;
-        }
-        left.retain(|(_, kind)| !dropped(*kind));
-        right.retain(|(_, kind)| !dropped(*kind));
-    }
-    (left, right)
-}
-
-/// The columns the segments occupy: their text plus one separator glyph per
-/// segment (left segments each trail one, right segments each lead with one).
-fn segments_width(left: &[Segment], right: &[Segment]) -> usize {
-    let text: usize = left
-        .iter()
-        .chain(right)
-        .map(|(text, _)| text.chars().count())
-        .sum();
-    text + left.len() + right.len()
 }
 
 /// The position segment's label, vim-ruler style: `Bot` at the tail, `Top` at
@@ -998,14 +1141,6 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker) {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// The `~Ntok / budget` label, or `None` when either number is missing.
-fn tokens_label(estimate: Option<u64>, budget: Option<u64>) -> Option<String> {
-    match (estimate, budget) {
-        (Some(estimate), Some(budget)) => Some(format!("~{estimate}tok / {budget}")),
-        _ => None,
-    }
-}
-
 fn join_summary(name: &str, summary: &str) -> String {
     if summary.is_empty() {
         name.to_string()
@@ -1140,47 +1275,51 @@ mod tests {
     // The powerline segment assembly.
     // -----------------------------------------------------------------------
 
-    /// Assembles at `width` with everything present: running, tokens known.
-    fn segments_at(width: usize) -> (Vec<Segment>, Vec<Segment>) {
-        status_segments(
+    /// Assembles the SEMANTIC bar at `width` with everything present: running,
+    /// tokens known at `Ok` pressure. Returns the pure [`StatusBar`] — no
+    /// drawing, no frame.
+    fn bar_at(width: usize) -> StatusBar {
+        status_bar(
             width,
             Status::Running,
-            0,
             "http://localhost:8080",
             false,
-            Some(("~1200tok / 32000".to_string(), PressureLevel::Ok)),
+            Some((1200, 32000, PressureLevel::Ok)),
             "Bot".to_string(),
         )
     }
 
-    fn kinds(segments: &[Segment]) -> Vec<SegmentKind> {
-        segments.iter().map(|(_, kind)| *kind).collect()
+    /// The painter's [`SegmentKind`] for each assembled segment — what routes
+    /// into [`segment_style`]. Asserting on kinds proves the right meaning
+    /// reaches the color mapping without drawing.
+    fn kinds(segments: &[StatusSegment]) -> Vec<SegmentKind> {
+        segments.iter().map(StatusSegment::kind).collect()
     }
 
     #[test]
     fn a_wide_bar_keeps_every_segment_in_order() {
-        let (left, right) = segments_at(200);
+        let bar = bar_at(200);
         assert_eq!(
-            kinds(&left),
+            kinds(&bar.left),
             vec![SegmentKind::ModeRunning, SegmentKind::Connection]
         );
         assert_eq!(
-            kinds(&right),
+            kinds(&bar.right),
             vec![
                 SegmentKind::Thinking,
                 SegmentKind::Tokens(PressureLevel::Ok),
                 SegmentKind::Position,
             ]
         );
-        assert!(segments_width(&left, &right) <= 200);
+        assert!(bar.cells() <= 200);
     }
 
     #[test]
     fn a_narrow_bar_drops_the_connection_segment_first() {
-        let (left, right) = segments_at(60);
-        assert_eq!(kinds(&left), vec![SegmentKind::ModeRunning]);
+        let bar = bar_at(60);
+        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
-            kinds(&right),
+            kinds(&bar.right),
             vec![
                 SegmentKind::Thinking,
                 SegmentKind::Tokens(PressureLevel::Ok),
@@ -1191,92 +1330,188 @@ mod tests {
 
     #[test]
     fn a_narrower_bar_drops_thinking_then_tokens() {
-        let (left, right) = segments_at(40);
-        assert_eq!(kinds(&left), vec![SegmentKind::ModeRunning]);
+        let bar = bar_at(40);
+        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
-            kinds(&right),
+            kinds(&bar.right),
             vec![
                 SegmentKind::Tokens(PressureLevel::Ok),
                 SegmentKind::Position
             ]
         );
 
-        let (left, right) = segments_at(20);
-        assert_eq!(kinds(&left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(kinds(&right), vec![SegmentKind::Position]);
+        let bar = bar_at(20);
+        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
+        assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
     }
 
     #[test]
     fn mode_and_position_survive_even_when_nothing_fits() {
         // Dropping stops at the last two; a sub-minimal width never panics.
-        let (left, right) = segments_at(1);
-        assert_eq!(kinds(&left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(kinds(&right), vec![SegmentKind::Position]);
+        let bar = bar_at(1);
+        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
+        assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
     }
 
     #[test]
-    fn the_thinking_segment_flips_its_marker_with_ctrl_t_state() {
+    fn the_thinking_segment_carries_the_ctrl_t_state() {
+        // The MEANING (expanded true/false) is a semantic fact; the ▾/▸ marker
+        // it paints to is a drawing detail asserted separately below.
         let thinking = |expanded: bool| {
-            let (_, right) = status_segments(
+            let bar = status_bar(
                 200,
                 Status::Idle,
-                0,
                 "http://localhost:8080",
                 expanded,
                 None,
                 "Bot".to_string(),
             );
-            right
-                .iter()
-                .find(|(_, kind)| *kind == SegmentKind::Thinking)
+            bar.right
+                .into_iter()
+                .find(|s| matches!(s, StatusSegment::Thinking { .. }))
                 .expect("thinking segment is always assembled")
-                .0
-                .clone()
         };
-        assert_eq!(thinking(true), " ▾ thinking ");
-        assert_eq!(thinking(false), " ▸ thinking ");
+        assert_eq!(thinking(true), StatusSegment::Thinking { expanded: true });
+        assert_eq!(thinking(false), StatusSegment::Thinking { expanded: false });
+    }
+
+    #[test]
+    fn the_thinking_marker_paints_from_its_state() {
+        assert_eq!(
+            StatusSegment::Thinking { expanded: true }.paint(0),
+            " ▾ thinking "
+        );
+        assert_eq!(
+            StatusSegment::Thinking { expanded: false }.paint(0),
+            " ▸ thinking "
+        );
     }
 
     #[test]
     fn the_tokens_segment_is_absent_until_an_estimate_exists() {
-        let (_, right) = status_segments(
+        let bar = status_bar(
             200,
             Status::Idle,
-            0,
             "http://localhost:8080",
             false,
             None,
             "Bot".to_string(),
         );
         assert_eq!(
-            kinds(&right),
+            kinds(&bar.right),
             vec![SegmentKind::Thinking, SegmentKind::Position]
         );
     }
 
     #[test]
-    fn the_running_mode_segment_carries_the_spinner_frame() {
-        let mode = |spinner: u64| {
-            status_segments(
+    fn critical_pressure_yields_a_tokens_segment_carrying_that_level() {
+        // The "Critical Context Pressure renders red" rule, asserted headless:
+        // the semantic segment carries PressureLevel::Critical, and its kind
+        // routes exactly that level into segment_style (which maps it to red).
+        let bar = status_bar(
+            200,
+            Status::Running,
+            "u",
+            false,
+            Some((99000, 32000, PressureLevel::Critical)),
+            "Bot".to_string(),
+        );
+        let tokens = bar
+            .right
+            .iter()
+            .find(|s| matches!(s, StatusSegment::Tokens { .. }))
+            .expect("tokens segment present when an estimate exists");
+        assert_eq!(
+            *tokens,
+            StatusSegment::Tokens {
+                estimate: 99000,
+                budget: 32000,
+                level: PressureLevel::Critical,
+            }
+        );
+        assert_eq!(tokens.kind(), SegmentKind::Tokens(PressureLevel::Critical));
+    }
+
+    #[test]
+    fn every_pressure_level_flows_through_the_tokens_segment_unchanged() {
+        for level in [
+            PressureLevel::Ok,
+            PressureLevel::Elevated,
+            PressureLevel::Critical,
+        ] {
+            let bar = status_bar(
                 200,
-                Status::Running,
-                spinner,
+                Status::Idle,
                 "u",
                 false,
-                None,
-                "Bot".into(),
-            )
-            .0
-            .remove(0)
-            .0
+                Some((1, 2, level)),
+                "Bot".to_string(),
+            );
+            let tokens = bar
+                .right
+                .iter()
+                .find(|s| matches!(s, StatusSegment::Tokens { .. }))
+                .expect("tokens segment present");
+            assert_eq!(tokens.kind(), SegmentKind::Tokens(level));
+        }
+    }
+
+    #[test]
+    fn the_mode_segment_carries_idle_vs_running_not_the_spinner_frame() {
+        // The semantic distinction is Idle vs. Running; the animation frame is
+        // a drawing input the assembly never sees.
+        let mode = |status| {
+            status_bar(200, status, "u", false, None, "Bot".to_string())
+                .left
+                .into_iter()
+                .next()
+                .unwrap()
         };
-        assert_eq!(mode(0), format!(" {} RUNNING ", SPINNER[0]));
-        assert_eq!(mode(1), format!(" {} RUNNING ", SPINNER[1]));
+        assert_eq!(mode(Status::Idle), StatusSegment::Mode(ModeState::Idle));
+        assert_eq!(
+            mode(Status::Running),
+            StatusSegment::Mode(ModeState::Running)
+        );
+    }
+
+    #[test]
+    fn the_running_mode_segment_paints_the_spinner_frame() {
+        let running = StatusSegment::Mode(ModeState::Running);
+        assert_eq!(running.paint(0), format!(" {} RUNNING ", SPINNER[0]));
+        assert_eq!(running.paint(1), format!(" {} RUNNING ", SPINNER[1]));
         // The counter wraps around the frame set.
         assert_eq!(
-            mode(SPINNER.len() as u64),
+            running.paint(SPINNER.len() as u64),
             format!(" {} RUNNING ", SPINNER[0])
         );
+    }
+
+    #[test]
+    fn the_tokens_segment_paints_the_estimate_and_budget() {
+        assert_eq!(
+            StatusSegment::Tokens {
+                estimate: 1200,
+                budget: 32000,
+                level: PressureLevel::Ok,
+            }
+            .paint(0),
+            " ~1200tok / 32000 "
+        );
+    }
+
+    #[test]
+    fn painted_width_matches_the_fit_measurement() {
+        // The pure fit policy measures StatusSegment::cells; the painter draws
+        // StatusSegment::paint. If they drift, the bar over/underflows. Assert
+        // they agree for every segment the running-with-tokens bar assembles.
+        let bar = bar_at(200);
+        for segment in bar.left.iter().chain(&bar.right) {
+            assert_eq!(
+                segment.cells(),
+                segment.paint(0).chars().count(),
+                "{segment:?} cells() disagrees with painted width"
+            );
+        }
     }
 
     #[test]
