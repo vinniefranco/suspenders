@@ -83,6 +83,24 @@ impl Response {
             error: Some(reason.into()),
         }
     }
+
+    /// Is this error a retryable malformed-tool-call generation (ADR-0030)?
+    /// A missing error string is not retryable — fail loud by default.
+    pub fn is_retryable(&self) -> bool {
+        self.error.as_deref().is_some_and(is_retryable_error)
+    }
+}
+
+/// A conservative classifier over an LLM error string: `true` ONLY for the
+/// malformed-tool-call class (ADR-0030) — the local server's
+/// `Failed to generate a valid tool call`, which `llm/stream.rs` wraps as
+/// `api_stream_error: ...`. Everything else is `false`, fail-loud by default:
+/// `Context size has been exceeded` (the KV-pool 500) and transport errors
+/// are pointless or a budget problem to retry, not a generation one. Mirrors
+/// the string-matching style of
+/// [`failure_category::classify`](crate::turn::governor::ledger::failure_category::classify).
+pub fn is_retryable_error(error: &str) -> bool {
+    error.contains("Failed to generate a valid tool call")
 }
 
 #[cfg(test)]
@@ -103,6 +121,37 @@ mod tests {
         let r = Response::error_with("boom", content.clone(), Usage::default());
         assert_eq!(r.content, content);
         assert_eq!(r.stop_reason, StopReason::Error);
+    }
+
+    // ---- retryable classifier (ADR-0030) ----
+
+    #[test]
+    fn only_the_malformed_tool_call_class_is_retryable() {
+        // The server's constrained-decoding miss, as stream.rs wraps it.
+        assert!(is_retryable_error(
+            "api_stream_error: Failed to generate a valid tool call"
+        ));
+    }
+
+    #[test]
+    fn context_exceeded_transport_errors_and_empty_are_not_retryable() {
+        assert!(!is_retryable_error(
+            "api_stream_error: Context size has been exceeded"
+        ));
+        assert!(!is_retryable_error("request_failed: connection refused"));
+        assert!(!is_retryable_error(""));
+    }
+
+    #[test]
+    fn is_retryable_reads_the_response_error_and_defaults_to_false_when_absent() {
+        let malformed = Response::error("api_stream_error: Failed to generate a valid tool call");
+        assert!(malformed.is_retryable());
+
+        let context = Response::error("api_stream_error: Context size has been exceeded");
+        assert!(!context.is_retryable());
+
+        // No error string set: fail loud by default.
+        assert!(!Response::default().is_retryable());
     }
 
     #[test]
