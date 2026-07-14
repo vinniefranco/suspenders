@@ -21,6 +21,8 @@ use serde_json::Value;
 use crate::content::{ContentBlock, Message, Role};
 use crate::voice;
 
+use super::turn_boundary;
+
 // The write Tools whose landed input the file on disk supersedes. Mirrors the
 // duplicate Governor's list; kept local so the Conversation core carries no
 // turn dependency.
@@ -110,14 +112,12 @@ impl Call<'_> {
 
 fn collect_calls(messages: &[Message]) -> Vec<Call<'_>> {
     let mut calls: Vec<Call<'_>> = Vec::new();
-    // Turn boundary: a user message opening with text (the same predicate
-    // Compaction's cutoff uses). A standalone rider can read as a boundary;
-    // that only narrows same-Turn supersession, never widens it.
+    // Turn ordinal, incremented at each Turn boundary (turn_boundary owns the
+    // rule Compaction's cutoff also reads). Same-Turn supersession compares
+    // this ordinal; only calls sharing a Turn can supersede one another.
     let mut turn = 0usize;
     for (msg_index, message) in messages.iter().enumerate() {
-        if message.role == Role::User
-            && matches!(message.content.first(), Some(ContentBlock::Text { .. }))
-        {
+        if turn_boundary::is_turn_start(message) {
             turn += 1;
         }
         for (block_index, block) in message.content.iter().enumerate() {

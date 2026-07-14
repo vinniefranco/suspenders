@@ -18,6 +18,7 @@
 //! Running it twice changes nothing.
 
 mod supersession;
+mod turn_boundary;
 
 use crate::content::{ContentBlock, Message, Role};
 use crate::voice::{self, FileOps};
@@ -249,7 +250,9 @@ impl Conversation {
 
     /// [`Conversation::for_request`], reporting the Eviction wave it applied:
     /// `None` when no wave fired (the messages went out byte-identical).
-    pub fn for_request_traced(&self) -> (Result<Request, ContextBudgetExhausted>, Option<WaveStats>) {
+    pub fn for_request_traced(
+        &self,
+    ) -> (Result<Request, ContextBudgetExhausted>, Option<WaveStats>) {
         let (evicted, wave) = self.evict_traced();
         let target = evicted
             .context_budget
@@ -358,16 +361,9 @@ impl Conversation {
 
         let msg_count = self.messages.len();
 
-        // Indexes of turn-start user messages (role=user, first block text).
-        let turn_start_indexes: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                m.role == Role::User && matches!(m.content.first(), Some(ContentBlock::Text { .. }))
-            })
-            .map(|(idx, _)| idx)
-            .collect();
+        // Indexes of turn-start user messages (turn_boundary owns the rule).
+        let turn_start_indexes: Vec<usize> =
+            turn_boundary::turn_start_indices(&self.messages).collect();
 
         // Walk backwards from the newest message, accumulating char estimate.
         // reversed idx increments; stop when accumulated >= keep_recent.
