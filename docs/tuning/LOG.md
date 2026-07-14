@@ -790,16 +790,32 @@ reproduced the head-101 artifact (Dangling Failure present, settled
 with the full endgame schedule and closed plain.
 
 **Verdict:** faults 1–2 **CREDITED** (unit-proven correctness). Fault 3
-(the Voice steer) **UNCREDITED — pending N=5.** It never ran against the
-scorecard; the only evidence is anecdotal and mixed — of two live runs
-that ran the suite, one obeyed the steer (`cargo test` bare, green) and
-one ignored it (`| head`, false 101). Consistent with the standing prior
-that a 9B complies with mechanics, not requests — which is exactly why
-the **trigger gate, not the steer, is load-bearing**. Next scorecard
-batch: run the steer across f4/f5/f6/f7 and confirm it neither regresses
-the green rate nor pushes prompt tokens past the budget the compaction
-round-trip test pins (`agent/tests.rs` bumped 4480→4640 for the added
-rule).
+(the Voice steer) **KEPT, NOT CREDITED** — N=5 scorecard run below.
+
+**N=5 scorecard (steer present, qwen3.5-9b, defaults):**
+
+| fixture | green | c013 baseline | `\| head` runs | recovery/handoff |
+|---|---|---|---|---|
+| f4 analysis | 5/5 ANALYSIS.md | 5/5 | 0/5 | 0 (read-only) |
+| f6 multifile bug | 5/5 | 5/5 | 0/5 | 0 |
+| f5 hard-algo | 3/5 (run1 no-compile, run4 2 failing) | ~4/5 (8/10) | 4/5 | 4× (all wrote) |
+| f7 hard-algo-2 | 0/4 (run5 aborted; run1–2 turn-error, run3–4 capped) | 1/4 | 2/4 (run4 ×14) | 2× (both wrote) |
+
+Two findings. **(a) No regression** — green rates sit within stochastic
+N=5 noise of baseline; the rule and its token bump hurt nothing.
+**(b) Not obeyed** — the 9B still pipes `cargo test | head` in 4/5 f5 and
+2/4 f7 runs (f7-run4 fourteen times). So the steer demonstrably does NOT
+stop the footgun; it is kept as harmless-and-honest (it encodes the
+audited failure), not credited. Confirms the standing prior — a 9B
+complies with mechanics, not requests — and cements that the **trigger
+gate, not the steer, is load-bearing**. The parked insight below is now
+promoted: the real fix for the `head` artifact must be mechanical.
+
+**Fault 1/2 validated on the scorecard too:** every recovery fired on a
+run where the model wrote code (legitimate unfinished-implementation
+recovery — several *rescued* a capped run to green), and the read-only
+fixture f4 fired zero recoveries across all five runs. No c014-class
+false recovery observed.
 
 **Caveat, not reproduced live:** nondeterminism meant no single post-fix
 run hit the exact original triple — cap **and** Dangling Failure **and**
@@ -818,3 +834,54 @@ false-recover. If the c014 Voice steer proves unreliable at N=5, the
 next lever is mechanical, not prose — e.g. run_command detecting a
 consumer-closed pipe, or the drive/vet scripts flagging it. Promote to a
 cycle if it recurs on the scorecard.
+
+---
+
+## 015 — A malformed tool call kills the whole Turn (no retry, no recovery) — OPEN
+
+**Status: OPEN.** No tweak yet — a design look, then drive on f7 at N=5.
+Promoted from the c013 parked insight ("malformed tool calls kill the
+whole Turn") because it recurred on the c014 scorecard.
+
+**Observed failure:** a single bad generation ends the entire Turn. The
+model emits `api_stream_error: Failed to generate a valid tool call`
+(llm/stream.rs sets `error`, response carries `StopReason::Error`), and
+the Turn loop maps that at `loop_.rs:303` to
+`Flow::Done(finish::fail(...))` — a terminal `failed` settle
+(finish.rs:185). Because it is a failure, not a Turn-Limit close, the
+Endgame never judges it: no Verification Pass, no final Pass, no Recovery
+Turn. One transient malformed generation discards the whole Turn's work.
+
+**Evidence (3 observations):**
+- c013-run2: died at pass 9, mid-run.
+- c014 f7-run1 and f7-run2: both settled `failed/error`, 1 pass / 17
+  failing — cost 2 of 4 f7 runs outright. f7's 0/4 this cycle is partly
+  this bug, not capability.
+
+**Why it matters:** variance, not capability — the same framing that
+justified the Recovery Turn (ADR-0028). A malformed generation is a
+transient; the Conversation so far is intact and one clean re-request
+would likely continue.
+
+**Candidate levers (pick after a design look):**
+1. *Bounded per-Pass retry.* Treat this stream-error class like a
+   truncated tool call (ADR-0009 neighborhood): re-request the Pass once
+   or twice rather than failing the Turn. Needs a Setpoint bounding
+   retries per Turn, and a retry that still fails falls through to the
+   current `finish::fail` path — no infinite loop on a persistently
+   malforming model.
+2. *Classify the error.* Distinguish transient generation errors
+   (malformed tool call, decode stall) from hard transport failures;
+   only the transient class retries. A hard 500/connection error must
+   still fail loud.
+3. Rejected shape — route the error through the settle path so Recovery
+   can act: recovery is cap-shaped (it needs a Turn-Limit close and the
+   Ledger's unfinished-work facts), and a mid-Turn error is neither. A
+   per-Pass retry fits the failure mode; a Recovery Turn does not.
+
+**Open questions for the design look:** does `StopReason::Error` already
+carry enough to tell the malformed-tool-call class from a transport
+error, or does the classifier need a new signal from llm/stream.rs? Is a
+re-requested Pass byte-identical enough to keep the server prompt cache
+warm? When built, a new per-Pass retry behavior in the loop is likely an
+ADR (it changes the fault model — ADR-0018 neighborhood).
