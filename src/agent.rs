@@ -814,18 +814,20 @@ fn start_recovery(state: &mut AgentState, recovery: Recovery) {
             state.conversation.merge_user_text(prompt);
             spawn_turn(state);
         }
-        RecoveryShape::Handoff => spawn_handoff_turn(state, prompt),
+        RecoveryShape::Handoff => spawn_handoff_turn(state, prompt, recovery.failing_command),
     }
 }
 
 // The Handoff arm: the Recovery Turn task first seeds the fresh Conversation
-// (the compaction machinery's LLM narrative + mechanical facts + the final
+// (the compaction machinery's LLM narrative + mechanical facts + the
 // verification verbatim + the prompt — a long LLM call, so it runs in the Turn
 // task, never on the Agent actor, per ADR-0012), posts the seed back
 // (`HandoffSeeded` logs it and retires the old Conversation), then runs the
 // Turn over the seeded Conversation. The Plan is harness-owned and rides
-// RunOpts verbatim — it survives the retirement untouched.
-fn spawn_handoff_turn(state: &mut AgentState, prompt: String) {
+// RunOpts verbatim — it survives the retirement untouched. `failing_command`
+// (the Dangling Failure the recovery names, `None` on an unverified-writes
+// recovery) tells the seed which command's result to carry verbatim.
+fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: Option<String>) {
     reset_turn_state(state);
     let dying = state.conversation.clone();
     let compaction = state.compaction.clone();
@@ -837,7 +839,13 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String) {
 
     let turn = tokio::spawn(async move {
         let seeded = compaction
-            .seed_handoff(&dying, &prompt, llm.as_ref(), &connection)
+            .seed_handoff(
+                &dying,
+                &prompt,
+                failing_command.as_deref(),
+                llm.as_ref(),
+                &connection,
+            )
             .await;
         let _ = tx.send(Msg::Turn(TurnMsg::HandoffSeeded {
             conversation: seeded.conversation.clone(),
@@ -888,7 +896,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     // opening. A cancel that raced the close wins — cancel means stop
     // everything, recovery included.
     let recovery = match (&outcome, state.cancel_flag) {
-        (LoopOrDown::Loop(LoopOutcome::Recover(_, _, recovery)), false) => Some(*recovery),
+        (LoopOrDown::Loop(LoopOutcome::Recover(_, _, recovery)), false) => Some(recovery.clone()),
         _ => None,
     };
 

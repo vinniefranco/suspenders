@@ -124,17 +124,26 @@ impl Compaction {
     /// Seeds a Handoff (CONTEXT.md: Handoff — the Recovery Turn shape that
     /// retires the Conversation): the model narrative over the WHOLE dying
     /// Conversation, the mechanical facts appended outside the LLM exactly as
-    /// Compaction does, the final verification result verbatim, and `prompt`
-    /// merged onto the seed message so it starts the fresh Conversation.
+    /// Compaction does, the verification result verbatim, and `prompt` merged
+    /// onto the seed message so it starts the fresh Conversation.
+    ///
+    /// The verification result is the Dangling Failure's OWN output when
+    /// `failing_command` is `Some` (the command the recovery prompt names —
+    /// CONTEXT.md: Handoff, ADR-0028 addendum 2026-07-14), so a red suite
+    /// followed by a green filtered rerun still hands over the red result the
+    /// prompt is about, not the last (green) command. It is the last
+    /// run_command's result when `None` (an unverified-writes recovery, where
+    /// no command dangles).
     ///
     /// Never fails: a failed summarization degrades to the mechanical
-    /// skeleton alone (facts + final verification + prompt) — bounded
+    /// skeleton alone (facts + verification + prompt) — bounded
     /// downside, the recovery still happens. The Plan is harness-owned and
     /// never enters the seed; it survives verbatim outside the Conversation.
     pub async fn seed_handoff(
         &self,
         conv: &Conversation,
         prompt: &str,
+        failing_command: Option<&str>,
         llm: &dyn Llm,
         connection: &Connection,
     ) -> Handoff {
@@ -146,8 +155,11 @@ impl Compaction {
             .original_task
             .clone()
             .or_else(|| conv.original_task().map(|s| s.to_string()));
-        let verification =
-            crate::conversation::last_command_result(&conv.messages).map(|s| s.to_string());
+        let verification = match failing_command {
+            Some(cmd) => crate::conversation::command_result_for(&conv.messages, cmd),
+            None => crate::conversation::last_command_result(&conv.messages),
+        }
+        .map(|s| s.to_string());
 
         let narrative = self.summarize(&conv.messages, llm, connection).await.ok();
 
@@ -623,7 +635,7 @@ mod tests {
         let conv = dying_conversation();
 
         let handoff = Compaction::new()
-            .seed_handoff(&conv, "[recovery prompt]", &fake, &connection())
+            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &connection())
             .await;
 
         // One user message: the seed with the prompt merged onto it.
@@ -659,7 +671,7 @@ mod tests {
             file_ops: FileOps::default(),
         };
         let handoff = prev
-            .seed_handoff(&conv, "[recovery prompt]", &fake, &connection())
+            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &connection())
             .await;
 
         assert_eq!(handoff.narrative, None);
@@ -683,11 +695,58 @@ mod tests {
         conv.add_assistant_blocks(vec![ContentBlock::text("[turn limit reached]")]);
 
         let handoff = Compaction::new()
-            .seed_handoff(&conv, "[recovery prompt]", &fake, &connection())
+            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &connection())
             .await;
 
         assert_eq!(handoff.verification, None);
         assert!(message_text(&handoff.conversation.messages[0]).contains("- none was run"));
+    }
+
+    #[tokio::test]
+    async fn seed_handoff_carries_the_failing_commands_own_result_not_the_last() {
+        // The exact contradiction from session 20260714-174034: a red full
+        // suite, then a green filtered rerun (a DIFFERENT command). The last
+        // command is green, but the recovery prompt names the red one — so the
+        // seed must carry the RED result, threaded by `failing_command`.
+        let fake = FakeLlm::script(vec![Entry::just(ok_response("narrative"))]);
+        let mut conv = Conversation::new("You are Baud.", opts());
+        conv.add_user_text("fix the tests");
+        conv.add_assistant_blocks(vec![ContentBlock::tool_use(
+            "r1",
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+        )]);
+        conv.add_tool_results(
+            vec![ContentBlock::tool_result("r1", "exit 101\n2 failed", true)],
+            Vec::new(),
+        );
+        conv.add_assistant_blocks(vec![ContentBlock::tool_use(
+            "r2",
+            "run_command",
+            serde_json::json!({"command": "cargo test one_test"}),
+        )]);
+        conv.add_tool_results(
+            vec![ContentBlock::tool_result("r2", "exit 0\n1 passed", false)],
+            Vec::new(),
+        );
+        conv.add_assistant_blocks(vec![ContentBlock::text("[turn limit reached]")]);
+
+        let handoff = Compaction::new()
+            .seed_handoff(
+                &conv,
+                "[recovery prompt]",
+                Some("cargo test"),
+                &fake,
+                &connection(),
+            )
+            .await;
+
+        // The seed carries the FAILING command's own result, not the last
+        // (passing) one.
+        assert_eq!(handoff.verification.as_deref(), Some("exit 101\n2 failed"));
+        let seed_text = message_text(&handoff.conversation.messages[0]);
+        assert!(seed_text.contains("exit 101\n2 failed"));
+        assert!(!seed_text.contains("exit 0\n1 passed"));
     }
 
     // ---- recovery_capture ----

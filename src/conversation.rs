@@ -631,6 +631,41 @@ pub fn last_command_result(messages: &[Message]) -> Option<&str> {
         })
 }
 
+/// The newest run_command Tool Result whose Tool Call ran `command`, verbatim —
+/// the Handoff's verification fact when a Dangling Failure drives the recovery
+/// (CONTEXT.md: Handoff — the Dangling Failure's OWN output, the command the
+/// recovery prompt names, never merely the last command run). Because the
+/// dangling command's most recent run failed, this returns its failing output.
+/// `None` when no run_command with that command string ever produced a result.
+pub fn command_result_for<'a>(messages: &'a [Message], command: &str) -> Option<&'a str> {
+    let command_ids: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, name, input, .. }
+                if name == "run_command"
+                    && input.get("command").and_then(|c| c.as_str()) == Some(command) =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.content.iter().rev())
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if command_ids.contains(tool_use_id.as_str()) => Some(content.as_str()),
+            _ => None,
+        })
+}
+
 // ceil(chars / 3.5) — a 3.5 ratio, not a div_ceil by 7, so keep as-is.
 fn tokens_for_chars(chars: u64) -> u64 {
     #[allow(clippy::manual_div_ceil)]
@@ -1480,6 +1515,77 @@ mod tests {
             Message::user(vec![tool_result("l1", "defmodule A")]),
         ];
         assert_eq!(last_command_result(&read_only), None);
+    }
+
+    // ---- command_result_for/2 ----
+
+    #[test]
+    fn command_result_for_returns_the_newest_result_of_the_named_command() {
+        // A red full suite, then a green filtered rerun (a DIFFERENT string):
+        // the full suite dangles, and its own failing output — not the last
+        // command run — is what the Handoff must carry.
+        let messages = vec![
+            Message::assistant(vec![tool_use_input(
+                "r1",
+                "run_command",
+                json!({"command": "cargo test"}),
+            )]),
+            Message::user(vec![tool_result_err("r1", "exit 101\n2 failed", true)]),
+            Message::assistant(vec![tool_use_input(
+                "r2",
+                "run_command",
+                json!({"command": "cargo test one_test"}),
+            )]),
+            Message::user(vec![tool_result("r2", "exit 0\n1 passed")]),
+        ];
+
+        assert_eq!(
+            command_result_for(&messages, "cargo test"),
+            Some("exit 101\n2 failed")
+        );
+        assert_eq!(
+            command_result_for(&messages, "cargo test one_test"),
+            Some("exit 0\n1 passed")
+        );
+    }
+
+    #[test]
+    fn command_result_for_returns_the_newest_run_of_the_same_string() {
+        // The same command string run twice: the newest result wins.
+        let messages = vec![
+            Message::assistant(vec![tool_use_input(
+                "r1",
+                "run_command",
+                json!({"command": "cargo test"}),
+            )]),
+            Message::user(vec![tool_result_err("r1", "exit 101\nfirst", true)]),
+            Message::assistant(vec![tool_use_input(
+                "r2",
+                "run_command",
+                json!({"command": "cargo test"}),
+            )]),
+            Message::user(vec![tool_result_err("r2", "exit 101\nsecond", true)]),
+        ];
+
+        assert_eq!(
+            command_result_for(&messages, "cargo test"),
+            Some("exit 101\nsecond")
+        );
+    }
+
+    #[test]
+    fn command_result_for_is_none_without_a_matching_command() {
+        assert_eq!(command_result_for(&[], "cargo test"), None);
+
+        let other = vec![
+            Message::assistant(vec![tool_use_input(
+                "r1",
+                "run_command",
+                json!({"command": "cargo build"}),
+            )]),
+            Message::user(vec![tool_result("r1", "ok")]),
+        ];
+        assert_eq!(command_result_for(&other, "cargo test"), None);
     }
 
     // ---- inject_anchor/2 ----

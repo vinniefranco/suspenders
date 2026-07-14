@@ -82,7 +82,7 @@ impl Default for RecoverySetpoints {
 /// [`super::FinishIntervention::CloseRecover`], carried out of the Turn to the
 /// Agent (which executes the Intervention — opening the next Turn, or seeding
 /// the fresh Conversation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovery {
     /// The arm to take, from the shape Setpoint.
     pub shape: RecoveryShape,
@@ -91,6 +91,12 @@ pub struct Recovery {
     /// failed), `false` when writes went unverified — the fact the Voice's
     /// recovery prompt is parameterized with.
     pub verification_failing: bool,
+    /// The Dangling Failure's command string, so the Handoff seed can carry
+    /// that command's OWN failing result verbatim — the command the recovery
+    /// prompt names, never merely the last command run (ADR-0028 addendum
+    /// 2026-07-14). `None` on an unverified-writes-only recovery (nothing
+    /// dangles), which keeps the pre-existing last-command seed.
+    pub failing_command: Option<String>,
 }
 
 /// The recovery judgment, consulted only when this Governor is already
@@ -99,14 +105,19 @@ pub struct Recovery {
 /// the request's recovery budget is not spent. The failing arm is
 /// dangling-failure-based, not last-command-only — a red full-suite run
 /// followed by a green filtered rerun (observed live) must not read as
-/// green. A capped Turn that settled green gets no recovery; `limit` 0
+/// green. The dangling-failure arm additionally requires that a write landed
+/// this Turn: a failing command during pure exploration is not unfinished
+/// implementation, so a read-only Turn draws no recovery (ADR-0028 addendum
+/// 2026-07-14). A capped Turn that settled green gets no recovery; `limit` 0
 /// disables the mechanic.
 pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recovery> {
-    let unfinished = ledger.dangling_failure() || ledger.unverified_writes();
+    let unfinished = ledger.unverified_writes()
+        || (ledger.dangling_failure() && ledger.wrote_this_turn());
     if unfinished && ledger.recoveries_used() < setpoints.limit {
         Some(Recovery {
             shape: setpoints.shape,
             verification_failing: ledger.dangling_failure(),
+            failing_command: ledger.dangling_command().map(str::to_string),
         })
     } else {
         None
@@ -339,9 +350,19 @@ mod tests {
 
     // ---- recovery/2 ----
 
-    // The most recent run_command this Turn failed.
+    // The model wrote, then its verification dangles red: a successful edit
+    // followed by a failing run_command. The write is the evidence the
+    // dangling-failure arm requires (ADR-0028 addendum 2026-07-14).
     fn command_failing() -> Ledger {
         let mut ledger = Ledger::new(25);
+        ledger.record_result(
+            "edit_file",
+            &json!({"path": "a.ex"}),
+            &ToolResult {
+                content: "edited a.ex",
+                is_error: false,
+            },
+        );
         ledger.record_result(
             "run_command",
             &json!({"command": "cargo test"}),
@@ -360,17 +381,22 @@ mod tests {
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
                 verification_failing: false,
+                failing_command: None,
             })
         );
     }
 
     #[test]
     fn a_failing_verification_draws_a_recovery_naming_the_failure() {
+        // The model wrote, then its verification dangles red (see
+        // `command_failing`): the dangling-failure arm fires, naming the
+        // failing command so the Handoff seed can carry its own result.
         assert_eq!(
             recovery(&RecoverySetpoints::default(), &command_failing()),
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
                 verification_failing: true,
+                failing_command: Some("cargo test".to_string()),
             })
         );
     }
@@ -395,8 +421,30 @@ mod tests {
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
                 verification_failing: true,
+                failing_command: Some("cargo test".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn a_dangling_failure_with_no_writes_draws_no_recovery() {
+        // The exact bug (session 20260714-174034): a read-only task ran a
+        // failing command (a `head`-truncated pipe reporting a spurious 101),
+        // never wrote, and settled green at the cap. With zero writes the
+        // dangling-failure arm must NOT fire — that is exploration, not
+        // unfinished implementation.
+        let mut ledger = Ledger::new(25);
+        ledger.record_result(
+            "run_command",
+            &json!({"command": "cargo test --lib 2>&1 | head -200"}),
+            &ToolResult {
+                content: "exit 101",
+                is_error: true,
+            },
+        );
+        assert!(ledger.dangling_failure());
+        assert!(!ledger.wrote_this_turn());
+        assert_eq!(recovery(&RecoverySetpoints::default(), &ledger), None);
     }
 
     #[test]

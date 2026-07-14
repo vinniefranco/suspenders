@@ -98,6 +98,13 @@ pub struct Ledger {
     // Writes and whether a verification has run since: true from a successful
     // write until the next run_command.
     unverified_writes: bool,
+    // A successful write landed this Turn. Monotonic — set once and NEVER
+    // cleared, unlike `unverified_writes` (which a run_command clears): it
+    // records that implementation happened at all, the evidence the
+    // dangling-failure recovery arm requires so a read-only Turn that merely
+    // ran a failing command opens no Recovery Turn (ADR-0028 addendum
+    // 2026-07-14).
+    wrote_this_turn: bool,
     // The most recent run_command that actually RAN this Turn failed.
     command_failing: bool,
     // The most recent outcome per distinct run_command command string that
@@ -122,6 +129,7 @@ impl Ledger {
             pass_calls: Vec::new(),
             failures: Vec::new(),
             unverified_writes: false,
+            wrote_this_turn: false,
             command_failing: false,
             command_outcomes: Vec::new(),
             recoveries_used: 0,
@@ -221,6 +229,15 @@ impl Ledger {
         self.unverified_writes
     }
 
+    /// Did any successful write land this Turn? Monotonic — once true it
+    /// stays true, even after a later run_command clears `unverified_writes`.
+    /// The evidence the dangling-failure recovery arm requires: a failing
+    /// command during pure exploration is not unfinished implementation
+    /// (ADR-0028 addendum 2026-07-14).
+    pub fn wrote_this_turn(&self) -> bool {
+        self.wrote_this_turn
+    }
+
     /// Did the most recent run_command this Turn fail?
     pub fn command_failing(&self) -> bool {
         self.command_failing
@@ -230,6 +247,20 @@ impl Ledger {
     /// passing run clears only its own command string.
     pub fn dangling_failure(&self) -> bool {
         self.command_outcomes.iter().any(|(_, failing)| *failing)
+    }
+
+    /// The command string of the Dangling Failure: the most-recently-recorded
+    /// `command_outcomes` entry whose most recent run still failed. `None`
+    /// when nothing dangles. When several dangle, the last one recorded wins —
+    /// the command the recovery prompt names, so its own failing result seeds
+    /// the Handoff (ADR-0028 addendum 2026-07-14), never merely the last
+    /// command run.
+    pub fn dangling_command(&self) -> Option<&str> {
+        self.command_outcomes
+            .iter()
+            .rev()
+            .find(|(_, failing)| *failing)
+            .map(|(command, _)| command.as_str())
     }
 
     /// Recovery Turns already consumed serving the current user request.
@@ -296,6 +327,7 @@ impl Ledger {
             self.unverified_writes = false;
         } else if WRITE_TOOLS.contains(&name) && !is_error {
             self.unverified_writes = true;
+            self.wrote_this_turn = true;
             if let Some(plan) = &mut self.plan {
                 plan.writes_since += 1;
             }
@@ -454,6 +486,37 @@ mod tests {
         assert!(ledger.unverified_writes());
     }
 
+    #[test]
+    fn a_successful_write_marks_the_turn_and_the_mark_survives_a_run_command() {
+        let mut ledger = Ledger::new(25);
+        assert!(!ledger.wrote_this_turn());
+
+        ledger.record_result("edit_file", &json!({}), &ok());
+        assert!(ledger.wrote_this_turn());
+
+        // Monotonic: the run_command clears unverified_writes but never the
+        // wrote-this-turn mark.
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
+        assert!(!ledger.unverified_writes());
+        assert!(ledger.wrote_this_turn());
+    }
+
+    #[test]
+    fn a_failed_write_does_not_mark_the_turn() {
+        let mut ledger = Ledger::new(25);
+        ledger.record_result("write_file", &json!({}), &err());
+        assert!(!ledger.wrote_this_turn());
+    }
+
+    #[test]
+    fn a_read_only_turn_never_marks_the_turn() {
+        let mut ledger = Ledger::new(25);
+        ledger.record_result("read_file", &json!({}), &ok());
+        ledger.record_result("grep", &json!({}), &ok());
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        assert!(!ledger.wrote_this_turn());
+    }
+
     // ----- the most recent run_command -----
 
     #[test]
@@ -515,6 +578,38 @@ mod tests {
         // Only run_command outcomes touch the record.
         ledger.record_result("edit_file", &json!({"path": "a.ex"}), &err());
         assert!(!ledger.dangling_failure());
+    }
+
+    #[test]
+    fn the_dangling_command_is_the_failing_command_string() {
+        let mut ledger = Ledger::new(25);
+        assert_eq!(ledger.dangling_command(), None);
+
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        assert_eq!(ledger.dangling_command(), Some("cargo test"));
+
+        // A green rerun of the same string clears it — nothing dangles.
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
+        assert_eq!(ledger.dangling_command(), None);
+    }
+
+    #[test]
+    fn the_dangling_command_is_the_last_recorded_that_still_fails() {
+        // cmd A red, cmd B red, B green → A still dangles. Two distinct strings
+        // failed; B cleared its own entry, so the newest-recorded entry that
+        // still fails is A.
+        let mut ledger = Ledger::new(25);
+        ledger.record_result("run_command", &json!({"command": "cmd A"}), &err());
+        ledger.record_result("run_command", &json!({"command": "cmd B"}), &err());
+        ledger.record_result("run_command", &json!({"command": "cmd B"}), &ok());
+
+        assert_eq!(ledger.dangling_command(), Some("cmd A"));
+
+        // Now A red, B red (both dangle): the most-recently-recorded wins.
+        let mut two = Ledger::new(25);
+        two.record_result("run_command", &json!({"command": "cmd A"}), &err());
+        two.record_result("run_command", &json!({"command": "cmd B"}), &err());
+        assert_eq!(two.dangling_command(), Some("cmd B"));
     }
 
     // ----- recoveries used -----
