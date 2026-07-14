@@ -43,8 +43,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::llm::Llm;
@@ -242,7 +240,7 @@ impl Scout {
                         state.last_text = text;
                     }
 
-                    let results = Self::run_tools(&response.content, &state.ctx).await;
+                    let results = tools::run_read_only(&response.content, &state.ctx).await;
 
                     conversation.add_assistant_blocks(response.content);
                     conversation.add_tool_results(results, Vec::new());
@@ -256,24 +254,6 @@ impl Scout {
                 _ => return report(&state, &response.content),
             }
         }
-    }
-
-    // Runs the Scout's read-only tool calls and builds their Tool Result
-    // blocks, plugin-free and Shaped, honoring the async Tool boundary.
-    async fn run_tools(content: &[ContentBlock], ctx: &ToolCtx) -> Vec<ContentBlock> {
-        let mut results = Vec::new();
-        for block in content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                let input = display_input(input);
-                let result = tools::run(name, &input, ctx).await;
-                results.push(ContentBlock::tool_result(
-                    id,
-                    result.content,
-                    result.is_error,
-                ));
-            }
-        }
-        results
     }
 }
 
@@ -303,24 +283,13 @@ fn extract_text(content: &[ContentBlock]) -> String {
     joined.trim().to_string()
 }
 
-// The LLM layer tags tool inputs whose JSON did not decode; never run those,
-// and let the read-only tool's own validation reject an empty map.
-fn display_input(input: &Value) -> Value {
-    if let Value::Object(map) = input
-        && map.contains_key(crate::llm::stream::MALFORMED_INPUT_SENTINEL)
-    {
-        return Value::Object(serde_json::Map::new());
-    }
-    input.clone()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::{ContentBlock, Message, Role, Usage};
     use crate::llm::response::{Response, StopReason};
     use crate::test_support::{Entry, FakeLlm};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -362,21 +331,6 @@ mod tests {
             usage: Usage::default(),
             error: None,
         }
-    }
-
-    // ---- display_input ----
-
-    // A tool input tagged with the malformed-input sentinel is displayed as an
-    // empty map, so the read-only tool's own validation rejects it instead of
-    // acting on undecoded JSON. Routed through the one shared sentinel constant.
-    #[test]
-    fn display_input_empties_a_sentinel_tagged_input() {
-        let tagged = json!({ crate::llm::stream::MALFORMED_INPUT_SENTINEL: "{\"path\": tru" });
-        assert_eq!(display_input(&tagged), json!({}));
-
-        // A well-formed input passes through untouched.
-        let ok = json!({ "path": "lib/widget.ex" });
-        assert_eq!(display_input(&ok), ok);
     }
 
     // ---- run/4 happy path ----
