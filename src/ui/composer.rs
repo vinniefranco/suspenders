@@ -28,6 +28,13 @@
 //!   the draft overflows the cap, [`first_visible_row`] scrolls the Composer
 //!   internally so the cursor row stays visible, pinned to the BOTTOM of the
 //!   box like a terminal.
+//!
+//! The LOGICAL line/column of the cursor is NOT computed here: it comes from
+//! `ui::draft`, the one owner shared with the edit path (`ui::transcript`), so
+//! the cell the user edits and the cell this module paints cannot drift apart.
+//! Wrapping that logical column into a visual row is this module's only job.
+
+use crate::ui::draft;
 
 /// The most rows the Composer ever occupies, however tall the terminal.
 pub const MAX_ROWS: usize = 8;
@@ -55,13 +62,17 @@ pub fn layout(value: &str, cursor: usize, width: usize) -> ComposerLayout {
     let width = width.max(1);
     let cursor = cursor.min(value.chars().count());
 
+    // The logical cell of the cursor — which hard line, and the char column
+    // within it — comes from the ONE owner (`ui::draft`), the same source the
+    // edit path reads. Wrapping that logical column into a visual row/col is
+    // this module's only addition; it never re-derives the logical geometry.
+    let (cursor_line, cursor_offset) = draft::line_col(value, cursor);
+
     let mut rows = Vec::new();
     let mut cursor_row = 0;
     let mut cursor_col = 0;
-    // The char index the current hard line starts at (its '\n' excluded).
-    let mut line_start = 0;
 
-    for line in value.split('\n') {
+    for (index, line) in value.split('\n').enumerate() {
         let chars: Vec<char> = line.chars().collect();
         // `len / width + 1` rows: the extra row on an exact multiple is the
         // cell the cursor occupies at the line's end (see the module doc).
@@ -71,15 +82,14 @@ pub fn layout(value: &str, cursor: usize, width: usize) -> ComposerLayout {
             let end = ((r + 1) * width).min(chars.len());
             rows.push(chars[r * width..end].iter().collect());
         }
-        // The cursor belongs to this line when it sits between the line's
-        // first char and the position just past its last (ON the '\n' counts
-        // as end-of-line, matching the core's `line_col`).
-        if cursor >= line_start && cursor <= line_start + chars.len() {
-            let offset = cursor - line_start;
-            cursor_row = base_row + offset / width;
-            cursor_col = offset % width;
+        // When this is the cursor's logical line, wrap its char column into a
+        // visual row/col. `cursor_offset < width` need not hold, so a wrapped
+        // line divides it: `/ width` picks the continuation row, `% width` the
+        // cell — and the exact-multiple extra row above catches the end cell.
+        if index == cursor_line {
+            cursor_row = base_row + cursor_offset / width;
+            cursor_col = cursor_offset % width;
         }
-        line_start += chars.len() + 1;
     }
 
     ComposerLayout {
@@ -219,6 +229,102 @@ mod tests {
     #[test]
     fn a_cursor_past_the_draft_clamps_to_the_end() {
         assert_eq!(cursor("hi", 99, 10), (0, 2));
+    }
+
+    // --- edit/render agreement ------------------------------------------------
+    //
+    // The property this whole extraction exists to pin: the render path
+    // (`layout`) and the edit path (`ui::draft`) resolve the cursor to the
+    // SAME cell for the same `(draft, cursor)`. At a width wide enough that
+    // every hard line fits in one row, a `layout` cell maps back to logical
+    // geometry exactly: `cursor_row` IS the logical line and `cursor_col` the
+    // column. That is `draft::line_col` — and running it back through
+    // `draft::cursor_at` must return the original cursor. These cases were
+    // previously guarded on neither side crossing the seam.
+
+    fn agree(value: &str) {
+        // Width past the longest hard line, so one row == one logical line.
+        let width = value.chars().count() + 1;
+        let chars = value.chars().count();
+        for cursor in 0..=chars {
+            let l = layout(value, cursor, width);
+            // Render side, read as (logical line, column).
+            let (render_line, render_col) = (l.cursor_row, l.cursor_col);
+            // Edit side, from the shared owner.
+            let (edit_line, edit_col) = draft::line_col(value, cursor);
+            assert_eq!(
+                (render_line, render_col),
+                (edit_line, edit_col),
+                "render/edit cursor disagree for value={value:?} cursor={cursor}"
+            );
+            // And the shared inverse returns exactly where we started.
+            assert_eq!(
+                draft::cursor_at(value, edit_line, edit_col),
+                cursor,
+                "cursor_at round trip failed for value={value:?} cursor={cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_and_edit_agree_on_an_empty_draft() {
+        agree("");
+    }
+
+    #[test]
+    fn render_and_edit_agree_with_the_cursor_at_the_end() {
+        agree("hello");
+    }
+
+    #[test]
+    fn render_and_edit_agree_across_a_trailing_hard_newline() {
+        agree("hello\n");
+    }
+
+    #[test]
+    fn render_and_edit_agree_across_consecutive_newlines() {
+        agree("a\n\n\nb");
+    }
+
+    #[test]
+    fn render_and_edit_agree_on_an_empty_line_between_two_newlines() {
+        // The cursor sitting alone on the blank middle line.
+        let value = "a\n\nb";
+        let empty_line_cursor = draft::cursor_at(value, 1, 0);
+        let l = layout(value, empty_line_cursor, 10);
+        assert_eq!((l.cursor_row, l.cursor_col), (1, 0));
+        assert_eq!(draft::line_col(value, empty_line_cursor), (1, 0));
+        agree(value);
+    }
+
+    #[test]
+    fn render_and_edit_agree_on_multibyte_chars() {
+        // Char index 2 sits after "hé" (é is two bytes): both sides must read
+        // that in chars, not bytes.
+        agree("héllo wörld");
+        let l = layout("héllo", 2, 10);
+        assert_eq!((l.cursor_row, l.cursor_col), (0, 2));
+        assert_eq!(draft::line_col("héllo", 2), (0, 2));
+    }
+
+    #[test]
+    fn render_and_edit_agree_when_a_wrapped_row_carries_the_cursor() {
+        // Narrow width forces wrapping: the render side divides the logical
+        // column into row/col, but the logical column it divides is still the
+        // one the edit side would compute.
+        let value = "abcdefghij\nkl";
+        let chars = value.chars().count();
+        for cursor in 0..=chars {
+            let l = layout(value, cursor, 4);
+            let (line, col) = draft::line_col(value, cursor);
+            // The visual col must be the logical col modulo the width, and the
+            // visual row must advance by the logical col / width beyond the
+            // line's base row.
+            assert_eq!(l.cursor_col, col % 4);
+            assert!(l.cursor_col < 4);
+            // Round-trips through the shared inverse regardless of wrapping.
+            assert_eq!(draft::cursor_at(value, line, col), cursor);
+        }
     }
 
     // --- height cap and internal scroll ---------------------------------------

@@ -41,6 +41,7 @@ use crate::conversation::compaction_target;
 use crate::event::{Event, Stage};
 use crate::llm::response::StopReason;
 use crate::plugins::{self, Registered};
+use crate::ui::draft;
 
 /// The greeting line a fresh Transcript opens with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
@@ -611,23 +612,23 @@ impl Transcript {
             // column clamped to that line's length. Down mirrors from the
             // LAST line. No goal-column memory — a simple clamp, on purpose.
             Key::ArrowUp => {
-                let (line, col) = line_col(&self.input_value, self.input_cursor);
+                let (line, col) = draft::line_col(&self.input_value, self.input_cursor);
                 if line == 0 {
                     self.history_up()
                 } else {
-                    let clamped = col.min(line_lengths(&self.input_value)[line - 1]);
-                    self.input_cursor = cursor_at(&self.input_value, line - 1, clamped);
+                    let clamped = col.min(draft::line_lengths(&self.input_value)[line - 1]);
+                    self.input_cursor = draft::cursor_at(&self.input_value, line - 1, clamped);
                     (self, vec![])
                 }
             }
             Key::ArrowDown => {
-                let (line, col) = line_col(&self.input_value, self.input_cursor);
-                let last = line_lengths(&self.input_value).len() - 1;
+                let (line, col) = draft::line_col(&self.input_value, self.input_cursor);
+                let last = draft::line_lengths(&self.input_value).len() - 1;
                 if line >= last {
                     self.history_down()
                 } else {
-                    let clamped = col.min(line_lengths(&self.input_value)[line + 1]);
-                    self.input_cursor = cursor_at(&self.input_value, line + 1, clamped);
+                    let clamped = col.min(draft::line_lengths(&self.input_value)[line + 1]);
+                    self.input_cursor = draft::cursor_at(&self.input_value, line + 1, clamped);
                     (self, vec![])
                 }
             }
@@ -660,14 +661,14 @@ impl Transcript {
                 (self, vec![])
             }
             Key::Home => {
-                let (line, _) = line_col(&self.input_value, self.input_cursor);
-                self.input_cursor = cursor_at(&self.input_value, line, 0);
+                let (line, _) = draft::line_col(&self.input_value, self.input_cursor);
+                self.input_cursor = draft::cursor_at(&self.input_value, line, 0);
                 (self, vec![])
             }
             Key::End => {
-                let (line, _) = line_col(&self.input_value, self.input_cursor);
-                let len = line_lengths(&self.input_value)[line];
-                self.input_cursor = cursor_at(&self.input_value, line, len);
+                let (line, _) = draft::line_col(&self.input_value, self.input_cursor);
+                let len = draft::line_lengths(&self.input_value)[line];
+                self.input_cursor = draft::cursor_at(&self.input_value, line, len);
                 (self, vec![])
             }
 
@@ -1014,26 +1015,19 @@ fn truncate(text: &str, width: usize) -> String {
 
 // -- Composer draft editing (char-index string surgery) --
 //
-// The Composer cursor is a CHAR index (the codebase counts chars, not bytes);
-// these helpers translate it to a byte offset exactly once, at the mutation
-// site, so multi-byte input never splits a char or panics. Lines are HARD
-// lines (split on '\n') — width-wrapping is the view's concern
-// (`ui::composer`), not the core's.
-
-/// The byte offset of char index `cursor` (the string's length when the
-/// cursor sits past the last char).
-fn byte_of(value: &str, cursor: usize) -> usize {
-    value
-        .char_indices()
-        .nth(cursor)
-        .map(|(i, _)| i)
-        .unwrap_or(value.len())
-}
+// The cursor is a CHAR index (the codebase counts chars, not bytes). The
+// logical line/column geometry — `line_col`, `line_lengths`, `cursor_at`,
+// `byte_of` — has ONE owner in `ui::draft`, shared with the render path
+// (`ui::composer`) so the cursor the user edits and the cursor the view
+// paints can never drift apart. These two helpers are the edit-side string
+// surgery built on that geometry: they translate the char-index cursor to a
+// byte offset (via `draft::byte_of`) exactly once, at the mutation site, so
+// multi-byte input never splits a char or panics.
 
 /// `value` with `c` inserted at char index `cursor`.
 fn insert_char(value: &str, cursor: usize, c: char) -> String {
     let mut out = value.to_string();
-    out.insert(byte_of(value, cursor), c);
+    out.insert(draft::byte_of(value, cursor), c);
     out
 }
 
@@ -1041,42 +1035,8 @@ fn insert_char(value: &str, cursor: usize, c: char) -> String {
 /// range (the Backspace arm guards it).
 fn remove_char(value: &str, cursor: usize) -> String {
     let mut out = value.to_string();
-    out.remove(byte_of(value, cursor));
+    out.remove(draft::byte_of(value, cursor));
     out
-}
-
-/// The `(hard line, column)` of char index `cursor` — both in chars. A cursor
-/// sitting ON a '\n' counts as the end of the line before it.
-fn line_col(value: &str, cursor: usize) -> (usize, usize) {
-    let mut line = 0;
-    let mut col = 0;
-    for c in value.chars().take(cursor) {
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-/// Each hard line's length in chars. Never empty: an empty draft is one
-/// zero-length line.
-fn line_lengths(value: &str) -> Vec<usize> {
-    value.split('\n').map(|l| l.chars().count()).collect()
-}
-
-/// The char index of `(line, col)` — the inverse of [`line_col`], counting
-/// one char per '\n' between lines. `col` must already be clamped to the
-/// line's length.
-fn cursor_at(value: &str, line: usize, col: usize) -> usize {
-    line_lengths(value)
-        .iter()
-        .take(line)
-        .map(|len| len + 1)
-        .sum::<usize>()
-        + col
 }
 
 fn append_history(history: &mut Vec<String>, prompt: &str) {
