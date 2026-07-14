@@ -30,6 +30,24 @@ use crate::tool::resolve_path;
 use crate::ui::transcript::TranscriptItem;
 use display::Diff as DiffArtifact;
 
+/// The Token keys the Diff plugin reserves, declared in one place.
+///
+/// `assigns` and `artifacts` are open `HashMap`s by design (ADR-0007: Plugins
+/// are an open extension seam, so the core [`Token`] never closes the key
+/// universe). Each Plugin owns its own reserved keys instead; naming them here
+/// once means a producer and consumer that disagree fail to *compile* rather
+/// than silently missing the value — a rename touches this module alone.
+mod keys {
+    /// `assigns`: the pre-edit file snapshot [`super::Diff::pre_run`] captures,
+    /// read back by [`super::Diff::post_run`] to compute the edit's hunks.
+    pub const BEFORE: &str = "before";
+
+    /// `artifacts`: the serialized [`super::DiffArtifact`] that rides the
+    /// Tool Result to Presentment (CONTEXT.md: Artifact), read back by
+    /// [`super::Diff::present`].
+    pub const DIFF: &str = "diff";
+}
+
 /// The tools the Diff plugin acts on.
 const TOOLS: [&str; 2] = ["edit_file", "write_file"];
 
@@ -48,7 +66,7 @@ impl Plugin for Diff {
         }
         match target(&token) {
             Some(abs) => match std::fs::read_to_string(&abs) {
-                Ok(content) => token.assign("before", content),
+                Ok(content) => token.assign(keys::BEFORE, content),
                 Err(_) => token,
             },
             None => token,
@@ -64,7 +82,7 @@ impl Plugin for Diff {
                     Some(abs) => abs,
                     None => return token,
                 };
-                let before = match token.assigns.get("before").and_then(|v| v.as_str()) {
+                let before = match token.assigns.get(keys::BEFORE).and_then(|v| v.as_str()) {
                     Some(b) => b.to_string(),
                     None => return token,
                 };
@@ -195,11 +213,11 @@ fn exact_apply(before: &str, input: &Value) -> Option<String> {
 // `diff` slot.
 fn put_diff(token: Token, artifact: &DiffArtifact) -> Token {
     let value = serde_json::to_value(artifact).expect("Diff artifact serializes");
-    token.put_artifact("diff", value)
+    token.put_artifact(keys::DIFF, value)
 }
 
 fn read_diff_artifact(artifacts: &HashMap<String, Value>) -> Option<DiffArtifact> {
-    let value = artifacts.get("diff")?;
+    let value = artifacts.get(keys::DIFF)?;
     serde_json::from_value(value.clone()).ok()
 }
 
@@ -400,7 +418,7 @@ mod tests {
             ),
         );
         assert!(failures.is_empty());
-        assert!(!token.assigns.contains_key("before"));
+        assert!(!token.assigns.contains_key(keys::BEFORE));
     }
 
     #[tokio::test]
@@ -456,7 +474,10 @@ mod tests {
         };
         overrides(&mut artifact);
         let mut map = HashMap::new();
-        map.insert("diff".to_string(), serde_json::to_value(&artifact).unwrap());
+        map.insert(
+            keys::DIFF.to_string(),
+            serde_json::to_value(&artifact).unwrap(),
+        );
         map
     }
 
