@@ -33,18 +33,18 @@ The mechanical schedule by which a Turn ends at its Turn Limit, counted in Passe
 _Avoid_: wind-down, wrap-up phase (the wrap-up warning is one step of the Endgame, not its name)
 
 **Recovery Turn**:
-A Turn the harness opens itself when the previous Turn settled at its Turn Limit with unverified writes or a Dangling Failure - the work is demonstrably unfinished, so one more bounded attempt is issued rather than leaving a broken state. Issued by the Endgame Governor through the close-and-open-a-Recovery-Turn Intervention; a Setpoint bounds how many may follow one user request. Its prompt belongs to the Voice - the only Turn whose prompt Suspenders authors - and it still serves the original user request. Two shapes: Continuation and Handoff.
+A Turn the harness opens itself when the previous Turn settled at its Turn Limit with unverified writes, or a Dangling Failure alongside a write that landed this Turn - the work is demonstrably unfinished, so one more bounded attempt is issued rather than leaving a broken state. A Dangling Failure with no writes this Turn is exploration, not unfinished implementation (a read-only task that merely ran a failing command), and opens no Recovery Turn. Issued by the Endgame Governor through the close-and-open-a-Recovery-Turn Intervention; a Setpoint bounds how many may follow one user request. Its prompt belongs to the Voice - the only Turn whose prompt Suspenders authors - and it still serves the original user request. Two shapes: Continuation and Handoff.
 _Avoid_: retry (nothing is re-attempted from scratch; unfinished work continues), auto-continue (that's the Continuation shape, not the umbrella)
 
 **Continuation**:
 The Recovery Turn shape that keeps the Conversation: the recovery prompt is appended and the model continues with everything it saw before.
 
 **Handoff**:
-The Recovery Turn shape that retires the Conversation: Compaction seeds a fresh one - the original task verbatim, the Plan verbatim, files touched, the model's narrative - plus the final failing verification result verbatim, and the recovery prompt starts it clean. The default shape: a fresh context with a structured handoff beats continuing a degraded one, and the gap widens as models shrink.
+The Recovery Turn shape that retires the Conversation: Compaction seeds a fresh one - the original task verbatim, the Plan verbatim, files touched, the model's narrative - plus the failing verification result verbatim - the Dangling Failure's own output, the command the recovery prompt names, never merely the last command run - and the recovery prompt starts it clean. The default shape: a fresh context with a structured handoff beats continuing a degraded one, and the gap widens as models shrink.
 _Avoid_: restart (the work and its facts carry over; only the rot is left behind)
 
 **Dangling Failure**:
-A command string whose most recent run this Turn failed. A passing run clears only its own command string, so a red full-suite run followed by a green filtered rerun still dangles - a capped Turn cannot launder a failure by rerunning a narrower command. The failing arm of the Recovery Turn's trigger; the Verify-failed Nudge keeps judging the last run only.
+A command string whose most recent run this Turn failed. A passing run clears only its own command string, so a red full-suite run followed by a green filtered rerun still dangles - a capped Turn cannot launder a failure by rerunning a narrower command. The failing arm of the Recovery Turn's trigger, but only alongside a write that landed this Turn; the Verify-failed Nudge keeps judging the last run only.
 _Avoid_: command failing (that's the last-run-only fact the Nudge reads), red build (too broad; the failure is per command string)
 
 **Tool**:
@@ -197,8 +197,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - An **Artifact** travels with its **Tool Result** to **Presentment** and appears only in the **Transcript**, never the **Conversation**
 - A **Plugin** failure never fails the **Turn** and never reaches the model; the **Transcript** records it as an info line and the Tool Call proceeds without that Plugin
 - A **Turn** ends in exactly one **Turn Settlement**: completed, failed, or cancelled
-- A **Recovery Turn** opens only off a Turn that settled at its **Turn Limit** with unverified writes or a **Dangling Failure**; its prompt belongs to the **Voice**, and a **Setpoint** bounds how many may serve one user request
-- A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the final failing verification; a **Continuation** keeps the whole **Conversation**
+- A **Recovery Turn** opens only off a Turn that settled at its **Turn Limit** with unverified writes, or a **Dangling Failure** alongside a write that landed this Turn (a failing command with no writes is exploration, not unfinished work); its prompt belongs to the **Voice**, and a **Setpoint** bounds how many may serve one user request
+- A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the **Dangling Failure**'s own result verbatim - the command the recovery prompt names, not merely the last one run; a **Continuation** keeps the whole **Conversation**
 - **Steering** is delivered after a Tool Call batch completes and before the next model call; a Turn that ends first triggers **Rollover**, a **Cancellation** discards it
 - **Steering** belongs to the user's voice and is never part of the **Voice**
 - A **Scout** runs its own fresh **Conversation** against the same model connection; its report is an ordinary **Tool Result**, subject to the **Result Cap**, and its exploration never enters the main **Conversation**

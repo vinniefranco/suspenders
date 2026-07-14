@@ -1363,11 +1363,21 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result(
-                    "r1",
-                    "run_command",
-                    json!({"command": "false"}),
-                )),
+                // The model wrote, then its verification dangles red — the
+                // write is the evidence the dangling-failure arm now requires.
+                just(Response {
+                    content: vec![
+                        ContentBlock::tool_use(
+                            "w1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "hi"}),
+                        ),
+                        ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error: None,
+                }),
                 just(text_end("done")),
             ],
         )
@@ -2005,7 +2015,7 @@ mod tests {
 
     fn recover(outcome: &Outcome) -> (&Conversation, log::StopReason, Recovery) {
         match outcome {
-            Outcome::Recover(c, reason, recovery) => (c, *reason, *recovery),
+            Outcome::Recover(c, reason, recovery) => (c, *reason, recovery.clone()),
             other => panic!("expected Recover, got {other:?}"),
         }
     }
@@ -2034,6 +2044,7 @@ mod tests {
             Recovery {
                 shape: RecoveryShape::Handoff,
                 verification_failing: false,
+                failing_command: None,
             }
         );
         // The Conversation closed on the turn-limit marker like any limit close.
@@ -2045,23 +2056,35 @@ mod tests {
 
     #[tokio::test]
     async fn a_cap_with_a_failing_verification_recovers_naming_the_failure() {
+        // The model wrote, then its verification dangles red: the write is the
+        // evidence the dangling-failure arm requires (ADR-0028 addendum
+        // 2026-07-14). The recovery names the failing command.
         let root = root();
         let mut opts = SessionOpts::default();
         opts.turn_limit = Some(1);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
-            vec![just(tool_use_result(
-                "r1",
-                "run_command",
-                json!({"command": "false"}),
-            ))],
+            vec![just(Response {
+                content: vec![
+                    ContentBlock::tool_use(
+                        "w1",
+                        "write_file",
+                        json!({"path": "a.txt", "content": "hi"}),
+                    ),
+                    ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+                error: None,
+            })],
         )
         .with_approvals(vec![true]);
 
         let (outcome, _deps) = run_with(&session, "run it", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
         assert!(recovery.verification_failing);
+        assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
 
     #[tokio::test]
@@ -2155,11 +2178,21 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result(
-                    "r1",
-                    "run_command",
-                    json!({"command": "false"}),
-                )),
+                // The model wrote, then its verification dangles red — the
+                // write is the evidence the dangling-failure arm now requires.
+                just(Response {
+                    content: vec![
+                        ContentBlock::tool_use(
+                            "w1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "hi"}),
+                        ),
+                        ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error: None,
+                }),
                 just(text_end("half done; the tests are still red")),
             ],
         )
@@ -2191,11 +2224,21 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result(
-                    "r1",
-                    "run_command",
-                    json!({"command": "false"}),
-                )),
+                // The model wrote, then its full run dangles red — the write
+                // is the evidence the dangling-failure arm now requires.
+                just(Response {
+                    content: vec![
+                        ContentBlock::tool_use(
+                            "w1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "hi"}),
+                        ),
+                        ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error: None,
+                }),
                 just(tool_use_result(
                     "r2",
                     "run_command",

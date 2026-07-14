@@ -85,3 +85,53 @@ recovery prompt is parameterized with) fires when any command string's
 most recent run failed — a passing run clears only its own string.
 `command_failing` and its other consumers (the Verify-failed Nudge)
 are untouched.
+
+## Addendum (2026-07-14): a false recovery on read-only work, found live, closed
+
+A read-only "evaluate this repo" task settled green at the cap and yet
+opened a Handoff Recovery Turn, which handed the model a fresh
+Conversation and made it restart the whole evaluation — the `restart`
+CONTEXT.md's Handoff entry explicitly forbids
+(session 20260714-174034). Three faults chained:
+
+1. **A spurious failure the exit code could not disown.** The model ran
+   `cargo test --lib 2>&1 | head -200`; under `run_command`'s `bash -o
+   pipefail` (a deliberate choice — a pipe must report the producer's
+   failure), `head` closed the pipe early, cargo died writing to it, and
+   the pipeline reported exit `101` — cargo's own code, indistinguishable
+   from a real test failure. The model re-ran with `| tail -50` (exit 0,
+   1022 passed), but that is a *different command string*, so the
+   Dangling Failure from the `head` run never cleared. This is the
+   anti-laundering rule of the 2026-07-13 addendum firing as a false
+   positive.
+
+2. **The trigger fired on exploration.** With zero writes, the
+   dangling-failure arm fired alone. But this ADR's whole evidence base
+   is unverified writes and mid-fix near-misses; a failing command during
+   pure exploration is not unfinished implementation. The dangling-failure
+   arm now additionally requires that a write landed this Turn — a new
+   monotonic Ledger fact, distinct from `unverified_writes` (which clears
+   on the next `run_command`). Recovery fires on `unverified_writes ||
+   (dangling_failure && wrote_this_turn)`. Per-Turn scope; `recovery_limit`
+   already bounds re-firing. Accepted trade-off: a capped attempt that
+   never managed a single write no longer recovers — but a Turn with no
+   writes across the whole cap has shown no progress a Handoff restart
+   would not simply repeat. The laundering protection is untouched: that
+   case always writes.
+
+3. **The Handoff seed contradicted its own prompt.** The seed carried the
+   *last* `run_command` result (the green `tail` rerun) while the
+   `verification_failing` prompt said "fix the failure" — a contradiction
+   the model could only resolve by starting over. The seed now carries the
+   Dangling Failure's *own* result verbatim (the failing command string's
+   last result, the command the prompt names), threaded from the Ledger
+   through the `Recovery` payload. This also fixes the canonical laundering
+   case (red suite → green filtered rerun → recovery), where the seed would
+   otherwise carry the green rerun.
+
+The generative cause — the model piping test output through `head` to
+manage size — is met with a Voice steer (system prompt): run commands
+bare, because the Result Cap already truncates output and keeps the exit
+code, and piping through `head`/`tail`/`wc` under `pipefail` can make a
+passing command report failure. Unlike an exit-code heuristic, a steer
+generalizes: a pipe-induced `101` cannot be told from a real one.
