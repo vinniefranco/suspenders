@@ -1736,6 +1736,111 @@ mod tests {
         assert!(summary_text.contains("lib/b.ex"));
     }
 
+    // The Compaction<->Resume fidelity invariant (ADR-0012's "byte-identical
+    // summary message", ADR-0021's test-as-spec): a LIVE compaction and the
+    // fold of its logged `Compacted` entry must reconstruct byte-identical
+    // Conversation messages. Both sides compose the summary through the single
+    // shared `compose_summary` helper — this crosses the seam BETWEEN them
+    // (each side is tested alone above; nothing exercised the round trip). The
+    // test drives the same builder ops into the Conversation and the Session
+    // Log in lockstep — exactly the "append every event as it happens" contract
+    // of ADR-0010 — runs a real `Compaction::run` over the head, then logs the
+    // `Compacted` entry via the production path (`session_log_entry`, converted
+    // the way `agent.rs` does) followed by the surviving tail. If someone
+    // changed one composition path without the other (e.g. `apply_compaction`
+    // prepended a marker the fold did not), the summary message would diverge
+    // and this assertion would fail.
+    #[tokio::test]
+    async fn a_live_compaction_and_its_logged_fold_reconstruct_byte_identical_messages() {
+        use crate::compaction::Compaction;
+        use crate::conversation::{Conversation, ConversationOpts};
+        use crate::llm::response::{Response, StopReason as LlmStop};
+        use crate::session::connection::Connection;
+        use crate::test_support::{Entry as ScriptEntry, FakeLlm};
+
+        // Arrange: a Conversation of several Turns (user text + assistant text),
+        // fat enough that the Compaction Keep leaves a real head to summarize.
+        // The same ops feed the Session Log so the log mirrors the live events.
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        let opts = ConversationOpts::new(2000, 500).eviction_slack(0.0);
+        let mut conv = Conversation::new("You are Baud.", opts);
+        for i in (1..=5).rev() {
+            let body = format!("{}: turn {i}", "line ".repeat(50));
+            conv.add_user_text(body.clone());
+            conv.add_assistant_blocks(vec![ContentBlock::text(body.clone())]);
+            log.append(Entry::UserText(body.clone()));
+            log.append(Entry::AssistantBlocks(vec![text(&body)]));
+        }
+        // The Turn that triggers Compaction settles first, like the real path.
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        // Act (live): a real compaction cycle with a scripted narrative.
+        let narrative = "## Goal\nPin the compaction seam\n## Progress\n### Done\n- traced";
+        let fake = FakeLlm::script(vec![ScriptEntry::just(Response {
+            content: vec![ContentBlock::text(narrative)],
+            stop_reason: LlmStop::EndTurn,
+            usage: crate::content::Usage::default(),
+            error: None,
+        })]);
+        let connection = Connection::new("http://test:4000/v1", "", "test-model", 4000);
+        let before = conv.clone();
+        let (compacted, new_state) = Compaction::new()
+            .run(&conv, &fake, &connection)
+            .await
+            .unwrap();
+        // Sanity: compaction actually folded something into one summary message.
+        assert!(compacted.messages.len() < before.messages.len());
+
+        // Act (log): append the `Compacted` entry through the production path —
+        // `session_log_entry` then the exact usize/Option conversion agent.rs
+        // performs — followed by the surviving tail as it would have been logged
+        // by the Turns that ran after the Compaction.
+        let skip = Compaction::skip_count(&before, &compacted);
+        let entry = new_state.session_log_entry(skip, 0);
+        log.append(Entry::Compacted {
+            summary: entry.summary.unwrap_or_default(),
+            skip_count: entry.skip_count as u64,
+            tokens_before: entry.tokens_before,
+            file_ops: entry.file_ops,
+            original_task: entry.original_task,
+        });
+        // The live-compacted tail (everything after the summary message) is
+        // what later Turns appended; replay each surviving message as its entry.
+        for msg in &compacted.messages[1..] {
+            match msg.role {
+                Role::User => {
+                    let text = match &msg.content[0] {
+                        ContentBlock::Text { text } => text.clone(),
+                        other => panic!("unexpected tail user block: {other:?}"),
+                    };
+                    log.append(Entry::UserText(text));
+                }
+                Role::Assistant => {
+                    log.append(Entry::AssistantBlocks(msg.content.clone()));
+                }
+            }
+        }
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        // Assert: the folded Conversation equals the live-compacted one, message
+        // for message, byte for byte — the summary message at index 0 in
+        // particular (where the two composition paths meet).
+        let (folded, drift) = resume(&log.path, &session).unwrap();
+        assert_eq!(drift, Vec::new());
+        assert_eq!(folded, compacted.messages);
+    }
+
     // ---- Recovery Turn entries (Continuation + Handoff) ----
 
     #[test]
