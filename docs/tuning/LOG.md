@@ -837,11 +837,31 @@ cycle if it recurs on the scorecard.
 
 ---
 
-## 015 — A malformed tool call kills the whole Turn (no retry, no recovery) — OPEN
+## 015 — A malformed tool call kills the whole Turn (no retry, no recovery) — BUILT, VALIDATION PENDING
 
-**Status: OPEN.** No tweak yet — a design look, then drive on f7 at N=5.
-Promoted from the c013 parked insight ("malformed tool calls kill the
-whole Turn") because it recurred on the c014 scorecard.
+**Status: BUILT (ADR-0030, commit 1359056), NOT YET CREDITED.** Design
+look done; fix implemented and unit-proven; the credit run — drive f7
+(where it recurs) at N≥3 and confirm the turn-error deaths clear without
+a visible retry loop — is still outstanding. Promoted from the c013
+parked insight ("malformed tool calls kill the whole Turn") because it
+recurred on the c014 scorecard (f7-run1/run2, 2/4).
+
+**Fix (ADR-0030):** a `StopReason::Error` classified retryable (the
+malformed-tool-call class ONLY — transport errors and context-exceeded
+still fail loud) re-issues the same request from the same Conversation,
+bounded by a per-Turn `malformed_retry_budget` Setpoint (default 3; 0
+disables). New `Flow::Retry` variant: the Pass is not advanced and
+nothing enters the Conversation (silent to the model), but every re-draw
+writes a durable `retry` Session Log entry + Transcript info line, and
+the budget is a hard floor-bounded ceiling — it cannot spin. On
+exhaustion, the existing `finish::fail` runs unchanged. Unit-proven
+(re-draw completes / budget exhausts to fail / non-retryable fails
+immediately / log round-trips), and the classifier matches the exact
+wire string logged in c014 (`...Failed to generate a valid tool call.`).
+The dead-loop concern was designed out, not around: silent to the model,
+never to the operator.
+
+**Original problem (retained):**
 
 **Observed failure:** a single bad generation ends the entire Turn. The
 model emits `api_stream_error: Failed to generate a valid tool call`
