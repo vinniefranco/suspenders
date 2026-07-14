@@ -30,7 +30,7 @@
 
 use crate::conversation::Conversation;
 use crate::llm::Llm;
-use crate::llm::request;
+use crate::llm::request::{self, LlmRequest};
 use crate::llm::response::StopReason;
 use crate::session::connection::Connection;
 use crate::session::log::compose_summary;
@@ -202,12 +202,13 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
             serialized
         );
 
-        // A tool-free request over a single user message (no `tools` key, per
-        // build's omit-when-empty rule).
+        // A tool-free request over a single user message: no tools offered
+        // (build_request omits the `tools` key when empty), Thinking left on.
         let messages = vec![crate::content::Message::user(vec![
             crate::content::ContentBlock::text(prompt),
         ])];
-        let wire = request::build(COMPACTION_SYSTEM, &messages, &[], connection, false);
+        let req = LlmRequest::new(COMPACTION_SYSTEM, messages, Vec::new());
+        let wire = request::build_request(&req, connection);
 
         let response = llm.complete(wire, connection, &mut |_ev| {}).await;
 

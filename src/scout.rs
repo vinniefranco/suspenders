@@ -48,7 +48,7 @@ use serde_json::Value;
 use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::llm::Llm;
-use crate::llm::request;
+use crate::llm::request::{self, LlmRequest};
 use crate::llm::response::StopReason;
 use crate::session::connection::Connection;
 use crate::tool::ToolCtx;
@@ -203,20 +203,17 @@ impl Scout {
             };
 
             // The report Pass offers no tools: the only move left is the
-            // report.
+            // report. Otherwise the read-only Scout subset rides. Thinking is
+            // off when the Scout runs no-think (ADR-0014). Both are expressed
+            // through the one typed request seam — no reach past it.
             let tools_specs = if report_pass {
                 Vec::new()
             } else {
                 tools::scout_specs()
             };
-
-            let wire = request::build(
-                &req.system,
-                &req.messages,
-                &tools_specs,
-                state.connection,
-                state.no_think,
-            );
+            let scout_request = LlmRequest::new(req.system, req.messages, tools_specs)
+                .with_no_think(state.no_think);
+            let wire = request::build_request(&scout_request, state.connection);
 
             let response = state
                 .llm
