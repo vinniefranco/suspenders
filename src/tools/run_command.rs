@@ -1,6 +1,7 @@
 //! `run_command(command)`: runs `bash -o pipefail -c command` in the Project Root with
-//! stdout and stderr merged, reporting the exit code. The only tool that
-//! requires the user's Approval (see [`crate::tools::requires_approval`]).
+//! stdout and stderr merged, reporting the exit code. Approval-gated: the
+//! Approval seam ([`crate::approvals::gate_text`]) shows the user the command
+//! before it runs (web_fetch's URL is gated the same way — ADR-0024).
 //!
 //! ADR-0023: the child runs in its OWN process group (`process_group(0)`);
 //! on timeout the whole group is signalled (`killpg`), and `kill_on_drop(true)`
