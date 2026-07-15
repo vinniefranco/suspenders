@@ -8,6 +8,12 @@
 //!
 //! By factoring request-building out of the boundary, the module is tested
 //! without a mock server: feed in the project's shapes, assert the output.
+//!
+//! There is exactly ONE public request-construction entry point,
+//! [`build_request`], taking a typed [`LlmRequest`] and a [`Connection`]. Every
+//! caller - the Turn, the Scout, and Compaction - routes through it; the
+//! string-argument [`build`] is a private helper of this module, so the wire
+//! format has a single typed seam and tests assert it through that seam.
 
 use serde_json::{Map, Value, json};
 
@@ -49,9 +55,13 @@ impl LlmRequest {
 /// Sets the model, system prompt, max_tokens, streaming flag, messages, tool
 /// specs, and (conditionally) temperature and the no-think field. Keys the
 /// server should default are omitted, not sent empty: no `"tools"` when
-/// `tools` is empty (a Compaction request offers none), no `"temperature"`
-/// when the connection carries `None` (sampling stays with the server).
-pub fn build(
+/// `tools` is empty (a Compaction request offers none, and so does the Scout's
+/// forced report Pass - ADR-0014), no `"temperature"` when the connection
+/// carries `None` (sampling stays with the server).
+///
+/// Private to this module: the only public entry point is [`build_request`],
+/// so no caller reaches past the typed [`LlmRequest`] seam.
+fn build(
     system: &str,
     messages: &[Message],
     tools: &[ToolSpec],
