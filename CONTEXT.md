@@ -8,10 +8,14 @@ A terminal coding agent for small local models: a full-screen TUI where a locall
 ## Language
 
 **Session**:
-One run of the Suspenders TUI, from launch to exit, holding exactly one Conversation. Its fixed facts - the Project Root, the Context Budget, the Result Cap, the Turn Limit, the command timeout, the Plugin list, and the model connection - are resolved and validated once at launch into a Session value; the Conversation is mutable state that lives beside that value, owned by the Agent.
+One run of the Suspenders TUI, from launch to exit, holding exactly one Conversation. Its fixed facts - the Project Root, the Context Budget, the Result Cap, the Turn Limit, the command timeout, the Plugin list, and the model connection (endpoint, token, output cap, temperature) - are resolved and validated once at launch into a Session value; the Conversation and the Active Model are mutable state that live beside that value, owned by the Agent.
 
 **Conversation**:
 The ordered message history sent to the model - user messages, assistant messages, and Tool Results.
+
+**Active Model**:
+The model identifier the next Turn will call. Owned by the Agent as mutable state beside the Session value - not one of the Session's fixed facts. Seeded from the model connection at launch and changed by the `/model` Slash Command; only the identifier changes, never the endpoint, the output cap, or any figure the Context Budget and Result Cap derive from, so a change needs no re-validation. A change takes effect on the next Turn: an in-flight Turn finishes on the model it captured when it began.
+_Avoid_: current model, model connection (the connection is the fixed endpoint and credentials; the Active Model is the mutable choice of which model to call over it).
 
 **Turn**:
 One user request and everything the Agent does to answer it - the model may make many Tool Calls within a single Turn.
@@ -66,8 +70,12 @@ The display-side history of a Session - everything the user saw, in order: user 
 _Avoid_: message list, chat log
 
 **Composer**:
-The input area of the TUI where the user authors the next prompt. Submitting it starts a Turn when the Agent is idle and becomes Steering when a Turn is running. Display-side only: its draft is never part of the Conversation until submitted.
+The input area of the TUI where the user authors the next prompt. A leading `/` opens the Slash Command menu; otherwise a submitted draft starts a Turn when the Agent is idle or becomes Steering when a Turn is running. Display-side only: its draft is never part of the Conversation until submitted.
 _Avoid_: input line (it is not a line; drafts may span many), prompt (that's what a submitted draft becomes)
+
+**Slash Command**:
+A directive the user invokes from the Composer, never sent to the model. Typing `/` opens a menu of the available commands that filters as the user types; selecting one runs it. Always available whatever the Agent is doing - a running Turn never suppresses the menu, though a command's effect may land at a Turn boundary (a model change applies to the next Turn). Distinct from a prompt (which starts a Turn) and from Steering (mid-Turn user text that joins the Conversation unadorned): a Slash Command enters neither the Conversation nor the Transcript as user text; it drives the harness or the Session (e.g. choosing the model), and the Transcript may show its outcome as an info line. The set of commands is open - adding one is routine.
+_Avoid_: command (that's the Agent's internal actor message), directive, colon-command
 
 **Project Root**:
 The directory Suspenders was launched from, captured once per Session as a value. Every Tool Call is confined to it: paths must not escape it, and run_command executes in it.
@@ -173,6 +181,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 
 - A **Session** has exactly one **Conversation**, one **Transcript**, and one **Project Root**
 - A **Session**'s fixed facts are resolved and validated once at launch; every **Turn** and **Tool Call** reads them from that value, never from ambient configuration
+- The **Active Model** is the one thing a **Turn** does NOT read from the fixed **Session** value: the **Agent** owns it mutably and each **Turn** captures it when it begins, so a `/model` change lands on the next **Turn**, never mid-flight
 - A **Conversation** is a sequence of **Turns**
 - A **Turn** is one or more **Passes**; the **Turn Limit** counts **Passes**
 - A **Turn** contains zero or more **Tool Calls**, each producing exactly one **Tool Result**

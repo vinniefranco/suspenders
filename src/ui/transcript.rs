@@ -42,6 +42,8 @@ use crate::llm::response::StopReason;
 use crate::plugins::{self, Registered};
 use crate::ui::draft;
 use crate::ui::history::History;
+use crate::ui::selector::{Selector, SelectorOutcome, SelectorRow};
+use crate::ui::slash;
 use crate::ui::streaming::Streaming;
 
 /// The greeting line a fresh Transcript opens with.
@@ -155,6 +157,64 @@ pub struct PendingApproval {
     pub command: String,
 }
 
+/// The open Slash Command menu (ADR-0032), exposed for rendering the way
+/// [`PendingApproval`] is: the view reads it through [`Transcript::slash_menu`]
+/// and draws the inline popup. `rows` are the commands matching the typed token
+/// (via the generic selector's row shape); `highlight` is the index into `rows`
+/// of the highlighted command. Empty `rows` means the typed token matches no
+/// command — the popup shows "no matches" and Enter is an unknown-command
+/// no-Turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashMenu {
+    pub rows: Vec<SelectorRow>,
+    pub highlight: usize,
+}
+
+/// The lifecycle of a committed selector-opening command's row list (ADR-0033),
+/// owned by [`CommandSelector`]. `Loading` after commit while the adapter
+/// fetches; `Ready` once [`Event::SelectorReady`] delivered rows into a
+/// [`Selector`]; `Failed` on [`Event::SelectorFailed`]. Only `Ready` accepts
+/// navigation/selection — a `Loading`/`Failed` overlay swallows Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorStatus {
+    Loading,
+    Ready(Selector),
+    Failed(String),
+}
+
+/// The owned command-selector overlay (ADR-0033): the sub-state entered when a
+/// selector-opening command (`/model`) is committed. `command` is the opaque
+/// command name the pure core carries back out on selection (it never learns
+/// what the command does); `status` is the row list's lifecycle. Modeled on
+/// [`PendingApproval`]: owned modal state the view reads through
+/// [`Transcript::slash_view`]. The overlay does NOT own its filter — the draft
+/// `rest` (after `/<name> `) filters the rows, consistent with Phase 3's menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSelector {
+    pub command: String,
+    pub status: SelectorStatus,
+}
+
+/// The current inline-popup view for the adapter to draw (ADR-0032/0033), one
+/// query folding the two slash sub-states so the adapter matches once. `Menu`
+/// is Phase 3's command palette (`rest = None`): the registry filtered by the
+/// command token. `Selector` is the committed-command sub-state (`rest =
+/// Some`): the overlay `status` plus, when `Ready`, the rows filtered by the
+/// draft `rest` and the highlighted index into that filtered view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashView {
+    Menu {
+        rows: Vec<SelectorRow>,
+        highlight: usize,
+    },
+    Selector {
+        command: String,
+        status: SelectorStatus,
+        rows: Vec<SelectorRow>,
+        highlight: usize,
+    },
+}
+
 /// A PURE key press, defined here so the core stays crossterm-free (ADR-0019):
 /// the adapter (`ui.rs`) maps a crossterm `KeyEvent` to one of these. `Char`
 /// carries a typed grapheme; the navigation/edit keys are named variants.
@@ -246,6 +306,17 @@ pub enum Effect {
     ScrollDown(ScrollStep),
     /// Persist a submitted prompt into the on-disk history file.
     HistoryAppend(String),
+    /// A committed Slash Command (ADR-0032): the pure core recognized `/name`
+    /// and hands it to the adapter to run. Commands carry no inline arg today —
+    /// a selector-opening command's sub-filter comes from the draft `rest`
+    /// (`slash_view`), not from this payload. The core does not know what any
+    /// command does — this payload is command-agnostic.
+    Command { name: String },
+    /// A row was chosen from a committed command's selector (ADR-0033): the
+    /// opaque command `name` and the selected row's `value`. The adapter
+    /// interprets it (e.g. `/model` swaps the Active Model and persists); the
+    /// pure core neither knows nor cares. Phase 4b implements the arm.
+    SelectorChosen { command: String, value: String },
 }
 
 /// The pure Transcript state (baud's `%Baud.UI.Transcript{}`).
@@ -269,6 +340,20 @@ pub struct Transcript {
     pub pressure_level: PressureLevel,
     pub input_value: String,
     pub input_cursor: usize,
+    /// The highlighted command in the Slash Command menu (ADR-0032), an index
+    /// into the FILTERED rows. Only meaningful while the draft `is_slash`; the
+    /// menu itself is derived on demand ([`Transcript::slash_menu`]) from the
+    /// draft (the filter) and the `&'static` registry, so this holds just the
+    /// cursor. Clamped to the filtered length as typing narrows the menu.
+    slash_cursor: usize,
+    /// The open command-selector overlay (ADR-0033), or `None` when no
+    /// selector-opening command is active. Set when a command whose descriptor
+    /// `opens_selector` is committed (to a `Loading` overlay), folded to
+    /// `Ready`/`Failed` by [`Transcript::apply_event`], and cleared on
+    /// selection, Escape, or backspacing out of the sub-state. Owned modal
+    /// state, mirroring [`Transcript::pending_approval`]; the filter is NOT
+    /// owned here — the draft `rest` filters the rows.
+    command_selector: Option<CommandSelector>,
     /// The prompt-history ring and its Readline-style recall rules. Owned by
     /// [`crate::ui::history`]; navigated from the Up/Down arms of
     /// [`Transcript::handle_key`] and appended to by [`Transcript::record_submit`].
@@ -312,6 +397,8 @@ impl Transcript {
             pressure_level: PressureLevel::Ok,
             input_value: String::new(),
             input_cursor: 0,
+            slash_cursor: 0,
+            command_selector: None,
             history: History::new(opts.history),
             thinking_expanded: false,
             messages_revision: 0,
@@ -505,6 +592,31 @@ impl Transcript {
                 (self, vec![])
             }
 
+            // The adapter delivered a committed command's selector rows: flip a
+            // Loading overlay to Ready over a fresh Selector. Guarded so a stale
+            // event that arrives after the overlay closed (Escape/selection) or
+            // was never Loading is ignored — it must not resurrect a closed
+            // popup.
+            Event::SelectorReady(rows) => {
+                if let Some(cs) = self.command_selector.as_mut()
+                    && matches!(cs.status, SelectorStatus::Loading)
+                {
+                    cs.status = SelectorStatus::Ready(Selector::new(rows));
+                }
+                (self, vec![])
+            }
+
+            // The adapter could not produce the rows: flip a Loading overlay to
+            // Failed. Same staleness guard as SelectorReady.
+            Event::SelectorFailed(message) => {
+                if let Some(cs) = self.command_selector.as_mut()
+                    && matches!(cs.status, SelectorStatus::Loading)
+                {
+                    cs.status = SelectorStatus::Failed(message);
+                }
+                (self, vec![])
+            }
+
             Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
 
             Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
@@ -563,6 +675,133 @@ impl Transcript {
                 // Every other key is swallowed.
                 _ => (self, vec![]),
             };
+        }
+
+        // Slash Command overlay (ADR-0032/0033): a leading `/` opens the popup
+        // whatever the Agent is doing (Idle or Running) — a slash draft is NEVER
+        // a prompt or Steering. The draft parses into `(name, rest)`; the popup
+        // is in one of two sub-states, keyed by whether the command committed:
+        //
+        //   * COMMAND MENU (`rest = None`, or `name` is not a known
+        //     selector-opening command): Phase 3's palette. Arrows move the
+        //     highlight, Enter/space commits, Escape closes; editing keys fall
+        //     through so typing filters the menu.
+        //   * SELECTOR (`rest = Some` and `name` is a known `opens_selector`
+        //     command): the committed command's own value list. Arrows move
+        //     within the `rest`-filtered rows, Enter chooses, Escape closes;
+        //     editing keys fall through so `rest` keeps filtering.
+        //
+        // This sits before the submit/steer/nav/edit arms precisely so `/`
+        // intercepts Enter and the arrows.
+        if slash::is_slash(&self.input_value) {
+            let draft = slash::parse(&self.input_value);
+            let in_selector = draft.rest.is_some()
+                && slash::lookup(&draft.name).is_some_and(|c| c.opens_selector);
+
+            if in_selector {
+                // -- SELECTOR sub-state (`/model qw`) --
+                let rest = draft.rest.clone().unwrap_or_default();
+                match key {
+                    Key::ArrowUp | Key::WheelUp | Key::ArrowDown | Key::WheelDown => {
+                        if let Some(CommandSelector {
+                            status: SelectorStatus::Ready(sel),
+                            ..
+                        }) = self.command_selector.as_mut()
+                        {
+                            sel.handle_nav(key, &rest);
+                        }
+                        return (self, vec![]);
+                    }
+                    Key::Enter => {
+                        // Only a Ready overlay with a highlighted row resolves;
+                        // Loading/Failed swallow Enter (no fetch to pick from).
+                        let chosen = match self.command_selector.as_mut() {
+                            Some(CommandSelector {
+                                command,
+                                status: SelectorStatus::Ready(sel),
+                            }) => sel.handle_nav(Key::Enter, &rest).and_then(
+                                |outcome| match outcome {
+                                    SelectorOutcome::Select(value) => {
+                                        Some(Effect::SelectorChosen {
+                                            command: command.clone(),
+                                            value,
+                                        })
+                                    }
+                                    SelectorOutcome::Cancel => None,
+                                },
+                            ),
+                            _ => None,
+                        };
+                        match chosen {
+                            Some(effect) => {
+                                self.close_selector();
+                                return (self, vec![effect]);
+                            }
+                            None => return (self, vec![]),
+                        }
+                    }
+                    Key::Escape => {
+                        // Close the overlay and empty the Composer (no Turn to
+                        // cancel — the overlay is a Composer state).
+                        self.close_selector();
+                        return (self, vec![]);
+                    }
+                    // Editing keys (chars, Backspace, newline, cursor moves)
+                    // fall through so `rest` keeps filtering the rows. Note:
+                    // backspacing away the space (rest → None) drops us back to
+                    // the COMMAND MENU next fold, and `sync_selector` there
+                    // closes this overlay so a re-activation re-fetches.
+                    _ => {}
+                }
+            } else {
+                // -- COMMAND MENU sub-state (`/mod`) --
+                // A menu keystroke means we are not in a selector sub-state; drop
+                // any overlay left over from backspacing out of one so the next
+                // commit is a fresh activation (re-emits Effect::Command).
+                self.command_selector = None;
+                let rows = slash::rows(&draft.name);
+                self.slash_cursor = self.slash_cursor.min(rows.len().saturating_sub(1));
+                match key {
+                    Key::ArrowUp | Key::WheelUp => {
+                        self.slash_cursor = self.slash_cursor.saturating_sub(1);
+                        return (self, vec![]);
+                    }
+                    Key::ArrowDown | Key::WheelDown => {
+                        if self.slash_cursor + 1 < rows.len() {
+                            self.slash_cursor += 1;
+                        }
+                        return (self, vec![]);
+                    }
+                    // Commit the highlighted command. An empty filtered menu means
+                    // the typed token matches no command: surface an
+                    // unknown-command info line, start no Turn, and clear the draft.
+                    Key::Enter => {
+                        let row = rows.get(self.slash_cursor).cloned();
+                        return self.commit_command(row.as_ref());
+                    }
+                    // Typing a space after a command token also commits it (the
+                    // palette convention): the space is the menu→command boundary,
+                    // so it commits the highlighted row rather than editing the
+                    // draft. Only when a row is highlighted — a bare/space on an
+                    // empty menu falls through as a normal edit.
+                    Key::Char(' ') if rows.get(self.slash_cursor).is_some() => {
+                        let row = rows.get(self.slash_cursor).cloned();
+                        return self.commit_command(row.as_ref());
+                    }
+                    // Escape closes the menu by clearing the draft — the same
+                    // "back to an empty Composer" the running-Turn Escape does NOT
+                    // do (that Cancels), but here there is no Turn to cancel: the
+                    // menu is a Composer state, so leaving it empties the Composer.
+                    Key::Escape => {
+                        self.clear_draft();
+                        return (self, vec![]);
+                    }
+                    // Every other key (chars, Backspace, newline, cursor moves)
+                    // falls through to the Composer editing below, so typing
+                    // filters the menu live.
+                    _ => {}
+                }
+            }
         }
 
         match key {
@@ -779,10 +1018,124 @@ impl Transcript {
         self.streaming.text()
     }
 
+    /// The open Slash Command MENU (ADR-0032) for rendering, or `None` when the
+    /// draft is not a slash draft OR the popup is in the selector sub-state
+    /// (`rest = Some` on a known selector-opening command — read that through
+    /// [`Transcript::slash_view`]). Exposed like [`Transcript::pending_approval`]
+    /// so the view reads it and draws the inline popup: `rows` are the commands
+    /// matching the typed token, `highlight` the (clamped) highlighted index.
+    ///
+    /// Kept beside the unified [`Transcript::slash_view`] because Phase 3's tests
+    /// and callers read the menu directly; `slash_view` is the one query the
+    /// adapter matches to draw either sub-state.
+    pub fn slash_menu(&self) -> Option<SlashMenu> {
+        match self.slash_view() {
+            Some(SlashView::Menu { rows, highlight }) => Some(SlashMenu { rows, highlight }),
+            _ => None,
+        }
+    }
+
+    /// The current inline-popup view (ADR-0032/0033), or `None` when the draft is
+    /// not a slash draft. One query the adapter matches once: `Menu` while the
+    /// command token is being typed (`rest = None`, or the token is not a known
+    /// selector-opening command), `Selector` once such a command committed
+    /// (`rest = Some`). The Selector's `rows`/`highlight` are the overlay rows
+    /// filtered by the draft `rest` (the filter is the draft's, not the
+    /// Selector's — consistent with the menu), so they reflect live typing.
+    pub fn slash_view(&self) -> Option<SlashView> {
+        if !slash::is_slash(&self.input_value) {
+            return None;
+        }
+        let draft = slash::parse(&self.input_value);
+        let in_selector =
+            draft.rest.is_some() && slash::lookup(&draft.name).is_some_and(|c| c.opens_selector);
+        if in_selector {
+            let rest = draft.rest.unwrap_or_default();
+            let (command, status, rows, highlight) = match &self.command_selector {
+                Some(cs) => {
+                    let (rows, highlight) = match &cs.status {
+                        SelectorStatus::Ready(sel) => (
+                            sel.filtered(&rest).into_iter().cloned().collect(),
+                            sel.cursor.min(sel.filtered(&rest).len().saturating_sub(1)),
+                        ),
+                        _ => (Vec::new(), 0),
+                    };
+                    (cs.command.clone(), cs.status.clone(), rows, highlight)
+                }
+                // No overlay yet (a fresh `/model ` before the next fold
+                // activates it): show a Loading placeholder for the command.
+                None => (draft.name.clone(), SelectorStatus::Loading, Vec::new(), 0),
+            };
+            Some(SlashView::Selector {
+                command,
+                status,
+                rows,
+                highlight,
+            })
+        } else {
+            let rows = slash::rows(&draft.name);
+            let highlight = self.slash_cursor.min(rows.len().saturating_sub(1));
+            Some(SlashView::Menu { rows, highlight })
+        }
+    }
+
     // ---- Internals ---------------------------------------------------------
 
     fn push_info(&mut self, text: String) {
         self.messages.push(TranscriptItem::Info { text });
+    }
+
+    // Empties the Composer, resets the Slash Command highlight, and closes any
+    // command-selector overlay — the landing spot after a committed/closed slash
+    // draft.
+    fn clear_draft(&mut self) {
+        self.input_value = String::new();
+        self.input_cursor = 0;
+        self.slash_cursor = 0;
+        self.command_selector = None;
+    }
+
+    // Closes the selector overlay AND clears the draft (they open together, they
+    // close together). The named alias reads as intent at the call sites where a
+    // selection/Escape resolves the sub-state.
+    fn close_selector(&mut self) {
+        self.clear_draft();
+    }
+
+    // Commits the highlighted command row from the COMMAND MENU (ADR-0032/0033).
+    // `row` is `None` when the filtered menu is empty (unknown command). A
+    // selector-opening command switches the popup to its selector sub-state:
+    // the draft is normalized to `"/<name> "`, a `Loading` overlay is set, and
+    // `Effect::Command` is emitted ONCE (the overlay's presence guards against
+    // re-emitting on later keystrokes — the menu block only runs when there is
+    // no overlay). A fire-and-run command keeps Phase 3 behavior: emit
+    // `Effect::Command` and clear the draft.
+    fn commit_command(mut self, row: Option<&SelectorRow>) -> (Self, Vec<Effect>) {
+        let row = match row {
+            Some(row) => row.clone(),
+            None => {
+                let filter = slash::parse(&self.input_value).name;
+                self.push_info(format!("unknown command: /{filter}"));
+                self.clear_draft();
+                return (self, vec![]);
+            }
+        };
+        let opens_selector = slash::lookup(&row.value).is_some_and(|c| c.opens_selector);
+        if opens_selector {
+            // Enter the selector sub-state: normalize to `/<name> ` so `rest`
+            // becomes `Some("")`, set the Loading overlay, and fetch once.
+            self.input_value = format!("/{} ", row.value);
+            self.input_cursor = self.input_value.chars().count();
+            self.slash_cursor = 0;
+            self.command_selector = Some(CommandSelector {
+                command: row.value.clone(),
+                status: SelectorStatus::Loading,
+            });
+            (self, vec![Effect::Command { name: row.value }])
+        } else {
+            self.clear_draft();
+            (self, vec![Effect::Command { name: row.value }])
+        }
     }
 
     // Presentment (CONTEXT.md): the configured Plugins may replace the default
@@ -1594,6 +1947,422 @@ mod tests {
         match &items[0] {
             TranscriptItem::Info { text } => assert!(text.contains("disk full")),
             other => panic!("expected info, got {other:?}"),
+        }
+    }
+
+    // --- Slash Commands (ADR-0032) -----------------------------------------
+
+    // A slash draft opens the menu; the menu is derived from the draft and the
+    // registry, so this just sets the Composer to a slash draft.
+    fn slashing(draft: &str) -> Transcript {
+        fresh().input_changed(draft, draft.chars().count())
+    }
+
+    #[test]
+    fn a_leading_slash_opens_the_menu_showing_every_command() {
+        let menu = slashing("/").slash_menu().expect("menu open on '/'");
+        assert_eq!(menu.rows, slash::rows(""));
+        assert_eq!(menu.highlight, 0);
+    }
+
+    #[test]
+    fn a_non_slash_draft_has_no_menu() {
+        assert_eq!(slashing("fix the bug").slash_menu(), None);
+        assert_eq!(fresh().slash_menu(), None);
+    }
+
+    #[test]
+    fn typing_filters_the_menu_by_the_command_token() {
+        let menu = slashing("/mod").slash_menu().expect("menu open");
+        assert_eq!(menu.rows, slash::rows("mod"));
+        assert_eq!(menu.rows.len(), 1);
+
+        // A token that matches nothing leaves an empty (but open) menu.
+        let empty = slashing("/zzz").slash_menu().expect("menu still open");
+        assert!(empty.rows.is_empty());
+    }
+
+    #[test]
+    fn up_down_move_the_menu_highlight_clamped_to_the_filtered_rows() {
+        // One command today, so the highlight cannot leave row 0; the arrows are
+        // still swallowed (no scroll effect) and saturate.
+        let (t, effects) = slashing("/").handle_key(Key::ArrowDown);
+        assert_eq!(effects, vec![], "arrows drive the menu, not a scroll");
+        assert_eq!(t.slash_menu().unwrap().highlight, 0);
+        let (t, effects) = t.handle_key(Key::ArrowUp);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.slash_menu().unwrap().highlight, 0);
+    }
+
+    // `/model` opens a selector (ADR-0033), so committing it does NOT clear the
+    // draft the way a fire-and-run command would (Phase 3). It normalizes the
+    // draft to `"/model "`, sets a Loading overlay, and emits ONE Effect::Command
+    // — the selector-activation path is exercised separately below.
+    #[test]
+    fn enter_commits_the_highlighted_command_and_clears_the_draft() {
+        let (t, effects) = slashing("/model").handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Command {
+                name: "model".into(),
+            }]
+        );
+        // Selector-opening: draft normalized, NOT cleared; overlay is Loading.
+        assert_eq!(t.input_value, "/model ");
+        assert_eq!(t.input_cursor, 7);
+        assert!(matches!(
+            t.slash_view(),
+            Some(SlashView::Selector {
+                status: SelectorStatus::Loading,
+                ..
+            })
+        ));
+        // No user line, no Turn.
+        assert_eq!(items(&t), vec![]);
+    }
+
+    #[test]
+    fn committing_a_partial_token_uses_the_highlighted_full_command_name() {
+        // "/mod" filters to the one command; Enter commits "model", not "mod".
+        let (_t, effects) = slashing("/mod").handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Command {
+                name: "model".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn enter_on_an_unknown_command_yields_an_info_line_and_no_turn() {
+        let (t, effects) = slashing("/nope").handle_key(Key::Enter);
+        assert_eq!(effects, vec![], "no Turn, no command effect");
+        assert_eq!(items(&t), vec![info("unknown command: /nope")]);
+        assert_eq!(t.input_value, "", "draft cleared");
+        assert_eq!(t.slash_menu(), None);
+    }
+
+    #[test]
+    fn escape_closes_the_menu_by_clearing_the_draft() {
+        let (t, effects) = slashing("/model").handle_key(Key::Escape);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "");
+        assert_eq!(t.slash_menu(), None);
+    }
+
+    #[test]
+    fn typing_and_backspace_fall_through_to_the_composer_while_slashing() {
+        // A char extends the draft (and refilters the menu).
+        let (t, effects) = slashing("/mode").handle_key(Key::Char('l'));
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "/model");
+        assert_eq!(t.slash_menu().unwrap().rows, slash::rows("model"));
+
+        // Backspace erases back toward the slash; the menu stays open.
+        let (t, effects) = t.handle_key(Key::Backspace);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "/mode");
+        assert!(t.slash_menu().is_some());
+
+        // Backspacing away the slash closes the menu; the remaining text is a
+        // normal draft again.
+        let t = slashing("/").input_changed("/", 1);
+        let (t, _) = t.handle_key(Key::Backspace);
+        assert_eq!(t.input_value, "");
+        assert_eq!(t.slash_menu(), None);
+    }
+
+    #[test]
+    fn a_slash_draft_never_submits_or_steers_even_while_running() {
+        // Idle: Enter commits a command, never a Submit.
+        let (_t, effects) = slashing("/model").handle_key(Key::Enter);
+        assert!(matches!(effects.as_slice(), [Effect::Command { .. }]));
+
+        // Running: the leading `/` still opens the menu and Enter commits the
+        // command — it is NOT Steering text.
+        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let t = t.input_changed("/model", 6);
+        assert!(t.slash_menu().is_some(), "menu opens while running");
+        let (_t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Command {
+                name: "model".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_normal_draft_still_submits_when_idle_and_steers_when_running() {
+        // Idle submit is unchanged.
+        let (_t, effects) = fresh()
+            .input_changed("do a thing", 10)
+            .handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Agent(AgentCommand::Submit("do a thing".into()))]
+        );
+
+        // Running steer is unchanged.
+        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let (_t, effects) = t.input_changed("also this", 9).handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Agent(AgentCommand::Steer("also this".into()))]
+        );
+    }
+
+    // --- Slash Command selector overlay (ADR-0033) -------------------------
+
+    // A model row for the injected SelectorReady events (value = label).
+    fn model_row(id: &str) -> SelectorRow {
+        SelectorRow::new(id, id, None)
+    }
+
+    // The overlay after committing `/model` and (optionally) delivering rows.
+    // The draft is left at `"/model "` (rest = Some("")), the sub-state.
+    fn model_selector_ready(rows: Vec<SelectorRow>) -> Transcript {
+        let (t, _) = slashing("/model").handle_key(Key::Enter);
+        let (t, _) = t.apply_event(Event::selector_ready(rows));
+        t
+    }
+
+    #[test]
+    fn committing_a_selector_command_by_enter_loads_normalizes_and_fetches_once() {
+        let (t, effects) = slashing("/model").handle_key(Key::Enter);
+        // Exactly one Effect::Command (the adapter fetches).
+        assert_eq!(
+            effects,
+            vec![Effect::Command {
+                name: "model".into(),
+            }]
+        );
+        // Draft normalized to `/model ` (rest = Some("")) — NOT cleared.
+        assert_eq!(t.input_value, "/model ");
+        // Overlay is Loading for `model`.
+        assert!(matches!(
+            t.slash_view(),
+            Some(SlashView::Selector {
+                status: SelectorStatus::Loading,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn committing_a_selector_command_by_typing_a_space_loads_and_fetches_once() {
+        // Typing the space after `/model` commits it the same way Enter does.
+        let (t, effects) = slashing("/model").handle_key(Key::Char(' '));
+        assert_eq!(
+            effects,
+            vec![Effect::Command {
+                name: "model".into(),
+            }]
+        );
+        assert_eq!(t.input_value, "/model ");
+        assert!(matches!(
+            t.slash_view(),
+            Some(SlashView::Selector {
+                status: SelectorStatus::Loading,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn selector_ready_flips_loading_to_ready_and_the_rest_filters_the_rows() {
+        let rows = vec![model_row("qwen"), model_row("llama"), model_row("gpt")];
+        let t = model_selector_ready(rows);
+        // Ready, all rows shown (rest is "").
+        match t.slash_view() {
+            Some(SlashView::Selector {
+                status: SelectorStatus::Ready(_),
+                rows,
+                highlight,
+                command,
+            }) => {
+                assert_eq!(command, "model");
+                assert_eq!(rows.len(), 3);
+                assert_eq!(highlight, 0);
+            }
+            other => panic!("expected Ready selector, got {other:?}"),
+        }
+        // Typing after the space filters via `rest` (the draft owns the filter).
+        let (t, _) = t.handle_key(Key::Char('q'));
+        assert_eq!(t.input_value, "/model q");
+        match t.slash_view() {
+            Some(SlashView::Selector { rows, .. }) => {
+                assert_eq!(rows, vec![model_row("qwen")], "only 'qwen' contains 'q'");
+            }
+            other => panic!("expected filtered selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn up_down_move_within_the_filtered_rows_of_a_ready_overlay() {
+        let rows = vec![model_row("qwen"), model_row("llama"), model_row("gpt")];
+        let t = model_selector_ready(rows);
+        let (t, effects) = t.handle_key(Key::ArrowDown);
+        assert_eq!(effects, vec![], "arrows drive the overlay, not a scroll");
+        assert_eq!(highlight_of(&t), 1);
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(highlight_of(&t), 2);
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(highlight_of(&t), 2, "saturates at the last row");
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(highlight_of(&t), 1);
+    }
+
+    // The highlighted index of a Ready selector overlay.
+    fn highlight_of(t: &Transcript) -> usize {
+        match t.slash_view() {
+            Some(SlashView::Selector { highlight, .. }) => highlight,
+            other => panic!("expected a selector overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_a_ready_overlay_chooses_the_highlighted_row_and_closes() {
+        let rows = vec![model_row("qwen"), model_row("llama")];
+        let t = model_selector_ready(rows);
+        // Move to the second row, then Enter.
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::SelectorChosen {
+                command: "model".into(),
+                value: "llama".into(),
+            }]
+        );
+        // Overlay closed, draft cleared.
+        assert_eq!(t.input_value, "");
+        assert_eq!(t.slash_view(), None);
+    }
+
+    #[test]
+    fn enter_selects_the_filtered_highlighted_row() {
+        let rows = vec![model_row("qwen"), model_row("llama"), model_row("gpt")];
+        let t = model_selector_ready(rows);
+        // Filter to just "llama" via `rest`, then Enter selects it.
+        let (t, _) = t.handle_key(Key::Char('l'));
+        let (t, _) = t.handle_key(Key::Char('l'));
+        let (_t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::SelectorChosen {
+                command: "model".into(),
+                value: "llama".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn selector_failed_shows_a_failed_overlay_and_enter_does_nothing() {
+        let (t, _) = slashing("/model").handle_key(Key::Enter);
+        let (t, _) = t.apply_event(Event::selector_failed("no server"));
+        assert!(matches!(
+            t.slash_view(),
+            Some(SlashView::Selector {
+                status: SelectorStatus::Failed(_),
+                ..
+            })
+        ));
+        // Enter on a Failed overlay does nothing (no rows to pick).
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(effects, vec![]);
+        assert!(matches!(
+            t.slash_view(),
+            Some(SlashView::Selector {
+                status: SelectorStatus::Failed(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn escape_closes_the_selector_overlay_and_clears_the_draft() {
+        let rows = vec![model_row("qwen")];
+        let t = model_selector_ready(rows);
+        let (t, effects) = t.handle_key(Key::Escape);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "");
+        assert_eq!(t.slash_view(), None);
+    }
+
+    #[test]
+    fn backspacing_the_space_returns_to_the_menu_and_reactivation_refetches() {
+        let rows = vec![model_row("qwen")];
+        let t = model_selector_ready(rows);
+        // Backspace removes the trailing space: `/model ` → `/model`, so rest
+        // goes None and we are back in the COMMAND MENU (overlay dropped).
+        let (t, effects) = t.handle_key(Key::Backspace);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "/model");
+        assert!(matches!(t.slash_view(), Some(SlashView::Menu { .. })));
+        // Re-committing is a fresh activation: it re-emits Effect::Command.
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(
+            effects,
+            vec![Effect::Command {
+                name: "model".into(),
+            }]
+        );
+        assert!(matches!(
+            t.slash_view(),
+            Some(SlashView::Selector {
+                status: SelectorStatus::Loading,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn backspacing_the_slash_exits_slash_mode_entirely() {
+        let t = model_selector_ready(vec![model_row("qwen")]);
+        // Drive the draft down to a lone `/`, then backspace it away.
+        let t = t.input_changed("/", 1);
+        let (t, _) = t.handle_key(Key::Backspace);
+        assert_eq!(t.input_value, "");
+        assert_eq!(t.slash_view(), None, "no longer a slash draft");
+    }
+
+    #[test]
+    fn a_stale_selector_ready_after_the_overlay_closed_is_ignored() {
+        // Commit, then Escape to close the overlay.
+        let (t, _) = slashing("/model").handle_key(Key::Enter);
+        let (t, _) = t.handle_key(Key::Escape);
+        assert_eq!(t.slash_view(), None);
+        // A late SelectorReady must not resurrect the popup.
+        let (t, effects) = t.apply_event(Event::selector_ready(vec![model_row("qwen")]));
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.slash_view(), None, "stale event ignored");
+    }
+
+    #[test]
+    fn selector_ready_is_ignored_when_no_overlay_is_loading() {
+        // No slash draft at all: the event is folded but changes nothing.
+        let (t, effects) = fresh().apply_event(Event::selector_ready(vec![model_row("qwen")]));
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.slash_view(), None);
+    }
+
+    #[test]
+    fn a_second_selector_ready_does_not_overwrite_a_ready_overlay() {
+        // Guard: once Ready, a duplicate delivery must not reset the cursor.
+        let t = model_selector_ready(vec![model_row("qwen"), model_row("llama")]);
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(highlight_of(&t), 1);
+        // A second (stale) ready arrives — the overlay is no longer Loading.
+        let (t, _) = t.apply_event(Event::selector_ready(vec![model_row("gpt")]));
+        match t.slash_view() {
+            Some(SlashView::Selector {
+                rows, highlight, ..
+            }) => {
+                assert_eq!(rows.len(), 2, "kept the first delivery");
+                assert_eq!(highlight, 1, "cursor untouched");
+            }
+            other => panic!("expected Ready selector, got {other:?}"),
         }
     }
 

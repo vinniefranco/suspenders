@@ -28,6 +28,7 @@ use crate::conversation::WaveStats;
 use crate::llm::response::StopReason;
 use crate::llm::stream::Delta;
 use crate::session::RecoveryShape;
+use crate::ui::selector::SelectorRow;
 
 /// The `plugin_error` stage: which point in the Plugin lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
@@ -202,6 +203,17 @@ pub enum Event {
         budget: u64,
     },
 
+    // ---- Slash Command selector (ADR-0032/0033) ----
+    /// A committed selector-opening Slash Command's rows arrived: the adapter
+    /// fetched them (e.g. `/model`'s model list) and hands them back so the
+    /// pure core flips its `Loading` overlay to a `Ready` [`SelectorRow`] list.
+    /// The core stays command-agnostic — it neither fetches nor interprets;
+    /// these are opaque rows the generic selector filters and renders.
+    SelectorReady(Vec<SelectorRow>),
+    /// The adapter could not produce the rows (fetch failed, cache empty): the
+    /// pure core flips its `Loading` overlay to `Failed(message)`.
+    SelectorFailed(String),
+
     // ---- Settlement ----
     TurnFinished {
         stop_reason: StopReason,
@@ -329,6 +341,16 @@ impl Event {
         Event::ApprovalAuto {
             command: command.into(),
         }
+    }
+
+    // ---- Slash Command selector ----
+
+    pub fn selector_ready(rows: Vec<SelectorRow>) -> Self {
+        Event::SelectorReady(rows)
+    }
+
+    pub fn selector_failed(message: impl Into<String>) -> Self {
+        Event::SelectorFailed(message.into())
     }
 
     // ---- The rest ----

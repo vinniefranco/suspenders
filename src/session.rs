@@ -184,7 +184,7 @@ impl SessionConfig {
     pub fn test_defaults() -> Self {
         let mut cfg = SessionConfig::base();
         cfg.base_url = "http://localhost:0/v1".into();
-        cfg.llm_module = "Baud.FakeLLM".into();
+        cfg.llm_module = "Suspenders.FakeLLM".into();
         cfg.plugins = vec![];
         cfg.session_dir = std::env::temp_dir()
             .join("suspenders_test_sessions")
@@ -348,6 +348,65 @@ impl SessionConfig {
         std::fs::write(path, json)
             .map_err(|e| SessionError(format!("failed to write config to {path}: {e}")))
     }
+
+    /// Persists the Active Model choice by a sparse read-modify-write of the
+    /// config file (ADR-0033, ADR-0031 amendment): the user's other keys are
+    /// preserved and `token` is never introduced by the tool. This is the one
+    /// sanctioned exception to ADR-0031's no-auto-create — an explicit `/model`
+    /// pick is a deliberate act, so the file is created if absent.
+    ///
+    /// If `path` exists it is parsed as a JSON object and only the `"model"` key
+    /// is set; if absent, a `{"model": "..."}` file (and its parent dirs) is
+    /// created. Malformed existing JSON is an [`Err`] naming `path` (mirroring
+    /// [`load_file_overlay`]'s error style). Parsing splits into the pure
+    /// [`merge_model`] and this thin impure reader/writer, the same split as
+    /// [`FileConfig::parse`] vs [`load_file_overlay`].
+    pub fn persist_model(path: &str, model: &str) -> Result<(), SessionError> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(SessionError(format!(
+                    "failed to read config at {path}: {e}"
+                )));
+            }
+        };
+
+        let json = merge_model(existing.as_deref(), model)
+            .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?;
+
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SessionError(format!("failed to create config directory {parent:?}: {e}"))
+            })?;
+        }
+
+        std::fs::write(path, json)
+            .map_err(|e| SessionError(format!("failed to write config to {path}: {e}")))
+    }
+}
+
+/// Pure sparse merge of the `model` key into a config file's JSON (ADR-0033):
+/// `existing` is the current file contents (or `None` when absent), and the
+/// result is the pretty JSON to write back. Every other key is preserved; a
+/// `token` key is never introduced (only the caller's existing one, if any,
+/// survives). A malformed or non-object existing file is an [`Err`] carrying the
+/// path-agnostic reason (the caller wraps it with the resolved path). Path-free
+/// and side-effect-free, so it unit-tests with literals like [`FileConfig::parse`].
+fn merge_model(existing: Option<&str>, model: &str) -> Result<String, String> {
+    let mut value = match existing {
+        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(raw) => serde_json::from_str(raw).map_err(|e| e.to_string())?,
+    };
+
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "config root must be a JSON object".to_string())?;
+    obj.insert("model".into(), serde_json::Value::String(model.to_string()));
+
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
 }
 
 /// The user config file's schema (ADR-0031): exactly the env-settable key set,
@@ -681,7 +740,9 @@ fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionE
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(SessionError(format!("failed to read config at {path}: {e}"))),
+        Err(e) => Err(SessionError(format!(
+            "failed to read config at {path}: {e}"
+        ))),
     }
 }
 
@@ -807,7 +868,7 @@ mod tests {
     #[test]
     fn defaults_come_from_config() {
         let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.llm_module, "Baud.FakeLLM");
+        assert_eq!(session.llm_module, "Suspenders.FakeLLM");
         assert_eq!(session.context_budget, cfg().context_budget);
         assert_eq!(session.connection.max_tokens, cfg().max_tokens);
         assert_eq!(session.plugins, Vec::<String>::new());
@@ -1500,7 +1561,10 @@ mod tests {
     #[test]
     fn write_template_omits_token_and_refuses_existing_without_force() {
         let path = std::env::temp_dir()
-            .join(format!("suspenders_write_config_{}.json", std::process::id()))
+            .join(format!(
+                "suspenders_write_config_{}.json",
+                std::process::id()
+            ))
             .to_string_lossy()
             .into_owned();
         let _ = std::fs::remove_file(&path);
@@ -1512,8 +1576,14 @@ mod tests {
         assert!(!written.contains("\"token\""));
         // The template is full: it parses and round-trips a known key.
         let fc = FileConfig::parse(&written).unwrap();
-        assert_eq!(fc.model.as_deref(), Some(SessionConfig::base().model.as_str()));
-        assert_eq!(fc.recovery_shape, Some(SessionConfig::base().recovery_shape));
+        assert_eq!(
+            fc.model.as_deref(),
+            Some(SessionConfig::base().model.as_str())
+        );
+        assert_eq!(
+            fc.recovery_shape,
+            Some(SessionConfig::base().recovery_shape)
+        );
         assert!(fc.token.is_none());
 
         // Refuses an existing target without force.
@@ -1529,7 +1599,11 @@ mod tests {
     // collide on the filesystem seam.
     fn temp_config_path(label: &str) -> String {
         std::env::temp_dir()
-            .join(format!("suspenders_cfg_{}_{}.json", label, std::process::id()))
+            .join(format!(
+                "suspenders_cfg_{}_{}.json",
+                label,
+                std::process::id()
+            ))
             .to_string_lossy()
             .into_owned()
     }
@@ -1587,5 +1661,65 @@ mod tests {
         assert!(fc.no_think_rescue.is_some());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- persist_model (ADR-0033: sparse, sticky /model write) --------------
+
+    #[test]
+    fn persist_model_creates_the_file_when_absent() {
+        // The sanctioned exception to no-auto-create: an explicit pick writes a
+        // fresh `{"model": ...}` (ADR-0033 / ADR-0031 amendment).
+        let path = temp_config_path("persist_creates");
+        let _ = std::fs::remove_file(&path);
+        assert!(!std::path::Path::new(&path).exists());
+
+        SessionConfig::persist_model(&path, "picked/model").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let fc = FileConfig::parse(&raw).unwrap();
+        assert_eq!(fc.model.as_deref(), Some("picked/model"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_model_merges_preserving_another_key_and_never_adds_token() {
+        // Sparse read-modify-write: only `model` changes; the user's other keys
+        // survive and `token` is never introduced by the tool.
+        let path = temp_config_path("persist_merges");
+        std::fs::write(&path, r#"{"context_budget": 12345, "model": "old/model"}"#).unwrap();
+
+        SessionConfig::persist_model(&path, "new/model").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // token is never persisted (the "token" substring in "max_tokens" is
+        // fine; the standalone key must be absent).
+        assert!(!raw.contains("\"token\""));
+        // The result re-parses via the DTO, with the merge applied and the
+        // pre-existing key preserved.
+        let fc = FileConfig::parse(&raw).unwrap();
+        assert_eq!(fc.model.as_deref(), Some("new/model"));
+        assert_eq!(fc.context_budget, Some(12345));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_model_errors_on_a_malformed_existing_file() {
+        let path = temp_config_path("persist_malformed");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let err = SessionConfig::persist_model(&path, "picked/model").unwrap_err();
+        assert!(err.0.contains(&path));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merge_model_starts_from_empty_when_absent() {
+        // The pure seam: absent existing → a lone `model` object.
+        let json = merge_model(None, "solo/model").unwrap();
+        let fc = FileConfig::parse(&json).unwrap();
+        assert_eq!(fc.model.as_deref(), Some("solo/model"));
     }
 }

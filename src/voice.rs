@@ -571,7 +571,9 @@ mod tests {
     fn system_prompt_bans_invented_line_numbers_but_allows_quoting_tool_output() {
         let prompt = system_prompt();
         assert!(prompt.contains("name the file and the function - never a line number"));
-        assert!(prompt.contains("Quoting a line number printed by a compiler or test error is fine"));
+        assert!(
+            prompt.contains("Quoting a line number printed by a compiler or test error is fine")
+        );
     }
 
     #[test]
