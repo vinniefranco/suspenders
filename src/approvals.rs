@@ -11,8 +11,38 @@
 //! a place where the model could compose an unapproved command out of an
 //! approved stem (ADR-0005).
 
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The Approval policy: the one place that declares which Tools gate and, for
+/// each, the field whose value the user reads in the modal (and a Standing
+/// Approval matches by exact string equality - ADR-0005). run_command shows
+/// the command (arbitrary code); web_fetch shows the URL (the one Tool that
+/// reaches outside the Project Root - ADR-0024).
+///
+/// One row per gated Tool ties "this gates" to "this is the field" so the two
+/// facts can never disagree. A gated Tool with the field missing or non-string
+/// still gates, reading the empty string - the gate is about the Tool, not the
+/// input's shape.
+const GATED: &[(&str, &str)] = &[("run_command", "command"), ("web_fetch", "url")];
+
+/// The single Approval-gate query over a Tool Call (name + input): `Some(text)`
+/// means the Call gates and `text` is exactly what the user reads (and what a
+/// Standing Approval matches); `None` means no gate. Because the same lookup
+/// answers both facts, "does this gate" and "what text" can never disagree.
+///
+/// The text is read from the plugin-adjusted input the caller hands over.
+pub fn gate_text(name: &str, input: &Value) -> Option<String> {
+    let (_, field) = GATED.iter().find(|(tool, _)| *tool == name)?;
+    Some(
+        input
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    )
+}
 
 /// A unique identifier for an Approval request, standing in for baud's
 /// `make_ref()`. In the wired Agent the id is minted by the Turn Loop and
@@ -139,9 +169,62 @@ impl Approvals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn id() -> ApprovalId {
         ApprovalId::new()
+    }
+
+    // ---- gate_text: the one Approval-gate query ----
+
+    #[test]
+    fn gate_text_gates_run_command_and_web_fetch_and_nothing_else() {
+        assert!(gate_text("run_command", &json!({"command": "mix test"})).is_some());
+        assert!(gate_text("web_fetch", &json!({"url": "https://docs.rs/tokio"})).is_some());
+
+        for name in [
+            "plan",
+            "read_file",
+            "list_files",
+            "grep",
+            "explore",
+            "edit_file",
+            "write_file",
+        ] {
+            assert_eq!(gate_text(name, &json!({})), None, "{name} must not gate");
+        }
+        assert_eq!(gate_text("no_such_tool", &json!({})), None);
+    }
+
+    #[test]
+    fn gate_text_is_the_command_for_run_command() {
+        assert_eq!(
+            gate_text("run_command", &json!({"command": "mix test"})),
+            Some("mix test".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_text_is_the_url_for_web_fetch() {
+        assert_eq!(
+            gate_text("web_fetch", &json!({"url": "https://docs.rs/tokio"})),
+            Some("https://docs.rs/tokio".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_text_is_none_for_tools_that_need_no_approval() {
+        assert_eq!(gate_text("read_file", &json!({"path": "a.ex"})), None);
+        assert_eq!(gate_text("no_such_tool", &json!({})), None);
+    }
+
+    #[test]
+    fn gate_text_falls_back_to_empty_when_the_field_is_missing_or_non_string() {
+        assert_eq!(gate_text("run_command", &json!({})), Some(String::new()));
+        assert_eq!(
+            gate_text("web_fetch", &json!({"url": 42})),
+            Some(String::new())
+        );
     }
 
     // An Approvals with a Standing Approval for `command`, nothing pending.

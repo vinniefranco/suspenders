@@ -102,6 +102,6 @@ mod tests {
 
     #[test]
     fn the_plan_tool_never_requires_approval() {
-        assert!(!crate::tools::requires_approval("plan"));
+        assert_eq!(crate::approvals::gate_text("plan", &json!({})), None);
     }
 }
