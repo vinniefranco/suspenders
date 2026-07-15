@@ -16,6 +16,8 @@ pub mod shaping;
 pub mod web_fetch;
 pub mod write_file;
 
+use crate::content::ContentBlock;
+use crate::llm::stream::MALFORMED_INPUT_SENTINEL;
 use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
 use serde_json::Value;
 
@@ -70,6 +72,49 @@ pub fn verification_specs() -> Vec<ToolSpec> {
         .into_iter()
         .filter(|s| s.name == "run_command")
         .collect()
+}
+
+/// Runs a batch of read-only Tool Calls plugin-free and collects their Tool
+/// Result blocks, in emission order.
+///
+/// This is the read-only collect-results core the Scout's Pass loop repeats:
+/// for every `tool_use` block, run the tool through [`run`] (Shaped, no
+/// Plugins) and wrap its outcome in a `tool_result` block. Non-`tool_use`
+/// blocks are ignored. A malformed-input sentinel (the LLM layer's tag for
+/// input JSON that never parsed) is blanked to an empty object so the tool's
+/// own validation rejects it rather than acting on undecoded JSON.
+///
+/// The Turn's batch (`turn::batch`) deliberately does NOT share this: it
+/// interleaves the Governor answering arbiter, the Plugin lifecycle, the
+/// Approval gate, Ledger recording, and per-result checkpointing around each
+/// call - none of which a read-only Scout has. The shared unit is only this
+/// plugin-free core.
+pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<ContentBlock> {
+    let mut results = Vec::new();
+    for block in blocks {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            let input = sanitize_input(input);
+            let result = run(name, &input, ctx).await;
+            results.push(ContentBlock::tool_result(
+                id,
+                result.content,
+                result.is_error,
+            ));
+        }
+    }
+    results
+}
+
+/// Blanks a malformed-input-tagged Tool Call input to an empty object. The LLM
+/// layer tags inputs whose JSON never decoded; never run those - let the tool's
+/// own validation reject an empty map.
+fn sanitize_input(input: &Value) -> Value {
+    if let Value::Object(map) = input
+        && map.contains_key(MALFORMED_INPUT_SENTINEL)
+    {
+        return Value::Object(serde_json::Map::new());
+    }
+    input.clone()
 }
 
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
@@ -219,6 +264,85 @@ mod tests {
                 assert!(schema["properties"].get(key).is_some());
             }
         }
+    }
+
+    // ---- sanitize_input ----
+
+    // A tool input tagged with the malformed-input sentinel is blanked to an
+    // empty object, so the read-only tool's own validation rejects it instead
+    // of acting on undecoded JSON. Routed through the one shared sentinel
+    // constant.
+    #[test]
+    fn sanitize_input_empties_a_sentinel_tagged_input() {
+        let tagged = json!({ MALFORMED_INPUT_SENTINEL: "{\"path\": tru" });
+        assert_eq!(sanitize_input(&tagged), json!({}));
+
+        // A well-formed input passes through untouched.
+        let ok = json!({ "path": "lib/widget.ex" });
+        assert_eq!(sanitize_input(&ok), ok);
+    }
+
+    // ---- run_read_only ----
+
+    // The read-only batch core runs every tool_use block plugin-free and Shaped,
+    // collecting one tool_result block per call in emission order; non-tool_use
+    // blocks are ignored.
+    #[tokio::test]
+    async fn run_read_only_collects_a_result_per_tool_use_in_order() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "alpha").unwrap();
+
+        let blocks = vec![
+            ContentBlock::text("thinking out loud"),
+            ContentBlock::tool_use("t1", "read_file", json!({ "path": "a.txt" })),
+            ContentBlock::tool_use("t2", "read_file", json!({ "path": "missing.txt" })),
+        ];
+        let results = run_read_only(&blocks, &ctx(tmp.path(), 10_000)).await;
+
+        assert_eq!(results.len(), 2);
+        match &results[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "t1");
+                assert_eq!(content, "alpha");
+                assert!(!is_error);
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+        match &results[1] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "t2");
+                assert!(is_error);
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    // A malformed-input-tagged Tool Call is never run on undecoded JSON: it is
+    // blanked to an empty object, so the tool's validation rejects it as an
+    // error result rather than acting on garbage.
+    #[tokio::test]
+    async fn run_read_only_rejects_a_malformed_tagged_input() {
+        let tmp = TempDir::new().unwrap();
+        let blocks = vec![ContentBlock::tool_use(
+            "t1",
+            "read_file",
+            json!({ MALFORMED_INPUT_SENTINEL: "{\"path\": tru" }),
+        )];
+        let results = run_read_only(&blocks, &ctx(tmp.path(), 10_000)).await;
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0],
+            ContentBlock::ToolResult { is_error: true, .. }
+        ));
     }
 
     // ---- execute ----
