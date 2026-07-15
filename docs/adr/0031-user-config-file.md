@@ -106,3 +106,16 @@ a Session is built. This requires `Serialize` on `FileConfig`.
   env.
 - The file and env seams must be kept in lockstep: a new user-tunable
   knob is added to both, or to neither.
+
+## Amendment (ADR-0033): `/model` may create and sparse-write the file
+
+The **No auto-create** rule above is about *launch* — the resolver never
+fabricates a file behind the user's back. The `/model` Slash Command
+(ADR-0033) is the one sanctioned exception: an explicit model pick is a
+deliberate act (the spirit of `--write-config`), so it will **create
+`config.json` if absent** and persist the choice by a **sparse
+read-modify-write** — parsing the existing file (or starting empty),
+setting only the `model` key, and writing it back. The user's other keys
+are preserved and `token` is still never written by the tool. Because the
+file sits below the environment, a write while `SUSPENDERS_MODEL` is set is
+accompanied by a warning that the env var will override it next launch.

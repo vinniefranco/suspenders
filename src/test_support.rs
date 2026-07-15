@@ -120,10 +120,19 @@ impl Entry {
     }
 }
 
-/// A per-instance scripted LLM. Pops one [`Entry`] per `complete` call.
+/// One scripted `list_models` answer: `Ok(ids)` or `Err(reason)`, mirroring the
+/// boundary's `Result<Vec<String>, String>`.
+pub type ModelsResult = Result<Vec<String>, String>;
+
+/// A per-instance scripted LLM. Pops one [`Entry`] per `complete` call and one
+/// [`ModelsResult`] per `list_models` call.
 #[derive(Clone)]
 pub struct FakeLlm {
     script: Arc<Mutex<VecDeque<Entry>>>,
+    /// Scripted `list_models` answers, popped front-to-back. Its own queue —
+    /// `list_models` is a discrete query, not part of the `complete` script.
+    /// Exhausted ⇒ `Ok(vec![])`.
+    models: Arc<Mutex<VecDeque<ModelsResult>>>,
 }
 
 impl FakeLlm {
@@ -131,7 +140,15 @@ impl FakeLlm {
     pub fn script(entries: impl IntoIterator<Item = Entry>) -> Self {
         FakeLlm {
             script: Arc::new(Mutex::new(entries.into_iter().collect())),
+            models: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    /// Seeds the scripted `list_models` answers (one popped per call), each
+    /// either an `Ok(ids)` or an `Err(reason)`.
+    pub fn with_models(self, answers: impl IntoIterator<Item = ModelsResult>) -> Self {
+        *self.models.lock().unwrap() = answers.into_iter().collect();
+        self
     }
 
     /// Fires `deltas` through `on_event`, each carrying a snapshot of the text
@@ -210,6 +227,16 @@ impl Llm for FakeLlm {
             // rather than panicking (the boundary must not fail).
             None => Response::error("fake_llm: script exhausted"),
         }
+    }
+
+    async fn list_models(&self, _connection: &Connection) -> Result<Vec<String>, String> {
+        // An unseeded queue answers with an empty list (the benign default);
+        // scripted entries drive the Ok/Err paths tests want to exercise.
+        self.models
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 }
 

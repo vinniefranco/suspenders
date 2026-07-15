@@ -975,13 +975,12 @@ mod tests {
         // The Conversation ends on the re-drawn reply; the failed draw left
         // nothing behind (no [turn failed] marker).
         let lm = last_message(conv);
-        assert!(
-            matches!(&lm.content[0], ContentBlock::Text { text } if text == "the good answer")
-        );
-        assert!(!conv.messages.iter().any(|m| m
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Text { text } if text == "[turn failed]"))));
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the good answer"));
+        assert!(!conv.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "[turn failed]"))
+        }));
 
         let evs = events(&deps);
         // A retry event was produced (visible + durable), naming attempt 1/3.
@@ -1032,10 +1031,7 @@ mod tests {
 
         let evs = events(&deps);
         // Exactly one re-draw was spent before the budget ran out.
-        assert_eq!(
-            count_voiced(&evs, |e| matches!(e, Event::Retry { .. })),
-            1
-        );
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::Retry { .. })), 1);
         assert_eq!(deps.requests.lock().unwrap().len(), 2);
     }
 
@@ -1054,10 +1050,7 @@ mod tests {
         let (outcome, deps) = run_with(&session, "go", deps).await;
         assert!(matches!(&outcome, Outcome::Failed(_, _)));
         let evs = events(&deps);
-        assert_eq!(
-            count_voiced(&evs, |e| matches!(e, Event::Retry { .. })),
-            0
-        );
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::Retry { .. })), 0);
         assert_eq!(deps.requests.lock().unwrap().len(), 1);
     }
 
@@ -1083,10 +1076,7 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         let evs = events(&deps);
-        assert_eq!(
-            count_voiced(&evs, |e| matches!(e, Event::Retry { .. })),
-            0
-        );
+        assert_eq!(count_voiced(&evs, |e| matches!(e, Event::Retry { .. })), 0);
         // Failed on the first draw: no re-request.
         assert_eq!(deps.requests.lock().unwrap().len(), 1);
     }

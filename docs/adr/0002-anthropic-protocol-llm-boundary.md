@@ -17,3 +17,22 @@ Considered and rejected:
 - **OpenAI-compat wire format.** No longer a portability win, and it has weaker thinking and tool-use semantics.
 - **A higher-level EventSource client with auto-reconnection.** Fights the one-shot stream and hides the mid-stream-cut error path this boundary must expose.
 - **Hand-rolled SSE framing.** Reinvents a solved problem.
+
+## Amendment (ADR-0033): a read-only models-list endpoint
+
+The boundary also answers `GET {base_url}/models`, via a second `Llm`
+method (`list_models`), so the `/model` Slash Command (ADR-0033) can list
+what a server offers. This is the one place the boundary speaks something
+other than Messages, and it is deliberately narrow: the models-list
+response is common to the Anthropic and OpenAI REST APIs
+(`{"data": [{"id": …}]}`), so a single parse of `data[].id` serves both,
+and the local servers we target (LM Studio, Ollama, vLLM) expose it on the
+same host as `/messages`. So "the OpenAI models endpoint" and "the
+Anthropic models endpoint" are one wire shape here — no protocol fork.
+
+Unlike `complete`, `list_models` returns `Result<Vec<String>, String>`
+rather than folding failure into a Response: it is a discrete,
+user-triggered query, not the streaming Turn loop, so a plain error the
+caller surfaces as an info line is simpler than the error algebra. A
+server with no `/models` route (404) is just an `Err` the `/model`
+command reports; nothing changes.
