@@ -732,3 +732,89 @@ f4/f5/f6/f7 plus drive.sh and vet.sh are vendored under
 reinstall everything to /tmp with baseline commits. Scorecards stay
 comparable across sessions - no more "-v2, treat old numbers as
 approximate."
+
+---
+
+## 014 - Recovery Turn false-fired on read-only work at the cap (found live)
+
+**Source:** a live user session, `20260714-174034` - not a fixture
+cycle. "evaluate this repo. Be thorough", qwen3.5-9b, defaults (budget
+64k, turn_limit 32).
+
+**Observed failure:** the Turn capped at its Turn Limit having already
+delivered a complete evaluation, then opened a **Handoff Recovery Turn
+that restarted the whole evaluation** from a fresh Conversation - the
+`restart` Handoff must never cause (CONTEXT.md). The recovery prompt
+said "the last verification failing - fix the failure," yet nothing had
+been written and the last test run was green.
+
+**Root cause - a three-part chain:**
+- The model ran `cargo test --lib 2>&1 | head -200`. Under run_command's
+  `bash -o pipefail` (c006), `head` closed the pipe early, cargo died
+  writing to it, and the pipeline reported exit 101 - cargo's own code,
+  indistinguishable from a real test failure. The green rerun used
+  `| tail -50`, a *different* command string, so the Dangling Failure
+  never cleared: the c008 anti-laundering rule firing as a **false
+  positive**.
+- The Endgame recovery judgment fired on `dangling_failure ||
+  unverified_writes`, so a Dangling Failure alone - with zero writes -
+  opened a Recovery Turn. But recovery's evidence base (c005–006,
+  c008–009) is unverified writes and mid-fix near-misses; a failing
+  command during read-only exploration is not unfinished implementation.
+- The Handoff seed carried the *last* run_command result (the green
+  rerun) while the prompt named a failure - a contradiction the model
+  resolved by starting over.
+
+**Tweaks (commit a54cff8):**
+1. *Governor behavior.* The dangling-failure arm now also requires that a
+   write landed this Turn - a new monotonic Ledger fact `wrote_this_turn`
+   (distinct from `unverified_writes`, which clears on the next
+   run_command). `unverified_writes` stays a standalone arm; the c008
+   laundering protection is untouched (that case always writes).
+2. *Tool/seed shape.* The Handoff seed carries the Dangling Failure's
+   own result verbatim (the command the recovery prompt names), threaded
+   from the Ledger via `dangling_command` / `command_result_for`. Fixes
+   the same contradiction in the c008 laundering case (red suite → green
+   filtered rerun → recovery).
+3. *Voice.* A rule steering the model to run commands whole - the Result
+   Cap already truncates and keeps the exit code, and `head` under
+   pipefail manufactures failures.
+
+**Evidence:** faults 1 and 2 are correctness, proven by unit tests
+(`a_dangling_failure_with_no_writes_draws_no_recovery` plus the arbiter
+tests that consult the judgment at the cap) - not a stochastic tuning
+matter, so no N=5. 1033 lib tests green, clippy clean. Three post-fix
+live read-only eval runs: zero false recoveries - including run 1, which
+reproduced the head-101 artifact (Dangling Failure present, settled
+`end_turn` clean at pass 31) and run 2, which capped at `turn_limit`
+with the full endgame schedule and closed plain.
+
+**Verdict:** faults 1–2 **CREDITED** (unit-proven correctness). Fault 3
+(the Voice steer) **UNCREDITED - pending N=5.** It never ran against the
+scorecard; the only evidence is anecdotal and mixed - of two live runs
+that ran the suite, one obeyed the steer (`cargo test` bare, green) and
+one ignored it (`| head`, false 101). Consistent with the standing prior
+that a 9B complies with mechanics, not requests - which is exactly why
+the **trigger gate, not the steer, is load-bearing**. Next scorecard
+batch: run the steer across f4/f5/f6/f7 and confirm it neither regresses
+the green rate nor pushes prompt tokens past the budget the compaction
+round-trip test pins (`agent/tests.rs` bumped 4480→4640 for the added
+rule).
+
+**Caveat, not reproduced live:** nondeterminism meant no single post-fix
+run hit the exact original triple - cap **and** Dangling Failure **and**
+zero writes - in one Turn (run 1 had the failure but finished a pass
+short of the cap; runs 2–3 capped but ran no failing command). That path
+is covered deterministically by the unit test; the live runs corroborate.
+
+### Parked insight - the `| head` footgun is general
+
+The false 101 is not specific to this task: any Turn where the model
+pipes a producer through an early-closing consumer under pipefail
+manufactures a failure the exit code cannot disown (101 vs 101). The
+trigger gate neutralizes it for read-only work, but an *implementation*
+Turn that writes and then pipes `cargo test | head` would still
+false-recover. If the c014 Voice steer proves unreliable at N=5, the
+next lever is mechanical, not prose - e.g. run_command detecting a
+consumer-closed pipe, or the drive/vet scripts flagging it. Promote to a
+cycle if it recurs on the scorecard.
