@@ -191,6 +191,17 @@ pub enum Event {
         text: String,
     },
 
+    /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
+    /// classified error and the attempt number against the budget. Silent to
+    /// the model's Conversation - nothing is appended - but never silent to
+    /// the operator: the Transcript shows an info line and the Session Log
+    /// records a `retry` entry.
+    Retry {
+        error: String,
+        attempt: u64,
+        budget: u64,
+    },
+
     // ---- Settlement ----
     TurnFinished {
         stop_reason: StopReason,
@@ -277,6 +288,14 @@ impl Event {
         Event::RecoveryTurn {
             shape,
             text: text.into(),
+        }
+    }
+
+    pub fn retry(error: impl Into<String>, attempt: u64, budget: u64) -> Self {
+        Event::Retry {
+            error: error.into(),
+            attempt,
+            budget,
         }
     }
 

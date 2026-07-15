@@ -237,6 +237,16 @@ pub enum Entry {
     /// merges it through the same seam the live path used, and
     /// [`recoveries_used`] counts these to restore the per-request bound.
     Recovery { shape: RecoveryShape, text: String },
+    /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
+    /// classified error and the attempt number against the budget, forensic
+    /// only. Silent to the model's Conversation - the failed draw produced
+    /// nothing to keep - so the fold emits no message; it is durable and
+    /// visible so a silent-and-unlogged retry stays rejected.
+    Retry {
+        error: String,
+        attempt: u64,
+        budget: u64,
+    },
 }
 
 // ------------------------------------------------------------------
@@ -305,6 +315,16 @@ impl Entry {
             Entry::Recovery { shape, text } => {
                 json!({"e": "recovery", "shape": shape.as_str(), "text": text})
             }
+            Entry::Retry {
+                error,
+                attempt,
+                budget,
+            } => json!({
+                "e": "retry",
+                "error": error,
+                "attempt": attempt,
+                "budget": budget,
+            }),
         }
     }
 
@@ -377,6 +397,11 @@ impl Entry {
             "recovery" => Some(Entry::Recovery {
                 shape: RecoveryShape::parse(m.get("shape")?.as_str()?)?,
                 text: string_field(m, "text")?,
+            }),
+            "retry" => Some(Entry::Retry {
+                error: string_field(m, "error")?,
+                attempt: m.get("attempt")?.as_u64()?,
+                budget: m.get("budget")?.as_u64()?,
             }),
             _ => None,
         }
@@ -840,6 +865,11 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
         // The Plan is held outside the Conversation, so it never becomes a
         // message and never disturbs an open tool batch.
         Entry::Plan(_) => {}
+        // A malformed-tool-call re-draw (ADR-0030) is silent to the model's
+        // Conversation: the failed draw produced nothing to keep, so the entry
+        // is forensic only and never becomes a message or disturbs an open
+        // batch - the re-issued request lands as the next assistant_blocks.
+        Entry::Retry { .. } => {}
         Entry::AssistantBlocks(blocks) => {
             flush(messages, batch.take());
             *batch = Some(Batch {
@@ -2022,6 +2052,81 @@ mod tests {
                     shape: RecoveryShape::Handoff,
                     text: "[h]".into(),
                 },
+            ]
+        );
+    }
+
+    // ---- retry entries (ADR-0030) ----
+
+    #[test]
+    fn retry_entries_round_trip_the_file_with_their_error_attempt_and_budget() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::Retry {
+            error: "api_stream_error: Failed to generate a valid tool call".into(),
+            attempt: 1,
+            budget: 3,
+        });
+        log.append(Entry::Retry {
+            error: "api_stream_error: Failed to generate a valid tool call".into(),
+            attempt: 2,
+            budget: 3,
+        });
+
+        let content = std::fs::read_to_string(&log.path).unwrap();
+        let entries: Vec<Entry> = content
+            .lines()
+            .skip(1)
+            .filter_map(|l| decode_line(l).and_then(|v| Entry::from_json(&v)))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                Entry::Retry {
+                    error: "api_stream_error: Failed to generate a valid tool call".into(),
+                    attempt: 1,
+                    budget: 3,
+                },
+                Entry::Retry {
+                    error: "api_stream_error: Failed to generate a valid tool call".into(),
+                    attempt: 2,
+                    budget: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retry_entry_is_silent_to_the_folded_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        // A retryable draw failed and was re-drawn silently; the re-issued
+        // request succeeded and the Turn completed.
+        log.append(Entry::Retry {
+            error: "api_stream_error: Failed to generate a valid tool call".into(),
+            attempt: 1,
+            budget: 3,
+        });
+        log.append(Entry::AssistantBlocks(vec![text("re-drawn answer")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        // The retry never enters the Conversation: user prompt then the reply.
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("go")]),
+                Message::assistant(vec![text("re-drawn answer")]),
             ]
         );
     }

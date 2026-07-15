@@ -115,6 +115,11 @@ pub struct Ledger {
     // fact the Agent owns across Turns and stamps once at Turn start (the
     // Agent resets it when a genuine user prompt starts a new request).
     recoveries_used: u64,
+    // Malformed-tool-call re-draws consumed this Turn (ADR-0030): the loop
+    // increments this at the retry firing site, and the re-draw decision
+    // reads it against the `malformed_retry_budget` Setpoint. Transient - a
+    // resumed Turn settles as failed regardless, so it is never restored.
+    retries_used: u64,
     // Plan recency (see [`PlanRecency`]): `None` until a Plan exists.
     plan: Option<PlanRecency>,
 }
@@ -133,6 +138,7 @@ impl Ledger {
             command_failing: false,
             command_outcomes: Vec::new(),
             recoveries_used: 0,
+            retries_used: 0,
             plan: None,
         }
     }
@@ -191,6 +197,12 @@ impl Ledger {
     /// serving the current user request (an Agent-owned cross-Turn count).
     pub fn note_recoveries_used(&mut self, n: u64) {
         self.recoveries_used = n;
+    }
+
+    /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): one
+    /// more of the per-Turn retry budget is spent.
+    pub fn note_retry(&mut self) {
+        self.retries_used += 1;
     }
 
     /// A successful plan Tool Call landed: the Plan just changed, so the
@@ -266,6 +278,13 @@ impl Ledger {
     /// Recovery Turns already consumed serving the current user request.
     pub fn recoveries_used(&self) -> u64 {
         self.recoveries_used
+    }
+
+    /// Malformed-tool-call re-draws already spent this Turn (ADR-0030), read
+    /// against the `malformed_retry_budget` Setpoint by the loop's re-draw
+    /// decision.
+    pub fn retries_used(&self) -> u64 {
+        self.retries_used
     }
 
     /// Passes since the Plan last changed (since Turn start for a Plan
@@ -621,6 +640,20 @@ mod tests {
 
         ledger.note_recoveries_used(2);
         assert_eq!(ledger.recoveries_used(), 2);
+    }
+
+    // ----- retries used (ADR-0030) -----
+
+    #[test]
+    fn retries_used_starts_at_zero_and_note_retry_increments() {
+        let mut ledger = Ledger::new(25);
+        assert_eq!(ledger.retries_used(), 0);
+
+        ledger.note_retry();
+        assert_eq!(ledger.retries_used(), 1);
+
+        ledger.note_retry();
+        assert_eq!(ledger.retries_used(), 2);
     }
 
     // ----- plan recency -----
