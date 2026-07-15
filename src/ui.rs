@@ -12,6 +12,7 @@
 
 pub mod components;
 pub mod composer;
+pub mod draft;
 pub mod markdown;
 pub mod picker;
 pub mod transcript;
