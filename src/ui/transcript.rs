@@ -36,18 +36,16 @@
 //!   [`crate::plugins::present`]; a crashing plugin is skipped with an info line
 //!   (fail-open, ADR-0007), as is every `plugin_error` event the Turn reports.
 
-use crate::content::ContentBlock;
 use crate::conversation::compaction_target;
 use crate::event::{Event, Stage};
 use crate::llm::response::StopReason;
 use crate::plugins::{self, Registered};
 use crate::ui::draft;
+use crate::ui::history::History;
+use crate::ui::streaming::Streaming;
 
 /// The greeting line a fresh Transcript opens with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
-
-/// The in-memory prompt-history ring cap.
-const MAX_HISTORY: usize = 100;
 
 /// The semantic style of one display line inside a [`TranscriptItem::Block`]
 /// (ADR-0008). Names WHAT the line is; the terminal color mapping is
@@ -259,9 +257,10 @@ pub struct Transcript {
     pub messages: Vec<TranscriptItem>,
     /// The configured Plugins whose pure `present` runs inside the fold.
     pub plugins: Vec<Registered>,
-    /// The latest streaming snapshot (`None` when not streaming). Stateless
-    /// streaming: each `message_update` replaces this wholesale.
-    pub streaming: Option<Vec<ContentBlock>>,
+    /// The in-flight streaming snapshot and its materialize rules. Owned by
+    /// [`crate::ui::streaming`]; read through [`Transcript::streaming_text`] and
+    /// [`Transcript::streaming_thinking`].
+    streaming: Streaming,
     pub status: Status,
     pub pending_approval: Option<PendingApproval>,
     pub token_estimate: Option<u64>,
@@ -270,9 +269,10 @@ pub struct Transcript {
     pub pressure_level: PressureLevel,
     pub input_value: String,
     pub input_cursor: usize,
-    pub history: Vec<String>,
-    pub history_idx: Option<usize>,
-    pub history_draft: String,
+    /// The prompt-history ring and its Readline-style recall rules. Owned by
+    /// [`crate::ui::history`]; navigated from the Up/Down arms of
+    /// [`Transcript::handle_key`] and appended to by [`Transcript::record_submit`].
+    history: History,
     /// Whether settled [`TranscriptItem::Thinking`] items render expanded (the
     /// full text) instead of the collapsed one-line form. Toggled by
     /// [`Key::ToggleThinking`] (Ctrl-T); defaults collapsed.
@@ -303,7 +303,7 @@ impl Transcript {
                 text: GREETING.to_string(),
             }],
             plugins: opts.plugins,
-            streaming: None,
+            streaming: Streaming::idle(),
             status: Status::Idle,
             pending_approval: None,
             token_estimate: None,
@@ -312,9 +312,7 @@ impl Transcript {
             pressure_level: PressureLevel::Ok,
             input_value: String::new(),
             input_cursor: 0,
-            history: opts.history,
-            history_idx: None,
-            history_draft: String::new(),
+            history: History::new(opts.history),
             thinking_expanded: false,
             messages_revision: 0,
         }
@@ -329,38 +327,28 @@ impl Transcript {
         match event {
             Event::TurnStarted(_reference) => {
                 self.status = Status::Running;
-                self.streaming = None;
+                self.streaming.clear();
                 (self, vec![Effect::PinBottom])
             }
 
             Event::MessageStart { .. } => {
-                self.streaming = Some(Vec::new());
+                self.streaming.start();
                 (self, vec![])
             }
 
             // Stateless streaming: the snapshot replaces the in-flight view.
             Event::MessageUpdate { content, .. } => {
-                self.streaming = Some(content);
+                self.streaming.update(content);
                 (self, vec![])
             }
 
-            // Materialize the finished message: Thinking (from the last
-            // snapshot - the final content never carries it) first, then the
-            // assistant text (from the final content).
+            // Materialize the finished message into discrete items (Thinking
+            // from the last snapshot, text from the final content); the seam
+            // in `ui::streaming` owns that asymmetry.
             Event::MessageEnd { content, .. } => {
-                let thinking = blocks_text(
-                    self.streaming.as_deref().unwrap_or(&[]),
-                    BlockKind::Thinking,
-                );
-                let text = blocks_text(&content, BlockKind::Text);
-                if !thinking.is_empty() {
-                    self.messages
-                        .push(TranscriptItem::Thinking { text: thinking });
+                for item in self.streaming.end(&content) {
+                    self.messages.push(item);
                 }
-                if !text.is_empty() {
-                    self.messages.push(TranscriptItem::Assistant { text });
-                }
-                self.streaming = None;
                 (self, vec![])
             }
 
@@ -614,7 +602,10 @@ impl Transcript {
             Key::ArrowUp => {
                 let (line, col) = draft::line_col(&self.input_value, self.input_cursor);
                 if line == 0 {
-                    self.history_up()
+                    if let Some(text) = self.history.up(&self.input_value) {
+                        self.recall(text);
+                    }
+                    (self, vec![])
                 } else {
                     let clamped = col.min(draft::line_lengths(&self.input_value)[line - 1]);
                     self.input_cursor = draft::cursor_at(&self.input_value, line - 1, clamped);
@@ -625,7 +616,10 @@ impl Transcript {
                 let (line, col) = draft::line_col(&self.input_value, self.input_cursor);
                 let last = draft::line_lengths(&self.input_value).len() - 1;
                 if line >= last {
-                    self.history_down()
+                    if let Some(text) = self.history.down() {
+                        self.recall(text);
+                    }
+                    (self, vec![])
                 } else {
                     let clamped = col.min(draft::line_lengths(&self.input_value)[line + 1]);
                     self.input_cursor = draft::cursor_at(&self.input_value, line + 1, clamped);
@@ -684,57 +678,11 @@ impl Transcript {
         }
     }
 
-    // ArrowUp: navigate backward through prompt history (Readline-style).
-    fn history_up(mut self) -> (Self, Vec<Effect>) {
-        if self.history.is_empty() {
-            return (self, vec![]);
-        }
-        match self.history_idx {
-            None => {
-                let idx = self.history.len() - 1;
-                let text = self.history[idx].clone();
-                self.history_idx = Some(idx);
-                self.history_draft = std::mem::take(&mut self.input_value);
-                self.input_cursor = text.chars().count();
-                self.input_value = text;
-                (self, vec![])
-            }
-            Some(0) => (self, vec![]),
-            Some(idx) => {
-                let new_idx = idx - 1;
-                let text = self.history[new_idx].clone();
-                self.history_idx = Some(new_idx);
-                self.input_cursor = text.chars().count();
-                self.input_value = text;
-                (self, vec![])
-            }
-        }
-    }
-
-    // ArrowDown: navigate forward through prompt history.
-    fn history_down(mut self) -> (Self, Vec<Effect>) {
-        if self.history.is_empty() {
-            return (self, vec![]);
-        }
-        let idx = match self.history_idx {
-            None => return (self, vec![]),
-            Some(idx) => idx,
-        };
-        let last_idx = self.history.len() - 1;
-        if idx >= last_idx {
-            let draft = std::mem::take(&mut self.history_draft);
-            self.history_idx = None;
-            self.input_cursor = draft.chars().count();
-            self.input_value = draft;
-            (self, vec![])
-        } else {
-            let new_idx = idx + 1;
-            let text = self.history[new_idx].clone();
-            self.history_idx = Some(new_idx);
-            self.input_cursor = text.chars().count();
-            self.input_value = text;
-            (self, vec![])
-        }
+    // Place a recalled (or restored) history entry into the composer, cursor at
+    // the end - the landing spot the Up/Down arms share.
+    fn recall(&mut self, text: String) {
+        self.input_cursor = text.chars().count();
+        self.input_value = text;
     }
 
     /// Mirrors the composer's value and cursor (from the input's change event).
@@ -811,15 +759,12 @@ impl Transcript {
 
     /// The in-flight Thinking text, from the latest streaming snapshot.
     pub fn streaming_thinking(&self) -> String {
-        blocks_text(
-            self.streaming.as_deref().unwrap_or(&[]),
-            BlockKind::Thinking,
-        )
+        self.streaming.thinking()
     }
 
     /// The in-flight assistant text, from the latest streaming snapshot.
     pub fn streaming_text(&self) -> String {
-        blocks_text(self.streaming.as_deref().unwrap_or(&[]), BlockKind::Text)
+        self.streaming.text()
     }
 
     // ---- Internals ---------------------------------------------------------
@@ -844,20 +789,11 @@ impl Transcript {
         }
     }
 
-    // Materialize a live snapshot (cancel/crash mid-stream); Thinking first.
+    // Materialize a live snapshot (cancel/crash mid-stream); the seam in
+    // `ui::streaming` takes both Thinking and text from it, Thinking first.
     fn flush_streaming(&mut self) {
-        let snapshot = match self.streaming.take() {
-            None => return,
-            Some(blocks) => blocks,
-        };
-        let thinking = blocks_text(&snapshot, BlockKind::Thinking);
-        let text = blocks_text(&snapshot, BlockKind::Text);
-        if !thinking.is_empty() {
-            self.messages
-                .push(TranscriptItem::Thinking { text: thinking });
-        }
-        if !text.is_empty() {
-            self.messages.push(TranscriptItem::Assistant { text });
+        for item in self.streaming.flush() {
+            self.messages.push(item);
         }
     }
 
@@ -888,12 +824,10 @@ impl Transcript {
 
     // -- Prompt history --
 
-    /// Records a successfully submitted prompt into the in-memory history ring.
-    /// Deduplicates consecutive identical entries and caps at [`MAX_HISTORY`].
+    /// Records a successfully submitted prompt into the in-memory history ring
+    /// (dedup + cap live in [`crate::ui::history`]).
     pub fn record_submit(&mut self, prompt: &str) {
-        self.history_idx = None;
-        self.history_draft = String::new();
-        append_history(&mut self.history, prompt);
+        self.history.record(prompt);
     }
 }
 
@@ -909,24 +843,6 @@ pub struct Idle;
 // ---------------------------------------------------------------------------
 // Free functions (pure helpers).
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BlockKind {
-    Text,
-    Thinking,
-}
-
-fn blocks_text(blocks: &[ContentBlock], kind: BlockKind) -> String {
-    let mut out = String::new();
-    for block in blocks {
-        match (kind, block) {
-            (BlockKind::Text, ContentBlock::Text { text }) => out.push_str(text),
-            (BlockKind::Thinking, ContentBlock::Thinking { text }) => out.push_str(text),
-            _ => {}
-        }
-    }
-    out
-}
 
 fn pending_steering_line(text: &str) -> String {
     format!("steering (queued): {text}")
@@ -1039,17 +955,6 @@ fn remove_char(value: &str, cursor: usize) -> String {
     out
 }
 
-fn append_history(history: &mut Vec<String>, prompt: &str) {
-    if history.last().map(|s| s.as_str()) == Some(prompt) {
-        return;
-    }
-    history.push(prompt.to_string());
-    if history.len() > MAX_HISTORY {
-        let drop = history.len() - MAX_HISTORY;
-        history.drain(0..drop);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,7 +1058,7 @@ mod tests {
         assert_eq!(t.status, Status::Idle);
         assert_eq!(t.context_budget, Some(32_000));
         assert_eq!(t.pending_approval, None);
-        assert!(t.streaming.is_none());
+        assert!(t.streaming_text().is_empty() && t.streaming_thinking().is_empty());
     }
 
     // --- streaming ---------------------------------------------------------
@@ -1161,10 +1066,11 @@ mod tests {
     #[test]
     fn turn_started_marks_running_clears_snapshot_and_pins() {
         let mut t = fresh();
-        t.streaming = Some(vec![text_block("stale")]);
+        t.streaming.start();
+        t.streaming.update(vec![text_block("stale")]);
         let (t, effects) = t.apply_event(Event::turn_started("r1"));
         assert_eq!(t.status, Status::Running);
-        assert!(t.streaming.is_none());
+        assert!(t.streaming_text().is_empty() && t.streaming_thinking().is_empty());
         assert_eq!(effects, vec![Effect::PinBottom]);
     }
 
@@ -1213,7 +1119,7 @@ mod tests {
                 tool_call("read_file", "path=lib/baud.ex"),
             ]
         );
-        assert!(t.streaming.is_none());
+        assert!(t.streaming_text().is_empty() && t.streaming_thinking().is_empty());
     }
 
     #[test]
@@ -1575,7 +1481,6 @@ mod tests {
         assert_eq!(items(&t), vec![user("fix the bug")]);
         assert_eq!(t.input_value, "");
         assert_eq!(t.input_cursor, 0);
-        assert_eq!(t.history, vec!["fix the bug".to_string()]);
         assert_eq!(
             effects,
             vec![
@@ -1583,6 +1488,9 @@ mod tests {
                 Effect::HistoryAppend("fix the bug".into())
             ]
         );
+        // Recorded into the ring: Up recalls it.
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "fix the bug");
     }
 
     #[test]
@@ -1856,9 +1764,9 @@ mod tests {
         assert!(t.thinking_expanded);
         assert_eq!(t.input_value, "b");
         assert_eq!(t.input_cursor, 1);
-        assert_eq!(t.history, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(t.history_idx, Some(1));
-        assert_eq!(t.history_draft, "typing...");
+        // The ring survived the toggle: Down still restores the stashed draft.
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(t.input_value, "typing...");
     }
 
     // --- presentment -------------------------------------------------------
@@ -2016,54 +1924,75 @@ mod tests {
 
     #[test]
     fn new_accepts_history_option_oldest_first() {
+        // Seeded oldest-first and parked (idx None): the first Up recalls the
+        // newest entry. Ring internals are covered in `ui::history` tests.
         let t = fresh_opts(TranscriptOpts {
             history: vec!["a".into(), "b".into(), "c".into()],
             ..Default::default()
         });
-        assert_eq!(t.history, vec!["a", "b", "c"]);
-        assert_eq!(t.history_idx, None);
-        assert_eq!(t.history_draft, "");
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "c");
     }
 
     #[test]
     fn submitted_appends_deduplicating_consecutive() {
+        // The submit path records into the ring; dedup of a repeated submit is
+        // observable as the ring walking a, b (not a, b, b) on Up.
         let t = fresh_opts(TranscriptOpts {
             history: vec!["a".into()],
             ..Default::default()
         });
         let (t, _) = t.submitted("b", Ok(()));
-        assert_eq!(t.history, vec!["a", "b"]);
-        let (t, _) = t.submitted("b", Ok(()));
-        assert_eq!(t.history, vec!["a", "b"]);
+        let (t, _) = t.submitted("b", Ok(())); // consecutive repeat: deduped
         let (t, _) = t.submitted("c", Ok(()));
-        assert_eq!(t.history, vec!["a", "b", "c"]);
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "c");
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "b");
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "a");
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "a"); // oldest - no further entry
     }
 
     #[test]
     fn record_submit_resets_position_and_draft() {
+        // Park mid-history (recall stashes the draft, so input_value is now the
+        // recalled "a"), then record_submit: the ring resets, so the next Up
+        // starts fresh from the just-recorded newest ("b") and re-stashes the
+        // CURRENT live draft - proving the prior stash was cleared, not carried.
         let mut t = fresh_opts(TranscriptOpts {
             history: vec!["a".into()],
             ..Default::default()
         });
-        t.history_idx = Some(0);
-        t.history_draft = "draft".into();
+        let (parked, _) = t.handle_key(Key::ArrowUp);
+        t = parked;
         t.record_submit("b");
-        assert_eq!(t.history_idx, None);
-        assert_eq!(t.history_draft, "");
-        assert_eq!(t.history, vec!["a", "b"]);
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "b"); // fresh from the newest, not the old idx
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(t.input_value, "a"); // the live draft at the reset Up, freshly stashed
     }
 
     #[test]
     fn history_capped_at_100() {
+        // Submitting a 101st prompt drops the oldest: Up recalls the newest
+        // ("prompt 101"), and walking to the oldest stops at "prompt 2" -
+        // "prompt 1" fell off. Cap arithmetic itself is a `ui::history` test.
         let history: Vec<String> = (1..=100).map(|n| format!("prompt {n}")).collect();
         let t = fresh_opts(TranscriptOpts {
             history,
             ..Default::default()
         });
-        let (t, _) = t.submitted("prompt 101", Ok(()));
-        assert_eq!(t.history.len(), 100);
-        assert_eq!(t.history[0], "prompt 2");
-        assert_eq!(t.history[99], "prompt 101");
+        let (mut t, _) = t.submitted("prompt 101", Ok(()));
+        let (walked, _) = t.handle_key(Key::ArrowUp);
+        t = walked;
+        assert_eq!(t.input_value, "prompt 101"); // newest
+        for _ in 0..200 {
+            let (walked, _) = t.handle_key(Key::ArrowUp);
+            t = walked;
+        }
+        assert_eq!(t.input_value, "prompt 2"); // oldest survivor, not "prompt 1"
     }
 
     #[test]
@@ -2083,21 +2012,16 @@ mod tests {
 
         let (t, effects) = t.handle_key(Key::ArrowUp);
         assert_eq!(effects, vec![]);
-        assert_eq!(t.history_idx, Some(2));
-        assert_eq!(t.history_draft, "typing...");
         assert_eq!(t.input_value, "c");
 
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.history_idx, Some(1));
         assert_eq!(t.input_value, "b");
 
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.history_idx, Some(0));
         assert_eq!(t.input_value, "a");
 
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.history_idx, Some(0));
-        assert_eq!(t.input_value, "a");
+        assert_eq!(t.input_value, "a"); // at the oldest - a no-op
     }
 
     #[test]
@@ -2118,21 +2042,17 @@ mod tests {
         });
 
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.history_idx, Some(2));
         assert_eq!(t.input_value, "c");
 
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.history_idx, Some(1));
         assert_eq!(t.input_value, "b");
 
         let (t, effects) = t.handle_key(Key::ArrowDown);
         assert_eq!(effects, vec![]);
-        assert_eq!(t.history_idx, Some(2));
         assert_eq!(t.input_value, "c");
 
         let (t, _) = t.handle_key(Key::ArrowDown);
-        assert_eq!(t.history_idx, None);
-        assert_eq!(t.input_value, "");
+        assert_eq!(t.input_value, ""); // past the newest: the empty draft returns
     }
 
     #[test]
@@ -2147,16 +2067,12 @@ mod tests {
         let (t, _) = t.handle_key(Key::ArrowUp);
         let (t, _) = t.handle_key(Key::ArrowUp);
         assert_eq!(t.input_value, "a");
-        assert_eq!(t.history_draft, "my draft");
 
         let (t, _) = t.handle_key(Key::ArrowDown);
-        assert_eq!(t.history_idx, Some(1));
         assert_eq!(t.input_value, "b");
 
         let (t, _) = t.handle_key(Key::ArrowDown);
-        assert_eq!(t.history_idx, None);
-        assert_eq!(t.input_value, "my draft");
-        assert_eq!(t.history_draft, "");
+        assert_eq!(t.input_value, "my draft"); // stash restored off the end
     }
 
     // --- Composer editing ----------------------------------------------------
@@ -2349,9 +2265,8 @@ mod tests {
         .input_changed("ab\ncd", 4); // on 'd' (line 1, col 1)
         let (t, effects) = t.handle_key(Key::ArrowUp);
         assert_eq!(effects, vec![]);
-        assert_eq!(t.input_value, "ab\ncd");
+        assert_eq!(t.input_value, "ab\ncd"); // draft intact - no recall happened
         assert_eq!(t.input_cursor, 1); // line 0, col 1
-        assert_eq!(t.history_idx, None);
     }
 
     #[test]
@@ -2364,8 +2279,10 @@ mod tests {
         let (t, _) = t.handle_key(Key::ArrowUp);
         assert_eq!(t.input_value, "old");
         assert_eq!(t.input_cursor, 3); // recall puts the cursor at the end
-        assert_eq!(t.history_idx, Some(0));
-        assert_eq!(t.history_draft, "ab\ncd"); // the draft is stashed
+        // The multi-line draft was stashed: Down off the recalled entry's end
+        // restores it.
+        let (t, _) = t.handle_key(Key::ArrowDown);
+        assert_eq!(t.input_value, "ab\ncd");
     }
 
     #[test]
@@ -2377,8 +2294,8 @@ mod tests {
         .input_changed("ab\ncd", 1); // line 0, col 1 - not the last line
         let (t, effects) = t.handle_key(Key::ArrowDown);
         assert_eq!(effects, vec![]);
+        assert_eq!(t.input_value, "ab\ncd"); // draft intact - cursor moved, no recall
         assert_eq!(t.input_cursor, 4); // line 1, col 1
-        assert_eq!(t.history_idx, None);
     }
 
     #[test]
@@ -2394,7 +2311,6 @@ mod tests {
         assert_eq!(t.input_value, "old");
         let (t, _) = t.handle_key(Key::ArrowDown);
         assert_eq!(t.input_value, "draft");
-        assert_eq!(t.history_idx, None);
     }
 
     #[test]
@@ -2418,11 +2334,15 @@ mod tests {
         })
         .input_changed("b", 1);
         let (t, effects) = t.submitted("b", Ok(()));
-        assert_eq!(t.history, vec!["a", "b"]);
-        assert_eq!(t.history_idx, None);
         assert_eq!(
             effects,
             vec![Effect::PinBottom, Effect::HistoryAppend("b".into())]
         );
+        // Recorded (Up walks a, b) and the recall position reset (first Up is
+        // the newest, not wherever a prior recall parked).
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "b");
+        let (t, _) = t.handle_key(Key::ArrowUp);
+        assert_eq!(t.input_value, "a");
     }
 }
