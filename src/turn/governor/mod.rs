@@ -469,10 +469,13 @@ mod tests {
         ledger
     }
 
-    // The most recent run_command this Turn failed.
+    // The model wrote, then its verification dangles red: a successful write
+    // followed by a failing run_command. The write is the evidence the
+    // dangling-failure recovery arm requires (ADR-0028 addendum 2026-07-14).
     fn command_failing_at(pass: u64, turn_limit: u64) -> Ledger {
         let mut ledger = ledger_at(pass, turn_limit);
-        ledger.record_result("run_command", &json!({}), &err());
+        ledger.record_result("edit_file", &json!({"path": "a.ex"}), &ok());
+        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
         ledger
     }
 
@@ -804,6 +807,7 @@ mod tests {
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: false,
+                    failing_command: None,
                 },
                 keep_reply: false,
             })
@@ -819,6 +823,7 @@ mod tests {
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
+                    failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: false,
             })
@@ -872,6 +877,7 @@ mod tests {
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
+                    failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: false,
             })
@@ -1048,6 +1054,7 @@ mod tests {
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
+                    failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: true,
             })
@@ -1068,6 +1075,7 @@ mod tests {
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: false,
+                    failing_command: None,
                 },
                 keep_reply: true,
             })

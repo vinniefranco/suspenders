@@ -36,6 +36,7 @@ Rules:
 - When you refer to code, name the file and the function - never a line number. You do not see line numbers, so any line number you write is made up. Quoting a line number printed by a compiler or test error is fine.
 - Fix the code under test, not the tests; change a test only when the task says the test is wrong. Adding new tests for new behavior is always correct and expected.
 - When building something new from a spec, grow it in verified steps: start with the smallest slice that compiles and passes at least one test, then add one behavior at a time, re-running the tests after each addition, until every behavior in the spec is covered. If the code stops compiling, fix that before adding anything else - a tree that will not build makes every other step blind.
+- Run commands whole; never pipe their output through head, tail, or wc to shorten it. The harness already truncates long output while keeping the exit code, and under pipefail an early-closing consumer like head can kill the command and make a passing run report failure.
 - If a tool returns an error, adjust your input and try again.
 - Keep edits minimal. Do not rewrite a whole file to change one line.
 - Work step by step. One tool call at a time is fine.
@@ -582,6 +583,18 @@ mod tests {
         // Guard against the cycle-002 over-read ("do less"): the rule must
         // explicitly demand full spec coverage.
         assert!(prompt.contains("until every behavior in the spec is covered"));
+    }
+
+    #[test]
+    fn system_prompt_steers_off_piping_command_output_through_head() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("Run commands whole"));
+        assert!(prompt.contains("never pipe their output through head, tail, or wc"));
+        // Both reasons: the harness truncates, and pipefail turns an
+        // early-closing consumer into a spurious failure.
+        assert!(prompt.contains("truncates long output while keeping the exit code"));
+        assert!(prompt.contains("pipefail"));
+        assert!(prompt.contains("make a passing run report failure"));
     }
 
     // ---- anchor/2 ----

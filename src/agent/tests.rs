@@ -956,10 +956,17 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
     let session_dir = session.session_dir.clone();
     let script = vec![
-        // Turn 1's single Pass: set the Plan and run a failing verification.
+        // Turn 1's single Pass: set the Plan, write, and run a failing
+        // verification. The write is the evidence the dangling-failure
+        // recovery arm now requires (ADR-0028 addendum 2026-07-14).
         Entry::just(Response {
             content: vec![
                 ContentBlock::tool_use("p1", "plan", json!({ "plan": "Goal: fix. 1. run [ ]" })),
+                ContentBlock::tool_use(
+                    "w1",
+                    "write_file",
+                    json!({ "path": "a.txt", "content": "hi" }),
+                ),
                 ContentBlock::tool_use("r1", "run_command", json!({ "command": "false" })),
             ],
             stop_reason: RStop::ToolUse,
@@ -1337,8 +1344,9 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             // it from 4000; run_command's pipefail description moved it
             // from 4200; the no-invented-line-numbers Voice rule moved it
             // from 4230; the grow-in-verified-steps Voice rule moved it
-            // from 4320).
-            context_budget: Some(4480),
+            // from 4320; the run-commands-whole Voice rule moved it from
+            // 4480).
+            context_budget: Some(4640),
             eviction_slack: Some(0.3),
             compaction_keep: Some(0.1),
             ..Default::default()
