@@ -681,15 +681,20 @@ fn human_stamp(name: &str) -> String {
     )
 }
 
-/// The last Plan logged in a Session Log file, or `None` when none was. A torn
-/// or foreign log yields `None` - the Plan is a convenience, never load-bearing
-/// for Resume's correctness.
+/// The last Plan logged in a Session Log file, or `None` when none was. Reads
+/// under the fold's torn-line tolerance: a torn line stops the scan (like
+/// [`resume`]), so this never returns a Plan the resumed Conversation would not
+/// see - it yields the last Plan logged BEFORE the first tear (or `None`). The
+/// Plan is a convenience, never load-bearing for Resume's correctness.
 pub fn plan(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut last: Option<String> = None;
-    for line in content.lines().filter(|l| !l.is_empty()) {
-        if let Some(Entry::Plan(text)) = decode_line(line).and_then(|v| Entry::from_json(&v)) {
-            last = Some(text);
+    // Skip the header line: it is not an entry.
+    for line in content.lines().filter(|l| !l.is_empty()).skip(1) {
+        match decode_line(line).and_then(|v| Entry::from_json(&v)) {
+            Some(Entry::Plan(text)) => last = Some(text),
+            Some(_) => {}
+            None => break,
         }
     }
     last
@@ -722,12 +727,38 @@ pub fn recoveries_used(path: &str) -> u64 {
 // Resume: fold a log file into Conversation messages
 // ------------------------------------------------------------------
 
+/// A resumed log, folded once. Carries the Conversation `messages` and header
+/// `drift` (the Transcript-facing facts), plus two governance facts derived from
+/// the SAME entry stream the fold walked: the last logged `plan` and the
+/// `recoveries` consumed by the logged request. Because all four come from one
+/// pass that stops at the first torn line, `plan`/`recoveries` here match
+/// [`plan`]/[`recoveries_used`] on the same file exactly, and stay consistent
+/// with the Conversation the fold produced. Private: the Agent unpacks it and
+/// keeps `plan`/`recoveries` outside the Transcript-facing `ResumeInfo`.
+pub(crate) struct Resumed {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) drift: Vec<Drift>,
+    pub(crate) plan: Option<String>,
+    pub(crate) recoveries: u64,
+}
+
 /// Folds a log file into the messages of a Conversation.
 ///
 /// Returns `(messages, drift)` where `drift` lists header facts that differ
 /// from the resuming Session's - the new Session's facts win.
 /// `Err(RootMismatch)` when the Project Root differs.
 pub fn resume(path: &str, session: &Session) -> Result<(Vec<Message>, Vec<Drift>), ResumeError> {
+    let r = resume_governed(path, session)?;
+    Ok((r.messages, r.drift))
+}
+
+/// Like [`resume`], but also returns the governance facts ([`Resumed::plan`],
+/// [`Resumed::recoveries`]) computed in the SAME single fold - so the Agent
+/// resumes the Plan and the recovery bound without re-reading the file. The two
+/// facts are derived from `entries`, which the loop below stops populating at
+/// the first torn line, so they inherit the fold's tolerance and match the
+/// standalone [`plan`]/[`recoveries_used`] queries line for line.
+pub(crate) fn resume_governed(path: &str, session: &Session) -> Result<Resumed, ResumeError> {
     let content = std::fs::read_to_string(path).map_err(|e| ResumeError::Read(e.to_string()))?;
 
     let mut lines = content.lines().filter(|l| !l.is_empty());
@@ -746,7 +777,27 @@ pub fn resume(path: &str, session: &Session) -> Result<(Vec<Message>, Vec<Drift>
         }
     }
 
-    Ok((fold(&entries), drift(&header, session)))
+    // Derive the two governance facts from the same tolerated entry stream,
+    // mirroring `plan`/`recoveries_used` exactly: `plan` is the last Plan seen;
+    // `recoveries` counts Recovery entries since the last UserText (reset on a
+    // genuine or rolled-over prompt, as the live Agent resets on submit).
+    let mut plan: Option<String> = None;
+    let mut recoveries: u64 = 0;
+    for entry in &entries {
+        match entry {
+            Entry::Plan(text) => plan = Some(text.clone()),
+            Entry::UserText(_) => recoveries = 0,
+            Entry::Recovery { .. } => recoveries += 1,
+            _ => {}
+        }
+    }
+
+    Ok(Resumed {
+        messages: fold(&entries),
+        drift: drift(&header, session),
+        plan,
+        recoveries,
+    })
 }
 
 fn check_root(header: &serde_json::Value, session: &Session) -> Result<(), ResumeError> {
@@ -2169,6 +2220,171 @@ mod tests {
     #[test]
     fn recoveries_used_is_zero_for_missing_or_foreign_files() {
         assert_eq!(recoveries_used("/definitely/not/here.jsonl"), 0);
+    }
+
+    // ---- plan/recoveries_used read under the fold's torn-line tolerance ----
+
+    // A torn line is a truncated JSON object (a crash mid-write), the shape the
+    // fold's `a_torn_last_line_is_dropped` uses. The header const and the
+    // `write_log` raw-file helper both live lower in this module.
+    const TORN_LINE: &str = r#"{"e": "plan", "tex"#;
+
+    #[test]
+    fn plan_is_none_for_a_missing_file() {
+        assert_eq!(plan("/definitely/not/here.jsonl"), None);
+    }
+
+    #[test]
+    fn plan_is_none_for_an_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[]);
+        assert_eq!(plan(&path), None);
+    }
+
+    #[test]
+    fn plan_is_none_for_a_header_only_log() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[TEST_HEADER]);
+        assert_eq!(plan(&path), None);
+    }
+
+    // A torn HEADER line: [`plan`] and [`recoveries_used`] both skip line 1
+    // unconditionally (header validation is [`resume`]'s job, not theirs), so a
+    // single torn header alone leaves nothing to scan - both read empty. The
+    // point of the test is that the two agree, the consistency the fix
+    // establishes; neither invents an entry from a log with no valid entries.
+    #[test]
+    fn plan_and_recoveries_used_agree_when_the_header_line_is_torn() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[TORN_LINE]);
+        assert_eq!(plan(&path), None);
+        assert_eq!(recoveries_used(&path), 0);
+    }
+
+    #[test]
+    fn plan_returns_the_last_plan_before_a_tear_never_one_after() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(
+            tmp.path(),
+            "20260101-000000-1.jsonl",
+            &[
+                TEST_HEADER,
+                r#"{"e":"user_text","text":"go"}"#,
+                r#"{"e":"plan","text":"before the tear"}"#,
+                TORN_LINE,
+                r#"{"e":"plan","text":"after the tear"}"#,
+            ],
+        );
+        // The tear stops the scan: the Plan after it is never observed, exactly
+        // as the resumed Conversation would never see it.
+        assert_eq!(plan(&path), Some("before the tear".to_string()));
+    }
+
+    #[test]
+    fn recoveries_used_stops_at_the_first_torn_line() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(
+            tmp.path(),
+            "20260101-000000-1.jsonl",
+            &[
+                TEST_HEADER,
+                r#"{"e":"user_text","text":"go"}"#,
+                r#"{"e":"recovery","shape":"continuation","text":"[r1]"}"#,
+                TORN_LINE,
+                r#"{"e":"recovery","shape":"continuation","text":"[r2]"}"#,
+            ],
+        );
+        // Only the recovery before the tear is counted; the one after it is
+        // dropped just as the fold drops everything past a torn line.
+        assert_eq!(recoveries_used(&path), 1);
+    }
+
+    #[test]
+    fn recoveries_used_and_plan_are_zero_none_for_a_header_only_log() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[TEST_HEADER]);
+        assert_eq!(recoveries_used(&path), 0);
+        assert_eq!(plan(&path), None);
+    }
+
+    #[test]
+    fn recoveries_used_is_zero_for_an_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[]);
+        assert_eq!(recoveries_used(&path), 0);
+    }
+
+    // ---- resume_governed folds the governance facts once ----
+    //
+    // The single fold's `plan`/`recoveries` MUST equal the standalone
+    // `plan`/`recoveries_used` queries on the same file: same last-Plan and
+    // same recovery-since-last-user_text semantics, same torn-line tolerance.
+
+    #[test]
+    fn resume_governed_plan_and_recoveries_match_the_standalone_queries() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::Plan("Goal: A. 1. read [x]".into()));
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            text: "[r1]".into(),
+        });
+        // A fresh prompt resets the recovery count (matching the live Agent's
+        // reset on submit); the later Plan is the one that resumes.
+        log.append(Entry::UserText("now do B".into()));
+        log.append(Entry::Plan("Goal: B. 1. edit [ ]".into()));
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            text: "[r2]".into(),
+        });
+
+        let r = resume_governed(&log.path, &session).unwrap();
+
+        assert_eq!(r.plan, plan(&log.path));
+        assert_eq!(r.recoveries, recoveries_used(&log.path));
+        assert_eq!(r.plan, Some("Goal: B. 1. edit [ ]".to_string()));
+        assert_eq!(r.recoveries, 1);
+    }
+
+    #[test]
+    fn resume_governed_matches_the_standalone_queries_under_a_tear() {
+        let tmp = TempDir::new().unwrap();
+        // The header's root is `/r`; resume needs a Session rooted there.
+        let session = Session::build(
+            SessionOpts {
+                root: Some("/r".into()),
+                session_dir: Some(tmp.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .unwrap();
+        let path = write_log(
+            tmp.path(),
+            "20260101-000000-1.jsonl",
+            &[
+                TEST_HEADER,
+                r#"{"e":"user_text","text":"go"}"#,
+                r#"{"e":"plan","text":"before the tear"}"#,
+                r#"{"e":"recovery","shape":"continuation","text":"[r1]"}"#,
+                TORN_LINE,
+                r#"{"e":"plan","text":"after the tear"}"#,
+                r#"{"e":"recovery","shape":"continuation","text":"[r2]"}"#,
+            ],
+        );
+
+        let r = resume_governed(&path, &session).unwrap();
+
+        // The tear stops the scan for all three derivations identically: the fold
+        // drops the post-tear messages, and `plan`/`recoveries` never observe the
+        // Plan or Recovery after it.
+        assert_eq!(r.plan, plan(&path));
+        assert_eq!(r.recoveries, recoveries_used(&path));
+        assert_eq!(r.plan, Some("before the tear".to_string()));
+        assert_eq!(r.recoveries, 1);
     }
 
     #[test]
