@@ -303,10 +303,15 @@ impl Conversation {
     /// [`Conversation::evict`], reporting what the wave reclaimed: `None`
     /// when no wave fired — or when a trigger found nothing to rewrite.
     pub fn evict_traced(&self) -> (Conversation, Option<WaveStats>) {
+        // Two waves, two triggers, decided once here. The dead-mass wave (elide
+        // every dead block) fires on EITHER trigger; the budget-pressure wave
+        // (live oldest-first eviction to the low-water mark) fires only under
+        // budget pressure.
         let target = self.context_budget.saturating_sub(self.max_tokens_reserve);
-        let over_budget = self.token_estimate() > target;
+        let fires_budget = self.token_estimate() > target;
         let dead = supersession::dead_blocks(&self.messages);
-        if !over_budget && !self.dead_mass_exceeded(&dead) {
+        let fires_dead_mass = self.dead_mass_exceeded(&dead);
+        if !fires_budget && !fires_dead_mass {
             return (self.clone(), None);
         }
 
@@ -316,16 +321,23 @@ impl Conversation {
             ..WaveStats::default()
         };
         let mut conv = self.clone();
+        // Dead-mass wave: reclaim every dead block. Runs on either trigger.
         conv.elide_dead(&dead, &mut stats);
-        if over_budget {
-            // Hysteresis: overshoot to the low-water mark (the Compaction
-            // Target — one number, one definition). Dead content already
-            // reclaimed above may have done the whole job.
-            let low_water = conv.compaction_target();
-            conv.do_evict(low_water, &mut stats);
+        if fires_budget {
+            conv.evict_budget_pressure_wave(&mut stats);
         }
         let fired = stats.fired().then_some(stats);
         (conv, fired)
+    }
+
+    // The budget-pressure wave: live oldest-first eviction overshooting to the
+    // low-water mark (the Compaction Target — one number, one definition), so
+    // elisions arrive in rare waves and the request prefix stays cache-stable
+    // between them (ADR-0006 hysteresis). Dead content the dead-mass wave
+    // already reclaimed may have done the whole job, leaving nothing to evict.
+    fn evict_budget_pressure_wave(&mut self, stats: &mut WaveStats) {
+        let low_water = self.compaction_target();
+        self.do_evict(low_water, stats);
     }
 
     // The Dead Mass trigger (CONTEXT.md: Dead Mass): dead content rots a
