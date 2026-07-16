@@ -671,6 +671,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_multi_tool_pass_checkpoints_once_with_the_whole_answered_batch() {
+        let root = root();
+        write(&root, "a.txt", "");
+        write(&root, "b.txt", "");
+        let session = session(root.path());
+        // One Pass emitting two Tool Calls: the batch is checkpointed once, after
+        // both are answered (per-batch, not per-tool — ADR-0010's per-event
+        // tool_result log entries carry crash recency; this checkpoint is only
+        // the settlement fallback).
+        let two_tool_pass = Response {
+            content: vec![
+                ContentBlock::tool_use("tu_1", "list_files", json!({"path": "."})),
+                ContentBlock::tool_use("tu_2", "list_files", json!({"path": "."})),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+            error: None,
+        };
+        let deps = deps_for(
+            &session,
+            vec![
+                Entry::just(two_tool_pass),
+                just(text_end("Done.")),
+            ],
+        );
+
+        let (outcome, deps) = run_with(&session, "list twice", deps).await;
+        ok(&outcome);
+
+        let checkpoints = deps.checkpoints.lock().unwrap();
+        // Exactly one checkpoint for the two-tool batch (plus the finish
+        // checkpoint on end-of-Turn) — never one per tool.
+        assert_eq!(checkpoints.len(), 2, "one per batch, not one per tool");
+
+        // The batch checkpoint carries both answered Tool Calls paired with
+        // their results, and no unanswered tool_use block.
+        let cp = &checkpoints[0];
+        let tail = &cp.messages[cp.messages.len() - 2..];
+        let assistant = &tail[0];
+        assert!(matches!(assistant.role, Role::Assistant));
+        let tool_use_ids: Vec<&str> = assistant
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_use_ids, vec!["tu_1", "tu_2"]);
+
+        let user = &tail[1];
+        assert!(matches!(user.role, Role::User));
+        let result_ids: Vec<&str> = user
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, vec!["tu_1", "tu_2"]);
+    }
+
+    #[tokio::test]
     async fn emits_message_grammar_per_pass_including_errored_responses() {
         let root = root();
         let session = session(root.path());

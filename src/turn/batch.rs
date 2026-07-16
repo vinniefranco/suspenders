@@ -13,8 +13,8 @@
 //! Approval (ADR-0005) requested between pre_run and execution for the tools
 //! that require it, on the plugin-adjusted input; the arbiter is consulted
 //! again after execution ([`governor::answer_read`] — the consecutive-failure
-//! annotation). After every result the Conversation is checkpointed with only
-//! the answered Tool Calls, so a crash mid-batch never persists an unanswered
+//! annotation). Once the batch finishes the Conversation is checkpointed with
+//! only the answered Tool Calls, so the checkpoint never persists an unanswered
 //! tool_use block.
 //!
 //! The loop skeleton lives in [`super::loop_`]; how a Turn ends when the model
@@ -36,9 +36,9 @@ use crate::turn::governor::{self, AnswerIntervention};
 use crate::turn::loop_::LoopState;
 use crate::voice;
 
-// Run tool calls in emission order; results keep that order. After each result,
-// checkpoint with only the answered Tool Calls. After the batch the duplicate
-// memory advances and the Ledger's failure-recency clock ticks.
+// Run tool calls in emission order; results keep that order. Checkpoint ONCE
+// after the batch, carrying every answered Tool Call. After the batch the
+// duplicate memory advances and the Ledger's failure-recency clock ticks.
 pub(super) async fn execute_tools<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
@@ -48,16 +48,23 @@ pub(super) async fn execute_tools<D: TurnDeps>(
     for block in blocks.iter().filter(|b| b.is_tool_use()) {
         let result = execute_tool(state, block).await;
         results.push(result);
-        let checkpoint = build_checkpoint(&conversation, blocks, &results);
-        state.deps.checkpoint(&checkpoint);
     }
+    // Per-BATCH, not per-tool, is the correct checkpoint granularity: crash
+    // recency comes from the Session Log's per-event tool_result entries
+    // (ADR-0010, flushed as each result is emitted), so a mid-batch crash keeps
+    // completed work through the log — not this checkpoint. The in-memory
+    // checkpoint is only the settlement fallback, so one over the finished
+    // batch is enough (and must not be dropped: it holds in-flight settlement
+    // state should the Turn end here).
+    let checkpoint = build_checkpoint(&conversation, blocks, &results);
+    state.deps.checkpoint(&checkpoint);
     state.governors.next_pass();
     state.ledger.close_batch();
     (results, conversation)
 }
 
-// The checkpoint after a partial batch: only the answered Tool Calls, paired
-// with their results.
+// The end-of-batch checkpoint: only the answered Tool Calls, paired with their
+// results (never a bare, unanswered tool_use block).
 fn build_checkpoint(
     conversation: &Conversation,
     blocks: &[ContentBlock],

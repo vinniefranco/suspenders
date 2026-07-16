@@ -111,8 +111,10 @@ pub trait TurnDeps: Send {
         command: String,
     ) -> impl Future<Output = bool> + Send;
 
-    /// Checkpoints the Conversation (fire-and-forget). Called after every Tool
-    /// Result so a cancel mid-Pass keeps completed work.
+    /// Checkpoints the Conversation (fire-and-forget). Called once per Tool Call
+    /// batch with the answered calls; crash recency comes from the Session Log's
+    /// per-event tool_result entries (ADR-0010), so this is the settlement
+    /// fallback, not the durability path.
     fn checkpoint(&mut self, conversation: &Conversation);
 
     /// Stores the Plan text outside the Conversation (fire-and-forget). Called
