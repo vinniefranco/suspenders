@@ -154,9 +154,9 @@ impl SessionConfig {
     /// The base config the app ships.
     pub fn base() -> Self {
         SessionConfig {
-            base_url: "http://studio-win.local:8888/v1".into(),
+            base_url: "http://studio-lin.local:8888/v1".into(),
             token: "".into(),
-            model: "qwen/qwen3.5-9b".into(),
+            model: "qwen/Qwen3.6-27B-MTP-GGUF".into(),
             max_tokens: 8_000,
             temperature: Some(0.7),
             context_budget: 64_000,

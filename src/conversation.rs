@@ -668,7 +668,7 @@ pub fn command_result_for<'a>(messages: &'a [Message], command: &str) -> Option<
 }
 
 // ceil(chars / 3.5) - a 3.5 ratio, not a div_ceil by 7, so keep as-is.
-fn tokens_for_chars(chars: u64) -> u64 {
+pub(crate) fn tokens_for_chars(chars: u64) -> u64 {
     #[allow(clippy::manual_div_ceil)]
     {
         (2 * chars + 6) / 7

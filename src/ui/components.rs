@@ -362,7 +362,7 @@ pub fn render_viewport(
         vec![]
     } else {
         vec![Line::styled(
-            format!("🧠 thinking… ({} chars)", thinking.chars().count()),
+            format!("🧠 thinking… (~{} tokens)", crate::conversation::tokens_for_chars(thinking.chars().count() as u64)),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
