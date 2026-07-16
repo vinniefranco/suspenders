@@ -71,6 +71,18 @@ pub trait Llm: Send + Sync {
         connection: &Connection,
         on_event: &mut OnEvent<'_>,
     ) -> Response;
+
+    /// Lists the model identifiers the server offers (`GET {base_url}/models`).
+    ///
+    /// Unlike [`complete`], this RETURNS a `Result` rather than folding failure
+    /// into a Response (ADR-0002 amendment, ADR-0033): it is a discrete,
+    /// user-triggered query, not the streaming Turn loop, so a plain `Err` the
+    /// caller surfaces as an info line is simpler than the never-Err error
+    /// algebra. Connection refused, a non-2xx status, and an unparseable body
+    /// are all `Err`; a well-formed response with no `data` is `Ok(vec![])`.
+    ///
+    /// [`complete`]: Llm::complete
+    async fn list_models(&self, connection: &Connection) -> Result<Vec<String>, String>;
 }
 
 /// The real boundary. Holds nothing config-ish - reads only the `connection`
@@ -152,6 +164,53 @@ impl Llm for AnthropicLlm {
         }
 
         state.finalize()
+    }
+
+    async fn list_models(&self, connection: &Connection) -> Result<Vec<String>, String> {
+        let url = format!("{}/models", connection.base_url.trim_end_matches('/'));
+
+        let client = reqwest::Client::new();
+        let sent = client
+            .get(&url)
+            .header("x-api-key", &connection.token)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await;
+
+        let resp = match sent {
+            Ok(resp) => resp,
+            // Connection refused, DNS failure, etc.
+            Err(e) => return Err(format!("request_failed: {e}")),
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("request_failed: HTTP {status}: {body}"));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("request_failed: {e}"))?;
+        let value: Value =
+            serde_json::from_str(&body).map_err(|e| format!("request_failed: {e}"))?;
+
+        // The models-list shape is common to the Anthropic and OpenAI REST
+        // APIs: `{"data": [{"id": …}]}`. Parse `data[].id`, leniently skipping
+        // any entry that lacks a string `id`. Missing/empty `data` → empty vec.
+        let ids = value
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ids)
     }
 }
 
@@ -863,5 +922,117 @@ mod tests {
         let result = fake.complete(json!({}), &conn, &mut no_op()).await;
         assert_eq!(result.stop_reason, StopReason::Error);
         assert_eq!(result.error.as_deref(), Some("boom"));
+    }
+
+    // ------------------------------------------------------------------
+    // list_models - the read-only models-list endpoint (ADR-0002 amendment)
+    // ------------------------------------------------------------------
+
+    async fn serve_models(server: &MockServer, status: u16, body: Value) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_ids_in_order() {
+        let server = MockServer::start().await;
+        serve_models(
+            &server,
+            200,
+            json!({ "data": [{ "id": "a" }, { "id": "b" }] }),
+        )
+        .await;
+
+        let conn = connection_for(&server);
+        let result = AnthropicLlm::new().list_models(&conn).await;
+        assert_eq!(result, Ok(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn list_models_empty_data_is_ok_empty() {
+        let server = MockServer::start().await;
+        serve_models(&server, 200, json!({ "data": [] })).await;
+
+        let conn = connection_for(&server);
+        assert_eq!(AnthropicLlm::new().list_models(&conn).await, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn list_models_missing_data_is_ok_empty() {
+        let server = MockServer::start().await;
+        serve_models(&server, 200, json!({})).await;
+
+        let conn = connection_for(&server);
+        assert_eq!(AnthropicLlm::new().list_models(&conn).await, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn list_models_skips_entries_without_a_string_id() {
+        let server = MockServer::start().await;
+        serve_models(
+            &server,
+            200,
+            json!({ "data": [{ "id": "a" }, { "id": 7 }, { "name": "no-id" }, { "id": "b" }] }),
+        )
+        .await;
+
+        let conn = connection_for(&server);
+        let result = AnthropicLlm::new().list_models(&conn).await;
+        assert_eq!(result, Ok(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn list_models_http_404_is_error() {
+        let server = MockServer::start().await;
+        serve_models(&server, 404, json!({ "type": "error" })).await;
+
+        let conn = connection_for(&server);
+        let result = AnthropicLlm::new().list_models(&conn).await;
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(result.unwrap_err().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_models_connection_refused_is_error() {
+        // A port nothing listens on.
+        let refused = Connection::new("http://localhost:1/v1", "t", "m", 100);
+        let result = AnthropicLlm::new().list_models(&refused).await;
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(result.unwrap_err().contains("request_failed"));
+    }
+
+    #[tokio::test]
+    async fn list_models_non_json_body_is_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let conn = connection_for(&server);
+        assert!(AnthropicLlm::new().list_models(&conn).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fake_llm_list_models_scripts_ok_then_err() {
+        use crate::test_support::FakeLlm;
+
+        let fake = FakeLlm::script(std::iter::empty()).with_models(vec![
+            Ok(vec!["m1".to_string(), "m2".to_string()]),
+            Err("boom".to_string()),
+        ]);
+        let conn = Connection::new("http://x/v1", "t", "m", 100);
+
+        assert_eq!(
+            fake.list_models(&conn).await,
+            Ok(vec!["m1".to_string(), "m2".to_string()])
+        );
+        assert_eq!(fake.list_models(&conn).await, Err("boom".to_string()));
+        // Exhausted queue falls back to the benign empty list.
+        assert_eq!(fake.list_models(&conn).await, Ok(vec![]));
     }
 }

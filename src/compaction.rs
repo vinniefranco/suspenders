@@ -611,7 +611,11 @@ mod tests {
         let mut conv = Conversation::new("You are Baud.", opts());
         conv.add_user_text("fix the failing glob tests");
         conv.add_assistant_blocks(vec![
-            ContentBlock::tool_use("e1", "edit_file", serde_json::json!({"path": "lib/glob.ex"})),
+            ContentBlock::tool_use(
+                "e1",
+                "edit_file",
+                serde_json::json!({"path": "lib/glob.ex"}),
+            ),
             ContentBlock::tool_use(
                 "r1",
                 "run_command",
@@ -656,7 +660,10 @@ mod tests {
             handoff.state.original_task.as_deref(),
             Some("fix the failing glob tests")
         );
-        assert_eq!(handoff.verification.as_deref(), Some("exit 1\n2 tests failed"));
+        assert_eq!(
+            handoff.verification.as_deref(),
+            Some("exit 1\n2 tests failed")
+        );
         assert_eq!(handoff.conversation.last_usage, None);
     }
 

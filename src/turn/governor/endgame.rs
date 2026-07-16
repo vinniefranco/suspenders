@@ -111,8 +111,8 @@ pub struct Recovery {
 /// 2026-07-14). A capped Turn that settled green gets no recovery; `limit` 0
 /// disables the mechanic.
 pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recovery> {
-    let unfinished = ledger.unverified_writes()
-        || (ledger.dangling_failure() && ledger.wrote_this_turn());
+    let unfinished =
+        ledger.unverified_writes() || (ledger.dangling_failure() && ledger.wrote_this_turn());
     if unfinished && ledger.recoveries_used() < setpoints.limit {
         Some(Recovery {
             shape: setpoints.shape,
@@ -449,7 +449,10 @@ mod tests {
 
     #[test]
     fn a_clean_cap_gets_no_recovery() {
-        assert_eq!(recovery(&RecoverySetpoints::default(), &Ledger::new(25)), None);
+        assert_eq!(
+            recovery(&RecoverySetpoints::default(), &Ledger::new(25)),
+            None
+        );
     }
 
     #[test]

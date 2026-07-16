@@ -10,12 +10,16 @@
 //! the core returns, and renders via [`components`]. Only this module and
 //! [`components`] `use ratatui` / `use crossterm` (ADR-0019 invariant).
 
+pub mod command;
 pub mod components;
 pub mod composer;
 pub mod draft;
 pub mod history;
 pub mod markdown;
+pub mod model_command;
 pub mod picker;
+pub mod selector;
+pub mod slash;
 pub mod streaming;
 pub mod transcript;
 pub mod viewport;
@@ -31,9 +35,10 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::agent::AgentHandle;
 use crate::approvals::Decision as AgentDecision;
+use crate::event::Event;
 use crate::history::History;
-use crate::session::Session;
 use crate::session::log::SessionEntry;
+use crate::session::{Session, default_config_path};
 use picker::{Picker, PickerOutcome};
 use transcript::{
     AgentCommand, Busy, Decision, Effect, Idle, Key, ScrollStep, Status, Transcript, TranscriptOpts,
@@ -132,6 +137,21 @@ async fn pick_loop(
     }
 }
 
+/// The adapter-side context the [`Effect`] handlers need beyond the pure core:
+/// the Agent, the config path a `/model` pick persists to, and the sender that
+/// injects a fetched [`Event::SelectorReady`]/[`SelectorFailed`] back into the
+/// [`run_loop`] select (ADR-0033). Bundled so the [`Effect`] plumbing stays a
+/// few params, not a dozen.
+pub(crate) struct AdapterCtx<'a> {
+    pub(crate) agent: &'a AgentHandle,
+    pub(crate) config_path: String,
+    /// The loop's own event injection channel: a `/model` fetch runs in a
+    /// spawned task (never blocking the select loop, ADR-0011) and posts its
+    /// SelectorReady/SelectorFailed here, where the loop folds it like an Agent
+    /// event.
+    pub(crate) selector_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     agent: AgentHandle,
@@ -140,9 +160,28 @@ async fn run_loop(
     let mut events = agent.subscribe();
     let mut input = EventStream::new();
 
-    // The base_url is a Session fact the status bar shows; the pure Transcript
-    // core never sees it, so the adapter carries it into the render.
-    let base_url = session.connection.base_url.clone();
+    // Adapter-injected events (a `/model` fetch's result). The fetch spawns a
+    // task that awaits `agent.list_models()` off the select loop and posts the
+    // resulting SelectorReady/SelectorFailed here; the loop folds it exactly
+    // like an Agent event (ADR-0033). A local mpsc, not the Agent's broadcast:
+    // the adapter owns this fetch, so it owns the channel.
+    let (selector_tx, mut selector_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+
+    // The connection facts the status bar shows - the fixed endpoint and the
+    // mutable Active Model (ADR-0033). The pure Transcript core stays
+    // command-agnostic and holds neither, so the adapter carries them into the
+    // render as one named-field carrier (never a position-coupled pair). The
+    // model is seeded from the connection, then refreshed from the Agent after
+    // any batch that could have changed it (a `/model` pick), never on the tick.
+    let mut conn = components::ConnectionFacts {
+        base_url: session.connection.base_url.clone(),
+        model: session.connection.model.clone(),
+    };
+    let ctx = AdapterCtx {
+        agent: &agent,
+        config_path: default_config_path(),
+        selector_tx,
+    };
 
     // Persistent prompt history (up/down recall ACROSS Sessions). The store
     // lives beside the Session Logs; the pure core keeps the in-memory ring -
@@ -180,7 +219,7 @@ async fn run_loop(
         terminal,
         transcript.as_ref().unwrap(),
         &viewport,
-        &base_url,
+        &conn,
         spinner,
         &mut cache,
     )?;
@@ -192,7 +231,7 @@ async fn run_loop(
             _ = ticker.tick() => {
                 if transcript.as_ref().unwrap().status == Status::Running {
                     spinner = spinner.wrapping_add(1);
-                    geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
+                    geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
                 }
                 continue;
             }
@@ -219,7 +258,7 @@ async fn run_loop(
                                 // tested place.
                                 let core = transcript.take().unwrap();
                                 let (core, effects) = core.handle_key(map_key(&key_event));
-                                transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
+                                transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                                 dirty = true;
                             }
                         }
@@ -230,7 +269,7 @@ async fn run_loop(
                             if let Some(key) = map_mouse(&mouse) {
                                 let core = transcript.take().unwrap();
                                 let (core, effects) = core.handle_key(key);
-                                transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
+                                transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                             }
                             dirty = true;
                         }
@@ -245,6 +284,10 @@ async fn run_loop(
                         None => break,
                     }
                 }
+                // Committing a `/model` pick is a key press, so it lands in this
+                // batch; refresh the Active Model the status bar shows (a cheap
+                // in-process actor query, ADR-0017/0033 - never on the tick).
+                conn.model = agent.active_model().await;
                 if !dirty {
                     continue;
                 }
@@ -256,7 +299,7 @@ async fn run_loop(
                     Ok(event) => {
                         let core = transcript.take().unwrap();
                         let (core, effects) = core.apply_event(event);
-                        transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
+                        transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                     }
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
@@ -266,12 +309,26 @@ async fn run_loop(
                     Err(RecvError::Closed) => {
                         let core = transcript.take().unwrap();
                         let (core, effects) = core.agent_down();
-                        transcript = Some(run_effects(core, effects, &agent, &mut viewport, geometry, history_store.as_ref()).await);
-                        let geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &base_url, spinner, &mut cache)?;
+                        transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                        let geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
                         // Nothing more will arrive; wait only on input now.
-                        return drain_input(terminal, input, transcript.take().unwrap(), viewport, geometry, base_url, cache).await;
+                        return drain_input(terminal, input, transcript.take().unwrap(), viewport, geometry, conn, cache).await;
                     }
                 }
+            }
+
+            // Adapter-injected events: a `/model` fetch's SelectorReady/Failed,
+            // posted by its spawned task (ADR-0033). Folded exactly like an Agent
+            // event - the pure core's guarded SelectorReady/Failed arms flip the
+            // Loading overlay (or ignore a stale delivery). The sender is held in
+            // `ctx`, so this side never ends while the loop runs.
+            Some(event) = selector_rx.recv() => {
+                let core = transcript.take().unwrap();
+                let (core, effects) = core.apply_event(event);
+                transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                // The fetch result never changes the model, but a pick could
+                // have raced in; refresh to stay truthful (still off the tick).
+                conn.model = agent.active_model().await;
             }
         }
 
@@ -279,21 +336,23 @@ async fn run_loop(
             terminal,
             transcript.as_ref().unwrap(),
             &viewport,
-            &base_url,
+            &conn,
             spinner,
             &mut cache,
         )?;
     }
 }
 
-/// After the Agent is gone we keep the TUI responsive to quit/scroll only.
+/// After the Agent is gone we keep the TUI responsive to quit/scroll only. The
+/// Active Model can no longer change (no Agent to swap it), so the connection
+/// facts are frozen - carried as one owned [`components::ConnectionFacts`].
 async fn drain_input(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut input: EventStream,
     transcript: Transcript,
     mut viewport: Viewport,
     mut geometry: Geometry,
-    base_url: String,
+    conn: components::ConnectionFacts,
     mut cache: components::RenderCache,
 ) -> anyhow::Result<()> {
     loop {
@@ -308,7 +367,7 @@ async fn drain_input(
                     Key::PageDown => viewport.page_down(total_lines, height),
                     _ => {}
                 }
-                geometry = draw(terminal, &transcript, &viewport, &base_url, 0, &mut cache)?;
+                geometry = draw(terminal, &transcript, &viewport, &conn, 0, &mut cache)?;
             }
             // The wheel still scrolls after the Agent is gone; other mouse
             // kinds are ignored.
@@ -318,7 +377,7 @@ async fn drain_input(
                     Some(Key::WheelDown) => viewport.scroll_down(WHEEL_LINES, total_lines, height),
                     _ => continue,
                 }
-                geometry = draw(terminal, &transcript, &viewport, &base_url, 0, &mut cache)?;
+                geometry = draw(terminal, &transcript, &viewport, &conn, 0, &mut cache)?;
             }
             Some(_) => {}
             None => return Ok(()),
@@ -404,13 +463,13 @@ fn map_mouse(mouse: &MouseEvent) -> Option<Key> {
 async fn run_effects(
     mut transcript: Transcript,
     effects: Vec<Effect>,
-    agent: &AgentHandle,
+    ctx: &AdapterCtx<'_>,
     viewport: &mut Viewport,
     geometry: Geometry,
     history: Option<&History>,
 ) -> Transcript {
     for effect in effects {
-        transcript = run_effect(transcript, effect, agent, viewport, geometry, history).await;
+        transcript = run_effect(transcript, effect, ctx, viewport, geometry, history).await;
     }
     transcript
 }
@@ -418,11 +477,12 @@ async fn run_effects(
 async fn run_effect(
     transcript: Transcript,
     effect: Effect,
-    agent: &AgentHandle,
+    ctx: &AdapterCtx<'_>,
     viewport: &mut Viewport,
     geometry: Geometry,
     history: Option<&History>,
 ) -> Transcript {
+    let agent = ctx.agent;
     // Scroll effects clamp against the LAST draw's measure (see [`Geometry`]);
     // the draw-time `top_offset` clamp corrects any staleness.
     let (total_lines, height) = geometry;
@@ -433,19 +493,13 @@ async fn run_effect(
             // retries as steer) and may emit MORE effects.
             let outcome = result.map_err(|_| Busy);
             let (core, effects) = transcript.submitted(prompt, outcome);
-            Box::pin(run_effects(
-                core, effects, agent, viewport, geometry, history,
-            ))
-            .await
+            Box::pin(run_effects(core, effects, ctx, viewport, geometry, history)).await
         }
         Effect::Agent(AgentCommand::Steer(text)) => {
             let result = agent.steer(text.clone()).await;
             let outcome = result.map_err(|_| Idle);
             let (core, effects) = transcript.steered(text, outcome);
-            Box::pin(run_effects(
-                core, effects, agent, viewport, geometry, history,
-            ))
-            .await
+            Box::pin(run_effects(core, effects, ctx, viewport, geometry, history)).await
         }
         Effect::Agent(AgentCommand::Approve(id, decision)) => {
             agent.approve(id, to_agent_decision(decision)).await;
@@ -488,6 +542,17 @@ async fn run_effect(
             }
             transcript
         }
+        // A committed Slash Command (ADR-0032/0033). The adapter routes it
+        // through the single `command::run` seam - `is_handled` reflects exactly
+        // what it routes, so an unwired registry entry is a visible info line,
+        // never a silent drop.
+        Effect::Command { name } => command::run(transcript, ctx, &name).await,
+        // A row was chosen from a command's selector (ADR-0033): routed through
+        // the same seam as the command itself.
+        Effect::SelectorChosen {
+            command: cmd,
+            value,
+        } => command::choose(transcript, ctx, &cmd, value).await,
     }
 }
 
@@ -518,13 +583,13 @@ fn draw(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     transcript: &Transcript,
     viewport: &Viewport,
-    base_url: &str,
+    conn: &components::ConnectionFacts,
     spinner: u64,
     cache: &mut components::RenderCache,
 ) -> anyhow::Result<Geometry> {
     let mut geometry: Geometry = (0, 0);
     terminal.draw(|frame| {
-        geometry = components::render(frame, transcript, base_url, spinner, viewport, cache);
+        geometry = components::render(frame, transcript, conn.view(), spinner, viewport, cache);
     })?;
     Ok(geometry)
 }

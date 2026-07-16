@@ -236,7 +236,10 @@ pub enum Entry {
     /// distinguishable as Suspenders' voice; `shape` is forensic. The fold
     /// merges it through the same seam the live path used, and
     /// [`recoveries_used`] counts these to restore the per-request bound.
-    Recovery { shape: RecoveryShape, text: String },
+    Recovery {
+        shape: RecoveryShape,
+        text: String,
+    },
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
     /// classified error and the attempt number against the budget, forensic
     /// only. Silent to the model's Conversation - the failed draw produced

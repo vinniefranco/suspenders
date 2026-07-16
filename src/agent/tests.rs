@@ -78,10 +78,7 @@ fn tool_use_result(id: &str, name: &str, input: Value) -> Response {
 // baud's assert_receive: pull events off a broadcast Receiver until one
 // matches the predicate or the deadline passes. Skips Lagged (never in
 // these tests) and returns the matched event.
-async fn recv_match(
-    rx: &mut broadcast::Receiver<Event>,
-    pred: impl Fn(&Event) -> bool,
-) -> Event {
+async fn recv_match(rx: &mut broadcast::Receiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1089,7 +1086,10 @@ async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
         &SessionConfig::test_defaults(),
     )
     .unwrap();
-    let agent = start(session, FakeLlm::script(vec![Entry::just(write_tool("w1", "a.txt"))]));
+    let agent = start(
+        session,
+        FakeLlm::script(vec![Entry::just(write_tool("w1", "a.txt"))]),
+    );
     let mut rx = agent.subscribe();
 
     agent.submit("write the file").await.unwrap();
@@ -1561,4 +1561,63 @@ async fn cancel_during_streaming_does_not_crash() {
 
     recv_match(&mut rx, |e| matches!(e, Event::TurnCancelled)).await;
     assert_eq!(agent.status().await, Status::Idle);
+}
+
+// ---- Active Model / set_model (ADR-0033) --------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_changes_what_active_model_returns() {
+    let dir = TempDir::new().unwrap();
+    let agent = start(session_in(&dir), FakeLlm::script(vec![]));
+
+    // Seeded from the Session's connection at launch.
+    assert_eq!(
+        agent.active_model().await,
+        SessionConfig::test_defaults().model
+    );
+
+    agent.set_model("picked/model".into()).await;
+    assert_eq!(agent.active_model().await, "picked/model");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_spawned_after_set_model_uses_the_new_model() {
+    // The next Turn captures the Agent's mutable connection, so the wire request
+    // carries the new model - not the Session's launch-time one (ADR-0033).
+    let dir = TempDir::new().unwrap();
+    let (req_tx, mut req_rx) = mpsc::unbounded_channel::<Value>();
+    let script = vec![Entry::dynamic(vec![], move |req: &Value| {
+        let _ = req_tx.send(req.clone());
+        text_end("done")
+    })];
+    let agent = start(session_in(&dir), FakeLlm::script(script));
+    let mut rx = agent.subscribe();
+
+    agent.set_model("picked/model".into()).await;
+    agent.submit("go").await.unwrap();
+
+    let request = req_rx.recv().await.expect("request");
+    assert_eq!(request["model"], json!("picked/model"));
+
+    recv_match(&mut rx, is_turn_finished).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_models_returns_the_scripted_ids_then_propagates_an_error() {
+    // The Agent owns the Llm + connection, so `list_models` proxies the
+    // boundary through it (ADR-0033). A scripted Ok comes back verbatim; a
+    // scripted Err propagates (the boundary's fallible shape, not the never-Err
+    // `complete` algebra).
+    let dir = TempDir::new().unwrap();
+    let fake = FakeLlm::script(vec![]).with_models(vec![
+        Ok(vec!["a/model".into(), "b/model".into()]),
+        Err("boom".into()),
+    ]);
+    let agent = start(session_in(&dir), fake);
+
+    assert_eq!(
+        agent.list_models().await,
+        Ok(vec!["a/model".to_string(), "b/model".to_string()])
+    );
+    assert_eq!(agent.list_models().await, Err("boom".to_string()));
 }

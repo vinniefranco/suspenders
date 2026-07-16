@@ -124,7 +124,13 @@ pub(super) fn finish<D: TurnDeps>(
             } else {
                 vec![ContentBlock::text(voice::turn_limit_marker())]
             };
-            Flow::Done(close_recover(state, conversation, closing, reason, recovery))
+            Flow::Done(close_recover(
+                state,
+                conversation,
+                closing,
+                reason,
+                recovery,
+            ))
         }
         Some(FinishIntervention::Standalone { tag, text }) => {
             conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));

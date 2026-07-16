@@ -642,9 +642,10 @@ pub fn command_result_for<'a>(messages: &'a [Message], command: &str) -> Option<
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input, .. }
-                if name == "run_command"
-                    && input.get("command").and_then(|c| c.as_str()) == Some(command) =>
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } if name == "run_command"
+                && input.get("command").and_then(|c| c.as_str()) == Some(command) =>
             {
                 Some(id.as_str())
             }

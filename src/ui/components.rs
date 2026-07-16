@@ -25,8 +25,10 @@ use syntect::parsing::SyntaxSet;
 use crate::ui::composer::{self, ComposerLayout};
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
+use crate::ui::selector::SelectorRow;
 use crate::ui::transcript::{
-    LineStyle, PressureLevel, Status, StyledLine, Transcript, TranscriptItem,
+    LineStyle, PressureLevel, SelectorStatus, SlashView, Status, StyledLine, Transcript,
+    TranscriptItem,
 };
 use crate::ui::viewport::Viewport;
 
@@ -103,7 +105,8 @@ pub fn segment_style(kind: SegmentKind) -> Style {
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
-        SegmentKind::Connection => Style::default()
+        // Model + Connection are the two connection facts, styled identically.
+        SegmentKind::Connection | SegmentKind::Model => Style::default()
             .fg(Color::Rgb(150, 160, 185))
             .bg(Color::Rgb(52, 58, 82)),
         SegmentKind::Thinking => Style::default().fg(Color::DarkGray).bg(SEGMENT_DARK_BG),
@@ -122,6 +125,41 @@ fn segment_bg(kind: SegmentKind) -> Color {
 // Render helpers.
 // ---------------------------------------------------------------------------
 
+/// The two connection facts the status bar shows (ADR-0033): the fixed endpoint
+/// and the mutable Active Model. Both are adapter-carried - the pure Transcript
+/// core stays command-agnostic and holds neither. The adapter OWNS them as a
+/// [`ConnectionFacts`]; this is the borrowed form the render path takes, so
+/// both elements are always name-addressed, never a position-coupled pair.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionView<'a> {
+    /// The Session's fixed `base_url`.
+    pub base_url: &'a str,
+    /// The Agent's Active Model, refreshed by the adapter after any batch that
+    /// could change it (a `/model` pick).
+    pub model: &'a str,
+}
+
+/// The adapter's owned copy of the two connection facts - the endpoint (a fixed
+/// Session fact) and the Active Model (mutable Agent state the adapter refreshes
+/// after a `/model` pick). Named fields, never a `(String, String)` pair, so the
+/// two can't be swapped at a call site. Borrowed into a [`ConnectionView`] at the
+/// render boundary via [`ConnectionFacts::view`].
+#[derive(Debug, Clone)]
+pub struct ConnectionFacts {
+    pub base_url: String,
+    pub model: String,
+}
+
+impl ConnectionFacts {
+    /// The borrowed [`ConnectionView`] the render path takes.
+    pub fn view(&self) -> ConnectionView<'_> {
+        ConnectionView {
+            base_url: &self.base_url,
+            model: &self.model,
+        }
+    }
+}
+
 /// Renders the whole frame: the transcript viewport, the status bar, the
 /// Composer, and - when an Approval is pending - the modal on top. The
 /// [`Viewport`] holds the pure scroll state; the returned `(total_lines,
@@ -137,7 +175,7 @@ fn segment_bg(kind: SegmentKind) -> Color {
 pub fn render(
     frame: &mut Frame,
     t: &Transcript,
-    base_url: &str,
+    conn: ConnectionView,
     spinner: u64,
     viewport: &Viewport,
     cache: &mut RenderCache,
@@ -165,13 +203,126 @@ pub fn render(
     // measured geometry (and the Viewport's clamped top) from this frame, not
     // a stale one.
     let geometry = render_viewport(frame, chunks[0], t, viewport, cache);
-    render_status_bar(frame, chunks[1], t, base_url, spinner, viewport, geometry);
+    render_status_bar(frame, chunks[1], t, conn, spinner, viewport, geometry);
     render_composer(frame, chunks[2], t, &layout);
+
+    // The Slash Command popup (ADR-0032/0033) floats just above the status bar +
+    // Composer - an inline overlay, not a full-screen modal. Drawn after the
+    // Composer so it sits on top; skipped entirely when no slash draft is open.
+    if let Some(view) = t.slash_view() {
+        render_slash_popup(frame, chunks[1].y, area, &view);
+    }
 
     if let Some(pending) = &t.pending_approval {
         render_approval_modal(frame, area, &pending.command);
     }
     geometry
+}
+
+/// The inline Slash Command popup (ADR-0032/0033): a compact bordered list
+/// anchored just above `anchor_y` (the status bar's row), listing the current
+/// [`SlashView`]'s rows with the highlighted one reversed and any hint dimmed.
+/// The `Selector`'s `Loading`/`Failed` states draw a single status line instead
+/// of rows. Inline and height-bounded - never the full screen.
+fn render_slash_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &SlashView) {
+    // The lines the popup body holds, plus the title.
+    let (title, lines): (&str, Vec<Line>) = match view {
+        SlashView::Menu { rows, highlight } => ("commands", popup_rows(rows, *highlight)),
+        SlashView::Selector {
+            status,
+            rows,
+            highlight,
+            ..
+        } => match status {
+            SelectorStatus::Loading => (
+                "models",
+                vec![Line::styled(
+                    "loading models…",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )],
+            ),
+            SelectorStatus::Failed(msg) => (
+                "models",
+                vec![Line::styled(
+                    format!("failed: {msg}"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )],
+            ),
+            SelectorStatus::Ready(_) => ("models", popup_rows(rows, *highlight)),
+        },
+    };
+
+    // Body rows + top/bottom border, capped so a long list never eats the
+    // screen; width caps to the terminal.
+    let body_rows = lines.len().max(1) as u16;
+    let height = (body_rows + 2).min(POPUP_MAX_ROWS + 2).min(area.height);
+    let width = area.width.saturating_sub(2).max(1);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = anchor_y.saturating_sub(height);
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Scroll the highlighted row into view when the list overflows the box.
+    let visible = inner.height as usize;
+    let highlight = match view {
+        SlashView::Menu { highlight, .. } => *highlight,
+        SlashView::Selector { highlight, .. } => *highlight,
+    };
+    let top = composer::first_visible_row(highlight, visible.max(1));
+    let shown: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The most body rows the Slash popup shows before it scrolls internally - keeps
+/// the overlay compact even against a long model list.
+const POPUP_MAX_ROWS: u16 = 8;
+
+/// One `Line` per [`SelectorRow`]: the label, then the hint dimmed; the
+/// highlighted row is reversed so it reads as the selection.
+fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::styled(
+            "no matches",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )];
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = vec![Span::raw(row.label.clone())];
+            if let Some(hint) = &row.hint {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    hint.clone(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
+            let line = Line::from(spans);
+            if i == highlight {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect()
 }
 
 /// The transcript viewport: the message list, oldest first, plus any in-flight
@@ -710,6 +861,13 @@ pub enum StatusSegment {
         /// The model connection's base URL.
         base_url: String,
     },
+    /// The Active Model this Session talks to (ADR-0033). Mutable - a `/model`
+    /// pick changes it - so the bar shows the one connection fact this feature
+    /// makes variable, beside the fixed endpoint.
+    Model {
+        /// The Active Model identifier.
+        model: String,
+    },
     /// The Ctrl-T Thinking-expansion state. Carries the boolean meaning; the
     /// `▾`/`▸` marker is chosen by the painter. Always assembled so the toggle
     /// has feedback even when no Thinking items are on screen.
@@ -747,6 +905,7 @@ impl StatusSegment {
             StatusSegment::Mode(ModeState::Idle) => SegmentKind::ModeIdle,
             StatusSegment::Mode(ModeState::Running) => SegmentKind::ModeRunning,
             StatusSegment::Connection { .. } => SegmentKind::Connection,
+            StatusSegment::Model { .. } => SegmentKind::Model,
             StatusSegment::Thinking { .. } => SegmentKind::Thinking,
             StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
             StatusSegment::Position { .. } => SegmentKind::Position,
@@ -767,6 +926,7 @@ impl StatusSegment {
             StatusSegment::Connection { base_url } => {
                 format!(" suspenders · {base_url} ").chars().count()
             }
+            StatusSegment::Model { model } => format!(" model · {model} ").chars().count(),
             // " M thinking " - the marker is one col in either state.
             StatusSegment::Thinking { .. } => " M thinking ".chars().count(),
             StatusSegment::Tokens {
@@ -791,14 +951,18 @@ pub struct StatusBar {
 
 impl StatusBar {
     /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then thinking, then tokens - mode and position survive
-    /// longest. Which segments to show at a given width is a SEMANTIC decision,
-    /// so it lives here in the pure layer; the width arithmetic reads each
-    /// segment's own [`StatusSegment::cells`]. Simple on purpose: a
-    /// partially-truncated segment would garble the powerline blocks.
+    /// connection, then model, then thinking, then tokens - mode and position
+    /// survive longest. Connection (the endpoint) drops BEFORE model: the
+    /// endpoint is a fixed, knowable fact, while the model is what the user
+    /// actively changes via `/model`, so the model earns the scarcer columns.
+    /// Which segments to show at a given width is a SEMANTIC decision, so it
+    /// lives here in the pure layer; the width arithmetic reads each segment's
+    /// own [`StatusSegment::cells`]. Simple on purpose: a partially-truncated
+    /// segment would garble the powerline blocks.
     fn fit(mut self, width: usize) -> StatusBar {
-        let drop_order: [fn(&StatusSegment) -> bool; 3] = [
+        let drop_order: [fn(&StatusSegment) -> bool; 4] = [
             |s| matches!(s, StatusSegment::Connection { .. }),
+            |s| matches!(s, StatusSegment::Model { .. }),
             |s| matches!(s, StatusSegment::Thinking { .. }),
             |s| matches!(s, StatusSegment::Tokens { .. }),
         ];
@@ -838,6 +1002,7 @@ pub fn status_bar(
     width: usize,
     status: Status,
     base_url: &str,
+    model: &str,
     thinking_expanded: bool,
     tokens: Option<(u64, u64, PressureLevel)>,
     position: String,
@@ -850,6 +1015,9 @@ pub fn status_bar(
         StatusSegment::Mode(mode),
         StatusSegment::Connection {
             base_url: base_url.to_string(),
+        },
+        StatusSegment::Model {
+            model: model.to_string(),
         },
     ];
 
@@ -879,6 +1047,9 @@ pub enum SegmentKind {
     ModeRunning,
     /// `suspenders · <base_url>` - the brand + endpoint, lowest priority.
     Connection,
+    /// `model · <id>` - the Active Model (ADR-0033), styled like the endpoint
+    /// since both are connection facts.
+    Model,
     /// The Ctrl-T thinking-expansion state (`▾`/`▸`). Always visible so the
     /// toggle has feedback even when no Thinking items are on screen.
     Thinking,
@@ -903,6 +1074,7 @@ impl StatusSegment {
             }
             StatusSegment::Mode(ModeState::Idle) => " IDLE ".to_string(),
             StatusSegment::Connection { base_url } => format!(" suspenders · {base_url} "),
+            StatusSegment::Model { model } => format!(" model · {model} "),
             StatusSegment::Thinking { expanded } => {
                 let marker = if *expanded { "▾" } else { "▸" };
                 format!(" {marker} thinking ")
@@ -929,7 +1101,7 @@ pub fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
     t: &Transcript,
-    base_url: &str,
+    conn: ConnectionView,
     spinner: u64,
     viewport: &Viewport,
     geometry: (usize, usize),
@@ -943,7 +1115,8 @@ pub fn render_status_bar(
     let bar = status_bar(
         area.width as usize,
         t.status,
-        base_url,
+        conn.base_url,
+        conn.model,
         t.thinking_expanded,
         match (t.token_estimate, t.context_budget) {
             (Some(estimate), Some(budget)) => Some((estimate, budget, t.pressure_level)),
@@ -1283,6 +1456,7 @@ mod tests {
             width,
             Status::Running,
             "http://localhost:8080",
+            "qwen/model",
             false,
             Some((1200, 32000, PressureLevel::Ok)),
             "Bot".to_string(),
@@ -1301,7 +1475,11 @@ mod tests {
         let bar = bar_at(200);
         assert_eq!(
             kinds(&bar.left),
-            vec![SegmentKind::ModeRunning, SegmentKind::Connection]
+            vec![
+                SegmentKind::ModeRunning,
+                SegmentKind::Connection,
+                SegmentKind::Model,
+            ]
         );
         assert_eq!(
             kinds(&bar.right),
@@ -1315,7 +1493,9 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_bar_drops_the_connection_segment_first() {
+    fn a_narrow_bar_drops_the_connection_then_the_model_segment() {
+        // At 60 cols the endpoint drops first (lowest value), then the model -
+        // both connection facts leave before mode/position/tokens.
         let bar = bar_at(60);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
@@ -1362,6 +1542,7 @@ mod tests {
                 200,
                 Status::Idle,
                 "http://localhost:8080",
+                "qwen/model",
                 expanded,
                 None,
                 "Bot".to_string(),
@@ -1393,6 +1574,7 @@ mod tests {
             200,
             Status::Idle,
             "http://localhost:8080",
+            "qwen/model",
             false,
             None,
             "Bot".to_string(),
@@ -1412,6 +1594,7 @@ mod tests {
             200,
             Status::Running,
             "u",
+            "qwen/model",
             false,
             Some((99000, 32000, PressureLevel::Critical)),
             "Bot".to_string(),
@@ -1443,6 +1626,7 @@ mod tests {
                 200,
                 Status::Idle,
                 "u",
+                "qwen/model",
                 false,
                 Some((1, 2, level)),
                 "Bot".to_string(),
@@ -1461,11 +1645,19 @@ mod tests {
         // The semantic distinction is Idle vs. Running; the animation frame is
         // a drawing input the assembly never sees.
         let mode = |status| {
-            status_bar(200, status, "u", false, None, "Bot".to_string())
-                .left
-                .into_iter()
-                .next()
-                .unwrap()
+            status_bar(
+                200,
+                status,
+                "u",
+                "qwen/model",
+                false,
+                None,
+                "Bot".to_string(),
+            )
+            .left
+            .into_iter()
+            .next()
+            .unwrap()
         };
         assert_eq!(mode(Status::Idle), StatusSegment::Mode(ModeState::Idle));
         assert_eq!(
@@ -1522,6 +1714,7 @@ mod tests {
             SegmentKind::ModeIdle,
             SegmentKind::ModeRunning,
             SegmentKind::Connection,
+            SegmentKind::Model,
             SegmentKind::Thinking,
             SegmentKind::Tokens(PressureLevel::Ok),
             SegmentKind::Tokens(PressureLevel::Elevated),
