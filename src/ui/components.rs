@@ -22,6 +22,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+use thousands::Separable;
+
 use crate::ui::composer::{self, ComposerLayout};
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
@@ -963,14 +965,11 @@ pub enum StatusSegment {
         /// Whether settled tool Blocks are currently expanded.
         expanded: bool,
     },
-    /// The Context Budget estimate and how close the Conversation sits to it.
     /// Carries the [`PressureLevel`] verbatim so the Critical-renders-red rule
     /// (ADR-0008) is a semantic fact the painter merely routes to a color.
     Tokens {
         /// The token estimate for the Conversation.
         estimate: u64,
-        /// The Context Budget the estimate is measured against.
-        budget: u64,
         /// How close to the budget the Conversation sits.
         level: PressureLevel,
         /// The LIVE Dead Mass share as an integer percent (from the most recent
@@ -1028,10 +1027,9 @@ impl StatusSegment {
             StatusSegment::Tools { .. } => " M tools ".chars().count(),
             StatusSegment::Tokens {
                 estimate,
-                budget,
                 dead_mass_pct,
                 ..
-            } => tokens_label(*estimate, *budget, *dead_mass_pct).chars().count(),
+            } => tokens_label(*estimate, *dead_mass_pct).chars().count(),
             StatusSegment::Position { label } => format!(" {label} ").chars().count(),
         }
     }
@@ -1039,15 +1037,17 @@ impl StatusSegment {
 
 /// The Tokens segment's display text, the ONE source both [`StatusSegment::cells`]
 /// and [`StatusSegment::paint`] draw from so their widths can never drift (the
-/// load-bearing fit invariant). `~{estimate}tok / {budget}` always; a `·
-/// {N}% dead` tail whenever a live Dead Mass share is known (the percent is
+/// load-bearing fit invariant). `~{estimate} tokens` always (grouped with
+/// thousands separators); a `· {N}% dead` tail whenever a live Dead Mass share
+/// is known (the percent is
 /// pre-rounded upstream through the single rounding rule, so no rounding happens
 /// here). The tail shows even at `Some(0)` - a live zero is the meaningful "no
 /// dead mass" fact, not an absence.
-fn tokens_label(estimate: u64, budget: u64, dead_mass_pct: Option<u64>) -> String {
+fn tokens_label(estimate: u64, dead_mass_pct: Option<u64>) -> String {
+    let estimate = estimate.separate_with_commas();
     match dead_mass_pct {
-        Some(pct) => format!(" ~{estimate}tok / {budget} · {pct}% dead "),
-        None => format!(" ~{estimate}tok / {budget} "),
+        Some(pct) => format!(" ~{estimate} tokens · {pct}% dead "),
+        None => format!(" ~{estimate} tokens "),
     }
 }
 
@@ -1107,25 +1107,24 @@ impl StatusBar {
     }
 }
 
-/// The token facts the status bar's Tokens segment needs: the `estimate` and
-/// `budget` it draws, the [`PressureLevel`] that colors it, and the live
+/// The token facts the status bar's Tokens segment needs: the `estimate` it
+/// draws, the [`PressureLevel`] that colors it, and the live
 /// `dead_mass_pct` (an integer percent, pre-rounded through the single rounding
 /// rule) from the most recent ContextPressure (`None` before any pressure
-/// event). A named struct rather than a 4-tuple so the extra Dead Mass fact
+/// event). A named struct rather than a tuple so the extra Dead Mass fact
 /// rides in cleanly and the `status_bar` arg COUNT stays at 8 (no 9th arg - the
 /// Stage 3 review's binding precondition against growing the already-suppressed
 /// signature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenView {
     pub estimate: u64,
-    pub budget: u64,
     pub level: PressureLevel,
     pub dead_mass_pct: Option<u64>,
 }
 
 /// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
 /// ordered semantic segments the bar conveys, fitted to `width`. `tokens` is
-/// `None` when no Context Budget estimate exists yet. No colors, glyphs, or
+/// `None` when no token estimate exists yet. No colors, glyphs, or
 /// label strings are decided here - that is the painter's job
 /// ([`render_status_bar`]) - so every rule this expresses (segment order, the
 /// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
@@ -1171,14 +1170,12 @@ pub fn status_bar(
     ];
     if let Some(TokenView {
         estimate,
-        budget,
         level,
         dead_mass_pct,
     }) = tokens
     {
         right.push(StatusSegment::Tokens {
             estimate,
-            budget,
             level,
             dead_mass_pct,
         });
@@ -1209,7 +1206,7 @@ pub enum SegmentKind {
     /// toggle has feedback even when no Blocks are on screen - the twin of
     /// `Thinking`.
     Tools,
-    /// The `~Ntok / budget` estimate, colored by its [`PressureLevel`].
+    /// The `~N tokens` estimate, colored by its [`PressureLevel`].
     Tokens(PressureLevel),
     /// The viewport scroll position (`Bot`/`Top`/`NN%`) - the bold accent.
     Position,
@@ -1219,7 +1216,7 @@ impl StatusSegment {
     /// Paints this segment into its display text (padding included). The ONLY
     /// place the drawing details live: the spinner glyph (chosen from the
     /// adapter's animation `spinner` tick), the `▾`/`▸` Thinking marker, the
-    /// `~Ntok / budget` label, and the block padding. Semantics-in,
+    /// `~N tokens` label, and the block padding. Semantics-in,
     /// terminal-text-out - the seam ADR-0019 wants.
     fn paint(&self, spinner: u64) -> String {
         match self {
@@ -1241,10 +1238,9 @@ impl StatusSegment {
             }
             StatusSegment::Tokens {
                 estimate,
-                budget,
                 dead_mass_pct,
                 ..
-            } => tokens_label(*estimate, *budget, *dead_mass_pct),
+            } => tokens_label(*estimate, *dead_mass_pct),
             StatusSegment::Position { label } => format!(" {label} "),
         }
     }
@@ -1282,15 +1278,11 @@ pub fn render_status_bar(
         conn.model,
         t.thinking_expanded,
         t.tools_expanded,
-        match (t.token_estimate, t.context_budget) {
-            (Some(estimate), Some(budget)) => Some(TokenView {
-                estimate,
-                budget,
-                level: t.pressure_level,
-                dead_mass_pct: t.dead_mass_pct,
-            }),
-            _ => None,
-        },
+        t.token_estimate.map(|estimate| TokenView {
+            estimate,
+            level: t.pressure_level,
+            dead_mass_pct: t.dead_mass_pct,
+        }),
         position,
     );
 
@@ -1663,7 +1655,6 @@ mod tests {
             false,
             Some(TokenView {
                 estimate: 1200,
-                budget: 32000,
                 level: PressureLevel::Ok,
                 dead_mass_pct: None,
             }),
@@ -1852,7 +1843,6 @@ mod tests {
             false,
             Some(TokenView {
                 estimate: 99000,
-                budget: 32000,
                 level: PressureLevel::Critical,
                 dead_mass_pct: None,
             }),
@@ -1867,7 +1857,6 @@ mod tests {
             *tokens,
             StatusSegment::Tokens {
                 estimate: 99000,
-                budget: 32000,
                 level: PressureLevel::Critical,
                 dead_mass_pct: None,
             }
@@ -1891,7 +1880,6 @@ mod tests {
                 false,
                 Some(TokenView {
                     estimate: 1,
-                    budget: 2,
                     level,
                     dead_mass_pct: None,
                 }),
@@ -1946,16 +1934,15 @@ mod tests {
     }
 
     #[test]
-    fn the_tokens_segment_paints_the_estimate_and_budget() {
+    fn the_tokens_segment_paints_the_estimate_grouped() {
         assert_eq!(
             StatusSegment::Tokens {
                 estimate: 1200,
-                budget: 32000,
                 level: PressureLevel::Ok,
                 dead_mass_pct: None,
             }
             .paint(0),
-            " ~1200tok / 32000 "
+            " ~1,200 tokens "
         );
     }
 
@@ -1966,27 +1953,24 @@ mod tests {
         // the old form. A live `Some(0)` is meaningful - it shows the tail.
         let with_dead = StatusSegment::Tokens {
             estimate: 1200,
-            budget: 32000,
             level: PressureLevel::Ok,
             dead_mass_pct: Some(12),
         };
-        assert_eq!(with_dead.paint(0), " ~1200tok / 32000 · 12% dead ");
+        assert_eq!(with_dead.paint(0), " ~1,200 tokens · 12% dead ");
 
         let zero = StatusSegment::Tokens {
             estimate: 1200,
-            budget: 32000,
             level: PressureLevel::Ok,
             dead_mass_pct: Some(0),
         };
-        assert_eq!(zero.paint(0), " ~1200tok / 32000 · 0% dead ");
+        assert_eq!(zero.paint(0), " ~1,200 tokens · 0% dead ");
 
         let without = StatusSegment::Tokens {
             estimate: 1200,
-            budget: 32000,
             level: PressureLevel::Ok,
             dead_mass_pct: None,
         };
-        assert_eq!(without.paint(0), " ~1200tok / 32000 ");
+        assert_eq!(without.paint(0), " ~1,200 tokens ");
     }
 
     #[test]
@@ -1996,7 +1980,6 @@ mod tests {
         for dead_mass_pct in [None, Some(0), Some(12)] {
             let seg = StatusSegment::Tokens {
                 estimate: 1200,
-                budget: 32000,
                 level: PressureLevel::Ok,
                 dead_mass_pct,
             };
