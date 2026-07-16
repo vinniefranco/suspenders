@@ -1,18 +1,18 @@
-//! The explore Governor: consecutive Passes spent hand-exploring inline —
-//! reading files or shelling out to search — instead of dispatching a Scout
+//! The explore Governor: consecutive Passes spent hand-exploring inline -
+//! reading files or shelling out to search - instead of dispatching a Scout
 //! draw the Explore Nudge (CONTEXT.md: Governor, Nudge, Scout; ADR-0026).
 //!
 //! * **Trigger**: `streak`, the private count of consecutive Passes whose
-//!   Tool Calls were ALL exploration — read-only Tools or a search-shaped
+//!   Tool Calls were ALL exploration - read-only Tools or a search-shaped
 //!   run_command ([`search_command`]). A Pass extends the streak only when it
 //!   made at least one Tool Call and every one was exploration; any other
 //!   Tool Call, or a Pass with no Tool Calls, resets it. The Pass's carried
 //!   calls are a Ledger fact; the streak over them is this Governor's own.
 //! * **Interventions**: rides the results tail at the answering moment
-//!   ([`Explore::note_pass_calls`]) — the Explore Nudge merges into the
+//!   ([`Explore::note_pass_calls`]) - the Explore Nudge merges into the
 //!   trailing tool-results user message, where a small model actually
 //!   attends.
-//! * **Setpoints**: [`Setpoints`] — the firing cadence (every Nth consecutive
+//! * **Setpoints**: [`Setpoints`] - the firing cadence (every Nth consecutive
 //!   exploration Pass; firing resets the streak so each fire starts a fresh
 //!   window). Not user-exposed: resolution at launch is the [`Default`],
 //!   because a Setpoint becomes user-configurable only when a real model has

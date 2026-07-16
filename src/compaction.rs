@@ -1,16 +1,16 @@
-//! Compaction — summarising history to fit the context window (ADR-0012).
+//! Compaction - summarising history to fit the context window (ADR-0012).
 //!
 //! ## What compaction is
 //!
 //! When the Conversation's token estimate approaches the Context Budget, old
 //! Turns are summarized by the LLM and replaced with a structured markdown
 //! summary. Unlike Eviction (which mechanically hollows out Tool Results),
-//! compaction is semantic — it extracts what was accomplished, what decisions
+//! compaction is semantic - it extracts what was accomplished, what decisions
 //! were made, and what files were touched.
 //!
 //! ## An effect, not part of the pure loop
 //!
-//! [`Compaction::run`] calls the [`Llm`] boundary directly — it is an effect,
+//! [`Compaction::run`] calls the [`Llm`] boundary directly - it is an effect,
 //! invoked via the Turn's `compact` Dep in production (ADR-0012), NOT inside
 //! the pure loop. It uses the Conversation's PURE helpers
 //! ([`Conversation::prepare_compaction`], [`Conversation::apply_compaction`],
@@ -96,7 +96,7 @@ impl Compaction {
             Some(prepared) => prepared,
         };
 
-        // Captured once, then carried in the struct across compactions — after
+        // Captured once, then carried in the struct across compactions - after
         // the first compaction the head of the Conversation is a summary
         // message, so only the carried value preserves it.
         let merged_ops = merge_ops(&self.file_ops, &new_ops);
@@ -121,14 +121,14 @@ impl Compaction {
         Ok((compacted, new_state))
     }
 
-    /// Seeds a Handoff (CONTEXT.md: Handoff — the Recovery Turn shape that
+    /// Seeds a Handoff (CONTEXT.md: Handoff - the Recovery Turn shape that
     /// retires the Conversation): the model narrative over the WHOLE dying
     /// Conversation, the mechanical facts appended outside the LLM exactly as
     /// Compaction does, the verification result verbatim, and `prompt` merged
     /// onto the seed message so it starts the fresh Conversation.
     ///
     /// The verification result is the Dangling Failure's OWN output when
-    /// `failing_command` is `Some` (the command the recovery prompt names —
+    /// `failing_command` is `Some` (the command the recovery prompt names -
     /// CONTEXT.md: Handoff, ADR-0028 addendum 2026-07-14), so a red suite
     /// followed by a green filtered rerun still hands over the red result the
     /// prompt is about, not the last (green) command. It is the last
@@ -136,7 +136,7 @@ impl Compaction {
     /// no command dangles).
     ///
     /// Never fails: a failed summarization degrades to the mechanical
-    /// skeleton alone (facts + verification + prompt) — bounded
+    /// skeleton alone (facts + verification + prompt) - bounded
     /// downside, the recovery still happens. The Plan is harness-owned and
     /// never enters the seed; it survives verbatim outside the Conversation.
     pub async fn seed_handoff(
@@ -170,7 +170,7 @@ impl Compaction {
             verification.as_deref(),
         );
         // Retire every message; the seed message replaces them all, and the
-        // recovery prompt merges onto it (one user message — strict chat
+        // recovery prompt merges onto it (one user message - strict chat
         // templates on small models choke on two user messages in a row).
         let mut conversation = conv.apply_compaction(&seed, conv.messages.len());
         conversation.merge_user_text(prompt);
@@ -232,7 +232,7 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
     }
 
     /// Convenience wrapper for use as a Turn `compact` Dep capture: runs and
-    /// drops the new state — the caller fires the state update separately.
+    /// drops the new state - the caller fires the state update separately.
     /// Returns `Ok(conversation)` or `Err(reason)`.
     pub async fn recovery_capture(
         &self,
@@ -279,7 +279,7 @@ impl Default for Compaction {
 /// A seeded Handoff (CONTEXT.md: Handoff): the fresh Conversation (seed
 /// message + recovery prompt, everything else retired), the updated
 /// compaction state the recovery Turn carries forward, and the two facts the
-/// Session Log entry needs beyond the state — the narrative actually used
+/// Session Log entry needs beyond the state - the narrative actually used
 /// (`None` when degraded) and the final verification result verbatim.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Handoff {
@@ -713,7 +713,7 @@ mod tests {
     async fn seed_handoff_carries_the_failing_commands_own_result_not_the_last() {
         // The exact contradiction from session 20260714-174034: a red full
         // suite, then a green filtered rerun (a DIFFERENT command). The last
-        // command is green, but the recovery prompt names the red one — so the
+        // command is green, but the recovery prompt names the red one - so the
         // seed must carry the RED result, threaded by `failing_command`.
         let fake = FakeLlm::script(vec![Entry::just(ok_response("narrative"))]);
         let mut conv = Conversation::new("You are Baud.", opts());

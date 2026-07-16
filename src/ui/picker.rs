@@ -1,4 +1,4 @@
-//! Session Picker — the PURE selection core behind bare `--resume` (ADR-0001's
+//! Session Picker - the PURE selection core behind bare `--resume` (ADR-0001's
 //! TEA shape, ADR-0019: no ratatui/crossterm here). The adapter
 //! ([`crate::ui::pick_session`]) owns the terminal, maps crossterm input to the
 //! shared [`Key`] vocabulary, and renders; every selection rule lives here,

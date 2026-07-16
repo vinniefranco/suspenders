@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# drive.sh FIXTURE TAG [N] — N headless runs of /tmp/FIXTURE, artifacts in /tmp/fixture-logs/TAG-runN/
+# drive.sh FIXTURE TAG [N] - N headless runs of /tmp/FIXTURE, artifacts in /tmp/fixture-logs/TAG-runN/
 # Arm config via env: SUSPENDERS_RECOVERY_LIMIT, SUSPENDERS_RECOVERY_SHAPE, etc.
 set -u
 FIXTURE=$1; TAG=$2; N=${3:-5}

@@ -3,9 +3,9 @@
 //! `Baud.Turn.Nudges.FailureCategory`).
 //!
 //! Placement judgment (ADR-0026 Step 3): the category is a FACT about the
-//! error — a deterministic classification of the result content, written once
+//! error - a deterministic classification of the result content, written once
 //! at the firing site and never tuned (no setpoints; correct or incorrect,
-//! like the Ledger itself) — so the classifier lives with the Ledger, not
+//! like the Ledger itself) - so the classifier lives with the Ledger, not
 //! with the failure Governor that JUDGES the tallies. The Governor reads
 //! counts and recency; the categories ride the streak as recorded facts.
 //!

@@ -1,11 +1,11 @@
-//! The `/model` Slash Command — its POLICY pure and tested, its I/O in the thin
+//! The `/model` Slash Command - its POLICY pure and tested, its I/O in the thin
 //! adapter (ADR-0033, ADR-0001's pure-core/adapter split).
 //!
 //! `/model` lists the models the server offers, lets the user pick one, swaps
 //! the Active Model live this Session, and persists the choice sticky for the
-//! next launch. The DECISIONS — re-selecting the current model is a no-op, an
+//! next launch. The DECISIONS - re-selecting the current model is a no-op, an
 //! `SUSPENDERS_MODEL` env value shadows the sticky write, a persist failure is
-//! surfaced but the live swap still stands — sit with the impure orchestration
+//! surfaced but the live swap still stands - sit with the impure orchestration
 //! ([`run`], [`choose`]) that does the env read, the `agent.set_model`/
 //! `persist_model` I/O, and the off-loop network fetch; the one pure part
 //! ([`applied_line`]) only formats. The generic command router that routes a
@@ -19,9 +19,9 @@ use crate::ui::selector::SelectorRow;
 use super::transcript::Transcript;
 
 /// The Transcript info line an applied `/model` pick emits (ADR-0033). Pure
-/// message construction over the two facts the impure orchestration gathered —
+/// message construction over the two facts the impure orchestration gathered -
 /// whether `SUSPENDERS_MODEL` shadows the sticky file, and how the persist
-/// went — so the "env-shadow warning" and "persist-failure note" rules are
+/// went - so the "env-shadow warning" and "persist-failure note" rules are
 /// unit-testable without touching the filesystem or the environment:
 /// - a persist error surfaces (the live swap still stands): `model → {chosen}
 ///   (not saved: {e})`
@@ -58,8 +58,8 @@ fn model_rows(ids: Vec<String>, current: &str) -> Vec<SelectorRow> {
 /// call): the endpoint is the Session's fixed `base_url`, a fixed fact, so there
 /// is nothing to cache-invalidate and a live list is what a server whose model
 /// set changed would show. The fetch spawns a task that awaits
-/// `agent.list_models()` OFF the select loop (ADR-0011) — on success it posts
-/// SelectorReady, on failure SelectorFailed — through `ctx.selector_tx`; the
+/// `agent.list_models()` OFF the select loop (ADR-0011) - on success it posts
+/// SelectorReady, on failure SelectorFailed - through `ctx.selector_tx`; the
 /// injected event arrives at the loop's `selector_rx` arm and flips the Loading
 /// overlay. The overlay stays Loading until it arrives.
 pub(super) async fn run(transcript: Transcript, ctx: &AdapterCtx<'_>) -> Transcript {
@@ -77,9 +77,9 @@ pub(super) async fn run(transcript: Transcript, ctx: &AdapterCtx<'_>) -> Transcr
 }
 
 /// Interprets a `/model` pick (ADR-0033). Re-selecting the current model is a
-/// no-op — return the Transcript untouched, no side effects. Otherwise this
-/// impure part does the I/O — swap the Active Model live, persist it by the
-/// sparse config write, read `SUSPENDERS_MODEL` — then hands those facts to the
+/// no-op - return the Transcript untouched, no side effects. Otherwise this
+/// impure part does the I/O - swap the Active Model live, persist it by the
+/// sparse config write, read `SUSPENDERS_MODEL` - then hands those facts to the
 /// pure [`applied_line`] for the info line. A persist failure is surfaced but
 /// the live swap still stands.
 pub(super) async fn choose(
@@ -88,7 +88,7 @@ pub(super) async fn choose(
     value: String,
 ) -> Transcript {
     // Re-selecting the current model changes nothing (no swap, no write, no
-    // warning — ADR-0033).
+    // warning - ADR-0033).
     if value == ctx.agent.active_model().await {
         return transcript;
     }

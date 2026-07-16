@@ -1,4 +1,4 @@
-//! Turn Deps — the static-dispatch dependency bundle for a Turn (ADR-0011).
+//! Turn Deps - the static-dispatch dependency bundle for a Turn (ADR-0011).
 //!
 //! Every effect the Turn loop performs, as trait methods (baud's `Baud.Turn.Deps`
 //! function captures). The shell builds a `TurnDeps` wiring these to Agent
@@ -8,7 +8,7 @@
 //! These are infrastructure, NOT Plugins: control-bearing and NOT fail-open
 //! (ADR-0011). A `TurnDeps` method that panics or returns an error fails the
 //! Turn honestly. Plugins remain the fail-open, tool-scoped unit of extension
-//! (ADR-0007) — that isolation lives in `crate::plugins`, not here.
+//! (ADR-0007) - that isolation lives in `crate::plugins`, not here.
 //!
 //! ## Static dispatch, no `async_trait`
 //!
@@ -17,7 +17,7 @@
 //! `drain_steering`, `compact`) return concrete futures via
 //! `impl Future` in return position (edition 2024 RPITIT), so no boxing and no
 //! `async_trait`. The fire-and-forget effects (`checkpoint`, `set_plan`) are
-//! synchronous — the Loop never awaits them.
+//! synchronous - the Loop never awaits them.
 //!
 //! Event emission is NOT a trait method: it is the owned [`Emitter`] handle
 //! [`TurnDeps::emitter`] hands out (ADR-0025), so the streaming sink can emit
@@ -33,7 +33,7 @@ use crate::llm::stream::StreamEvent;
 
 /// The detached emission handle (ADR-0025): an owned sink for turn [`Event`]s,
 /// obtained once from [`TurnDeps::emitter`] and carried by the Loop alongside
-/// the deps. Because it is a separate owned value — not a method on the deps —
+/// the deps. Because it is a separate owned value - not a method on the deps -
 /// the streaming sink inside `complete_and_emit` can emit MessageUpdates LIVE
 /// while `complete` holds the exclusive `&mut D` borrow.
 ///
@@ -60,7 +60,7 @@ pub enum AfterPass {
     /// Keep looping.
     Continue,
     /// Close the Turn with the stopped marker and this stop reason (an arbitrary
-    /// atom in baud — carried here as a string, e.g. `"budget_hook"`).
+    /// atom in baud - carried here as a string, e.g. `"budget_hook"`).
     Stop(String),
     /// Merge this text into the trailing tool-results user message and loop.
     Inject(String),
@@ -79,12 +79,12 @@ pub struct CompactError(pub String);
 /// [`TurnDeps::emitter`] hands out (ADR-0025).
 ///
 /// `complete` receives the fully-built [`LlmRequest`] (system, messages, tools,
-/// no_think) — the shell renders it to wire JSON and calls the LLM boundary,
+/// no_think) - the shell renders it to wire JSON and calls the LLM boundary,
 /// forwarding each streaming `StreamEvent` to `on_event`.
 pub trait TurnDeps: Send {
     /// Calls the model with the built request, forwarding every streaming delta
     /// snapshot to `on_event`, and yields the [`Response`] (the error algebra
-    /// means this never "fails" — a failure is a `Response` with an `Error`
+    /// means this never "fails" - a failure is a `Response` with an `Error`
     /// stop reason).
     fn complete(
         &mut self,
@@ -131,7 +131,7 @@ pub trait TurnDeps: Send {
     }
 
     /// Compacts the Conversation. Default: a no-op that reports no compactor
-    /// (ADR-0012 — the real compaction effect is a later phase). A successful
+    /// (ADR-0012 - the real compaction effect is a later phase). A successful
     /// compaction returns the rewritten Conversation; an error falls through to
     /// the budget-exhaustion path.
     fn compact(

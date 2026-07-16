@@ -9,7 +9,7 @@ Slash Command (ADR-0032).
 ## Decision
 
 **List via the boundary, live on every open.** Committing `/model` lists
-models from `GET {base_url}/models` (ADR-0002 amendment) — a fresh fetch each
+models from `GET {base_url}/models` (ADR-0002 amendment) - a fresh fetch each
 time the selector opens, off the event loop so the UI never blocks (ADR-0011),
 with a `Loading` state until the reply lands. No cache: it is a localhost call,
 and the server's live answer is always the truth. We deliberately did **not**
@@ -31,12 +31,12 @@ with. No mid-stream swap, no synchronization.
 reserve, and the budget invariants all derive from `max_tokens` and
 `context_budget`, never the model name. So swapping the identifier alone needs
 **no re-validation**. The price: switching to a model with a smaller context
-window than the configured budget does **not** auto-shrink anything — that stays
+window than the configured budget does **not** auto-shrink anything - that stays
 the user's call via config/env.
 
 **Sticky, via a sparse write.** A selection persists by a read-modify-write of
 `config.json`: parse the existing file (or start empty), set only `model`, write
-it back — never touching the user's other keys and never introducing `token`.
+it back - never touching the user's other keys and never introducing `token`.
 The file is **created if absent**: this is the one sanctioned exception to
 ADR-0031's no-auto-create, because an explicit `/model` pick is a deliberate act
 (the spirit of `--write-config`), not launch fabricating a file. When
@@ -44,29 +44,29 @@ ADR-0031's no-auto-create, because an explicit `/model` pick is a deliberate act
 precedence), so the write is accompanied by a Transcript warning that next
 launch will override it; the live swap still applies this Session.
 
-Re-selecting the current model is a no-op — no swap, no write, no warning.
+Re-selecting the current model is a no-op - no swap, no write, no warning.
 
 ## Considered options
 
-- **pi's configured registry** (hand-authored `models.json`) — rejected: earns
+- **pi's configured registry** (hand-authored `models.json`) - rejected: earns
   its keep across many cloud providers with per-provider auth; pure overhead for
   one local server, and it collides with ADR-0031's locked config schema.
-- **Rebuild the whole `Arc<Session>` on change** — rejected: heavier, re-runs
+- **Rebuild the whole `Arc<Session>` on change** - rejected: heavier, re-runs
   full validation, and breaks "fixed facts resolved once at launch." A mutable
   Active Model beside the fixed facts is the smaller, honest change.
-- **Swap the whole Connection (incl. `max_tokens`)** — rejected: `max_tokens`
+- **Swap the whole Connection (incl. `max_tokens`)** - rejected: `max_tokens`
   feeds `result_cap` and the budget invariants, so changing it would force
   re-derivation and re-validation mid-Session. Swapping only the identifier keeps
   the change cheap and total.
 - **An endpoint-pinned cache of the model list** (`{ endpoint, ids }` under
-  `$XDG_CACHE_HOME`, invalidated when `base_url` changes) — built, then dropped
+  `$XDG_CACHE_HOME`, invalidated when `base_url` changes) - built, then dropped
   on review. `base_url` is a *fixed* Session fact, so the endpoint-switch
   invalidation can never fire mid-Session (it is dead code), and with no refresh
   affordance the cache goes stale across Sessions whenever the server's model set
-  changes — the exact local-server workflow this feature serves. It guarded only
+  changes - the exact local-server workflow this feature serves. It guarded only
   a ~50ms localhost call. The correct version, if instant cross-Session paint is
   ever wanted, is stale-while-revalidate (show cached rows, always re-fetch,
-  reconcile with a request-generation token) — a deliberate future add, not a
+  reconcile with a request-generation token) - a deliberate future add, not a
   bare cache.
 
 ## Consequences
@@ -82,5 +82,5 @@ Re-selecting the current model is a no-op — no swap, no write, no warning.
   keeping decisions out of the untested adapter. A registry-coverage test asserts
   every `slash::COMMANDS` entry has an adapter handler, so adding a command
   without wiring it fails loudly.
-- The Active Model shows in the status bar beside the endpoint — the mutable
+- The Active Model shows in the status bar beside the endpoint - the mutable
   connection fact is surfaced, not just the fixed one.

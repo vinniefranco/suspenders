@@ -1,4 +1,4 @@
-//! Governor — the per-moment arbiter over the closed Intervention set
+//! Governor - the per-moment arbiter over the closed Intervention set
 //! (CONTEXT.md: Governor, Intervention; ADR-0026).
 //!
 //! A Governor is a tunable rule that watches the Pass cycle and intervenes to
@@ -7,7 +7,7 @@
 //! as a user message, ride the results tail, narrow the offered Tools, silence
 //! Thinking for a Pass, close the Turn on a marker, or close the Turn and open
 //! a Recovery Turn. The set is deliberately closed: a new Governor is routine,
-//! a new KIND of Intervention is a visible design decision (ADR-0026 — do not
+//! a new KIND of Intervention is a visible design decision (ADR-0026 - do not
 //! generalize these enums away; the eighth variant, the Endgame Governor's
 //! close-and-recover, deliberately touched the firing sites).
 //!
@@ -16,31 +16,31 @@
 //! (CONTEXT.md). The moments are three distinct types, so an Intervention
 //! cannot fire at the wrong moment by construction:
 //!
-//!   * **shaping the request** — [`RequestIntervention`], consulted once per
+//!   * **shaping the request** - [`RequestIntervention`], consulted once per
 //!     Pass by [`shape_request`] as the request is built;
-//!   * **answering a Tool Call** — [`AnswerIntervention`]. One moment, three
+//!   * **answering a Tool Call** - [`AnswerIntervention`]. One moment, three
 //!     consultation points: [`answer_sent`] before a call executes (Governors
-//!     judge what the model SENT — CONTEXT.md), [`answer_read`] after it
+//!     judge what the model SENT - CONTEXT.md), [`answer_read`] after it
 //!     executes (what the model will READ), and [`answer_tail`] once per batch
-//!     for the results tail — the same user message, so still this moment;
-//!   * **settling a finish** — [`FinishIntervention`]. One moment, two
+//!     for the results tail - the same user message, so still this moment;
+//!   * **settling a finish** - [`FinishIntervention`]. One moment, two
 //!     consultation points, because a Turn finishes two ways:
 //!     [`settle_capped`] after a tool-answering Pass at the Turn Limit, and
 //!     [`settle_finish`] when the model stops calling tools.
 //!
 //! Facts live in the Turn [`Ledger`](ledger) ("The Ledger holds facts, never
-//! opinions or setpoints" — CONTEXT.md), written once by the loop at the
+//! opinions or setpoints" - CONTEXT.md), written once by the loop at the
 //! firing sites and READ here. Each Governor lives in its own child module
-//! (ADR-0022: modules mirror the domain tree) — [`duplicate`], [`failure`],
-//! [`explore`], [`verify`], [`empty`], [`anchor`], [`endgame`] — owning its
+//! (ADR-0022: modules mirror the domain tree) - [`duplicate`], [`failure`],
+//! [`explore`], [`verify`], [`empty`], [`anchor`], [`endgame`] - owning its
 //! private trigger state, its opinion predicates, and its Setpoints
 //! (declared with defaults; the Session's resolved knobs feed the Governors
 //! that carry them). The loop threads their state as one [`Governors`]
-//! value, and no Governor reads a sibling's state — cross-cutting needs go
+//! value, and no Governor reads a sibling's state - cross-cutting needs go
 //! through the Ledger (CONTEXT.md). What lives HERE is precedence: each
 //! entry point is the one readable function where its moment's order is
-//! decided. The firing sites (`loop_`, `batch`, `finish`) keep every effect —
-//! building requests, executing tools, appending messages — and decide
+//! decided. The firing sites (`loop_`, `batch`, `finish`) keep every effect -
+//! building requests, executing tools, appending messages - and decide
 //! nothing heuristic inline.
 
 pub mod anchor;
@@ -75,7 +75,7 @@ pub enum RequestIntervention {
     SilenceThinking,
 }
 
-/// What rides the results tail — the payload of
+/// What rides the results tail - the payload of
 /// [`AnswerIntervention::RideTail`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rider {
@@ -85,8 +85,8 @@ pub enum Rider {
     Voiced { tag: VoicedTag, text: String },
     /// The Anchor (CONTEXT.md): its placement rides the same seam
     /// ([`Conversation::inject_anchor`](crate::conversation::Conversation::inject_anchor)
-    /// merges into the trailing user message), but its content is the Plan's —
-    /// the model's voice, never authored here — so the Plan text never rides
+    /// merges into the trailing user message), but its content is the Plan's -
+    /// the model's voice, never authored here - so the Plan text never rides
     /// with the Intervention. The one exception is `stale_line`: the anchor
     /// Governor's Voiced stale-plan line, appended BELOW the Anchor when the
     /// Plan has sat unchanged past its Setpoint while writes landed
@@ -102,7 +102,7 @@ pub enum AnswerIntervention {
     /// this content instead (identical Tool Call repeated). It reads as an
     /// error so the model re-plans rather than trusting a stale echo.
     ReplaceResult { content: String, is_error: bool },
-    /// Annotate the Tool Result: the model reads this content — the real
+    /// Annotate the Tool Result: the model reads this content - the real
     /// result carrying the consecutive-failure step-back suffix.
     AnnotateResult(String),
     /// Ride the results tail: merge into the trailing tool-results user
@@ -111,7 +111,7 @@ pub enum AnswerIntervention {
 }
 
 /// The Governors' private trigger state and resolved Setpoints, threaded
-/// through the Turn loop as one value beside the [`Ledger`] — one field per
+/// through the Turn loop as one value beside the [`Ledger`] - one field per
 /// Governor that carries state or a Session-fed Setpoint ([`failure`] and
 /// [`endgame`] carry neither: they are pure reads over the Ledger), each
 /// field's internals opaque outside its own module, so no Governor reads a
@@ -133,7 +133,7 @@ impl Governors {
     /// defaults, and the Session's resolved knobs feed the Governors that
     /// carry them (`anchor_interval` and `plan_stale_after` feed the anchor
     /// Governor, `no_think_rescue` the empty Governor, and
-    /// [`with_recovery`](Governors::with_recovery) the endgame Governor —
+    /// [`with_recovery`](Governors::with_recovery) the endgame Governor -
     /// CONTEXT.md: "the Session resolves them once at launch").
     pub fn new(anchor_interval: u64, plan_stale_after: u64, no_think_rescue: bool) -> Self {
         Governors {
@@ -184,14 +184,14 @@ pub enum FinishIntervention {
         reason: log::StopReason,
         recovery: endgame::Recovery,
         /// Whether the model's reply enters the Conversation before the
-        /// close. True on the final-Pass text settle — the reply is the
+        /// close. True on the final-Pass text settle - the reply is the
         /// model's genuine wrap-up (the tools were withdrawn, ADR-0015), so
         /// Handoff compaction-seeding and Continuation both read it. False
         /// at the tool-answering cap and on the tool-insistent close, where
         /// the turn-limit marker stands in for the reply.
         keep_reply: bool,
     },
-    /// Stand alone as a user message — a finish Nudge; the model gets one
+    /// Stand alone as a user message - a finish Nudge; the model gets one
     /// more Pass to act on it.
     Standalone { tag: VoicedTag, text: String },
 }
@@ -207,12 +207,12 @@ pub enum FinishIntervention {
 ///
 /// Borrows the empty Governor's rescue state mutably: consulting this moment
 /// consumes the one-Pass rescue arm, so the Pass after a rescued one reverts
-/// — unless the rescue has gone sticky (second empty of the Turn).
+/// - unless the rescue has gone sticky (second empty of the Turn).
 pub fn shape_request(ledger: &Ledger, governors: &mut Governors) -> Vec<RequestIntervention> {
     let mut interventions = Vec::new();
 
     // The Endgame Governor's narrowing (ADR-0015/0016), answered directly:
-    // outside the schedule it is `None` and no Intervention issues — the
+    // outside the schedule it is `None` and no Intervention issues - the
     // firing site's full registry rides.
     if let Some(tools) = endgame::narrowed_tools(ledger.pass(), ledger.turn_limit(), ledger) {
         interventions.push(RequestIntervention::NarrowTools(tools));
@@ -243,7 +243,7 @@ pub fn answer_sent(governors: &Governors, name: &str, input: &Value) -> Option<A
 
 /// The Tool Call answering moment, after a call executes (or was replaced):
 /// judge what the model will READ. The outcome's facts are already on the
-/// Ledger — the firing site records them ([`Ledger::record_result`]) before
+/// Ledger - the firing site records them ([`Ledger::record_result`]) before
 /// consulting, replaced results included. This consultation folds the outcome
 /// into the duplicate Governor's fresh-set trigger state and, from the third
 /// consecutive failure of one Tool onward, annotates the result with the
@@ -263,18 +263,18 @@ pub fn answer_read(
 }
 
 /// The Tool Call answering moment, once per batch: what rides the results
-/// tail — the trailing tool-results user message the model reads next. The
+/// tail - the trailing tool-results user message the model reads next. The
 /// Pass's carried calls and position are Ledger facts. Precedence within this
 /// consultation is the merge ORDER (every due rider rides; none subsumes
 /// another):
 ///
-///   1. the Explore Nudge — every 3rd consecutive exploration Pass,
-///   2. the Anchor — every `anchor_interval` Passes, and the first Pass after
+///   1. the Explore Nudge - every 3rd consecutive exploration Pass,
+///   2. the Anchor - every `anchor_interval` Passes, and the first Pass after
 ///      a Compaction (the anchor Governor's cadence), carrying the Voiced
 ///      stale-plan line whenever the anchor Governor's stale-plan opinion
 ///      holds ([`anchor::Anchor::stale_plan`]),
 ///   3. the Endgame's rider (wrap-up warning / Verification Pass prompt /
-///      final-Pass prompt) — last, nearest the model's attention.
+///      final-Pass prompt) - last, nearest the model's attention.
 pub fn answer_tail(ledger: &Ledger, governors: &mut Governors) -> Vec<AnswerIntervention> {
     let mut interventions = Vec::new();
 
@@ -303,8 +303,8 @@ pub fn answer_tail(ledger: &Ledger, governors: &mut Governors) -> Vec<AnswerInte
 /// The finish-settlement moment, consulted after a tool-answering Pass: at
 /// the Turn Limit the Turn closes on the marker even though the model is
 /// still asking for Tools (CONTEXT.md: a Turn ends at its Turn Limit). The
-/// close is plain, or — when the Ledger says the work is demonstrably
-/// unfinished and the endgame Governor's recovery budget allows — the
+/// close is plain, or - when the Ledger says the work is demonstrably
+/// unfinished and the endgame Governor's recovery budget allows - the
 /// close-and-open-a-Recovery-Turn Intervention; the stop reason distinguishes
 /// a stuck Turn from a productive one either way.
 pub fn settle_capped(ledger: &Ledger, governors: &Governors) -> Option<FinishIntervention> {
@@ -330,32 +330,32 @@ fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
 }
 
 /// The finish-settlement moment, consulted when the model stops calling
-/// tools. `stop_reason` is the CLOSED reason — a phantom tool_use already
+/// tools. `stop_reason` is the CLOSED reason - a phantom tool_use already
 /// mapped to end_turn by the firing site. One consultation, one explicit
 /// precedence:
 ///
 ///   1. the final-Pass tool-insistence Close (ADR-0015): a reply that still
 ///      insists on tools as serialized markup closes on the turn-limit marker
-///      — it outranks every Nudge because no Pass is left to grant; it is a
+///      - it outranks every Nudge because no Pass is left to grant; it is a
 ///      Turn-Limit close, so the endgame Governor's recovery judgment applies
 ///      exactly as at [`settle_capped`];
 ///   2. the final-Pass text-settle recovery (ADR-0028 addendum): ADR-0015
 ///      withdraws every tool on the final Pass, so a capped Turn nearly
-///      always ends here — a plain reply, end_turn — and the recovery
+///      always ends here - a plain reply, end_turn - and the recovery
 ///      judgment applies exactly as at the marker closes. When it fires, the
 ///      reply (the model's genuine wrap-up) enters the Conversation before
 ///      the close (`keep_reply`); when it does not (a green settle, or the
 ///      budget spent), the Turn concludes on the reply as before;
-///   3. the Verify-failed Nudge — the last run_command this Turn failed;
-///   4. the Verify Nudge — files changed but nothing was verified;
-///   5. the Empty-response Nudge — no content, or a parroted empty marker.
+///   3. the Verify-failed Nudge - the last run_command this Turn failed;
+///   4. the Verify Nudge - files changed but nothing was verified;
+///   5. the Empty-response Nudge - no content, or a parroted empty marker.
 ///      The strict Verify-failed > Verify > Empty order, each gated on
-///      end_turn, room under the Turn Limit ([`endgame::can_loop`] — the
+///      end_turn, room under the Turn Limit ([`endgame::can_loop`] - the
 ///      limit bounds every Nudge), and its own re-arm bookkeeping;
-///   6. nothing — the Turn concludes on the model's reply.
+///   6. nothing - the Turn concludes on the model's reply.
 ///
 /// A firing Nudge updates its trigger bookkeeping here (the once-per-Turn
-/// caps, the no-think rescue arm, and the duplicate Governor's memory clear —
+/// caps, the no-think rescue arm, and the duplicate Governor's memory clear -
 /// the finishing response's dropped tool_use blocks never produced results):
 /// that is decision state, not effect. The firing site keeps the effects.
 pub fn settle_finish(
@@ -416,8 +416,8 @@ pub fn settle_finish(
 }
 
 // The one seam every finish Nudge passes through. The domain rule is
-// UNCONDITIONAL: any finish Nudge grants the model fresh context — the
-// finishing response's dropped tool_use blocks never produced results — so the
+// UNCONDITIONAL: any finish Nudge grants the model fresh context - the
+// finishing response's dropped tool_use blocks never produced results - so the
 // duplicate Governor's freshness memory clears here, once, for all three kinds
 // (Verify-failed, Verify, Empty alike). Each branch above owns only its own
 // trigger bookkeeping (the once-per-Turn cap, the no-think rescue arm); the
@@ -696,7 +696,7 @@ mod tests {
     fn a_stale_plan_line_rides_the_anchor_and_every_later_one() {
         // Plan on Pass 1, a write since, anchor cadence 5: the Anchors at
         // Pass 10 and Pass 15 both carry the line (9 then 14 Passes since),
-        // freshly parameterized — never a one-shot.
+        // freshly parameterized - never a one-shot.
         let mut governors = Governors::new(5, 8, true);
         let mut ledger = ledger_at(1, 50);
         ledger.note_plan_updated();
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn a_fresh_plan_or_a_writeless_stretch_rides_a_bare_anchor() {
-        // Same cadence hit, but the Plan is within its threshold — and a
+        // Same cadence hit, but the Plan is within its threshold - and a
         // stale Plan with zero writes since (pure reading) stays bare too.
         let mut fresh = ledger_at(1, 50);
         fresh.note_plan_updated();
@@ -1016,7 +1016,7 @@ mod tests {
         // The UNCONDITIONAL domain rule: any finish Nudge grants the model
         // fresh context (the finishing response's dropped tool_use blocks
         // never produced results), so Duplicate's repeat-detection memory
-        // clears — for all three finish-Nudge kinds alike. Each case arms a
+        // clears - for all three finish-Nudge kinds alike. Each case arms a
         // call Duplicate WOULD otherwise flag as a repeat, fires one kind of
         // finish Nudge, and asserts the call is no longer a duplicate.
         let repeated = json!({"path": "a.ex"});
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn a_final_pass_text_settle_with_a_dangling_failure_closes_and_recovers() {
         // ADR-0015 withdrew the tools, so the capped Turn ends on a plain
-        // reply — the recovery judgment applies, and the reply (not the
+        // reply - the recovery judgment applies, and the reply (not the
         // marker) enters the Conversation.
         assert_eq!(
             settle_finish(

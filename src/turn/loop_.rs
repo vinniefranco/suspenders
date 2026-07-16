@@ -1,9 +1,9 @@
-//! Turn Loop — the inner tool-call loop of a Turn (baud's `Baud.Turn.Loop`).
-//! (Module name is `loop_` because `loop` is a keyword — ADR-0022.)
+//! Turn Loop - the inner tool-call loop of a Turn (baud's `Baud.Turn.Loop`).
+//! (Module name is `loop_` because `loop` is a keyword - ADR-0022.)
 //!
 //! One Pass (CONTEXT.md) = one model response plus the Tool Calls it carries.
-//! Per Pass the loop emits a well-formed message grammar — `MessageStart`,
-//! `MessageUpdate` (delta + accumulated snapshot), `MessageEnd` — on every path,
+//! Per Pass the loop emits a well-formed message grammar - `MessageStart`,
+//! `MessageUpdate` (delta + accumulated snapshot), `MessageEnd` - on every path,
 //! including errored responses, then acts on the stop reason. See the Elixir
 //! moduledoc (`baud/lib/baud/turn/loop.ex`) for the full narrative; this port
 //! preserves its behaviour exactly, with the Turn Ledger and the Governors'
@@ -15,14 +15,14 @@
 //! tool-answering Pass (Steering, Explore Nudge, Anchor, Endgame tail rider,
 //! Turn Limit, after-Pass hook). Executing a Pass's Tool Call batch lives in
 //! [`super::batch`]; how a Turn ends when the model stops calling tools lives
-//! in [`super::finish`]. Every heuristic decision — which Tools ride, what
-//! rides the results tail, when the Turn Limit closes — comes from the
+//! in [`super::finish`]. Every heuristic decision - which Tools ride, what
+//! rides the results tail, when the Turn Limit closes - comes from the
 //! arbiter in [`super::governor`] (ADR-0026); this module only translates the
 //! returned Interventions into effects.
 //!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
 //! [`TurnDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
-//! over a `plugins` list and a `ToolCtx` the caller supplies — the Rust Session
+//! over a `plugins` list and a `ToolCtx` the caller supplies - the Rust Session
 //! carries plugin *names*, not `Registered` values, so these ride as explicit
 //! `run` arguments (the shell builds them from the Session).
 
@@ -57,7 +57,7 @@ pub enum Outcome {
     /// the Endgame Governor issued the close-and-open-a-Recovery-Turn
     /// Intervention (CONTEXT.md: Recovery Turn). The Conversation is closed on
     /// the turn-limit marker exactly like an `Ok` limit close; the directive
-    /// rides out so the Agent — which owns the Turn lifecycle — executes the
+    /// rides out so the Agent - which owns the Turn lifecycle - executes the
     /// opening.
     Recover(Conversation, log::StopReason, governor::endgame::Recovery),
     /// The response errored; carries the LLM error reason and the Conversation
@@ -99,7 +99,7 @@ pub struct RunOpts {
 // The loop state that spans Passes: the effect bundle, the owned emission
 // handle (obtained once from `deps.emitter()`, ADR-0025), the Plan/Anchor
 // state, the Turn Ledger (the Turn's facts, written here and in `batch` at
-// the firing sites — ADR-0026), and the Governors' trigger state + resolved
+// the firing sites - ADR-0026), and the Governors' trigger state + resolved
 // Setpoints. The Session's fixed facts the loop needs are resolved into the
 // Ledger and the Governors once at Turn start, so no Session reference rides.
 // The Conversation stays a separate value the loop folds. Fields are
@@ -115,7 +115,7 @@ pub(super) struct LoopState<'a, D: TurnDeps> {
     // The malformed-tool-call re-draw Setpoint (ADR-0030), resolved once from
     // the Session at Turn start: how many in-band re-draws a retryable
     // generation error may trigger this Turn (0 disables it). A Session fact,
-    // not a Ledger field — the Ledger holds only how many retries were USED.
+    // not a Ledger field - the Ledger holds only how many retries were USED.
     pub(super) malformed_retry_budget: u64,
 }
 
@@ -229,14 +229,14 @@ async fn run_loop<D: TurnDeps>(
             Flow::Continue(next) => conversation = next,
             // A malformed-tool-call re-draw (ADR-0030): re-issue the request
             // from the SAME, unmutated Conversation without advancing the
-            // Pass — the failed draw produced nothing to keep and nothing for
+            // Pass - the failed draw produced nothing to keep and nothing for
             // the model to correct, so the retry is silent to the model.
             Flow::Retry(same) => conversation = same,
         }
     }
 }
 
-// The invariant: streaming deltas are emitted AS THEY STREAM — every
+// The invariant: streaming deltas are emitted AS THEY STREAM - every
 // MessageUpdate goes out between MessageStart and MessageEnd, DURING the
 // `complete` call, never buffered until it returns. `complete` exclusively
 // borrows `state.deps`, which is exactly why emission is the owned `Emitter`
@@ -305,7 +305,7 @@ pub(super) enum Flow {
     Done(Outcome),
     /// A malformed-tool-call generation is re-drawn in-band (ADR-0030): the
     /// SAME, unmutated Conversation is re-requested without advancing the Pass
-    /// — no batch to answer (no tool_use blocks were produced), so nothing
+    /// - no batch to answer (no tool_use blocks were produced), so nothing
     /// enters the Conversation. The loop's third path beside Continue and Done
     /// (ADR-0018's third fault path: a bounded re-draw beside settle and fail).
     Retry(Conversation),
@@ -344,15 +344,15 @@ async fn dispatch<D: TurnDeps>(
     }
 }
 
-// ADR-0030: a StopReason::Error whose error string classifies as retryable —
-// the malformed-tool-call class only — re-draws the generation in-band while
+// ADR-0030: a StopReason::Error whose error string classifies as retryable -
+// the malformed-tool-call class only - re-draws the generation in-band while
 // the per-Turn budget holds, instead of failing the whole Turn. The re-draw
 // is a mechanical response to a wire event (it lives here, not in a Governor,
 // and carries no trajectory judgment): increment the Ledger, emit the visible
 // info event (the Agent folds it to a durable `retry` Session Log entry, never
 // into the Conversation), and re-request the SAME, unmutated Conversation. On
 // a non-retryable error, or once the budget is spent (default 3, 0 disables),
-// the existing loud `finish::fail` runs — preserved exactly, only deferred.
+// the existing loud `finish::fail` runs - preserved exactly, only deferred.
 fn error_flow<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
@@ -447,8 +447,8 @@ async fn next_pass<D: TurnDeps>(
     state.governors.note_progress(state.ledger.pass_calls());
 
     // The results tail of the Tool Call answering moment (ADR-0026): the
-    // arbiter decides what rides the trailing tool-results user message —
-    // Explore Nudge, Anchor, the Endgame's rider — and this site applies it.
+    // arbiter decides what rides the trailing tool-results user message -
+    // Explore Nudge, Anchor, the Endgame's rider - and this site applies it.
     let tail = governor::answer_tail(&state.ledger, &mut state.governors);
     state.ledger.note_tail_delivered();
     for intervention in tail {
@@ -459,7 +459,7 @@ async fn next_pass<D: TurnDeps>(
 
     // The finish-settlement moment, consulted after a tool-answering Pass: at
     // the Turn Limit the arbiter closes the Turn on the marker (stop calling
-    // the model; the marker keeps roles alternating) — carrying the Endgame
+    // the model; the marker keeps roles alternating) - carrying the Endgame
     // Governor's recovery directive out when the work is unfinished.
     match governor::settle_capped(&state.ledger, &state.governors) {
         Some(FinishIntervention::Close(reason)) => {
@@ -677,7 +677,7 @@ mod tests {
         write(&root, "b.txt", "");
         let session = session(root.path());
         // One Pass emitting two Tool Calls: the batch is checkpointed once, after
-        // both are answered (per-batch, not per-tool — ADR-0010's per-event
+        // both are answered (per-batch, not per-tool - ADR-0010's per-event
         // tool_result log entries carry crash recency; this checkpoint is only
         // the settlement fallback).
         let two_tool_pass = Response {
@@ -702,7 +702,7 @@ mod tests {
 
         let checkpoints = deps.checkpoints.lock().unwrap();
         // Exactly one checkpoint for the two-tool batch (plus the finish
-        // checkpoint on end-of-Turn) — never one per tool.
+        // checkpoint on end-of-Turn) - never one per tool.
         assert_eq!(checkpoints.len(), 2, "one per batch, not one per tool");
 
         // The batch checkpoint carries both answered Tool Calls paired with
@@ -787,7 +787,7 @@ mod tests {
         let session = session(root.path());
 
         // A shared events log created UP FRONT, so the Dynamic entry can drop a
-        // sentinel into it from INSIDE `complete` — after every delta has gone
+        // sentinel into it from INSIDE `complete` - after every delta has gone
         // through the streaming sink, immediately before `complete` returns.
         // If the loop buffered deltas and emitted after the call (the defect
         // ADR-0025 removes), every MessageUpdate would land AFTER the sentinel.
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(update_positions.len(), 2);
         assert!(
             update_positions.iter().all(|&i| i < sentinel_at),
-            "every MessageUpdate must precede the sentinel — updates are emitted \
+            "every MessageUpdate must precede the sentinel - updates are emitted \
              DURING complete, not after it returns (updates at {update_positions:?}, \
              sentinel at {sentinel_at})"
         );
@@ -1027,7 +1027,7 @@ mod tests {
     async fn a_retryable_error_re_draws_in_band_and_the_turn_completes() {
         let root = root();
         let session = session(root.path());
-        // A retryable draw fails, then the re-draw succeeds — the Turn
+        // A retryable draw fails, then the re-draw succeeds - the Turn
         // continues and completes rather than failing.
         let deps = deps_for(
             &session,
@@ -1057,7 +1057,7 @@ mod tests {
         )));
 
         // The re-draw did NOT advance the Pass: both the failed draw and the
-        // successful re-draw carry MessageStart { pass: 1 } — no extra Pass.
+        // successful re-draw carry MessageStart { pass: 1 } - no extra Pass.
         let starts: Vec<u32> = evs
             .iter()
             .filter_map(|e| match e {
@@ -1319,7 +1319,7 @@ mod tests {
         ok(&outcome);
         let evs = events(&deps);
 
-        // Each fetch requested Approval showing the full URL as the string —
+        // Each fetch requested Approval showing the full URL as the string -
         // the same string Standing Approval would match exactly (ADR-0024).
         assert!(
             evs.iter()
@@ -1609,7 +1609,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                // The model wrote, then its verification dangles red — the
+                // The model wrote, then its verification dangles red - the
                 // write is the evidence the dangling-failure arm now requires.
                 just(Response {
                     content: vec![
@@ -2414,7 +2414,7 @@ mod tests {
     #[tokio::test]
     async fn a_final_pass_text_settle_with_a_dangling_failure_recovers_on_the_reply() {
         // ADR-0015 withdrew the tools on the final Pass, so the capped Turn
-        // ends on a plain reply — the recovery judgment applies there too
+        // ends on a plain reply - the recovery judgment applies there too
         // (ADR-0028 addendum), and the reply (the model's genuine wrap-up),
         // NOT the turn-limit marker, closes the Conversation.
         let root = root();
@@ -2424,7 +2424,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                // The model wrote, then its verification dangles red — the
+                // The model wrote, then its verification dangles red - the
                 // write is the evidence the dangling-failure arm now requires.
                 just(Response {
                     content: vec![
@@ -2470,7 +2470,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                // The model wrote, then its full run dangles red — the write
+                // The model wrote, then its full run dangles red - the write
                 // is the evidence the dangling-failure arm now requires.
                 just(Response {
                     content: vec![
@@ -3261,7 +3261,7 @@ mod tests {
         opts.turn_limit = Some(50);
         let session = session_with(root.path(), opts);
 
-        // Pass 1 sets the Plan; Passes 2-8 keep writing without touching it —
+        // Pass 1 sets the Plan; Passes 2-8 keep writing without touching it -
         // the audited f5 shape (a pass-5 plan re-injected verbatim while the
         // model debugged 20 passes deep).
         let mut script = vec![just(tool_use_result(
@@ -3316,7 +3316,7 @@ mod tests {
         let session = session_with(root.path(), opts);
 
         // Writes land every Pass, but the model refreshes its Plan on Pass 4
-        // — inside the window every Anchor would otherwise go stale in.
+        // - inside the window every Anchor would otherwise go stale in.
         let deps = deps_for(
             &session,
             vec![
@@ -3346,7 +3346,7 @@ mod tests {
         let (conv, _) = ok(&outcome);
 
         // Anchors on Passes 2 and 4: 1 Pass since the Pass-1 plan, then 0
-        // since the Pass-4 refresh — the update reset the clock.
+        // since the Pass-4 refresh - the update reset the clock.
         let anchors = anchors_in(conv);
         assert_eq!(anchors.len(), 2);
         assert!(anchors.iter().all(|a| !a.contains("has not changed")));
@@ -3410,7 +3410,7 @@ mod tests {
         .await;
         let (conv, _) = ok(&outcome);
 
-        // Anchors on Passes 2 and 4: 1 then 3 Passes since Turn start — the
+        // Anchors on Passes 2 and 4: 1 then 3 Passes since Turn start - the
         // carried Plan crosses the threshold without ever being set this Turn.
         let anchors = anchors_in(conv);
         assert_eq!(anchors.len(), 2);
@@ -3547,7 +3547,7 @@ mod tests {
     //
     // baud drives the Scout's internal Passes through the same FakeLLM. The Rust
     // Scout is not yet ported, so we wire the ctx's `scout` capture to return a
-    // canned ScoutOutcome — exercising the SAME loop behaviour (only the explore
+    // canned ScoutOutcome - exercising the SAME loop behaviour (only the explore
     // Tool Call and its Tool Result enter the Conversation; a Scout failure
     // becomes an ordinary is_error Tool Result, never failing the Turn).
 

@@ -1,17 +1,17 @@
 //! Pure functional core holding the Conversation: the ordered message history
 //! sent to the model, plus the Context Budget bookkeeping for Eviction. No
-//! processes, no IO, no config reads — every option is passed explicitly by
+//! processes, no IO, no config reads - every option is passed explicitly by
 //! the composition root (from the Session).
 //!
 //! ## Eviction
 //!
 //! A wave fires on either of two triggers (CONTEXT.md: Eviction). On budget
-//! pressure — the estimate over `context_budget - max_tokens_reserve` —
+//! pressure - the estimate over `context_budget - max_tokens_reserve` -
 //! [`Conversation::evict`] reclaims dead content first, then replaces the
 //! contents of old Tool Results, oldest first, with the elision marker,
-//! overshooting to the low-water mark (hysteresis, ADR-0006). On Dead Mass —
+//! overshooting to the low-water mark (hysteresis, ADR-0006). On Dead Mass -
 //! elidable dead content (Supersession, [`supersession`]) exceeding
-//! `dead_mass_fraction` of the Context Budget — a wave reclaims all dead
+//! `dead_mass_fraction` of the Context Budget - a wave reclaims all dead
 //! content and nothing live, even with budget to spare. The last two
 //! tool-result-bearing user messages and their paired tool_use blocks, the
 //! system prompt, and live non-`tool_result` blocks are never touched.
@@ -26,7 +26,7 @@ use crate::voice::{self, FileOps};
 /// What one Eviction wave reclaimed, counted by kind, with the Dead Mass
 /// share at wave time (CONTEXT.md: Eviction, Dead Mass, Supersession).
 /// Returned beside the evicted Conversation by
-/// [`Conversation::evict_traced`] so the request path can announce the wave —
+/// [`Conversation::evict_traced`] so the request path can announce the wave -
 /// waves rewrite the request copy only and would otherwise leave no trace.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct WaveStats {
@@ -279,7 +279,7 @@ impl Conversation {
     /// (`token_estimate` over `context_budget - max_tokens_reserve`) or Dead
     /// Mass over its threshold fraction of the Context Budget. Without a
     /// trigger the messages come back byte-identical. A wave reclaims all
-    /// dead content outside the recency guard — zero value by definition —
+    /// dead content outside the recency guard - zero value by definition -
     /// and only a budget-pressure wave continues into the oldest-first live
     /// walk, eliding down to the low-water mark. Idempotent.
     pub fn evict(&self) -> Conversation {
@@ -288,8 +288,8 @@ impl Conversation {
 
     /// The CURRENT Dead Mass share (CONTEXT.md: Dead Mass): the tokens the
     /// dead blocks presently occupy as a fraction of the Context Budget. This is
-    /// the LIVE figure every pass — the same formula [`evict_traced`] snapshots
-    /// PRE-reclaim — so the status bar can advertise dead mass as it stands, not
+    /// the LIVE figure every pass - the same formula [`evict_traced`] snapshots
+    /// PRE-reclaim - so the status bar can advertise dead mass as it stands, not
     /// the (already-cleared) amount a past wave found. `0.0` when nothing is
     /// dead.
     ///
@@ -301,7 +301,7 @@ impl Conversation {
     }
 
     /// [`Conversation::evict`], reporting what the wave reclaimed: `None`
-    /// when no wave fired — or when a trigger found nothing to rewrite.
+    /// when no wave fired - or when a trigger found nothing to rewrite.
     pub fn evict_traced(&self) -> (Conversation, Option<WaveStats>) {
         // Two waves, two triggers, decided once here. The dead-mass wave (elide
         // every dead block) fires on EITHER trigger; the budget-pressure wave
@@ -331,7 +331,7 @@ impl Conversation {
     }
 
     // The budget-pressure wave: live oldest-first eviction overshooting to the
-    // low-water mark (the Compaction Target — one number, one definition), so
+    // low-water mark (the Compaction Target - one number, one definition), so
     // elisions arrive in rare waves and the request prefix stays cache-stable
     // between them (ADR-0006 hysteresis). Dead content the dead-mass wave
     // already reclaimed may have done the whole job, leaving nothing to evict.
@@ -582,8 +582,8 @@ pub struct ContextBudgetExhausted;
 
 /// [`Conversation::merge_user_text`] over bare messages: a trailing user-role
 /// message gains a text block; otherwise a fresh user message is appended.
-/// The one seam every tail rider crosses — Steering, Nudges, Endgame prompts,
-/// and Anchors alike — shared with Resume's fold so a logged rider replays
+/// The one seam every tail rider crosses - Steering, Nudges, Endgame prompts,
+/// and Anchors alike - shared with Resume's fold so a logged rider replays
 /// through the same code that placed it live.
 pub fn merge_user_text(messages: &mut Vec<Message>, text: impl Into<String>) {
     match messages.last_mut() {
@@ -634,7 +634,7 @@ pub fn extract_file_ops(messages: &[Message]) -> FileOps {
     }
 }
 
-/// The newest run_command Tool Result in `messages`, verbatim — the Handoff's
+/// The newest run_command Tool Result in `messages`, verbatim - the Handoff's
 /// final-verification fact (CONTEXT.md: Handoff; the simplest correct rule:
 /// the last run_command Tool Result of the Turn is the single highest-value
 /// artifact for a debugging continuation). `None` when no run_command ever
@@ -663,9 +663,9 @@ pub fn last_command_result(messages: &[Message]) -> Option<&str> {
         })
 }
 
-/// The newest run_command Tool Result whose Tool Call ran `command`, verbatim —
+/// The newest run_command Tool Result whose Tool Call ran `command`, verbatim -
 /// the Handoff's verification fact when a Dangling Failure drives the recovery
-/// (CONTEXT.md: Handoff — the Dangling Failure's OWN output, the command the
+/// (CONTEXT.md: Handoff - the Dangling Failure's OWN output, the command the
 /// recovery prompt names, never merely the last command run). Because the
 /// dangling command's most recent run failed, this returns its failing output.
 /// `None` when no run_command with that command string ever produced a result.
@@ -699,7 +699,7 @@ pub fn command_result_for<'a>(messages: &'a [Message], command: &str) -> Option<
         })
 }
 
-// ceil(chars / 3.5) — a 3.5 ratio, not a div_ceil by 7, so keep as-is.
+// ceil(chars / 3.5) - a 3.5 ratio, not a div_ceil by 7, so keep as-is.
 pub(crate) fn tokens_for_chars(chars: u64) -> u64 {
     #[allow(clippy::manual_div_ceil)]
     {
@@ -819,7 +819,7 @@ mod tests {
     // NOTE: baud's "context_budget and max_tokens_reserve are required
     // (KeyError)" test is enforced here by the type system: ConversationOpts
     // makes both fields non-optional, so a caller cannot omit them. No runtime
-    // assertion is possible or needed — the equivalent guarantee is a compile
+    // assertion is possible or needed - the equivalent guarantee is a compile
     // error. (Documented judgment call.)
 
     #[test]
@@ -1555,8 +1555,8 @@ mod tests {
     #[test]
     fn command_result_for_returns_the_newest_result_of_the_named_command() {
         // A red full suite, then a green filtered rerun (a DIFFERENT string):
-        // the full suite dangles, and its own failing output — not the last
-        // command run — is what the Handoff must carry.
+        // the full suite dangles, and its own failing output - not the last
+        // command run - is what the Handoff must carry.
         let messages = vec![
             Message::assistant(vec![tool_use_input(
                 "r1",
@@ -1817,7 +1817,7 @@ mod tests {
     #[test]
     fn a_dead_mass_wave_counts_superseded_results_by_tool_kind() {
         // A superseded run_command counts as Command, a superseded read_file as
-        // Read — the classification lives on the dead block's kind, not a marker
+        // Read - the classification lives on the dead block's kind, not a marker
         // string comparison. The newest identical call survives; the two filler
         // reads sit in the protected recency window.
         let dump = "FAILED ".repeat(80);
@@ -1862,7 +1862,7 @@ mod tests {
         assert_eq!(live.dead_mass(), 0.0);
 
         // A landed edit whose body is now dead (later reads push it past the
-        // recency guard): the live fraction is positive — the same figure a
+        // recency guard): the live fraction is positive - the same figure a
         // wave would find pre-reclaim, but computed WITHOUT rewriting anything.
         let conv = conv_with_landed_edit(ConversationOpts::new(10_000, 0), &"x".repeat(8_000));
         assert!(conv.dead_mass() > 0.0);

@@ -10,10 +10,10 @@ The real implementation wires these methods to the Agent's channels and the Sess
 
 The loop owns zero I/O and zero process concerns. All policy and effects arrive through the trait, so it is unit-tested with a fake and no tokio runtime scaffolding.
 
-Boundary with Plugins: `TurnDeps` methods are infrastructure — control-bearing and fail-**loud** (a panicking Dep fails the Turn honestly). Plugins remain the fail-open, tool-scoped extension unit (ADR-0007).
+Boundary with Plugins: `TurnDeps` methods are infrastructure - control-bearing and fail-**loud** (a panicking Dep fails the Turn honestly). Plugins remain the fail-open, tool-scoped extension unit (ADR-0007).
 
 Considered and rejected:
 
-- **An explicit state-machine / enum-of-states design.** The states are fake — the loop runs forward and never branches on "which state am I in" — and encoding them pushes policy back into the loop.
+- **An explicit state-machine / enum-of-states design.** The states are fake - the loop runs forward and never branches on "which state am I in" - and encoding them pushes policy back into the loop.
 - **A struct of boxed async closures.** Async closures in a struct force `Box<dyn Fn() -> Pin<Box<dyn Future>>>` and the attendant lifetime pain.
-- **The loop sending effect-messages back to the Agent and awaiting replies.** Re-entangles the loop with the process model — the exact coupling this design removes.
+- **The loop sending effect-messages back to the Agent and awaiting replies.** Re-entangles the loop with the process model - the exact coupling this design removes.

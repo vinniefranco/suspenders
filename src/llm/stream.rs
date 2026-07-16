@@ -40,13 +40,13 @@ const MALFORMED_INPUT_SENTINEL: &str = "__suspenders_malformed_input__";
 ///
 /// This is how the SSE-decoding fact that a tool_use's input was mangled
 /// crosses the LLM boundary as a domain signal. The sentinel string that
-/// carries it on the wire stays private to this module — domain code (the Turn
+/// carries it on the wire stays private to this module - domain code (the Turn
 /// batch, the tool registry) gates on this accessor without knowing the
 /// wire representation.
 ///
 /// ADR-0002: malformation is DATA folded into the content path, so it rides in
 /// the durable `ContentBlock::ToolUse.input` `Value` unchanged and is
-/// interpreted here — never surfaced as an `Err`.
+/// interpreted here - never surfaced as an `Err`.
 pub fn malformed_tool_input(input: &Value) -> Option<&str> {
     // The key's presence is the verdict; its value carries the raw unparsed
     // text (always a string from the decoder, "" defensively otherwise).
@@ -55,7 +55,7 @@ pub fn malformed_tool_input(input: &Value) -> Option<&str> {
         .map(|raw| raw.as_str().unwrap_or(""))
 }
 
-/// Builds the malformed-input marker `Value` from raw unparsed text — the
+/// Builds the malformed-input marker `Value` from raw unparsed text - the
 /// counterpart to [`malformed_tool_input`]. The boundary produces these when
 /// input JSON fails to decode; construction stays here so no caller (or test)
 /// spells the wire sentinel itself.
@@ -134,7 +134,7 @@ impl StreamState {
     }
 
     /// Folds one parsed SSE event. Once an error is recorded, subsequent
-    /// events are ignored (the error takes precedence — the error algebra).
+    /// events are ignored (the error takes precedence - the error algebra).
     pub fn handle_event(&mut self, event: &SseEvent) {
         if self.error.is_some() {
             return;
@@ -192,7 +192,7 @@ impl StreamState {
             "error" => {
                 self.error = Some(format!("api_stream_error: {data}"));
             }
-            // message_stop, ping, unknown events — no-op.
+            // message_stop, ping, unknown events - no-op.
             _ => {}
         }
     }
@@ -267,7 +267,7 @@ impl StreamState {
     }
 }
 
-/// Folds a sequence of parsed SSE events into a [`Response`] — the pure core.
+/// Folds a sequence of parsed SSE events into a [`Response`] - the pure core.
 pub fn fold_sse(events: impl IntoIterator<Item = SseEvent>) -> Response {
     let mut state = StreamState::new();
     for event in events {

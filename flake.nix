@@ -1,5 +1,5 @@
 {
-  description = "suspenders — a Rust project";
+  description = "suspenders - a Rust project";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

@@ -1,4 +1,4 @@
-//! Slash Command registry and draft parsing — the PURE recognition core behind
+//! Slash Command registry and draft parsing - the PURE recognition core behind
 //! the Composer's `/`-menu (ADR-0032, CONTEXT.md: **Slash Command**). No
 //! ratatui/crossterm and no knowledge of what any command DOES: the pure
 //! [`crate::ui::transcript::Transcript`] looks a command up here and emits an
@@ -23,13 +23,13 @@
 use crate::ui::selector::SelectorRow;
 
 /// One command descriptor: the name typed after `/` and the one-line help the
-/// menu shows. The Effect the command produces is NOT here — the pure core
+/// menu shows. The Effect the command produces is NOT here - the pure core
 /// emits a command-agnostic [`Effect::Command`](crate::ui::transcript::Effect::Command)
 /// and the adapter decides what it does.
 ///
 /// `opens_selector` is the one bit of shape the pure core reads: a command like
 /// `/model` opens a second filterable list (its own values) after it is
-/// committed, so committing it does NOT clear the draft — it switches the same
+/// committed, so committing it does NOT clear the draft - it switches the same
 /// inline popup to the command's selector sub-state (ADR-0033). A command
 /// without a selector (`false`) is fire-and-run: committing it emits the
 /// [`Effect::Command`](crate::ui::transcript::Effect::Command) and clears the
@@ -59,7 +59,7 @@ pub struct SlashDraft {
     pub rest: Option<String>,
 }
 
-/// True when the draft, ignoring leading whitespace, begins with `/` — the
+/// True when the draft, ignoring leading whitespace, begins with `/` - the
 /// signal the Composer is in Slash Command mode.
 pub fn is_slash(draft: &str) -> bool {
     draft.trim_start().starts_with('/')
@@ -67,7 +67,7 @@ pub fn is_slash(draft: &str) -> bool {
 
 /// Splits a slash draft into its command token and optional remainder. The
 /// leading `/` (and any whitespace before it) is stripped; the FIRST space
-/// after the token is the boundary — everything past it is `rest`. A token with
+/// after the token is the boundary - everything past it is `rest`. A token with
 /// no following space (or nothing after `/`) has `rest: None`; a trailing space
 /// with no remainder (`"/model "`) yields `rest: Some("")`, so a committed
 /// command with a bare trailing space still seeds an empty sub-filter.

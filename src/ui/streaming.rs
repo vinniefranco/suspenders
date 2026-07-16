@@ -1,16 +1,16 @@
-//! In-flight streaming state — the ONE owner of the assistant message being
+//! In-flight streaming state - the ONE owner of the assistant message being
 //! streamed (CONTEXT.md: the snapshot the Transcript shows mid-Turn, before it
 //! settles into discrete items).
 //!
 //! Streaming is STATELESS (ADR-0001, and see `ui::transcript`): each
 //! [`Event::MessageUpdate`](crate::event::Event) carries the accumulated
-//! snapshot, so [`Streaming::update`] replaces the in-flight view wholesale —
+//! snapshot, so [`Streaming::update`] replaces the in-flight view wholesale -
 //! no delta accumulation. Two moments MATERIALIZE the snapshot into discrete
 //! [`TranscriptItem`]s, and they differ in ONE way:
 //!
 //! * [`Streaming::end`] (a clean [`Event::MessageEnd`](crate::event::Event))
-//!   takes Thinking from the LAST SNAPSHOT — the final `content` the event
-//!   carries never repeats thinking — and text from that final content.
+//!   takes Thinking from the LAST SNAPSHOT - the final `content` the event
+//!   carries never repeats thinking - and text from that final content.
 //! * [`Streaming::flush`] (a cancel or crash mid-stream) has no final content,
 //!   so it takes BOTH thinking and text from the last snapshot.
 //!
@@ -59,7 +59,7 @@ impl Streaming {
     }
 
     /// Materialize a finished message (a clean [`Event::MessageEnd`]): Thinking
-    /// from the last snapshot — the final content never carries it — then the
+    /// from the last snapshot - the final content never carries it - then the
     /// assistant text from that final `content`. Empties the snapshot.
     ///
     /// [`Event::MessageEnd`]: crate::event::Event
@@ -88,7 +88,7 @@ impl Streaming {
     }
 }
 
-// Thinking item first (if any), then the assistant item (if any) — the order
+// Thinking item first (if any), then the assistant item (if any) - the order
 // the Transcript pushes them in. Empties are skipped.
 fn materialize(thinking: String, text: String) -> Vec<TranscriptItem> {
     let mut items = Vec::new();
@@ -150,7 +150,7 @@ mod tests {
         s.start();
         s.update(vec![text_block("Hel")]);
         assert_eq!(s.text(), "Hel");
-        // The second update REPLACES the first — no accumulation.
+        // The second update REPLACES the first - no accumulation.
         s.update(vec![thinking_block("hm"), text_block("Hello")]);
         assert_eq!(s.text(), "Hello");
         assert_eq!(s.thinking(), "hm");
@@ -194,7 +194,7 @@ mod tests {
         s.update(vec![thinking_block("mid"), text_block("partial")]);
         let items = s.flush();
         assert_eq!(items, vec![thinking("mid"), assistant("partial")]);
-        // Emptied — a second flush yields nothing.
+        // Emptied - a second flush yields nothing.
         assert_eq!(s.flush(), vec![]);
     }
 

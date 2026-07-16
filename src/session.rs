@@ -13,7 +13,7 @@
 //! downstream receives values from this struct, so the cross-module invariants
 //! live in one constructor:
 //!
-//! * the Eviction reserve IS `connection.max_tokens` — one field, read by the
+//! * the Eviction reserve IS `connection.max_tokens` - one field, read by the
 //!   Conversation and the LLM request alike, so they cannot drift
 //! * `connection.max_tokens` must leave room in the Context Budget
 //! * the Result Cap derives from the same two numbers, once, here
@@ -70,7 +70,7 @@ pub struct Session {
     /// The Project Root (captured once, never read from the cwd again).
     pub root: String,
     /// The module implementing the LLM boundary (a name; the trait wiring is a
-    /// later phase — carried here as a module name).
+    /// later phase - carried here as a module name).
     pub llm_module: String,
     /// The Session's Plugin list (opaque here; entries carried as names).
     pub plugins: Vec<String>,
@@ -84,7 +84,7 @@ pub struct Session {
     pub turn_limit: u64,
     pub anchor_interval: u64,
     /// The anchor Governor's stale-plan Setpoint: the Passes a Plan may sit
-    /// unchanged — while writes land — before each Anchor carries the
+    /// unchanged - while writes land - before each Anchor carries the
     /// stale-plan line.
     pub plan_stale_after: u64,
     /// The Endgame Governor's recovery Setpoint: at most this many Recovery
@@ -279,7 +279,7 @@ impl SessionConfig {
         }
 
         // "handoff" | "continuation". Note: the env parser trims whitespace
-        // (via `parse_recovery_shape`), but the JSON path does not — serde
+        // (via `parse_recovery_shape`), but the JSON path does not - serde
         // matches the string exactly. Accepted, not fixed: a stray space in
         // a hand-typed env var is likelier than in an editor-formatted file.
         if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_SHAPE") {
@@ -352,7 +352,7 @@ impl SessionConfig {
     /// Persists the Active Model choice by a sparse read-modify-write of the
     /// config file (ADR-0033, ADR-0031 amendment): the user's other keys are
     /// preserved and `token` is never introduced by the tool. This is the one
-    /// sanctioned exception to ADR-0031's no-auto-create — an explicit `/model`
+    /// sanctioned exception to ADR-0031's no-auto-create - an explicit `/model`
     /// pick is a deliberate act, so the file is created if absent.
     ///
     /// If `path` exists it is parsed as a JSON object and only the `"model"` key
@@ -463,7 +463,7 @@ impl FileConfig {
     /// Pure parse of the config file's JSON (ADR-0031): syntax errors, unknown
     /// keys, and type mismatches each surface as a [`SessionError`]. The message
     /// is path-agnostic (the caller, [`load_file_overlay`], wraps it with the
-    /// resolved path). Range checks are NOT done here — a bad-but-typed value is
+    /// resolved path). Range checks are NOT done here - a bad-but-typed value is
     /// caught later by `validate()` on the final [`Session`].
     fn parse(raw: &str) -> Result<FileConfig, SessionError> {
         serde_json::from_str(raw).map_err(|e| SessionError(e.to_string()))
@@ -634,7 +634,7 @@ impl Session {
         Session::build(opts, &SessionConfig::load())
     }
 
-    /// Builds and validates against an explicit [`SessionConfig`] — the
+    /// Builds and validates against an explicit [`SessionConfig`] - the
     /// no-env path tests use. Every `None` opt falls back to `config`.
     pub fn build(opts: SessionOpts, config: &SessionConfig) -> Result<Session, SessionError> {
         let connection = opts.connection.clone().unwrap_or_else(|| {
@@ -1637,8 +1637,8 @@ mod tests {
     #[test]
     fn write_template_round_trips_every_non_token_field_as_some() {
         // Lockstep guard (ADR-0031): the writer emits every schema key, and the
-        // DTO parses them all back. A field the writer forgets — or a serde
-        // rename that drifts — trips this. `token` is the sole intended None.
+        // DTO parses them all back. A field the writer forgets - or a serde
+        // rename that drifts - trips this. `token` is the sole intended None.
         let path = temp_config_path("round_trip");
         SessionConfig::write_template(&path, true).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();

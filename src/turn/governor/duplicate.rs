@@ -2,27 +2,27 @@
 //! result is still fresh draws a replacement Tool Result instead of a rerun
 //! (CONTEXT.md: Governor, Nudge; ADR-0026).
 //!
-//! * **Trigger**: private freshness memory — `prev_calls` remembers the
+//! * **Trigger**: private freshness memory - `prev_calls` remembers the
 //!   previous response's calls whose results are still fresh, `fresh`
 //!   accumulates this batch's; membership is `{name, input}` equality. The
 //!   Governor keys on what the model SENT, before Plugins adjust it
 //!   (CONTEXT.md: "the Nudge for duplicates keys on what the model sent").
 //!   A successful edit_file/write_file clears both sets, because results from
-//!   before a write are stale — an identical call after it (fix, then retest)
-//!   is a legitimate re-run, not a loop symptom — and the fresh set restarts
+//!   before a write are stale - an identical call after it (fix, then retest)
+//!   is a legitimate re-run, not a loop symptom - and the fresh set restarts
 //!   at the write itself. A fired finish Nudge clears the previous memory
 //!   too: the finishing response's dropped tool_use blocks never produced
 //!   results.
 //! * **Interventions**: replaces a Tool Result at the answering moment,
-//!   before the call executes ([`Duplicate::is_duplicate`] — the call never
+//!   before the call executes ([`Duplicate::is_duplicate`] - the call never
 //!   runs, and the model reads an error so it re-plans rather than trusting a
 //!   stale echo).
-//! * **Setpoints**: none — the one-Pass freshness window and the clearing
+//! * **Setpoints**: none - the one-Pass freshness window and the clearing
 //!   rules are the trigger's mechanics; no threshold here has ever demanded
 //!   tuning.
 //!
 //! Judgment call (from Step 2 of ADR-0026's strangler): the Tool Calls each
-//! Pass carried are Ledger facts, and the Ledger records them — but "still
+//! Pass carried are Ledger facts, and the Ledger records them - but "still
 //! fresh" is this Governor's OPINION about which results the model may still
 //! trust, and it is not derivable from the facts by a pure read: the memory
 //! clears on a successful write and when a finish Nudge fires, and a fired

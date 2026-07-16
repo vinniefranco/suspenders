@@ -1,21 +1,21 @@
-//! Context Files — project and global files that supplement or replace the
+//! Context Files - project and global files that supplement or replace the
 //! default system prompt.
 //!
 //! Conventions (in priority order, within each category):
 //!
-//!   * `.suspenders/SYSTEM.md` in the Project Root — **replaces** the default system
+//!   * `.suspenders/SYSTEM.md` in the Project Root - **replaces** the default system
 //!     prompt entirely. When absent, [`crate::voice::system_prompt`] is used.
-//!   * `.suspenders/APPEND_SYSTEM.md` in the Project Root — appended verbatim to the
+//!   * `.suspenders/APPEND_SYSTEM.md` in the Project Root - appended verbatim to the
 //!     system prompt (whether default or replaced).
-//!   * `.suspenders/AGENTS.md` / `.suspenders/CLAUDE.md` — project-specific instructions.
+//!   * `.suspenders/AGENTS.md` / `.suspenders/CLAUDE.md` - project-specific instructions.
 //!     All matching files in every ancestor directory of the Project Root are
 //!     loaded (root first, then parents walking up to the filesystem root),
 //!     each placed under a descriptive header. Appended after any
 //!     SYSTEM.md/APPEND_SYSTEM.md content.
-//!   * `~/.config/suspenders/AGENTS.md` / `~/.config/suspenders/CLAUDE.md` — global context
+//!   * `~/.config/suspenders/AGENTS.md` / `~/.config/suspenders/CLAUDE.md` - global context
 //!     files in the user's XDG config directory, loaded last.
 //!
-//! Missing or unreadable files are silently skipped — context loading must
+//! Missing or unreadable files are silently skipped - context loading must
 //! never prevent the Session from starting.
 
 use std::path::{Component, Path, PathBuf};

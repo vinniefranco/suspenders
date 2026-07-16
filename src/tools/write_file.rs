@@ -1,5 +1,5 @@
 //! `write_file(path, content)`: creates a new file, creating parent
-//! directories as needed. Refuses to overwrite an existing file — changing an
+//! directories as needed. Refuses to overwrite an existing file - changing an
 //! existing file is edit_file's job. Closing the whole-file-rewrite channel
 //! stops a small model from destroying a file by rewriting it (each
 //! reproduction shorter than the last) instead of making a targeted edit.

@@ -10,7 +10,7 @@
 //! ## Where the original task comes from
 //!
 //! Captured once per Turn from the Conversation's first user text
-//! ([`crate::conversation::Conversation::original_task`]) — unless the caller
+//! ([`crate::conversation::Conversation::original_task`]) - unless the caller
 //! already holds a durable copy. After a Compaction the Conversation's head is
 //! the summary message, whose first block is also user text: a fresh capture
 //! there would anchor the summary blob, not the task. The durable copy lives in
@@ -63,7 +63,7 @@ impl Plan {
 
     /// Folds one executed Tool Call into the Plan: a successful plan Tool Call
     /// with non-empty content updates it, anything else leaves it alone. The
-    /// Plan content is the model's voice, verbatim — never rewritten (a
+    /// Plan content is the model's voice, verbatim - never rewritten (a
     /// malformed input sentinel or an errored call stores nothing).
     pub fn update(&self, name: &str, input: &Value, is_error: bool) -> Update {
         if name == "plan"
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn the_durable_copy_wins_over_a_summary_head_post_compaction() {
-        // After a Compaction the Conversation's head is the summary message —
+        // After a Compaction the Conversation's head is the summary message -
         // also user text. A fresh capture would anchor the summary blob; the
         // carried copy from the Compaction state keeps the verbatim task.
         let mut base = conversation();

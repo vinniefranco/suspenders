@@ -1,21 +1,21 @@
-//! The empty Governor: a reply that arrives empty — no content once tool_use
-//! blocks are dropped, or a parroted empty-response marker — draws the
+//! The empty Governor: a reply that arrives empty - no content once tool_use
+//! blocks are dropped, or a parroted empty-response marker - draws the
 //! Empty-response Nudge, and repeated emptiness escalates to the break-glass
 //! no-think rescue (CONTEXT.md: Governor, Nudge, Thinking; ADR-0026).
 //!
 //! * **Trigger**: [`is_empty_reply`], a pure predicate over the finishing
 //!   response's content blocks, gated by the private once-per-Turn cap
-//!   (`nudged`, re-armed by progress — [`Empty::note_progress`]) and the
+//!   (`nudged`, re-armed by progress - [`Empty::note_progress`]) and the
 //!   rescue's private arming state (`rescue_next`, `rescue_sticky`,
 //!   `empty_count`). Progress never disarms the rescue.
 //! * **Interventions**: stands alone as a user message at the finish
-//!   settlement (the Empty-response Nudge — the model gets one more Pass),
+//!   settlement (the Empty-response Nudge - the model gets one more Pass),
 //!   and silences Thinking for a Pass at the request-shaping moment (the
 //!   rescue: after the Nudge fires, the very next model call carries
-//!   no_think, then reverts — unless the SECOND empty of the Turn has made
+//!   no_think, then reverts - unless the SECOND empty of the Turn has made
 //!   the rescue sticky). Consulting the shaping moment consumes the one-Pass
 //!   arm ([`Empty::consume_rescue`]).
-//! * **Setpoints**: [`Setpoints`] — whether the rescue may arm at all. This
+//! * **Setpoints**: [`Setpoints`] - whether the rescue may arm at all. This
 //!   one IS user-exposed: the Session's `no_think_rescue` knob feeds it,
 //!   resolved at Session construction; the default matches the Session's.
 //!   With the knob off the Nudge still fires and the empty count still
@@ -72,8 +72,8 @@ impl Empty {
     }
 
     /// The Empty-response Nudge fired: the once-per-Turn cap sets (UNTIL
-    /// progress re-arms it), the empty count advances, and — when the
-    /// setpoint allows — the no-think rescue arms for the very next model
+    /// progress re-arms it), the empty count advances, and - when the
+    /// setpoint allows - the no-think rescue arms for the very next model
     /// call, going STICKY on the second empty of the Turn.
     pub fn note_fired(&mut self) {
         self.empty_count += 1;
@@ -100,7 +100,7 @@ impl Empty {
     }
 
     /// Consumes the one-Pass rescue arm: the rescue rides exactly the Pass
-    /// right after the Empty-response Nudge fired — unless it has gone sticky.
+    /// right after the Empty-response Nudge fired - unless it has gone sticky.
     pub fn consume_rescue(&mut self) {
         self.rescue_next = false;
     }

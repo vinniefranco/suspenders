@@ -1,4 +1,4 @@
-//! Scout — the disposable read-only worker the model dispatches through the
+//! Scout - the disposable read-only worker the model dispatches through the
 //! explore Tool (CONTEXT.md). It searches the Project Root in its own fresh
 //! Conversation against the same model connection, with a hard Pass cap and a
 //! read-only Tool subset (read_file, list_files, grep), and returns a
@@ -6,7 +6,7 @@
 //!
 //! ## An effect, not part of the Turn loop
 //!
-//! Like [`crate::compaction`], the Scout calls the [`Llm`] boundary directly —
+//! Like [`crate::compaction`], the Scout calls the [`Llm`] boundary directly -
 //! it is an effect that lives outside the Turn loop (ADR-0011, ADR-0013). The
 //! explore Tool reaches it through the `scout` capture on the Tool ctx, which
 //! wires the Session's llm and connection. The Turn loop never sees the
@@ -203,7 +203,7 @@ impl Scout {
             // The report Pass offers no tools: the only move left is the
             // report. Otherwise the read-only Scout subset rides. Thinking is
             // off when the Scout runs no-think (ADR-0014). Both are expressed
-            // through the one typed request seam — no reach past it.
+            // through the one typed request seam - no reach past it.
             let tools_specs = if report_pass {
                 Vec::new()
             } else {
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some(false));
     }
 
-    // Mirrors baud's `Map.has_key?(request, :no_think)` — the wire field is
+    // Mirrors baud's `Map.has_key?(request, :no_think)` - the wire field is
     // the no-think key `chat_template_kwargs.enable_thinking == false`.
     fn has_no_think(req: &Value) -> bool {
         req.get("chat_template_kwargs")

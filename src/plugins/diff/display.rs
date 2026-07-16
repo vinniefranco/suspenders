@@ -5,8 +5,8 @@
 //! Extracted from [`crate::plugins::diff`] so the rendering logic is
 //! unit-testable without a Plugin lifecycle.
 //!
-//! Lines carry semantic styles — [`LineStyle::Added`], `Removed`, `Context`,
-//! `Muted` — that a later `ui/components` phase maps to terminal colors.
+//! Lines carry semantic styles - [`LineStyle::Added`], `Removed`, `Context`,
+//! `Muted` - that a later `ui/components` phase maps to terminal colors.
 
 use serde::{Deserialize, Serialize};
 

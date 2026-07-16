@@ -1,10 +1,10 @@
-//! Agent — the actor driving Turns for a Session (baud's `Baud.Agent`, ADR-0017).
+//! Agent - the actor driving Turns for a Session (baud's `Baud.Agent`, ADR-0017).
 //!
 //! A `tokio::spawn`ed task SOLELY owns the mutable state: the `Session`, the one
 //! `Conversation`, the `Approvals` fold, the Steering queue, the latest
 //! per-Tool-Result checkpoint, the Plan, the Session Log handle, and the
 //! `broadcast` Sender to subscribers. The UI, the headless driver, and tests
-//! talk ONLY to the Agent — never to a Turn — by sending [`Command`]s over an
+//! talk ONLY to the Agent - never to a Turn - by sending [`Command`]s over an
 //! `mpsc` channel and reading [`Event`]s off a `broadcast` channel. Single
 //! ownership serializes the state without shared locks and fixes one
 //! deterministic Event order (ADR-0017).
@@ -23,7 +23,7 @@
 //! the public Commands use, so the single owner serializes them and Event order
 //! is the owner's order. Fire-and-forget effects (`emit`, `checkpoint`,
 //! `set_plan`, `compacted`) are plain sends; `drain_steering` and
-//! `request_approval` carry a `oneshot` reply — the Agent owns the Steering
+//! `request_approval` carry a `oneshot` reply - the Agent owns the Steering
 //! queue (a dead Turn cannot hand back its mailbox) and consults the Standing
 //! Approvals when relaying (an auto-approve emits `approval_auto` and answers
 //! the reply immediately; the Turn cannot tell the difference).
@@ -96,7 +96,7 @@ pub enum Resume {
 /// prompt override, and an optional Resume.
 pub struct StartOpts {
     /// A prebuilt Session (the fixed facts). When `None`, the caller must supply
-    /// one — the Rust port has no ambient config default at this seam, so tests
+    /// one - the Rust port has no ambient config default at this seam, so tests
     /// and the app build the Session and pass it here.
     pub session: Session,
     /// The LLM boundary, injected per instance (ADR-0020). The real
@@ -204,7 +204,7 @@ pub enum TurnMsg {
 pub enum Command {
     Submit(String, oneshot::Sender<Result<(), Busy>>),
     Steer(String, oneshot::Sender<Result<(), Idle>>),
-    /// Swap the Active Model (ADR-0033). Takes effect on the next Turn — an
+    /// Swap the Active Model (ADR-0033). Takes effect on the next Turn - an
     /// in-flight Turn is unaffected. No-op semantics (re-selecting the current
     /// model) are the caller's job in a later phase, not here.
     SetModel(String, oneshot::Sender<()>),
@@ -261,7 +261,7 @@ impl AgentHandle {
         // Resume BEFORE opening the new log (baud, ADR-0010): root mismatch fails
         // loudly; other drift yields to the new Session and is reported. One fold
         // yields the messages, the Transcript-facing `ResumeInfo`, AND the two
-        // governance facts below — no re-reading the log for the Plan or the
+        // governance facts below - no re-reading the log for the Plan or the
         // recovery count.
         let (resumed_messages, resume_info, governance) = maybe_resume(resume, &session)?;
 
@@ -316,7 +316,7 @@ impl AgentHandle {
         // CONTEXT.md: Active Model), seeded from the Session's connection at
         // launch. Each Turn is spawned with a snapshot of THIS connection, so a
         // `SetModel` between Turns lands on the next Turn and an in-flight Turn
-        // is unaffected. Only `model` ever changes on it — the endpoint, output
+        // is unaffected. Only `model` ever changes on it - the endpoint, output
         // cap, and temperature stay as launched, so nothing derived re-validates.
         let connection = session.connection.clone();
 
@@ -346,7 +346,7 @@ impl AgentHandle {
     }
 
     /// Subscribes to the Agent's Event stream (baud's `subscribe/1`). A dropped
-    /// receiver auto-cleans (tokio broadcast semantics — see the module note in
+    /// receiver auto-cleans (tokio broadcast semantics - see the module note in
     /// `agent.rs` tests).
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
@@ -397,8 +397,8 @@ impl AgentHandle {
     }
 
     /// Lists the models the Active Model's endpoint offers (ADR-0033), by
-    /// asking the Agent — the owner of the `Llm` and the mutable `connection`
-    /// — so the listed endpoint always matches the model the next Turn will
+    /// asking the Agent - the owner of the `Llm` and the mutable `connection`
+    /// - so the listed endpoint always matches the model the next Turn will
     /// call. The Agent fetches off its actor loop; this awaits the reply. A
     /// dead Agent (or a dropped reply) surfaces as `Err`, matching the
     /// boundary's fallible shape.
@@ -473,7 +473,7 @@ struct AgentState {
     session: Session,
     // The Active Model as mutable Agent state (ADR-0033, CONTEXT.md: Active
     // Model): an owned Connection seeded from `session.connection` at launch and
-    // read — not `session.connection` — when spawning a Turn. `Command::SetModel`
+    // read - not `session.connection` - when spawning a Turn. `Command::SetModel`
     // swaps only its `model` field; everything else stays as launched, so no
     // Session fact is re-derived or re-validated.
     connection: Connection,
@@ -498,7 +498,7 @@ struct AgentState {
     steering: Vec<String>,
     compaction: Compaction,
     // Recovery Turns consumed serving the CURRENT user request (CONTEXT.md:
-    // Recovery Turn — the Setpoint bounds recoveries per user request, not
+    // Recovery Turn - the Setpoint bounds recoveries per user request, not
     // per Turn). Cross-Turn state lives with the Agent: reset when a genuine
     // user prompt starts a new request (`Command::Submit`), NOT by Rollover
     // or a Recovery Turn; a Resume restores it from the folded log.
@@ -527,7 +527,7 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             } else {
                 // A genuine user prompt starts a new request: the recovery
                 // budget resets. Rollover starts its Turn via `start_turn`
-                // directly and keeps the count — its Steering missed a Turn
+                // directly and keeps the count - its Steering missed a Turn
                 // of the SAME request.
                 state.recoveries_used = 0;
                 start_turn(state, prompt);
@@ -555,8 +555,8 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         }
         Command::ListModels(reply) => {
             // Fetch OFF the actor (ADR-0011/0017: never block the actor loop on
-            // the network). Clone the boundary and the current connection — the
-            // Active Model's endpoint — so the listed endpoint always matches the
+            // the network). Clone the boundary and the current connection - the
+            // Active Model's endpoint - so the listed endpoint always matches the
             // model the next Turn will call, then answer the oneshot from the
             // spawned task.
             let llm = Arc::clone(&state.llm);
@@ -678,7 +678,7 @@ fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
     }
 }
 
-// A Standing Approval covering the exact string answers the Turn immediately —
+// A Standing Approval covering the exact string answers the Turn immediately -
 // no modal, an `approval_auto` event; the Turn cannot tell the difference.
 // Otherwise the request becomes pending and its reply channel is held until the
 // user's `approve` arrives (baud's approval_request handler).
@@ -816,8 +816,8 @@ fn start_turn(state: &mut AgentState, prompt: String) {
     spawn_turn(state);
 }
 
-// Spawns a Turn over the Agent's CURRENT Conversation (the prompt — user or
-// Voice — is already appended and logged by the caller).
+// Spawns a Turn over the Agent's CURRENT Conversation (the prompt - user or
+// Voice - is already appended and logged by the caller).
 fn spawn_turn(state: &mut AgentState) {
     reset_turn_state(state);
     // The AgentDeps wires each effect to the Agent's mpsc + the Session's Llm.
@@ -873,7 +873,7 @@ fn watch_turn(state: &mut AgentState, turn: tokio::task::JoinHandle<LoopOutcome>
             }
             Err(join_err) => {
                 let reason = if join_err.is_cancelled() {
-                    // abort() — Turn Settlement pairs this with the cancel flag.
+                    // abort() - Turn Settlement pairs this with the cancel flag.
                     Reason::atom("shutdown")
                 } else {
                     // A panic; close with the failure marker (baud's turn_error
@@ -892,8 +892,8 @@ fn watch_turn(state: &mut AgentState, turn: tokio::task::JoinHandle<LoopOutcome>
 // ---- Recovery Turn (CONTEXT.md: Recovery Turn) -------------------------------
 
 // Executes the Endgame Governor's close-and-open-a-Recovery-Turn Intervention:
-// the Governor judged (trigger + both Setpoints); the Agent — owner of the
-// Conversation and the Turn lifecycle — opens the next Turn. The prompt is the
+// the Governor judged (trigger + both Setpoints); the Agent - owner of the
+// Conversation and the Turn lifecycle - opens the next Turn. The prompt is the
 // Voice's: the only Turn whose prompt Suspenders authors.
 fn start_recovery(state: &mut AgentState, recovery: Recovery) {
     state.recoveries_used += 1;
@@ -921,11 +921,11 @@ fn start_recovery(state: &mut AgentState, recovery: Recovery) {
 
 // The Handoff arm: the Recovery Turn task first seeds the fresh Conversation
 // (the compaction machinery's LLM narrative + mechanical facts + the
-// verification verbatim + the prompt — a long LLM call, so it runs in the Turn
+// verification verbatim + the prompt - a long LLM call, so it runs in the Turn
 // task, never on the Agent actor, per ADR-0012), posts the seed back
 // (`HandoffSeeded` logs it and retires the old Conversation), then runs the
 // Turn over the seeded Conversation. The Plan is harness-owned and rides
-// RunOpts verbatim — it survives the retirement untouched. `failing_command`
+// RunOpts verbatim - it survives the retirement untouched. `failing_command`
 // (the Dangling Failure the recovery names, `None` on an unverified-writes
 // recovery) tells the seed which command's result to carry verbatim.
 fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: Option<String>) {
@@ -934,7 +934,7 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
     let compaction = state.compaction.clone();
     let llm = Arc::clone(&state.llm);
     // A snapshot of the Agent's mutable connection (the Active Model), as
-    // `spawn_turn` does — the seed narrative and the Recovery Turn both run on
+    // `spawn_turn` does - the seed narrative and the Recovery Turn both run on
     // the model current at spawn (ADR-0033).
     let connection = state.connection.clone();
     let session = state.session.clone();
@@ -997,7 +997,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
 
     // The Endgame Governor's recovery directive, held aside: the Turn settles
     // exactly like an Ok limit close first, then the Agent executes the
-    // opening. A cancel that raced the close wins — cancel means stop
+    // opening. A cancel that raced the close wins - cancel means stop
     // everything, recovery included.
     let recovery = match (&outcome, state.cancel_flag) {
         (LoopOrDown::Loop(LoopOutcome::Recover(_, _, recovery)), false) => Some(recovery.clone()),
@@ -1032,7 +1032,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
 
     // Rollover outranks recovery: rolled-over Steering is the user's voice
     // continuing the same request, which is itself the bounded continuation
-    // the recovery would have bought — and the recovery budget stays unspent.
+    // the recovery would have bought - and the recovery budget stays unspent.
     match resolution.rollover {
         Rollover::Submit(prompt) => start_turn(state, prompt),
         Rollover::None => {
@@ -1062,7 +1062,7 @@ fn to_settlement_outcome(outcome: LoopOrDown) -> Outcome {
         LoopOrDown::Loop(LoopOutcome::Error) => {
             Outcome::Error(Reason::atom("context_budget_exhausted"))
         }
-        // A panic or an abort — settlement tells them apart via the cancel flag.
+        // A panic or an abort - settlement tells them apart via the cancel flag.
         LoopOrDown::Down(reason) => Outcome::Down(reason),
     }
 }
@@ -1070,7 +1070,7 @@ fn to_settlement_outcome(outcome: LoopOrDown) -> Outcome {
 fn outcome_stop_to_log(stop: OutcomeStop) -> StopReason {
     match stop {
         OutcomeStop::Reason(r) => r,
-        // A custom after-Pass Stop atom — the wired AgentDeps never produces one
+        // A custom after-Pass Stop atom - the wired AgentDeps never produces one
         // (its after_pass defaults to Continue). Degrade to Unknown.
         OutcomeStop::Custom(_) => StopReason::Unknown,
     }
@@ -1114,7 +1114,7 @@ fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
 /// The governance facts a Resume restores alongside the Conversation: the last
 /// logged Plan (held outside the Conversation) and the recoveries the logged
 /// request consumed (per-request bound). Computed in the single fold, so they
-/// never belong on the Transcript-facing [`ResumeInfo`] — the Agent threads
+/// never belong on the Transcript-facing [`ResumeInfo`] - the Agent threads
 /// them privately instead.
 #[derive(Default)]
 struct ResumedGovernance {

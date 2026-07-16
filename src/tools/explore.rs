@@ -7,8 +7,8 @@
 //!
 //! ## Never crashes the Turn
 //!
-//! Every Scout failure mode — an LLM error, empty findings, or hitting the
-//! Scout's hard Pass cap — comes back as an ordinary Tool Result. Failures are
+//! Every Scout failure mode - an LLM error, empty findings, or hitting the
+//! Scout's hard Pass cap - comes back as an ordinary Tool Result. Failures are
 //! `is_error` and carry a Voice-owned marker plus whatever partial findings the
 //! Scout gathered; a clean report is an ok result.
 

@@ -1,12 +1,12 @@
 //! `run_command(command)`: runs `bash -o pipefail -c command` in the Project Root with
 //! stdout and stderr merged, reporting the exit code. Approval-gated: the
 //! Approval seam ([`crate::approvals::gate_text`]) shows the user the command
-//! before it runs (web_fetch's URL is gated the same way — ADR-0024).
+//! before it runs (web_fetch's URL is gated the same way - ADR-0024).
 //!
 //! ADR-0023: the child runs in its OWN process group (`process_group(0)`);
 //! on timeout the whole group is signalled (`killpg`), and `kill_on_drop(true)`
 //! is a Cancellation backstop. Killing only the direct child would leak
-//! orphaned grandchildren. Unix-only by design — a future reader must not
+//! orphaned grandchildren. Unix-only by design - a future reader must not
 //! "simplify" this to `child.kill()`.
 
 use crate::tool::{Tool, ToolCtx, ToolSpec};
@@ -70,7 +70,7 @@ async fn spawn_and_wait(
     timeout_ms: u64,
 ) -> Result<String, String> {
     // bash with pipefail: a piped command must report the producer's failure,
-    // not the consumer's success — the Verify and failure Governors key on the
+    // not the consumer's success - the Verify and failure Governors key on the
     // exit code, and `cargo test | head` must not launder a red suite into
     // is_error=false.
     let mut cmd = tokio::process::Command::new("bash");

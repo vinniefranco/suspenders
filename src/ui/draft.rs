@@ -1,6 +1,6 @@
-//! Draft cursor geometry — the ONE owner of where the cursor sits in the
+//! Draft cursor geometry - the ONE owner of where the cursor sits in the
 //! Composer's draft (CONTEXT.md: the input area where the user authors the
-//! next prompt; NOT a line — drafts may span many).
+//! next prompt; NOT a line - drafts may span many).
 //!
 //! Both sides that reason about the draft cursor read from here:
 //!
@@ -16,14 +16,14 @@
 //!
 //! # Units
 //!
-//! The cursor is a CHAR index, not a byte offset and not a grapheme cluster —
+//! The cursor is a CHAR index, not a byte offset and not a grapheme cluster -
 //! this is the convention the whole codebase measures text in. A LOGICAL line
 //! is a hard line: the draft split on '\n'. Width-wrapping into VISUAL rows is
 //! a rendering concern (`ui::composer`) BUILT ON this logical geometry, never
 //! a re-derivation of it. No ratatui types cross this seam (ADR-0019): strings
 //! and char indices in, plain numbers out.
 
-/// The `(logical line, column)` of char index `cursor` — both counted in
+/// The `(logical line, column)` of char index `cursor` - both counted in
 /// chars. A logical line is a hard line (split on '\n'); the column is the
 /// char offset from that line's start. A cursor sitting ON a '\n' counts as
 /// the end of the line before it (its column equals that line's length).
@@ -45,13 +45,13 @@ pub fn line_col(value: &str, cursor: usize) -> (usize, usize) {
 }
 
 /// Each logical (hard) line's length in chars, top first. Never empty: an
-/// empty draft is one zero-length line — the cursor still needs a line to sit
+/// empty draft is one zero-length line - the cursor still needs a line to sit
 /// on.
 pub fn line_lengths(value: &str) -> Vec<usize> {
     value.split('\n').map(|l| l.chars().count()).collect()
 }
 
-/// The char index of `(logical line, col)` — the inverse of [`line_col`],
+/// The char index of `(logical line, col)` - the inverse of [`line_col`],
 /// counting one char per '\n' between lines. `col` must already be clamped to
 /// the line's length by the caller.
 pub fn cursor_at(value: &str, line: usize, col: usize) -> usize {

@@ -1,7 +1,7 @@
 //! The value threaded through one Tool Call's Plugin lifecycle (ADR-0007).
 //!
 //! Plug-inspired, not Plug: in baud the lifecycle spans two processes and
-//! three points in time, so there is no single `call/2` — the token carries
+//! three points in time, so there is no single `call/2` - the token carries
 //! what crosses those gaps instead. `assigns` is plugin state threading
 //! `pre_run` into `post_run`; `artifacts` is display-side data (CONTEXT.md:
 //! Artifact) that rides the `:tool_result` event to Presentment and never
@@ -12,7 +12,7 @@
 //!
 //! baud's Token holds `ctx :: Baud.Tool.ctx()` (a shared, cheaply-copied map)
 //! directly. The Rust [`ToolCtx`] is `Clone` (its `scout` capture is an
-//! `Arc`-backed effect), so the Token owns a `ToolCtx` by value — the same
+//! `Arc`-backed effect), so the Token owns a `ToolCtx` by value - the same
 //! ownership shape as baud, without threading a lifetime through the whole
 //! Plugin trait. The pipeline reads `token.ctx` for `Tools::execute` and for
 //! the Result Cap; a plugin may read it but never needs to mutate it.
@@ -25,7 +25,7 @@ use crate::tool::ToolCtx;
 
 /// The raw Tool Result a Plugin sees mid-pipeline: the content the model
 /// would see and whether it was an error. Mirrors baud's `Token.result/0`
-/// (`%{content, is_error}`) — distinct from [`crate::tools::ToolResult`] only
+/// (`%{content, is_error}`) - distinct from [`crate::tools::ToolResult`] only
 /// in that it is the in-flight, pre-Shaping value the `post_run` fold rewrites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenResult {

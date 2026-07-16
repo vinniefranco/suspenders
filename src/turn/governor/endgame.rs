@@ -1,16 +1,16 @@
 //! The Endgame Governor: the mechanical schedule by which a Turn ends at its
 //! Turn Limit (CONTEXT.md: Endgame, Governor; ADR-0015, ADR-0016, ADR-0026).
 //!
-//! * **Trigger**: the Pass position against the Turn Limit — Passes remaining
-//!   — plus the Ledger's unverified-writes fact (a principled cross-read:
+//! * **Trigger**: the Pass position against the Turn Limit - Passes remaining
+//!   - plus the Ledger's unverified-writes fact (a principled cross-read:
 //!   verification state is a Ledger fact, never a sibling Governor's state).
 //! * **Interventions**: uniquely, this Governor speaks at all three moments of
-//!   a Pass — it narrows the offered Tools at the request-shaping moment
+//!   a Pass - it narrows the offered Tools at the request-shaping moment
 //!   ([`narrowed_tools`]), rides the results tail at the answering moment
 //!   ([`tail_rider`]), and closes the Turn on the turn-limit marker at the
 //!   finish settlement ([`final_pass`], [`tool_insistent_text`],
 //!   [`limit_stop_reason`]).
-//! * **Setpoints**: the recovery pair ([`RecoverySetpoints`]) — `recovery_limit`
+//! * **Setpoints**: the recovery pair ([`RecoverySetpoints`]) - `recovery_limit`
 //!   (at most N Recovery Turns per user request, `0` disables the mechanic) and
 //!   `recovery_shape` (Handoff or Continuation). The schedule itself carries
 //!   none: its offsets (2, 1, 0 Passes remaining) ARE the mechanics, and the
@@ -18,10 +18,10 @@
 //!
 //! The Recovery Turn (CONTEXT.md): when this Governor closes a Turn at its
 //! Turn Limit and the Ledger says the work is demonstrably unfinished
-//! (unverified writes, or a Dangling Failure — a command string whose most
+//! (unverified writes, or a Dangling Failure - a command string whose most
 //! recent run this Turn failed), it issues the
 //! close-and-open-a-Recovery-Turn Intervention instead of the plain close
-//! ([`recovery`]) — evidence: 12 of 15 hard f5 runs died AT the cap, several
+//! ([`recovery`]) - evidence: 12 of 15 hard f5 runs died AT the cap, several
 //! one honest debugging turn from green (LOG.md cycles 005-006). The Agent
 //! executes the Intervention; this Governor only judges.
 //!
@@ -30,16 +30,16 @@
 //! classifier, the Scout's forced report Pass, the tool-less final Pass). Its
 //! schedule, counted in Passes remaining before the Turn Limit:
 //!
-//!   * **2 remaining** — the tail rider warns: the one-shot wrap-up warning,
+//!   * **2 remaining** - the tail rider warns: the one-shot wrap-up warning,
 //!     or the Verification Pass prompt in its place when writes are unverified
 //!     (the prompt subsumes the warning: verify now, the final Pass concludes).
-//!   * **1 remaining** — the Verification Pass (ADR-0016) when writes are
+//!   * **1 remaining** - the Verification Pass (ADR-0016) when writes are
 //!     unverified: the request offers run_command ONLY, so a capped Turn cannot
 //!     end unverified for lack of opportunity. The tail rider is the final-Pass
 //!     prompt either way: tools are about to be withdrawn.
-//!   * **0 remaining (the final Pass)** — no tools offered (ADR-0015): the only
-//!     move left is the conclusion. A reply that still insists on tools — as
-//!     real tool_use blocks or as serialized markup in plain text — closes on
+//!   * **0 remaining (the final Pass)** - no tools offered (ADR-0015): the only
+//!     move left is the conclusion. A reply that still insists on tools - as
+//!     real tool_use blocks or as serialized markup in plain text - closes on
 //!     the turn-limit marker instead of passing as a conclusion.
 //!
 //! Every query is a pure function over the Pass position and the Turn
@@ -56,7 +56,7 @@ use crate::turn::governor::failure;
 use crate::turn::governor::ledger::Ledger;
 use crate::voice;
 
-/// The Endgame Governor's recovery Setpoints (CONTEXT.md: Setpoint —
+/// The Endgame Governor's recovery Setpoints (CONTEXT.md: Setpoint -
 /// resolved by the Session once at launch and fed to the Governor that owns
 /// them). Defaults mirror the shipped config: one Recovery Turn per user
 /// request, Handoff-shaped.
@@ -80,19 +80,19 @@ impl Default for RecoverySetpoints {
 
 /// The close-and-recover directive: the payload of
 /// [`super::FinishIntervention::CloseRecover`], carried out of the Turn to the
-/// Agent (which executes the Intervention — opening the next Turn, or seeding
+/// Agent (which executes the Intervention - opening the next Turn, or seeding
 /// the fresh Conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovery {
     /// The arm to take, from the shape Setpoint.
     pub shape: RecoveryShape,
     /// Why the work is unfinished: `true` when a verification is failing (a
-    /// Dangling Failure — a command string whose most recent run this Turn
-    /// failed), `false` when writes went unverified — the fact the Voice's
+    /// Dangling Failure - a command string whose most recent run this Turn
+    /// failed), `false` when writes went unverified - the fact the Voice's
     /// recovery prompt is parameterized with.
     pub verification_failing: bool,
     /// The Dangling Failure's command string, so the Handoff seed can carry
-    /// that command's OWN failing result verbatim — the command the recovery
+    /// that command's OWN failing result verbatim - the command the recovery
     /// prompt names, never merely the last command run (ADR-0028 addendum
     /// 2026-07-14). `None` on an unverified-writes-only recovery (nothing
     /// dangles), which keeps the pre-existing last-command seed.
@@ -103,7 +103,7 @@ pub struct Recovery {
 /// closing the Turn at its Turn Limit: `Some` when the Ledger says the work
 /// is demonstrably unfinished (unverified writes, or a Dangling Failure) and
 /// the request's recovery budget is not spent. The failing arm is
-/// dangling-failure-based, not last-command-only — a red full-suite run
+/// dangling-failure-based, not last-command-only - a red full-suite run
 /// followed by a green filtered rerun (observed live) must not read as
 /// green. The dangling-failure arm additionally requires that a write landed
 /// this Turn: a failing command during pure exploration is not unfinished
@@ -136,12 +136,12 @@ pub enum TailRider {
 
 /// The Endgame's narrowing of the offered Tools, answered directly: `Some` of
 /// no specs on the final Pass (ADR-0015), `Some` of run_command only on the
-/// Verification Pass (ADR-0016 — one Pass before the limit with unverified
-/// writes), and `None` outside the schedule — no narrowing, the full registry
+/// Verification Pass (ADR-0016 - one Pass before the limit with unverified
+/// writes), and `None` outside the schedule - no narrowing, the full registry
 /// rides (which is the firing site's default, never built here).
 ///
 /// The unverified state cannot drift between the Verification Pass prompt (the
-/// previous Pass's tail) and this request — no tool runs in between. A path
+/// previous Pass's tail) and this request - no tool runs in between. A path
 /// that never carried the prompt (a verify-nudged finish) still narrows here;
 /// the nudge's own wording is the prompt in that path.
 pub fn narrowed_tools(pass: u64, turn_limit: u64, ledger: &Ledger) -> Option<Vec<ToolSpec>> {
@@ -181,16 +181,16 @@ pub fn final_pass(pass: u64, turn_limit: u64) -> bool {
 }
 
 /// May a finish Nudge send the model back for one more Pass? False at the Turn
-/// Limit — the limit bounds every Nudge (CONTEXT.md).
+/// Limit - the limit bounds every Nudge (CONTEXT.md).
 pub fn can_loop(pass: u64, turn_limit: u64) -> bool {
     pass < turn_limit
 }
 
 /// The stop reason for a Turn closing at its limit: `TurnLimitStuck` when the
-/// Turn has been stuck in a recent failure loop ([`failure::stuck`] — the
+/// Turn has been stuck in a recent failure loop ([`failure::stuck`] - the
 /// failure Governor's one exported predicate over the Ledger's failure
-/// tallies; one set of setpoints, two readers — ADR-0026), `TurnLimit`
-/// otherwise — so Settlement and the UI can distinguish "ran out of turns
+/// tallies; one set of setpoints, two readers - ADR-0026), `TurnLimit`
+/// otherwise - so Settlement and the UI can distinguish "ran out of turns
 /// productively" from "ran out of turns while stuck."
 pub fn limit_stop_reason(ledger: &Ledger) -> StopReason {
     if failure::stuck(ledger) {
@@ -202,7 +202,7 @@ pub fn limit_stop_reason(ledger: &Ledger) -> StopReason {
 
 /// Tool insistence as text (seen live TWICE on the forced final Pass): the
 /// visible text carries a serialized tool call, in the markup Qwen emits when
-/// the request offers no tools to parse against — once leading the response,
+/// the request offers no tools to parse against - once leading the response,
 /// once after a one-sentence preamble. Detection is line-anchored: a line that
 /// IS markup means the model is still trying to work; the markup string
 /// appearing inline in prose is still a conclusion. A final-Pass reply carrying
@@ -431,7 +431,7 @@ mod tests {
         // The exact bug (session 20260714-174034): a read-only task ran a
         // failing command (a `head`-truncated pipe reporting a spurious 101),
         // never wrote, and settled green at the cap. With zero writes the
-        // dangling-failure arm must NOT fire — that is exploration, not
+        // dangling-failure arm must NOT fire - that is exploration, not
         // unfinished implementation.
         let mut ledger = Ledger::new(25);
         ledger.record_result(

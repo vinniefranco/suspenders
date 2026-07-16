@@ -1,4 +1,4 @@
-//! The Voice (CONTEXT.md): every Suspenders-voiced string the model reads —
+//! The Voice (CONTEXT.md): every Suspenders-voiced string the model reads -
 //! the system prompt, the Nudges, and the markers that enter the
 //! Conversation. The boundary is voice, not arity: wording may be
 //! parameterized, but Suspenders authors it.
@@ -6,7 +6,7 @@
 //! Wording is the highest-leverage tuning surface for small local models;
 //! owning it in one module means swapping wordings model-by-model touches one
 //! file. Strings a tool produces about its own execution (path-bearing errors)
-//! stay in that tool — only Suspenders' own steering text lives here.
+//! stay in that tool - only Suspenders' own steering text lives here.
 //!
 //! Everything returned here either enters the Conversation or is the system
 //! prompt. Markers are bracketed (`[...]`) so a small model can tell the Voice
@@ -61,7 +61,7 @@ pub fn elision_marker() -> &'static str {
 const WRITE_INPUT_ELISION: &str = "[edit body elided - the file on disk holds the result]";
 
 /// Eviction's husk for a dead write input: valid JSON keeping the narrative
-/// spine — the path survives, the edit body does not. Replaces the `input` of
+/// spine - the path survives, the edit body does not. Replaces the `input` of
 /// a successful edit_file/write_file Tool Call once its result has landed.
 pub fn write_input_husk(path: Option<&str>) -> serde_json::Value {
     match path {
@@ -77,7 +77,7 @@ pub fn is_write_input_husk(input: &serde_json::Value) -> bool {
 }
 
 /// Marker replacing a run_command Tool Result superseded by an identical later
-/// run in the same Turn (CONTEXT.md: Supersession — the newest result always
+/// run in the same Turn (CONTEXT.md: Supersession - the newest result always
 /// survives verbatim).
 pub fn superseded_command_marker() -> &'static str {
     "[superseded by a newer run of this command below]"
@@ -118,7 +118,7 @@ pub fn anchor(task: &str, plan: Option<&str>) -> String {
 /// already placing, when the Plan has not changed in more than
 /// `plan_stale_after` Passes while writes landed (PROPOSALS.md #4: the f5
 /// audit's stale "Next step" refreshed as authoritative guidance for 20
-/// Passes). Deliberately conditional and low-pressure — a 9B over-reads
+/// Passes). Deliberately conditional and low-pressure - a 9B over-reads
 /// imperatives (LOG.md cycle 002); "if it no longer matches reality" leaves
 /// the model free to conclude it still matches.
 pub fn stale_plan_line(passes: u64) -> String {
@@ -154,10 +154,10 @@ pub fn turn_limit_marker() -> &'static str {
     "[turn limit reached - reply to continue]"
 }
 
-/// The Recovery Turn's prompt (CONTEXT.md: Recovery Turn — the only Turn
+/// The Recovery Turn's prompt (CONTEXT.md: Recovery Turn - the only Turn
 /// whose prompt Suspenders authors). Parameterized on the Ledger fact that
 /// triggered it: the last verification failing, or writes left unverified.
-/// Deliberately short and mechanical — a 9B over-reads long imperatives
+/// Deliberately short and mechanical - a 9B over-reads long imperatives
 /// (LOG.md cycle 002).
 pub fn recovery_prompt(verification_failing: bool) -> &'static str {
     if verification_failing {
@@ -168,7 +168,7 @@ pub fn recovery_prompt(verification_failing: bool) -> &'static str {
 }
 
 /// The Handoff seed's final-verification section (CONTEXT.md: Handoff): the
-/// newest run_command Tool Result of the dying Conversation, verbatim —
+/// newest run_command Tool Result of the dying Conversation, verbatim -
 /// appended mechanically outside the LLM output, like every compaction fact.
 pub fn handoff_verification(result: Option<&str>) -> String {
     let body = result.unwrap_or("- none was run");

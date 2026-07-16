@@ -1,14 +1,14 @@
 //! Supersession (CONTEXT.md): the rule that classifies Conversation content
-//! as dead. Two classifiers, both mechanical — what they classify is correct
+//! as dead. Two classifiers, both mechanical - what they classify is correct
 //! or incorrect, never a judgment call:
 //!
 //! * A successful write's input body is dead once its result lands: the file
-//!   on disk holds the result. A FAILED edit's input is NOT dead — the model
-//!   may need to see what it tried against the error — until a later
+//!   on disk holds the result. A FAILED edit's input is NOT dead - the model
+//!   may need to see what it tried against the error - until a later
 //!   successful write to the same file supersedes the attempt chain.
 //! * A run_command or read_file Tool Call identical to a LATER call in the
-//!   same Turn — full `(name, input)` equality, the same identity the
-//!   duplicate Governor uses — leaves its older result dead. The newest
+//!   same Turn - full `(name, input)` equality, the same identity the
+//!   duplicate Governor uses - leaves its older result dead. The newest
 //!   result always survives verbatim.
 //!
 //! The recency guard is symmetric: the last two tool-result-bearing user
@@ -28,7 +28,7 @@ use super::turn_boundary;
 // turn dependency.
 const WRITE_TOOLS: &[&str] = &["edit_file", "write_file"];
 
-/// The tool kind of a superseded Tool Result — the classification supersession
+/// The tool kind of a superseded Tool Result - the classification supersession
 /// makes when it marks a Result dead. Voice owns the marker wording (ADR-0008);
 /// this only names which kind it is, so the one seam that needs the text routes
 /// to the right Voice function instead of round-tripping through a string.
@@ -54,7 +54,7 @@ impl ResultKind {
 /// One dead block: where it sits and which husk replaces it at wave time.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Dead {
-    /// A write's input body — the file on disk holds the result.
+    /// A write's input body - the file on disk holds the result.
     WriteInput {
         msg_index: usize,
         block_index: usize,
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(dead_blocks(&messages), vec![]);
 
         // With two more exchanges appended, the guard moves on and both
-        // become classifiable — plus t3's older duplicate of the command.
+        // become classifiable - plus t3's older duplicate of the command.
         let [a, b] = exchange(
             tool_use("t3", "run_command", cmd.clone()),
             result("t3", "ok"),

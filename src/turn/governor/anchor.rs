@@ -1,20 +1,20 @@
-//! The anchor Governor: when the Anchor — an injected copy of the Plan and
-//! the original task — is placed near the Conversation's tail, so the goal
+//! The anchor Governor: when the Anchor - an injected copy of the Plan and
+//! the original task - is placed near the Conversation's tail, so the goal
 //! always sits where a small model actually attends (CONTEXT.md: Anchor,
 //! Governor; ADR-0026).
 //!
-//! * **Trigger**: no private state — both inputs are Ledger facts: the Pass
+//! * **Trigger**: no private state - both inputs are Ledger facts: the Pass
 //!   position for the periodic cadence, and the compacted-since-tail flag
-//!   ("An Anchor is refreshed immediately after every Compaction" —
+//!   ("An Anchor is refreshed immediately after every Compaction" -
 //!   CONTEXT.md).
 //! * **Interventions**: rides the results tail at the answering moment
 //!   ([`Anchor::due`] answers, the arbiter issues the
 //!   [`Rider::Anchor`](super::Rider::Anchor)). Placement only: an Anchor's
-//!   content is the Plan's — the model's voice, never authored by a Governor
-//!   — and an Anchor is routine, not corrective (it is no Nudge). The one
+//!   content is the Plan's - the model's voice, never authored by a Governor
+//!   - and an Anchor is routine, not corrective (it is no Nudge). The one
 //!   Voice line this Governor adds ([`Anchor::stale_plan`]) rides BELOW the
 //!   Anchor, never inside the Plan's content.
-//! * **Setpoints**: [`Setpoints`] — the placement interval, in Passes
+//! * **Setpoints**: [`Setpoints`] - the placement interval, in Passes
 //!   (0 disables the periodic cadence; the post-Compaction refresh still
 //!   fires), and `plan_stale_after`, the Passes a Plan may go unchanged
 //!   while writes land before each Anchor carries the stale-plan line.
@@ -32,7 +32,7 @@ pub struct Setpoints {
     /// Place an Anchor every this-many Passes; 0 disables the periodic
     /// cadence (the post-Compaction refresh is unconditional).
     pub interval: u64,
-    /// The Passes a Plan may sit unchanged — while writes land — before an
+    /// The Passes a Plan may sit unchanged - while writes land - before an
     /// Anchor carries the stale-plan line (PROPOSALS.md #4: the f5 audit's
     /// pass-5 plan re-injected verbatim for 20 Passes of debugging).
     pub plan_stale_after: u64,
@@ -67,11 +67,11 @@ impl Anchor {
     }
 
     /// The stale-plan opinion: the Plan exists, has not changed in more than
-    /// `plan_stale_after` Passes, and writes have landed since — the Anchor
+    /// `plan_stale_after` Passes, and writes have landed since - the Anchor
     /// being placed carries the stale-plan line, parameterized by the
     /// returned Pass count (the Voice owns the wording). A stale Plan during
-    /// pure reading is not stale, just not yet actionable — hence the writes
-    /// gate — and while the condition holds the line rides EVERY Anchor
+    /// pure reading is not stale, just not yet actionable - hence the writes
+    /// gate - and while the condition holds the line rides EVERY Anchor
     /// (Anchors are periodic; a one-shot line would scroll into the same
     /// rot). Both inputs are Ledger facts: `None` from the Ledger means no
     /// Plan exists, and no Plan cannot be stale.

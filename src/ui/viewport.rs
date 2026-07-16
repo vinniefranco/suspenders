@@ -1,7 +1,7 @@
-//! UI Viewport — the pure, bottom-anchored scroll state of the transcript
+//! UI Viewport - the pure, bottom-anchored scroll state of the transcript
 //! view. Lives in its own module because `ui.rs` is untested-by-design
 //! (ADR-0001's split): the scroll rules are all here, all unit-tested, and
-//! plain `usize` in/out — no ratatui types (ADR-0019); the adapter saturates
+//! plain `usize` in/out - no ratatui types (ADR-0019); the adapter saturates
 //! to `u16` only at the ratatui boundary, since long sessions can exceed
 //! `u16` wrapped lines.
 //!
@@ -11,13 +11,13 @@
 //!   wrapped line is always the bottom line of the viewport, however much
 //!   content streams in.
 //! * **Scrolling up unpins**, and the first step lands exactly `n` lines
-//!   above the tail — never at the top of the session.
+//!   above the tail - never at the top of the session.
 //! * **Unpinned is stationary**: the state is an absolute top offset into the
 //!   wrapped content, so new content appending below never moves what the
 //!   user is reading.
 //! * **Only user actions re-pin**: a downward scroll that reaches/passes the
 //!   tail, or an explicit [`Viewport::pin_bottom`] (prompt submit). Agent
-//!   events — turn end, streaming — never call in here.
+//!   events - turn end, streaming - never call in here.
 //! * **Clamped both ends**: the top offset stays in
 //!   `[0, total_lines - height]`; when the content fits the viewport,
 //!   scrolling is a no-op and the view starts at the top (offset 0).
@@ -35,7 +35,7 @@ pub const WHEEL_LINES: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
     /// Absolute top-line offset into the wrapped content. Only meaningful
-    /// while unpinned — pinned derives the offset from geometry, so the tail
+    /// while unpinned - pinned derives the offset from geometry, so the tail
     /// is followed without any per-frame mutation.
     top: usize,
     /// Whether the view follows the tail.
@@ -103,7 +103,7 @@ impl Viewport {
     }
 
     /// Pins to the tail ([`Effect::PinBottom`](crate::ui::transcript::Effect)
-    /// — prompt submit and other explicit user actions only).
+    /// - prompt submit and other explicit user actions only).
     pub fn pin_bottom(&mut self) {
         self.pinned = true;
         self.top = 0;

@@ -1,4 +1,4 @@
-//! The event vocabulary between the Turn, the Agent, and the Transcript — one
+//! The event vocabulary between the Turn, the Agent, and the Transcript - one
 //! authoritative enumeration of every shape that flows as a turn/agent event
 //! (baud's `{:turn_event, ...}` / `{:baud_event, ...}` payloads).
 //!
@@ -14,9 +14,9 @@
 //!
 //! An event the Transcript does not know is still silently ignored by its
 //! catch-all (baud's deliberate tolerance: a new event must not break an old
-//! subscriber) — that lives in the Transcript fold, not here.
+//! subscriber) - that lives in the Transcript fold, not here.
 //!
-//! baud has no `event_test.exs`, so there are no ported tests in this module —
+//! baud has no `event_test.exs`, so there are no ported tests in this module -
 //! just the exhaustive enum and the constructor helpers `Baud.Event` provides.
 
 use std::collections::HashMap;
@@ -73,7 +73,7 @@ pub enum VoicedTag {
 /// Every event shape the Turn and the Agent emit.
 ///
 /// The `artifacts` on [`Event::ToolResult`] is display-side Plugin data
-/// (CONTEXT.md: Artifact) — a `HashMap<String, Value>`, `{}` when no plugin
+/// (CONTEXT.md: Artifact) - a `HashMap<String, Value>`, `{}` when no plugin
 /// attached any; it never enters the Conversation, is never shaped or evicted.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -146,7 +146,7 @@ pub enum Event {
     },
     /// An Eviction wave fired while shaping a request (CONTEXT.md: Eviction,
     /// Dead Mass): the counts by kind and the Dead Mass share at wave time.
-    /// Display-side only — a wave rewrites the request copy, never the
+    /// Display-side only - a wave rewrites the request copy, never the
     /// Session Log (the log's schema is replay-sensitive; Resume re-applies
     /// waves request-time), so this event is how wave behavior gets vetted.
     EvictionWave {
@@ -182,7 +182,7 @@ pub enum Event {
         text: String,
     },
     /// An Anchor entered the Conversation (CONTEXT.md: Anchor). Placement is
-    /// the anchor Governor's; the content is the Plan's — the model's voice,
+    /// the anchor Governor's; the content is the Plan's - the model's voice,
     /// so it carries no [`VoicedTag`]. Routine rather than corrective, the
     /// Transcript ignores it; the Session Log persists it like every rider.
     Anchor {
@@ -190,7 +190,7 @@ pub enum Event {
     },
 
     /// A Recovery Turn opened (CONTEXT.md: Recovery Turn): carries the arm
-    /// taken and the Voice-authored prompt that starts it — the prompt enters
+    /// taken and the Voice-authored prompt that starts it - the prompt enters
     /// the Conversation, so the Transcript must show it.
     RecoveryTurn {
         shape: RecoveryShape,
@@ -199,7 +199,7 @@ pub enum Event {
 
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
     /// classified error and the attempt number against the budget. Silent to
-    /// the model's Conversation — nothing is appended — but never silent to
+    /// the model's Conversation - nothing is appended - but never silent to
     /// the operator: the Transcript shows an info line and the Session Log
     /// records a `retry` entry.
     Retry {
@@ -212,7 +212,7 @@ pub enum Event {
     /// A committed selector-opening Slash Command's rows arrived: the adapter
     /// fetched them (e.g. `/model`'s model list) and hands them back so the
     /// pure core flips its `Loading` overlay to a `Ready` [`SelectorRow`] list.
-    /// The core stays command-agnostic — it neither fetches nor interprets;
+    /// The core stays command-agnostic - it neither fetches nor interprets;
     /// these are opaque rows the generic selector filters and renders.
     SelectorReady(Vec<SelectorRow>),
     /// The adapter could not produce the rows (fetch failed, cache empty): the

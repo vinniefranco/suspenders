@@ -1,4 +1,4 @@
-//! Session Log — the JSONL persistence of a Session (CONTEXT.md, ADR-0010).
+//! Session Log - the JSONL persistence of a Session (CONTEXT.md, ADR-0010).
 //!
 //! One append-only JSONL file per Session: a header line carrying the
 //! Session's fixed facts, then one line per Conversation event, appended as
@@ -10,26 +10,26 @@
 //! message grows as results land, so message-granular appends would rewrite
 //! history):
 //!
-//!   * `user_text` — submit and Rollover alike
-//!   * `assistant_blocks` — each message-end, tool_use included; the fold
+//!   * `user_text` - submit and Rollover alike
+//!   * `assistant_blocks` - each message-end, tool_use included; the fold
 //!     repairs a dangling batch
-//!   * `tool_result` — per Tool Result
-//!   * `steering` — delivered Steering (user-voiced)
-//!   * `nudge` — a user-role Nudge (Verify Nudge, Explore Nudge). The fold
+//!   * `tool_result` - per Tool Result
+//!   * `steering` - delivered Steering (user-voiced)
+//!   * `nudge` - a user-role Nudge (Verify Nudge, Explore Nudge). The fold
 //!     merges it into an open tool-results batch when one is open (the Explore
 //!     Nudge rode that message live), else stands it alone (the Verify Nudge)
-//!   * `rider{tag, text}` — a results-tail rider the model read: the Anchor or
+//!   * `rider{tag, text}` - a results-tail rider the model read: the Anchor or
 //!     an Endgame prompt (wrap-up warning, Verification Pass prompt, final-Pass
 //!     prompt), logged as injected. The fold closes the open batch (every
 //!     result of the Pass precedes its riders) and re-injects the text through
 //!     the same merge seam the live Turn used
-//!   * `plan` — the model's Plan; held OUTSIDE the Conversation, so the fold
+//!   * `plan` - the model's Plan; held OUTSIDE the Conversation, so the fold
 //!     never turns it into a message; [`plan`] reads the last one back
-//!   * `message` — a verbatim Conversation message; seeds a fresh log on Resume
-//!   * `settled{outcome, stop_reason, reason}` — Turn Settlement; `reason` is
+//!   * `message` - a verbatim Conversation message; seeds a fresh log on Resume
+//!   * `settled{outcome, stop_reason, reason}` - Turn Settlement; `reason` is
 //!     forensic only (the fold ignores it)
 //!   * `compacted{summary, skip_count, tokens_before, file_ops, original_task}`
-//!     — Compaction: old messages replaced by a summary. On Resume the fold
+//!     - Compaction: old messages replaced by a summary. On Resume the fold
 //!     discards everything before this entry and emits just the reconstructed
 //!     summary message.
 //!
@@ -159,7 +159,7 @@ impl SettledEntry {
 }
 
 /// Which rider a `rider` entry carries: the Anchor or one of the Endgame's
-/// tail prompts. Forensic — every kind replays through the one tail-merge
+/// tail prompts. Forensic - every kind replays through the one tail-merge
 /// seam it rode live, so the tag never changes the fold's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiderTag {
@@ -232,7 +232,7 @@ pub enum Entry {
         verification: Option<String>,
     },
     /// The Voice-authored prompt that opened a Recovery Turn (CONTEXT.md:
-    /// Recovery Turn) — a Turn-starting prompt like `user_text`, but
+    /// Recovery Turn) - a Turn-starting prompt like `user_text`, but
     /// distinguishable as Suspenders' voice; `shape` is forensic. The fold
     /// merges it through the same seam the live path used, and
     /// [`recoveries_used`] counts these to restore the per-request bound.
@@ -242,8 +242,8 @@ pub enum Entry {
     },
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
     /// classified error and the attempt number against the budget, forensic
-    /// only. Silent to the model's Conversation — the failed draw produced
-    /// nothing to keep — so the fold emits no message; it is durable and
+    /// only. Silent to the model's Conversation - the failed draw produced
+    /// nothing to keep - so the fold emits no message; it is durable and
     /// visible so a silent-and-unlogged retry stays rejected.
     Retry {
         error: String,
@@ -332,7 +332,7 @@ impl Entry {
     }
 
     // Decode a JSON object into an entry. `None` means "valid JSON but not a
-    // valid entry shape" — the fold stops there, like a torn line.
+    // valid entry shape" - the fold stops there, like a torn line.
     fn from_json(m: &serde_json::Value) -> Option<Entry> {
         let e = m.get("e")?.as_str()?;
         match e {
@@ -534,14 +534,14 @@ fn utc_stamp() -> String {
         .unwrap_or_else(|_| "00000000-000000".into())
 }
 
-/// The header line's fixed facts — the DURABLE subset of the Session a Resume
+/// The header line's fixed facts - the DURABLE subset of the Session a Resume
 /// must reconcile: `root` (must match, else `RootMismatch`) plus `model`,
 /// `context_budget`, and `turn_limit` (drift-checked in [`drift`]; the resuming
 /// Session's value wins and the difference is reported). Everything else the
 /// Session resolves at launch is deliberately NOT persisted: Setpoints such as
 /// `eviction_slack` and `compaction_keep` are user-tunable (ADR-0031) and simply
 /// yield to the resuming Session's values, so they are neither logged nor
-/// drift-checked. When adding a Session field, decide which it is — a durable
+/// drift-checked. When adding a Session field, decide which it is - a durable
 /// fact (add it here AND to [`drift`]) or a Setpoint (omit it; it takes the
 /// resuming Session's value on Resume).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,7 +596,7 @@ pub struct SessionEntry {
     pub label: String,
 }
 
-/// Every Session Log in `dir`, NEWEST first — keyed by the sortable stamp
+/// Every Session Log in `dir`, NEWEST first - keyed by the sortable stamp
 /// filename, the same source [`latest`] sorts on. Unreadable or foreign files
 /// (a torn header included) are skipped, never a panic: the picker shows what
 /// it can and stays quiet about the rest.
@@ -618,7 +618,7 @@ pub fn list(dir: &str) -> Vec<SessionEntry> {
 }
 
 // One picker row, or `None` for a file that cannot be read or whose header is
-// not a Session Log header (foreign/torn — the same decode tolerance resume
+// not a Session Log header (foreign/torn - the same decode tolerance resume
 // takes, minus the error reporting: the picker just skips it).
 fn list_entry(dir: &str, name: &str) -> Option<SessionEntry> {
     let path = std::path::Path::new(dir)
@@ -693,7 +693,7 @@ fn human_stamp(name: &str) -> String {
 /// The last Plan logged in a Session Log file, or `None` when none was. Reads
 /// under the fold's torn-line tolerance: a torn line stops the scan (like
 /// [`resume`]), so this never returns a Plan the resumed Conversation would not
-/// see — it yields the last Plan logged BEFORE the first tear (or `None`). The
+/// see - it yields the last Plan logged BEFORE the first tear (or `None`). The
 /// Plan is a convenience, never load-bearing for Resume's correctness.
 pub fn plan(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -754,7 +754,7 @@ pub(crate) struct Resumed {
 /// Folds a log file into the messages of a Conversation.
 ///
 /// Returns `(messages, drift)` where `drift` lists header facts that differ
-/// from the resuming Session's — the new Session's facts win.
+/// from the resuming Session's - the new Session's facts win.
 /// `Err(RootMismatch)` when the Project Root differs.
 pub fn resume(path: &str, session: &Session) -> Result<(Vec<Message>, Vec<Drift>), ResumeError> {
     let r = resume_governed(path, session)?;
@@ -762,7 +762,7 @@ pub fn resume(path: &str, session: &Session) -> Result<(Vec<Message>, Vec<Drift>
 }
 
 /// Like [`resume`], but also returns the governance facts ([`Resumed::plan`],
-/// [`Resumed::recoveries`]) computed in the SAME single fold — so the Agent
+/// [`Resumed::recoveries`]) computed in the SAME single fold - so the Agent
 /// resumes the Plan and the recovery bound without re-reading the file. The two
 /// facts are derived from `entries`, which the loop below stops populating at
 /// the first torn line, so they inherit the fold's tolerance and match the
@@ -866,7 +866,7 @@ fn decode_line(line: &str) -> Option<serde_json::Value> {
 // ------------------------------------------------------------------
 
 // The open tool batch: the last assistant_blocks and the results/steering that
-// followed it, pending until the batch closes — mirroring how the Loop builds
+// followed it, pending until the batch closes - mirroring how the Loop builds
 // the live Conversation.
 struct Batch {
     blocks: Vec<ContentBlock>,
@@ -913,7 +913,7 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             None => messages.push(user_message(vec![text_block(text)])),
         },
         // A rider rode the trailing tool-results user message live, after
-        // every result of its Pass — the open batch is complete, so it can
+        // every result of its Pass - the open batch is complete, so it can
         // flush before the rider re-injects through the same merge seam
         // `apply_tail` used ([`conversation::merge_user_text`]; the Anchor's
         // `inject_anchor` IS that seam). The tag never varies the shape.
@@ -931,7 +931,7 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
         // A malformed-tool-call re-draw (ADR-0030) is silent to the model's
         // Conversation: the failed draw produced nothing to keep, so the entry
         // is forensic only and never becomes a message or disturbs an open
-        // batch — the re-issued request lands as the next assistant_blocks.
+        // batch - the re-issued request lands as the next assistant_blocks.
         Entry::Retry { .. } => {}
         Entry::AssistantBlocks(blocks) => {
             flush(messages, batch.take());
@@ -1020,7 +1020,7 @@ pub fn compose_summary(narrative: &str, original_task: Option<&str>, file_ops: &
 
 /// The Handoff seed (CONTEXT.md: Handoff): the compaction composition plus the
 /// final verification result verbatim. A `None` narrative is the degraded
-/// mechanical skeleton (the summarization call failed — bounded downside, the
+/// mechanical skeleton (the summarization call failed - bounded downside, the
 /// recovery still happens). One author for the live seeding
 /// ([`crate::compaction::Compaction::seed_handoff`]) and the fold's
 /// reconstruction, so Resume rebuilds the same bytes.
@@ -1707,7 +1707,7 @@ mod tests {
             });
         }
 
-        // No open batch: each rider merges into the trailing user message —
+        // No open batch: each rider merges into the trailing user message -
         // the same role-alternation rule the live seam applies. The log ends
         // mid-Turn, so the fold settles it as failed.
         let (messages, _) = resume(&log.path, &session).unwrap();
@@ -1933,11 +1933,11 @@ mod tests {
     // summary message", ADR-0021's test-as-spec): a LIVE compaction and the
     // fold of its logged `Compacted` entry must reconstruct byte-identical
     // Conversation messages. Both sides compose the summary through the single
-    // shared `compose_summary` helper — this crosses the seam BETWEEN them
+    // shared `compose_summary` helper - this crosses the seam BETWEEN them
     // (each side is tested alone above; nothing exercised the round trip). The
     // test drives the same builder ops into the Conversation and the Session
-    // Log in lockstep — exactly the "append every event as it happens" contract
-    // of ADR-0010 — runs a real `Compaction::run` over the head, then logs the
+    // Log in lockstep - exactly the "append every event as it happens" contract
+    // of ADR-0010 - runs a real `Compaction::run` over the head, then logs the
     // `Compacted` entry via the production path (`session_log_entry`, converted
     // the way `agent.rs` does) followed by the surviving tail. If someone
     // changed one composition path without the other (e.g. `apply_compaction`
@@ -1991,9 +1991,9 @@ mod tests {
         // Sanity: compaction actually folded something into one summary message.
         assert!(compacted.messages.len() < before.messages.len());
 
-        // Act (log): append the `Compacted` entry through the production path —
+        // Act (log): append the `Compacted` entry through the production path -
         // `session_log_entry` then the exact usize/Option conversion agent.rs
-        // performs — followed by the surviving tail as it would have been logged
+        // performs - followed by the surviving tail as it would have been logged
         // by the Turns that ran after the Compaction.
         let skip = Compaction::skip_count(&before, &compacted);
         let entry = new_state.session_log_entry(skip, 0);
@@ -2027,7 +2027,7 @@ mod tests {
         });
 
         // Assert: the folded Conversation equals the live-compacted one, message
-        // for message, byte for byte — the summary message at index 0 in
+        // for message, byte for byte - the summary message at index 0 in
         // particular (where the two composition paths meet).
         let (folded, drift) = resume(&log.path, &session).unwrap();
         assert_eq!(drift, Vec::new());
@@ -2116,7 +2116,7 @@ mod tests {
         let (messages, _) = resume(&log.path, &session).unwrap();
 
         // Everything before the handoff is gone; the seed message is the
-        // composed handoff plus the prompt merged onto the same message —
+        // composed handoff plus the prompt merged onto the same message -
         // byte-identical to the live seeding path.
         assert_eq!(messages.len(), 2);
         let composed = compose_handoff(
@@ -2359,7 +2359,7 @@ mod tests {
 
     // A torn HEADER line: [`plan`] and [`recoveries_used`] both skip line 1
     // unconditionally (header validation is [`resume`]'s job, not theirs), so a
-    // single torn header alone leaves nothing to scan — both read empty. The
+    // single torn header alone leaves nothing to scan - both read empty. The
     // point of the test is that the two agree, the consistency the fix
     // establishes; neither invents an entry from a log with no valid entries.
     #[test]

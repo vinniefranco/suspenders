@@ -2,7 +2,7 @@
 //!
 //! In baud these are plain atom-keyed maps told apart by a `:type`
 //! discriminator. In Rust they are serde-tagged domain enums (strong domain
-//! enums, `serde_json::Value` only at open edges — ADR: the tool_use `input`
+//! enums, `serde_json::Value` only at open edges - ADR: the tool_use `input`
 //! is the open edge, so it stays a `Value`).
 //!
 //! Thinking is NEVER stored in messages (CONTEXT.md); the `Thinking` variant
@@ -64,7 +64,7 @@ impl ContentBlock {
     }
 
     /// Is this block a Tool Call (`tool_use`)? A property of the content
-    /// itself — shared by the Turn loop's dispatch, the Scout's, and the
+    /// itself - shared by the Turn loop's dispatch, the Scout's, and the
     /// empty Governor's reply predicate.
     pub fn is_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ToolUse { .. })
@@ -100,7 +100,7 @@ impl Message {
     }
 }
 
-/// Token usage reported by the API. Kept flexible — every field optional —
+/// Token usage reported by the API. Kept flexible - every field optional -
 /// so partial/streamed usage maps deserialize without loss.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {

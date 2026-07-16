@@ -2,7 +2,7 @@
 //!
 //! Registry order is prompt order: the order the model sees the tool specs.
 //! [`execute`] turns every outcome into a `{content, is_error}` Tool Result, so
-//! a tool can never crash the Turn. [`run`] adds Shaping on top — the
+//! a tool can never crash the Turn. [`run`] adds Shaping on top - the
 //! plugin-free dispatch path.
 
 pub mod edit_file;
@@ -87,7 +87,7 @@ pub fn verification_specs() -> Vec<ToolSpec> {
 /// The Turn's batch (`turn::batch`) deliberately does NOT share this: it
 /// interleaves the Governor answering arbiter, the Plugin lifecycle, the
 /// Approval gate, Ledger recording, and per-result checkpointing around each
-/// call — none of which a read-only Scout has. The shared unit is only this
+/// call - none of which a read-only Scout has. The shared unit is only this
 /// plugin-free core.
 pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<ContentBlock> {
     let mut results = Vec::new();
@@ -106,7 +106,7 @@ pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<Conten
 }
 
 /// Blanks a malformed-input-tagged Tool Call input to an empty object. The LLM
-/// layer tags inputs whose JSON never decoded; never run those — let the tool's
+/// layer tags inputs whose JSON never decoded; never run those - let the tool's
 /// own validation reject an empty map.
 fn sanitize_input(input: &Value) -> Value {
     if malformed_tool_input(input).is_some() {
@@ -128,7 +128,7 @@ pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     result
 }
 
-/// Runs the named tool WITHOUT Shaping — the raw result. Input is validated
+/// Runs the named tool WITHOUT Shaping - the raw result. Input is validated
 /// against the tool's JSON Schema before execution; an unknown tool name and an
 /// `Err` return both come back as `is_error` results.
 pub async fn execute(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {

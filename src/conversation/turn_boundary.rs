@@ -1,7 +1,7 @@
 //! Turn boundaries (CONTEXT.md: Turn): the one rule that locates where a Turn
 //! begins in a Conversation slice. A Turn is one user request and everything
 //! the Agent does to answer it; a Conversation is a sequence of Turns. The
-//! Turn starts at a turn-start user message — role User with a Text first
+//! Turn starts at a turn-start user message - role User with a Text first
 //! block. A standalone rider (text appended after tool results) is NOT a
 //! boundary: its first block is a ToolResult, so a new user request always
 //! opens with the request text itself.
@@ -13,7 +13,7 @@
 
 use crate::content::{ContentBlock, Message, Role};
 
-/// Does this message open a Turn? True for a turn-start user message — role
+/// Does this message open a Turn? True for a turn-start user message - role
 /// User whose first content block is Text (the user's request). False for a
 /// standalone rider (a User message whose first block is a ToolResult), an
 /// assistant message, and an empty message.

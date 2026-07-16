@@ -3,24 +3,24 @@
 //! (CONTEXT.md: Governor, Setpoint, Nudge; ADR-0026).
 //!
 //! * **Trigger**: the Ledger's per-Tool consecutive-failure tallies and their
-//!   recency stamps — facts only; this Governor keeps no trigger state of its
+//!   recency stamps - facts only; this Governor keeps no trigger state of its
 //!   own (a streak resets on that Tool's next success, recorded at the firing
 //!   site).
-//! * **Interventions**: annotates a Tool Result at the answering moment —
+//! * **Interventions**: annotates a Tool Result at the answering moment -
 //!   from the threshold failure of one Tool onward, the "step back" suffix
 //!   rides the real result, summarising the kinds of errors seen
 //!   ([`annotation`]). Its judgment also informs the close at the finish
 //!   settlement: the Endgame's turn-limit stop reason reads [`stuck`] to
 //!   distinguish a stuck Turn from a productive one.
-//! * **Setpoints**: [`Setpoints`] — the annotation threshold and the stuck
+//! * **Setpoints**: [`Setpoints`] - the annotation threshold and the stuck
 //!   recency window. Neither is user-exposed: resolution at launch is the
 //!   [`Default`], because a Setpoint becomes user-configurable only when a
 //!   real model has demanded a different value (CONTEXT.md: Setpoint).
 //!
 //! [`stuck`] is deliberately this Governor's one exported pure predicate with
-//! two readers — the answering moment's annotation shares its threshold, and
+//! two readers - the answering moment's annotation shares its threshold, and
 //! Settlement's stop reason (via [`super::endgame::limit_stop_reason`]) shares
-//! the whole judgment — over one set of setpoints (ADR-0026). The wording
+//! the whole judgment - over one set of setpoints (ADR-0026). The wording
 //! lives in [`crate::voice`]; this module never authors nudge strings.
 
 use crate::turn::governor::ledger::Ledger;
@@ -48,7 +48,7 @@ impl Default for Setpoints {
 }
 
 /// Is the Turn stuck in a failure loop? True when any Tool has reached the
-/// consecutive-failure threshold AND that streak is recent — its last failure
+/// consecutive-failure threshold AND that streak is recent - its last failure
 /// landed within the final `stuck_recency` batches. A streak only resets on
 /// that Tool's next success, so without the recency requirement a Tool the
 /// model abandoned early and routed around would still label the Turn stuck
@@ -99,7 +99,7 @@ mod tests {
 
     // ----- consecutive-failure annotation -----
 
-    // Records one outcome and asks for the annotation the model would read —
+    // Records one outcome and asks for the annotation the model would read -
     // the fact write (Ledger) and the opinion (this module), composed the way
     // the answering arbiter composes them.
     fn annotated(ledger: &mut Ledger, name: &str, result: &ToolResult) -> Option<String> {

@@ -4,7 +4,7 @@
 //! Matching is a two-pass pipeline (DESIGN.md): (1) exact match; (2) only when
 //! exact finds zero matches, a whitespace-normalized fallback that compares
 //! lines with leading/trailing whitespace stripped and applies the edit
-//! preserving the file's real indentation — `new_str` is re-indented by the
+//! preserving the file's real indentation - `new_str` is re-indented by the
 //! per-line delta between `old_str` as given and the file's actual span.
 //! Whichever pass matches must match exactly one span; more than one is an
 //! error reporting the match count. When both passes find zero matches, the
@@ -278,7 +278,7 @@ fn closest_region(file_lines: &[&str], needle: &str) -> Option<String> {
 }
 
 // A trailing newline means "up to the end of that line", not "plus an empty
-// line" — drop it before line-windowing.
+// line" - drop it before line-windowing.
 fn split_lines(str: &str) -> Vec<String> {
     let trimmed = str.strip_suffix('\n').unwrap_or(str);
     trimmed.split('\n').map(|s| s.to_string()).collect()

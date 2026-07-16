@@ -1,11 +1,11 @@
-//! Markdown — the pure fold from markdown source to semantic terminal lines.
+//! Markdown - the pure fold from markdown source to semantic terminal lines.
 //!
 //! Assistant text arrives as raw markdown; this module renders it into
 //! [`MdLine`]s of [`MdSpan`]s carrying SEMANTIC styles ([`MdStyle`]), never
-//! colors — the one markdown-style → ratatui mapping lives in
+//! colors - the one markdown-style → ratatui mapping lives in
 //! [`crate::ui::components`] (`md_style`), the same move as ADR-0008's
 //! `LineStyle`. Pure data in/out like [`crate::ui::transcript`]: no ratatui,
-//! no state, no IO, and [`to_lines`] never panics — any input, including
+//! no state, no IO, and [`to_lines`] never panics - any input, including
 //! partial mid-stream markdown, produces reasonable lines.
 
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
@@ -34,11 +34,11 @@ pub struct MdSpan {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MdLine {
     pub spans: Vec<MdSpan>,
-    /// `Some(lang)` on every line inside a code block — the fence's info
+    /// `Some(lang)` on every line inside a code block - the fence's info
     /// string, lowercased and cut at the first word (```` ```Rust,ignore ````
     /// → `Some("rust")`). A bare ```` ``` ```` fence and indented code blocks
     /// carry `Some("")` (a code block with no language). `None` on every
-    /// non-code line. Still semantic — WHAT language, never a color; the
+    /// non-code line. Still semantic - WHAT language, never a color; the
     /// highlighting lives in components.rs (ADR-0008).
     pub code_lang: Option<String>,
 }
@@ -132,7 +132,7 @@ impl Fold {
                 self.push_span("───".to_string(), MdStyle::Plain);
                 self.flush();
             }
-            // Raw HTML degrades to its literal text — never dropped silently.
+            // Raw HTML degrades to its literal text - never dropped silently.
             Event::Html(html) | Event::InlineHtml(html) => self.text(&html),
             // Math/footnotes/tasklists are OFF (Options::empty()), but degrade
             // to their literal text if they ever arrive.
@@ -219,7 +219,7 @@ impl Fold {
             }
             // Tables/footnotes/definition lists/metadata are OFF by default;
             // if they ever arrive, their Text events flow through as plain
-            // content — structure degrades, content survives.
+            // content - structure degrades, content survives.
             _ => {}
         }
     }
@@ -348,7 +348,7 @@ impl Fold {
     }
 
     /// Emits the buffered code block: each source line is its own MdLine with
-    /// a single CodeBlock span, contents verbatim — internal blank lines
+    /// a single CodeBlock span, contents verbatim - internal blank lines
     /// survive as empty CodeBlock-span lines so the block reads as a unit.
     /// Every line carries the fence's language ([`MdLine::code_lang`]).
     fn end_code_block(&mut self) {

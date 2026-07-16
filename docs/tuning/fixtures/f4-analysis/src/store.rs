@@ -1,6 +1,6 @@
 //! Persistence: reads and writes the task database file.
 //!
-//! The format is deliberately simple — one task per line, four
+//! The format is deliberately simple - one task per line, four
 //! tab-separated fields:
 //!
 //! ```text

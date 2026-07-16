@@ -4,18 +4,18 @@
 //! Everything else speaks the plain typed shapes from DESIGN.md.
 //!
 //! Connection settings (endpoint, token, model, max_tokens, temperature)
-//! arrive as a [`Connection`] on every call — this module reads no config. The
+//! arrive as a [`Connection`] on every call - this module reads no config. The
 //! connection argument is the test seam: transport tests point one at a mock
 //! server; logic tests inject a [`test_support::FakeLlm`] behind the [`Llm`]
 //! trait (ADR-0020).
 //!
 //! ## Internal architecture
 //!
-//! - Request building (wire-format conversion) lives in [`request`] — pure, no
+//! - Request building (wire-format conversion) lives in [`request`] - pure, no
 //!   transport reference; it produces the complete payload this module sends.
-//! - SSE event decoding (the streaming state machine) lives in [`stream`] — a
+//! - SSE event decoding (the streaming state machine) lives in [`stream`] - a
 //!   pure fold, testable with canned event lists.
-//! - Emit pacing (the ~30fps UI accommodation) lives in [`throttle`] — a pure
+//! - Emit pacing (the ~30fps UI accommodation) lives in [`throttle`] - a pure
 //!   decision over caller-supplied clock ticks.
 //!
 //! [`AnthropicLlm`] wires the three together: reqwest for HTTP,
@@ -58,7 +58,7 @@ pub type OnEvent<'cb> = dyn FnMut(&StreamEvent) + Send + 'cb;
 ///
 /// `request` is the complete wire payload (build it with
 /// [`request::build_request`]). `on_event` gets one [`StreamEvent`] per
-/// text/thinking delta in arrival order — the delta plus the snapshot of
+/// text/thinking delta in arrival order - the delta plus the snapshot of
 /// blocks accumulated so far (open block included; consumers re-render
 /// statelessly). Snapshots carry the accumulated thinking block so the UI can
 /// render Thinking without bookkeeping; it is dropped from the returned
@@ -85,7 +85,7 @@ pub trait Llm: Send + Sync {
     async fn list_models(&self, connection: &Connection) -> Result<Vec<String>, String>;
 }
 
-/// The real boundary. Holds nothing config-ish — reads only the `connection`
+/// The real boundary. Holds nothing config-ish - reads only the `connection`
 /// argument on each call (ADR-0002, ADR-0020).
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicLlm;
@@ -118,7 +118,7 @@ impl Llm for AnthropicLlm {
 
         let resp = match sent {
             Ok(resp) => resp,
-            // Connection refused, DNS failure, etc. — no content streamed.
+            // Connection refused, DNS failure, etc. - no content streamed.
             Err(e) => return Response::error(format!("request_failed: {e}")),
         };
 
@@ -881,7 +881,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // FakeLlm (ADR-0020) — exercised here so the seam is covered.
+    // FakeLlm (ADR-0020) - exercised here so the seam is covered.
     // ------------------------------------------------------------------
 
     #[tokio::test]
@@ -925,7 +925,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // list_models — the read-only models-list endpoint (ADR-0002 amendment)
+    // list_models - the read-only models-list endpoint (ADR-0002 amendment)
     // ------------------------------------------------------------------
 
     async fn serve_models(server: &MockServer, status: u16, body: Value) {

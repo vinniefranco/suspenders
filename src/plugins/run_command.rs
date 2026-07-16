@@ -1,8 +1,8 @@
 //! The run_command exit-badge Plugin (ADR-0007), Stage 3 of the UI plan.
 //!
 //! [`post_run`](RunCommand::post_run) reads the exit code out of a run_command
-//! result — the `[exit code: N]` tail [`crate::tools::run_command::report`]
-//! owns — and attaches it (plus a timeout marker) as Artifacts. It never
+//! result - the `[exit code: N]` tail [`crate::tools::run_command::report`]
+//! owns - and attaches it (plus a timeout marker) as Artifacts. It never
 //! mutates model-facing content. [`present`](RunCommand::present) turns those
 //! Artifacts into a one-liner badge on the Tool Result summary: `✓ exit 0`,
 //! `✗ exit N`, or `✗ timed out`.
@@ -17,7 +17,7 @@
 //! NOTE / limitation: a FAILING run_command (`is_error: true`) now shows the
 //! `✗ exit N` badge, but its stdout/stderr no longer rides the transcript line
 //! (it stays in model content). That is the recede-machinery goal, and the
-//! Stage 2 review's C2 gap ("large non-diff results don't fold") — accepted for
+//! Stage 2 review's C2 gap ("large non-diff results don't fold") - accepted for
 //! Stage 3.
 
 use std::collections::HashMap;

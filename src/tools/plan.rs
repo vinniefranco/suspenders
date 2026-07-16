@@ -1,4 +1,4 @@
-//! `plan(plan)`: records the model's Plan (CONTEXT.md: Plan) — its statement
+//! `plan(plan)`: records the model's Plan (CONTEXT.md: Plan) - its statement
 //! of the current goal, the steps with their status, and the next step.
 //!
 //! The schema is deliberately tiny and flat (one required string) so a small

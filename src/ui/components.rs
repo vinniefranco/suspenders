@@ -1,4 +1,4 @@
-//! UI Components — the SINGLE mapping from the semantic display vocabulary
+//! UI Components - the SINGLE mapping from the semantic display vocabulary
 //! (ADR-0008) to ratatui `Style`/`Color`, plus the render helpers the frontend
 //! draws with.
 //!
@@ -6,7 +6,7 @@
 //! color for a Block's lines, [`PressureLevel`] → color/emphasis for the status
 //! bar. Plugins and the Transcript core never touch ratatui; they speak the
 //! vocabulary and this module renders it. Everything here is pure presentation
-//! of [`TranscriptItem`]s — no state, no IO. Only this module and [`crate::ui`]
+//! of [`TranscriptItem`]s - no state, no IO. Only this module and [`crate::ui`]
 //! `use ratatui` / `use crossterm` (ADR-0019 invariant).
 
 use std::sync::OnceLock;
@@ -78,7 +78,7 @@ pub fn md_style(style: MdStyle) -> Style {
 /// The ONE mapping from the semantic [`PressureLevel`] (ADR-0008) to the
 /// tokens segment's style: `Ok` reads muted, `Elevated` warns, `Critical`
 /// alarms. Segment form (fg ON a bg) because the status bar is a powerline of
-/// colored blocks — the semantics are unchanged, only the presentation moved
+/// colored blocks - the semantics are unchanged, only the presentation moved
 /// from colored text to colored blocks.
 pub fn pressure_style(level: PressureLevel) -> Style {
     match level {
@@ -93,7 +93,7 @@ pub fn pressure_style(level: PressureLevel) -> Style {
 
 /// The ONE mapping from a [`SegmentKind`] to its powerline segment style
 /// (ADR-0008: this is the only place segment semantics become colors). Every
-/// segment style carries a bg — the powerline separators are drawn from the
+/// segment style carries a bg - the powerline separators are drawn from the
 /// adjacent segments' bgs ([`segment_bg`]).
 pub fn segment_style(kind: SegmentKind) -> Style {
     match kind {
@@ -113,13 +113,13 @@ pub fn segment_style(kind: SegmentKind) -> Style {
         SegmentKind::Thinking | SegmentKind::Tools => {
             Style::default().fg(Color::DarkGray).bg(SEGMENT_DARK_BG)
         }
-        // Tokens keep the single PressureLevel mapping — segment_style only
+        // Tokens keep the single PressureLevel mapping - segment_style only
         // routes to it, it does not restate the colors.
         SegmentKind::Tokens(level) => pressure_style(level),
     }
 }
 
-/// A segment's background — what the powerline separator glyphs blend with.
+/// A segment's background - what the powerline separator glyphs blend with.
 fn segment_bg(kind: SegmentKind) -> Color {
     segment_style(kind).bg.unwrap_or(BAR_BG)
 }
@@ -129,7 +129,7 @@ fn segment_bg(kind: SegmentKind) -> Color {
 // ---------------------------------------------------------------------------
 
 /// The two connection facts the status bar shows (ADR-0033): the fixed endpoint
-/// and the mutable Active Model. Both are adapter-carried — the pure Transcript
+/// and the mutable Active Model. Both are adapter-carried - the pure Transcript
 /// core stays command-agnostic and holds neither. The adapter OWNS them as a
 /// [`ConnectionFacts`]; this is the borrowed form the render path takes, so
 /// both elements are always name-addressed, never a position-coupled pair.
@@ -142,7 +142,7 @@ pub struct ConnectionView<'a> {
     pub model: &'a str,
 }
 
-/// The adapter's owned copy of the two connection facts — the endpoint (a fixed
+/// The adapter's owned copy of the two connection facts - the endpoint (a fixed
 /// Session fact) and the Active Model (mutable Agent state the adapter refreshes
 /// after a `/model` pick). Named fields, never a `(String, String)` pair, so the
 /// two can't be swapped at a call site. Borrowed into a [`ConnectionView`] at the
@@ -164,7 +164,7 @@ impl ConnectionFacts {
 }
 
 /// Renders the whole frame: the transcript viewport, the status bar, the
-/// Composer, and — when an Approval is pending — the modal on top. The
+/// Composer, and - when an Approval is pending - the modal on top. The
 /// [`Viewport`] holds the pure scroll state; the returned `(total_lines,
 /// height)` is the geometry the viewport was measured/drawn at, which the
 /// adapter stores for the scroll effects that execute between draws.
@@ -172,7 +172,7 @@ impl ConnectionFacts {
 /// The Composer GROWS with its draft: its height is the wrapped row count
 /// (hard newlines and width-wrapping both), capped by
 /// [`composer::max_visible_rows`] so a tall draft never starves the
-/// transcript viewport — which is expected to shrink as the Composer grows.
+/// transcript viewport - which is expected to shrink as the Composer grows.
 /// The wrap math runs at the exact width the Composer is drawn at (the frame
 /// minus the 2-cell gutter), so the measured cursor cell is the drawn one.
 pub fn render(
@@ -210,7 +210,7 @@ pub fn render(
     render_composer(frame, chunks[2], t, &layout);
 
     // The Slash Command popup (ADR-0032/0033) floats just above the status bar +
-    // Composer — an inline overlay, not a full-screen modal. Drawn after the
+    // Composer - an inline overlay, not a full-screen modal. Drawn after the
     // Composer so it sits on top; skipped entirely when no slash draft is open.
     if let Some(view) = t.slash_view() {
         render_slash_popup(frame, chunks[1].y, area, &view);
@@ -226,7 +226,7 @@ pub fn render(
 /// anchored just above `anchor_y` (the status bar's row), listing the current
 /// [`SlashView`]'s rows with the highlighted one reversed and any hint dimmed.
 /// The `Selector`'s `Loading`/`Failed` states draw a single status line instead
-/// of rows. Inline and height-bounded — never the full screen.
+/// of rows. Inline and height-bounded - never the full screen.
 fn render_slash_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &SlashView) {
     // The lines the popup body holds, plus the title.
     let (title, lines): (&str, Vec<Line>) = match view {
@@ -290,7 +290,7 @@ fn render_slash_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Slash
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-/// The most body rows the Slash popup shows before it scrolls internally — keeps
+/// The most body rows the Slash popup shows before it scrolls internally - keeps
 /// the overlay compact even against a long model list.
 const POPUP_MAX_ROWS: u16 = 8;
 
@@ -337,7 +337,7 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
 /// wrapped counts come from the [`RenderCache`] (built once per item, per
 /// width), the total comes from summing the cached counts, and only the items
 /// intersecting the visible window ([`visible_window`]) are handed to the
-/// `Paragraph` — with a scroll offset RELATIVE to that slice. Measuring and
+/// `Paragraph` - with a scroll offset RELATIVE to that slice. Measuring and
 /// drawing still agree exactly: each item was measured with the same
 /// `Wrap { trim: false }` at the same width it is drawn at, and ratatui wraps
 /// each `Line` independently, so per-item counts sum to the whole.
@@ -358,8 +358,8 @@ pub fn render_viewport(
     cache.sync(t, text_area.width);
 
     // The live streaming snapshot renders below the settled items: the
-    // one-line thinking indicator (rebuilt each frame — one Line is cheap)
-    // and the streaming markdown (cached — see [`RenderCache::sync`]).
+    // one-line thinking indicator (rebuilt each frame - one Line is cheap)
+    // and the streaming markdown (cached - see [`RenderCache::sync`]).
     let thinking = t.streaming_thinking();
     let thinking_lines: Vec<Line<'static>> = if thinking.is_empty() {
         vec![]
@@ -373,7 +373,7 @@ pub fn render_viewport(
     };
 
     // One (lines, wrapped-count) entry per window "item": every settled
-    // message, then the streaming tail — a single indexing shared by the
+    // message, then the streaming tail - a single indexing shared by the
     // window selection and the slice assembly below.
     let mut item_lines: Vec<&[Line<'static>]> = cache
         .items
@@ -423,7 +423,7 @@ pub fn render_viewport(
 //
 // WHY: rebuilding every settled item's lines (markdown parse + syntect
 // highlight) and re-wrapping the whole session on EVERY frame pegged a core
-// while scrolling and made typing expensive — each keystroke only changes the
+// while scrolling and made typing expensive - each keystroke only changes the
 // Composer, each wheel tick only a scroll offset. Settled items never change
 // content (the pure core only appends, and bumps `messages_revision` on its
 // one structural edit), so their lines and wrapped counts are built once and
@@ -440,7 +440,7 @@ pub struct RenderCache {
     /// Thinking item's lines, so a flip clears the cache wholesale).
     thinking_expanded: bool,
     /// The Ctrl-O state the settled lines were built with (it changes every
-    /// multi-line Block's lines, so a flip clears the cache wholesale — the
+    /// multi-line Block's lines, so a flip clears the cache wholesale - the
     /// same rule as `thinking_expanded`).
     tools_expanded: bool,
     /// The core's `messages_revision` the entries were built at: while it
@@ -458,7 +458,7 @@ pub struct RenderCache {
 }
 
 /// One settled item's built lines and its wrapped row count at the cache's
-/// width — the numbers [`visible_window`] does its prefix-sum math over.
+/// width - the numbers [`visible_window`] does its prefix-sum math over.
 struct CachedItem {
     lines: Vec<Line<'static>>,
     wrapped: usize,
@@ -486,7 +486,7 @@ impl RenderCache {
     /// Brings the cache up to date with the Transcript at `width`: clears
     /// wholesale when a key input changed (width, Ctrl-T, Ctrl-O, a structural
     /// `messages` edit), then builds entries for the newly appended items
-    /// only — the steady-state cost of a frame is zero rebuilt items.
+    /// only - the steady-state cost of a frame is zero rebuilt items.
     fn sync(&mut self, t: &Transcript, width: u16) {
         if self.width != width
             || self.thinking_expanded != t.thinking_expanded
@@ -506,7 +506,7 @@ impl RenderCache {
             // One trailing blank row per settled item so turns read as
             // distinct paragraphs rather than one wall. Building it into the
             // cached lines keeps measurement (`wrapped`) and rendering exactly
-            // consistent — the viewport window math depends on that agreement.
+            // consistent - the viewport window math depends on that agreement.
             lines.push(Line::default());
             let wrapped = wrapped_count(lines.clone(), width);
             self.items.push(CachedItem { lines, wrapped });
@@ -515,7 +515,7 @@ impl RenderCache {
     }
 
     /// Re-parses the streaming markdown only when its char length moved
-    /// (monotonic within a message — see the field doc); drops the entry when
+    /// (monotonic within a message - see the field doc); drops the entry when
     /// streaming ended so the next message starts from nothing.
     fn sync_streaming(&mut self, text: &str, width: u16) {
         if text.is_empty() {
@@ -547,7 +547,7 @@ impl Default for RenderCache {
 }
 
 /// The rows `lines` wrap to at `width`, measured by a throwaway `Paragraph`
-/// with the SAME `Wrap { trim: false }` the viewport draws with — the window
+/// with the SAME `Wrap { trim: false }` the viewport draws with - the window
 /// math is only correct if measuring and drawing agree exactly.
 fn wrapped_count(lines: Vec<Line<'static>>, width: u16) -> usize {
     Paragraph::new(lines)
@@ -596,7 +596,7 @@ fn machinery_style() -> Style {
 /// [`line_style`]. `thinking_expanded` (Ctrl-T, the core's
 /// `Transcript::thinking_expanded`) picks the collapsed one-liner or the full
 /// text for settled `Thinking` items; `tools_expanded` (Ctrl-O, the core's
-/// `Transcript::tools_expanded`) does the same for multi-line `Block` bodies —
+/// `Transcript::tools_expanded`) does the same for multi-line `Block` bodies -
 /// the same detail-on-demand rule applied to the machinery plane.
 fn message_lines(
     item: &TranscriptItem,
@@ -606,7 +606,7 @@ fn message_lines(
     // Detail-on-demand collapse (Ctrl-O), keyed on the SEMANTIC fold predicate
     // (Stage 2 review C2 / S1): any item with a `foldable_body` collapses to its
     // `fold_title` one-liner, so the fold rule is NOT gated inside a per-variant
-    // match arm — a future non-Block foldable item folds the same way. The
+    // match arm - a future non-Block foldable item folds the same way. The
     // affordance is a fixed `· ^O expand`, NOT a line count: a Block's title
     // already carries its `(+A −R)` magnitude, and the body is display-capped
     // upstream, so a raw `lines.len()` would misreport what was elided.
@@ -665,7 +665,7 @@ fn message_lines(
         }
         // Tool-call machinery recedes into a dim, indented background gutter so
         // the conversation (assistant prose, user text) owns the foreground:
-        // DarkGray (not italic — italic stays reserved for Thinking/Info), a
+        // DarkGray (not italic - italic stays reserved for Thinking/Info), a
         // two-space indent, and a quiet "⋯" glyph in place of the loud "⚙".
         TranscriptItem::ToolCall { name, summary, .. } => vec![Line::styled(
             format!("  ⋯ {}", join_summary(name, summary)),
@@ -686,11 +686,11 @@ fn message_lines(
         // Errors are the exception that belongs in the foreground: they keep
         // red + bold and the ⚙ gutter, share the two-space indent, and ALWAYS
         // carry a `✗` failed-marker so they can't be missed (the two-planes
-        // design leans on this — red+bold alone is weaker for scanning and
+        // design leans on this - red+bold alone is weaker for scanning and
         // colorblind users). The merged `key_arg` is kept so the failing
         // path/command stays visible. The one exception: when the `summary`
-        // already begins with a status glyph — a plugin badge like `✗ exit 1`
-        // (or `✓`) — the line injects none of its own, so a badge never doubles
+        // already begins with a status glyph - a plugin badge like `✗ exit 1`
+        // (or `✓`) - the line injects none of its own, so a badge never doubles
         // up its glyph.
         TranscriptItem::ToolResult {
             name,
@@ -709,7 +709,7 @@ fn message_lines(
             )]
         }
         // A foldable Block reaches here only EXPANDED (Ctrl-O on) or when it has
-        // no foldable body (titleless / empty) — the collapse is handled once at
+        // no foldable body (titleless / empty) - the collapse is handled once at
         // the top of this fn. Expanded: the title line then the body rows, which
         // keep their semantic diff colors (added/removed/context) indented under
         // the gutter.
@@ -738,7 +738,7 @@ fn message_lines(
 }
 
 // ---------------------------------------------------------------------------
-// Code-fence syntax highlighting (presentation, so it lives HERE — ADR-0008:
+// Code-fence syntax highlighting (presentation, so it lives HERE - ADR-0008:
 // markdown.rs carries only the semantic fact, the fence's language).
 // ---------------------------------------------------------------------------
 
@@ -765,14 +765,14 @@ fn highlighter() -> &'static Highlighter {
 type CodeFragment = ((u8, u8, u8), String);
 
 /// Highlights one code block: per input line, the [`CodeFragment`]s syntect
-/// colors it with — pure data in/out, no ratatui types. `None` when `lang`
+/// colors it with - pure data in/out, no ratatui types. `None` when `lang`
 /// resolves to no bundled syntax (caller falls back to the plain
 /// [`MdStyle::CodeBlock`] rendering). Parse state carries across the lines, so
 /// multi-line constructs (block comments, raw strings) color correctly.
 fn highlight_code(lines: &[&str], lang: &str) -> Option<Vec<Vec<CodeFragment>>> {
     let hl = highlighter();
     // `find_syntax_by_token` matches the syntax name ("rust", "python") AND
-    // file extensions ("rs", "py"), case-insensitively — the widest net for
+    // file extensions ("rs", "py"), case-insensitively - the widest net for
     // fence tags.
     let syntax = hl.syntaxes.find_syntax_by_token(lang)?;
     let mut state = HighlightLines::new(syntax, &hl.theme);
@@ -798,7 +798,7 @@ fn highlight_code(lines: &[&str], lang: &str) -> Option<Vec<Vec<CodeFragment>>> 
 /// Renders assistant markdown into ratatui lines: one `Line` per [`MdLine`],
 /// each span styled by the single [`md_style`] mapping; an empty MdLine (block
 /// separation) becomes a blank row. Consecutive code lines sharing a non-empty
-/// `code_lang` are highlighted as one block via [`highlight_code`] — syntect
+/// `code_lang` are highlighted as one block via [`highlight_code`] - syntect
 /// fg over OUR code background; blocks with no/unknown language fall back to
 /// the plain CodeBlock style.
 fn markdown_lines(text: &str) -> Vec<Line<'static>> {
@@ -900,7 +900,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // The powerline status bar.
 // ---------------------------------------------------------------------------
 
-/// The status bar's base background — what the middle gap and the outermost
+/// The status bar's base background - what the middle gap and the outermost
 /// separators fade into.
 const BAR_BG: Color = Color::Rgb(30, 30, 40);
 
@@ -910,16 +910,16 @@ const SEGMENT_DARK_BG: Color = Color::Rgb(40, 44, 58);
 
 /// Powerline separators (Nerd Font): right-pointing after left-side segments,
 /// left-pointing before right-side segments. Drawn fg = the segment's bg over
-/// bg = the neighbor's bg — the standard powerline triangle technique.
+/// bg = the neighbor's bg - the standard powerline triangle technique.
 const SEP_RIGHT: &str = "\u{e0b0}"; //
 const SEP_LEFT: &str = "\u{e0b2}"; //
 
-/// The Agent's mode as the status bar conveys it — the semantic distinction
+/// The Agent's mode as the status bar conveys it - the semantic distinction
 /// the leftmost block draws. Carries no spinner frame: the animation glyph is
 /// a drawing concern the painter injects, not part of what the bar *means*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeState {
-    /// The Agent is idle — no Turn running.
+    /// The Agent is idle - no Turn running.
     Idle,
     /// The Agent is running a Turn.
     Running,
@@ -927,7 +927,7 @@ pub enum ModeState {
 
 /// One status bar segment's MEANING, ratatui-free (ADR-0019). The pure
 /// assembly ([`status_bar`]) emits these carrying only the display state they
-/// convey — no colors (that is [`segment_style`], ADR-0008), no glyphs, no
+/// convey - no colors (that is [`segment_style`], ADR-0008), no glyphs, no
 /// padding, no label formatting (all [`StatusSegment::paint`]'s job). This is
 /// the testable seam: the semantics of the bar can be asserted without drawing
 /// a frame.
@@ -941,8 +941,8 @@ pub enum StatusSegment {
         /// The model connection's base URL.
         base_url: String,
     },
-    /// The Active Model this Session talks to (ADR-0033). Mutable — a `/model`
-    /// pick changes it — so the bar shows the one connection fact this feature
+    /// The Active Model this Session talks to (ADR-0033). Mutable - a `/model`
+    /// pick changes it - so the bar shows the one connection fact this feature
     /// makes variable, beside the fixed endpoint.
     Model {
         /// The Active Model identifier.
@@ -956,8 +956,8 @@ pub enum StatusSegment {
         expanded: bool,
     },
     /// The Ctrl-O tool-Block-expansion state. Carries the boolean meaning; the
-    /// `▾`/`▸` marker is chosen by the painter. Always assembled — the twin of
-    /// `Thinking` — so the toggle has feedback even when no Blocks are on
+    /// `▾`/`▸` marker is chosen by the painter. Always assembled - the twin of
+    /// `Thinking` - so the toggle has feedback even when no Blocks are on
     /// screen.
     Tools {
         /// Whether settled tool Blocks are currently expanded.
@@ -975,7 +975,7 @@ pub enum StatusSegment {
         level: PressureLevel,
         /// The LIVE Dead Mass share as an integer percent (from the most recent
         /// ContextPressure), or `None` before any pressure event. When `Some`,
-        /// the segment appends a `· N% dead` tail — pre-rounded upstream (the
+        /// the segment appends a `· N% dead` tail - pre-rounded upstream (the
         /// single rounding rule) and baked into `cells()` like every other
         /// segment fact, never recomputed in the painter.
         dead_mass_pct: Option<u64>,
@@ -989,7 +989,7 @@ pub enum StatusSegment {
 }
 
 impl StatusSegment {
-    /// The painter's [`SegmentKind`] for this segment — the key into
+    /// The painter's [`SegmentKind`] for this segment - the key into
     /// [`segment_style`] (ADR-0008). Pure classification, no ratatui: it just
     /// carries the [`PressureLevel`] through for the Tokens segment so the
     /// single pressure→color mapping (Critical renders red) still decides the
@@ -1015,16 +1015,16 @@ impl StatusSegment {
     /// segment kind is a compile error here as well as in the painter.
     fn cells(&self) -> usize {
         match self {
-            // " X RUNNING " / " IDLE " — the running spinner glyph is one col.
+            // " X RUNNING " / " IDLE " - the running spinner glyph is one col.
             StatusSegment::Mode(ModeState::Running) => " X RUNNING ".chars().count(),
             StatusSegment::Mode(ModeState::Idle) => " IDLE ".chars().count(),
             StatusSegment::Connection { base_url } => {
                 format!(" suspenders · {base_url} ").chars().count()
             }
             StatusSegment::Model { model } => format!(" model · {model} ").chars().count(),
-            // " M thinking " — the marker is one col in either state.
+            // " M thinking " - the marker is one col in either state.
             StatusSegment::Thinking { .. } => " M thinking ".chars().count(),
-            // " M tools " — the marker is one col in either state.
+            // " M tools " - the marker is one col in either state.
             StatusSegment::Tools { .. } => " M tools ".chars().count(),
             StatusSegment::Tokens {
                 estimate,
@@ -1042,7 +1042,7 @@ impl StatusSegment {
 /// load-bearing fit invariant). `~{estimate}tok / {budget}` always; a `·
 /// {N}% dead` tail whenever a live Dead Mass share is known (the percent is
 /// pre-rounded upstream through the single rounding rule, so no rounding happens
-/// here). The tail shows even at `Some(0)` — a live zero is the meaningful "no
+/// here). The tail shows even at `Some(0)` - a live zero is the meaningful "no
 /// dead mass" fact, not an absence.
 fn tokens_label(estimate: u64, budget: u64, dead_mass_pct: Option<u64>) -> String {
     match dead_mass_pct {
@@ -1053,7 +1053,7 @@ fn tokens_label(estimate: u64, budget: u64, dead_mass_pct: Option<u64>) -> Strin
 
 /// The status bar's assembled MEANING: an ordered left group (mode, then
 /// connection) and right group (thinking, tools, tokens, position), already
-/// fitted to the terminal width. Pure and ratatui-free — this is what the new
+/// fitted to the terminal width. Pure and ratatui-free - this is what the new
 /// colocated tests assert against without drawing a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusBar {
@@ -1065,7 +1065,7 @@ pub struct StatusBar {
 
 impl StatusBar {
     /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then model, then tools, then thinking, then tokens — mode
+    /// connection, then model, then tools, then thinking, then tokens - mode
     /// and position survive longest. Connection (the endpoint) drops BEFORE
     /// model: the endpoint is a fixed, knowable fact, while the model is what
     /// the user actively changes via `/model`, so the model earns the scarcer
@@ -1112,7 +1112,7 @@ impl StatusBar {
 /// `dead_mass_pct` (an integer percent, pre-rounded through the single rounding
 /// rule) from the most recent ContextPressure (`None` before any pressure
 /// event). A named struct rather than a 4-tuple so the extra Dead Mass fact
-/// rides in cleanly and the `status_bar` arg COUNT stays at 8 (no 9th arg — the
+/// rides in cleanly and the `status_bar` arg COUNT stays at 8 (no 9th arg - the
 /// Stage 3 review's binding precondition against growing the already-suppressed
 /// signature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1126,8 +1126,8 @@ pub struct TokenView {
 /// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
 /// ordered semantic segments the bar conveys, fitted to `width`. `tokens` is
 /// `None` when no Context Budget estimate exists yet. No colors, glyphs, or
-/// label strings are decided here — that is the painter's job
-/// ([`render_status_bar`]) — so every rule this expresses (segment order, the
+/// label strings are decided here - that is the painter's job
+/// ([`render_status_bar`]) - so every rule this expresses (segment order, the
 /// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
 /// tokens-absent-until-estimate rule) is a semantic fact assertable without a
 /// frame.
@@ -1193,25 +1193,25 @@ pub fn status_bar(
 /// is the single place kinds become colors (ADR-0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentKind {
-    /// Agent idle — calm green mode block.
+    /// Agent idle - calm green mode block.
     ModeIdle,
-    /// Agent running — yellow mode block with the animated spinner.
+    /// Agent running - yellow mode block with the animated spinner.
     ModeRunning,
-    /// `suspenders · <base_url>` — the brand + endpoint, lowest priority.
+    /// `suspenders · <base_url>` - the brand + endpoint, lowest priority.
     Connection,
-    /// `model · <id>` — the Active Model (ADR-0033), styled like the endpoint
+    /// `model · <id>` - the Active Model (ADR-0033), styled like the endpoint
     /// since both are connection facts.
     Model,
     /// The Ctrl-T thinking-expansion state (`▾`/`▸`). Always visible so the
     /// toggle has feedback even when no Thinking items are on screen.
     Thinking,
     /// The Ctrl-O tool-Block-expansion state (`▾`/`▸`). Always visible so the
-    /// toggle has feedback even when no Blocks are on screen — the twin of
+    /// toggle has feedback even when no Blocks are on screen - the twin of
     /// `Thinking`.
     Tools,
     /// The `~Ntok / budget` estimate, colored by its [`PressureLevel`].
     Tokens(PressureLevel),
-    /// The viewport scroll position (`Bot`/`Top`/`NN%`) — the bold accent.
+    /// The viewport scroll position (`Bot`/`Top`/`NN%`) - the bold accent.
     Position,
 }
 
@@ -1220,7 +1220,7 @@ impl StatusSegment {
     /// place the drawing details live: the spinner glyph (chosen from the
     /// adapter's animation `spinner` tick), the `▾`/`▸` Thinking marker, the
     /// `~Ntok / budget` label, and the block padding. Semantics-in,
-    /// terminal-text-out — the seam ADR-0019 wants.
+    /// terminal-text-out - the seam ADR-0019 wants.
     fn paint(&self, spinner: u64) -> String {
         match self {
             // While running, the animated braille spinner lives inside the
@@ -1253,7 +1253,7 @@ impl StatusSegment {
 /// The bottom status bar, powerline style: left segments (mode, connection)
 /// fading into the base bg, right segments (thinking, tokens, position)
 /// growing out of it, each block joined by triangle separators. `geometry` is
-/// the `(total_lines, height)` the viewport was measured at THIS frame — the
+/// the `(total_lines, height)` the viewport was measured at THIS frame - the
 /// position segment must agree with what is actually drawn above it.
 ///
 /// A thin painter over the pure [`status_bar`] assembly: the semantics (which
@@ -1299,7 +1299,7 @@ pub fn render_status_bar(
         let kind = segment.kind();
         spans.push(Span::styled(segment.paint(spinner), segment_style(kind)));
         // The separator wears THIS segment's bg over the NEXT one's (the base
-        // bg after the last segment) — that is what draws the triangle.
+        // bg after the last segment) - that is what draws the triangle.
         let next_bg = bar
             .left
             .get(i + 1)
@@ -1330,13 +1330,13 @@ pub fn render_status_bar(
 /// The position segment's label, vim-ruler style: `Bot` at the tail, `Top` at
 /// the top of overflowing content, otherwise the percentage of the scroll
 /// range. Content that FITS the viewport is `Bot`, not `Top`: the tail is
-/// visible, which is what a pinned reader cares about — and it keeps the
+/// visible, which is what a pinned reader cares about - and it keeps the
 /// label stable as a fresh session grows past one page.
 fn scroll_position_label(top: usize, total_lines: usize, height: usize) -> String {
     let max_top = total_lines.saturating_sub(height);
     if top >= max_top {
         // Also covers max_top == 0 (content fits, or empty/degenerate
-        // geometry) — no division by zero below.
+        // geometry) - no division by zero below.
         "Bot".to_string()
     } else if top == 0 {
         "Top".to_string()
@@ -1346,15 +1346,15 @@ fn scroll_position_label(top: usize, total_lines: usize, height: usize) -> Strin
 }
 
 /// The Composer: the draft, pre-wrapped by the pure [`composer::layout`]
-/// (char-based, so the cursor cell below is exact — `Paragraph`'s word-wrap
+/// (char-based, so the cursor cell below is exact - `Paragraph`'s word-wrap
 /// points can't be queried). The FIRST row keeps the "› " gutter; every
-/// continuation row — hard-newline and wrapped alike — indents 2 spaces to
+/// continuation row - hard-newline and wrapped alike - indents 2 spaces to
 /// align under it, mirroring how submitted multi-line User prompts render.
 ///
 /// When the draft is taller than the box, the Composer scrolls internally
 /// ([`composer::first_visible_row`]) so the cursor row stays visible, near
 /// the bottom like a terminal. The REAL terminal cursor is placed at the
-/// cursor's cell — except while the Approval modal owns the keyboard, when a
+/// cursor's cell - except while the Approval modal owns the keyboard, when a
 /// blinking composer cursor would misstate where keys go.
 pub fn render_composer(frame: &mut Frame, area: Rect, t: &Transcript, layout: &ComposerLayout) {
     let visible = area.height as usize;
@@ -1499,7 +1499,7 @@ fn present_arg(key_arg: Option<&str>) -> Option<&str> {
     key_arg.filter(|a| !a.is_empty())
 }
 
-// Whether a Tool Result summary already opens with a status glyph — a plugin
+// Whether a Tool Result summary already opens with a status glyph - a plugin
 // badge like `✗ exit 1` or `✓ exit 0`. The error line uses this to avoid
 // doubling the `✗` it otherwise injects.
 fn starts_with_status_glyph(summary: &str) -> bool {
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[test]
     fn scroll_position_label_shows_bot_when_the_content_fits() {
-        // The tail is visible, so a pinned reader sees `Bot` — and the label
+        // The tail is visible, so a pinned reader sees `Bot` - and the label
         // does not flap Top→Bot as a fresh session grows past one page.
         assert_eq!(scroll_position_label(0, 5, 20), "Bot");
         assert_eq!(scroll_position_label(0, 20, 20), "Bot");
@@ -1651,7 +1651,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Assembles the SEMANTIC bar at `width` with everything present: running,
-    /// tokens known at `Ok` pressure. Returns the pure [`StatusBar`] — no
+    /// tokens known at `Ok` pressure. Returns the pure [`StatusBar`] - no
     /// drawing, no frame.
     fn bar_at(width: usize) -> StatusBar {
         status_bar(
@@ -1671,7 +1671,7 @@ mod tests {
         )
     }
 
-    /// The painter's [`SegmentKind`] for each assembled segment — what routes
+    /// The painter's [`SegmentKind`] for each assembled segment - what routes
     /// into [`segment_style`]. Asserting on kinds proves the right meaning
     /// reaches the color mapping without drawing.
     fn kinds(segments: &[StatusSegment]) -> Vec<SegmentKind> {
@@ -1703,7 +1703,7 @@ mod tests {
 
     #[test]
     fn a_narrow_bar_drops_the_connection_then_the_model_segment() {
-        // At 60 cols the endpoint drops first (lowest value), then the model —
+        // At 60 cols the endpoint drops first (lowest value), then the model -
         // both connection facts leave before mode/position/tokens.
         let bar = bar_at(60);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
@@ -1963,7 +1963,7 @@ mod tests {
     fn a_dead_mass_share_appends_a_percent_dead_tail() {
         // Once a live Dead Mass share is known the Tokens segment grows a `· N%
         // dead` tail (the integer percent, pre-rounded upstream); `None` paints
-        // the old form. A live `Some(0)` is meaningful — it shows the tail.
+        // the old form. A live `Some(0)` is meaningful - it shows the tail.
         let with_dead = StatusSegment::Tokens {
             estimate: 1200,
             budget: 32000,
@@ -2128,7 +2128,7 @@ mod tests {
 
         // Mutating a settled item WITHOUT bumping the revision is outside the
         // core's contract (it only appends); the cache must not have paid to
-        // notice — the stale entry proves nothing was rebuilt.
+        // notice - the stale entry proves nothing was rebuilt.
         t.messages[1] = TranscriptItem::Info {
             text: "mutated".to_string(),
         };
@@ -2266,7 +2266,7 @@ mod tests {
     #[test]
     fn a_failing_result_without_a_badge_gets_an_injected_error_glyph() {
         // A tool whose summary carries no glyph (no badge plugin): the line
-        // injects a leading `✗` so the failure is never missed — the ⚙ gutter,
+        // injects a leading `✗` so the failure is never missed - the ⚙ gutter,
         // the arg, then `✗ {summary}`, all red+bold.
         let item = TranscriptItem::ToolResult {
             name: "edit_file".to_string(),
@@ -2326,7 +2326,7 @@ mod tests {
     #[test]
     fn ctrl_o_still_folds_a_diff_block_after_the_merge() {
         // A merge produces a lone diff Block (the call line removed). Ctrl-O
-        // must still collapse it to its one-line title — the semantic fold
+        // must still collapse it to its one-line title - the semantic fold
         // predicate keys on the Block's foldable body, unaffected by the merge.
         let block = TranscriptItem::Block {
             title: "edit_file src/foo.rs (+1 -1)".to_string(),
@@ -2348,8 +2348,8 @@ mod tests {
     }
 
     // The Stage 2 review's deferred scroll test: an unpinned viewport stores an
-    // absolute top offset, so flipping Ctrl-O and back — which changes the total
-    // line count while expanded but restores it when collapsed — leaves the
+    // absolute top offset, so flipping Ctrl-O and back - which changes the total
+    // line count while expanded but restores it when collapsed - leaves the
     // clamped draw-time offset exactly where it was.
     #[test]
     fn a_ctrl_o_round_trip_leaves_the_viewport_position_stable() {
@@ -2415,7 +2415,7 @@ mod tests {
             "hello"
         );
 
-        // Same length, different text: the monotonic-key contract — within a
+        // Same length, different text: the monotonic-key contract - within a
         // message the snapshot only GROWS, so an equal length means unchanged
         // and the cached lines are reused as-is.
         cache.sync_streaming("world", 80);

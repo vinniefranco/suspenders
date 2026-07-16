@@ -36,7 +36,7 @@ use display::Diff as DiffArtifact;
 /// are an open extension seam, so the core [`Token`] never closes the key
 /// universe). Each Plugin owns its own reserved keys instead; naming them here
 /// once means a producer and consumer that disagree fail to *compile* rather
-/// than silently missing the value — a rename touches this module alone.
+/// than silently missing the value - a rename touches this module alone.
 mod keys {
     /// `assigns`: the pre-edit file snapshot [`super::Diff::pre_run`] captures,
     /// read back by [`super::Diff::post_run`] to compute the edit's hunks.
@@ -52,7 +52,7 @@ mod keys {
 const TOOLS: [&str; 2] = ["edit_file", "write_file"];
 
 /// Model-facing compact diff cap (lines); the Result Cap still applies on top.
-/// Display cap is looser — Artifacts cost no Context Budget.
+/// Display cap is looser - Artifacts cost no Context Budget.
 const MODEL_DIFF_LINES: usize = 40;
 
 /// The Diff plugin (ADR-0007).
@@ -424,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_refused_overwrite_error_result_no_diff_artifact() {
         // write_file refuses to overwrite an existing file, so the Diff plugin
-        // has nothing to diff — the error passes through with no artifact.
+        // has nothing to diff - the error passes through with no artifact.
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
         let path = "config.txt";

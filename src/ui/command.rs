@@ -1,4 +1,4 @@
-//! The adapter-side Slash Command router — the SINGLE seam a committed command
+//! The adapter-side Slash Command router - the SINGLE seam a committed command
 //! name crosses to reach its adapter work (ADR-0032/0033). The pure core emits
 //! a command-agnostic [`Effect::Command`](crate::ui::transcript::Effect::Command)
 //! (and [`SelectorChosen`](crate::ui::transcript::Effect::SelectorChosen)); this
@@ -22,10 +22,10 @@ use super::model_command;
 use super::transcript::Transcript;
 
 /// The Slash Commands the adapter knows how to run (today: just [`Handled::Model`]).
-/// Not named `Command` — that collides with [`crate::agent::Command`].
+/// Not named `Command` - that collides with [`crate::agent::Command`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handled {
-    /// `/model` — [`super::model_command`].
+    /// `/model` - [`super::model_command`].
     Model,
 }
 
@@ -85,8 +85,8 @@ mod tests {
 
     // Adding a COMMANDS entry without a `handled` mapping would otherwise fail
     // silently (ADR-0032's extension seam): assert every registered command is
-    // handled. This drives the real classifier — the same one `run`/`choose`
-    // match exhaustively — so a registry entry cannot outrun its adapter arm.
+    // handled. This drives the real classifier - the same one `run`/`choose`
+    // match exhaustively - so a registry entry cannot outrun its adapter arm.
     #[test]
     fn every_registry_command_is_handled() {
         for c in slash::COMMANDS {

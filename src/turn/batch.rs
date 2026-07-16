@@ -1,18 +1,18 @@
-//! Tool Call batch — executing one Pass's Tool Calls (carved from the Turn
+//! Tool Call batch - executing one Pass's Tool Calls (carved from the Turn
 //! Loop port of baud's `Baud.Turn.Loop`; "batch" is the domain word: Steering
 //! is delivered after a Tool Call batch completes, and ADR-0009's truncated
 //! response means none of its batch executes).
 //!
 //! [`execute_tools`] runs a Pass's Tool Calls in emission order. Each call goes
 //! through the gates in sequence: the malformed-input sentinel (the LLM layer
-//! tags inputs that never parsed — those are answered, never run), the Tool
+//! tags inputs that never parsed - those are answered, never run), the Tool
 //! Call answering arbiter before execution ([`governor::answer_sent`],
 //! ADR-0026: an identical repeat draws a replacement Tool Result instead of a
-//! rerun), then the Plugin lifecycle (ADR-0007: pre_run — which may halt the
-//! call with the plugin's own wording — execution, post_run/Shaping), with
+//! rerun), then the Plugin lifecycle (ADR-0007: pre_run - which may halt the
+//! call with the plugin's own wording - execution, post_run/Shaping), with
 //! Approval (ADR-0005) requested between pre_run and execution for the tools
 //! that require it, on the plugin-adjusted input; the arbiter is consulted
-//! again after execution ([`governor::answer_read`] — the consecutive-failure
+//! again after execution ([`governor::answer_read`] - the consecutive-failure
 //! annotation). Once the batch finishes the Conversation is checkpointed with
 //! only the answered Tool Calls, so the checkpoint never persists an unanswered
 //! tool_use block.
@@ -52,7 +52,7 @@ pub(super) async fn execute_tools<D: TurnDeps>(
     // Per-BATCH, not per-tool, is the correct checkpoint granularity: crash
     // recency comes from the Session Log's per-event tool_result entries
     // (ADR-0010, flushed as each result is emitted), so a mid-batch crash keeps
-    // completed work through the log — not this checkpoint. The in-memory
+    // completed work through the log - not this checkpoint. The in-memory
     // checkpoint is only the settlement fallback, so one over the finished
     // batch is enough (and must not be dropped: it holds in-flight settlement
     // state should the Turn end here).
@@ -112,7 +112,7 @@ async fn execute_tool<D: TurnDeps>(
     let (raw_content, is_error, artifacts) = run_block(state, &name, &input).await;
 
     // The outcome's facts go on the Ledger first, written once at this firing
-    // site (ADR-0026) — replaced results included: a replaced duplicate still
+    // site (ADR-0026) - replaced results included: a replaced duplicate still
     // counts toward the failure tally, and a duplicated write/run_command
     // still moves the verify state. Then the answering moment's second
     // consultation: the arbiter judges what the model will READ, possibly
@@ -147,7 +147,7 @@ async fn execute_tool<D: TurnDeps>(
 // A successful plan Tool Call updates the Plan value and stores its content
 // through the set_plan Dep; the Loop's copy keeps this Turn's Anchors current,
 // and the Ledger's plan-recency fact resets at the same firing site (written
-// once as it happens — ADR-0026).
+// once as it happens - ADR-0026).
 fn maybe_store_plan<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
@@ -171,7 +171,7 @@ pub(super) fn display_input(input: &Value) -> Value {
     }
 }
 
-// The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs — never
+// The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs - never
 // run those (mechanics, not a Governor's judgment). Otherwise the answering
 // arbiter judges what the model SENT (a replaced Tool Result skips execution),
 // then pre_run, Approval on the plugin-adjusted command, and execution with

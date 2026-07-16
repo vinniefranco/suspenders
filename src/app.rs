@@ -3,9 +3,9 @@
 //! Wires the Session, the Agent, and a frontend, then runs it. Two entry
 //! points, one per ADR-0019 shape:
 //!
-//! * [`run_tui`] — the interactive ratatui frontend (ADR-0001), owning the
+//! * [`run_tui`] - the interactive ratatui frontend (ADR-0001), owning the
 //!   terminal for the session.
-//! * [`run_headless`] — the stdout event-subscriber runner (ADR-0019): submit
+//! * [`run_headless`] - the stdout event-subscriber runner (ADR-0019): submit
 //!   each prompt as a sequential Turn in ONE session, stream every event to
 //!   stdout, auto-approve run_command Approvals, and report the token estimate
 //!   and message count on settlement.
@@ -32,7 +32,7 @@ pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::R
     let session = build_session(root)?;
     let resume = if resume.as_deref() == Some(PICK) {
         // The picker needs the Session first: the logs live in its
-        // session_dir. No sessions to pick from is silently a fresh start —
+        // session_dir. No sessions to pick from is silently a fresh start -
         // we're pre-alt-screen, and a note would just flash and vanish.
         let entries = crate::session::log::list(&session.session_dir);
         if entries.is_empty() {
@@ -89,7 +89,7 @@ pub async fn run_headless(
             continue;
         }
 
-        // Drain events until this Turn settles — including any Recovery Turn
+        // Drain events until this Turn settles - including any Recovery Turn
         // the settlement opens (the Agent starts it before answering the
         // status query, so Running here means recovery is underway; ADR-0019:
         // headless drives the same Agent seam, recovery included).

@@ -1,10 +1,10 @@
-//! UI — the ratatui frontend, confined to this module (ADR-0001, ADR-0019).
+//! UI - the ratatui frontend, confined to this module (ADR-0001, ADR-0019).
 //!
 //! The submodules split by testability: [`transcript`] is the PURE TEA core
 //! (The Elm Architecture, ADR-0001) with all the rules and all the tests;
 //! [`viewport`] is the pure, tested scroll state (bottom-anchored, clamped,
 //! only user actions re-pin); [`components`] is the ONE semantic→terminal
-//! color mapping (ADR-0008); and this file — the `run` adapter — is the
+//! color mapping (ADR-0008); and this file - the `run` adapter - is the
 //! untested-by-design driver that owns the terminal, maps crossterm input to
 //! the core's pure [`transcript::Key`], carries out the [`transcript::Effect`]s
 //! the core returns, and renders via [`components`]. Only this module and
@@ -52,7 +52,7 @@ const TICK_MS: u64 = 100;
 /// viewport height)`. Scroll effects execute BETWEEN draws, and the adapter
 /// cannot know the wrap-aware line total outside one (only the render path
 /// measures the built `Paragraph`), so it feeds the pure [`Viewport`] the
-/// previous frame's numbers. At worst one frame stale — harmless, because the
+/// previous frame's numbers. At worst one frame stale - harmless, because the
 /// draw-time [`Viewport::top_offset`] clamp against the fresh measure is
 /// authoritative.
 type Geometry = (usize, usize);
@@ -82,8 +82,8 @@ pub async fn run(agent: AgentHandle, session: &Session) -> anyhow::Result<()> {
 }
 
 /// Runs the `--resume` Session Picker full-screen and returns how it resolved.
-/// Same terminal lifecycle as [`run`] — raw mode + alternate screen entered and
-/// restored around the loop, mouse capture enabled/released symmetrically —
+/// Same terminal lifecycle as [`run`] - raw mode + alternate screen entered and
+/// restored around the loop, mouse capture enabled/released symmetrically -
 /// because the picker runs BEFORE the Agent starts, on its own screen.
 ///
 /// Crossterm input folds through the pure [`picker::Picker`] core via the same
@@ -167,7 +167,7 @@ async fn run_loop(
     // the adapter owns this fetch, so it owns the channel.
     let (selector_tx, mut selector_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
-    // The connection facts the status bar shows — the fixed endpoint and the
+    // The connection facts the status bar shows - the fixed endpoint and the
     // mutable Active Model (ADR-0033). The pure Transcript core stays
     // command-agnostic and holds neither, so the adapter carries them into the
     // render as one named-field carrier (never a position-coupled pair). The
@@ -184,7 +184,7 @@ async fn run_loop(
     };
 
     // Persistent prompt history (up/down recall ACROSS Sessions). The store
-    // lives beside the Session Logs; the pure core keeps the in-memory ring —
+    // lives beside the Session Logs; the pure core keeps the in-memory ring -
     // the adapter loads it at mount and appends on each submit (HistoryAppend).
     let history_store = history_path(session).and_then(|p| crate::history::open(&p).ok());
     let history = history_store
@@ -202,7 +202,7 @@ async fn run_loop(
 
     // The per-item render cache: settled items' lines and wrapped counts are
     // built once (per width / Ctrl-T state) instead of on every frame. Owned
-    // here — it holds ratatui `Line`s, so it lives in the adapter/components
+    // here - it holds ratatui `Line`s, so it lives in the adapter/components
     // layer (ADR-0019), never in the pure core.
     let mut cache = components::RenderCache::new();
 
@@ -227,7 +227,7 @@ async fn run_loop(
     loop {
         tokio::select! {
             // Animation tick: advance the spinner and repaint, but ONLY while a
-            // Turn is running — an idle UI does no work between events.
+            // Turn is running - an idle UI does no work between events.
             _ = ticker.tick() => {
                 if transcript.as_ref().unwrap().status == Status::Running {
                     spinner = spinner.wrapping_add(1);
@@ -238,8 +238,8 @@ async fn run_loop(
 
             // Terminal input. Bursts (wheel ticks, paste, held keys) are
             // coalesced: after handling one event, any IMMEDIATELY-available
-            // events drain through the exact same path — quit checks, key
-            // mapping, effects — and the batch pays for ONE draw, not one per
+            // events drain through the exact same path - quit checks, key
+            // mapping, effects - and the batch pays for ONE draw, not one per
             // event. `dirty` mirrors the old per-event behavior: only
             // Release-kind keys skipped the repaint.
             maybe_input = input.next() => {
@@ -252,8 +252,8 @@ async fn run_loop(
                                 return Ok(());
                             }
                             if key_event.kind != KeyEventKind::Release {
-                                // EVERY key folds through the pure core — Composer
-                                // editing included — so all the rules (modal gating,
+                                // EVERY key folds through the pure core - Composer
+                                // editing included - so all the rules (modal gating,
                                 // edge-triggered history, cursor editing) live in one
                                 // tested place.
                                 let core = transcript.take().unwrap();
@@ -286,7 +286,7 @@ async fn run_loop(
                 }
                 // Committing a `/model` pick is a key press, so it lands in this
                 // batch; refresh the Active Model the status bar shows (a cheap
-                // in-process actor query, ADR-0017/0033 — never on the tick).
+                // in-process actor query, ADR-0017/0033 - never on the tick).
                 conn.model = agent.active_model().await;
                 if !dirty {
                     continue;
@@ -304,7 +304,7 @@ async fn run_loop(
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
                     Err(RecvError::Lagged(_)) => {}
-                    // The Agent's sender is gone — it crashed/stopped. Reset to
+                    // The Agent's sender is gone - it crashed/stopped. Reset to
                     // a truthful idle state (agent-down) and keep the UI up.
                     Err(RecvError::Closed) => {
                         let core = transcript.take().unwrap();
@@ -319,7 +319,7 @@ async fn run_loop(
 
             // Adapter-injected events: a `/model` fetch's SelectorReady/Failed,
             // posted by its spawned task (ADR-0033). Folded exactly like an Agent
-            // event — the pure core's guarded SelectorReady/Failed arms flip the
+            // event - the pure core's guarded SelectorReady/Failed arms flip the
             // Loading overlay (or ignore a stale delivery). The sender is held in
             // `ctx`, so this side never ends while the loop runs.
             Some(event) = selector_rx.recv() => {
@@ -345,7 +345,7 @@ async fn run_loop(
 
 /// After the Agent is gone we keep the TUI responsive to quit/scroll only. The
 /// Active Model can no longer change (no Agent to swap it), so the connection
-/// facts are frozen — carried as one owned [`components::ConnectionFacts`].
+/// facts are frozen - carried as one owned [`components::ConnectionFacts`].
 async fn drain_input(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut input: EventStream,
@@ -391,7 +391,7 @@ async fn drain_input(
 ///
 /// This deliberately is NOT `FutureExt::now_or_never`. Crossterm's
 /// [`EventStream`] hands the FIRST Pending poll's waker to its wake-up thread
-/// and DISCARDS wakers from later polls until that thread fires — and
+/// and DISCARDS wakers from later polls until that thread fires - and
 /// `now_or_never` polls with a no-op waker. A batch-ending `now_or_never`
 /// poll therefore parked a waker that wakes nobody: the next keystroke woke
 /// nothing and sat buffered until the 100ms animation tick happened to
@@ -416,7 +416,7 @@ fn is_quit(key: &KeyEvent) -> bool {
 /// Maps a crossterm [`KeyEvent`] to the pure core's [`Key`]. Text characters
 /// (`y`/`n`/`a` matter to the modal; everything else edits the Composer) come
 /// through as [`Key::Char`]; the navigation/edit keys map to their named
-/// variants. The core handles ALL of them — the adapter never edits the
+/// variants. The core handles ALL of them - the adapter never edits the
 /// Composer itself.
 fn map_key(key: &KeyEvent) -> Key {
     match key.code {
@@ -544,7 +544,7 @@ async fn run_effect(
             transcript
         }
         // A committed Slash Command (ADR-0032/0033). The adapter routes it
-        // through the single `command::run` seam — `is_handled` reflects exactly
+        // through the single `command::run` seam - `is_handled` reflects exactly
         // what it routes, so an unwired registry entry is a visible info line,
         // never a silent drop.
         Effect::Command { name } => command::run(transcript, ctx, &name).await,
@@ -577,7 +577,7 @@ fn to_agent_decision(decision: Decision) -> AgentDecision {
 /// Draws one frame and returns the measured viewport [`Geometry`]: the render
 /// path syncs the [`components::RenderCache`] (settled items build once, per
 /// width), sums the cached wrap-aware total, asks the pure [`Viewport`] for
-/// the clamped offset, and draws only the visible slice + scrollbar — all
+/// the clamped offset, and draws only the visible slice + scrollbar - all
 /// inside [`components::render`]; the adapter only stores the measure for the
 /// scroll effects that arrive before the next draw.
 fn draw(
@@ -605,7 +605,7 @@ mod tests {
     // crossterm→Key mapping the adapter owns.
 
     // Regression: Ctrl-T must map to ToggleThinking, not be swallowed by the
-    // generic Char arm as a plain 't' — the modifier arms must come first.
+    // generic Char arm as a plain 't' - the modifier arms must come first.
     #[test]
     fn ctrl_t_maps_to_toggle_thinking() {
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
@@ -613,7 +613,7 @@ mod tests {
     }
 
     // Regression: Ctrl-O must map to ToggleTools, not be swallowed by the
-    // generic Char arm as a plain 'o' — the modifier arms must come first.
+    // generic Char arm as a plain 'o' - the modifier arms must come first.
     #[test]
     fn ctrl_o_maps_to_toggle_tools() {
         let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(map_mouse(&mouse(MouseEventKind::Moved)), None);
     }
 
-    // next_if_ready must return without suspending in ALL three stream states —
+    // next_if_ready must return without suspending in ALL three stream states -
     // a ready item, an ended stream, and (the one that matters) a stream with
     // nothing buffered. Suspending on the empty case would stall the input
     // batch loop until the next event instead of ending the batch.

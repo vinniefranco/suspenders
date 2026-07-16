@@ -1,4 +1,4 @@
-//! Turn finish — how a Turn ends when the model stops calling tools (carved
+//! Turn finish - how a Turn ends when the model stops calling tools (carved
 //! from the Turn Loop port of baud's `Baud.Turn.Loop`). Deliberately NOT named
 //! "settlement": Turn Settlement (CONTEXT.md, [`super::settlement`]) is how an
 //! already-ended Turn enters the Conversation; this module is the ending
@@ -8,7 +8,7 @@
 //! ends there, but the finish-settlement arbiter ([`super::governor`],
 //! ADR-0026) may intervene instead: close the Turn on the turn-limit marker
 //! (ADR-0015's tool-insistence rule) or send the model back for one more Pass
-//! with a stand-alone Nudge — the strict Verify-failed > Verify > Empty
+//! with a stand-alone Nudge - the strict Verify-failed > Verify > Empty
 //! precedence lives in [`governor::settle_finish`], not here. This module
 //! keeps the effects: appending blocks, announcing the Nudge, closing.
 //!
@@ -92,9 +92,9 @@ pub(super) fn fail<D: TurnDeps>(
 
 // The model stopped without (executable) Tool Calls. The finish-settlement
 // arbiter (ADR-0026) decides how the finish settles; this site translates:
-// a Close appends the turn-limit marker (the reply — ADR-0015's insistent
-// markup — never enters the Conversation), a CloseRecover appends the marker
-// or — `keep_reply`, the final-Pass text settle — the reply itself before
+// a Close appends the turn-limit marker (the reply - ADR-0015's insistent
+// markup - never enters the Conversation), a CloseRecover appends the marker
+// or - `keep_reply`, the final-Pass text settle - the reply itself before
 // carrying the recovery directive out, a Standalone Nudge appends the reply
 // and then the user-role Nudge for one more Pass, and no Intervention
 // concludes the Turn on the reply. Any tool_use block in this branch is

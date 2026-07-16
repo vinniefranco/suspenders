@@ -6,8 +6,8 @@
 //! `run_command` pipelines (`find ... | xargs grep ...`) instead of the
 //! read-only Tools (read_file, list_files, grep) the streak counts. This
 //! classifier lets the Explore Nudge count a search-shaped `run_command` as
-//! exploration too, and treat everything else — `mix test`, `git`, `echo`, a
-//! redirect — as non-exploration, resetting the streak. `mix test` MUST reset:
+//! exploration too, and treat everything else - `mix test`, `git`, `echo`, a
+//! redirect - as non-exploration, resetting the streak. `mix test` MUST reset:
 //! it is verification, the behavior the harness wants.
 //!
 //! This is policy, not wording: it lives beside the explore Governor's
@@ -23,7 +23,7 @@
 //! (`>`), or any other program, resets the streak.
 
 // Read-only programs whose sole effect is to search or read. `xargs` is here
-// but judged specially — its payload is the next word.
+// but judged specially - its payload is the next word.
 const READ_ONLY: &[&str] = &[
     "grep", "rg", "find", "ls", "cat", "head", "tail", "tree", "wc", "file", "stat", "xargs",
 ];
@@ -52,7 +52,7 @@ fn segments(command: &str) -> Vec<String> {
         .collect()
 }
 
-// A redirect anywhere in the segment writes to disk — never search-shaped
+// A redirect anywhere in the segment writes to disk - never search-shaped
 // (`>` also catches `>>`).
 fn search_segment(segment: &str) -> bool {
     if segment.contains('>') {

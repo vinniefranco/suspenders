@@ -1,4 +1,4 @@
-//! Turn — one agent iteration (prompt to settlement).
+//! Turn - one agent iteration (prompt to settlement).
 //!
 //! [`AgentDeps`] is the thin Turn shell: the concrete
 //! [`TurnDeps`] that wires each effect to the Agent's channels and the Session's
@@ -7,7 +7,7 @@
 //! the [`Emitter`](deps::Emitter) handle, `checkpoint`, and `set_plan`;
 //! request/reply `oneshot` for `drain_steering`
 //! and `request_approval`). `complete` and `compact` call the injected `Llm`
-//! directly — in the Turn task, NEVER on the Agent (ADR-0012): an Agent-side
+//! directly - in the Turn task, NEVER on the Agent (ADR-0012): an Agent-side
 //! summarization call would block every caller for its duration.
 
 mod batch;
@@ -94,7 +94,7 @@ impl TurnDeps for AgentDeps {
     }
 
     fn emitter(&mut self) -> Emitter {
-        // Fire-and-forget to the Agent, which broadcasts AND logs — routing
+        // Fire-and-forget to the Agent, which broadcasts AND logs - routing
         // through the single owner keeps Event order deterministic (ADR-0017):
         // the handle and the Turn task feed the SAME mpsc channel from the SAME
         // task, so detaching emission into a handle (ADR-0025) changes nothing
@@ -125,7 +125,7 @@ impl TurnDeps for AgentDeps {
         // forwards (a per-Turn approval reply oneshot). The Agent owns the
         // request-side emission: it consults the Standing Approvals and emits
         // either `approval_request` (opening the modal) or, on an auto-approve,
-        // `approval_auto` — the Turn cannot tell the difference. Once answered,
+        // `approval_auto` - the Turn cannot tell the difference. Once answered,
         // the Turn emits `approval_resolved` (baud's `Baud.Turn` dep), the same
         // on both paths.
         let tx = self.tx.clone();
@@ -141,7 +141,7 @@ impl TurnDeps for AgentDeps {
             {
                 return false;
             }
-            // No timeout — the user decides. A cancel aborts this task, so a
+            // No timeout - the user decides. A cancel aborts this task, so a
             // pending Approval dies with it.
             let approved = rx.await.unwrap_or(false);
             let _ = tx.send(Msg::Turn(TurnMsg::Emit(Event::approval_resolved(

@@ -1,5 +1,5 @@
 //! Line-level diff hunks for [`crate::plugins::diff`], computed with a
-//! Myers/LCS line diff — no dependency.
+//! Myers/LCS line diff - no dependency.
 //!
 //! A hunk is a run of changed lines plus up to 3 context lines on each side;
 //! changed runs closer than a context gap merge into one hunk, the classic
@@ -13,7 +13,7 @@
 //! Rust has no stdlib equivalent, so [`myers_difference`] reimplements it: a
 //! classic Myers shortest-edit-script over the two line lists, walked back into
 //! the same `Eq | Del | Ins` chunk sequence. The chunk order matches
-//! `List.myers_difference` for the tested inputs — within a change region all
+//! `List.myers_difference` for the tested inputs - within a change region all
 //! deletions precede all insertions (a `Del` chunk before its paired `Ins`
 //! chunk), which the `number`/`group` passes and every ported hunks test rely
 //! on.

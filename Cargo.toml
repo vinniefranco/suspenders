@@ -8,7 +8,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 
-# TUI (confined to the `ui` module — ADR-0001, ADR-0019).
+# TUI (confined to the `ui` module - ADR-0001, ADR-0019).
 # unstable-rendered-line-info: `Paragraph::line_count(width)` gives the exact
 # wrap-aware line total from the SAME wrapping code that draws, which the
 # bottom-anchored viewport (ui::viewport) needs to follow the tail.

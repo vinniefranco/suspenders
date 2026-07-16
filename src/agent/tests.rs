@@ -1,5 +1,5 @@
 // ===========================================================================
-// Tests — ported 1:1 from baud/test/baud/agent_test.exs (ADR-0017). baud's
+// Tests - ported 1:1 from baud/test/baud/agent_test.exs (ADR-0017). baud's
 // process primitives translate to their tokio analogs, preserving OBSERVABLE
 // behavior: `assert_receive` → a broadcast recv with a timeout helper;
 // `GenServer.call` → the request/reply Commands; `spawn` + `Process.monitor`
@@ -45,7 +45,7 @@ fn start(session: Session, fake: FakeLlm) -> AgentHandle {
     .expect("agent starts")
 }
 
-// Starts an Agent over the DEFAULT (Voice) system prompt — the compaction
+// Starts an Agent over the DEFAULT (Voice) system prompt - the compaction
 // test needs the real prompt's bulk in the token estimate so the small
 // Turns cross the compaction target (baud's agent runs the default prompt +
 // context files; the Rust test uses the Voice default alone).
@@ -1122,7 +1122,7 @@ fn rider_session(dir: &TempDir) -> Session {
 
 // [`rider_session`] with the Recovery Turn disabled: a Turn that caps
 // with unverified writes now settles as a recovery close (ADR-0028
-// addendum), which has its own coverage — the test on this fixture
+// addendum), which has its own coverage - the test on this fixture
 // asserts rider logging and byte-for-byte Resume only.
 fn rider_session_no_recovery(dir: &TempDir) -> Session {
     let root = dir.path().to_string_lossy().into_owned();
@@ -1238,7 +1238,7 @@ async fn a_turn_that_carried_riders_resumes_byte_for_byte() {
     .expect("resumes");
 
     // The reconstructed Conversation carries the same bytes the model
-    // read live — Anchor and Endgame prompts included.
+    // read live - Anchor and Endgame prompts included.
     assert_eq!(resumed.conversation().await.messages, live.messages);
 }
 
@@ -1358,7 +1358,7 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
 
     // Adaptation of baud's mid-test `Baud.FakeLLM.script(...)` re-scripting:
     // the Rust FakeLlm is per-instance with a fixed queue (ADR-0020), so all
-    // entries ride ONE script up front — three small Turns to build history
+    // entries ride ONE script up front - three small Turns to build history
     // past the compaction target, then the proactive summarization call
     // (popped FIRST on the next submit) and that Turn's own reply.
     let reply = "word ".repeat(250);
@@ -1514,8 +1514,8 @@ async fn tool_use_during_streaming_steer_then_unblock_no_crash() {
     agent.submit("test streaming").await.unwrap();
 
     // The first model call parks in-flight (mid-Turn). The first Pass's
-    // MessageStart has already gone out; steer NOW — the Turn is running but
-    // has not reached its drain point — then release into a tool_use.
+    // MessageStart has already gone out; steer NOW - the Turn is running but
+    // has not reached its drain point - then release into a tool_use.
     // `steer().await` round-trips through the Agent, so the text is queued
     // before the tool batch runs and the drain delivers it (this removes
     // baud's implicit scheduler race while preserving the observable
@@ -1583,7 +1583,7 @@ async fn set_model_changes_what_active_model_returns() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_spawned_after_set_model_uses_the_new_model() {
     // The next Turn captures the Agent's mutable connection, so the wire request
-    // carries the new model — not the Session's launch-time one (ADR-0033).
+    // carries the new model - not the Session's launch-time one (ADR-0033).
     let dir = TempDir::new().unwrap();
     let (req_tx, mut req_rx) = mpsc::unbounded_channel::<Value>();
     let script = vec![Entry::dynamic(vec![], move |req: &Value| {

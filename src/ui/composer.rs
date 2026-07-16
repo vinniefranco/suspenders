@@ -1,30 +1,30 @@
-//! UI Composer layout — the pure wrapping and cursor-position math behind the
+//! UI Composer layout - the pure wrapping and cursor-position math behind the
 //! growing Composer (CONTEXT.md: the input area where the user authors the
-//! next prompt; NOT a line — drafts may span many).
+//! next prompt; NOT a line - drafts may span many).
 //!
 //! Lives in its own module for the same reason `ui::viewport` does: `ui.rs`
 //! and `ui::components` are untested-by-design adapters (ADR-0001's split),
-//! so the math they draw with is plain strings and `usize` in/out — no
-//! ratatui types (ADR-0019) — and all unit-tested here.
+//! so the math they draw with is plain strings and `usize` in/out - no
+//! ratatui types (ADR-0019) - and all unit-tested here.
 //!
 //! The wrapping is CHAR-based, not word-based, on purpose: the view places a
 //! REAL terminal cursor (`frame.set_cursor_position`) at the exact cell of
 //! the draft cursor, which needs row/column math the renderer can reproduce
-//! exactly — `Paragraph`'s word-wrap points cannot be queried cheaply.
+//! exactly - `Paragraph`'s word-wrap points cannot be queried cheaply.
 //! Char-per-cell is also how the rest of the codebase measures text.
 //!
 //! The contract:
 //!
 //! * **Rows** are the draft split on hard '\n', each hard line then chunked
 //!   into `width`-char rows. A hard line whose length is an exact multiple of
-//!   `width` (the empty line included) yields one EXTRA empty row — the cell
+//!   `width` (the empty line included) yields one EXTRA empty row - the cell
 //!   the cursor occupies at that line's end, exactly like a terminal that has
 //!   just wrapped. So `cursor_row/cursor_col` are total functions of the
 //!   cursor: `offset / width` and `offset % width` within the hard line.
 //! * **Every cursor position is a real cell**: `cursor_col < width` always,
 //!   so the view never places the terminal cursor outside the Composer.
-//! * **Height is capped** at `min(8, terminal_height / 3)` rows — never
-//!   below one — so a tall draft never starves the transcript viewport; when
+//! * **Height is capped** at `min(8, terminal_height / 3)` rows - never
+//!   below one - so a tall draft never starves the transcript viewport; when
 //!   the draft overflows the cap, [`first_visible_row`] scrolls the Composer
 //!   internally so the cursor row stays visible, pinned to the BOTTOM of the
 //!   box like a terminal.
@@ -41,7 +41,7 @@ pub const MAX_ROWS: usize = 8;
 
 /// The Composer's draft, wrapped: the display rows (hard newlines AND
 /// width-wrapping both split) and the `(row, col)` cell the cursor occupies
-/// within them. Plain data — the view adds the gutter and colors.
+/// within them. Plain data - the view adds the gutter and colors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerLayout {
     /// The wrapped display rows, top first. Never empty: an empty draft is
@@ -55,15 +55,15 @@ pub struct ComposerLayout {
 
 /// Wraps the draft at `width` chars per row and locates the cursor (a CHAR
 /// index into `value`, clamped to its length). `width` is the text width the
-/// view will draw the rows at — the same for every row, first and
+/// view will draw the rows at - the same for every row, first and
 /// continuation alike, since the "› " gutter and the 2-space indent are the
 /// same 2 cells. A degenerate `width` of 0 is treated as 1.
 pub fn layout(value: &str, cursor: usize, width: usize) -> ComposerLayout {
     let width = width.max(1);
     let cursor = cursor.min(value.chars().count());
 
-    // The logical cell of the cursor — which hard line, and the char column
-    // within it — comes from the ONE owner (`ui::draft`), the same source the
+    // The logical cell of the cursor - which hard line, and the char column
+    // within it - comes from the ONE owner (`ui::draft`), the same source the
     // edit path reads. Wrapping that logical column into a visual row/col is
     // this module's only addition; it never re-derives the logical geometry.
     let (cursor_line, cursor_offset) = draft::line_col(value, cursor);
@@ -85,7 +85,7 @@ pub fn layout(value: &str, cursor: usize, width: usize) -> ComposerLayout {
         // When this is the cursor's logical line, wrap its char column into a
         // visual row/col. `cursor_offset < width` need not hold, so a wrapped
         // line divides it: `/ width` picks the continuation row, `% width` the
-        // cell — and the exact-multiple extra row above catches the end cell.
+        // cell - and the exact-multiple extra row above catches the end cell.
         if index == cursor_line {
             cursor_row = base_row + cursor_offset / width;
             cursor_col = cursor_offset % width;
@@ -100,7 +100,7 @@ pub fn layout(value: &str, cursor: usize, width: usize) -> ComposerLayout {
 }
 
 /// The most rows the Composer may occupy in a `terminal_height`-row terminal:
-/// `min(8, terminal_height / 3)`, but never below 1 — the transcript viewport
+/// `min(8, terminal_height / 3)`, but never below 1 - the transcript viewport
 /// keeps the lion's share, and the Composer never vanishes.
 pub fn max_visible_rows(terminal_height: usize) -> usize {
     (terminal_height / 3).clamp(1, MAX_ROWS)
@@ -238,7 +238,7 @@ mod tests {
     // SAME cell for the same `(draft, cursor)`. At a width wide enough that
     // every hard line fits in one row, a `layout` cell maps back to logical
     // geometry exactly: `cursor_row` IS the logical line and `cursor_col` the
-    // column. That is `draft::line_col` — and running it back through
+    // column. That is `draft::line_col` - and running it back through
     // `draft::cursor_at` must return the original cursor. These cases were
     // previously guarded on neither side crossing the seam.
 

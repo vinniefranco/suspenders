@@ -1,12 +1,12 @@
-//! Approvals — the pure fold over the Session's Approval state (CONTEXT.md:
+//! Approvals - the pure fold over the Session's Approval state (CONTEXT.md:
 //! Approval, Standing Approval; ADR-0005).
 //!
 //! Owns the one pending Approval (the open modal) and the Session's Standing
 //! Approvals. Returns verdicts; the Agent hosts this struct and translates the
 //! verdicts into the actual `send` to the Turn task and the broadcast to
-//! subscribers — this module knows nothing about task handles or events.
+//! subscribers - this module knows nothing about task handles or events.
 //!
-//! Standing Approval matching is string equality only — no prefix, glob, or
+//! Standing Approval matching is string equality only - no prefix, glob, or
 //! whitespace normalization (`mix  test` ≠ `mix test`). Every widening rule is
 //! a place where the model could compose an unapproved command out of an
 //! approved stem (ADR-0005).
@@ -17,13 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Approval policy: the one place that declares which Tools gate and, for
 /// each, the field whose value the user reads in the modal (and a Standing
-/// Approval matches by exact string equality — ADR-0005). run_command shows
+/// Approval matches by exact string equality - ADR-0005). run_command shows
 /// the command (arbitrary code); web_fetch shows the URL (the one Tool that
-/// reaches outside the Project Root — ADR-0024).
+/// reaches outside the Project Root - ADR-0024).
 ///
 /// One row per gated Tool ties "this gates" to "this is the field" so the two
 /// facts can never disagree. A gated Tool with the field missing or non-string
-/// still gates, reading the empty string — the gate is about the Tool, not the
+/// still gates, reading the empty string - the gate is about the Tool, not the
 /// input's shape.
 const GATED: &[(&str, &str)] = &[("run_command", "command"), ("web_fetch", "url")];
 
@@ -159,7 +159,7 @@ impl Approvals {
     }
 
     /// Clears the pending Approval (the Turn it belonged to is gone: settled or
-    /// freshly started). Standing Approvals survive — they are Session-scoped.
+    /// freshly started). Standing Approvals survive - they are Session-scoped.
     pub fn reset(mut self) -> Self {
         self.pending = None;
         self

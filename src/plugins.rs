@@ -5,7 +5,7 @@
 //! so the first-registered plugin wraps the rest.
 //!
 //! Every stage call is wrapped: a panic skips that
-//! plugin's effect — the token passes through unchanged from before it ran —
+//! plugin's effect - the token passes through unchanged from before it ran -
 //! and comes back as a [`Failure`] for the caller to report. Fail-open with
 //! visibility (ADR-0007 / ADR-0018): the model never sees it, the Turn never
 //! fails. In Rust the isolation is `std::panic::catch_unwind` around each
@@ -13,7 +13,7 @@
 //! `UnwindSafe`); the panic message is recovered from the panic payload.
 //!
 //! [`execute`] is the Turn's dispatch seam: [`crate::tools::execute`] (raw,
-//! unshaped), then the `post_run` fold, then Shaping — so plugins transform
+//! unshaped), then the `post_run` fold, then Shaping - so plugins transform
 //! the model-facing content BEFORE the Result Cap, and whatever they append is
 //! capped like any other content. Artifacts bypass Shaping entirely; they
 //! never enter the Conversation. [`crate::tools::run`] remains the
@@ -100,7 +100,7 @@ pub fn pre_run(plugins: &[Registered], token: Token) -> (Token, Vec<Failure>) {
 /// Executes the Tool and runs the back half of the pipeline: raw execution,
 /// `post_run` fold in REVERSE registration order, then Shaping.
 pub async fn execute(plugins: &[Registered], token: Token) -> (PipelineResult, Vec<Failure>) {
-    // Raw, unshaped execution — the plugin-facing result the post_run fold
+    // Raw, unshaped execution - the plugin-facing result the post_run fold
     // rewrites.
     let raw = tools::execute(&token.tool, &token.input, &token.ctx).await;
 
@@ -179,7 +179,7 @@ pub fn present(
 /// One entry in the configured Plugin list: a plugin name and its registration
 /// options. The Session carries plugins as these lightweight specs (a name plus
 /// opts) and resolves them into live [`Registered`] instances at Turn/UI start.
-/// This is the analogue of the config `:plugins` entries — a bare `Module` or a
+/// This is the analogue of the config `:plugins` entries - a bare `Module` or a
 /// `{Module, opts}` tuple.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginSpec {
@@ -464,7 +464,7 @@ mod tests {
     // ============================================================
 
     // The config-list normalization case: a bare name entry gets empty opts, a
-    // {name, opts} entry passes its opts through — the analogue of normalizing
+    // {name, opts} entry passes its opts through - the analogue of normalizing
     // bare `Module` and `{Module, opts}` entries to `{module, opts}`.
     #[test]
     fn normalize_bare_and_name_opts_entries() {
@@ -564,7 +564,7 @@ mod tests {
     // baud's "a stage returning a non-token is a reported failure" case: in
     // baud a plugin can return the wrong shape at runtime (dynamic dispatch on
     // an untyped return). In Rust the trait method's return type is `Token`, so
-    // this failure mode is impossible — the compiler enforces the contract that
+    // this failure mode is impossible - the compiler enforces the contract that
     // baud's `token_stage` guards at runtime. SKIPPED as unrepresentable
     // (type-system-enforced), not deferred; noted in the report.
 

@@ -2,7 +2,7 @@
 //!
 //! Converts the project's typed content blocks and tool specs into the
 //! string-keyed JSON the wire protocol expects. This module never references
-//! the transport — it produces a plain `serde_json::Value` that the `Llm`
+//! the transport - it produces a plain `serde_json::Value` that the `Llm`
 //! boundary sends, nothing added downstream. Its interface is one pure
 //! function: [`build`].
 //!
@@ -11,7 +11,7 @@
 //!
 //! There is exactly ONE public request-construction entry point,
 //! [`build_request`], taking a typed [`LlmRequest`] and a [`Connection`]. Every
-//! caller — the Turn, the Scout, and Compaction — routes through it; the
+//! caller - the Turn, the Scout, and Compaction - routes through it; the
 //! string-argument [`build`] is a private helper of this module, so the wire
 //! format has a single typed seam and tests assert it through that seam.
 
@@ -21,8 +21,8 @@ use crate::content::Message;
 use crate::session::connection::Connection;
 use crate::tool::ToolSpec;
 
-/// A typed request as the caller assembles it. [`build_request`] renders it —
-/// together with a [`Connection`] — to the complete Anthropic wire payload.
+/// A typed request as the caller assembles it. [`build_request`] renders it -
+/// together with a [`Connection`] - to the complete Anthropic wire payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlmRequest {
     pub system: String,
@@ -56,7 +56,7 @@ impl LlmRequest {
 /// specs, and (conditionally) temperature and the no-think field. Keys the
 /// server should default are omitted, not sent empty: no `"tools"` when
 /// `tools` is empty (a Compaction request offers none, and so does the Scout's
-/// forced report Pass — ADR-0014), no `"temperature"` when the connection
+/// forced report Pass - ADR-0014), no `"temperature"` when the connection
 /// carries `None` (sampling stays with the server).
 ///
 /// Private to this module: the only public entry point is [`build_request`],
@@ -268,7 +268,7 @@ mod tests {
             json!({"enable_thinking": false})
         );
 
-        // no_think:false has no chat_template_kwargs key at all — byte-identical
+        // no_think:false has no chat_template_kwargs key at all - byte-identical
         // to a normal request.
         let plain = build("s", &[], &[], &connection(), false);
         assert!(

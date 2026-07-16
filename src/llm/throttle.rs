@@ -2,7 +2,7 @@
 //!
 //! The UI accommodation (ADR-0002) extracted: at most one emit per interval
 //! keeps the TUI responsive while a local server streams faster than a
-//! terminal can usefully draw (~30fps). This module owns only the decision —
+//! terminal can usefully draw (~30fps). This module owns only the decision -
 //! the caller supplies the clock (a monotonic tick in production, plain
 //! integers in tests) and performs the emit.
 //!

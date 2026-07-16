@@ -5,7 +5,7 @@
 //!
 //! HTML converts to readable text via html2text; other `text/*` and JSON pass
 //! through raw; anything else is an error. The download itself is guarded at
-//! 2 MB — the Result Cap (Shaping) handles the Conversation-side size, but the
+//! 2 MB - the Result Cap (Shaping) handles the Conversation-side size, but the
 //! guard keeps a huge file from streaming into memory first.
 
 use crate::tool::{Tool, ToolCtx, ToolSpec};

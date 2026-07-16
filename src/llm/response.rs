@@ -1,6 +1,6 @@
-//! LLM Response — one model response, whatever happened.
+//! LLM Response - one model response, whatever happened.
 //!
-//! The error algebra (DESIGN.md / ADR-0002): `Llm::complete` never fails — a
+//! The error algebra (DESIGN.md / ADR-0002): `Llm::complete` never fails - a
 //! request or stream failure comes back as a `Response` with
 //! `stop_reason: Error`, `error` set, and whatever content blocks accumulated
 //! before the failure. The loop matches one shape everywhere; partial streamed
@@ -85,14 +85,14 @@ impl Response {
     }
 
     /// Is this error a retryable malformed-tool-call generation (ADR-0030)?
-    /// A missing error string is not retryable — fail loud by default.
+    /// A missing error string is not retryable - fail loud by default.
     pub fn is_retryable(&self) -> bool {
         self.error.as_deref().is_some_and(is_retryable_error)
     }
 }
 
 /// A conservative classifier over an LLM error string: `true` ONLY for the
-/// malformed-tool-call class (ADR-0030) — the local server's
+/// malformed-tool-call class (ADR-0030) - the local server's
 /// `Failed to generate a valid tool call`, which `llm/stream.rs` wraps as
 /// `api_stream_error: ...`. Everything else is `false`, fail-loud by default:
 /// `Context size has been exceeded` (the KV-pool 500) and transport errors

@@ -1,12 +1,12 @@
 //! Turn Settlement (CONTEXT.md): how an ended Turn enters the Conversation, as
 //! one pure fold.
 //!
-//! `crate::agent` accumulates the facts here while the Turn task runs — the
-//! latest checkpoint, the reported stop reason, whether the user cancelled —
+//! `crate::agent` accumulates the facts here while the Turn task runs - the
+//! latest checkpoint, the reported stop reason, whether the user cancelled -
 //! and calls [`settle`] exactly once when the task ends. The fold returns the
 //! complete resolution: the settled Conversation, the settlement event to
 //! broadcast, the Session Log entry, and the Rollover decision over the queued
-//! Steering. The Agent only interprets — it updates its state, logs,
+//! Steering. The Agent only interprets - it updates its state, logs,
 //! broadcasts, and maybe starts the next Turn (the same pure-core/process-shell
 //! split ADR-0011 gave the Turn loop).
 //!
@@ -19,12 +19,12 @@
 //! Conversation when none arrived): the killed Turn's Tool Calls already
 //! mutated the disk, so dropping them from the Conversation would leave the
 //! model amnesiac about its own edits. The settled Conversation closes with an
-//! assistant marker so roles keep alternating — strict chat templates on small
+//! assistant marker so roles keep alternating - strict chat templates on small
 //! local models choke on two user messages in a row.
 //!
 //! Rollover (CONTEXT.md): Steering the Turn ended before delivering
 //! auto-submits as the next Turn's prompt (queued texts joined) when the Turn
-//! settled completed or failed; Cancellation discards it — cancel means stop
+//! settled completed or failed; Cancellation discards it - cancel means stop
 //! everything (the text stays in the UI's input history).
 
 use crate::content::ContentBlock;
@@ -67,9 +67,9 @@ impl Reason {
 }
 
 /// How the Turn task ended, as seen from the Agent's mailbox (baud's
-/// `outcome`): the async reply — [`Outcome::Ok`], [`Outcome::Failed`] (the Loop
+/// `outcome`): the async reply - [`Outcome::Ok`], [`Outcome::Failed`] (the Loop
 /// already closed the Conversation with the failure marker), or
-/// [`Outcome::Error`] (no Conversation came back, e.g. budget exhaustion) — or
+/// [`Outcome::Error`] (no Conversation came back, e.g. budget exhaustion) - or
 /// [`Outcome::Down`] when the task died without replying.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {

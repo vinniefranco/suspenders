@@ -1,11 +1,11 @@
-//! Generic filterable selector — a PURE, reusable single-select list (ADR-0001's
+//! Generic filterable selector - a PURE, reusable single-select list (ADR-0001's
 //! TEA shape, ADR-0019: no ratatui/crossterm here). It is the one widget behind
 //! both the Slash Command menu (ADR-0032) and any command's own list (the
 //! `/model` model list, a future `/theme` theme list): all "filter a list, pick
 //! one" the same shape.
 //!
 //! The model is a cursor over [`SelectorRow`]s. The selector does NOT own the
-//! filter text — the Composer drives it, so the caller passes the current
+//! filter text - the Composer drives it, so the caller passes the current
 //! filter into every query. [`Selector::filtered`] is the case-insensitive
 //! substring view over `label`; [`Selector::handle_nav`] folds a navigation key
 //! against that filtered view and either moves the cursor (`None`) or resolves
@@ -45,7 +45,7 @@ pub enum SelectorOutcome {
 
 /// The selector's whole state: the rows and the highlighted index. The cursor
 /// is an index into the FILTERED view (re-clamped on every fold), not into
-/// `rows` — filtering narrows what the cursor may land on.
+/// `rows` - filtering narrows what the cursor may land on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selector {
     pub rows: Vec<SelectorRow>,

@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --write-config removes the hand-authoring friction (ADR-0031): resolve the
     // path (empty = XDG default), write the base()-defaults template, and exit
-    // before any Session is built — works for both TUI and headless.
+    // before any Session is built - works for both TUI and headless.
     if let Some(path) = cli.write_config {
         let path = if path.is_empty() {
             suspenders::session::default_config_path()

@@ -2,11 +2,11 @@
 
 Speak the Anthropic Messages API (`/v1/messages`) as the wire protocol against local servers, and confine all HTTP and SSE implementation to one `llm` module behind an `Llm` trait. Everything else speaks the project's own typed structs.
 
-Local servers serve the Anthropic API natively, with first-class thinking blocks and structured `tool_use` — both load-bearing for a coding agent on reasoning models. One boundary module contains the coupling to the wire format, so any future swap is a one-module change.
+Local servers serve the Anthropic API natively, with first-class thinking blocks and structured `tool_use` - both load-bearing for a coding agent on reasoning models. One boundary module contains the coupling to the wire format, so any future swap is a one-module change.
 
 ## Implementation
 
-reqwest carries the transport, streaming the response body with `bytes_stream()`. The `eventsource-stream` crate handles SSE framing. A **pure `fold_sse` function** turns the sequence of parsed SSE events into a Response — blocks, `stop_reason`, and usage — with no I/O, so it is testable against canned event lists. `fold_sse` absorbs the server quirks: the missing-`index` case, exclusion of thinking blocks from the Conversation, and `tool_use` `input_json_delta` reassembly.
+reqwest carries the transport, streaming the response body with `bytes_stream()`. The `eventsource-stream` crate handles SSE framing. A **pure `fold_sse` function** turns the sequence of parsed SSE events into a Response - blocks, `stop_reason`, and usage - with no I/O, so it is testable against canned event lists. `fold_sse` absorbs the server quirks: the missing-`index` case, exclusion of thinking blocks from the Conversation, and `tool_use` `input_json_delta` reassembly.
 
 ## Error algebra
 
@@ -28,7 +28,7 @@ response is common to the Anthropic and OpenAI REST APIs
 (`{"data": [{"id": …}]}`), so a single parse of `data[].id` serves both,
 and the local servers we target (LM Studio, Ollama, vLLM) expose it on the
 same host as `/messages`. So "the OpenAI models endpoint" and "the
-Anthropic models endpoint" are one wire shape here — no protocol fork.
+Anthropic models endpoint" are one wire shape here - no protocol fork.
 
 Unlike `complete`, `list_models` returns `Result<Vec<String>, String>`
 rather than folding failure into a Response: it is a discrete,

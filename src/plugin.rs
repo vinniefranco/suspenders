@@ -8,16 +8,16 @@
 //! does not override a stage passes the token through unchanged, exactly like
 //! a baud plugin that does not export it.
 //!
-//! * `pre_run` — before the Tool executes. May replace the token's input,
+//! * `pre_run` - before the Tool executes. May replace the token's input,
 //!   [`Token::halt`] the call, or capture state into `assigns`. Runs after the
 //!   Duplicate Nudge check and before the Approval gate, so the user always
 //!   approves the plugin-adjusted command.
-//! * `post_run` — after execution, before Shaping. May transform
+//! * `post_run` - after execution, before Shaping. May transform
 //!   `token.result` (the content the model sees) and attach Artifacts.
 //!
-//! * `present` — the PURE Presentment stage inside the Transcript fold. Given a
+//! * `present` - the PURE Presentment stage inside the Transcript fold. Given a
 //!   [`crate::ui::transcript::TranscriptItem`] and the Tool Call's Artifacts, it
-//!   returns the item to display — unchanged (default = identity) or replaced
+//!   returns the item to display - unchanged (default = identity) or replaced
 //!   (e.g. a one-line Tool Result summary rewritten into a diff `Block`). No IO:
 //!   it runs in the view, folds over the item in registration order, and reads
 //!   only the Artifacts riding the `:tool_result` event.
@@ -42,7 +42,7 @@ pub use token::{Token, TokenResult};
 /// stages it cares about.
 ///
 /// `opts` is the plugin's registration options (baud's `keyword()`), carried
-/// as a `serde_json::Value` — the open edge for per-plugin config.
+/// as a `serde_json::Value` - the open edge for per-plugin config.
 pub trait Plugin: Send + Sync {
     /// Runs before the Tool executes. Default: identity.
     fn pre_run(&self, token: Token, _opts: &Value) -> Token {

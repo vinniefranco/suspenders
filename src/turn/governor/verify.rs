@@ -5,15 +5,15 @@
 //! left unverified) share the trigger discipline and the re-arm rule.
 //!
 //! * **Trigger**: private once-per-Turn caps (`verify_nudged`,
-//!   `verify_failed_nudged`), re-armed by progress — a Pass that made at
+//!   `verify_failed_nudged`), re-armed by progress - a Pass that made at
 //!   least one Tool Call ([`Verify::note_progress`]). The unverified-writes
 //!   and command-failing facts themselves are the Ledger's; this Governor
 //!   only judges them against its caps.
 //! * **Interventions**: stands alone as a user message at the finish
-//!   settlement — the model gets one more Pass to act on it. The strict
+//!   settlement - the model gets one more Pass to act on it. The strict
 //!   Verify-failed > Verify precedence is the arbiter's
 //!   ([`super::settle_finish`]), not this module's.
-//! * **Setpoints**: none — the once-per-Turn-until-progress cap is the
+//! * **Setpoints**: none - the once-per-Turn-until-progress cap is the
 //!   trigger's mechanics, not a tuned value; no threshold here has ever
 //!   demanded tuning.
 //!

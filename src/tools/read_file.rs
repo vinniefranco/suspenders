@@ -1,7 +1,7 @@
 //! `read_file(path, start_line = 1)`: returns file contents from `start_line`
 //! on. Size is not this tool's concern: `Tools::run` shapes every Tool Result
 //! to the Result Cap, and read_file's shaping cut names the `start_line` that
-//! continues a truncated read — `start_line` is windowing (WHICH part), the
+//! continues a truncated read - `start_line` is windowing (WHICH part), the
 //! cap stays the size authority (HOW MUCH).
 
 use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};

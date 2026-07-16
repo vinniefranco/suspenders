@@ -16,7 +16,7 @@
 //! * **Failed file operations are worded by [`file_error`]**, which formats the
 //!   POSIX reason and appends closest-match suggestions on ENOENT.
 //! * **Errors return, never raise.**
-//! * **Size is not a tool concern** — `tools::shaping` cuts every result.
+//! * **Size is not a tool concern** - `tools::shaping` cuts every result.
 
 use crate::scout::ScoutFn;
 use std::path::{Path, PathBuf};
@@ -33,11 +33,11 @@ pub struct ToolSpec {
 
 /// The authoring contract a Suspenders tool implements (baud's `Baud.Tool`
 /// behaviour). `spec` is the Anthropic tool format; `run` gets the decoded
-/// input (an open edge — a `serde_json::Value`) plus the [`ToolCtx`].
+/// input (an open edge - a `serde_json::Value`) plus the [`ToolCtx`].
 ///
 /// `run` is async so the object-safe registry can hold `Box<dyn Tool>` (via
 /// `async-trait`); most tools implement a sync heuristic core and make `run` a
-/// thin wrapper. Errors return (`Err`), never raise — `Tools::execute` maps an
+/// thin wrapper. Errors return (`Err`), never raise - `Tools::execute` maps an
 /// `Err` to an `is_error` Tool Result.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -55,7 +55,7 @@ pub struct ToolCtx {
     pub result_cap: usize,
     pub command_timeout_ms: u64,
     /// The `scout` capture: an effect wired to the Session that dispatches a
-    /// Scout. `None` on the plugin-free path (tests, direct callers) — explore
+    /// Scout. `None` on the plugin-free path (tests, direct callers) - explore
     /// then returns a graceful "no Scout wired" error.
     pub scout: Option<ScoutFn>,
 }

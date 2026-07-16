@@ -1,4 +1,4 @@
-//! UI Transcript — the pure functional core of the TUI (ADR-0001, The Elm
+//! UI Transcript - the pure functional core of the TUI (ADR-0001, The Elm
 //! Architecture).
 //!
 //! The Transcript is the display-side history of the Session and every rule
@@ -17,7 +17,7 @@
 //! ## Rules encoded here
 //!
 //! * Streaming is STATELESS: [`Event::MessageUpdate`] carries the accumulated
-//!   snapshot, so the in-flight view is replaced wholesale per event — no delta
+//!   snapshot, so the in-flight view is replaced wholesale per event - no delta
 //!   accumulation. [`Event::MessageEnd`] materializes the snapshot into
 //!   discrete items (Thinking first, then assistant text); a cancel/crash
 //!   mid-stream materializes whatever the last snapshot held.
@@ -27,7 +27,7 @@
 //! * The Composer is edited HERE, not in the adapter: chars insert at the
 //!   cursor (a char index), Alt-Enter and a trailing-backslash Enter insert
 //!   hard newlines, Home/End work within the current line, and Up/Down are
-//!   edge-triggered — history recall only from the draft's first/last line,
+//!   edge-triggered - history recall only from the draft's first/last line,
 //!   cursor movement everywhere else.
 //! * A pending Approval swallows every key except `y`, `n`, `a`, and `Escape`;
 //!   `a` is approve-always (Standing Approval); Escape means Cancellation,
@@ -92,21 +92,21 @@ impl StyledLine {
 ///
 /// Mirrors baud's `item` sum type:
 ///
-/// * `User { text }` — `{:user, text}`.
-/// * `Assistant { text }` — `{:assistant, text}`.
-/// * `Thinking { text }` — `{:thinking, text}`.
-/// * `ToolCall { id, name, summary }` — `{:tool_call, id, name, summary}`; `id`
+/// * `User { text }` - `{:user, text}`.
+/// * `Assistant { text }` - `{:assistant, text}`.
+/// * `Thinking { text }` - `{:thinking, text}`.
+/// * `ToolCall { id, name, summary }` - `{:tool_call, id, name, summary}`; `id`
 ///   is a display-opaque correlation token (the `tool_use_id`) used ONLY to
-///   pair the call with its later `ToolResult` in the fold — the display never
+///   pair the call with its later `ToolResult` in the fold - the display never
 ///   interprets it.
-/// * `ToolResult { name, summary, is_error, key_arg }` —
+/// * `ToolResult { name, summary, is_error, key_arg }` -
 ///   `{:tool_result, name, summary, is_error, key_arg}`, the default one-line
 ///   summary a plugin's `present` may replace; `key_arg` is the salient input
 ///   arg (path/command/pattern) carried over from the paired call so the merged
 ///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
-/// * `Block { title, lines }` — `{:block, title, lines}`: a titled block of
+/// * `Block { title, lines }` - `{:block, title, lines}`: a titled block of
 ///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
-/// * `Info { text }` — `{:info, text}`.
+/// * `Info { text }` - `{:info, text}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User {
@@ -133,7 +133,7 @@ pub enum TranscriptItem {
         /// The salient input arg (path/command/pattern) carried from the paired
         /// [`TranscriptItem::ToolCall`], so the merged line can read
         /// `name  <key_arg> · <result>`. `None` for a result with no live call
-        /// (e.g. governor-injected) — the line falls back to `name → result`.
+        /// (e.g. governor-injected) - the line falls back to `name → result`.
         key_arg: Option<String>,
     },
     Block {
@@ -154,7 +154,7 @@ impl TranscriptItem {
     /// `matches!(item, Block)`, so the merge is free to choose an item's shape
     /// without re-implementing the fold rule. Today only a [`Block`] with a
     /// non-empty body folds; a merged one-line `ToolResult` has no body, so it
-    /// never collapses. Stays pure — returns the pure-core [`StyledLine`] slice,
+    /// never collapses. Stays pure - returns the pure-core [`StyledLine`] slice,
     /// never a ratatui type (ADR-0019).
     ///
     /// [`Block`]: TranscriptItem::Block
@@ -167,7 +167,7 @@ impl TranscriptItem {
 
     /// The title an item collapses TO under the global tools toggle (Ctrl-O):
     /// the one-liner the view shows in place of the folded [`foldable_body`].
-    /// Kept beside `foldable_body` so the collapse rule — predicate AND title —
+    /// Kept beside `foldable_body` so the collapse rule - predicate AND title -
     /// lives entirely in the pure core (Stage 2 review C2 / S1): the view
     /// composes the collapsed line from this accessor without matching on
     /// `Block`, so a future non-Block foldable item collapses the same way.
@@ -215,7 +215,7 @@ pub struct PendingApproval {
 /// and draws the inline popup. `rows` are the commands matching the typed token
 /// (via the generic selector's row shape); `highlight` is the index into `rows`
 /// of the highlighted command. Empty `rows` means the typed token matches no
-/// command — the popup shows "no matches" and Enter is an unknown-command
+/// command - the popup shows "no matches" and Enter is an unknown-command
 /// no-Turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashMenu {
@@ -227,7 +227,7 @@ pub struct SlashMenu {
 /// owned by [`CommandSelector`]. `Loading` after commit while the adapter
 /// fetches; `Ready` once [`Event::SelectorReady`] delivered rows into a
 /// [`Selector`]; `Failed` on [`Event::SelectorFailed`]. Only `Ready` accepts
-/// navigation/selection — a `Loading`/`Failed` overlay swallows Enter.
+/// navigation/selection - a `Loading`/`Failed` overlay swallows Enter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorStatus {
     Loading,
@@ -240,7 +240,7 @@ pub enum SelectorStatus {
 /// command name the pure core carries back out on selection (it never learns
 /// what the command does); `status` is the row list's lifecycle. Modeled on
 /// [`PendingApproval`]: owned modal state the view reads through
-/// [`Transcript::slash_view`]. The overlay does NOT own its filter — the draft
+/// [`Transcript::slash_view`]. The overlay does NOT own its filter - the draft
 /// `rest` (after `/<name> `) filters the rows, consistent with Phase 3's menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSelector {
@@ -277,10 +277,10 @@ pub enum Key {
     Escape,
     PageUp,
     PageDown,
-    /// Mouse wheel up — scrolls by a few lines where [`Key::PageUp`] scrolls
+    /// Mouse wheel up - scrolls by a few lines where [`Key::PageUp`] scrolls
     /// by a whole page; otherwise handled identically in every state.
     WheelUp,
-    /// Mouse wheel down — scrolls by a few lines where [`Key::PageDown`]
+    /// Mouse wheel down - scrolls by a few lines where [`Key::PageDown`]
     /// scrolls by a whole page; otherwise handled identically in every state.
     WheelDown,
     ArrowUp,
@@ -334,7 +334,7 @@ pub enum Decision {
 
 /// How far one scroll Effect moves: the wheel steps by [`ScrollStep::Line`]s,
 /// the page keys by whole viewport [`ScrollStep::Page`]s. The core only names
-/// the granularity — the adapter's `ui::viewport` knows the geometry and turns
+/// the granularity - the adapter's `ui::viewport` knows the geometry and turns
 /// it into an actual line count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollStep {
@@ -362,10 +362,10 @@ pub enum Effect {
     /// Persist a submitted prompt into the on-disk history file.
     HistoryAppend(String),
     /// A committed Slash Command (ADR-0032): the pure core recognized `/name`
-    /// and hands it to the adapter to run. Commands carry no inline arg today —
+    /// and hands it to the adapter to run. Commands carry no inline arg today -
     /// a selector-opening command's sub-filter comes from the draft `rest`
     /// (`slash_view`), not from this payload. The core does not know what any
-    /// command does — this payload is command-agnostic.
+    /// command does - this payload is command-agnostic.
     Command { name: String },
     /// A row was chosen from a committed command's selector (ADR-0033): the
     /// opaque command `name` and the selected row's `value`. The adapter
@@ -396,7 +396,7 @@ pub struct Transcript {
     /// The live Dead Mass share (integer percent) from the most recent
     /// [`Event::ContextPressure`], for the status bar. `None` until the first
     /// pressure event; folded into the Tokens segment as a `· N% dead` tail so
-    /// context reclamation is legible AS IT STANDS — not the pre-reclaim
+    /// context reclamation is legible AS IT STANDS - not the pre-reclaim
     /// snapshot a past wave found (which a wave clears the instant it fires).
     pub dead_mass_pct: Option<u64>,
     pub input_value: String,
@@ -413,7 +413,7 @@ pub struct Transcript {
     /// `Ready`/`Failed` by [`Transcript::apply_event`], and cleared on
     /// selection, Escape, or backspacing out of the sub-state. Owned modal
     /// state, mirroring [`Transcript::pending_approval`]; the filter is NOT
-    /// owned here — the draft `rest` filters the rows.
+    /// owned here - the draft `rest` filters the rows.
     command_selector: Option<CommandSelector>,
     /// The prompt-history ring and its Readline-style recall rules. Owned by
     /// [`crate::ui::history`]; navigated from the Up/Down arms of
@@ -425,14 +425,14 @@ pub struct Transcript {
     pub thinking_expanded: bool,
     /// Whether settled [`TranscriptItem::Block`] items (diffs, tool output)
     /// render expanded (the full body) instead of the collapsed one-line
-    /// title. Toggled by [`Key::ToggleTools`] (Ctrl-O); defaults collapsed —
+    /// title. Toggled by [`Key::ToggleTools`] (Ctrl-O); defaults collapsed -
     /// the same detail-on-demand rule as `thinking_expanded`, applied to the
     /// machinery plane so a burst of tool output can't eat the window.
     pub tools_expanded: bool,
     /// Bumped whenever `messages` changes OTHER than by appending (today only
     /// `SteeringDelivered`, which removes its pending info line from wherever
     /// it sits). The frontend's per-item render cache extends incrementally
-    /// while this holds still and rebuilds when it moves — appends are the hot
+    /// while this holds still and rebuilds when it moves - appends are the hot
     /// path, structural edits the rare one. Every other `messages` mutation is
     /// a push and must stay one (or bump this).
     pub messages_revision: u64,
@@ -511,7 +511,7 @@ impl Transcript {
             // Live context-pressure indication: refresh the status bar's token
             // estimate, budget, and LIVE Dead Mass share mid-Turn and name the
             // semantic pressure level (ADR-0008). NEVER a Transcript item. The
-            // Dead Mass here is the current figure, refreshed every pass — the
+            // Dead Mass here is the current figure, refreshed every pass - the
             // bar tracks it, not a wave's cleared snapshot.
             Event::ContextPressure {
                 token_estimate,
@@ -544,12 +544,12 @@ impl Transcript {
             }
 
             // Merge the result with its call into ONE line: find the pending
-            // `ToolCall` by `id` (NEVER by position — parallel tool calls
+            // `ToolCall` by `id` (NEVER by position - parallel tool calls
             // interleave), recover its `key_arg`, remove the redundant call
             // line, and stamp the arg onto the result BEFORE Presentment (a
             // plugin's `present` may replace the item with a Block, so stamping
             // after would stamp a dropped item). Removing the call is a
-            // NON-append structural edit, so it bumps `messages_revision` — the
+            // NON-append structural edit, so it bumps `messages_revision` - the
             // RenderCache desyncs without it (mirrors `SteeringDelivered`). An
             // unpaired result (governor-injected, no live call) removes nothing,
             // does not bump, and carries no `key_arg`.
@@ -561,7 +561,7 @@ impl Transcript {
                 artifacts,
             } => {
                 // Recover the paired call's `key_arg` (its summary already IS the
-                // salient arg — `key_arg` never yields an empty string, so no
+                // salient arg - `key_arg` never yields an empty string, so no
                 // re-check here; the render layer normalizes any empty value once).
                 let key_arg = self
                     .messages
@@ -684,7 +684,7 @@ impl Transcript {
             }
 
             // A malformed-tool-call re-draw (ADR-0030): silent to the model's
-            // Conversation, never silent to the operator — an info line marks
+            // Conversation, never silent to the operator - an info line marks
             // each bounded re-draw.
             Event::Retry {
                 attempt, budget, ..
@@ -698,7 +698,7 @@ impl Transcript {
             // The adapter delivered a committed command's selector rows: flip a
             // Loading overlay to Ready over a fresh Selector. Guarded so a stale
             // event that arrives after the overlay closed (Escape/selection) or
-            // was never Loading is ignored — it must not resurrect a closed
+            // was never Loading is ignored - it must not resurrect a closed
             // popup.
             Event::SelectorReady(rows) => {
                 if let Some(cs) = self.command_selector.as_mut()
@@ -727,8 +727,8 @@ impl Transcript {
             // An Eviction wave rewrote the request copy (CONTEXT.md: Eviction,
             // Dead Mass): recede ONE terse Info line naming the wave and its
             // at-wave (pre-reclaim) snapshot. The status bar does NOT derive from
-            // this — it tracks the LIVE Dead Mass off `ContextPressure`, and this
-            // wave has just cleared what it found. APPEND-ONLY — `push_info` is a
+            // this - it tracks the LIVE Dead Mass off `ContextPressure`, and this
+            // wave has just cleared what it found. APPEND-ONLY - `push_info` is a
             // push, so this must NOT bump `messages_revision` (the wave line
             // keeps the RenderCache incremental; only a non-append edit bumps).
             Event::EvictionWave { stats } => {
@@ -750,17 +750,17 @@ impl Transcript {
 
     // ---- User intents ------------------------------------------------------
 
-    /// Folds one key press into the Transcript. ALL keys route through here —
-    /// Composer editing included — so every rule lives in the pure core
+    /// Folds one key press into the Transcript. ALL keys route through here -
+    /// Composer editing included - so every rule lives in the pure core
     /// (ADR-0001); the adapter only maps crossterm events to [`Key`]s.
     ///
     /// While an Approval is pending, only `y`, `n`, `a` and `Escape` do
-    /// anything; every other key is swallowed — in particular, plain chars
+    /// anything; every other key is swallowed - in particular, plain chars
     /// must NOT edit the Composer while the modal is open. Escape is
     /// Cancellation, which wins over the Approval.
     ///
     /// The Composer cursor (`input_cursor`) is a CHAR index into
-    /// `input_value` — the codebase counts chars, not bytes, so multi-byte
+    /// `input_value` - the codebase counts chars, not bytes, so multi-byte
     /// input never splits or panics.
     pub fn handle_key(mut self, key: Key) -> (Self, Vec<Effect>) {
         // Modal-open handling swallows everything but y/n/a/Escape.
@@ -800,7 +800,7 @@ impl Transcript {
         }
 
         // Slash Command overlay (ADR-0032/0033): a leading `/` opens the popup
-        // whatever the Agent is doing (Idle or Running) — a slash draft is NEVER
+        // whatever the Agent is doing (Idle or Running) - a slash draft is NEVER
         // a prompt or Steering. The draft parses into `(name, rest)`; the popup
         // is in one of two sub-states, keyed by whether the command committed:
         //
@@ -864,7 +864,7 @@ impl Transcript {
                     }
                     Key::Escape => {
                         // Close the overlay and empty the Composer (no Turn to
-                        // cancel — the overlay is a Composer state).
+                        // cancel - the overlay is a Composer state).
                         self.close_selector();
                         return (self, vec![]);
                     }
@@ -904,13 +904,13 @@ impl Transcript {
                     // Typing a space after a command token also commits it (the
                     // palette convention): the space is the menu→command boundary,
                     // so it commits the highlighted row rather than editing the
-                    // draft. Only when a row is highlighted — a bare/space on an
+                    // draft. Only when a row is highlighted - a bare/space on an
                     // empty menu falls through as a normal edit.
                     Key::Char(' ') if rows.get(self.slash_cursor).is_some() => {
                         let row = rows.get(self.slash_cursor).cloned();
                         return self.commit_command(row.as_ref());
                     }
-                    // Escape closes the menu by clearing the draft — the same
+                    // Escape closes the menu by clearing the draft - the same
                     // "back to an empty Composer" the running-Turn Escape does NOT
                     // do (that Cancels), but here there is no Turn to cancel: the
                     // menu is a Composer state, so leaving it empties the Composer.
@@ -929,7 +929,7 @@ impl Transcript {
         match key {
             // Trailing-backslash continuation: Enter on a draft whose LAST
             // char is a literal `\` replaces that backslash with a hard
-            // newline (cursor to the end) instead of submitting — the
+            // newline (cursor to the end) instead of submitting - the
             // fallback for terminals whose Alt-Enter never reaches us. Checked
             // before the submit/steer arms so it applies in both states.
             Key::Enter if self.input_value.ends_with('\\') => {
@@ -939,7 +939,7 @@ impl Transcript {
                 (self, vec![])
             }
 
-            // Enter submits when idle, steers when running — the composer never
+            // Enter submits when idle, steers when running - the composer never
             // locks.
             Key::Enter if self.status == Status::Running => match self.input_value.trim() {
                 "" => (self, vec![]),
@@ -971,7 +971,7 @@ impl Transcript {
             // recalls history (the pre-multi-line behavior, draft stashing
             // included); anywhere else it moves the cursor up one line, the
             // column clamped to that line's length. Down mirrors from the
-            // LAST line. No goal-column memory — a simple clamp, on purpose.
+            // LAST line. No goal-column memory - a simple clamp, on purpose.
             Key::ArrowUp => {
                 let (line, col) = draft::line_col(&self.input_value, self.input_cursor);
                 if line == 0 {
@@ -1048,7 +1048,7 @@ impl Transcript {
             }
 
             // Ctrl-O: flip the tool-Block expansion; a pure display toggle, no
-            // effects. Mirrors Ctrl-T for the machinery plane — the status
+            // effects. Mirrors Ctrl-T for the machinery plane - the status
             // bar's tools segment renders this flag, so the flip is visible
             // even with no Blocks on screen.
             Key::ToggleTools => {
@@ -1061,7 +1061,7 @@ impl Transcript {
     }
 
     // Place a recalled (or restored) history entry into the composer, cursor at
-    // the end — the landing spot the Up/Down arms share.
+    // the end - the landing spot the Up/Down arms share.
     fn recall(&mut self, text: String) {
         self.input_cursor = text.chars().count();
         self.input_value = text;
@@ -1076,7 +1076,7 @@ impl Transcript {
 
     /// Records how the `Submit` effect went: `Ok` appends the user line and
     /// clears the composer; `Err(Busy)` means the submit raced a starting Turn
-    /// — retry as Steering.
+    /// - retry as Steering.
     pub fn submitted(
         mut self,
         prompt: impl Into<String>,
@@ -1102,7 +1102,7 @@ impl Transcript {
 
     /// Records how the `Steer` effect went: `Ok` clears the composer (the
     /// pending line arrives via `steering_queued`); `Err(Idle)` means the Turn
-    /// ended between keypress and call — retry as a submit.
+    /// ended between keypress and call - retry as a submit.
     pub fn steered(
         mut self,
         text: impl Into<String>,
@@ -1151,7 +1151,7 @@ impl Transcript {
 
     /// The open Slash Command MENU (ADR-0032) for rendering, or `None` when the
     /// draft is not a slash draft OR the popup is in the selector sub-state
-    /// (`rest = Some` on a known selector-opening command — read that through
+    /// (`rest = Some` on a known selector-opening command - read that through
     /// [`Transcript::slash_view`]). Exposed like [`Transcript::pending_approval`]
     /// so the view reads it and draws the inline popup: `rows` are the commands
     /// matching the typed token, `highlight` the (clamped) highlighted index.
@@ -1172,7 +1172,7 @@ impl Transcript {
     /// selector-opening command), `Selector` once such a command committed
     /// (`rest = Some`). The Selector's `rows`/`highlight` are the overlay rows
     /// filtered by the draft `rest` (the filter is the draft's, not the
-    /// Selector's — consistent with the menu), so they reflect live typing.
+    /// Selector's - consistent with the menu), so they reflect live typing.
     pub fn slash_view(&self) -> Option<SlashView> {
         if !slash::is_slash(&self.input_value) {
             return None;
@@ -1217,7 +1217,7 @@ impl Transcript {
     }
 
     // Empties the Composer, resets the Slash Command highlight, and closes any
-    // command-selector overlay — the landing spot after a committed/closed slash
+    // command-selector overlay - the landing spot after a committed/closed slash
     // draft.
     fn clear_draft(&mut self) {
         self.input_value = String::new();
@@ -1238,7 +1238,7 @@ impl Transcript {
     // selector-opening command switches the popup to its selector sub-state:
     // the draft is normalized to `"/<name> "`, a `Loading` overlay is set, and
     // `Effect::Command` is emitted ONCE (the overlay's presence guards against
-    // re-emitting on later keystrokes — the menu block only runs when there is
+    // re-emitting on later keystrokes - the menu block only runs when there is
     // no overlay). A fire-and-run command keeps Phase 3 behavior: emit
     // `Effect::Command` and clear the draft.
     fn commit_command(mut self, row: Option<&SelectorRow>) -> (Self, Vec<Effect>) {
@@ -1371,9 +1371,9 @@ fn pressure_level(estimate: u64, budget: u64, reserve: u64, slack: f64) -> Press
 // the Dead Mass share plus ONLY the nonzero counts, by kind, so a wave that
 // reclaimed one kind reads cleanly (`context wave · 12% dead mass · 3 results`)
 // and a mixed wave stays single-line. Dead Mass is the AT-WAVE (pre-reclaim)
-// fraction from [`WaveStats::dead_mass`] — correct for a historical line —
+// fraction from [`WaveStats::dead_mass`] - correct for a historical line -
 // rounded through the shared [`dead_mass_pct`] rule so this line and the status
-// bar can never disagree. Kept quiet — this is machinery, and Info is already
+// bar can never disagree. Kept quiet - this is machinery, and Info is already
 // DarkGray italic.
 fn eviction_wave_line(stats: &WaveStats) -> String {
     let counts = [
@@ -1400,7 +1400,7 @@ fn eviction_wave_line(stats: &WaveStats) -> String {
 // `path` for read/edit/write, the `command` for run_command, the `pattern`/
 // `query` for grep/search; otherwise the first value in alphabetical key order.
 // `None` when the input carries no object values OR the picked value formats
-// empty — the ONE emptiness rule, sourced here (so the caller falls back to the
+// empty - the ONE emptiness rule, sourced here (so the caller falls back to the
 // full `key=value` summary and never treats an empty arg as present). Truncated
 // like [`format_value`] so a long path/command cannot blow out the line.
 fn key_arg(name: &str, input: &serde_json::Value) -> Option<String> {
@@ -1489,8 +1489,8 @@ fn truncate(text: &str, width: usize) -> String {
 // -- Composer draft editing (char-index string surgery) --
 //
 // The cursor is a CHAR index (the codebase counts chars, not bytes). The
-// logical line/column geometry — `line_col`, `line_lengths`, `cursor_at`,
-// `byte_of` — has ONE owner in `ui::draft`, shared with the render path
+// logical line/column geometry - `line_col`, `line_lengths`, `cursor_at`,
+// `byte_of` - has ONE owner in `ui::draft`, shared with the render path
 // (`ui::composer`) so the cursor the user edits and the cursor the view
 // paints can never drift apart. These two helpers are the edit-side string
 // surgery built on that geometry: they translate the char-index cursor to a
@@ -2140,7 +2140,7 @@ mod tests {
     // An Eviction wave recedes ONE Info line and, being append-only, must NOT
     // bump messages_revision (the precondition guard: the wave line keeps the
     // RenderCache incremental). It must NOT touch the status bar's `dead_mass_pct`
-    // — the bar tracks the LIVE figure off ContextPressure, and this wave just
+    // - the bar tracks the LIVE figure off ContextPressure, and this wave just
     // cleared what it found (the S1 bug: advertising the reclaimed snapshot).
     #[test]
     fn an_eviction_wave_pushes_one_info_line_without_bumping_or_setting_the_live_bar() {
@@ -2201,7 +2201,7 @@ mod tests {
     }
 
     // The wave line names ONLY the nonzero counts, in kind order, with the Dead
-    // Mass share as an integer percent — a single-kind wave reads cleanly.
+    // Mass share as an integer percent - a single-kind wave reads cleanly.
     #[test]
     fn eviction_wave_line_names_only_nonzero_counts() {
         let one_kind = WaveStats {
@@ -2306,7 +2306,7 @@ mod tests {
     // `/model` opens a selector (ADR-0033), so committing it does NOT clear the
     // draft the way a fire-and-run command would (Phase 3). It normalizes the
     // draft to `"/model "`, sets a Loading overlay, and emits ONE Effect::Command
-    // — the selector-activation path is exercised separately below.
+    // - the selector-activation path is exercised separately below.
     #[test]
     fn enter_commits_the_highlighted_command_and_clears_the_draft() {
         let (t, effects) = slashing("/model").handle_key(Key::Enter);
@@ -2388,7 +2388,7 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::Command { .. }]));
 
         // Running: the leading `/` still opens the menu and Enter commits the
-        // command — it is NOT Steering text.
+        // command - it is NOT Steering text.
         let (t, _) = fresh().apply_event(Event::turn_started("r1"));
         let t = t.input_changed("/model", 6);
         assert!(t.slash_menu().is_some(), "menu opens while running");
@@ -2446,7 +2446,7 @@ mod tests {
                 name: "model".into(),
             }]
         );
-        // Draft normalized to `/model ` (rest = Some("")) — NOT cleared.
+        // Draft normalized to `/model ` (rest = Some("")) - NOT cleared.
         assert_eq!(t.input_value, "/model ");
         // Overlay is Loading for `model`.
         assert!(matches!(
@@ -2662,7 +2662,7 @@ mod tests {
         let t = model_selector_ready(vec![model_row("qwen"), model_row("llama")]);
         let (t, _) = t.handle_key(Key::ArrowDown);
         assert_eq!(highlight_of(&t), 1);
-        // A second (stale) ready arrives — the overlay is no longer Loading.
+        // A second (stale) ready arrives - the overlay is no longer Loading.
         let (t, _) = t.apply_event(Event::selector_ready(vec![model_row("gpt")]));
         match t.slash_view() {
             Some(SlashView::Selector {
@@ -3227,7 +3227,7 @@ mod tests {
                 artifacts,
             )],
         );
-        // Only the Block remains — the redundant call line is gone.
+        // Only the Block remains - the redundant call line is gone.
         assert_eq!(
             items(&t),
             vec![TranscriptItem::Block {
@@ -3317,7 +3317,7 @@ mod tests {
         let (t, _) = t.handle_key(Key::ArrowUp);
         assert_eq!(t.input_value, "a");
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.input_value, "a"); // oldest — no further entry
+        assert_eq!(t.input_value, "a"); // oldest - no further entry
     }
 
     #[test]
@@ -3325,7 +3325,7 @@ mod tests {
         // Park mid-history (recall stashes the draft, so input_value is now the
         // recalled "a"), then record_submit: the ring resets, so the next Up
         // starts fresh from the just-recorded newest ("b") and re-stashes the
-        // CURRENT live draft — proving the prior stash was cleared, not carried.
+        // CURRENT live draft - proving the prior stash was cleared, not carried.
         let mut t = fresh_opts(TranscriptOpts {
             history: vec!["a".into()],
             ..Default::default()
@@ -3342,7 +3342,7 @@ mod tests {
     #[test]
     fn history_capped_at_100() {
         // Submitting a 101st prompt drops the oldest: Up recalls the newest
-        // ("prompt 101"), and walking to the oldest stops at "prompt 2" —
+        // ("prompt 101"), and walking to the oldest stops at "prompt 2" -
         // "prompt 1" fell off. Cap arithmetic itself is a `ui::history` test.
         let history: Vec<String> = (1..=100).map(|n| format!("prompt {n}")).collect();
         let t = fresh_opts(TranscriptOpts {
@@ -3386,7 +3386,7 @@ mod tests {
         assert_eq!(t.input_value, "a");
 
         let (t, _) = t.handle_key(Key::ArrowUp);
-        assert_eq!(t.input_value, "a"); // at the oldest — a no-op
+        assert_eq!(t.input_value, "a"); // at the oldest - a no-op
     }
 
     #[test]
@@ -3587,7 +3587,7 @@ mod tests {
         assert_eq!(t.input_value, "steer me\n");
     }
 
-    // Only a LITERAL trailing backslash — the LAST char of the draft —
+    // Only a LITERAL trailing backslash - the LAST char of the draft -
     // triggers the continuation.
     #[test]
     fn a_backslash_anywhere_else_still_submits() {
@@ -3630,7 +3630,7 @@ mod tests {
         .input_changed("ab\ncd", 4); // on 'd' (line 1, col 1)
         let (t, effects) = t.handle_key(Key::ArrowUp);
         assert_eq!(effects, vec![]);
-        assert_eq!(t.input_value, "ab\ncd"); // draft intact — no recall happened
+        assert_eq!(t.input_value, "ab\ncd"); // draft intact - no recall happened
         assert_eq!(t.input_cursor, 1); // line 0, col 1
     }
 
@@ -3656,17 +3656,17 @@ mod tests {
             history: vec!["old".into()],
             ..Default::default()
         })
-        .input_changed("ab\ncd", 1); // line 0, col 1 — not the last line
+        .input_changed("ab\ncd", 1); // line 0, col 1 - not the last line
         let (t, effects) = t.handle_key(Key::ArrowDown);
         assert_eq!(effects, vec![]);
-        assert_eq!(t.input_value, "ab\ncd"); // draft intact — cursor moved, no recall
+        assert_eq!(t.input_value, "ab\ncd"); // draft intact - cursor moved, no recall
         assert_eq!(t.input_cursor, 4); // line 1, col 1
     }
 
     #[test]
     fn arrow_down_on_the_last_line_of_a_multi_line_draft_recalls_history() {
         // Recall history, then Down from the recalled entry's last line
-        // restores the stashed draft — the pre-multi-line behavior.
+        // restores the stashed draft - the pre-multi-line behavior.
         let t = fresh_opts(TranscriptOpts {
             history: vec!["old".into()],
             ..Default::default()

@@ -3,7 +3,7 @@
 //! directories and binary files; capped at 100 matches.
 //!
 //! A pattern that fails to compile as a regex is retried as literal text, with
-//! a note prefixed to the result — the same forgive-the-caller philosophy as
+//! a note prefixed to the result - the same forgive-the-caller philosophy as
 //! edit_file's two-pass matching. Small models routinely emit `foo(bar`
 //! meaning the literal characters; bouncing that back costs a full model
 //! response on a slow local server.

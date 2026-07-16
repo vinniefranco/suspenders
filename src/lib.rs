@@ -1,4 +1,4 @@
-//! suspenders — a terminal coding agent for small local models.
+//! suspenders - a terminal coding agent for small local models.
 //!
 //! Library crate declaring the full module tree (ported 1:1 from baud/lib).
 

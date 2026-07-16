@@ -2,7 +2,7 @@
 //! modules' tests can drive the LLM boundary without a network.
 //!
 //! [`FakeLlm`] owns its OWN script queue (`Arc<Mutex<VecDeque<Entry>>>`)
-//! supplied per instance — NOT a global registry — so the suite runs in
+//! supplied per instance - NOT a global registry - so the suite runs in
 //! parallel with no shared mutable state (ADR-0020).
 
 use std::collections::VecDeque;
@@ -39,7 +39,7 @@ pub struct Release {
 /// is entered: the built request (so the test can inspect it, e.g. Rollover's
 /// carried prompt) and the oneshot the test answers with a [`Release`] to
 /// unpark the call. Dropping the oneshot without answering leaves `complete`
-/// parked forever — which is exactly what `JoinHandle::abort()` cancels for the
+/// parked forever - which is exactly what `JoinHandle::abort()` cancels for the
 /// cancellation tests.
 ///
 /// [`Barrier`]: Entry::Barrier
@@ -50,7 +50,7 @@ pub struct InFlight {
 
 /// One scripted interaction. Designed to grow: today a canned response (with
 /// optional deltas) or an error; tomorrow a request-inspecting closure that
-/// blocks on a barrier — the [`Entry::Dynamic`] variant is that clean seam.
+/// blocks on a barrier - the [`Entry::Dynamic`] variant is that clean seam.
 pub enum Entry {
     /// Fire `deltas` through `on_event` (each with the accumulated snapshot),
     /// then return `response`.
@@ -112,7 +112,7 @@ impl Entry {
 
     /// A barrier entry paired with the receiver the test watches. The test
     /// recvs an [`InFlight`] once `complete` parks, then answers its `release`
-    /// oneshot with a [`Release`] to unpark — or drops it / never recvs, so an
+    /// oneshot with a [`Release`] to unpark - or drops it / never recvs, so an
     /// `abort()` cancels the parked call (the cancellation tests).
     pub fn barrier() -> (Self, tokio::sync::mpsc::UnboundedReceiver<InFlight>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -129,7 +129,7 @@ pub type ModelsResult = Result<Vec<String>, String>;
 #[derive(Clone)]
 pub struct FakeLlm {
     script: Arc<Mutex<VecDeque<Entry>>>,
-    /// Scripted `list_models` answers, popped front-to-back. Its own queue —
+    /// Scripted `list_models` answers, popped front-to-back. Its own queue -
     /// `list_models` is a discrete query, not part of the `complete` script.
     /// Exhausted ⇒ `Ok(vec![])`.
     models: Arc<Mutex<VecDeque<ModelsResult>>>,
@@ -212,7 +212,7 @@ impl Llm for FakeLlm {
                 {
                     return Response::error("fake_llm: barrier signal receiver dropped");
                 }
-                // Park until the test releases us — or forever, so an abort()
+                // Park until the test releases us - or forever, so an abort()
                 // cancels the Turn task exactly at this await.
                 match release_rx.await {
                     Ok(Release { deltas, response }) => {
@@ -241,7 +241,7 @@ impl Llm for FakeLlm {
 }
 
 // ---------------------------------------------------------------------------
-// FakeDeps — the Turn loop's dependency bundle for tests (baud's loop_test fake
+// FakeDeps - the Turn loop's dependency bundle for tests (baud's loop_test fake
 // Deps). Records emitted events, checkpoints, set_plan calls, and each built
 // request into shared handles the test inspects; scripts `complete` through an
 // owned [`FakeLlm`]; answers Approvals from a canned per-call queue OR an
@@ -395,7 +395,7 @@ impl TurnDeps for FakeDeps {
     fn emitter(&mut self) -> Emitter {
         // The handle shares the SAME `Arc<Mutex<Vec<Event>>>` the fake records
         // into directly (approval request/resolved below), so a test sees one
-        // ordered log regardless of which path emitted (ADR-0025) — and the
+        // ordered log regardless of which path emitted (ADR-0025) - and the
         // existing `deps.events` inspectors keep working unchanged.
         let events = Arc::clone(&self.events);
         Emitter::new(move |event| events.lock().unwrap().push(event))

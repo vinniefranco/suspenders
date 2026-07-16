@@ -1,16 +1,16 @@
-//! The prompt-history ring — the ONE owner of Readline-style recall through
+//! The prompt-history ring - the ONE owner of Readline-style recall through
 //! previously submitted prompts (CONTEXT.md: the Composer remembers what you
 //! sent, so Up/Down walk back and forth through it).
 //!
 //! The ring holds submitted prompts oldest-first, an optional cursor `idx` into
 //! them (`None` means "parked in the live composer draft, not recalling"), and
-//! a stashed `draft` — the composer text as it stood the moment recall began.
+//! a stashed `draft` - the composer text as it stood the moment recall began.
 //!
 //! Navigation is EDGE-TRIGGERED and stateful in exactly one way: the FIRST
 //! [`up`](History::up) stashes the caller's live draft, and the [`down`] that
 //! walks PAST the newest entry restores it, resetting `idx` to `None`. Between
 //! those ends, up/down just step the cursor. Recording a new submission resets
-//! the cursor and clears the stash — the next Up starts fresh from the newest.
+//! the cursor and clears the stash - the next Up starts fresh from the newest.
 //!
 //! No terminal, no async, no IO (ADR-0019): the caller passes its live draft
 //! text in and gets back the text to place in the composer, or `None` for a
@@ -41,7 +41,7 @@ impl History {
     }
 
     /// Record a successfully submitted prompt: reset the cursor and clear the
-    /// stash, then append — deduplicating a repeat of the newest entry and
+    /// stash, then append - deduplicating a repeat of the newest entry and
     /// capping the ring at [`MAX_HISTORY`] (dropping the oldest).
     pub fn record(&mut self, prompt: &str) {
         self.idx = None;
@@ -137,7 +137,7 @@ mod tests {
         let mut h = History::new(vec!["a".into(), "b".into()]);
         assert_eq!(h.up("live"), Some("b".to_string()));
         assert_eq!(h.up("live"), Some("a".to_string()));
-        // Already at the oldest — further Up does nothing.
+        // Already at the oldest - further Up does nothing.
         assert_eq!(h.up("live"), None);
     }
 
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(h.down(), Some("c".to_string()));
         // Past the newest: the stashed draft returns and we're parked again.
         assert_eq!(h.down(), Some("draft".to_string()));
-        // Parked — a further Down is a no-op.
+        // Parked - a further Down is a no-op.
         assert_eq!(h.down(), None);
     }
 
@@ -194,7 +194,7 @@ mod tests {
         for n in (2..=MAX_HISTORY).rev() {
             assert_eq!(h.up(""), Some(format!("prompt {n}")));
         }
-        // "prompt 1" is gone — the ring stayed capped at MAX_HISTORY.
+        // "prompt 1" is gone - the ring stayed capped at MAX_HISTORY.
         assert_eq!(h.up(""), None);
     }
 

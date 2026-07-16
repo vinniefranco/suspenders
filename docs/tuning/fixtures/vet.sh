@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vet.sh RUN_DIR — compact summary of one suspenders headless run directory.
+# vet.sh RUN_DIR - compact summary of one suspenders headless run directory.
 # Reads: stdout.txt, exit_code, duration_secs, diff.patch, cargo_test_full.txt,
 # and the session-log *.jsonl (entry codec: src/session/log.rs).
 set -u
@@ -40,7 +40,7 @@ else testres="(missing)"; compiled="?"; fi
 
 # --- eviction / supersession traces (marker strings from voice.rs; eviction is
 #     request-time only, so nonzero counts here mean the text leaked into logged
-#     entries — count both jsonl and stdout for visibility) ---
+#     entries - count both jsonl and stdout for visibility) ---
 cnt() { { grep -oF "$1" <<<"$jsonl"; grep -oF "$1" "$stdout" 2>/dev/null; } | wc -l; }
 elided=$(cnt '[result elided - re-run the tool if needed]')
 sup_cmd=$(cnt '[superseded by a newer run of this command below]')

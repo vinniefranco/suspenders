@@ -2,7 +2,7 @@
 
 Use ratatui (immediate-mode) with crossterm for the terminal UI. The UI is split at a seam: a **pure Transcript core** holds every decision, and a **thin adapter** owns the terminal, the event streams, and the drawing.
 
-The core follows The Elm Architecture. Functions `apply_event`, `handle_key`, `input_changed`, `submitted`, `steered`, and `agent_down` each take the current Transcript and return `(Transcript, Vec<Effect>)`, where an `Effect` is plain data — an Agent command, a scroll — never an action performed inline. This half of the crate is UI-free and fully unit-tested with no terminal attached.
+The core follows The Elm Architecture. Functions `apply_event`, `handle_key`, `input_changed`, `submitted`, `steered`, and `agent_down` each take the current Transcript and return `(Transcript, Vec<Effect>)`, where an `Effect` is plain data - an Agent command, a scroll - never an action performed inline. This half of the crate is UI-free and fully unit-tested with no terminal attached.
 
 The adapter runs a `tokio::select!` loop over crossterm's async `EventStream` and the Agent's broadcast events. It feeds each into the core, executes the returned effects, and renders the resulting Transcript. It carries no decisions of its own.
 

@@ -1,4 +1,4 @@
-//! History — persistent prompt history across sessions.
+//! History - persistent prompt history across sessions.
 //!
 //! Each row is one submitted prompt. The store is size-capped (a wrap log):
 //! the oldest entries are discarded once the file exceeds the cap, so history
@@ -9,8 +9,8 @@
 //! [`open`] on mount, [`close`] on exit.
 //!
 //! baud backs this with Erlang's `:disk_log` (a two-file wrap log at ~100 kB
-//! each). Rust has no `:disk_log`, so this port keeps the same *contract* — a
-//! bounded, append-only, order-preserving, crash-tolerant prompt ring — over a
+//! each). Rust has no `:disk_log`, so this port keeps the same *contract* - a
+//! bounded, append-only, order-preserving, crash-tolerant prompt ring - over a
 //! single newline-delimited file trimmed to the cap. Prompts are line-oriented
 //! user text, so one prompt per line round-trips without escaping; a torn tail
 //! is dropped on read, never load-bearing.
@@ -59,8 +59,8 @@ impl History {
         }
     }
 
-    /// Appends one prompt. Does not deduplicate or cap the *count* — that is
-    /// the in-memory Transcript's job — but trims the oldest rows to keep the
+    /// Appends one prompt. Does not deduplicate or cap the *count* - that is
+    /// the in-memory Transcript's job - but trims the oldest rows to keep the
     /// file under the byte cap (the wrap). Silently ignores errors so a full
     /// disk or corrupted store never crashes the UI.
     pub fn append(&self, text: &str) {

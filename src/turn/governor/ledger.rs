@@ -1,13 +1,13 @@
-//! Turn Ledger — the record of facts about the running Turn (CONTEXT.md:
+//! Turn Ledger - the record of facts about the running Turn (CONTEXT.md:
 //! Turn Ledger; ADR-0026). Facts are written once as each thing happens: the
 //! Tool Calls the Pass carried, per-Tool consecutive-failure tallies (with
 //! error categories and a recency stamp for the last failure), writes and
 //! whether a verification has run since, the run_command outcomes (the most
 //! recent run, and the most recent outcome per distinct command string),
 //! the Plan's recency (Passes and
-//! successful writes since it last changed — absent while no Plan exists),
+//! successful writes since it last changed - absent while no Plan exists),
 //! and the Pass position (current Pass,
-//! Turn Limit). The Ledger holds facts, never opinions or setpoints —
+//! Turn Limit). The Ledger holds facts, never opinions or setpoints -
 //! Governors read it and judge; no Governor reads another Governor's state.
 //!
 //! Only the loop writes here, at the firing sites: `crate::turn::batch`
@@ -16,11 +16,11 @@
 //! Pass's carried calls, and the truncated batch's close (ADR-0009), and
 //! `crate::turn::finish` advances the Pass a finish Nudge grants.
 //! Governors and the arbiter ([`super`]) READ the
-//! Ledger; their thresholds (setpoints) and trigger state stay their own —
+//! Ledger; their thresholds (setpoints) and trigger state stay their own -
 //! e.g. the annotation threshold that judges a failure tally lives with the
 //! failure Governor in [`super::failure`], not here. The error-category
 //! CLASSIFIER does live here ([`failure_category`]): the category is a fact
-//! about the error, recorded as it happens — see that module's placement
+//! about the error, recorded as it happens - see that module's placement
 //! judgment.
 
 pub mod failure_category;
@@ -64,7 +64,7 @@ impl FailureStreak {
 
 // Plan recency: the Pass the Plan last changed on (the Turn's start Pass when
 // the Plan was carried in from a previous Turn), and the successful writes
-// since. Absent while no Plan exists — a Turn with no Plan has nothing to go
+// since. Absent while no Plan exists - a Turn with no Plan has nothing to go
 // stale, so the recency facts read as `None` rather than counting from Turn
 // start.
 #[derive(Debug, Clone)]
@@ -83,9 +83,9 @@ pub struct Ledger {
     pass: u64,
     turn_limit: u64,
     // A Compaction has happened since the last results tail (the Anchor is
-    // refreshed immediately after every Compaction — CONTEXT.md).
+    // refreshed immediately after every Compaction - CONTEXT.md).
     compacted_since_tail: bool,
-    // Closed Tool Call batches — the recency clock the failure streaks are
+    // Closed Tool Call batches - the recency clock the failure streaks are
     // stamped against. Distinct from `pass`: finish-Nudge Passes advance the
     // Pass position but close no batch, and must not age a failure streak.
     batches: u64,
@@ -98,7 +98,7 @@ pub struct Ledger {
     // Writes and whether a verification has run since: true from a successful
     // write until the next run_command.
     unverified_writes: bool,
-    // A successful write landed this Turn. Monotonic — set once and NEVER
+    // A successful write landed this Turn. Monotonic - set once and NEVER
     // cleared, unlike `unverified_writes` (which a run_command clears): it
     // records that implementation happened at all, the evidence the
     // dangling-failure recovery arm requires so a read-only Turn that merely
@@ -111,13 +111,13 @@ pub struct Ledger {
     // actually RAN this Turn: `true` records a failure not yet followed by a
     // rerun of the SAME string.
     command_outcomes: Vec<(String, bool)>,
-    // Recovery Turns already consumed serving the current user request — a
+    // Recovery Turns already consumed serving the current user request - a
     // fact the Agent owns across Turns and stamps once at Turn start (the
     // Agent resets it when a genuine user prompt starts a new request).
     recoveries_used: u64,
     // Malformed-tool-call re-draws consumed this Turn (ADR-0030): the loop
     // increments this at the retry firing site, and the re-draw decision
-    // reads it against the `malformed_retry_budget` Setpoint. Transient — a
+    // reads it against the `malformed_retry_budget` Setpoint. Transient - a
     // resumed Turn settles as failed regardless, so it is never restored.
     retries_used: u64,
     // Plan recency (see [`PlanRecency`]): `None` until a Plan exists.
@@ -163,7 +163,7 @@ impl Ledger {
         self.compacted_since_tail = false;
     }
 
-    /// Records the Tool Calls this Pass carried (from the response content —
+    /// Records the Tool Calls this Pass carried (from the response content -
     /// a truncated batch's calls count even though none executed).
     pub fn record_pass_calls(&mut self, calls: Vec<(String, Value)>) {
         self.pass_calls = calls;
@@ -171,8 +171,8 @@ impl Ledger {
 
     /// Records one executed (or replaced) Tool Call's outcome: the
     /// consecutive-failure tally for its Tool (a success resets it), the
-    /// write/verification state, and the run_command outcomes — the last run
-    /// and the per-command-string record. Record EVERY outcome — a replaced
+    /// write/verification state, and the run_command outcomes - the last run
+    /// and the per-command-string record. Record EVERY outcome - a replaced
     /// duplicate still counts toward the failure tally, and a duplicated
     /// write/run_command still moves the verify state.
     pub fn record_result(&mut self, name: &str, input: &Value, result: &ToolResult) {
@@ -187,7 +187,7 @@ impl Ledger {
     }
 
     /// The Turn began with a Plan carried in from a previous Turn: the
-    /// recency clock starts at Turn start — nothing changed the Plan THIS
+    /// recency clock starts at Turn start - nothing changed the Plan THIS
     /// Turn yet, but a Plan exists to go stale.
     pub fn note_plan_carried(&mut self) {
         self.note_plan_updated();
@@ -241,7 +241,7 @@ impl Ledger {
         self.unverified_writes
     }
 
-    /// Did any successful write land this Turn? Monotonic — once true it
+    /// Did any successful write land this Turn? Monotonic - once true it
     /// stays true, even after a later run_command clears `unverified_writes`.
     /// The evidence the dangling-failure recovery arm requires: a failing
     /// command during pure exploration is not unfinished implementation
@@ -263,7 +263,7 @@ impl Ledger {
 
     /// The command string of the Dangling Failure: the most-recently-recorded
     /// `command_outcomes` entry whose most recent run still failed. `None`
-    /// when nothing dangles. When several dangle, the last one recorded wins —
+    /// when nothing dangles. When several dangle, the last one recorded wins -
     /// the command the recovery prompt names, so its own failing result seeds
     /// the Handoff (ADR-0028 addendum 2026-07-14), never merely the last
     /// command run.
@@ -288,7 +288,7 @@ impl Ledger {
     }
 
     /// Passes since the Plan last changed (since Turn start for a Plan
-    /// carried in from a previous Turn). `None` while no Plan exists — a
+    /// carried in from a previous Turn). `None` while no Plan exists - a
     /// missing Plan cannot be stale.
     pub fn passes_since_plan_update(&self) -> Option<u64> {
         self.plan.as_ref().map(|p| self.pass - p.updated_at_pass)
@@ -309,7 +309,7 @@ impl Ledger {
             .map(|(_, streak)| (streak.count, streak.categories.as_slice()))
     }
 
-    /// Every live failure streak as (count, batches since its last failure) —
+    /// Every live failure streak as (count, batches since its last failure) -
     /// the facts the stuck predicate judges against its setpoints.
     pub fn failure_tallies(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.failures
@@ -355,10 +355,10 @@ impl Ledger {
 
     // The most recent run_command this Turn: a failing one sets the fact, a
     // passing one clears it. The per-command-string record moves the same
-    // way, keyed by the call's command string — a passing run clears only
+    // way, keyed by the call's command string - a passing run clears only
     // its own entry. Exactly one exemption: an Approval-denied command never
     // ran, so it leaves the facts untouched. A plugin-halted run_command
-    // also never ran, but its halt DOES set the facts — the halt reads as a
+    // also never ran, but its halt DOES set the facts - the halt reads as a
     // failed run and the verify-failed gate follows suit. Only run_command
     // outcomes touch this.
     fn record_command(&mut self, name: &str, input: &Value, result: &ToolResult) {
@@ -607,7 +607,7 @@ mod tests {
         ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
         assert_eq!(ledger.dangling_command(), Some("cargo test"));
 
-        // A green rerun of the same string clears it — nothing dangles.
+        // A green rerun of the same string clears it - nothing dangles.
         ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
         assert_eq!(ledger.dangling_command(), None);
     }

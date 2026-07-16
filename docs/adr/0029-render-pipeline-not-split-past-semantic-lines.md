@@ -19,10 +19,10 @@ carry the pure semantics:
 Everything left in `ui/components::message_lines` is one of two things, and
 neither wants a new module:
 
-1. **Display chrome bonded to ratatui** — the `"> "` gutter, the
+1. **Display chrome bonded to ratatui** - the `"> "` gutter, the
    `⚙`/`🧠 thought:`/`✗` glyphs, and the per-variant `Color`. These are
    ratatui `Style`/`Span` by nature; ADR-0019 keeps them in `ui/components`.
-2. **One pure decision** — the Thinking collapse rule (collapsed one-liner vs.
+2. **One pure decision** - the Thinking collapse rule (collapsed one-liner vs.
    expanded header + full text under Ctrl-T). If it ever needs isolated tests,
    a colocated pure helper is the whole fix; that is cleanup, not a deepening.
 
@@ -30,14 +30,14 @@ The `RenderCache` stays bonded to ratatui: it caches `Line<'static>` and
 measures wrap counts with a throwaway `Paragraph::line_count`, whose own
 invariant is that measuring and drawing must agree EXACTLY. A pure, char-based
 re-implementation of wrapping is the one change guaranteed to drift from what
-ratatui paints — the bug the current design exists to prevent.
+ratatui paints - the bug the current design exists to prevent.
 
 ## Presentment is a deep seam, not a shallow one
 
 Do not read the "extraction comes back shallow" verdict above as a claim that
-the whole display path is shallow. It is not. **Presentment** — the
+the whole display path is shallow. It is not. **Presentment** - the
 `Plugin::present` seam (`TranscriptItem -> TranscriptItem`, folded across every
-Plugin in `plugins::present`) — is a genuinely DEEP seam and is deliberately
+Plugin in `plugins::present`) - is a genuinely DEEP seam and is deliberately
 kept intact for the opposite reason the extractions are rejected.
 
 Run the deletion test on it: delete `Plugin::present` and every Plugin must
@@ -45,21 +45,21 @@ emit ratatui `Line`s directly, `StyledLine` reappears inside each Plugin, the
 Presentment substitution logic (the diff Plugin swapping a Tool Result summary
 for a `Block`) duplicates across every site, and the panic-isolation that keeps
 one Plugin's failure off the Transcript fragments. Complexity cascades across N
-Plugins — the mark of a seam earning its keep, one semantic contract serving
+Plugins - the mark of a seam earning its keep, one semantic contract serving
 all Plugins with colors living in one place (ADR-0019).
 
 The distinction that matters:
 
 - The `Plugin::present` **interface** is a deep seam Plugins participate in
-  WITHOUT touching ratatui — keep it.
+  WITHOUT touching ratatui - keep it.
 - The **vocabulary** it speaks (`LineStyle`/`StyledLine`, the `Block`) stays in
   the core because Plugins READ it, not export it. Lifting the vocabulary into
   its own module would scatter it across Plugins and tests and breach the
-  ADR-0019 confinement — the same shallow move this ADR rejects for
+  ADR-0019 confinement - the same shallow move this ADR rejects for
   `message_lines`.
 
 So the render pipeline is not split further, and the Presentment seam is not
-collapsed inward — both for the same reason, read from opposite ends: depth
+collapsed inward - both for the same reason, read from opposite ends: depth
 belongs where it already sits.
 
 ## Considered options
@@ -78,11 +78,11 @@ belongs where it already sits.
 ## Consequences
 
 - New display capability grows at the vocabularies that already exist
-  (`MdStyle` for markdown, `LineStyle` for Blocks) — the ADR-0008 chokepoint —
+  (`MdStyle` for markdown, `LineStyle` for Blocks) - the ADR-0008 chokepoint -
   not by inserting a semantic-line layer between `TranscriptItem` and ratatui.
 - The `ui/components` file stays large because drawing is genuinely there;
   its size is not itself a deepening signal. The pure semantics were already
   lifted out; what remains is the adapter ADR-0019 confines to this module.
 - This ADR does not forbid splitting `ui/transcript` (streaming, prompt
   history): those ARE pure, ratatui-free, and materialize into
-  `TranscriptItem`s — they clear the deletion test the render pipeline fails.
+  `TranscriptItem`s - they clear the deletion test the render pipeline fails.

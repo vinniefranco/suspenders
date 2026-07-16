@@ -2,7 +2,7 @@
 //!
 //! This module owns the display ordering of tasks: listings are sorted by
 //! priority (highest first) and, within a priority, by creation order
-//! (lowest id first). Nothing else in the program sorts tasks — the store
+//! (lowest id first). Nothing else in the program sorts tasks - the store
 //! keeps them in insertion order.
 
 use crate::task::Task;

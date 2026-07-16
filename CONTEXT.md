@@ -2,7 +2,7 @@
 
 A terminal coding agent for small local models: a full-screen TUI where a locally-served LLM completes coding tasks in the user's project by calling tools.
 
-> This file is a glossary and nothing else — the ubiquitous language of the
+> This file is a glossary and nothing else - the ubiquitous language of the
 > domain. Implementation and architecture decisions live in `docs/adr/`.
 
 ## Language
@@ -97,11 +97,11 @@ Replacing the contents of dead Conversation blocks with an elision marker: old T
 _Avoid_: truncation (that's what the server does when we fail), compaction
 
 **Dead Mass**:
-The total size of Conversation content whose information is already superseded — the input bodies of successful writes (the file on disk holds the result), older results of repeated identical Tool Calls, redundant re-reads, stale Anchors. Dead Mass rots a small model's attention long before the Context Budget is threatened, so it has its own Eviction trigger: when it exceeds its threshold fraction of the Context Budget, a wave fires even with budget to spare.
+The total size of Conversation content whose information is already superseded - the input bodies of successful writes (the file on disk holds the result), older results of repeated identical Tool Calls, redundant re-reads, stale Anchors. Dead Mass rots a small model's attention long before the Context Budget is threatened, so it has its own Eviction trigger: when it exceeds its threshold fraction of the Context Budget, a wave fires even with budget to spare.
 _Avoid_: bloat, garbage (both too vague to trigger on)
 
 **Supersession**:
-The rule that classifies Conversation content as dead: a newer result of an identical Tool Call supersedes the older ones (the newest survives verbatim), and a successful write supersedes its own input body — the file on disk is the truth. Identity is the full Tool Call (name and input), never a judgment call. A failed edit's input is not superseded by its failure; only a later successful write to the same file supersedes the attempt chain.
+The rule that classifies Conversation content as dead: a newer result of an identical Tool Call supersedes the older ones (the newest survives verbatim), and a successful write supersedes its own input body - the file on disk is the truth. Identity is the full Tool Call (name and input), never a judgment call. A failed edit's input is not superseded by its failure; only a later successful write to the same file supersedes the attempt chain.
 _Avoid_: deduplication (mechanism, not meaning), pruning
 
 **Result Cap**:
@@ -188,8 +188,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Turn** ends at its **Turn Limit** even if the model is still asking for Tools; the **Endgame** schedules how it ends, counted in **Passes** remaining
 - A **Tool Call** for run_command requires an **Approval** before execution, unless a **Standing Approval** covers its exact command string
 - A **Standing Approval** belongs to the **Session** - it does not survive restart and never widens beyond the identical command string
-- **Eviction** targets dead content — old **Tool Results**, blocks dead by **Supersession**, the input bodies of successful writes, superseded **Anchors** — oldest first, and never the system prompt, the two most recent tool-result exchanges, or the most recent **Anchor**
-- **Eviction** fires in waves on either of two triggers — Context Budget pressure, or **Dead Mass** crossing its threshold; once triggered it elides down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
+- **Eviction** targets dead content - old **Tool Results**, blocks dead by **Supersession**, the input bodies of successful writes, superseded **Anchors** - oldest first, and never the system prompt, the two most recent tool-result exchanges, or the most recent **Anchor**
+- **Eviction** fires in waves on either of two triggers - Context Budget pressure, or **Dead Mass** crossing its threshold; once triggered it elides down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
 - When **Eviction** cannot fit the **Conversation** within the **Context Budget**, the **Turn** fails loudly; an over-budget request is never sent
 - Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** once per **Session**
 - The system prompt, every **Nudge**, and every marker belong to the **Voice**; the **Governors** that fire them own the when, not the wording
