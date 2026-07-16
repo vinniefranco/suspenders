@@ -32,6 +32,36 @@ invariant is that measuring and drawing must agree EXACTLY. A pure, char-based
 re-implementation of wrapping is the one change guaranteed to drift from what
 ratatui paints — the bug the current design exists to prevent.
 
+## Presentment is a deep seam, not a shallow one
+
+Do not read the "extraction comes back shallow" verdict above as a claim that
+the whole display path is shallow. It is not. **Presentment** — the
+`Plugin::present` seam (`TranscriptItem -> TranscriptItem`, folded across every
+Plugin in `plugins::present`) — is a genuinely DEEP seam and is deliberately
+kept intact for the opposite reason the extractions are rejected.
+
+Run the deletion test on it: delete `Plugin::present` and every Plugin must
+emit ratatui `Line`s directly, `StyledLine` reappears inside each Plugin, the
+Presentment substitution logic (the diff Plugin swapping a Tool Result summary
+for a `Block`) duplicates across every site, and the panic-isolation that keeps
+one Plugin's failure off the Transcript fragments. Complexity cascades across N
+Plugins — the mark of a seam earning its keep, one semantic contract serving
+all Plugins with colors living in one place (ADR-0019).
+
+The distinction that matters:
+
+- The `Plugin::present` **interface** is a deep seam Plugins participate in
+  WITHOUT touching ratatui — keep it.
+- The **vocabulary** it speaks (`LineStyle`/`StyledLine`, the `Block`) stays in
+  the core because Plugins READ it, not export it. Lifting the vocabulary into
+  its own module would scatter it across Plugins and tests and breach the
+  ADR-0019 confinement — the same shallow move this ADR rejects for
+  `message_lines`.
+
+So the render pipeline is not split further, and the Presentment seam is not
+collapsed inward — both for the same reason, read from opposite ends: depth
+belongs where it already sits.
+
 ## Considered options
 
 - **Extract `RenderCache` into a frame-free module.** Rejected: its
