@@ -389,8 +389,8 @@ pub fn settle_finish(
 
     if governors.verify.verify_failed_nudge(ledger) {
         governors.verify.note_verify_failed_nudged();
-        governors.duplicate.note_finish_nudged();
-        return Some(standalone(
+        return Some(finish_nudge(
+            governors,
             VoicedTag::VerifyFailedNudge,
             voice::verify_failed_nudge(),
         ));
@@ -398,16 +398,15 @@ pub fn settle_finish(
 
     if governors.verify.verify_nudge(ledger) {
         governors.verify.note_verify_nudged();
-        governors.duplicate.note_finish_nudged();
-        return Some(standalone(VoicedTag::VerifyNudge, voice::verify_nudge()));
+        return Some(finish_nudge(governors, VoicedTag::VerifyNudge, voice::verify_nudge()));
     }
 
     if empty::is_empty_reply(blocks) && governors.empty.due() {
         // The fire arms the break-glass no-think rescue for the next Pass,
         // gated by the empty Governor's setpoint.
         governors.empty.note_fired();
-        governors.duplicate.note_finish_nudged();
-        return Some(standalone(
+        return Some(finish_nudge(
+            governors,
             VoicedTag::EmptyResponseNudge,
             voice::empty_response_nudge(),
         ));
@@ -416,7 +415,15 @@ pub fn settle_finish(
     None
 }
 
-fn standalone(tag: VoicedTag, text: &str) -> FinishIntervention {
+// The one seam every finish Nudge passes through. The domain rule is
+// UNCONDITIONAL: any finish Nudge grants the model fresh context — the
+// finishing response's dropped tool_use blocks never produced results — so the
+// duplicate Governor's freshness memory clears here, once, for all three kinds
+// (Verify-failed, Verify, Empty alike). Each branch above owns only its own
+// trigger bookkeeping (the once-per-Turn cap, the no-think rescue arm); the
+// cross-Governor clear lives only here, so the rule has a single visible site.
+fn finish_nudge(governors: &mut Governors, tag: VoicedTag, text: &str) -> FinishIntervention {
+    governors.duplicate.note_finish_nudged();
     FinishIntervention::Standalone {
         tag,
         text: text.to_string(),
@@ -1002,6 +1009,69 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn every_finish_nudge_clears_the_duplicate_governors_freshness() {
+        // The UNCONDITIONAL domain rule: any finish Nudge grants the model
+        // fresh context (the finishing response's dropped tool_use blocks
+        // never produced results), so Duplicate's repeat-detection memory
+        // clears — for all three finish-Nudge kinds alike. Each case arms a
+        // call Duplicate WOULD otherwise flag as a repeat, fires one kind of
+        // finish Nudge, and asserts the call is no longer a duplicate.
+        let repeated = json!({"path": "a.ex"});
+
+        // A helper: prime Duplicate with a still-fresh call, confirm it would
+        // flag the repeat, then return the primed Governors.
+        let primed = || {
+            let mut governors = Governors::new(5, 8, true);
+            governors
+                .duplicate
+                .note_answered("read_file", &repeated, false);
+            governors.duplicate.next_pass();
+            assert!(governors.duplicate.is_duplicate("read_file", &repeated));
+            governors
+        };
+
+        // Verify-failed Nudge.
+        let mut ledger = ledger_at(2, 25);
+        ledger.record_result("run_command", &json!({}), &err());
+        let mut governors = primed();
+        assert!(matches!(
+            settle_finish(&ledger, &mut governors, &text("done"), &StopReason::EndTurn),
+            Some(FinishIntervention::Standalone {
+                tag: VoicedTag::VerifyFailedNudge,
+                ..
+            })
+        ));
+        assert!(!governors.duplicate.is_duplicate("read_file", &repeated));
+
+        // Verify Nudge.
+        let mut governors = primed();
+        assert!(matches!(
+            settle_finish(
+                &unverified_at(2, 25),
+                &mut governors,
+                &text("done"),
+                &StopReason::EndTurn
+            ),
+            Some(FinishIntervention::Standalone {
+                tag: VoicedTag::VerifyNudge,
+                ..
+            })
+        ));
+        assert!(!governors.duplicate.is_duplicate("read_file", &repeated));
+
+        // Empty-response Nudge.
+        let mut governors = primed();
+        assert!(matches!(
+            settle_finish(&ledger_at(2, 25), &mut governors, &[], &StopReason::EndTurn),
+            Some(FinishIntervention::Standalone {
+                tag: VoicedTag::EmptyResponseNudge,
+                ..
+            })
+        ));
+        assert!(!governors.duplicate.is_duplicate("read_file", &repeated));
     }
 
     #[test]
