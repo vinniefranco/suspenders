@@ -259,19 +259,21 @@ impl AgentHandle {
         } = opts;
 
         // Resume BEFORE opening the new log (baud, ADR-0010): root mismatch fails
-        // loudly; other drift yields to the new Session and is reported.
-        let (resumed_messages, resume_info) = maybe_resume(resume, &session)?;
+        // loudly; other drift yields to the new Session and is reported. One fold
+        // yields the messages, the Transcript-facing `ResumeInfo`, AND the two
+        // governance facts below — no re-reading the log for the Plan or the
+        // recovery count.
+        let (resumed_messages, resume_info, governance) = maybe_resume(resume, &session)?;
 
         // The Plan is held outside the Conversation; a Resume restores the last
-        // logged Plan so the model keeps its goal across a restart.
-        let plan = resume_info.as_ref().and_then(|ri| log::plan(&ri.path));
-
-        // A Resume also restores the recoveries consumed by the logged
-        // request, so a resumed Session cannot re-trigger them unboundedly.
-        let recoveries_used = resume_info
-            .as_ref()
-            .map(|ri| log::recoveries_used(&ri.path))
-            .unwrap_or(0);
+        // logged Plan (folded above) so the model keeps its goal across a restart.
+        // A Resume also restores the recoveries the logged request consumed, so a
+        // resumed Session cannot re-trigger them unboundedly. Both were computed
+        // in the single fold, sharing its torn-line tolerance.
+        let ResumedGovernance {
+            plan,
+            recoveries_used,
+        } = governance;
 
         // The tool specs ride with every request but live outside the messages;
         // the estimate has to count them or Eviction fires late (baud's
@@ -1109,20 +1111,38 @@ fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
 
 // ---- Resume ----------------------------------------------------------------
 
+/// The governance facts a Resume restores alongside the Conversation: the last
+/// logged Plan (held outside the Conversation) and the recoveries the logged
+/// request consumed (per-request bound). Computed in the single fold, so they
+/// never belong on the Transcript-facing [`ResumeInfo`] — the Agent threads
+/// them privately instead.
+#[derive(Default)]
+struct ResumedGovernance {
+    plan: Option<String>,
+    recoveries_used: u64,
+}
+
 fn maybe_resume(
     resume: Option<Resume>,
     session: &Session,
-) -> Result<(Vec<crate::content::Message>, Option<ResumeInfo>), StartError> {
+) -> Result<(Vec<crate::content::Message>, Option<ResumeInfo>, ResumedGovernance), StartError> {
     let path = match resume {
-        None => return Ok((Vec::new(), None)),
+        None => return Ok((Vec::new(), None, ResumedGovernance::default())),
         Some(Resume::Path(p)) => p,
         Some(Resume::Latest) => log::latest(&session.session_dir).ok_or_else(|| {
             StartError::ResumeFailed(format!("no Session Log found in {}", session.session_dir))
         })?,
     };
 
-    match log::resume(&path, session) {
-        Ok((messages, drift)) => Ok((messages, Some(ResumeInfo { path, drift }))),
+    match log::resume_governed(&path, session) {
+        Ok(r) => Ok((
+            r.messages,
+            Some(ResumeInfo { path, drift: r.drift }),
+            ResumedGovernance {
+                plan: r.plan,
+                recoveries_used: r.recoveries,
+            },
+        )),
         Err(ResumeError::RootMismatch) => Err(StartError::ResumeRootMismatch(path)),
         Err(e) => Err(StartError::ResumeFailed(format!(
             "cannot resume {path}: {e:?}"
