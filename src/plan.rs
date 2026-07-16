@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(
             plan.update(
                 "plan",
-                &json!({ crate::llm::stream::MALFORMED_INPUT_SENTINEL: "raw" }),
+                &crate::llm::stream::malformed_input_marker("raw"),
                 false
             ),
             Update::Unchanged

@@ -17,7 +17,7 @@ pub mod web_fetch;
 pub mod write_file;
 
 use crate::content::ContentBlock;
-use crate::llm::stream::MALFORMED_INPUT_SENTINEL;
+use crate::llm::stream::malformed_tool_input;
 use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
 use serde_json::Value;
 
@@ -109,9 +109,7 @@ pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<Conten
 /// layer tags inputs whose JSON never decoded; never run those — let the tool's
 /// own validation reject an empty map.
 fn sanitize_input(input: &Value) -> Value {
-    if let Value::Object(map) = input
-        && map.contains_key(MALFORMED_INPUT_SENTINEL)
-    {
+    if malformed_tool_input(input).is_some() {
         return Value::Object(serde_json::Map::new());
     }
     input.clone()
@@ -268,13 +266,13 @@ mod tests {
 
     // ---- sanitize_input ----
 
-    // A tool input tagged with the malformed-input sentinel is blanked to an
-    // empty object, so the read-only tool's own validation rejects it instead
-    // of acting on undecoded JSON. Routed through the one shared sentinel
-    // constant.
+    // A tool input the boundary marked malformed is blanked to an empty
+    // object, so the read-only tool's own validation rejects it instead of
+    // acting on undecoded JSON. The marker is built and read through the
+    // boundary's domain accessors, not the wire sentinel.
     #[test]
-    fn sanitize_input_empties_a_sentinel_tagged_input() {
-        let tagged = json!({ MALFORMED_INPUT_SENTINEL: "{\"path\": tru" });
+    fn sanitize_input_empties_a_malformed_marked_input() {
+        let tagged = crate::llm::stream::malformed_input_marker("{\"path\": tru");
         assert_eq!(sanitize_input(&tagged), json!({}));
 
         // A well-formed input passes through untouched.
@@ -334,7 +332,7 @@ mod tests {
         let blocks = vec![ContentBlock::tool_use(
             "t1",
             "read_file",
-            json!({ MALFORMED_INPUT_SENTINEL: "{\"path\": tru" }),
+            crate::llm::stream::malformed_input_marker("{\"path\": tru"),
         )];
         let results = run_read_only(&blocks, &ctx(tmp.path(), 10_000)).await;
 

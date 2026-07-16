@@ -583,7 +583,7 @@ mod tests {
     use crate::content::{ContentBlock, Role};
     use crate::event::Stage;
     use crate::llm::response::Response;
-    use crate::llm::stream::{Delta, MALFORMED_INPUT_SENTINEL};
+    use crate::llm::stream::{Delta, malformed_input_marker};
     use crate::plugin::{Plugin, Token};
     use crate::plugins::Registered;
     use crate::session::connection::Connection;
@@ -2903,7 +2903,7 @@ mod tests {
                     content: vec![ContentBlock::tool_use(
                         "t1",
                         "write_file",
-                        json!({ MALFORMED_INPUT_SENTINEL: "{\"path\": \"oops" }),
+                        malformed_input_marker("{\"path\": \"oops"),
                     )],
                     stop_reason: StopReason::ToolUse,
                     usage: Usage::default(),
