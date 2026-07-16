@@ -174,7 +174,7 @@ impl SessionConfig {
             scout_pass_limit: 8,
             scout_no_think: true,
             no_think_rescue: true,
-            plugins: vec!["diff".into()],
+            plugins: vec!["diff".into(), "run_command".into()],
             session_dir: default_session_dir(),
         }
     }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::agent::{AgentHandle, StartOpts};
 use crate::approvals::Decision;
+use crate::conversation::dead_mass_pct;
 use crate::event::Event;
 use crate::llm::AnthropicLlm;
 use crate::session::{Session, SessionOpts};
@@ -207,20 +208,22 @@ async fn handle_event(agent: &AgentHandle, event: &Event, started: std::time::In
             token_estimate,
             context_budget,
             max_tokens_reserve,
+            dead_mass,
         } => {
             println!(
-                "   ## pressure token_estimate={token_estimate} context_budget={context_budget} max_tokens_reserve={max_tokens_reserve} (t={t}s)"
+                "   ## pressure token_estimate={token_estimate} context_budget={context_budget} max_tokens_reserve={max_tokens_reserve} (dead_mass={}%) (t={t}s)",
+                dead_mass_pct(*dead_mass)
             );
         }
         Event::EvictionWave { stats } => {
             println!(
-                "   ## EVICTION wave: results={} cmd_superseded={} read_superseded={} edit_husked={} anchors={} (dead_mass={:.0}%) (t={t}s)",
+                "   ## EVICTION wave: results={} cmd_superseded={} read_superseded={} edit_husked={} anchors={} (dead_mass={}%) (t={t}s)",
                 stats.results_elided,
                 stats.cmd_superseded,
                 stats.read_superseded,
                 stats.edits_husked,
                 stats.anchors_elided,
-                stats.dead_mass * 100.0
+                dead_mass_pct(stats.dead_mass)
             );
         }
         Event::CompactionProgress { status } => {

@@ -26,6 +26,7 @@
 //! event and does no IO.
 
 pub mod diff;
+pub mod run_command;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -228,8 +229,9 @@ pub fn normalize(entry: impl Into<PluginSpec>) -> PluginSpec {
 /// instances, in registration order. Each name maps to its plugin
 /// implementation ([`build`]); an unknown name is skipped (it cannot be
 /// registered, so it has no effect and cannot fail a stage). This is the
-/// production registry: the shipped config resolves `["diff"]` into the one
-/// Diff plugin, so the live app runs the Turn/Presentment pipeline with Diff.
+/// production registry: the shipped config resolves `["diff", "run_command"]`
+/// into the Diff plugin and the run_command exit-badge plugin, so the live app
+/// runs the Turn/Presentment pipeline with both.
 pub fn configured(names: &[String]) -> Vec<Registered> {
     names
         .iter()
@@ -244,6 +246,11 @@ fn build(spec: &PluginSpec) -> Option<Registered> {
         "diff" => Some(Registered::new(
             "diff",
             Box::new(diff::Diff),
+            spec.opts.clone(),
+        )),
+        "run_command" => Some(Registered::new(
+            "run_command",
+            Box::new(run_command::RunCommand),
             spec.opts.clone(),
         )),
         _ => None,
@@ -673,6 +680,7 @@ mod tests {
             name: "edit_file".to_string(),
             summary: "edited x".to_string(),
             is_error: false,
+            key_arg: None,
         };
         let plugins = vec![reg(
             "ArtifactPresenter",
@@ -693,6 +701,7 @@ mod tests {
             name: "edit_file".to_string(),
             summary: "edited x".to_string(),
             is_error: false,
+            key_arg: None,
         };
         let plugins = vec![reg(
             "ArtifactPresenter",
@@ -717,6 +726,7 @@ mod tests {
     #[test]
     fn present_a_crashing_present_keeps_the_item_from_before_that_plugin_and_reports() {
         let item = TranscriptItem::ToolCall {
+            id: "t1".to_string(),
             name: "grep".to_string(),
             summary: "pattern=x".to_string(),
         };
