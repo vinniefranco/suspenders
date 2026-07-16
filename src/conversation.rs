@@ -347,14 +347,13 @@ impl Conversation {
                 supersession::Dead::Result {
                     msg_index,
                     block_index,
-                    marker,
+                    kind,
                 } => {
-                    if *marker == voice::superseded_command_marker() {
-                        stats.cmd_superseded += 1;
-                    } else {
-                        stats.read_superseded += 1;
+                    match kind {
+                        supersession::ResultKind::Command => stats.cmd_superseded += 1,
+                        supersession::ResultKind::Read => stats.read_superseded += 1,
                     }
-                    self.elide(*msg_index, *block_index, marker)
+                    self.elide(*msg_index, *block_index, kind.marker())
                 }
                 supersession::Dead::WriteInput {
                     msg_index,
@@ -1801,6 +1800,39 @@ mod tests {
             ]
         );
         assert_eq!(evicted.evict(), evicted);
+    }
+
+    #[test]
+    fn a_dead_mass_wave_counts_superseded_results_by_tool_kind() {
+        // A superseded run_command counts as Command, a superseded read_file as
+        // Read — the classification lives on the dead block's kind, not a marker
+        // string comparison. The newest identical call survives; the two filler
+        // reads sit in the protected recency window.
+        let dump = "FAILED ".repeat(80);
+        let cmd = json!({"command": "cargo test"});
+        let read = json!({"path": "a.rs"});
+        let mut conv = Conversation::new(
+            "sys",
+            ConversationOpts::new(10_000, 0).dead_mass_fraction(0.01),
+        );
+        conv.add_user_text("go");
+        for id in ["c1", "c2"] {
+            conv.add_assistant_blocks(vec![tool_use_input(id, "run_command", cmd.clone())]);
+            conv.add_tool_results(vec![tool_result(id, &dump)], vec![]);
+        }
+        for id in ["d1", "d2"] {
+            conv.add_assistant_blocks(vec![tool_use_input(id, "read_file", read.clone())]);
+            conv.add_tool_results(vec![tool_result(id, &dump)], vec![]);
+        }
+        for (id, path) in [("f1", "p"), ("f2", "q")] {
+            conv.add_assistant_blocks(vec![tool_use_input(id, "read_file", json!({"path": path}))]);
+            conv.add_tool_results(vec![tool_result(id, "keep")], vec![]);
+        }
+
+        let (_, stats) = conv.evict_traced();
+        let stats = stats.expect("a dead-mass wave fired");
+        assert_eq!(stats.cmd_superseded, 1);
+        assert_eq!(stats.read_superseded, 1);
     }
 
     #[test]

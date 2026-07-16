@@ -28,6 +28,29 @@ use super::turn_boundary;
 // turn dependency.
 const WRITE_TOOLS: &[&str] = &["edit_file", "write_file"];
 
+/// The tool kind of a superseded Tool Result — the classification supersession
+/// makes when it marks a Result dead. Voice owns the marker wording (ADR-0008);
+/// this only names which kind it is, so the one seam that needs the text routes
+/// to the right Voice function instead of round-tripping through a string.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ResultKind {
+    /// A run_command result.
+    Command,
+    /// A read-family result (read_file).
+    Read,
+}
+
+impl ResultKind {
+    /// The Voice marker text for this kind. Voice authors the wording; this
+    /// only selects which Voice function speaks it.
+    pub(super) fn marker(self) -> &'static str {
+        match self {
+            ResultKind::Command => voice::superseded_command_marker(),
+            ResultKind::Read => voice::superseded_read_marker(),
+        }
+    }
+}
+
 /// One dead block: where it sits and which husk replaces it at wave time.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Dead {
@@ -41,7 +64,7 @@ pub(super) enum Dead {
     Result {
         msg_index: usize,
         block_index: usize,
-        marker: &'static str,
+        kind: ResultKind,
     },
 }
 
@@ -240,14 +263,14 @@ fn superseded_results(calls: &[Call<'_>], guard: &RecencyGuard) -> Vec<Dead> {
     calls
         .iter()
         .filter_map(|call| {
-            let marker = match call.name {
-                "run_command" => voice::superseded_command_marker(),
-                "read_file" => voice::superseded_read_marker(),
+            let kind = match call.name {
+                "run_command" => ResultKind::Command,
+                "read_file" => ResultKind::Read,
                 _ => return None,
             };
             let result = call.result.as_ref()?;
             if guard.protects_result(result.msg_index)
-                || result.content == marker
+                || result.content == kind.marker()
                 || result.content == voice::elision_marker()
             {
                 return None;
@@ -262,7 +285,7 @@ fn superseded_results(calls: &[Call<'_>], guard: &RecencyGuard) -> Vec<Dead> {
             superseded.then_some(Dead::Result {
                 msg_index: result.msg_index,
                 block_index: result.block_index,
-                marker,
+                kind,
             })
         })
         .collect()
@@ -445,12 +468,12 @@ mod tests {
                 Dead::Result {
                     msg_index: 2,
                     block_index: 0,
-                    marker: voice::superseded_command_marker(),
+                    kind: ResultKind::Command,
                 },
                 Dead::Result {
                     msg_index: 4,
                     block_index: 0,
-                    marker: voice::superseded_command_marker(),
+                    kind: ResultKind::Command,
                 },
             ]
         );
@@ -491,7 +514,7 @@ mod tests {
             vec![Dead::Result {
                 msg_index: 2,
                 block_index: 0,
-                marker: voice::superseded_read_marker(),
+                kind: ResultKind::Read,
             }]
         );
     }
