@@ -5,10 +5,13 @@
 //! the no-think knobs, the command timeout, the
 //! Plugin list, the LLM module, and the model connection.
 //!
-//! This is the composition seam for configuration. [`Session::new`] is the
-//! only place Suspenders reads the environment for these keys (via
-//! [`SessionConfig::from_env`]); everything downstream receives values from
-//! this struct, so the cross-module invariants live in one constructor:
+//! This is the composition seam for configuration. [`Session::new`] resolves
+//! these keys once (via [`SessionConfig::load`]) by overlaying, in order, the
+//! hardcoded [`SessionConfig::base`] defaults, the user's `config.json`
+//! (ADR-0031), and the `SUSPENDERS_*` environment (the file is the persistent
+//! baseline; the environment still wins per-invocation over it); everything
+//! downstream receives values from this struct, so the cross-module invariants
+//! live in one constructor:
 //!
 //! * the Eviction reserve IS `connection.max_tokens` - one field, read by the
 //!   Conversation and the LLM request alike, so they cannot drift
@@ -25,6 +28,7 @@ pub mod log;
 use crate::conversation;
 use crate::tool::ToolCtx;
 use connection::Connection;
+use serde::{Deserialize, Serialize};
 
 /// The shape of a Recovery Turn (CONTEXT.md: Recovery Turn, Continuation,
 /// Handoff): [`RecoveryShape::Handoff`] retires the Conversation and seeds a
@@ -32,7 +36,12 @@ use connection::Connection;
 /// keeps it and appends the recovery prompt. A Setpoint value the Endgame
 /// Governor owns; defined here beside the Session facts that resolve it (the
 /// same direction as [`log::StopReason`], which the Endgame also reads).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `rename_all = "lowercase"` makes the serde forms exactly the lowercase
+/// strings the env seam already parses (`"handoff"` / `"continuation"`), so the
+/// [`FileConfig`] serialization and [`RecoveryShape::parse`]/[`as_str`] agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RecoveryShape {
     Handoff,
     Continuation,
@@ -113,8 +122,8 @@ impl std::fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 /// The resolved config defaults a Session is built against.
-/// [`SessionConfig::from_env`] is the single env seam and tests pass
-/// [`SessionConfig::test_defaults`] explicitly (no env reads).
+/// [`SessionConfig::load`] composes it (base → file → env) and tests pass
+/// [`SessionConfig::test_defaults`] explicitly (no file/env reads).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
     pub base_url: String,
@@ -154,7 +163,7 @@ impl SessionConfig {
             eviction_slack: 0.2,
             dead_mass_fraction: 0.15,
             compaction_keep: 0.5,
-            llm_module: "Baud.LLM".into(),
+            llm_module: "Suspenders.LLM".into(),
             command_timeout_ms: 120_000,
             turn_limit: 32,
             anchor_interval: 5,
@@ -184,20 +193,40 @@ impl SessionConfig {
         cfg
     }
 
-    /// The single env seam: overlays `SUSPENDERS_*` environment variables on
-    /// the base config, with the same parsing and validation the runtime
-    /// documents. A malformed value is a hard error (the same reasons carried
-    /// as a [`SessionError`]) rather than a silent fallback.
-    pub fn from_env() -> Self {
-        SessionConfig::try_from_env().expect("invalid SUSPENDERS_* environment configuration")
+    /// The composition entry (ADR-0031): [`base`](Self::base) defaults overlaid
+    /// by the user's `config.json`, then by the `SUSPENDERS_*` environment.
+    /// [`try_load`](Self::try_load) is the fallible form; this is the panicking
+    /// convenience over it.
+    pub fn load() -> Self {
+        SessionConfig::try_load().expect("invalid suspenders configuration (file or SUSPENDERS_*)")
     }
 
-    /// The fallible env seam: reads each `SUSPENDERS_*` override and validates
-    /// it, returning the reason on the first malformed value. [`from_env`] is
-    /// the panicking convenience over this.
-    pub fn try_from_env() -> Result<Self, SessionError> {
+    /// The fallible composition entry: `base()` → `config.json` overlay → env
+    /// overlay, returning the reason on the first malformed value (a bad file,
+    /// a bad env var). The file is the user's persistent baseline; the
+    /// environment still wins per-invocation over it (ADR-0031).
+    pub fn try_load() -> Result<Self, SessionError> {
         let mut cfg = SessionConfig::base();
+        // Order is load-bearing (ADR-0031): the file overlay lands FIRST, then
+        // `apply_env`, so the environment wins per-invocation over the file's
+        // persistent baseline. The env-over-file precedence is not unit-tested:
+        // the suite deliberately never touches process env (edition 2024 makes
+        // `set_var` unsafe/racy), so proving it would mean mutating the ambient
+        // environment other tests share.
+        load_file_overlay(&mut cfg, &default_config_path())?;
+        SessionConfig::apply_env(&mut cfg)?;
+        Ok(cfg)
+    }
 
+    /// The env-overlay step (formerly `try_from_env`): reads each `SUSPENDERS_*`
+    /// override and validates it, overlaying present values onto `cfg` and
+    /// returning the reason on the first malformed value. A malformed value is a
+    /// hard error (carried as a [`SessionError`]) rather than a silent fallback.
+    ///
+    /// This and [`FileConfig`] are the two serializations of one schema; a new
+    /// user-tunable knob is added to both seams or to neither (ADR-0031: "the
+    /// file and env seams must be kept in lockstep").
+    fn apply_env(cfg: &mut SessionConfig) -> Result<(), SessionError> {
         // Plain string overrides, set whenever present.
         if let Ok(v) = std::env::var("SUSPENDERS_URL") {
             cfg.base_url = v;
@@ -249,7 +278,10 @@ impl SessionConfig {
             cfg.recovery_limit = parse_int(&v, "SUSPENDERS_RECOVERY_LIMIT")?;
         }
 
-        // "handoff" | "continuation".
+        // "handoff" | "continuation". Note: the env parser trims whitespace
+        // (via `parse_recovery_shape`), but the JSON path does not - serde
+        // matches the string exactly. Accepted, not fixed: a stray space in
+        // a hand-typed env var is likelier than in an editor-formatted file.
         if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_SHAPE") {
             cfg.recovery_shape = parse_recovery_shape(&v)?;
         }
@@ -267,7 +299,166 @@ impl SessionConfig {
             cfg.no_think_rescue = parse_bool(&v, "SUSPENDERS_NO_THINK_RESCUE")?;
         }
 
-        Ok(cfg)
+        Ok(())
+    }
+
+    /// Writes a fully-populated `config.json` template to `path` from the
+    /// [`base`](Self::base) defaults (ADR-0031): every schema key present and
+    /// self-documenting, EXCEPT `token`, which stays absent so no secret is ever
+    /// persisted by the tool. Refuses an existing target unless `force`, creates
+    /// parent dirs as needed, and serializes pretty.
+    pub fn write_template(path: &str, force: bool) -> Result<(), SessionError> {
+        if !force && std::path::Path::new(path).exists() {
+            return Err(SessionError(format!(
+                "refusing to overwrite existing config at {path} (pass --force to replace it)"
+            )));
+        }
+
+        let base = SessionConfig::base();
+        let template = FileConfig {
+            base_url: Some(base.base_url),
+            // token is deliberately left None: never persist a secret.
+            token: None,
+            model: Some(base.model),
+            max_tokens: Some(base.max_tokens),
+            temperature: base.temperature,
+            context_budget: Some(base.context_budget),
+            eviction_slack: Some(base.eviction_slack),
+            dead_mass_fraction: Some(base.dead_mass_fraction),
+            compaction_keep: Some(base.compaction_keep),
+            plan_stale_after: Some(base.plan_stale_after),
+            recovery_limit: Some(base.recovery_limit),
+            recovery_shape: Some(base.recovery_shape),
+            malformed_retry_budget: Some(base.malformed_retry_budget),
+            scout_no_think: Some(base.scout_no_think),
+            no_think_rescue: Some(base.no_think_rescue),
+        };
+
+        let json = serde_json::to_string_pretty(&template)
+            .map_err(|e| SessionError(format!("failed to serialize config template: {e}")))?;
+
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SessionError(format!("failed to create config directory {parent:?}: {e}"))
+            })?;
+        }
+
+        std::fs::write(path, json)
+            .map_err(|e| SessionError(format!("failed to write config to {path}: {e}")))
+    }
+}
+
+/// The user config file's schema (ADR-0031): exactly the env-settable key set,
+/// every field `Option<T>` so an absent key is an empty overlay. The DTO and the
+/// env seam are two serializations of one schema; the deliberately excluded
+/// fields (`session_dir`, `llm_module`, `turn_limit`, `anchor_interval`,
+/// `scout_pass_limit`, `plugins`) are simply absent, so `deny_unknown_fields`
+/// rejects them for free. `token` is `Option` so [`write_template`] can omit it
+/// while the user may still add it by hand.
+///
+/// This and [`SessionConfig::apply_env`] are the two serializations of one
+/// schema; a new user-tunable knob is added to both seams or to neither
+/// (ADR-0031: "the file and env seams must be kept in lockstep").
+///
+/// [`write_template`]: SessionConfig::write_template
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+    /// Presence sets `Some`; the file cannot null it out (same limitation as the
+    /// env seam).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eviction_slack: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dead_mass_fraction: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction_keep: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_stale_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_shape: Option<RecoveryShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malformed_retry_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scout_no_think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_think_rescue: Option<bool>,
+}
+
+impl FileConfig {
+    /// Pure parse of the config file's JSON (ADR-0031): syntax errors, unknown
+    /// keys, and type mismatches each surface as a [`SessionError`]. The message
+    /// is path-agnostic (the caller, [`load_file_overlay`], wraps it with the
+    /// resolved path). Range checks are NOT done here - a bad-but-typed value is
+    /// caught later by `validate()` on the final [`Session`].
+    fn parse(raw: &str) -> Result<FileConfig, SessionError> {
+        serde_json::from_str(raw).map_err(|e| SessionError(e.to_string()))
+    }
+
+    /// Overlays only the present (`Some`) fields onto `cfg`; absent fields leave
+    /// `cfg` untouched. Private on purpose: a `SessionConfig` mutated this way
+    /// must still pass through `validate()` on the built [`Session`].
+    fn apply(&self, cfg: &mut SessionConfig) {
+        if let Some(v) = &self.base_url {
+            cfg.base_url = v.clone();
+        }
+        if let Some(v) = &self.token {
+            cfg.token = v.clone();
+        }
+        if let Some(v) = &self.model {
+            cfg.model = v.clone();
+        }
+        if let Some(v) = self.max_tokens {
+            cfg.max_tokens = v;
+        }
+        if let Some(v) = self.temperature {
+            cfg.temperature = Some(v);
+        }
+        if let Some(v) = self.context_budget {
+            cfg.context_budget = v;
+        }
+        if let Some(v) = self.eviction_slack {
+            cfg.eviction_slack = v;
+        }
+        if let Some(v) = self.dead_mass_fraction {
+            cfg.dead_mass_fraction = v;
+        }
+        if let Some(v) = self.compaction_keep {
+            cfg.compaction_keep = v;
+        }
+        if let Some(v) = self.plan_stale_after {
+            cfg.plan_stale_after = v;
+        }
+        if let Some(v) = self.recovery_limit {
+            cfg.recovery_limit = v;
+        }
+        if let Some(v) = self.recovery_shape {
+            cfg.recovery_shape = v;
+        }
+        if let Some(v) = self.malformed_retry_budget {
+            cfg.malformed_retry_budget = v;
+        }
+        if let Some(v) = self.scout_no_think {
+            cfg.scout_no_think = v;
+        }
+        if let Some(v) = self.no_think_rescue {
+            cfg.no_think_rescue = v;
+        }
     }
 }
 
@@ -377,10 +568,11 @@ pub struct SessionOpts {
 }
 
 impl Session {
-    /// Builds and validates the Session's fixed facts, reading config from the
-    /// environment (the single env seam). `root` defaults to the current dir.
+    /// Builds and validates the Session's fixed facts, resolving config through
+    /// the composition seam (base → file → env; ADR-0031). `root` defaults to
+    /// the current dir.
     pub fn new(opts: SessionOpts) -> Result<Session, SessionError> {
-        Session::build(opts, &SessionConfig::from_env())
+        Session::build(opts, &SessionConfig::load())
     }
 
     /// Builds and validates against an explicit [`SessionConfig`] - the
@@ -448,13 +640,49 @@ fn default_root() -> String {
         .unwrap_or_else(|_| ".".into())
 }
 
-// Session Logs live outside the Project Root (ADR-0010): XDG data home.
+// Session Logs live outside the Project Root (ADR-0010): XDG data home. Per the
+// XDG spec, a set-but-empty var is treated as unset (else the path degrades to
+// `/suspenders/sessions`).
 fn default_session_dir() -> String {
-    let base = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        format!("{home}/.local/share")
-    });
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.local/share")
+        });
     format!("{base}/suspenders/sessions")
+}
+
+// The user config file lives beside the Session Logs (ADR-0031): XDG config
+// home, mirroring `default_session_dir` (empty var == unset, per XDG).
+pub fn default_config_path() -> String {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.config")
+        });
+    format!("{base}/suspenders/config.json")
+}
+
+// The thin impure reader (ADR-0031): reads the config at `path` and overlays it
+// onto `cfg`. An absent file is an empty overlay (Ok, base defaults, no file
+// touched); any IO or parse error becomes a [`SessionError`] naming `path`.
+// `path` is an argument (not resolved here) so the overlay is testable without
+// the real XDG dir.
+fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionError> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            FileConfig::parse(&raw)
+                .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?
+                .apply(cfg);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SessionError(format!("failed to read config at {path}: {e}"))),
+    }
 }
 
 // All cross-key invariants live here, each in its own focused check so the
@@ -1202,5 +1430,162 @@ mod tests {
         assert_eq!(ctx.root, std::path::PathBuf::from("/tmp"));
         assert_eq!(ctx.result_cap, session.result_cap);
         assert_eq!(ctx.command_timeout_ms, 1_234);
+    }
+
+    // ---- FileConfig (ADR-0031: user config file) ----
+
+    #[test]
+    fn file_config_parse_accepts_a_sparse_subset() {
+        let fc = FileConfig::parse(r#"{"model": "custom/model", "max_tokens": 4096}"#).unwrap();
+        assert_eq!(fc.model.as_deref(), Some("custom/model"));
+        assert_eq!(fc.max_tokens, Some(4096));
+        // Absent keys stay None.
+        assert_eq!(fc.base_url, None);
+        assert_eq!(fc.recovery_shape, None);
+    }
+
+    #[test]
+    fn file_config_parse_rejects_an_unknown_key() {
+        // deny_unknown_fields: a misspelled/excluded key is a hard error. The
+        // message is path-agnostic (the reader wraps it with the path) but still
+        // names the offending key.
+        let err = FileConfig::parse(r#"{"max_token": 4096}"#).unwrap_err();
+        assert!(err.0.contains("max_token"));
+
+        // An excluded field (never in the DTO) is rejected the same way.
+        assert!(FileConfig::parse(r#"{"turn_limit": 10}"#).is_err());
+    }
+
+    #[test]
+    fn file_config_parse_rejects_a_wrong_typed_value() {
+        assert!(FileConfig::parse(r#"{"max_tokens": "lots"}"#).is_err());
+    }
+
+    #[test]
+    fn file_config_recovery_shape_round_trips_the_lowercase_strings() {
+        let fc = FileConfig::parse(r#"{"recovery_shape": "continuation"}"#).unwrap();
+        assert_eq!(fc.recovery_shape, Some(RecoveryShape::Continuation));
+        // And the enum serializes to exactly those strings.
+        let json = serde_json::to_string(&RecoveryShape::Handoff).unwrap();
+        assert_eq!(json, "\"handoff\"");
+    }
+
+    #[test]
+    fn file_config_apply_overlays_only_present_fields() {
+        let mut cfg = SessionConfig::test_defaults();
+        let before_budget = cfg.context_budget;
+        let fc = FileConfig {
+            model: Some("overlaid/model".into()),
+            recovery_shape: Some(RecoveryShape::Continuation),
+            ..Default::default()
+        };
+        fc.apply(&mut cfg);
+        assert_eq!(cfg.model, "overlaid/model");
+        assert_eq!(cfg.recovery_shape, RecoveryShape::Continuation);
+        // Absent fields untouched.
+        assert_eq!(cfg.context_budget, before_budget);
+    }
+
+    #[test]
+    fn out_of_range_file_value_surfaces_via_the_build_path() {
+        // Range errors are NOT caught by parse(); they surface at validate().
+        let mut cfg = SessionConfig::test_defaults();
+        FileConfig::parse(r#"{"eviction_slack": 1.0}"#)
+            .unwrap()
+            .apply(&mut cfg);
+        let err = Session::build(opts(), &cfg).unwrap_err();
+        assert!(err.0.contains(":eviction_slack"));
+    }
+
+    #[test]
+    fn write_template_omits_token_and_refuses_existing_without_force() {
+        let path = std::env::temp_dir()
+            .join(format!("suspenders_write_config_{}.json", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+
+        SessionConfig::write_template(&path, false).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        // token is never persisted (the "token" substring in "max_tokens" is
+        // fine; the standalone key must be absent).
+        assert!(!written.contains("\"token\""));
+        // The template is full: it parses and round-trips a known key.
+        let fc = FileConfig::parse(&written).unwrap();
+        assert_eq!(fc.model.as_deref(), Some(SessionConfig::base().model.as_str()));
+        assert_eq!(fc.recovery_shape, Some(SessionConfig::base().recovery_shape));
+        assert!(fc.token.is_none());
+
+        // Refuses an existing target without force.
+        let err = SessionConfig::write_template(&path, false).unwrap_err();
+        assert!(err.0.contains(&path));
+        // force overwrites.
+        SessionConfig::write_template(&path, true).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A temp path namespaced by PID + a caller label, so parallel tests never
+    // collide on the filesystem seam.
+    fn temp_config_path(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("suspenders_cfg_{}_{}.json", label, std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn load_file_overlay_applies_a_value_onto_base() {
+        let path = temp_config_path("overlay_applies");
+        std::fs::write(&path, r#"{"model": "from/file", "context_budget": 12345}"#).unwrap();
+
+        let mut cfg = SessionConfig::test_defaults();
+        load_file_overlay(&mut cfg, &path).unwrap();
+        assert_eq!(cfg.model, "from/file");
+        assert_eq!(cfg.context_budget, 12345);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_file_overlay_missing_file_is_ok_and_leaves_config_unchanged() {
+        // Proves "absent file = defaults, no file touched" (ADR-0031).
+        let path = temp_config_path("missing");
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = SessionConfig::test_defaults();
+        let before = cfg.clone();
+        load_file_overlay(&mut cfg, &path).unwrap();
+        assert_eq!(cfg, before);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn write_template_round_trips_every_non_token_field_as_some() {
+        // Lockstep guard (ADR-0031): the writer emits every schema key, and the
+        // DTO parses them all back. A field the writer forgets - or a serde
+        // rename that drifts - trips this. `token` is the sole intended None.
+        let path = temp_config_path("round_trip");
+        SessionConfig::write_template(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let fc = FileConfig::parse(&raw).unwrap();
+
+        assert!(fc.base_url.is_some());
+        assert!(fc.token.is_none());
+        assert!(fc.model.is_some());
+        assert!(fc.max_tokens.is_some());
+        assert!(fc.temperature.is_some());
+        assert!(fc.context_budget.is_some());
+        assert!(fc.eviction_slack.is_some());
+        assert!(fc.dead_mass_fraction.is_some());
+        assert!(fc.compaction_keep.is_some());
+        assert!(fc.plan_stale_after.is_some());
+        assert!(fc.recovery_limit.is_some());
+        assert!(fc.recovery_shape.is_some());
+        assert!(fc.malformed_retry_budget.is_some());
+        assert!(fc.scout_no_think.is_some());
+        assert!(fc.no_think_rescue.is_some());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

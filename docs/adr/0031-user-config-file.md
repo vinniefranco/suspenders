@@ -1,0 +1,108 @@
+# A user config file overlays base defaults, below the environment
+
+The Session's fixed facts resolve in one composition seam
+(`session.rs`): `base()` hardcoded defaults, overlaid by `SUSPENDERS_*`
+env vars (`try_from_env`), overlaid by `SessionOpts` (the CLI/programmatic
+keyword opts), then validated once. Env is the only persistence a user
+gets, and it is per-invocation - there is no home for "my model, my
+endpoint, my budget" that survives a shell without an exported var or a
+wrapper script. Re-exporting `SUSPENDERS_TOKEN` every session is the daily
+friction.
+
+The `.suspenders/` folder already exists, but it is **project-scoped**
+and git-tracked (`context_files.rs`: `SYSTEM.md`, `AGENTS.md`, …). User
+config is a different scope - per-user, secret-bearing, not committed -
+so it does not belong there despite the tempting name collision. Session
+Logs already established the per-user precedent: they live under
+`$XDG_DATA_HOME` (ADR-0010). Config pairs with that as `$XDG_CONFIG_HOME`.
+
+## Decision
+
+A sparse JSON config file at
+`$XDG_CONFIG_HOME/suspenders/config.json` (falling back to
+`$HOME/.config`, resolved manually to mirror `default_session_dir`) sits
+in the composition **between `base()` and the environment**:
+
+```
+base()  →  config.json  →  SUSPENDERS_*  →  SessionOpts  →  validate()
+```
+
+The file is the user's persistent baseline; the environment still wins
+per-invocation over it. The composition entry is renamed `load()` /
+`try_load()` (`from_env` becomes the internal env-overlay step it always
+was) because the seam is no longer env-only.
+
+**Schema is exactly the env-settable key set.** The file and the env
+seam are two serializations of one schema - `base_url`, `token`, `model`,
+`max_tokens`, `temperature`, `context_budget`, `eviction_slack`,
+`dead_mass_fraction`, `compaction_keep`, `plan_stale_after`,
+`recovery_limit`, `recovery_shape`, `malformed_retry_budget`,
+`scout_no_think`, `no_think_rescue`. Fields the env never exposed
+(`session_dir`, `llm_module`, `turn_limit`, `anchor_interval`,
+`scout_pass_limit`, `plugins`) stay out of both; closing that gap means
+adding to both seams, not letting the file diverge.
+
+**A `FileConfig` DTO carries the schema** - every field `Option<T>`,
+`#[serde(deny_unknown_fields)]`, with an `apply(&self, &mut
+SessionConfig)` that overlays only present keys. Parsing splits into a
+pure `FileConfig::parse(&str)` (unit-tested with JSON literals) and a
+thin impure reader that resolves the path and reads the bytes. The
+excluded fields are simply absent from the DTO, so `deny_unknown_fields`
+rejects them for free.
+
+**Failure is loud, mirroring the env philosophy.** Malformed JSON
+syntax, an unknown/misspelled key, and an out-of-range value are each a
+hard error at launch. The range check is free: `validate()` already
+range-checks every one of these fields on the final `Session`, so a bad
+file value that survives to launch is caught there.
+
+**No auto-create.** An absent file is an empty overlay - `base()`
+defaults, no file touched. Auto-writing would bake the current defaults
+into a file that then pins them below every future default bump.
+
+**A `--write-config[=PATH]` flag** removes the hand-authoring friction
+without auto-create: it writes `base()` defaults (not the current
+effective config), **full** (every schema key, self-documenting),
+**omitting `token`** so no secret is ever persisted by the tool, refuses
+if the target exists unless `--force`, prints the path, and exits before
+a Session is built. This requires `Serialize` on `FileConfig`.
+
+## Considered options
+
+- **File above the environment** (`base → env → file`) - rejected: env
+  is the natural per-invocation override (`SUSPENDERS_MODEL=… suspenders`
+  for a one-off), and a persistent file that silently beats an explicit
+  env var is the more surprising order.
+- **Project-local `.suspenders/config.json`** - rejected: that folder is
+  git-tracked and project-scoped; user config is per-user and
+  secret-bearing. Reusing the name across two scopes would make
+  `.suspenders/` ambiguous.
+- **Bare `~/.suspenders/config.json`** - rejected for `$XDG_CONFIG_HOME`,
+  which pairs with the `$XDG_DATA_HOME` Session Logs already use and
+  keeps the double-meaning of `.suspenders` out of `$HOME`.
+- **`#[derive(Deserialize)]` on `SessionConfig` directly** - rejected:
+  its fields are not `Option`, its defaults come from `base()` not
+  `Default`, and it carries fields we deliberately exclude. A DTO makes
+  the excluded set explicit and parallels the env overlay.
+- **Lenient unknown keys** (forward-compatible) - rejected for
+  `deny_unknown_fields`: a silently-dropped typo (`max_token`) is the
+  most frustrating config failure. Version skew is a non-issue for a
+  single local binary.
+- **Writer dumps the effective config** (base + active env) - rejected:
+  non-deterministic ("why is `temperature` 0.9 in my file?") and it would
+  risk writing an env-sourced `token` to disk. `base()` defaults are a
+  clean, reproducible template.
+
+## Consequences
+
+- `from_env`/`try_from_env` become the internal env-overlay step;
+  `load`/`try_load` is the public composition entry `Session::new` calls.
+- The resolver now touches the filesystem, but only on the `Session::new`
+  path. Tests use `test_defaults()` + `Session::build` and never hit the
+  file seam, so the suite stays hermetic; new tests cover
+  `FileConfig::parse`/`apply` with literals.
+- `token` can now be persisted per-user (the point of the file), but the
+  tool never writes it - the user adds the key by hand or keeps it in
+  env.
+- The file and env seams must be kept in lockstep: a new user-tunable
+  knob is added to both, or to neither.
