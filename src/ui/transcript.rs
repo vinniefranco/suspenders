@@ -36,7 +36,7 @@
 //!   [`crate::plugins::present`]; a crashing plugin is skipped with an info line
 //!   (fail-open, ADR-0007), as is every `plugin_error` event the Turn reports.
 
-use crate::conversation::compaction_target;
+use crate::conversation::{WaveStats, compaction_target, dead_mass_pct};
 use crate::event::{Event, Stage};
 use crate::llm::response::StopReason;
 use crate::plugins::{self, Registered};
@@ -95,9 +95,15 @@ impl StyledLine {
 /// * `User { text }` — `{:user, text}`.
 /// * `Assistant { text }` — `{:assistant, text}`.
 /// * `Thinking { text }` — `{:thinking, text}`.
-/// * `ToolCall { name, summary }` — `{:tool_call, name, summary}`.
-/// * `ToolResult { name, summary, is_error }` — `{:tool_result, name, summary,
-///   is_error}`, the default one-line summary a plugin's `present` may replace.
+/// * `ToolCall { id, name, summary }` — `{:tool_call, id, name, summary}`; `id`
+///   is a display-opaque correlation token (the `tool_use_id`) used ONLY to
+///   pair the call with its later `ToolResult` in the fold — the display never
+///   interprets it.
+/// * `ToolResult { name, summary, is_error, key_arg }` —
+///   `{:tool_result, name, summary, is_error, key_arg}`, the default one-line
+///   summary a plugin's `present` may replace; `key_arg` is the salient input
+///   arg (path/command/pattern) carried over from the paired call so the merged
+///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
 /// * `Block { title, lines }` — `{:block, title, lines}`: a titled block of
 ///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
 /// * `Info { text }` — `{:info, text}`.
@@ -113,6 +119,10 @@ pub enum TranscriptItem {
         text: String,
     },
     ToolCall {
+        /// A display-opaque correlation token (the `tool_use_id`): used ONLY to
+        /// pair this call with its later [`TranscriptItem::ToolResult`] in the
+        /// fold. The view never interprets or renders it.
+        id: String,
         name: String,
         summary: String,
     },
@@ -120,6 +130,11 @@ pub enum TranscriptItem {
         name: String,
         summary: String,
         is_error: bool,
+        /// The salient input arg (path/command/pattern) carried from the paired
+        /// [`TranscriptItem::ToolCall`], so the merged line can read
+        /// `name  <key_arg> · <result>`. `None` for a result with no live call
+        /// (e.g. governor-injected) — the line falls back to `name → result`.
+        key_arg: Option<String>,
     },
     Block {
         title: String,
@@ -128,6 +143,44 @@ pub enum TranscriptItem {
     Info {
         text: String,
     },
+}
+
+impl TranscriptItem {
+    /// The body this item collapses to under the global tools toggle (Ctrl-O),
+    /// or `None` if the item has nothing to fold and always renders in full.
+    ///
+    /// This is the SEMANTIC collapse predicate (Stage 2 review C2): the view's
+    /// fold keys on `foldable_body().is_some()`, not on a structural
+    /// `matches!(item, Block)`, so the merge is free to choose an item's shape
+    /// without re-implementing the fold rule. Today only a [`Block`] with a
+    /// non-empty body folds; a merged one-line `ToolResult` has no body, so it
+    /// never collapses. Stays pure — returns the pure-core [`StyledLine`] slice,
+    /// never a ratatui type (ADR-0019).
+    ///
+    /// [`Block`]: TranscriptItem::Block
+    pub fn foldable_body(&self) -> Option<&[StyledLine]> {
+        match self {
+            TranscriptItem::Block { lines, .. } if !lines.is_empty() => Some(lines),
+            _ => None,
+        }
+    }
+
+    /// The title an item collapses TO under the global tools toggle (Ctrl-O):
+    /// the one-liner the view shows in place of the folded [`foldable_body`].
+    /// Kept beside `foldable_body` so the collapse rule — predicate AND title —
+    /// lives entirely in the pure core (Stage 2 review C2 / S1): the view
+    /// composes the collapsed line from this accessor without matching on
+    /// `Block`, so a future non-Block foldable item collapses the same way.
+    /// Today only a [`Block`] has a fold title.
+    ///
+    /// [`foldable_body`]: TranscriptItem::foldable_body
+    /// [`Block`]: TranscriptItem::Block
+    pub fn fold_title(&self) -> Option<&str> {
+        match self {
+            TranscriptItem::Block { title, .. } => Some(title),
+            _ => None,
+        }
+    }
 }
 
 /// The semantic pressure level (ADR-0008): how full the live context window is,
@@ -248,6 +301,8 @@ pub enum Key {
     InsertNewline,
     /// Ctrl-T: toggle the expanded rendering of settled Thinking items.
     ToggleThinking,
+    /// Ctrl-O: toggle the expanded rendering of settled tool Blocks.
+    ToggleTools,
     Char(char),
     /// A key the core does not act on (function keys, etc.).
     Other,
@@ -338,6 +393,12 @@ pub struct Transcript {
     pub context_budget: Option<u64>,
     pub eviction_slack: f64,
     pub pressure_level: PressureLevel,
+    /// The live Dead Mass share (integer percent) from the most recent
+    /// [`Event::ContextPressure`], for the status bar. `None` until the first
+    /// pressure event; folded into the Tokens segment as a `· N% dead` tail so
+    /// context reclamation is legible AS IT STANDS — not the pre-reclaim
+    /// snapshot a past wave found (which a wave clears the instant it fires).
+    pub dead_mass_pct: Option<u64>,
     pub input_value: String,
     pub input_cursor: usize,
     /// The highlighted command in the Slash Command menu (ADR-0032), an index
@@ -362,6 +423,12 @@ pub struct Transcript {
     /// full text) instead of the collapsed one-line form. Toggled by
     /// [`Key::ToggleThinking`] (Ctrl-T); defaults collapsed.
     pub thinking_expanded: bool,
+    /// Whether settled [`TranscriptItem::Block`] items (diffs, tool output)
+    /// render expanded (the full body) instead of the collapsed one-line
+    /// title. Toggled by [`Key::ToggleTools`] (Ctrl-O); defaults collapsed —
+    /// the same detail-on-demand rule as `thinking_expanded`, applied to the
+    /// machinery plane so a burst of tool output can't eat the window.
+    pub tools_expanded: bool,
     /// Bumped whenever `messages` changes OTHER than by appending (today only
     /// `SteeringDelivered`, which removes its pending info line from wherever
     /// it sits). The frontend's per-item render cache extends incrementally
@@ -395,12 +462,14 @@ impl Transcript {
             context_budget: opts.context_budget,
             eviction_slack: opts.eviction_slack,
             pressure_level: PressureLevel::Ok,
+            dead_mass_pct: None,
             input_value: String::new(),
             input_cursor: 0,
             slash_cursor: 0,
             command_selector: None,
             history: History::new(opts.history),
             thinking_expanded: false,
+            tools_expanded: false,
             messages_revision: 0,
         }
     }
@@ -440,15 +509,19 @@ impl Transcript {
             }
 
             // Live context-pressure indication: refresh the status bar's token
-            // estimate and budget mid-Turn and name the semantic pressure level
-            // (ADR-0008). NEVER a Transcript item.
+            // estimate, budget, and LIVE Dead Mass share mid-Turn and name the
+            // semantic pressure level (ADR-0008). NEVER a Transcript item. The
+            // Dead Mass here is the current figure, refreshed every pass — the
+            // bar tracks it, not a wave's cleared snapshot.
             Event::ContextPressure {
                 token_estimate,
                 context_budget,
                 max_tokens_reserve,
+                dead_mass,
             } => {
                 self.token_estimate = Some(token_estimate);
                 self.context_budget = Some(context_budget);
+                self.dead_mass_pct = Some(dead_mass_pct(dead_mass));
                 self.pressure_level = pressure_level(
                     token_estimate,
                     context_budget,
@@ -458,26 +531,56 @@ impl Transcript {
                 (self, vec![])
             }
 
-            Event::ToolCall { name, input, .. } => {
-                let item = TranscriptItem::ToolCall {
-                    name,
-                    summary: summarize_input(&input),
-                };
+            // Stamp the call's `id` (for later result-pairing) and give the
+            // live in-flight line a clean summary: the salient `key_arg`
+            // (path/command/pattern), falling back to the raw `key=value`
+            // summary only when no arg stands out.
+            Event::ToolCall { id, name, input } => {
+                let summary =
+                    key_arg(&name, &input).unwrap_or_else(|| summarize_input(&input));
+                let item = TranscriptItem::ToolCall { id, name, summary };
                 self.present(item, &std::collections::HashMap::new());
                 (self, vec![])
             }
 
+            // Merge the result with its call into ONE line: find the pending
+            // `ToolCall` by `id` (NEVER by position — parallel tool calls
+            // interleave), recover its `key_arg`, remove the redundant call
+            // line, and stamp the arg onto the result BEFORE Presentment (a
+            // plugin's `present` may replace the item with a Block, so stamping
+            // after would stamp a dropped item). Removing the call is a
+            // NON-append structural edit, so it bumps `messages_revision` — the
+            // RenderCache desyncs without it (mirrors `SteeringDelivered`). An
+            // unpaired result (governor-injected, no live call) removes nothing,
+            // does not bump, and carries no `key_arg`.
             Event::ToolResult {
+                id,
                 name,
                 content,
                 is_error,
                 artifacts,
-                ..
             } => {
+                // Recover the paired call's `key_arg` (its summary already IS the
+                // salient arg — `key_arg` never yields an empty string, so no
+                // re-check here; the render layer normalizes any empty value once).
+                let key_arg = self
+                    .messages
+                    .iter()
+                    .rposition(|m| matches!(m, TranscriptItem::ToolCall { id: call_id, .. } if *call_id == id))
+                    .map(|pos| {
+                        let arg = match &self.messages[pos] {
+                            TranscriptItem::ToolCall { summary, .. } => summary.clone(),
+                            _ => unreachable!("rposition matched a ToolCall"),
+                        };
+                        self.messages.remove(pos);
+                        self.messages_revision += 1;
+                        arg
+                    });
                 let item = TranscriptItem::ToolResult {
                     name,
                     summary: summarize_result(&content),
                     is_error,
+                    key_arg,
                 };
                 self.present(item, &artifacts);
                 (self, vec![])
@@ -620,6 +723,25 @@ impl Transcript {
             Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
 
             Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
+
+            // An Eviction wave rewrote the request copy (CONTEXT.md: Eviction,
+            // Dead Mass): recede ONE terse Info line naming the wave and its
+            // at-wave (pre-reclaim) snapshot. The status bar does NOT derive from
+            // this — it tracks the LIVE Dead Mass off `ContextPressure`, and this
+            // wave has just cleared what it found. APPEND-ONLY — `push_info` is a
+            // push, so this must NOT bump `messages_revision` (the wave line
+            // keeps the RenderCache incremental; only a non-append edit bumps).
+            Event::EvictionWave { stats } => {
+                self.push_info(eviction_wave_line(&stats));
+                (self, vec![])
+            }
+
+            // Compaction made progress: recede one Info line. Append-only, same
+            // no-bump contract as the Eviction wave.
+            Event::CompactionProgress { status } => {
+                self.push_info(format!("compaction: {status}"));
+                (self, vec![])
+            }
 
             // Unknown / display-irrelevant events are ignored.
             _ => (self, vec![]),
@@ -922,6 +1044,15 @@ impl Transcript {
             // so the flip is visible even with no Thinking items on screen.
             Key::ToggleThinking => {
                 self.thinking_expanded = !self.thinking_expanded;
+                (self, vec![])
+            }
+
+            // Ctrl-O: flip the tool-Block expansion; a pure display toggle, no
+            // effects. Mirrors Ctrl-T for the machinery plane — the status
+            // bar's tools segment renders this flag, so the flip is visible
+            // even with no Blocks on screen.
+            Key::ToggleTools => {
+                self.tools_expanded = !self.tools_expanded;
                 (self, vec![])
             }
 
@@ -1236,6 +1367,67 @@ fn pressure_level(estimate: u64, budget: u64, reserve: u64, slack: f64) -> Press
 
 // -- Event summarising --
 
+// One terse recede line for an Eviction wave (CONTEXT.md: Eviction, Dead Mass):
+// the Dead Mass share plus ONLY the nonzero counts, by kind, so a wave that
+// reclaimed one kind reads cleanly (`context wave · 12% dead mass · 3 results`)
+// and a mixed wave stays single-line. Dead Mass is the AT-WAVE (pre-reclaim)
+// fraction from [`WaveStats::dead_mass`] — correct for a historical line —
+// rounded through the shared [`dead_mass_pct`] rule so this line and the status
+// bar can never disagree. Kept quiet — this is machinery, and Info is already
+// DarkGray italic.
+fn eviction_wave_line(stats: &WaveStats) -> String {
+    let counts = [
+        (stats.results_elided, "results"),
+        (stats.cmd_superseded, "cmd superseded"),
+        (stats.read_superseded, "read superseded"),
+        (stats.edits_husked, "husked"),
+        (stats.anchors_elided, "anchors"),
+    ];
+    let parts: Vec<String> = counts
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+    let pct = dead_mass_pct(stats.dead_mass);
+    if parts.is_empty() {
+        format!("context wave · {pct}% dead mass")
+    } else {
+        format!("context wave · {pct}% dead mass · {}", parts.join(", "))
+    }
+}
+
+// The single salient input arg for a merged one-liner, picked by tool: the
+// `path` for read/edit/write, the `command` for run_command, the `pattern`/
+// `query` for grep/search; otherwise the first value in alphabetical key order.
+// `None` when the input carries no object values OR the picked value formats
+// empty — the ONE emptiness rule, sourced here (so the caller falls back to the
+// full `key=value` summary and never treats an empty arg as present). Truncated
+// like [`format_value`] so a long path/command cannot blow out the line.
+fn key_arg(name: &str, input: &serde_json::Value) -> Option<String> {
+    let obj = match input.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return None,
+    };
+    let salient: &[&str] = match name {
+        "read_file" | "edit_file" | "write_file" => &["path"],
+        "run_command" => &["command"],
+        "grep" | "search" => &["pattern", "query"],
+        _ => &[],
+    };
+    let value = salient
+        .iter()
+        .find_map(|key| obj.get(*key))
+        .or_else(|| {
+            // No named arg matched: fall back to the first value in sorted key
+            // order, so the pick is stable regardless of map ordering.
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+            keys.first().and_then(|k| obj.get(*k))
+        })?;
+    let formatted = format_value(value);
+    (!formatted.is_empty()).then_some(formatted)
+}
+
 // One-line summary of a Tool Call input map, e.g. `path=lib/baud.ex`. Keys are
 // sorted for a stable line (baud's `Enum.sort`).
 fn summarize_input(input: &serde_json::Value) -> String {
@@ -1383,8 +1575,9 @@ mod tests {
     fn info(text: &str) -> TranscriptItem {
         TranscriptItem::Info { text: text.into() }
     }
-    fn tool_call(name: &str, summary: &str) -> TranscriptItem {
+    fn tool_call(id: &str, name: &str, summary: &str) -> TranscriptItem {
         TranscriptItem::ToolCall {
+            id: id.into(),
             name: name.into(),
             summary: summary.into(),
         }
@@ -1394,6 +1587,20 @@ mod tests {
             name: name.into(),
             summary: summary.into(),
             is_error,
+            key_arg: None,
+        }
+    }
+    fn tool_result_merged(
+        name: &str,
+        summary: &str,
+        is_error: bool,
+        key_arg: &str,
+    ) -> TranscriptItem {
+        TranscriptItem::ToolResult {
+            name: name.into(),
+            summary: summary.into(),
+            is_error,
+            key_arg: Some(key_arg.into()),
         }
     }
 
@@ -1481,7 +1688,7 @@ mod tests {
             vec![
                 thinking("hmm"),
                 assistant("reading"),
-                tool_call("read_file", "path=lib/baud.ex"),
+                tool_call("t1", "read_file", "lib/baud.ex"),
             ]
         );
         assert!(t.streaming_text().is_empty() && t.streaming_thinking().is_empty());
@@ -1500,7 +1707,7 @@ mod tests {
         );
         assert_eq!(
             items(&t),
-            vec![assistant("no thinking here"), tool_call("list_files", "")]
+            vec![assistant("no thinking here"), tool_call("t1", "list_files", "")]
         );
     }
 
@@ -1601,7 +1808,7 @@ mod tests {
                 eviction_slack: 0.10,
                 ..Default::default()
             }),
-            vec![Event::context_pressure(estimate, 1200, 200)],
+            vec![Event::context_pressure(estimate, 1200, 200, 0.0)],
         )
     }
 
@@ -1640,7 +1847,7 @@ mod tests {
                 eviction_slack: 0.0,
                 ..Default::default()
             }),
-            vec![Event::context_pressure(1500, 2000, 200)],
+            vec![Event::context_pressure(1500, 2000, 200, 0.0)],
         );
         assert_eq!(t.context_budget, Some(2000));
         assert_eq!(t.pressure_level, PressureLevel::Ok);
@@ -1916,6 +2123,108 @@ mod tests {
         // Delivered with no matching pending line removes nothing: no bump.
         let t = fold(t, vec![Event::steering_delivered("never queued")]);
         assert_eq!(t.messages_revision, 1);
+    }
+
+    // --- context visibility (Bundle A) -------------------------------------
+
+    fn wave_stats() -> WaveStats {
+        WaveStats {
+            results_elided: 3,
+            read_superseded: 1,
+            edits_husked: 2,
+            dead_mass: 0.12,
+            ..WaveStats::default()
+        }
+    }
+
+    // An Eviction wave recedes ONE Info line and, being append-only, must NOT
+    // bump messages_revision (the precondition guard: the wave line keeps the
+    // RenderCache incremental). It must NOT touch the status bar's `dead_mass_pct`
+    // — the bar tracks the LIVE figure off ContextPressure, and this wave just
+    // cleared what it found (the S1 bug: advertising the reclaimed snapshot).
+    #[test]
+    fn an_eviction_wave_pushes_one_info_line_without_bumping_or_setting_the_live_bar() {
+        let t = fresh();
+        assert_eq!(t.messages_revision, 0);
+        assert_eq!(t.dead_mass_pct, None);
+        let (t, effects) = t.apply_event(Event::eviction_wave(wave_stats()));
+        assert_eq!(effects, vec![]);
+        assert_eq!(
+            items(&t),
+            vec![info("context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked")]
+        );
+        // The wave did not set the live bar figure.
+        assert_eq!(t.dead_mass_pct, None);
+        assert_eq!(t.messages_revision, 0);
+    }
+
+    // The status bar's Dead Mass is LIVE: ContextPressure refreshes it every
+    // pass (pre-rounded through the shared rule), NOT the wave.
+    #[test]
+    fn context_pressure_sets_the_live_dead_mass_pct() {
+        let t = fresh();
+        let (t, _) = t.apply_event(Event::context_pressure(1500, 2000, 200, 0.128));
+        assert_eq!(t.dead_mass_pct, Some(13));
+
+        // A later pass with the dead mass reclaimed refreshes to the new figure.
+        let (t, _) = t.apply_event(Event::context_pressure(1500, 2000, 200, 0.0));
+        assert_eq!(t.dead_mass_pct, Some(0));
+    }
+
+    // S2 lock: the wave line's percent and the bar's percent are the SAME
+    // function of the same fraction (both via `dead_mass_pct`), so they agree.
+    #[test]
+    fn the_wave_line_and_the_bar_round_the_dead_mass_the_same_way() {
+        let fraction = 0.128;
+        let (t, _) = fresh().apply_event(Event::context_pressure(1, 2, 0, fraction));
+        let bar_pct = t.dead_mass_pct.expect("pressure set the live figure");
+
+        let stats = WaveStats {
+            dead_mass: fraction,
+            ..WaveStats::default()
+        };
+        let line = eviction_wave_line(&stats);
+        assert!(
+            line.contains(&format!("{bar_pct}% dead mass")),
+            "wave line {line:?} disagrees with bar percent {bar_pct}"
+        );
+    }
+
+    // Compaction progress recedes one Info line, append-only (no bump).
+    #[test]
+    fn compaction_progress_pushes_one_info_line_without_bumping() {
+        let t = fresh();
+        let (t, effects) = t.apply_event(Event::compaction_progress("working"));
+        assert_eq!(effects, vec![]);
+        assert_eq!(items(&t), vec![info("compaction: working")]);
+        assert_eq!(t.messages_revision, 0);
+    }
+
+    // The wave line names ONLY the nonzero counts, in kind order, with the Dead
+    // Mass share as an integer percent — a single-kind wave reads cleanly.
+    #[test]
+    fn eviction_wave_line_names_only_nonzero_counts() {
+        let one_kind = WaveStats {
+            results_elided: 3,
+            dead_mass: 0.05,
+            ..WaveStats::default()
+        };
+        assert_eq!(
+            eviction_wave_line(&one_kind),
+            "context wave · 5% dead mass · 3 results"
+        );
+
+        assert_eq!(
+            eviction_wave_line(&wave_stats()),
+            "context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked"
+        );
+
+        // A wave with no reclaimable counts still names the Dead Mass share.
+        let none = WaveStats {
+            dead_mass: 0.20,
+            ..WaveStats::default()
+        };
+        assert_eq!(eviction_wave_line(&none), "context wave · 20% dead mass");
     }
 
     #[test]
@@ -2453,8 +2762,8 @@ mod tests {
     #[test]
     fn unknown_events_and_keys_are_ignored() {
         let t = fresh();
-        // CompactionProgress is not folded into a Transcript item.
-        let (t, effects) = t.apply_event(Event::compaction_progress("working"));
+        // Anchor is display-irrelevant: not folded into a Transcript item.
+        let (t, effects) = t.apply_event(Event::anchor("anchored"));
         assert_eq!(effects, vec![]);
         assert_eq!(items(&t), vec![]);
 
@@ -2548,6 +2857,37 @@ mod tests {
         // The ring survived the toggle: Down still restores the stashed draft.
         let (t, _) = t.handle_key(Key::ArrowDown);
         assert_eq!(t.input_value, "typing...");
+    }
+
+    // --- Ctrl-O tools toggle -------------------------------------------------
+    // The machinery-plane twin of the Ctrl-T thinking toggle: a pure display
+    // flip, no effects, swallowed by an open modal.
+
+    #[test]
+    fn tools_start_collapsed() {
+        assert!(!fresh().tools_expanded);
+    }
+
+    #[test]
+    fn toggle_tools_flips_on_and_off_with_no_effects() {
+        let (t, effects) = fresh().handle_key(Key::ToggleTools);
+        assert!(t.tools_expanded);
+        assert_eq!(effects, vec![]);
+
+        let (t, effects) = t.handle_key(Key::ToggleTools);
+        assert!(!t.tools_expanded);
+        assert_eq!(effects, vec![]);
+    }
+
+    #[test]
+    fn modal_swallows_toggle_tools() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let pending_before = t.pending_approval.clone();
+        let (t, effects) = t.handle_key(Key::ToggleTools);
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.pending_approval, pending_before);
+        assert!(!t.tools_expanded);
     }
 
     // --- presentment -------------------------------------------------------
@@ -2654,7 +2994,7 @@ mod tests {
             ..Default::default()
         });
         let t = fold(t, vec![Event::tool_call("t1", "grep", json!({}))]);
-        assert_eq!(items(&t), vec![tool_call("grep", "")]);
+        assert_eq!(items(&t), vec![tool_call("t1", "grep", "")]);
     }
 
     #[test]
@@ -2699,6 +3039,250 @@ mod tests {
             }
             other => panic!("expected info, got {other:?}"),
         }
+    }
+
+    // --- Stage 3: key_arg summaries ----------------------------------------
+
+    #[test]
+    fn key_arg_picks_the_salient_arg_by_tool() {
+        // path for the file tools, command for run_command, pattern/query for
+        // grep/search.
+        assert_eq!(
+            key_arg("read_file", &json!({"path": "src/foo.rs", "start_line": 10})),
+            Some("src/foo.rs".to_string())
+        );
+        assert_eq!(
+            key_arg("run_command", &json!({"command": "cargo test"})),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(
+            key_arg("grep", &json!({"pattern": "TODO", "path": "src"})),
+            Some("TODO".to_string())
+        );
+        assert_eq!(
+            key_arg("search", &json!({"query": "needle"})),
+            Some("needle".to_string())
+        );
+    }
+
+    #[test]
+    fn key_arg_falls_back_to_the_first_sorted_value_and_none_when_empty() {
+        // No named arg for this tool: the first value in sorted key order.
+        assert_eq!(
+            key_arg("mystery_tool", &json!({"zeta": "z", "alpha": "a"})),
+            Some("a".to_string())
+        );
+        // An empty / non-object input has no salient arg.
+        assert_eq!(key_arg("read_file", &json!({})), None);
+        assert_eq!(key_arg("read_file", &json!("not an object")), None);
+    }
+
+    #[test]
+    fn a_live_tool_call_line_reads_name_then_key_arg_not_key_equals_value() {
+        let t = fold(
+            fresh(),
+            vec![Event::tool_call(
+                "t1",
+                "read_file",
+                json!({"path": "src/foo.rs"}),
+            )],
+        );
+        assert_eq!(items(&t), vec![tool_call("t1", "read_file", "src/foo.rs")]);
+    }
+
+    // --- Stage 3: call/result pairing merge --------------------------------
+
+    // The paired call+result collapse to ONE result item carrying the call's
+    // key_arg; the redundant call line is removed and the revision bumps.
+    #[test]
+    fn a_result_merges_with_its_call_removing_the_call_and_bumping_revision() {
+        let t = fold(
+            fresh(),
+            vec![Event::tool_call(
+                "t1",
+                "read_file",
+                json!({"path": "src/foo.rs"}),
+            )],
+        );
+        let rev_after_call = t.messages_revision;
+        assert_eq!(items(&t), vec![tool_call("t1", "read_file", "src/foo.rs")]);
+
+        let t = fold(
+            t,
+            vec![Event::tool_result(
+                "t1",
+                "read_file",
+                "340 lines",
+                false,
+                HashMap::new(),
+            )],
+        );
+        // Call gone, ONE merged result with the recovered key_arg.
+        assert_eq!(
+            items(&t),
+            vec![tool_result_merged("read_file", "340 lines", false, "src/foo.rs")]
+        );
+        // The removal is a non-append edit: revision moved.
+        assert_eq!(t.messages_revision, rev_after_call + 1);
+    }
+
+    // An in-flight call with no result yet renders alone and never bumps.
+    #[test]
+    fn an_in_flight_call_renders_alone_without_bumping_revision() {
+        let t = fold(
+            fresh(),
+            vec![Event::tool_call("t1", "run_command", json!({"command": "ls"}))],
+        );
+        assert_eq!(items(&t), vec![tool_call("t1", "run_command", "ls")]);
+        assert_eq!(t.messages_revision, 0);
+    }
+
+    // Parallel/interleaved ids pair by id, not by position: the second result
+    // matches the first call.
+    #[test]
+    fn parallel_calls_pair_by_id_not_by_position() {
+        let t = fold(
+            fresh(),
+            vec![
+                Event::tool_call("a", "read_file", json!({"path": "a.rs"})),
+                Event::tool_call("b", "read_file", json!({"path": "b.rs"})),
+                // Result for the FIRST call arrives second.
+                Event::tool_result("a", "read_file", "10 lines", false, HashMap::new()),
+            ],
+        );
+        // Call `a` merged away; call `b` still pending; result carries a.rs.
+        assert_eq!(
+            items(&t),
+            vec![
+                tool_call("b", "read_file", "b.rs"),
+                tool_result_merged("read_file", "10 lines", false, "a.rs"),
+            ]
+        );
+    }
+
+    // A result with no live call (governor-injected) removes nothing, does not
+    // bump, and carries no key_arg.
+    #[test]
+    fn an_unpaired_result_does_not_bump_and_has_no_key_arg() {
+        let t = fold(
+            fresh(),
+            vec![Event::tool_result(
+                "orphan",
+                "run_command",
+                "injected",
+                false,
+                HashMap::new(),
+            )],
+        );
+        assert_eq!(
+            items(&t),
+            vec![tool_result_item("run_command", "injected", false)]
+        );
+        assert_eq!(t.messages_revision, 0);
+    }
+
+    // An error result keeps is_error, still removes the call, stamps key_arg,
+    // and bumps.
+    #[test]
+    fn an_error_result_merges_keeping_the_error_flag_and_key_arg() {
+        let t = fold(
+            fresh(),
+            vec![
+                Event::tool_call("t1", "run_command", json!({"command": "cargo test"})),
+                Event::tool_result("t1", "run_command", "boom", true, HashMap::new()),
+            ],
+        );
+        assert_eq!(
+            items(&t),
+            vec![tool_result_merged("run_command", "boom", true, "cargo test")]
+        );
+        assert_eq!(t.messages_revision, 1);
+    }
+
+    // The diff-Block redundancy case: because the paired call is removed, the
+    // Diff plugin's Block (whose title summarizes the call) stands alone.
+    #[test]
+    fn a_diff_block_stands_alone_after_the_paired_call_is_removed() {
+        let t = fresh_opts(TranscriptOpts {
+            plugins: vec![reg("BlockPresenter", Box::new(BlockPresenter))],
+            ..Default::default()
+        });
+        let t = fold(
+            t,
+            vec![Event::tool_call(
+                "t1",
+                "edit_file",
+                json!({"path": "src/x.rs"}),
+            )],
+        );
+        let mut artifacts = HashMap::new();
+        artifacts.insert("diff".to_string(), json!("d"));
+        let t = fold(
+            t,
+            vec![Event::tool_result(
+                "t1",
+                "edit_file",
+                "edited",
+                false,
+                artifacts,
+            )],
+        );
+        // Only the Block remains — the redundant call line is gone.
+        assert_eq!(
+            items(&t),
+            vec![TranscriptItem::Block {
+                title: "diff edit_file".into(),
+                lines: vec![StyledLine::new(LineStyle::Added, "+ new line")],
+            }]
+        );
+        assert_eq!(t.messages_revision, 1);
+    }
+
+    // --- Stage 3: pure-core fold accessors ---------------------------------
+
+    // The predicate and its title travel together in the pure core (S1): a
+    // non-empty Block has both; everything else (empty Block, one-line result)
+    // has neither, so the view never re-implements the fold rule.
+    #[test]
+    fn foldable_body_and_fold_title_agree_on_what_collapses() {
+        let block = TranscriptItem::Block {
+            title: "edit_file x (+1 -1)".into(),
+            lines: vec![StyledLine::new(LineStyle::Added, "+ a")],
+        };
+        assert!(block.foldable_body().is_some());
+        assert_eq!(block.fold_title(), Some("edit_file x (+1 -1)"));
+
+        // An empty Block: no body to fold. (It still HAS a title, but the view
+        // gates on `foldable_body().is_some()`, so it never collapses.)
+        let empty = TranscriptItem::Block {
+            title: "empty".into(),
+            lines: vec![],
+        };
+        assert!(empty.foldable_body().is_none());
+
+        // A merged one-line ToolResult: neither.
+        let result = TranscriptItem::ToolResult {
+            name: "read_file".into(),
+            summary: "340 lines".into(),
+            is_error: false,
+            key_arg: Some("src/foo.rs".into()),
+        };
+        assert!(result.foldable_body().is_none());
+        assert_eq!(result.fold_title(), None);
+    }
+
+    // The single emptiness rule (Nit-1): a salient arg that formats empty yields
+    // None, so the live call line falls back to the full summary rather than a
+    // dangling `name  ` with a blank arg.
+    #[test]
+    fn key_arg_maps_an_empty_formatted_value_to_none() {
+        assert_eq!(key_arg("run_command", &json!({"command": ""})), None);
+        // The live call line then falls back to summarize_input, not a blank arg.
+        let t = fold(
+            fresh(),
+            vec![Event::tool_call("t1", "run_command", json!({"command": ""}))],
+        );
+        assert_eq!(items(&t), vec![tool_call("t1", "run_command", "command=")]);
     }
 
     // --- Prompt history ----------------------------------------------------

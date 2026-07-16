@@ -146,6 +146,26 @@ fn report(output: &str, exit_code: i32) -> String {
     }
 }
 
+/// Recovers the exit code [`report`] owns from a run_command result, or `None`
+/// when the tail is absent (a timeout, or content produced elsewhere). The
+/// inverse of [`report`]: the `[exit code: N]` tail is the single-sourced
+/// contract between here and the run_command plugin's `present`, so the badge is
+/// a semantic fact, not a fragile fold-time parse. Searched from the END so
+/// command output that happens to contain the phrase cannot spoof it.
+pub fn parse_exit_code(content: &str) -> Option<i32> {
+    let last = content.lines().last()?.trim_end();
+    let inner = last.strip_prefix("[exit code: ")?.strip_suffix(']')?;
+    inner.parse().ok()
+}
+
+/// Whether a run_command result is the timeout report [`spawn_and_wait`]
+/// emits (`[command timed out after Nms]`), matched semantically rather than by
+/// substring so ordinary output cannot masquerade as a timeout.
+pub fn parse_timed_out(content: &str) -> bool {
+    let line = content.trim_end();
+    line.starts_with("[command timed out after") && line.ends_with("ms]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +251,34 @@ mod tests {
             run(json!({"command": "sleep 5"}), &c).await,
             Err("[command timed out after 100ms]".into())
         );
+    }
+
+    #[test]
+    fn parse_exit_code_round_trips_report_including_empty_output() {
+        for code in [0, 1, 3, 42, -1, 130] {
+            assert_eq!(parse_exit_code(&report("some output", code)), Some(code));
+            assert_eq!(parse_exit_code(&report("", code)), Some(code));
+            assert_eq!(
+                parse_exit_code(&report("trailing newline\n", code)),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_exit_code_none_when_the_tail_is_absent() {
+        assert_eq!(parse_exit_code("just output, no tail"), None);
+        assert_eq!(parse_exit_code("[command timed out after 100ms]"), None);
+        // A spoof line in the MIDDLE is not the tail, so it is ignored.
+        assert_eq!(parse_exit_code("[exit code: 9]\nreal tail"), None);
+    }
+
+    #[test]
+    fn parse_timed_out_matches_only_the_timeout_report() {
+        assert!(parse_timed_out("[command timed out after 100ms]"));
+        assert!(parse_timed_out("[command timed out after 100ms]\n"));
+        assert!(!parse_timed_out(&report("ok", 0)));
+        assert!(!parse_timed_out("timed out somewhere in the middle"));
     }
 
     #[tokio::test]

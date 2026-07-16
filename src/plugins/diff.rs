@@ -487,6 +487,7 @@ mod tests {
             name: "edit_file".to_string(),
             summary: "edited lib/x.ex".to_string(),
             is_error: false,
+            key_arg: None,
         };
 
         let presented = Diff.present(item, &diff_artifact(|_| {}), &json!({}));
@@ -513,6 +514,7 @@ mod tests {
             name: "write_file".to_string(),
             summary: "created lib/x.ex".to_string(),
             is_error: false,
+            key_arg: None,
         };
 
         let presented = Diff.present(item, &artifacts, &json!({}));
@@ -540,6 +542,7 @@ mod tests {
             name: "write_file".to_string(),
             summary: "created big".to_string(),
             is_error: false,
+            key_arg: None,
         };
 
         let presented = Diff.present(item, &artifacts, &json!({}));
@@ -560,8 +563,10 @@ mod tests {
             name: "edit_file".to_string(),
             summary: "old_str not found".to_string(),
             is_error: true,
+            key_arg: None,
         };
         let call_item = TranscriptItem::ToolCall {
+            id: "t1".to_string(),
             name: "edit_file".to_string(),
             summary: "path=x".to_string(),
         };
@@ -569,6 +574,7 @@ mod tests {
             name: "edit_file".to_string(),
             summary: "edited x".to_string(),
             is_error: false,
+            key_arg: None,
         };
 
         assert_eq!(
