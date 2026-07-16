@@ -11,9 +11,11 @@
 //!   fall back to a monotonic counter so text + tool_use deltas don't collapse
 //!   into one entry; deltas/stops without an index target the last-opened
 //!   block.
-//! - Malformed tool input JSON: marked with the
-//!   [`MALFORMED_INPUT_SENTINEL`] key so the Turn never sends an empty map that
-//!   looks valid. Empty accumulated JSON decodes to `{}`.
+//! - Malformed tool input JSON: tagged so a mangled Tool Call stays
+//!   distinguishable from a valid empty-input call, and vended across the
+//!   boundary as a domain signal via [`malformed_tool_input`] (the wire
+//!   sentinel that carries it stays private). Empty accumulated JSON decodes
+//!   to `{}`.
 //! - Open blocks surviving a truncated or errored stream: their partial text
 //!   is preserved in the final content (the error algebra).
 //! - Thinking blocks: accumulated for the snapshot (UI rendering) and dropped
@@ -27,8 +29,39 @@ use crate::content::{ContentBlock, Usage};
 use crate::llm::response::{Response, StopReason};
 
 /// The sentinel key wrapping raw JSON that failed to parse, so a mangled
-/// tool call stays distinguishable from a valid empty-input call.
-pub const MALFORMED_INPUT_SENTINEL: &str = "__suspenders_malformed_input__";
+/// tool call stays distinguishable from a valid empty-input call. Private to
+/// the boundary: callers read the fact through [`malformed_tool_input`], never
+/// the wire string.
+const MALFORMED_INPUT_SENTINEL: &str = "__suspenders_malformed_input__";
+
+/// The boundary's semantic verdict on a Tool Call's decoded `input`: if the
+/// input JSON never parsed, [`malformed_tool_input`] returns the raw unparsed
+/// text (`Some`); a valid input (including a valid empty map) returns `None`.
+///
+/// This is how the SSE-decoding fact that a tool_use's input was mangled
+/// crosses the LLM boundary as a domain signal. The sentinel string that
+/// carries it on the wire stays private to this module - domain code (the Turn
+/// batch, the tool registry) gates on this accessor without knowing the
+/// wire representation.
+///
+/// ADR-0002: malformation is DATA folded into the content path, so it rides in
+/// the durable `ContentBlock::ToolUse.input` `Value` unchanged and is
+/// interpreted here - never surfaced as an `Err`.
+pub fn malformed_tool_input(input: &Value) -> Option<&str> {
+    // The key's presence is the verdict; its value carries the raw unparsed
+    // text (always a string from the decoder, "" defensively otherwise).
+    input
+        .get(MALFORMED_INPUT_SENTINEL)
+        .map(|raw| raw.as_str().unwrap_or(""))
+}
+
+/// Builds the malformed-input marker `Value` from raw unparsed text - the
+/// counterpart to [`malformed_tool_input`]. The boundary produces these when
+/// input JSON fails to decode; construction stays here so no caller (or test)
+/// spells the wire sentinel itself.
+pub fn malformed_input_marker(raw: &str) -> Value {
+    json!({ MALFORMED_INPUT_SENTINEL: raw })
+}
 
 /// One parsed SSE frame handed to the fold. The transport turns each
 /// `event:`/`data:` frame into a [`SseEvent::Event`]; a framing/JSON failure
@@ -316,7 +349,7 @@ fn decode_tool_input(json: &str) -> Value {
     }
     match serde_json::from_str::<Value>(json) {
         Ok(v) if v.is_object() => v,
-        _ => json!({ MALFORMED_INPUT_SENTINEL: json }),
+        _ => malformed_input_marker(json),
     }
 }
 
@@ -495,9 +528,21 @@ mod tests {
             vec![ContentBlock::tool_use(
                 "t1",
                 "list_files",
-                json!({ MALFORMED_INPUT_SENTINEL: malformed })
+                malformed_input_marker(malformed)
             )]
         );
+        // The boundary vends the fact semantically: the accessor returns the
+        // raw unparsed text, without any caller spelling the wire sentinel.
+        let ContentBlock::ToolUse { input, .. } = &r.content[0] else {
+            panic!("expected tool_use");
+        };
+        assert_eq!(malformed_tool_input(input), Some(malformed));
+    }
+
+    #[test]
+    fn valid_tool_input_is_not_malformed() {
+        assert_eq!(malformed_tool_input(&json!({ "path": "." })), None);
+        assert_eq!(malformed_tool_input(&json!({})), None);
     }
 
     #[test]

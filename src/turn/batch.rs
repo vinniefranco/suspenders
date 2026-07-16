@@ -26,7 +26,7 @@ use crate::approvals;
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::stream::MALFORMED_INPUT_SENTINEL;
+use crate::llm::stream::malformed_tool_input;
 use crate::plan::Update;
 use crate::plugin::Token;
 use crate::plugins;
@@ -157,7 +157,7 @@ fn maybe_store_plan<D: TurnDeps>(
 }
 
 pub(super) fn display_input(input: &Value) -> Value {
-    if input.get(MALFORMED_INPUT_SENTINEL).is_some() {
+    if malformed_tool_input(input).is_some() {
         Value::Object(Default::default())
     } else {
         input.clone()
@@ -174,9 +174,8 @@ async fn run_block<D: TurnDeps>(
     name: &str,
     input: &Value,
 ) -> (String, bool, std::collections::HashMap<String, Value>) {
-    if let Some(raw) = input.get(MALFORMED_INPUT_SENTINEL) {
-        let raw_str = raw.as_str().unwrap_or("");
-        return (voice::malformed_input(raw_str), true, Default::default());
+    if let Some(raw) = malformed_tool_input(input) {
+        return (voice::malformed_input(raw), true, Default::default());
     }
 
     match governor::answer_sent(&state.governors, name, input) {

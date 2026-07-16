@@ -541,7 +541,7 @@ mod tests {
             vec![ContentBlock::tool_use(
                 "t1",
                 "list_files",
-                json!({ stream::MALFORMED_INPUT_SENTINEL: malformed })
+                stream::malformed_input_marker(malformed)
             )]
         );
     }
