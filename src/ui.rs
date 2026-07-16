@@ -438,6 +438,7 @@ fn map_key(key: &KeyEvent) -> Key {
         // Modifier-aware arms come BEFORE the generic Char arm, which would
         // otherwise swallow the keypress as a plain character.
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleThinking,
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleTools,
         // Any other Ctrl chord is a command, never text: since the core now
         // inserts every `Key::Char` into the Composer, letting e.g. Ctrl-X
         // through as Char('x') would type an 'x'.
@@ -609,6 +610,14 @@ mod tests {
     fn ctrl_t_maps_to_toggle_thinking() {
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(map_key(&key), Key::ToggleThinking);
+    }
+
+    // Regression: Ctrl-O must map to ToggleTools, not be swallowed by the
+    // generic Char arm as a plain 'o' - the modifier arms must come first.
+    #[test]
+    fn ctrl_o_maps_to_toggle_tools() {
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(&key), Key::ToggleTools);
     }
 
     #[test]

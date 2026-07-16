@@ -44,6 +44,13 @@ pub struct WaveStats {
     pub dead_mass: f64,
 }
 
+/// The SINGLE rounding rule for a Dead Mass fraction → integer percent, shared
+/// by every surface that shows it (the status bar, the transcript wave line, the
+/// engine's stdout wave print) so they can never disagree. Rounds to nearest.
+pub fn dead_mass_pct(fraction: f64) -> u64 {
+    (fraction * 100.0).round() as u64
+}
+
 impl WaveStats {
     // Did the wave actually rewrite anything? A trigger with nothing
     // reclaimable (all dead already husked, nothing evictable) is not a wave.
@@ -277,6 +284,20 @@ impl Conversation {
     /// walk, eliding down to the low-water mark. Idempotent.
     pub fn evict(&self) -> Conversation {
         self.evict_traced().0
+    }
+
+    /// The CURRENT Dead Mass share (CONTEXT.md: Dead Mass): the tokens the
+    /// dead blocks presently occupy as a fraction of the Context Budget. This is
+    /// the LIVE figure every pass - the same formula [`evict_traced`] snapshots
+    /// PRE-reclaim - so the status bar can advertise dead mass as it stands, not
+    /// the (already-cleared) amount a past wave found. `0.0` when nothing is
+    /// dead.
+    ///
+    /// [`evict_traced`]: Conversation::evict_traced
+    pub fn dead_mass(&self) -> f64 {
+        let dead = supersession::dead_blocks(&self.messages);
+        tokens_for_chars(supersession::dead_chars(&self.messages, &dead)) as f64
+            / self.context_budget.max(1) as f64
     }
 
     /// [`Conversation::evict`], reporting what the wave reclaimed: `None`
@@ -1780,6 +1801,35 @@ mod tests {
             ]
         );
         assert_eq!(evicted.evict(), evicted);
+    }
+
+    #[test]
+    fn dead_mass_is_zero_with_no_dead_blocks_and_positive_with_a_dead_one() {
+        // Only live content (a fresh conversation with one live call): nothing
+        // is dead, so the live fraction is exactly zero.
+        let mut live = Conversation::new("sys", ConversationOpts::new(10_000, 0));
+        live.add_user_text("go");
+        live.add_assistant_blocks(vec![tool_use_input(
+            "t1",
+            "read_file",
+            json!({"path": "a"}),
+        )]);
+        live.add_tool_results(vec![tool_result("t1", "r1")], vec![]);
+        assert_eq!(live.dead_mass(), 0.0);
+
+        // A landed edit whose body is now dead (later reads push it past the
+        // recency guard): the live fraction is positive - the same figure a
+        // wave would find pre-reclaim, but computed WITHOUT rewriting anything.
+        let conv = conv_with_landed_edit(ConversationOpts::new(10_000, 0), &"x".repeat(8_000));
+        assert!(conv.dead_mass() > 0.0);
+    }
+
+    #[test]
+    fn dead_mass_pct_rounds_to_nearest() {
+        assert_eq!(dead_mass_pct(0.128), 13);
+        assert_eq!(dead_mass_pct(0.0), 0);
+        assert_eq!(dead_mass_pct(0.124), 12);
+        assert_eq!(dead_mass_pct(1.0), 100);
     }
 
     #[test]

@@ -138,6 +138,11 @@ pub enum Event {
         token_estimate: u64,
         context_budget: u64,
         max_tokens_reserve: u64,
+        /// The LIVE Dead Mass share (CONTEXT.md: Dead Mass) this pass, as a
+        /// fraction of the Context Budget. Refreshed every pass alongside the
+        /// token estimate, so the status bar shows dead mass as it currently
+        /// stands, not the pre-reclaim snapshot a past wave found.
+        dead_mass: f64,
     },
     /// An Eviction wave fired while shaping a request (CONTEXT.md: Eviction,
     /// Dead Mass): the counts by kind and the Dead Mass share at wave time.
@@ -373,11 +378,13 @@ impl Event {
         token_estimate: u64,
         context_budget: u64,
         max_tokens_reserve: u64,
+        dead_mass: f64,
     ) -> Self {
         Event::ContextPressure {
             token_estimate,
             context_budget,
             max_tokens_reserve,
+            dead_mass,
         }
     }
 

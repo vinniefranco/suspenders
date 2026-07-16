@@ -559,6 +559,7 @@ fn emit_context_pressure<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation
         conversation.token_estimate(),
         conversation.context_budget,
         conversation.max_tokens_reserve,
+        conversation.dead_mass(),
     ));
 }
 
@@ -792,6 +793,7 @@ mod tests {
                     token_estimate,
                     context_budget,
                     max_tokens_reserve,
+                    ..
                 } => Some((*token_estimate, *context_budget, *max_tokens_reserve)),
                 _ => None,
             })

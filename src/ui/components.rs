@@ -109,7 +109,10 @@ pub fn segment_style(kind: SegmentKind) -> Style {
         SegmentKind::Connection | SegmentKind::Model => Style::default()
             .fg(Color::Rgb(150, 160, 185))
             .bg(Color::Rgb(52, 58, 82)),
-        SegmentKind::Thinking => Style::default().fg(Color::DarkGray).bg(SEGMENT_DARK_BG),
+        // Thinking + Tools are the two detail-on-demand toggles, styled alike.
+        SegmentKind::Thinking | SegmentKind::Tools => {
+            Style::default().fg(Color::DarkGray).bg(SEGMENT_DARK_BG)
+        }
         // Tokens keep the single PressureLevel mapping - segment_style only
         // routes to it, it does not restate the colors.
         SegmentKind::Tokens(level) => pressure_style(level),
@@ -436,6 +439,10 @@ pub struct RenderCache {
     /// The Ctrl-T state the settled lines were built with (it changes every
     /// Thinking item's lines, so a flip clears the cache wholesale).
     thinking_expanded: bool,
+    /// The Ctrl-O state the settled lines were built with (it changes every
+    /// multi-line Block's lines, so a flip clears the cache wholesale - the
+    /// same rule as `thinking_expanded`).
+    tools_expanded: bool,
     /// The core's `messages_revision` the entries were built at: while it
     /// holds still, `messages` only appends and the cache extends; when it
     /// moves (a structural edit), the cache rebuilds from scratch.
@@ -469,6 +476,7 @@ impl RenderCache {
         RenderCache {
             width: 0,
             thinking_expanded: false,
+            tools_expanded: false,
             revision: 0,
             items: Vec::new(),
             streaming: None,
@@ -476,12 +484,13 @@ impl RenderCache {
     }
 
     /// Brings the cache up to date with the Transcript at `width`: clears
-    /// wholesale when a key input changed (width, Ctrl-T, a structural
+    /// wholesale when a key input changed (width, Ctrl-T, Ctrl-O, a structural
     /// `messages` edit), then builds entries for the newly appended items
     /// only - the steady-state cost of a frame is zero rebuilt items.
     fn sync(&mut self, t: &Transcript, width: u16) {
         if self.width != width
             || self.thinking_expanded != t.thinking_expanded
+            || self.tools_expanded != t.tools_expanded
             || self.revision != t.messages_revision
             || self.items.len() > t.messages.len()
         {
@@ -489,10 +498,16 @@ impl RenderCache {
             self.streaming = None;
             self.width = width;
             self.thinking_expanded = t.thinking_expanded;
+            self.tools_expanded = t.tools_expanded;
             self.revision = t.messages_revision;
         }
         for item in &t.messages[self.items.len()..] {
-            let lines = message_lines(item, t.thinking_expanded);
+            let mut lines = message_lines(item, t.thinking_expanded, t.tools_expanded);
+            // One trailing blank row per settled item so turns read as
+            // distinct paragraphs rather than one wall. Building it into the
+            // cached lines keeps measurement (`wrapped`) and rendering exactly
+            // consistent - the viewport window math depends on that agreement.
+            lines.push(Line::default());
             let wrapped = wrapped_count(lines.clone(), width);
             self.items.push(CachedItem { lines, wrapped });
         }
@@ -568,12 +583,43 @@ fn visible_window(counts: &[usize], top: usize, height: usize) -> (std::ops::Ran
     (start..end, offset)
 }
 
+/// The backgrounded "machinery" style for tool-call lines: dim DarkGray, NOT
+/// italic (italic stays reserved for Thinking/Info so those remain
+/// distinguishable). Paired with a two-space indent + "⋯" gutter, it makes
+/// tool machinery recede so the conversation owns the foreground.
+fn machinery_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 /// The lines one Transcript item renders as. `Block` is the semantic display
 /// vocabulary (ADR-0008): a titled block whose lines take their color from
 /// [`line_style`]. `thinking_expanded` (Ctrl-T, the core's
 /// `Transcript::thinking_expanded`) picks the collapsed one-liner or the full
-/// text for settled `Thinking` items.
-fn message_lines(item: &TranscriptItem, thinking_expanded: bool) -> Vec<Line<'static>> {
+/// text for settled `Thinking` items; `tools_expanded` (Ctrl-O, the core's
+/// `Transcript::tools_expanded`) does the same for multi-line `Block` bodies -
+/// the same detail-on-demand rule applied to the machinery plane.
+fn message_lines(
+    item: &TranscriptItem,
+    thinking_expanded: bool,
+    tools_expanded: bool,
+) -> Vec<Line<'static>> {
+    // Detail-on-demand collapse (Ctrl-O), keyed on the SEMANTIC fold predicate
+    // (Stage 2 review C2 / S1): any item with a `foldable_body` collapses to its
+    // `fold_title` one-liner, so the fold rule is NOT gated inside a per-variant
+    // match arm - a future non-Block foldable item folds the same way. The
+    // affordance is a fixed `· ^O expand`, NOT a line count: a Block's title
+    // already carries its `(+A −R)` magnitude, and the body is display-capped
+    // upstream, so a raw `lines.len()` would misreport what was elided.
+    if !tools_expanded
+        && item.foldable_body().is_some()
+        && let Some(title) = item.fold_title()
+    {
+        return vec![Line::styled(
+            format!("  ⋯ {title} · ^O expand"),
+            machinery_style(),
+        )];
+    }
+
     match item {
         // User prompts: the "› " gutter on the first row, continuation rows
         // aligned under it. Multi-line input renders as multiple rows.
@@ -617,32 +663,66 @@ fn message_lines(item: &TranscriptItem, thinking_expanded: bool) -> Vec<Line<'st
                 )]
             }
         }
-        TranscriptItem::ToolCall { name, summary } => vec![Line::styled(
-            format!("⚙ {}", join_summary(name, summary)),
-            Style::default().fg(Color::Yellow),
+        // Tool-call machinery recedes into a dim, indented background gutter so
+        // the conversation (assistant prose, user text) owns the foreground:
+        // DarkGray (not italic - italic stays reserved for Thinking/Info), a
+        // two-space indent, and a quiet "⋯" glyph in place of the loud "⚙".
+        TranscriptItem::ToolCall { name, summary, .. } => vec![Line::styled(
+            format!("  ⋯ {}", join_summary(name, summary)),
+            machinery_style(),
         )],
+        // A merged one-liner (Stage 3): a paired call+result reads
+        // `⋯ name  <key_arg> · <result>`; an unpaired result (no live call, so
+        // no arg) keeps the older `⋯ name → result` shape.
         TranscriptItem::ToolResult {
             name,
             summary,
             is_error: false,
+            key_arg,
         } => vec![Line::styled(
-            format!("⚙ {name} → {summary}"),
-            Style::default().fg(Color::Yellow),
+            format!("  ⋯ {}", join_merged(name, key_arg.as_deref(), summary)),
+            machinery_style(),
         )],
+        // Errors are the exception that belongs in the foreground: they keep
+        // red + bold and the ⚙ gutter, share the two-space indent, and ALWAYS
+        // carry a `✗` failed-marker so they can't be missed (the two-planes
+        // design leans on this - red+bold alone is weaker for scanning and
+        // colorblind users). The merged `key_arg` is kept so the failing
+        // path/command stays visible. The one exception: when the `summary`
+        // already begins with a status glyph - a plugin badge like `✗ exit 1`
+        // (or `✓`) - the line injects none of its own, so a badge never doubles
+        // up its glyph.
         TranscriptItem::ToolResult {
             name,
             summary,
             is_error: true,
-        } => vec![Line::styled(
-            format!("⚙ {name} ✗ {summary}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )],
+            key_arg,
+        } => {
+            let glyph = if starts_with_status_glyph(summary) {
+                ""
+            } else {
+                "✗ "
+            };
+            vec![Line::styled(
+                format!("  ⚙ {} {glyph}{summary}", join_arg(name, key_arg.as_deref())),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )]
+        }
+        // A foldable Block reaches here only EXPANDED (Ctrl-O on) or when it has
+        // no foldable body (titleless / empty) - the collapse is handled once at
+        // the top of this fn. Expanded: the title line then the body rows, which
+        // keep their semantic diff colors (added/removed/context) indented under
+        // the gutter.
         TranscriptItem::Block { title, lines } => {
-            let mut out = vec![Line::styled(
-                format!("⚙ {title}"),
-                Style::default().fg(Color::Yellow),
-            )];
-            out.extend(lines.iter().map(block_line));
+            let mut out = vec![Line::styled(format!("  ⋯ {title}"), machinery_style())];
+            // Body rows keep their semantic diff colors (added/removed/context)
+            // but sit indented under the gutter.
+            out.extend(lines.iter().map(|line| {
+                let styled = block_line(line);
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(styled.spans);
+                Line::from(spans)
+            }));
             out
         }
         TranscriptItem::Info { text } => {
@@ -875,6 +955,14 @@ pub enum StatusSegment {
         /// Whether settled Thinking items are currently expanded.
         expanded: bool,
     },
+    /// The Ctrl-O tool-Block-expansion state. Carries the boolean meaning; the
+    /// `▾`/`▸` marker is chosen by the painter. Always assembled - the twin of
+    /// `Thinking` - so the toggle has feedback even when no Blocks are on
+    /// screen.
+    Tools {
+        /// Whether settled tool Blocks are currently expanded.
+        expanded: bool,
+    },
     /// The Context Budget estimate and how close the Conversation sits to it.
     /// Carries the [`PressureLevel`] verbatim so the Critical-renders-red rule
     /// (ADR-0008) is a semantic fact the painter merely routes to a color.
@@ -885,6 +973,12 @@ pub enum StatusSegment {
         budget: u64,
         /// How close to the budget the Conversation sits.
         level: PressureLevel,
+        /// The LIVE Dead Mass share as an integer percent (from the most recent
+        /// ContextPressure), or `None` before any pressure event. When `Some`,
+        /// the segment appends a `· N% dead` tail - pre-rounded upstream (the
+        /// single rounding rule) and baked into `cells()` like every other
+        /// segment fact, never recomputed in the painter.
+        dead_mass_pct: Option<u64>,
     },
     /// The viewport scroll position label (`Bot`/`Top`/`NN%`), already derived
     /// from this frame's geometry by [`scroll_position_label`].
@@ -907,6 +1001,7 @@ impl StatusSegment {
             StatusSegment::Connection { .. } => SegmentKind::Connection,
             StatusSegment::Model { .. } => SegmentKind::Model,
             StatusSegment::Thinking { .. } => SegmentKind::Thinking,
+            StatusSegment::Tools { .. } => SegmentKind::Tools,
             StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
             StatusSegment::Position { .. } => SegmentKind::Position,
         }
@@ -929,18 +1024,37 @@ impl StatusSegment {
             StatusSegment::Model { model } => format!(" model · {model} ").chars().count(),
             // " M thinking " - the marker is one col in either state.
             StatusSegment::Thinking { .. } => " M thinking ".chars().count(),
+            // " M tools " - the marker is one col in either state.
+            StatusSegment::Tools { .. } => " M tools ".chars().count(),
             StatusSegment::Tokens {
-                estimate, budget, ..
-            } => format!(" ~{estimate}tok / {budget} ").chars().count(),
+                estimate,
+                budget,
+                dead_mass_pct,
+                ..
+            } => tokens_label(*estimate, *budget, *dead_mass_pct).chars().count(),
             StatusSegment::Position { label } => format!(" {label} ").chars().count(),
         }
     }
 }
 
+/// The Tokens segment's display text, the ONE source both [`StatusSegment::cells`]
+/// and [`StatusSegment::paint`] draw from so their widths can never drift (the
+/// load-bearing fit invariant). `~{estimate}tok / {budget}` always; a `·
+/// {N}% dead` tail whenever a live Dead Mass share is known (the percent is
+/// pre-rounded upstream through the single rounding rule, so no rounding happens
+/// here). The tail shows even at `Some(0)` - a live zero is the meaningful "no
+/// dead mass" fact, not an absence.
+fn tokens_label(estimate: u64, budget: u64, dead_mass_pct: Option<u64>) -> String {
+    match dead_mass_pct {
+        Some(pct) => format!(" ~{estimate}tok / {budget} · {pct}% dead "),
+        None => format!(" ~{estimate}tok / {budget} "),
+    }
+}
+
 /// The status bar's assembled MEANING: an ordered left group (mode, then
-/// connection) and right group (thinking, tokens, position), already fitted to
-/// the terminal width. Pure and ratatui-free - this is what the new colocated
-/// tests assert against without drawing a frame.
+/// connection) and right group (thinking, tools, tokens, position), already
+/// fitted to the terminal width. Pure and ratatui-free - this is what the new
+/// colocated tests assert against without drawing a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusBar {
     /// Left-anchored segments, highest priority first.
@@ -951,18 +1065,21 @@ pub struct StatusBar {
 
 impl StatusBar {
     /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then model, then thinking, then tokens - mode and position
-    /// survive longest. Connection (the endpoint) drops BEFORE model: the
-    /// endpoint is a fixed, knowable fact, while the model is what the user
-    /// actively changes via `/model`, so the model earns the scarcer columns.
-    /// Which segments to show at a given width is a SEMANTIC decision, so it
-    /// lives here in the pure layer; the width arithmetic reads each segment's
-    /// own [`StatusSegment::cells`]. Simple on purpose: a partially-truncated
+    /// connection, then model, then tools, then thinking, then tokens - mode
+    /// and position survive longest. Connection (the endpoint) drops BEFORE
+    /// model: the endpoint is a fixed, knowable fact, while the model is what
+    /// the user actively changes via `/model`, so the model earns the scarcer
+    /// columns. Tools drops before thinking (both are the same detail-on-demand
+    /// class; thinking is the older, more-referenced affordance). Which
+    /// segments to show at a given width is a SEMANTIC decision, so it lives
+    /// here in the pure layer; the width arithmetic reads each segment's own
+    /// [`StatusSegment::cells`]. Simple on purpose: a partially-truncated
     /// segment would garble the powerline blocks.
     fn fit(mut self, width: usize) -> StatusBar {
-        let drop_order: [fn(&StatusSegment) -> bool; 4] = [
+        let drop_order: [fn(&StatusSegment) -> bool; 5] = [
             |s| matches!(s, StatusSegment::Connection { .. }),
             |s| matches!(s, StatusSegment::Model { .. }),
+            |s| matches!(s, StatusSegment::Tools { .. }),
             |s| matches!(s, StatusSegment::Thinking { .. }),
             |s| matches!(s, StatusSegment::Tokens { .. }),
         ];
@@ -990,6 +1107,22 @@ impl StatusBar {
     }
 }
 
+/// The token facts the status bar's Tokens segment needs: the `estimate` and
+/// `budget` it draws, the [`PressureLevel`] that colors it, and the live
+/// `dead_mass_pct` (an integer percent, pre-rounded through the single rounding
+/// rule) from the most recent ContextPressure (`None` before any pressure
+/// event). A named struct rather than a 4-tuple so the extra Dead Mass fact
+/// rides in cleanly and the `status_bar` arg COUNT stays at 8 (no 9th arg - the
+/// Stage 3 review's binding precondition against growing the already-suppressed
+/// signature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenView {
+    pub estimate: u64,
+    pub budget: u64,
+    pub level: PressureLevel,
+    pub dead_mass_pct: Option<u64>,
+}
+
 /// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
 /// ordered semantic segments the bar conveys, fitted to `width`. `tokens` is
 /// `None` when no Context Budget estimate exists yet. No colors, glyphs, or
@@ -998,13 +1131,20 @@ impl StatusBar {
 /// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
 /// tokens-absent-until-estimate rule) is a semantic fact assertable without a
 /// frame.
+// Each parameter is an independent display FACT the bar renders (status,
+// endpoint, model, the two detail-on-demand toggles, tokens, position); keeping
+// them primitive is exactly what makes the assembly assertable without a
+// Transcript or a frame, so we take the extra argument rather than bundle them
+// into a struct that would only re-hide those facts behind one opaque type.
+#[allow(clippy::too_many_arguments)]
 pub fn status_bar(
     width: usize,
     status: Status,
     base_url: &str,
     model: &str,
     thinking_expanded: bool,
-    tokens: Option<(u64, u64, PressureLevel)>,
+    tools_expanded: bool,
+    tokens: Option<TokenView>,
     position: String,
 ) -> StatusBar {
     let mode = match status {
@@ -1021,14 +1161,26 @@ pub fn status_bar(
         },
     ];
 
-    let mut right = vec![StatusSegment::Thinking {
-        expanded: thinking_expanded,
-    }];
-    if let Some((estimate, budget, level)) = tokens {
+    let mut right = vec![
+        StatusSegment::Thinking {
+            expanded: thinking_expanded,
+        },
+        StatusSegment::Tools {
+            expanded: tools_expanded,
+        },
+    ];
+    if let Some(TokenView {
+        estimate,
+        budget,
+        level,
+        dead_mass_pct,
+    }) = tokens
+    {
         right.push(StatusSegment::Tokens {
             estimate,
             budget,
             level,
+            dead_mass_pct,
         });
     }
     right.push(StatusSegment::Position { label: position });
@@ -1053,6 +1205,10 @@ pub enum SegmentKind {
     /// The Ctrl-T thinking-expansion state (`▾`/`▸`). Always visible so the
     /// toggle has feedback even when no Thinking items are on screen.
     Thinking,
+    /// The Ctrl-O tool-Block-expansion state (`▾`/`▸`). Always visible so the
+    /// toggle has feedback even when no Blocks are on screen - the twin of
+    /// `Thinking`.
+    Tools,
     /// The `~Ntok / budget` estimate, colored by its [`PressureLevel`].
     Tokens(PressureLevel),
     /// The viewport scroll position (`Bot`/`Top`/`NN%`) - the bold accent.
@@ -1079,9 +1235,16 @@ impl StatusSegment {
                 let marker = if *expanded { "▾" } else { "▸" };
                 format!(" {marker} thinking ")
             }
+            StatusSegment::Tools { expanded } => {
+                let marker = if *expanded { "▾" } else { "▸" };
+                format!(" {marker} tools ")
+            }
             StatusSegment::Tokens {
-                estimate, budget, ..
-            } => format!(" ~{estimate}tok / {budget} "),
+                estimate,
+                budget,
+                dead_mass_pct,
+                ..
+            } => tokens_label(*estimate, *budget, *dead_mass_pct),
             StatusSegment::Position { label } => format!(" {label} "),
         }
     }
@@ -1118,8 +1281,14 @@ pub fn render_status_bar(
         conn.base_url,
         conn.model,
         t.thinking_expanded,
+        t.tools_expanded,
         match (t.token_estimate, t.context_budget) {
-            (Some(estimate), Some(budget)) => Some((estimate, budget, t.pressure_level)),
+            (Some(estimate), Some(budget)) => Some(TokenView {
+                estimate,
+                budget,
+                level: t.pressure_level,
+                dead_mass_pct: t.dead_mass_pct,
+            }),
             _ => None,
         },
         position,
@@ -1322,6 +1491,39 @@ fn join_summary(name: &str, summary: &str) -> String {
     }
 }
 
+// Normalizes a `key_arg` for rendering: an absent OR empty arg both read as "no
+// arg". The ONE place the display treats emptiness (the source rule lives in the
+// core's `key_arg`, but a recovered call summary can still be empty), so both
+// join helpers below share it.
+fn present_arg(key_arg: Option<&str>) -> Option<&str> {
+    key_arg.filter(|a| !a.is_empty())
+}
+
+// Whether a Tool Result summary already opens with a status glyph - a plugin
+// badge like `✗ exit 1` or `✓ exit 0`. The error line uses this to avoid
+// doubling the `✗` it otherwise injects.
+fn starts_with_status_glyph(summary: &str) -> bool {
+    summary.starts_with('✗') || summary.starts_with('✓')
+}
+
+// The name plus its merged `key_arg`, if any: `name  arg` (two spaces set the
+// arg off) or bare `name`. Shared by the success and error result lines.
+fn join_arg(name: &str, key_arg: Option<&str>) -> String {
+    match present_arg(key_arg) {
+        Some(arg) => format!("{name}  {arg}"),
+        None => name.to_string(),
+    }
+}
+
+// The merged success one-liner body: `name  arg · result`, dropping to
+// `name → result` when there is no arg (an unpaired result).
+fn join_merged(name: &str, key_arg: Option<&str>, summary: &str) -> String {
+    match present_arg(key_arg) {
+        Some(arg) => format!("{name}  {arg} · {summary}"),
+        None => format!("{name} → {summary}"),
+    }
+}
+
 fn first_line(text: &str) -> &str {
     text.split('\n').next().unwrap_or("")
 }
@@ -1458,7 +1660,13 @@ mod tests {
             "http://localhost:8080",
             "qwen/model",
             false,
-            Some((1200, 32000, PressureLevel::Ok)),
+            false,
+            Some(TokenView {
+                estimate: 1200,
+                budget: 32000,
+                level: PressureLevel::Ok,
+                dead_mass_pct: None,
+            }),
             "Bot".to_string(),
         )
     }
@@ -1485,6 +1693,7 @@ mod tests {
             kinds(&bar.right),
             vec![
                 SegmentKind::Thinking,
+                SegmentKind::Tools,
                 SegmentKind::Tokens(PressureLevel::Ok),
                 SegmentKind::Position,
             ]
@@ -1502,6 +1711,7 @@ mod tests {
             kinds(&bar.right),
             vec![
                 SegmentKind::Thinking,
+                SegmentKind::Tools,
                 SegmentKind::Tokens(PressureLevel::Ok),
                 SegmentKind::Position,
             ]
@@ -1544,6 +1754,7 @@ mod tests {
                 "http://localhost:8080",
                 "qwen/model",
                 expanded,
+                false,
                 None,
                 "Bot".to_string(),
             );
@@ -1569,6 +1780,43 @@ mod tests {
     }
 
     #[test]
+    fn the_tools_segment_carries_the_ctrl_o_state() {
+        // The twin of the thinking segment for the machinery plane: the MEANING
+        // (expanded true/false) is the semantic fact; the ▾/▸ marker is a
+        // drawing detail asserted separately below.
+        let tools = |expanded: bool| {
+            let bar = status_bar(
+                200,
+                Status::Idle,
+                "http://localhost:8080",
+                "qwen/model",
+                false,
+                expanded,
+                None,
+                "Bot".to_string(),
+            );
+            bar.right
+                .into_iter()
+                .find(|s| matches!(s, StatusSegment::Tools { .. }))
+                .expect("tools segment is always assembled")
+        };
+        assert_eq!(tools(true), StatusSegment::Tools { expanded: true });
+        assert_eq!(tools(false), StatusSegment::Tools { expanded: false });
+    }
+
+    #[test]
+    fn the_tools_marker_paints_from_its_state() {
+        assert_eq!(
+            StatusSegment::Tools { expanded: true }.paint(0),
+            " ▾ tools "
+        );
+        assert_eq!(
+            StatusSegment::Tools { expanded: false }.paint(0),
+            " ▸ tools "
+        );
+    }
+
+    #[test]
     fn the_tokens_segment_is_absent_until_an_estimate_exists() {
         let bar = status_bar(
             200,
@@ -1576,12 +1824,17 @@ mod tests {
             "http://localhost:8080",
             "qwen/model",
             false,
+            false,
             None,
             "Bot".to_string(),
         );
         assert_eq!(
             kinds(&bar.right),
-            vec![SegmentKind::Thinking, SegmentKind::Position]
+            vec![
+                SegmentKind::Thinking,
+                SegmentKind::Tools,
+                SegmentKind::Position
+            ]
         );
     }
 
@@ -1596,7 +1849,13 @@ mod tests {
             "u",
             "qwen/model",
             false,
-            Some((99000, 32000, PressureLevel::Critical)),
+            false,
+            Some(TokenView {
+                estimate: 99000,
+                budget: 32000,
+                level: PressureLevel::Critical,
+                dead_mass_pct: None,
+            }),
             "Bot".to_string(),
         );
         let tokens = bar
@@ -1610,6 +1869,7 @@ mod tests {
                 estimate: 99000,
                 budget: 32000,
                 level: PressureLevel::Critical,
+                dead_mass_pct: None,
             }
         );
         assert_eq!(tokens.kind(), SegmentKind::Tokens(PressureLevel::Critical));
@@ -1628,7 +1888,13 @@ mod tests {
                 "u",
                 "qwen/model",
                 false,
-                Some((1, 2, level)),
+                false,
+                Some(TokenView {
+                    estimate: 1,
+                    budget: 2,
+                    level,
+                    dead_mass_pct: None,
+                }),
                 "Bot".to_string(),
             );
             let tokens = bar
@@ -1650,6 +1916,7 @@ mod tests {
                 status,
                 "u",
                 "qwen/model",
+                false,
                 false,
                 None,
                 "Bot".to_string(),
@@ -1685,10 +1952,60 @@ mod tests {
                 estimate: 1200,
                 budget: 32000,
                 level: PressureLevel::Ok,
+                dead_mass_pct: None,
             }
             .paint(0),
             " ~1200tok / 32000 "
         );
+    }
+
+    #[test]
+    fn a_dead_mass_share_appends_a_percent_dead_tail() {
+        // Once a live Dead Mass share is known the Tokens segment grows a `· N%
+        // dead` tail (the integer percent, pre-rounded upstream); `None` paints
+        // the old form. A live `Some(0)` is meaningful - it shows the tail.
+        let with_dead = StatusSegment::Tokens {
+            estimate: 1200,
+            budget: 32000,
+            level: PressureLevel::Ok,
+            dead_mass_pct: Some(12),
+        };
+        assert_eq!(with_dead.paint(0), " ~1200tok / 32000 · 12% dead ");
+
+        let zero = StatusSegment::Tokens {
+            estimate: 1200,
+            budget: 32000,
+            level: PressureLevel::Ok,
+            dead_mass_pct: Some(0),
+        };
+        assert_eq!(zero.paint(0), " ~1200tok / 32000 · 0% dead ");
+
+        let without = StatusSegment::Tokens {
+            estimate: 1200,
+            budget: 32000,
+            level: PressureLevel::Ok,
+            dead_mass_pct: None,
+        };
+        assert_eq!(without.paint(0), " ~1200tok / 32000 ");
+    }
+
+    #[test]
+    fn the_tokens_segment_cells_match_its_paint_with_and_without_dead_mass() {
+        // The load-bearing fit invariant: cells() must equal the painted width
+        // in BOTH forms, or the bar over/underflows once a share lands.
+        for dead_mass_pct in [None, Some(0), Some(12)] {
+            let seg = StatusSegment::Tokens {
+                estimate: 1200,
+                budget: 32000,
+                level: PressureLevel::Ok,
+                dead_mass_pct,
+            };
+            assert_eq!(
+                seg.cells(),
+                seg.paint(0).chars().count(),
+                "{seg:?} cells() disagrees with painted width"
+            );
+        }
     }
 
     #[test]
@@ -1716,6 +2033,7 @@ mod tests {
             SegmentKind::Connection,
             SegmentKind::Model,
             SegmentKind::Thinking,
+            SegmentKind::Tools,
             SegmentKind::Tokens(PressureLevel::Ok),
             SegmentKind::Tokens(PressureLevel::Elevated),
             SegmentKind::Tokens(PressureLevel::Critical),
@@ -1795,7 +2113,8 @@ mod tests {
         let mut cache = RenderCache::new();
         cache.sync(&t, 10);
         assert_eq!(cache.items.len(), 2);
-        assert_eq!(cache.items[1].wrapped, 3);
+        // 3 wrapped rows + 1 trailing inter-turn blank separator.
+        assert_eq!(cache.items[1].wrapped, 4);
     }
 
     #[test]
@@ -1850,9 +2169,11 @@ mod tests {
         });
         let mut cache = RenderCache::new();
         cache.sync(&t, 80);
-        assert_eq!(cache.items[1].wrapped, 1);
+        // 1 content row + 1 trailing inter-turn blank separator.
+        assert_eq!(cache.items[1].wrapped, 2);
+        let wide = cache.items[1].wrapped;
         cache.sync(&t, 10); // resize: every wrapped count is stale
-        assert!(cache.items[1].wrapped > 1);
+        assert!(cache.items[1].wrapped > wide);
     }
 
     #[test]
@@ -1863,10 +2184,226 @@ mod tests {
         });
         let mut cache = RenderCache::new();
         cache.sync(&t, 80);
-        assert_eq!(cache.items[1].lines.len(), 1); // collapsed one-liner
+        // Collapsed one-liner + 1 trailing inter-turn blank separator.
+        assert_eq!(cache.items[1].lines.len(), 2);
         t.thinking_expanded = true;
         cache.sync(&t, 80);
-        assert_eq!(cache.items[1].lines.len(), 3); // header + both rows
+        // Header + both rows + 1 trailing inter-turn blank separator.
+        assert_eq!(cache.items[1].lines.len(), 4);
+    }
+
+    #[test]
+    fn cache_sync_rebuilds_when_the_tools_toggle_flips() {
+        // The Ctrl-O twin of the thinking-toggle test: a multi-line Block folds
+        // to a single title line when collapsed and to the full body when
+        // expanded, and flipping the toggle clears the cache so the change
+        // takes effect. (+1 everywhere for Stage 1's trailing blank separator.)
+        let mut t = fresh_transcript();
+        t.messages.push(TranscriptItem::Block {
+            title: "edit_file src/foo.rs".to_string(),
+            lines: vec![
+                StyledLine::new(LineStyle::Added, "+ added line"),
+                StyledLine::new(LineStyle::Removed, "- removed line"),
+            ],
+        });
+        let mut cache = RenderCache::new();
+        cache.sync(&t, 80);
+        // Collapsed one-liner + 1 trailing inter-turn blank separator.
+        assert_eq!(cache.items[1].lines.len(), 2);
+        assert_eq!(
+            line_text(&cache.items[1].lines[0]),
+            "  ⋯ edit_file src/foo.rs · ^O expand"
+        );
+        t.tools_expanded = true;
+        cache.sync(&t, 80);
+        // Title row + both body rows + 1 trailing inter-turn blank separator.
+        assert_eq!(cache.items[1].lines.len(), 4);
+        assert_eq!(line_text(&cache.items[1].lines[0]), "  ⋯ edit_file src/foo.rs");
+    }
+
+    // --- Stage 3: merged one-liners + semantic fold ------------------------
+
+    #[test]
+    fn a_merged_result_renders_name_arg_dot_result() {
+        let item = TranscriptItem::ToolResult {
+            name: "read_file".to_string(),
+            summary: "340 lines".to_string(),
+            is_error: false,
+            key_arg: Some("src/foo.rs".to_string()),
+        };
+        let lines = message_lines(&item, false, false);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "  ⋯ read_file  src/foo.rs · 340 lines");
+    }
+
+    #[test]
+    fn an_unpaired_result_keeps_the_arrow_shape() {
+        // No key_arg (governor-injected result): the older `name → result` form.
+        let item = TranscriptItem::ToolResult {
+            name: "run_command".to_string(),
+            summary: "injected".to_string(),
+            is_error: false,
+            key_arg: None,
+        };
+        let lines = message_lines(&item, false, false);
+        assert_eq!(line_text(&lines[0]), "  ⋯ run_command → injected");
+    }
+
+    #[test]
+    fn a_failing_merged_result_keeps_the_arg_and_shows_a_single_badge_glyph() {
+        // The summary already carries the plugin badge `✗ exit 1`; the error
+        // line injects no glyph of its own, so there is a SINGLE `✗`, not `✗ ✗`.
+        let item = TranscriptItem::ToolResult {
+            name: "run_command".to_string(),
+            summary: "✗ exit 1".to_string(),
+            is_error: true,
+            key_arg: Some("cargo test".to_string()),
+        };
+        let lines = message_lines(&item, false, false);
+        assert_eq!(line_text(&lines[0]), "  ⚙ run_command  cargo test ✗ exit 1");
+    }
+
+    #[test]
+    fn a_failing_result_without_a_badge_gets_an_injected_error_glyph() {
+        // A tool whose summary carries no glyph (no badge plugin): the line
+        // injects a leading `✗` so the failure is never missed - the ⚙ gutter,
+        // the arg, then `✗ {summary}`, all red+bold.
+        let item = TranscriptItem::ToolResult {
+            name: "edit_file".to_string(),
+            summary: "old_str not found".to_string(),
+            is_error: true,
+            key_arg: Some("src/foo.rs".to_string()),
+        };
+        let lines = message_lines(&item, false, false);
+        assert_eq!(
+            line_text(&lines[0]),
+            "  ⚙ edit_file  src/foo.rs ✗ old_str not found"
+        );
+    }
+
+    #[test]
+    fn a_summary_already_starting_with_a_status_glyph_is_not_doubled() {
+        // Guard the `✓`/`✗` prefix check: a badge that opens with EITHER glyph
+        // suppresses the injected `✗`, so neither doubles up.
+        for badge in ["✗ exit 137", "✓ exit 0"] {
+            let item = TranscriptItem::ToolResult {
+                name: "run_command".to_string(),
+                summary: badge.to_string(),
+                is_error: true,
+                key_arg: None,
+            };
+            let lines = message_lines(&item, false, false);
+            assert_eq!(line_text(&lines[0]), format!("  ⚙ run_command {badge}"));
+        }
+    }
+
+    #[test]
+    fn foldable_body_is_some_only_for_a_non_empty_block() {
+        // A non-empty Block folds under Ctrl-O.
+        let block = TranscriptItem::Block {
+            title: "edit_file x".to_string(),
+            lines: vec![StyledLine::new(LineStyle::Added, "+ a")],
+        };
+        assert!(block.foldable_body().is_some());
+
+        // A one-line merged ToolResult has no body to fold.
+        let result = TranscriptItem::ToolResult {
+            name: "read_file".to_string(),
+            summary: "340 lines".to_string(),
+            is_error: false,
+            key_arg: Some("src/foo.rs".to_string()),
+        };
+        assert!(result.foldable_body().is_none());
+
+        // An empty Block has nothing to fold either.
+        let empty = TranscriptItem::Block {
+            title: "titled but empty".to_string(),
+            lines: vec![],
+        };
+        assert!(empty.foldable_body().is_none());
+    }
+
+    #[test]
+    fn ctrl_o_still_folds_a_diff_block_after_the_merge() {
+        // A merge produces a lone diff Block (the call line removed). Ctrl-O
+        // must still collapse it to its one-line title - the semantic fold
+        // predicate keys on the Block's foldable body, unaffected by the merge.
+        let block = TranscriptItem::Block {
+            title: "edit_file src/foo.rs (+1 -1)".to_string(),
+            lines: vec![
+                StyledLine::new(LineStyle::Added, "+ new"),
+                StyledLine::new(LineStyle::Removed, "- old"),
+            ],
+        };
+        // Collapsed (tools_expanded = false): one title line with the affordance.
+        let collapsed = message_lines(&block, false, false);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            line_text(&collapsed[0]),
+            "  ⋯ edit_file src/foo.rs (+1 -1) · ^O expand"
+        );
+        // Expanded: title + both body rows.
+        let expanded = message_lines(&block, false, true);
+        assert_eq!(expanded.len(), 3);
+    }
+
+    // The Stage 2 review's deferred scroll test: an unpinned viewport stores an
+    // absolute top offset, so flipping Ctrl-O and back - which changes the total
+    // line count while expanded but restores it when collapsed - leaves the
+    // clamped draw-time offset exactly where it was.
+    #[test]
+    fn a_ctrl_o_round_trip_leaves_the_viewport_position_stable() {
+        use crate::ui::viewport::Viewport;
+
+        let mut t = fresh_transcript();
+        // Some prose above the fold, then a tall foldable block so expand/collapse
+        // changes the total wrapped-line count.
+        for i in 0..8 {
+            t.messages.push(TranscriptItem::Info {
+                text: format!("prose line {i}"),
+            });
+        }
+        t.messages.push(TranscriptItem::Block {
+            title: "edit_file big.rs".to_string(),
+            lines: (0..30)
+                .map(|i| StyledLine::new(LineStyle::Added, format!("+ line {i}")))
+                .collect(),
+        });
+
+        let width = 80u16;
+        let height = 10usize;
+
+        let mut cache = RenderCache::new();
+
+        let total_lines = |cache: &mut RenderCache, t: &Transcript| -> usize {
+            cache.sync(t, width);
+            cache.items.iter().map(|i| i.wrapped).sum()
+        };
+
+        // Collapsed: scroll up a few lines to an absolute offset (unpins).
+        let collapsed_total = total_lines(&mut cache, &t);
+        let mut vp = Viewport::new();
+        vp.scroll_up(5, collapsed_total, height);
+        let collapsed_top = vp.top_offset(collapsed_total, height);
+
+        // Expand: the total grows, but the stored absolute offset is stationary.
+        t.tools_expanded = true;
+        let expanded_total = total_lines(&mut cache, &t);
+        assert!(expanded_total > collapsed_total, "expanding adds body rows");
+        let expanded_top = vp.top_offset(expanded_total, height);
+        assert_eq!(
+            expanded_top, collapsed_top,
+            "an unpinned viewport is stationary across the expand"
+        );
+
+        // Collapse again: the total returns, and so does the drawn offset.
+        t.tools_expanded = false;
+        let collapsed_again_total = total_lines(&mut cache, &t);
+        let collapsed_again_top = vp.top_offset(collapsed_again_total, height);
+        assert_eq!(
+            collapsed_top, collapsed_again_top,
+            "a Ctrl-O round trip returns the viewport to the same position"
+        );
     }
 
     #[test]
@@ -1918,11 +2455,11 @@ mod tests {
         for width in [10u16, 24, 80] {
             let per_item: usize = items
                 .iter()
-                .map(|item| wrapped_count(message_lines(item, false), width))
+                .map(|item| wrapped_count(message_lines(item, false, false), width))
                 .sum();
             let whole: Vec<Line> = items
                 .iter()
-                .flat_map(|item| message_lines(item, false))
+                .flat_map(|item| message_lines(item, false, false))
                 .collect();
             assert_eq!(per_item, wrapped_count(whole, width), "width {width}");
         }
