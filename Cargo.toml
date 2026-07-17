@@ -22,6 +22,8 @@ async-trait = "0.1" # only the object-safe `Llm` trait needs this; TurnDeps stay
 
 # markdown → semantic terminal lines (ui::markdown is the pure fold; colors stay in ui::components, ADR-0008)
 pulldown-cmark = { version = "0.12", default-features = false }
+# Human-friendly formatting
+thousands = "0.2.0"
 # code-fence syntax highlighting at render time (ui::components only, ADR-0008);
 # "default-fancy" = pure-Rust fancy-regex engine + bundled syntaxes/themes, no onig C dep
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
