@@ -1,8 +1,8 @@
 //! The Endgame Governor: the mechanical schedule by which a Turn ends at its
 //! Turn Limit (CONTEXT.md: Endgame, Governor; ADR-0015, ADR-0016, ADR-0026).
 //!
-//! * **Trigger**: the Pass position against the Turn Limit - Passes remaining
-//!   - plus the Ledger's unverified-writes fact (a principled cross-read:
+//! * **Trigger**: the Pass position against the Turn Limit - Passes remaining -
+//!   plus the Ledger's unverified-writes fact (a principled cross-read:
 //!   verification state is a Ledger fact, never a sibling Governor's state).
 //! * **Interventions**: uniquely, this Governor speaks at all three moments of
 //!   a Pass - it narrows the offered Tools at the request-shaping moment

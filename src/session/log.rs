@@ -28,8 +28,8 @@
 //!   * `message` - a verbatim Conversation message; seeds a fresh log on Resume
 //!   * `settled{outcome, stop_reason, reason}` - Turn Settlement; `reason` is
 //!     forensic only (the fold ignores it)
-//!   * `compacted{summary, skip_count, tokens_before, file_ops, original_task}`
-//!     - Compaction: old messages replaced by a summary. On Resume the fold
+//!   * `compacted{summary, skip_count, tokens_before, file_ops, original_task}` -
+//!     Compaction: old messages replaced by a summary. On Resume the fold
 //!     discards everything before this entry and emits just the reconstructed
 //!     summary message.
 //!

@@ -10,8 +10,8 @@
 //! * **Interventions**: rides the results tail at the answering moment
 //!   ([`Anchor::due`] answers, the arbiter issues the
 //!   [`Rider::Anchor`](super::Rider::Anchor)). Placement only: an Anchor's
-//!   content is the Plan's - the model's voice, never authored by a Governor
-//!   - and an Anchor is routine, not corrective (it is no Nudge). The one
+//!   content is the Plan's - the model's voice, never authored by a Governor -
+//!   and an Anchor is routine, not corrective (it is no Nudge). The one
 //!   Voice line this Governor adds ([`Anchor::stale_plan`]) rides BELOW the
 //!   Anchor, never inside the Plan's content.
 //! * **Setpoints**: [`Setpoints`] - the placement interval, in Passes

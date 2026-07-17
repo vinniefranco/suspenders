@@ -397,8 +397,8 @@ impl AgentHandle {
     }
 
     /// Lists the models the Active Model's endpoint offers (ADR-0033), by
-    /// asking the Agent - the owner of the `Llm` and the mutable `connection`
-    /// - so the listed endpoint always matches the model the next Turn will
+    /// asking the Agent - the owner of the `Llm` and the mutable `connection` -
+    /// so the listed endpoint always matches the model the next Turn will
     /// call. The Agent fetches off its actor loop; this awaits the reply. A
     /// dead Agent (or a dropped reply) surfaces as `Err`, matching the
     /// boundary's fallible shape.
@@ -1125,7 +1125,14 @@ struct ResumedGovernance {
 fn maybe_resume(
     resume: Option<Resume>,
     session: &Session,
-) -> Result<(Vec<crate::content::Message>, Option<ResumeInfo>, ResumedGovernance), StartError> {
+) -> Result<
+    (
+        Vec<crate::content::Message>,
+        Option<ResumeInfo>,
+        ResumedGovernance,
+    ),
+    StartError,
+> {
     let path = match resume {
         None => return Ok((Vec::new(), None, ResumedGovernance::default())),
         Some(Resume::Path(p)) => p,
@@ -1137,7 +1144,10 @@ fn maybe_resume(
     match log::resume_governed(&path, session) {
         Ok(r) => Ok((
             r.messages,
-            Some(ResumeInfo { path, drift: r.drift }),
+            Some(ResumeInfo {
+                path,
+                drift: r.drift,
+            }),
             ResumedGovernance {
                 plan: r.plan,
                 recoveries_used: r.recoveries,

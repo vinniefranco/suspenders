@@ -304,8 +304,8 @@ pub(super) enum Flow {
     Continue(Conversation),
     Done(Outcome),
     /// A malformed-tool-call generation is re-drawn in-band (ADR-0030): the
-    /// SAME, unmutated Conversation is re-requested without advancing the Pass
-    /// - no batch to answer (no tool_use blocks were produced), so nothing
+    /// SAME, unmutated Conversation is re-requested without advancing the Pass -
+    /// no batch to answer (no tool_use blocks were produced), so nothing
     /// enters the Conversation. The loop's third path beside Continue and Done
     /// (ADR-0018's third fault path: a bounded re-draw beside settle and fail).
     Retry(Conversation),
@@ -691,10 +691,7 @@ mod tests {
         };
         let deps = deps_for(
             &session,
-            vec![
-                Entry::just(two_tool_pass),
-                just(text_end("Done.")),
-            ],
+            vec![Entry::just(two_tool_pass), just(text_end("Done."))],
         );
 
         let (outcome, deps) = run_with(&session, "list twice", deps).await;

@@ -335,8 +335,8 @@ fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
 /// precedence:
 ///
 ///   1. the final-Pass tool-insistence Close (ADR-0015): a reply that still
-///      insists on tools as serialized markup closes on the turn-limit marker
-///      - it outranks every Nudge because no Pass is left to grant; it is a
+///      insists on tools as serialized markup closes on the turn-limit marker -
+///      it outranks every Nudge because no Pass is left to grant; it is a
 ///      Turn-Limit close, so the endgame Governor's recovery judgment applies
 ///      exactly as at [`settle_capped`];
 ///   2. the final-Pass text-settle recovery (ADR-0028 addendum): ADR-0015
@@ -398,7 +398,11 @@ pub fn settle_finish(
 
     if governors.verify.verify_nudge(ledger) {
         governors.verify.note_verify_nudged();
-        return Some(finish_nudge(governors, VoicedTag::VerifyNudge, voice::verify_nudge()));
+        return Some(finish_nudge(
+            governors,
+            VoicedTag::VerifyNudge,
+            voice::verify_nudge(),
+        ));
     }
 
     if empty::is_empty_reply(blocks) && governors.empty.due() {
