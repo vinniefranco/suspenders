@@ -11,9 +11,9 @@ instead of the model, and we want adding a command to be a one-line change so
 Typing `/` in the Composer opens a **menu** of the available commands that
 filters as the user types (pi's command palette), rather than parsing the
 command only on submit. The menu, its filtering, cursor movement, selection,
-and unknown-command handling all live in the **pure `Transcript`** (ADR-0001's
-TEA core), where every other Composer rule already lives and is unit-tested -
-no crossterm, no I/O.
+and unknown-command handling all live in the **pure Composer** (`ui::composer`,
+ADR-0034's module inside ADR-0001's TEA core), where every other Composer rule
+already lives and is unit-tested - no crossterm, no I/O.
 
 **A `&'static` registry of command descriptors** is the extension seam. A
 descriptor is just `{ name, help, produce-an-Effect }`. The pure core looks a
@@ -46,8 +46,9 @@ Transcript info line, never a Turn.
   per-command help.
 - **Handle commands in the `ui.rs` adapter** - rejected: parsing and menu state
   would then be untested-by-design (ADR-0001 splits the pure core from the
-  adapter). Keeping recognition in `Transcript` keeps it unit-tested; only the
-  side-effecting work crosses into the adapter, through an `Effect`.
+  adapter). Keeping recognition in the Composer (ADR-0034) keeps it
+  unit-tested; only the side-effecting work crosses into the adapter, through
+  an `Effect`.
 - **A per-command bespoke UI** - rejected: `/model` and `/theme` are both
   "filter a list, pick one." One generic selector means the second command is a
   descriptor plus an Effect arm, not a new widget.

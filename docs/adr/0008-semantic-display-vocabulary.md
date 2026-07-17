@@ -1,11 +1,11 @@
 # Presentment speaks a semantic display vocabulary, not raw markup
 
 A Plugin's Presentment callback (ADR-0007) needs to show rich output - a diff,
-not a one-line summary - without breaking ADR-0001's boundary: the Transcript
-is a pure semantic core and terminal markup exists only in the adapter. So the
-core defines one structured Transcript item type - a titled block of lines
-with semantic styles (added, removed, context, emphasis, muted) - and Plugins
-compose within it. One module owns the single mapping from semantic styles to
+not a one-line summary - without breaking ADR-0001's boundary: the Screen core
+(and the Transcript store it owns, ADR-0034) is pure and semantic, and
+terminal markup exists only in the adapter. So the core defines one structured
+Transcript item type - a titled block of lines with semantic styles (added,
+removed, context, emphasis, muted) - and Plugins compose within it. One module owns the single mapping from semantic styles to
 terminal colors, the same move as the Steering Vocabulary: one module owns the
 mapping, everyone else speaks semantics.
 

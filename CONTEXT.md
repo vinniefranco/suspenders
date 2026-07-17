@@ -69,9 +69,13 @@ _Avoid_: reasoning content, chain of thought
 The display-side history of a Session - everything the user saw, in order: user prompts, assistant text, collapsed Thinking, Tool Call and Tool Result summaries, and info lines. Not the Conversation: Thinking and info lines live in the Transcript but never in the Conversation.
 _Avoid_: message list, chat log
 
+**Screen**:
+The pure UI core - the fold root owning everything the terminal shows: the Transcript, the Composer, the Approval modal, and the status-bar figures. Folds keys and Session events into new state plus effects; the adapter executes the effects and draws. Keys route through it in a fixed order: the Approval gate first, then the Composer's first refusal, then the Screen's own arms. Display-side only: nothing in the Screen enters the Conversation.
+_Avoid_: Transcript (that's the display history the Screen owns, not the whole core), UI state (too vague), model (TEA jargon; the domain names the thing)
+
 **Composer**:
-The input area of the TUI where the user authors the next prompt. A leading `/` opens the Slash Command menu; otherwise a submitted draft starts a Turn when the Agent is idle or becomes Steering when a Turn is running. Display-side only: its draft is never part of the Conversation until submitted.
-_Avoid_: input line (it is not a line; drafts may span many), prompt (that's what a submitted draft becomes)
+The input area of the TUI where the user authors the next prompt. A leading `/` opens the Slash Command menu; a committed selector-opening command shows its value list in its place. Both overlays are Composer states - the draft filters them, backspacing out of one re-enters the other, and Escape empties the Composer - not modals: only an Approval takes keys away from the Composer. Otherwise a submitted draft starts a Turn when the Agent is idle or becomes Steering when a Turn is running. Display-side only: its draft is never part of the Conversation until submitted.
+_Avoid_: input line (it is not a line; drafts may span many), prompt (that's what a submitted draft becomes), selector modal (the selector is a Composer overlay; the Approval modal is the only modal)
 
 **Slash Command**:
 A directive the user invokes from the Composer, never sent to the model. Typing `/` opens a menu of the available commands that filters as the user types; selecting one runs it. Always available whatever the Agent is doing - a running Turn never suppresses the menu, though a command's effect may land at a Turn boundary (a model change applies to the next Turn). Distinct from a prompt (which starts a Turn) and from Steering (mid-Turn user text that joins the Conversation unadorned): a Slash Command enters neither the Conversation nor the Transcript as user text; it drives the harness or the Session (e.g. choosing the model), and the Transcript may show its outcome as an info line. The set of commands is open - adding one is routine.

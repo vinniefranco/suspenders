@@ -83,6 +83,8 @@ belongs where it already sits.
 - The `ui/components` file stays large because drawing is genuinely there;
   its size is not itself a deepening signal. The pure semantics were already
   lifted out; what remains is the adapter ADR-0019 confines to this module.
-- This ADR does not forbid splitting `ui/transcript` (streaming, prompt
-  history): those ARE pure, ratatui-free, and materialize into
-  `TranscriptItem`s - they clear the deletion test the render pipeline fails.
+- This ADR does not forbid splitting the pure core (streaming, prompt
+  history) - and ADR-0034 since has: streaming is the Transcript store's
+  private child and the prompt-history ring lives in `ui/composer`. Those ARE
+  pure, ratatui-free, and materialize into `TranscriptItem`s - they clear the
+  deletion test the render pipeline fails.

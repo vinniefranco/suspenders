@@ -9,7 +9,7 @@
 //! cursor (`None`) or resolves the picker with a [`PickerOutcome`].
 
 use crate::session::log::SessionEntry;
-use crate::ui::transcript::Key;
+use crate::ui::screen::Key;
 
 /// The picker's whole state: the rows and the highlighted index.
 #[derive(Debug, Clone, PartialEq, Eq)]

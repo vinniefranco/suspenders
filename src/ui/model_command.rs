@@ -16,7 +16,7 @@ use crate::session::{SessionConfig, SessionError};
 use crate::ui::AdapterCtx;
 use crate::ui::selector::SelectorRow;
 
-use super::transcript::Transcript;
+use super::screen::Screen;
 
 /// The Transcript info line an applied `/model` pick emits (ADR-0033). Pure
 /// message construction over the two facts the impure orchestration gathered -
@@ -62,7 +62,7 @@ fn model_rows(ids: Vec<String>, current: &str) -> Vec<SelectorRow> {
 /// SelectorReady, on failure SelectorFailed - through `ctx.selector_tx`; the
 /// injected event arrives at the loop's `selector_rx` arm and flips the Loading
 /// overlay. The overlay stays Loading until it arrives.
-pub(super) async fn run(transcript: Transcript, ctx: &AdapterCtx<'_>) -> Transcript {
+pub(super) async fn run(screen: Screen, ctx: &AdapterCtx<'_>) -> Screen {
     let current = ctx.agent.active_model().await;
     let agent = ctx.agent.clone();
     let tx = ctx.selector_tx.clone();
@@ -73,29 +73,25 @@ pub(super) async fn run(transcript: Transcript, ctx: &AdapterCtx<'_>) -> Transcr
         };
         let _ = tx.send(event);
     });
-    transcript
+    screen
 }
 
 /// Interprets a `/model` pick (ADR-0033). Re-selecting the current model is a
-/// no-op - return the Transcript untouched, no side effects. Otherwise this
+/// no-op - return the Screen untouched, no side effects. Otherwise this
 /// impure part does the I/O - swap the Active Model live, persist it by the
 /// sparse config write, read `SUSPENDERS_MODEL` - then hands those facts to the
 /// pure [`applied_line`] for the info line. A persist failure is surfaced but
 /// the live swap still stands.
-pub(super) async fn choose(
-    transcript: Transcript,
-    ctx: &AdapterCtx<'_>,
-    value: String,
-) -> Transcript {
+pub(super) async fn choose(screen: Screen, ctx: &AdapterCtx<'_>, value: String) -> Screen {
     // Re-selecting the current model changes nothing (no swap, no write, no
     // warning - ADR-0033).
     if value == ctx.agent.active_model().await {
-        return transcript;
+        return screen;
     }
     ctx.agent.set_model(value.clone()).await;
     let persist = SessionConfig::persist_model(&ctx.config_path, &value);
     let env_shadowed = std::env::var("SUSPENDERS_MODEL").is_ok();
-    transcript.info(applied_line(&value, env_shadowed, &persist))
+    screen.info(applied_line(&value, env_shadowed, &persist))
 }
 
 #[cfg(test)]

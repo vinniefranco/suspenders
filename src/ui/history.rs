@@ -15,14 +15,17 @@
 //! No terminal, no async, no IO (ADR-0019): the caller passes its live draft
 //! text in and gets back the text to place in the composer, or `None` for a
 //! no-op (empty ring, or already at an end). The History struct mints no
-//! effects; the Transcript owns those.
+//! effects; the Composer owns those - its `submitted_ok` pairs this ring's
+//! record with the on-disk `HistoryAppend`.
 
 /// The in-memory prompt-history ring cap.
 const MAX_HISTORY: usize = 100;
 
 /// The prompt-history ring: submitted prompts (oldest first), the recall cursor
 /// (`None` when parked in the live draft), and the draft stashed on first Up.
-#[derive(Debug, Clone)]
+/// `PartialEq` serves the Composer's refusal contract: a refused key must
+/// leave the whole Composer - this ring and its stash included - bit-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct History {
     entries: Vec<String>,
     idx: Option<usize>,

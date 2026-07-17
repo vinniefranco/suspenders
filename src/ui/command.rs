@@ -1,7 +1,7 @@
 //! The adapter-side Slash Command router - the SINGLE seam a committed command
 //! name crosses to reach its adapter work (ADR-0032/0033). The pure core emits
-//! a command-agnostic [`Effect::Command`](crate::ui::transcript::Effect::Command)
-//! (and [`SelectorChosen`](crate::ui::transcript::Effect::SelectorChosen)); this
+//! a command-agnostic [`Effect::Command`](crate::ui::screen::Effect::Command)
+//! (and [`SelectorChosen`](crate::ui::screen::Effect::SelectorChosen)); this
 //! module classifies the opaque name and routes it to the owning module (today
 //! only [`super::model_command`]).
 //!
@@ -19,7 +19,7 @@
 use crate::ui::AdapterCtx;
 
 use super::model_command;
-use super::transcript::Transcript;
+use super::screen::Screen;
 
 /// The Slash Commands the adapter knows how to run (today: just [`Handled::Model`]).
 /// Not named `Command` - that collides with [`crate::agent::Command`].
@@ -49,10 +49,10 @@ pub fn is_handled(name: &str) -> bool {
 /// unrecognized name is a visible no-op-with-info-line, not a silent drop. The
 /// [`Handled`] match is exhaustive, so a new command is a compile error here
 /// until it is handled.
-pub(super) async fn run(transcript: Transcript, ctx: &AdapterCtx<'_>, name: &str) -> Transcript {
+pub(super) async fn run(screen: Screen, ctx: &AdapterCtx<'_>, name: &str) -> Screen {
     match handled(name) {
-        Some(Handled::Model) => model_command::run(transcript, ctx).await,
-        None => transcript.info(format!("/{name}: no handler")),
+        Some(Handled::Model) => model_command::run(screen, ctx).await,
+        None => screen.info(format!("/{name}: no handler")),
     }
 }
 
@@ -60,14 +60,14 @@ pub(super) async fn run(transcript: Transcript, ctx: &AdapterCtx<'_>, name: &str
 /// (ADR-0033). Mirrors [`run`]'s exhaustiveness and unrecognized-name coverage:
 /// an unknown command is a visible info line, never a dropped selection.
 pub(super) async fn choose(
-    transcript: Transcript,
+    screen: Screen,
     ctx: &AdapterCtx<'_>,
     command: &str,
     value: String,
-) -> Transcript {
+) -> Screen {
     match handled(command) {
-        Some(Handled::Model) => model_command::choose(transcript, ctx, value).await,
-        None => transcript.info(format!("/{command}: no handler")),
+        Some(Handled::Model) => model_command::choose(screen, ctx, value).await,
+        None => screen.info(format!("/{command}: no handler")),
     }
 }
 

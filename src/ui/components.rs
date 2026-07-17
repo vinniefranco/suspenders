@@ -4,7 +4,7 @@
 //!
 //! This is the one place semantics become terminal colors: [`LineStyle`] →
 //! color for a Block's lines, [`PressureLevel`] → color/emphasis for the status
-//! bar. Plugins and the Transcript core never touch ratatui; they speak the
+//! bar. Plugins and the Screen core never touch ratatui; they speak the
 //! vocabulary and this module renders it. Everything here is pure presentation
 //! of [`TranscriptItem`]s - no state, no IO. Only this module and [`crate::ui`]
 //! `use ratatui` / `use crossterm` (ADR-0019 invariant).
@@ -24,14 +24,12 @@ use syntect::parsing::SyntaxSet;
 
 use thousands::Separable;
 
-use crate::ui::composer::{self, ComposerLayout};
+use crate::ui::composer::{self, ComposerLayout, OverlayStatus, OverlayView};
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
+use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::selector::SelectorRow;
-use crate::ui::transcript::{
-    LineStyle, PressureLevel, SelectorStatus, SlashView, Status, StyledLine, Transcript,
-    TranscriptItem,
-};
+use crate::ui::transcript::{LineStyle, StyledLine, Transcript, TranscriptItem};
 use crate::ui::viewport::Viewport;
 
 // ---------------------------------------------------------------------------
@@ -131,7 +129,7 @@ fn segment_bg(kind: SegmentKind) -> Color {
 // ---------------------------------------------------------------------------
 
 /// The two connection facts the status bar shows (ADR-0033): the fixed endpoint
-/// and the mutable Active Model. Both are adapter-carried - the pure Transcript
+/// and the mutable Active Model. Both are adapter-carried - the pure Screen
 /// core stays command-agnostic and holds neither. The adapter OWNS them as a
 /// [`ConnectionFacts`]; this is the borrowed form the render path takes, so
 /// both elements are always name-addressed, never a position-coupled pair.
@@ -179,16 +177,19 @@ impl ConnectionFacts {
 /// minus the 2-cell gutter), so the measured cursor cell is the drawn one.
 pub fn render(
     frame: &mut Frame,
-    t: &Transcript,
+    t: &Screen,
     conn: ConnectionView,
     spinner: u64,
     viewport: &Viewport,
     cache: &mut RenderCache,
 ) -> (usize, usize) {
     let area = frame.area();
+    // The Composer's one render window (ADR-0034): the draft, the char-index
+    // cursor, and the open overlay, read together.
+    let composer_view = t.composer().view();
     let layout = composer::layout(
-        &t.input_value,
-        t.input_cursor,
+        composer_view.draft,
+        composer_view.cursor,
         area.width.saturating_sub(2) as usize,
     );
     let composer_height = layout
@@ -211,11 +212,11 @@ pub fn render(
     render_status_bar(frame, chunks[1], t, conn, spinner, viewport, geometry);
     render_composer(frame, chunks[2], t, &layout);
 
-    // The Slash Command popup (ADR-0032/0033) floats just above the status bar +
-    // Composer - an inline overlay, not a full-screen modal. Drawn after the
-    // Composer so it sits on top; skipped entirely when no slash draft is open.
-    if let Some(view) = t.slash_view() {
-        render_slash_popup(frame, chunks[1].y, area, &view);
+    // The Composer overlay (ADR-0032/0033) floats just above the status bar +
+    // Composer - an inline popup, a Composer state, not a modal. Drawn after
+    // the Composer so it sits on top; skipped entirely when none is open.
+    if let Some(overlay) = composer_view.overlay {
+        render_composer_popup(frame, chunks[1].y, area, &overlay);
     }
 
     if let Some(pending) = &t.pending_approval {
@@ -224,22 +225,23 @@ pub fn render(
     geometry
 }
 
-/// The inline Slash Command popup (ADR-0032/0033): a compact bordered list
+/// The inline Composer overlay popup (ADR-0032/0033): a compact bordered list
 /// anchored just above `anchor_y` (the status bar's row), listing the current
-/// [`SlashView`]'s rows with the highlighted one reversed and any hint dimmed.
-/// The `Selector`'s `Loading`/`Failed` states draw a single status line instead
-/// of rows. Inline and height-bounded - never the full screen.
-fn render_slash_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &SlashView) {
+/// [`OverlayView`]'s rows with the highlighted one reversed and any hint
+/// dimmed. The `Selector`'s `Loading`/`Failed` states draw a single status
+/// line instead of rows. Inline and height-bounded - never the full screen:
+/// the overlay is a Composer state, not a modal.
+fn render_composer_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &OverlayView) {
     // The lines the popup body holds, plus the title.
     let (title, lines): (&str, Vec<Line>) = match view {
-        SlashView::Menu { rows, highlight } => ("commands", popup_rows(rows, *highlight)),
-        SlashView::Selector {
+        OverlayView::Menu { rows, highlight } => ("commands", popup_rows(rows, *highlight)),
+        OverlayView::Selector {
             status,
             rows,
             highlight,
             ..
         } => match status {
-            SelectorStatus::Loading => (
+            OverlayStatus::Loading => (
                 "models",
                 vec![Line::styled(
                     "loading models…",
@@ -248,14 +250,14 @@ fn render_slash_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Slash
                         .add_modifier(Modifier::ITALIC),
                 )],
             ),
-            SelectorStatus::Failed(msg) => (
+            OverlayStatus::Failed(msg) => (
                 "models",
                 vec![Line::styled(
                     format!("failed: {msg}"),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )],
             ),
-            SelectorStatus::Ready(_) => ("models", popup_rows(rows, *highlight)),
+            OverlayStatus::Ready => ("models", popup_rows(rows, *highlight)),
         },
     };
 
@@ -284,8 +286,8 @@ fn render_slash_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Slash
     // Scroll the highlighted row into view when the list overflows the box.
     let visible = inner.height as usize;
     let highlight = match view {
-        SlashView::Menu { highlight, .. } => *highlight,
-        SlashView::Selector { highlight, .. } => *highlight,
+        OverlayView::Menu { highlight, .. } => *highlight,
+        OverlayView::Selector { highlight, .. } => *highlight,
     };
     let top = composer::first_visible_row(highlight, visible.max(1));
     let shown: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
@@ -346,7 +348,7 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
 pub fn render_viewport(
     frame: &mut Frame,
     area: Rect,
-    t: &Transcript,
+    t: &Screen,
     viewport: &Viewport,
     cache: &mut RenderCache,
 ) -> (usize, usize) {
@@ -357,17 +359,27 @@ pub fn render_viewport(
         width: area.width.saturating_sub(1),
         ..area
     };
-    cache.sync(t, text_area.width);
+    cache.sync(
+        t.transcript(),
+        Toggles {
+            thinking_expanded: t.thinking_expanded,
+            tools_expanded: t.tools_expanded,
+        },
+        text_area.width,
+    );
 
     // The live streaming snapshot renders below the settled items: the
     // one-line thinking indicator (rebuilt each frame - one Line is cheap)
     // and the streaming markdown (cached - see [`RenderCache::sync`]).
-    let thinking = t.streaming_thinking();
+    let thinking = t.transcript().streaming_thinking();
     let thinking_lines: Vec<Line<'static>> = if thinking.is_empty() {
         vec![]
     } else {
         vec![Line::styled(
-            format!("🧠 thinking… (~{} tokens)", crate::conversation::tokens_for_chars(thinking.chars().count() as u64)),
+            format!(
+                "🧠 thinking… (~{} tokens)",
+                crate::conversation::tokens_for_chars(thinking.chars().count() as u64)
+            ),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -427,10 +439,21 @@ pub fn render_viewport(
 // highlight) and re-wrapping the whole session on EVERY frame pegged a core
 // while scrolling and made typing expensive - each keystroke only changes the
 // Composer, each wheel tick only a scroll offset. Settled items never change
-// content (the pure core only appends, and bumps `messages_revision` on its
-// one structural edit), so their lines and wrapped counts are built once and
-// reused; the frame then renders only the items intersecting the window.
+// content under an unchanged `Transcript::revision` (the store's contract:
+// appends never bump, structural edits always do), so their lines and wrapped
+// counts are built once and reused; the frame then renders only the items
+// intersecting the window.
 // ---------------------------------------------------------------------------
+
+/// The two detail-on-demand display toggles the settled lines are built with:
+/// Ctrl-T (Thinking) and Ctrl-O (tool Blocks). Carried as named fields - never
+/// a position-coupled pair of bools, the same rule as [`ConnectionFacts`] -
+/// because two adjacent `bool` parameters swap without a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Toggles {
+    thinking_expanded: bool,
+    tools_expanded: bool,
+}
 
 /// Per-item render state for the transcript viewport, owned by the adapter's
 /// run loop and threaded through [`render`]. Holds ratatui [`Line`]s, so it
@@ -438,18 +461,15 @@ pub fn render_viewport(
 pub struct RenderCache {
     /// The text width everything below was built/measured at.
     width: u16,
-    /// The Ctrl-T state the settled lines were built with (it changes every
-    /// Thinking item's lines, so a flip clears the cache wholesale).
-    thinking_expanded: bool,
-    /// The Ctrl-O state the settled lines were built with (it changes every
-    /// multi-line Block's lines, so a flip clears the cache wholesale - the
-    /// same rule as `thinking_expanded`).
-    tools_expanded: bool,
-    /// The core's `messages_revision` the entries were built at: while it
-    /// holds still, `messages` only appends and the cache extends; when it
-    /// moves (a structural edit), the cache rebuilds from scratch.
+    /// The [`Toggles`] the settled lines were built with (either flip changes
+    /// every affected item's lines, so it clears the cache wholesale).
+    toggles: Toggles,
+    /// The store's [`Transcript::revision`] the entries were built at: while
+    /// it holds still, the settled items only extend (the store's prefix
+    /// contract) and the cache extends with them; when it moves (a structural
+    /// edit), the cache rebuilds from scratch.
     revision: u64,
-    /// One entry per settled `Transcript::messages` item, same order.
+    /// One entry per settled [`Transcript::items`] item, same order.
     items: Vec<CachedItem>,
     /// The in-flight streaming markdown, keyed on its char length: within one
     /// message the snapshot only grows, so the length is a cheap monotonic
@@ -477,8 +497,7 @@ impl RenderCache {
     pub fn new() -> Self {
         RenderCache {
             width: 0,
-            thinking_expanded: false,
-            tools_expanded: false,
+            toggles: Toggles::default(),
             revision: 0,
             items: Vec::new(),
             streaming: None,
@@ -486,25 +505,26 @@ impl RenderCache {
     }
 
     /// Brings the cache up to date with the Transcript at `width`: clears
-    /// wholesale when a key input changed (width, Ctrl-T, Ctrl-O, a structural
-    /// `messages` edit), then builds entries for the newly appended items
-    /// only - the steady-state cost of a frame is zero rebuilt items.
-    fn sync(&mut self, t: &Transcript, width: u16) {
+    /// wholesale when a key input changed (width, a [`Toggles`] flip, a
+    /// structural edit that moved the store's revision), then builds entries
+    /// for the newly appended items only - the steady-state cost of a frame is
+    /// zero rebuilt items. The extend-only fast path is safe because the store
+    /// guarantees the settled items are a PREFIX of the last read while the
+    /// revision holds still; the length check is cheap defense in kind.
+    fn sync(&mut self, t: &Transcript, toggles: Toggles, width: u16) {
         if self.width != width
-            || self.thinking_expanded != t.thinking_expanded
-            || self.tools_expanded != t.tools_expanded
-            || self.revision != t.messages_revision
-            || self.items.len() > t.messages.len()
+            || self.toggles != toggles
+            || self.revision != t.revision()
+            || self.items.len() > t.items().len()
         {
             self.items.clear();
             self.streaming = None;
             self.width = width;
-            self.thinking_expanded = t.thinking_expanded;
-            self.tools_expanded = t.tools_expanded;
-            self.revision = t.messages_revision;
+            self.toggles = toggles;
+            self.revision = t.revision();
         }
-        for item in &t.messages[self.items.len()..] {
-            let mut lines = message_lines(item, t.thinking_expanded, t.tools_expanded);
+        for item in &t.items()[self.items.len()..] {
+            let mut lines = message_lines(item, toggles.thinking_expanded, toggles.tools_expanded);
             // One trailing blank row per settled item so turns read as
             // distinct paragraphs rather than one wall. Building it into the
             // cached lines keeps measurement (`wrapped`) and rendering exactly
@@ -706,7 +726,10 @@ fn message_lines(
                 "✗ "
             };
             vec![Line::styled(
-                format!("  ⚙ {} {glyph}{summary}", join_arg(name, key_arg.as_deref())),
+                format!(
+                    "  ⚙ {} {glyph}{summary}",
+                    join_arg(name, key_arg.as_deref())
+                ),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )]
         }
@@ -1259,7 +1282,7 @@ impl StatusSegment {
 pub fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
-    t: &Transcript,
+    t: &Screen,
     conn: ConnectionView,
     spinner: u64,
     viewport: &Viewport,
@@ -1348,7 +1371,7 @@ fn scroll_position_label(top: usize, total_lines: usize, height: usize) -> Strin
 /// the bottom like a terminal. The REAL terminal cursor is placed at the
 /// cursor's cell - except while the Approval modal owns the keyboard, when a
 /// blinking composer cursor would misstate where keys go.
-pub fn render_composer(frame: &mut Frame, area: Rect, t: &Transcript, layout: &ComposerLayout) {
+pub fn render_composer(frame: &mut Frame, area: Rect, t: &Screen, layout: &ComposerLayout) {
     let visible = area.height as usize;
     if visible == 0 || area.width < 2 {
         return;
@@ -1381,7 +1404,7 @@ pub fn render_composer(frame: &mut Frame, area: Rect, t: &Transcript, layout: &C
 }
 
 /// The Approval modal for a run_command Tool Call: `y` approves, `n` denies,
-/// `a` approves-always. Key handling lives in the Transcript core; this draws it.
+/// `a` approves-always. Key handling lives in the Screen core; this draws it.
 pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str) {
     let width = (command.chars().count() as u16 + 8)
         .max(44)
@@ -2073,106 +2096,101 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The render cache (sync + the streaming tail's monotonic key).
+    //
+    // The cache syncs against the Transcript STORE (ADR-0034): tests seed a
+    // bare store through its verbs - the items Vec is not reachable, which is
+    // the point (the extend-vs-rebuild contract is the store's revision).
     // -----------------------------------------------------------------------
-
-    use crate::ui::transcript::TranscriptOpts;
 
     fn line_text(line: &Line<'static>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     fn fresh_transcript() -> Transcript {
-        Transcript::new(TranscriptOpts::default())
+        Transcript::new(Vec::new())
     }
 
     #[test]
     fn cache_sync_builds_one_entry_per_settled_item_with_its_wrapped_count() {
         let mut t = fresh_transcript();
-        t.messages.push(TranscriptItem::User {
-            // At width 10 the word-wrapper puts the unbreakable 16-char word
-            // below the "› " gutter row and splits it: 3 rows.
-            text: "0123456789012345".to_string(),
-        });
+        // At width 10 the word-wrapper puts the unbreakable 16-char word
+        // below the "› " gutter row and splits it: 3 rows.
+        t.user("0123456789012345");
         let mut cache = RenderCache::new();
-        cache.sync(&t, 10);
-        assert_eq!(cache.items.len(), 2);
+        cache.sync(&t, Toggles::default(), 10);
+        assert_eq!(cache.items.len(), 1);
         // 3 wrapped rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[1].wrapped, 4);
+        assert_eq!(cache.items[0].wrapped, 4);
     }
 
     #[test]
     fn cache_sync_extends_for_appends_without_rebuilding_settled_entries() {
         let mut t = fresh_transcript();
-        t.messages.push(TranscriptItem::Info {
-            text: "first".to_string(),
-        });
+        t.info("first");
         let mut cache = RenderCache::new();
-        cache.sync(&t, 80);
+        cache.sync(&t, Toggles::default(), 80);
 
-        // Mutating a settled item WITHOUT bumping the revision is outside the
-        // core's contract (it only appends); the cache must not have paid to
-        // notice - the stale entry proves nothing was rebuilt.
-        t.messages[1] = TranscriptItem::Info {
-            text: "mutated".to_string(),
-        };
-        t.messages.push(TranscriptItem::Info {
-            text: "appended".to_string(),
-        });
-        cache.sync(&t, 80);
-        assert_eq!(cache.items.len(), 3);
-        assert_eq!(line_text(&cache.items[1].lines[0]), "first");
-        assert_eq!(line_text(&cache.items[2].lines[0]), "appended");
+        // Plant a sentinel in the built entry: an append extends the cache
+        // without touching settled entries, so the sentinel must survive the
+        // next sync - a rebuild would have replaced it with "first".
+        cache.items[0].lines[0] = Line::raw("sentinel");
+        t.info("appended");
+        cache.sync(&t, Toggles::default(), 80);
+        assert_eq!(cache.items.len(), 2);
+        assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
+        assert_eq!(line_text(&cache.items[1].lines[0]), "appended");
     }
 
     #[test]
-    fn cache_sync_rebuilds_when_the_messages_revision_moves() {
+    fn cache_sync_rebuilds_when_the_revision_moves() {
         let mut t = fresh_transcript();
-        t.messages.push(TranscriptItem::Info {
-            text: "first".to_string(),
-        });
+        t.steering_queued("check");
         let mut cache = RenderCache::new();
-        cache.sync(&t, 80);
+        cache.sync(&t, Toggles::default(), 80);
+        cache.items[0].lines[0] = Line::raw("sentinel");
 
-        // A structural edit (SteeringDelivered's remove) bumps the revision:
-        // the cache rebuilds and sees the new content.
-        t.messages[1] = TranscriptItem::Info {
-            text: "replaced".to_string(),
-        };
-        t.messages_revision += 1;
-        cache.sync(&t, 80);
-        assert_eq!(cache.items.len(), 2);
-        assert_eq!(line_text(&cache.items[1].lines[0]), "replaced");
+        // The delivered steering removes its pending marker - a structural
+        // edit that bumps the store's revision - so the cache rebuilds from
+        // scratch: the sentinel is gone and the promoted user line is seen.
+        t.steering_delivered("check");
+        cache.sync(&t, Toggles::default(), 80);
+        assert_eq!(cache.items.len(), 1);
+        assert_eq!(line_text(&cache.items[0].lines[0]), "› check");
     }
 
     #[test]
     fn cache_sync_rebuilds_when_the_width_changes() {
         let mut t = fresh_transcript();
-        t.messages.push(TranscriptItem::User {
-            text: "0123456789012345".to_string(),
-        });
+        t.user("0123456789012345");
         let mut cache = RenderCache::new();
-        cache.sync(&t, 80);
+        cache.sync(&t, Toggles::default(), 80);
         // 1 content row + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[1].wrapped, 2);
-        let wide = cache.items[1].wrapped;
-        cache.sync(&t, 10); // resize: every wrapped count is stale
-        assert!(cache.items[1].wrapped > wide);
+        assert_eq!(cache.items[0].wrapped, 2);
+        let wide = cache.items[0].wrapped;
+        cache.sync(&t, Toggles::default(), 10); // resize: every wrapped count is stale
+        assert!(cache.items[0].wrapped > wide);
     }
 
     #[test]
     fn cache_sync_rebuilds_when_the_thinking_toggle_flips() {
         let mut t = fresh_transcript();
-        t.messages.push(TranscriptItem::Thinking {
+        t.push(TranscriptItem::Thinking {
             text: "line one\nline two".to_string(),
         });
         let mut cache = RenderCache::new();
-        cache.sync(&t, 80);
+        cache.sync(&t, Toggles::default(), 80);
         // Collapsed one-liner + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[1].lines.len(), 2);
-        t.thinking_expanded = true;
-        cache.sync(&t, 80);
+        assert_eq!(cache.items[0].lines.len(), 2);
+        cache.sync(
+            &t,
+            Toggles {
+                thinking_expanded: true,
+                ..Toggles::default()
+            },
+            80,
+        );
         // Header + both rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[1].lines.len(), 4);
+        assert_eq!(cache.items[0].lines.len(), 4);
     }
 
     #[test]
@@ -2182,7 +2200,7 @@ mod tests {
         // expanded, and flipping the toggle clears the cache so the change
         // takes effect. (+1 everywhere for Stage 1's trailing blank separator.)
         let mut t = fresh_transcript();
-        t.messages.push(TranscriptItem::Block {
+        t.push(TranscriptItem::Block {
             title: "edit_file src/foo.rs".to_string(),
             lines: vec![
                 StyledLine::new(LineStyle::Added, "+ added line"),
@@ -2190,18 +2208,27 @@ mod tests {
             ],
         });
         let mut cache = RenderCache::new();
-        cache.sync(&t, 80);
+        cache.sync(&t, Toggles::default(), 80);
         // Collapsed one-liner + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[1].lines.len(), 2);
+        assert_eq!(cache.items[0].lines.len(), 2);
         assert_eq!(
-            line_text(&cache.items[1].lines[0]),
+            line_text(&cache.items[0].lines[0]),
             "  ⋯ edit_file src/foo.rs · ^O expand"
         );
-        t.tools_expanded = true;
-        cache.sync(&t, 80);
+        cache.sync(
+            &t,
+            Toggles {
+                tools_expanded: true,
+                ..Toggles::default()
+            },
+            80,
+        );
         // Title row + both body rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[1].lines.len(), 4);
-        assert_eq!(line_text(&cache.items[1].lines[0]), "  ⋯ edit_file src/foo.rs");
+        assert_eq!(cache.items[0].lines.len(), 4);
+        assert_eq!(
+            line_text(&cache.items[0].lines[0]),
+            "  ⋯ edit_file src/foo.rs"
+        );
     }
 
     // --- Stage 3: merged one-liners + semantic fold ------------------------
@@ -2216,7 +2243,10 @@ mod tests {
         };
         let lines = message_lines(&item, false, false);
         assert_eq!(lines.len(), 1);
-        assert_eq!(line_text(&lines[0]), "  ⋯ read_file  src/foo.rs · 340 lines");
+        assert_eq!(
+            line_text(&lines[0]),
+            "  ⋯ read_file  src/foo.rs · 340 lines"
+        );
     }
 
     #[test]
@@ -2342,11 +2372,9 @@ mod tests {
         // Some prose above the fold, then a tall foldable block so expand/collapse
         // changes the total wrapped-line count.
         for i in 0..8 {
-            t.messages.push(TranscriptItem::Info {
-                text: format!("prose line {i}"),
-            });
+            t.info(format!("prose line {i}"));
         }
-        t.messages.push(TranscriptItem::Block {
+        t.push(TranscriptItem::Block {
             title: "edit_file big.rs".to_string(),
             lines: (0..30)
                 .map(|i| StyledLine::new(LineStyle::Added, format!("+ line {i}")))
@@ -2358,20 +2386,26 @@ mod tests {
 
         let mut cache = RenderCache::new();
 
-        let total_lines = |cache: &mut RenderCache, t: &Transcript| -> usize {
-            cache.sync(t, width);
+        let total_lines = |cache: &mut RenderCache, t: &Transcript, tools: bool| -> usize {
+            cache.sync(
+                t,
+                Toggles {
+                    tools_expanded: tools,
+                    ..Toggles::default()
+                },
+                width,
+            );
             cache.items.iter().map(|i| i.wrapped).sum()
         };
 
         // Collapsed: scroll up a few lines to an absolute offset (unpins).
-        let collapsed_total = total_lines(&mut cache, &t);
+        let collapsed_total = total_lines(&mut cache, &t, false);
         let mut vp = Viewport::new();
         vp.scroll_up(5, collapsed_total, height);
         let collapsed_top = vp.top_offset(collapsed_total, height);
 
         // Expand: the total grows, but the stored absolute offset is stationary.
-        t.tools_expanded = true;
-        let expanded_total = total_lines(&mut cache, &t);
+        let expanded_total = total_lines(&mut cache, &t, true);
         assert!(expanded_total > collapsed_total, "expanding adds body rows");
         let expanded_top = vp.top_offset(expanded_total, height);
         assert_eq!(
@@ -2380,8 +2414,7 @@ mod tests {
         );
 
         // Collapse again: the total returns, and so does the drawn offset.
-        t.tools_expanded = false;
-        let collapsed_again_total = total_lines(&mut cache, &t);
+        let collapsed_again_total = total_lines(&mut cache, &t, false);
         let collapsed_again_top = vp.top_offset(collapsed_again_total, height);
         assert_eq!(
             collapsed_top, collapsed_again_top,

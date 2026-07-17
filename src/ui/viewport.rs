@@ -102,7 +102,7 @@ impl Viewport {
         self.scroll_down(page_step(height), total_lines, height);
     }
 
-    /// Pins to the tail ([`Effect::PinBottom`](crate::ui::transcript::Effect)
+    /// Pins to the tail ([`Effect::PinBottom`](crate::ui::screen::Effect)
     /// - prompt submit and other explicit user actions only).
     pub fn pin_bottom(&mut self) {
         self.pinned = true;

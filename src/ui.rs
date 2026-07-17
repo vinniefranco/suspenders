@@ -1,12 +1,14 @@
 //! UI - the ratatui frontend, confined to this module (ADR-0001, ADR-0019).
 //!
-//! The submodules split by testability: [`transcript`] is the PURE TEA core
-//! (The Elm Architecture, ADR-0001) with all the rules and all the tests;
+//! The submodules split by testability: [`screen`] is the PURE TEA fold root
+//! (The Elm Architecture, ADR-0001), [`transcript`] the display-history store
+//! it delegates to, and [`composer`] the Composer it offers keys and events to
+//! first (ADR-0034), each with its rules and its tests;
 //! [`viewport`] is the pure, tested scroll state (bottom-anchored, clamped,
 //! only user actions re-pin); [`components`] is the ONE semantic→terminal
 //! color mapping (ADR-0008); and this file - the `run` adapter - is the
 //! untested-by-design driver that owns the terminal, maps crossterm input to
-//! the core's pure [`transcript::Key`], carries out the [`transcript::Effect`]s
+//! the core's pure [`screen::Key`], carries out the [`screen::Effect`]s
 //! the core returns, and renders via [`components`]. Only this module and
 //! [`components`] `use ratatui` / `use crossterm` (ADR-0019 invariant).
 
@@ -18,9 +20,9 @@ pub mod history;
 pub mod markdown;
 pub mod model_command;
 pub mod picker;
+pub mod screen;
 pub mod selector;
 pub mod slash;
-pub mod streaming;
 pub mod transcript;
 pub mod viewport;
 
@@ -40,8 +42,8 @@ use crate::history::History;
 use crate::session::log::SessionEntry;
 use crate::session::{Session, default_config_path};
 use picker::{Picker, PickerOutcome};
-use transcript::{
-    AgentCommand, Busy, Decision, Effect, Idle, Key, ScrollStep, Status, Transcript, TranscriptOpts,
+use screen::{
+    AgentCommand, Busy, Decision, Effect, Idle, Key, Screen, ScreenOpts, ScrollStep, Status,
 };
 use viewport::{Viewport, WHEEL_LINES};
 
@@ -63,7 +65,7 @@ type Geometry = (usize, usize);
 ///
 /// The loop is a `tokio::select!` over crossterm's async [`EventStream`] and the
 /// Agent's broadcast [`Receiver`](tokio::sync::broadcast::Receiver): key presses
-/// fold through the Transcript core, agent events fold through it too, and the
+/// fold through the Screen core, agent events fold through it too, and the
 /// returned [`Effect`]s are executed here (Agent calls, scroll/focus, history).
 ///
 /// Mouse capture is enabled for the duration so the wheel scrolls the viewport
@@ -87,7 +89,7 @@ pub async fn run(agent: AgentHandle, session: &Session) -> anyhow::Result<()> {
 /// because the picker runs BEFORE the Agent starts, on its own screen.
 ///
 /// Crossterm input folds through the pure [`picker::Picker`] core via the same
-/// [`map_key`]/[`map_mouse`] mappings the Transcript uses; Ctrl-C/Ctrl-Q
+/// [`map_key`]/[`map_mouse`] mappings the Screen uses; Ctrl-C/Ctrl-Q
 /// ([`is_quit`]) resolve as [`PickerOutcome::Quit`].
 pub async fn pick_session(entries: Vec<SessionEntry>) -> anyhow::Result<PickerOutcome> {
     let mut terminal = ratatui::init();
@@ -168,7 +170,7 @@ async fn run_loop(
     let (selector_tx, mut selector_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
     // The connection facts the status bar shows - the fixed endpoint and the
-    // mutable Active Model (ADR-0033). The pure Transcript core stays
+    // mutable Active Model (ADR-0033). The pure Screen core stays
     // command-agnostic and holds neither, so the adapter carries them into the
     // render as one named-field carrier (never a position-coupled pair). The
     // model is seeded from the connection, then refreshed from the Agent after
@@ -192,7 +194,7 @@ async fn run_loop(
         .map(History::read)
         .unwrap_or_default();
 
-    let mut transcript = Some(Transcript::new(TranscriptOpts {
+    let mut screen = Some(Screen::new(ScreenOpts {
         context_budget: Some(session.context_budget),
         eviction_slack: session.eviction_slack,
         plugins: crate::plugins::configured(&session.plugins),
@@ -217,7 +219,7 @@ async fn run_loop(
     // effects (see [`Geometry`]).
     let mut geometry = draw(
         terminal,
-        transcript.as_ref().unwrap(),
+        screen.as_ref().unwrap(),
         &viewport,
         &conn,
         spinner,
@@ -229,9 +231,9 @@ async fn run_loop(
             // Animation tick: advance the spinner and repaint, but ONLY while a
             // Turn is running - an idle UI does no work between events.
             _ = ticker.tick() => {
-                if transcript.as_ref().unwrap().status == Status::Running {
+                if screen.as_ref().unwrap().status == Status::Running {
                     spinner = spinner.wrapping_add(1);
-                    geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
+                    geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
                 }
                 continue;
             }
@@ -256,9 +258,9 @@ async fn run_loop(
                                 // editing included - so all the rules (modal gating,
                                 // edge-triggered history, cursor editing) live in one
                                 // tested place.
-                                let core = transcript.take().unwrap();
+                                let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(map_key(&key_event));
-                                transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                                 dirty = true;
                             }
                         }
@@ -267,9 +269,9 @@ async fn run_loop(
                         // other mouse kinds are ignored.
                         Some(Ok(CtEvent::Mouse(mouse))) => {
                             if let Some(key) = map_mouse(&mouse) {
-                                let core = transcript.take().unwrap();
+                                let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(key);
-                                transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                             }
                             dirty = true;
                         }
@@ -297,9 +299,9 @@ async fn run_loop(
             recv = events.recv() => {
                 match recv {
                     Ok(event) => {
-                        let core = transcript.take().unwrap();
+                        let core = screen.take().unwrap();
                         let (core, effects) = core.apply_event(event);
-                        transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                        screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                     }
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
@@ -307,12 +309,12 @@ async fn run_loop(
                     // The Agent's sender is gone - it crashed/stopped. Reset to
                     // a truthful idle state (agent-down) and keep the UI up.
                     Err(RecvError::Closed) => {
-                        let core = transcript.take().unwrap();
+                        let core = screen.take().unwrap();
                         let (core, effects) = core.agent_down();
-                        transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
-                        let geometry = draw(terminal, transcript.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
+                        screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                        let geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
                         // Nothing more will arrive; wait only on input now.
-                        return drain_input(terminal, input, transcript.take().unwrap(), viewport, geometry, conn, cache).await;
+                        return drain_input(terminal, input, screen.take().unwrap(), viewport, geometry, conn, cache).await;
                     }
                 }
             }
@@ -323,9 +325,9 @@ async fn run_loop(
             // Loading overlay (or ignore a stale delivery). The sender is held in
             // `ctx`, so this side never ends while the loop runs.
             Some(event) = selector_rx.recv() => {
-                let core = transcript.take().unwrap();
+                let core = screen.take().unwrap();
                 let (core, effects) = core.apply_event(event);
-                transcript = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
                 // The fetch result never changes the model, but a pick could
                 // have raced in; refresh to stay truthful (still off the tick).
                 conn.model = agent.active_model().await;
@@ -334,7 +336,7 @@ async fn run_loop(
 
         geometry = draw(
             terminal,
-            transcript.as_ref().unwrap(),
+            screen.as_ref().unwrap(),
             &viewport,
             &conn,
             spinner,
@@ -349,7 +351,7 @@ async fn run_loop(
 async fn drain_input(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut input: EventStream,
-    transcript: Transcript,
+    screen: Screen,
     mut viewport: Viewport,
     mut geometry: Geometry,
     conn: components::ConnectionFacts,
@@ -367,7 +369,7 @@ async fn drain_input(
                     Key::PageDown => viewport.page_down(total_lines, height),
                     _ => {}
                 }
-                geometry = draw(terminal, &transcript, &viewport, &conn, 0, &mut cache)?;
+                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache)?;
             }
             // The wheel still scrolls after the Agent is gone; other mouse
             // kinds are ignored.
@@ -377,7 +379,7 @@ async fn drain_input(
                     Some(Key::WheelDown) => viewport.scroll_down(WHEEL_LINES, total_lines, height),
                     _ => continue,
                 }
-                geometry = draw(terminal, &transcript, &viewport, &conn, 0, &mut cache)?;
+                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache)?;
             }
             Some(_) => {}
             None => return Ok(()),
@@ -459,30 +461,30 @@ fn map_mouse(mouse: &MouseEvent) -> Option<Key> {
     }
 }
 
-/// Carries out the Effects the pure core returned, threading the Transcript
+/// Carries out the Effects the pure core returned, threading the Screen
 /// through the Agent retries (submit↔steer) the core asks for.
 async fn run_effects(
-    mut transcript: Transcript,
+    mut screen: Screen,
     effects: Vec<Effect>,
     ctx: &AdapterCtx<'_>,
     viewport: &mut Viewport,
     geometry: Geometry,
     history: Option<&History>,
-) -> Transcript {
+) -> Screen {
     for effect in effects {
-        transcript = run_effect(transcript, effect, ctx, viewport, geometry, history).await;
+        screen = run_effect(screen, effect, ctx, viewport, geometry, history).await;
     }
-    transcript
+    screen
 }
 
 async fn run_effect(
-    transcript: Transcript,
+    screen: Screen,
     effect: Effect,
     ctx: &AdapterCtx<'_>,
     viewport: &mut Viewport,
     geometry: Geometry,
     history: Option<&History>,
-) -> Transcript {
+) -> Screen {
     let agent = ctx.agent;
     // Scroll effects clamp against the LAST draw's measure (see [`Geometry`]);
     // the draw-time `top_offset` clamp corrects any staleness.
@@ -493,47 +495,47 @@ async fn run_effect(
             // The core records the outcome (ok appends the user line; busy
             // retries as steer) and may emit MORE effects.
             let outcome = result.map_err(|_| Busy);
-            let (core, effects) = transcript.submitted(prompt, outcome);
+            let (core, effects) = screen.submitted(prompt, outcome);
             Box::pin(run_effects(core, effects, ctx, viewport, geometry, history)).await
         }
         Effect::Agent(AgentCommand::Steer(text)) => {
             let result = agent.steer(text.clone()).await;
             let outcome = result.map_err(|_| Idle);
-            let (core, effects) = transcript.steered(text, outcome);
+            let (core, effects) = screen.steered(text, outcome);
             Box::pin(run_effects(core, effects, ctx, viewport, geometry, history)).await
         }
         Effect::Agent(AgentCommand::Approve(id, decision)) => {
             agent.approve(id, to_agent_decision(decision)).await;
-            transcript
+            screen
         }
         Effect::Agent(AgentCommand::Cancel) => {
             agent.cancel().await;
-            transcript
+            screen
         }
         Effect::PinBottom => {
             viewport.pin_bottom();
-            transcript
+            screen
         }
         Effect::ScrollUp(ScrollStep::Line) => {
             viewport.scroll_up(WHEEL_LINES, total_lines, height);
-            transcript
+            screen
         }
         Effect::ScrollUp(ScrollStep::Page) => {
             viewport.page_up(total_lines, height);
-            transcript
+            screen
         }
         Effect::ScrollDown(ScrollStep::Line) => {
             viewport.scroll_down(WHEEL_LINES, total_lines, height);
-            transcript
+            screen
         }
         Effect::ScrollDown(ScrollStep::Page) => {
             viewport.page_down(total_lines, height);
-            transcript
+            screen
         }
         // Focus effects are a no-op in the ratatui adapter: there is no separate
         // focusable widget tree; the modal captures keys via the pure core's
         // pending_approval, and the composer is always the input target.
-        Effect::FocusModal | Effect::FocusComposer => transcript,
+        Effect::FocusModal | Effect::FocusComposer => screen,
         // Persist the submitted prompt so up/down recall survives across
         // Sessions. The pure core already added it to its in-memory ring; this
         // writes it through to the on-disk store (best-effort, never fatal).
@@ -541,19 +543,19 @@ async fn run_effect(
             if let Some(store) = history {
                 store.append(&prompt);
             }
-            transcript
+            screen
         }
         // A committed Slash Command (ADR-0032/0033). The adapter routes it
         // through the single `command::run` seam - `is_handled` reflects exactly
         // what it routes, so an unwired registry entry is a visible info line,
         // never a silent drop.
-        Effect::Command { name } => command::run(transcript, ctx, &name).await,
+        Effect::Command { name } => command::run(screen, ctx, &name).await,
         // A row was chosen from a command's selector (ADR-0033): routed through
         // the same seam as the command itself.
         Effect::SelectorChosen {
             command: cmd,
             value,
-        } => command::choose(transcript, ctx, &cmd, value).await,
+        } => command::choose(screen, ctx, &cmd, value).await,
     }
 }
 
@@ -582,7 +584,7 @@ fn to_agent_decision(decision: Decision) -> AgentDecision {
 /// scroll effects that arrive before the next draw.
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    transcript: &Transcript,
+    screen: &Screen,
     viewport: &Viewport,
     conn: &components::ConnectionFacts,
     spinner: u64,
@@ -590,7 +592,7 @@ fn draw(
 ) -> anyhow::Result<Geometry> {
     let mut geometry: Geometry = (0, 0);
     terminal.draw(|frame| {
-        geometry = components::render(frame, transcript, conn.view(), spinner, viewport, cache);
+        geometry = components::render(frame, screen, conn.view(), spinner, viewport, cache);
     })?;
     Ok(geometry)
 }

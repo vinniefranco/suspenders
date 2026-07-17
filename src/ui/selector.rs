@@ -11,7 +11,7 @@
 //! against that filtered view and either moves the cursor (`None`) or resolves
 //! with a [`SelectorOutcome`].
 
-use crate::ui::transcript::Key;
+use crate::ui::screen::Key;
 
 /// One row in a [`Selector`]: `value` is what a [`SelectorOutcome::Select`]
 /// returns, `label` is shown and filtered on, and `hint` is optional secondary

@@ -9,4 +9,4 @@ Considered and rejected:
 - **A Cargo workspace splitting core/tui/drive crates.** Compile-time enforcement of the seam, but heavier than a single-author binary warrants.
 - **Feature-gated UI in one crate.** Draws the seam by feature flags rather than a clear module boundary.
 
-Consequence: the pure-Transcript-core / thin-adapter split (ADR-0001) is a module boundary, not a crate boundary.
+Consequence: the pure-Screen-core / thin-adapter split (ADR-0001) is a module boundary, not a crate boundary.

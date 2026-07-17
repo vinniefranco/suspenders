@@ -4,10 +4,10 @@
 //!
 //! Both sides that reason about the draft cursor read from here:
 //!
-//! * the EDIT path (`ui::transcript`) moves and mutates the cursor as the
-//!   user types, and
-//! * the RENDER path (`ui::composer`) wraps the draft to `width` and places a
-//!   real terminal cell for the cursor.
+//! * the EDIT path (`ui::composer`'s key fold) moves and mutates the cursor
+//!   as the user types, and
+//! * the RENDER path (`ui::composer`'s `layout`) wraps the draft to `width`
+//!   and places a real terminal cell for the cursor.
 //!
 //! They previously computed equivalent line/column math independently and
 //! stayed in sync only by hand; one diverging rule (how a trailing '\n', a

@@ -1,6 +1,7 @@
 //! In-flight streaming state - the ONE owner of the assistant message being
 //! streamed (CONTEXT.md: the snapshot the Transcript shows mid-Turn, before it
-//! settles into discrete items).
+//! settles into discrete items). A PRIVATE child of the Transcript store
+//! (ADR-0034): only the store's verbs reach it.
 //!
 //! Streaming is STATELESS (ADR-0001, and see `ui::transcript`): each
 //! [`Event::MessageUpdate`](crate::event::Event) carries the accumulated
@@ -21,7 +22,8 @@
 //! [`String`]s and [`TranscriptItem`]s out.
 
 use crate::content::ContentBlock;
-use crate::ui::transcript::TranscriptItem;
+
+use super::TranscriptItem;
 
 /// The latest streaming snapshot (`None` when not streaming). Owns the
 /// stateless-streaming rules: replace-wholesale, and the two materialize paths.
@@ -63,6 +65,7 @@ impl Streaming {
     /// assistant text from that final `content`. Empties the snapshot.
     ///
     /// [`Event::MessageEnd`]: crate::event::Event
+    #[must_use = "the materialized items ARE the finished message - dropping them loses it (the snapshot is already emptied)"]
     pub fn end(&mut self, final_content: &[ContentBlock]) -> Vec<TranscriptItem> {
         let thinking = blocks_text(self.snapshot(), BlockKind::Thinking);
         let text = blocks_text(final_content, BlockKind::Text);
@@ -73,6 +76,7 @@ impl Streaming {
     /// Materialize a live snapshot after a cancel/crash mid-stream: BOTH
     /// Thinking and text come from the last snapshot (there is no final
     /// content). Empties the snapshot; a no-op when already idle.
+    #[must_use = "the materialized items ARE the salvaged mid-stream content - dropping them loses it (the snapshot is already emptied)"]
     pub fn flush(&mut self) -> Vec<TranscriptItem> {
         let snapshot = match self.0.take() {
             None => return Vec::new(),
