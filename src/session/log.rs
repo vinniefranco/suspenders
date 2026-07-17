@@ -534,7 +534,16 @@ fn utc_stamp() -> String {
         .unwrap_or_else(|_| "00000000-000000".into())
 }
 
-/// The header line's fixed facts.
+/// The header line's fixed facts - the DURABLE subset of the Session a Resume
+/// must reconcile: `root` (must match, else `RootMismatch`) plus `model`,
+/// `context_budget`, and `turn_limit` (drift-checked in [`drift`]; the resuming
+/// Session's value wins and the difference is reported). Everything else the
+/// Session resolves at launch is deliberately NOT persisted: Setpoints such as
+/// `eviction_slack` and `compaction_keep` are user-tunable (ADR-0031) and simply
+/// yield to the resuming Session's values, so they are neither logged nor
+/// drift-checked. When adding a Session field, decide which it is - a durable
+/// fact (add it here AND to [`drift`]) or a Setpoint (omit it; it takes the
+/// resuming Session's value on Resume).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Header {
     #[serde(rename = "type")]
@@ -1234,6 +1243,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_mixed_batch_keeps_answered_tool_calls_and_drops_unanswered_ones() {
+        // ADR-0009 keeps a tool_use whose result landed; ADR-0004 drops one that
+        // never answered. A batch with both must keep t1 (+ its result) and drop
+        // t2 entirely.
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![
+            tool_use("t1", "read_file", json!({"path": "a.rs"})),
+            tool_use("t2", "read_file", json!({"path": "b.rs"})),
+        ]));
+        log.append(Entry::ToolResult(tool_result("t1", "ok")));
+        log.append(Entry::AssistantBlocks(vec![text("done")]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("go")]),
+                // t2 is gone; only the answered t1 survives.
+                Message::assistant(vec![tool_use("t1", "read_file", json!({"path": "a.rs"}))]),
+                user_message(vec![tool_result("t1", "ok")]),
+                Message::assistant(vec![text("done")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_all_unanswered_batch_collapses_to_the_empty_response_marker() {
+        // Every tool_use dropped (ADR-0004) leaves no assistant content, so the
+        // batch close emits the empty-response marker instead of an empty message.
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks(vec![
+            tool_use("t1", "read_file", json!({"path": "a.rs"})),
+            tool_use("t2", "read_file", json!({"path": "b.rs"})),
+        ]));
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![
+                user_message(vec![text("go")]),
+                Message::assistant(vec![text(voice::empty_response_marker())]),
+            ]
+        );
+    }
+
     // ---- Plan survives Resume ----
 
     #[test]
@@ -1726,6 +1801,40 @@ mod tests {
             logged: session.turn_limit.to_string(),
             current: changed.turn_limit.to_string(),
         }));
+    }
+
+    #[test]
+    fn a_setpoint_like_eviction_slack_yields_on_resume_and_never_drifts() {
+        // eviction_slack is a Setpoint (ADR-0031), not a durable header fact: it
+        // is never persisted, so a resuming Session with a different value
+        // reports NO drift for it and simply keeps its own value.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let session_dir = tmp.path().join("sessions").to_string_lossy().into_owned();
+
+        let build = |slack: f64| {
+            Session::build(
+                SessionOpts {
+                    root: Some(root.clone()),
+                    session_dir: Some(session_dir.clone()),
+                    eviction_slack: Some(slack),
+                    ..Default::default()
+                },
+                &SessionConfig::test_defaults(),
+            )
+            .unwrap()
+        };
+
+        let logged = build(0.15);
+        let mut log = Log::open(&logged).unwrap();
+        log.append(Entry::UserText("go".into()));
+
+        let resuming = build(0.25);
+        let (_messages, drift) = resume(&log.path, &resuming).unwrap();
+
+        assert!(!drift.iter().any(|d| d.key == "eviction_slack"));
+        // The resuming Session keeps its own Setpoint; the logged 0.15 is gone.
+        assert_eq!(resuming.eviction_slack, 0.25);
     }
 
     #[test]
