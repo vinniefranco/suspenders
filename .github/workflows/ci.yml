@@ -13,7 +13,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rustup (preinstalled on the runner) reads rust-toolchain.toml and
       # installs the pinned channel plus rustfmt/clippy on first use
@@ -48,7 +48,7 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Sync toolchain
         run: |
@@ -62,8 +62,30 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      # tar from a staged <target>/ folder so the archive unpacks to
+      # <target>/suspenders with the executable bit intact (artifact zips
+      # strip permissions; tar keeps them)
+      - name: Stage
+        run: |
+          mkdir -p stage/${{ matrix.target }} dist
+          cp target/${{ matrix.target }}/release/suspenders stage/${{ matrix.target }}/
+          tar -czf dist/suspenders-${{ matrix.target }}.tar.gz -C stage ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v6
         with:
           name: suspenders-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/suspenders
+          path: dist
           if-no-files-found: error
+
+  # fold the per-target artifacts into one download holding the three
+  # suspenders-<target>.tar.gz archives
+  package:
+    name: package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact/merge@v6
+        with:
+          name: suspenders
+          pattern: suspenders-*
+          delete-merged: true
