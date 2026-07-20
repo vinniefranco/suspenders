@@ -22,6 +22,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # prebuilt binary, no compile cost
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Format
         run: cargo fmt --check
 
@@ -29,7 +33,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo nextest run
+
+      # nextest doesn't run doctests; keep them covered for the lib target
+      - name: Doctest
+        run: cargo test --doc
 
   # release binaries, built only when main advances (all deps are pure Rust
   # thanks to rustls + fancy-regex, so cross-arch darwin builds need no SDK fuss)

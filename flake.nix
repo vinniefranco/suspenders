@@ -42,6 +42,7 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.cargo-nextest
           ];
 
           env.RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

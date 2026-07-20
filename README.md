@@ -26,7 +26,7 @@ The vocabulary is deliberate. `CONTEXT.md` is the glossary, the ubiquitous langu
 
 ```
 cargo build --release
-cargo test
+cargo nextest run
 ```
 
 Stable toolchain (see `rust-toolchain.toml`). A Nix flake is provided: `nix develop` for a dev shell.
