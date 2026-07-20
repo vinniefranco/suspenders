@@ -43,6 +43,7 @@
             rustToolchain
             pkgs.rust-analyzer
             pkgs.cargo-nextest
+            pkgs.cargo-tarpaulin
           ];
 
           env.RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

@@ -84,17 +84,33 @@ pub fn verification_specs() -> Vec<ToolSpec> {
 /// input JSON that never parsed) is blanked to an empty object so the tool's
 /// own validation rejects it rather than acting on undecoded JSON.
 ///
+/// The read-only subset is enforced at dispatch, not only by the offered
+/// specs (CONTEXT.md: Scout - a Scout cannot edit, run commands, or dispatch
+/// further Scouts): a call naming anything outside the subset is answered
+/// with the Voice's refusal and never runs. Small local models hallucinate
+/// Tool Calls the request never offered; the refusal is the mechanic.
+///
 /// The Turn's batch (`turn::batch`) deliberately does NOT share this: it
 /// interleaves the Governor answering arbiter, the Plugin lifecycle, the
 /// Approval gate, Ledger recording, and per-result checkpointing around each
 /// call - none of which a read-only Scout has. The shared unit is only this
 /// plugin-free core.
 pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<ContentBlock> {
+    // The subset names, resolved once per batch: the dispatch check and the
+    // refusal wording read the same derivation.
+    let subset = scout_tool_names();
     let mut results = Vec::new();
     for block in blocks {
         if let ContentBlock::ToolUse { id, name, input } = block {
-            let input = sanitize_input(input);
-            let result = run(name, &input, ctx).await;
+            let result = if subset.iter().any(|n| n == name) {
+                let input = sanitize_input(input);
+                run(name, &input, ctx).await
+            } else {
+                ToolResult {
+                    content: crate::voice::scout_tool_refusal(name, &subset.join(", ")),
+                    is_error: true,
+                }
+            };
             results.push(ContentBlock::tool_result(
                 id,
                 result.content,
@@ -103,6 +119,13 @@ pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<Conten
         }
     }
     results
+}
+
+// The Scout's read-only Tool names, derived from the same list the offered
+// specs come from: one source of truth for the specs, the dispatch check,
+// and the Voice's refusal wording.
+fn scout_tool_names() -> Vec<String> {
+    scout_tools_list().iter().map(|t| t.spec().name).collect()
 }
 
 /// Blanks a malformed-input-tagged Tool Call input to an empty object. The LLM
@@ -341,6 +364,70 @@ mod tests {
             &results[0],
             ContentBlock::ToolResult { is_error: true, .. }
         ));
+    }
+
+    // A Tool Call outside the read-only subset is answered with the Voice's
+    // refusal and NEVER executed (CONTEXT.md: Scout - a Scout cannot edit,
+    // run commands, or dispatch further Scouts). The offered specs shape the
+    // Scout's request; this dispatch check is what enforces the subset when
+    // a small model hallucinates a mutating or command Tool anyway.
+    #[tokio::test]
+    async fn run_read_only_refuses_out_of_subset_calls_without_executing() {
+        let tmp = TempDir::new().unwrap();
+        let blocks = vec![
+            ContentBlock::tool_use(
+                "w1",
+                "write_file",
+                json!({ "path": "evil.txt", "content": "pwned" }),
+            ),
+            ContentBlock::tool_use("r1", "run_command", json!({ "command": "touch pwned.txt" })),
+            ContentBlock::tool_use("e1", "explore", json!({ "task": "look around" })),
+            ContentBlock::tool_use("p1", "plan", json!({ "content": "take over" })),
+        ];
+        let results = run_read_only(&blocks, &ctx(tmp.path(), 10_000)).await;
+
+        assert_eq!(results.len(), 4);
+        for result in &results {
+            match result {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    assert!(is_error, "{content}");
+                    assert!(content.contains("not available to a scout"), "{content}");
+                }
+                other => panic!("expected tool_result, got {other:?}"),
+            }
+        }
+        assert!(!tmp.path().join("evil.txt").exists());
+        assert!(!tmp.path().join("pwned.txt").exists());
+    }
+
+    // In-subset calls still run alongside refused ones: one bad call does not
+    // poison the batch.
+    #[tokio::test]
+    async fn run_read_only_runs_in_subset_calls_alongside_refused_ones() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "alpha").unwrap();
+        let blocks = vec![
+            ContentBlock::tool_use("t1", "read_file", json!({ "path": "a.txt" })),
+            ContentBlock::tool_use(
+                "w1",
+                "write_file",
+                json!({ "path": "evil.txt", "content": "x" }),
+            ),
+        ];
+        let results = run_read_only(&blocks, &ctx(tmp.path(), 10_000)).await;
+
+        assert_eq!(results.len(), 2);
+        assert!(matches!(
+            &results[0],
+            ContentBlock::ToolResult { content, is_error: false, .. } if content == "alpha"
+        ));
+        assert!(matches!(
+            &results[1],
+            ContentBlock::ToolResult { is_error: true, .. }
+        ));
+        assert!(!tmp.path().join("evil.txt").exists());
     }
 
     // ---- execute ----

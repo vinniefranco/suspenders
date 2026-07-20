@@ -243,7 +243,7 @@ pub fn answer_sent(governors: &Governors, name: &str, input: &Value) -> Option<A
 
 /// The Tool Call answering moment, after a call executes (or was replaced):
 /// judge what the model will READ. The outcome's facts are already on the
-/// Ledger - the firing site records them ([`Ledger::record_result`]) before
+/// Ledger - the firing site records them ([`Ledger::record`]) before
 /// consulting, replaced results included. This consultation folds the outcome
 /// into the duplicate Governor's fresh-set trigger state and, from the third
 /// consecutive failure of one Tool onward, annotates the result with the
@@ -448,6 +448,7 @@ fn endgame_rider(ledger: &Ledger) -> Option<(VoicedTag, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::governor::ledger::CallOutcome;
     use serde_json::json;
 
     fn ok() -> ToolResult<'static> {
@@ -476,7 +477,7 @@ mod tests {
     // One successful edit_file leaves the Turn with unverified writes.
     fn unverified_at(pass: u64, turn_limit: u64) -> Ledger {
         let mut ledger = ledger_at(pass, turn_limit);
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger
     }
 
@@ -485,8 +486,18 @@ mod tests {
     // dangling-failure recovery arm requires (ADR-0028 addendum 2026-07-14).
     fn command_failing_at(pass: u64, turn_limit: u64) -> Ledger {
         let mut ledger = ledger_at(pass, turn_limit);
-        ledger.record_result("edit_file", &json!({"path": "a.ex"}), &ok());
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        ledger.record(
+            "edit_file",
+            &json!({"path": "a.ex"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &err(),
+            CallOutcome::Ran,
+        );
         ledger
     }
 
@@ -573,7 +584,7 @@ mod tests {
         input: &Value,
         result: &ToolResult,
     ) -> Option<AnswerIntervention> {
-        ledger.record_result(name, input, result);
+        ledger.record(name, input, result, CallOutcome::Ran);
         answer_read(ledger, governors, name, input, result)
     }
 
@@ -704,7 +715,7 @@ mod tests {
         let mut governors = Governors::new(5, 8, true);
         let mut ledger = ledger_at(1, 50);
         ledger.note_plan_updated();
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         for _ in 1..10 {
             ledger.advance_pass();
         }
@@ -733,7 +744,7 @@ mod tests {
         // stale Plan with zero writes since (pure reading) stays bare too.
         let mut fresh = ledger_at(1, 50);
         fresh.note_plan_updated();
-        fresh.record_result("edit_file", &json!({}), &ok());
+        fresh.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         for _ in 1..5 {
             fresh.advance_pass();
         }
@@ -762,7 +773,7 @@ mod tests {
         // Deep in the Turn with writes but no Plan ever set: the Anchor rides
         // bare (its no-plan fallback already asks for a Plan).
         let mut ledger = ledger_at(1, 50);
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         for _ in 1..20 {
             ledger.advance_pass();
         }
@@ -801,7 +812,7 @@ mod tests {
     fn a_stuck_turn_closes_with_the_stuck_reason() {
         let mut stuck = ledger_at(25, 25);
         for _ in 0..3 {
-            stuck.record_result("grep", &json!({}), &err());
+            stuck.record("grep", &json!({}), &err(), CallOutcome::Ran);
         }
         assert_eq!(
             settle_capped(&stuck, &Governors::new(5, 8, true)),
@@ -912,8 +923,8 @@ mod tests {
     fn verify_failed_speaks_before_verify() {
         // Both armed: a failing run_command, then an unverified write.
         let mut ledger = ledger_at(2, 25);
-        ledger.record_result("run_command", &json!({}), &err());
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         let mut governors = Governors::new(5, 8, true);
 
         assert_eq!(
@@ -1039,7 +1050,7 @@ mod tests {
 
         // Verify-failed Nudge.
         let mut ledger = ledger_at(2, 25);
-        ledger.record_result("run_command", &json!({}), &err());
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Ran);
         let mut governors = primed();
         assert!(matches!(
             settle_finish(&ledger, &mut governors, &text("done"), &StopReason::EndTurn),

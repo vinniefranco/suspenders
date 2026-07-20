@@ -15,6 +15,7 @@ pub mod deps;
 mod finish;
 pub mod governor;
 pub mod loop_;
+mod offer;
 pub mod settlement;
 
 // Shared test fixtures for the split Loop (today only `loop_`'s tests; any

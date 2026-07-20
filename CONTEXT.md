@@ -33,7 +33,7 @@ The maximum number of Passes allowed within one Turn. The last permitted Pass is
 _Avoid_: iteration cap, loop limit
 
 **Endgame**:
-The mechanical schedule by which a Turn ends at its Turn Limit, counted in Passes remaining: at 2, the wrap-up warning rides the results tail (or the Verification Pass prompt in its place when writes are unverified); at 1, the Verification Pass narrows the offered Tools to run_command when writes are unverified, and the final-Pass prompt rides the tail; at 0, the final Pass offers no Tools and a tool-insistent reply (real Tool Calls or serialized markup in text) closes on the turn-limit marker instead of passing as a conclusion. Mechanical because small models comply with mechanics, not requests.
+The mechanical schedule by which a Turn ends at its Turn Limit, counted in Passes remaining: at 2, the wrap-up warning rides the results tail (or the Verification Pass prompt in its place when writes are unverified); at 1, the Verification Pass narrows the offered Tools to run_command when writes are unverified, and the final-Pass prompt rides the tail; at 0, the final Pass offers no Tools and a tool-insistent reply (real Tool Calls or serialized markup in text) closes on the turn-limit marker instead of passing as a conclusion. The narrowing is enforced at dispatch, not just in the request (ADR-0035): a Tool Call the Pass did not offer is answered with the Voice's refusal and never executes - a mechanic beside the malformed-input sentinel, not a Governor's judgment. Mechanical because small models comply with mechanics, not requests.
 _Avoid_: wind-down, wrap-up phase (the wrap-up warning is one step of the Endgame, not its name)
 
 **Recovery Turn**:
@@ -60,6 +60,14 @@ _Avoid_: invocation (the legacy text-protocol term), tool request
 
 **Tool Result**:
 The structured outcome of executing a Tool Call, returned to the model as a `tool_result` block.
+
+**Answer**:
+How the Turn's batch answered one Tool Call: the Tool Result the model will read plus the typed fact of whether the call ran - Ran (executed, and the outcomes that read as runs: a Governor's replaced result, a Plugin halt, a malformed-input answer), Denied (the Approval gate), or Refused (the Pass did not offer the Tool, ADR-0035). Built only through constructors that pair the Voice's wording with the fact so the two cannot drift, and recorded on the Turn Ledger through one method: the batch states the fact, the Ledger owns what each fact moves.
+_Avoid_: response (a Response is the model's), reply (also the model's), outcome alone (the ran-fact is one part of an Answer)
+
+**Offer**:
+The Tools one Pass puts before the model. The narrowed specs move into the Offer at the request-shaping moment (after the Governors' NarrowTools Intervention); the request carries exactly what the Offer holds, and the batch refuses any Tool Call the Offer does not name (ADR-0035). One value with two readers, so the enforced set and the wire set cannot drift. Before the first request is shaped, the Offer offers nothing - and the batch can never run before then.
+_Avoid_: allowlist, whitelist (a filter's framing; the Offer is a fact of the Pass), available tools
 
 **Thinking**:
 The model's reasoning stream, displayed but never fed back into the Conversation.
@@ -152,7 +160,7 @@ Display-side data a Plugin derives from a Tool Call - a diff, an annotation - ca
 _Avoid_: metadata, attachment
 
 **Voice**:
-Every Suspenders-voiced string the model reads: the system prompt, every Nudge, and every marker (elision, turn limit, the wrap-up warning two Passes before it, cancellation, Result Cap cuts, malformed input). The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Plugin produces about its own decisions stay in that Plugin. Owned by one module so wording can be tuned per model in one place.
+Every Suspenders-voiced string the model reads: the system prompt, every Nudge, and every marker (elision, turn limit, the wrap-up warning two Passes before it, cancellation, Result Cap cuts, malformed input, the offered-set refusals). The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Plugin produces about its own decisions stay in that Plugin. Owned by one module so wording can be tuned per model in one place.
 _Avoid_: prompt strings, constants, "static strings" (parameterized wording still belongs), Steering Vocabulary (legacy name; Steering now means mid-Turn user input)
 
 **Steering**:
@@ -171,7 +179,7 @@ An injected copy of the Plan and the original task statement, placed near the ta
 _Avoid_: reminder, re-injection (mechanism, not meaning), reorientation nudge (a Nudge is corrective and fires only while its trigger persists; an Anchor is routine)
 
 **Scout**:
-A disposable read-only worker the model dispatches through the explore Tool: it searches the Project Root (grep, list, read) in its own fresh Conversation with a hard Pass cap and returns a structured findings report as an ordinary Tool Result. The cap's last Pass is a forced report Pass (no tools offered - the only move left is the report), and Scouts run without Thinking by default (ADR-0014). The exploration never enters the main Conversation - only the report does. A Scout cannot edit, run commands, or dispatch further Scouts.
+A disposable read-only worker the model dispatches through the explore Tool: it searches the Project Root (grep, list, read) in its own fresh Conversation with a hard Pass cap and returns a structured findings report as an ordinary Tool Result. The cap's last Pass is a forced report Pass (no tools offered - the only move left is the report), and Scouts run without Thinking by default (ADR-0014). The exploration never enters the main Conversation - only the report does. A Scout cannot edit, run commands, or dispatch further Scouts - enforced at dispatch (ADR-0035), not just by the offered specs: a hallucinated mutating or command Tool Call is answered with the Voice's refusal and never executes.
 _Avoid_: subagent (generic; Suspenders has exactly one delegation shape), task agent, worker
 
 **Session Log**:
@@ -234,6 +242,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 > **Domain expert:** "**Cancellation** wins: the **Tool Call** is recorded as cancelled, no **Tool Result** is fabricated, and the **Turn** ends."
 
 ## Flagged ambiguities
+
+- ADR-0015/0016 tolerated Tool Calls on narrowed Passes ("those Tools run"); ADR-0035 (2026-07) reversed the tolerance - such calls are refused at dispatch as mechanics beside the malformed-input sentinel, NOT issued by a Governor. The relationship "every Endgame step is issued by a Governor" covers the schedule (warning, narrowing, prompts, closes); the refusal is the enforcement of that schedule, one layer down.
 
 - "invocation" previously meant a parsed text-protocol tool request (`extract_invocations`); with native tool calling it is retired in favor of **Tool Call**.
 - "truncation" was used for both server-side context overflow and our own management strategy - resolved: ours is **Eviction**; "truncation" refers only to the server's silent behavior we're preventing.

@@ -78,7 +78,7 @@ impl Verify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::governor::ledger::ToolResult;
+    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
     use serde_json::json;
 
     fn ok() -> ToolResult<'static> {
@@ -100,7 +100,7 @@ mod tests {
     // One successful edit_file leaves the Turn with unverified writes.
     fn unverified() -> Ledger {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger
     }
 
@@ -119,7 +119,7 @@ mod tests {
         let mut ledger = unverified();
         let mut verify = Verify::new();
         verify.note_verify_nudged();
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
 
         assert!(!verify.verify_nudge(&ledger));
     }
@@ -129,7 +129,7 @@ mod tests {
     // The most recent run_command this Turn failed.
     fn command_failing() -> Ledger {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &json!({}), &err());
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Ran);
         ledger
     }
 

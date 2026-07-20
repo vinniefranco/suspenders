@@ -808,8 +808,9 @@ async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
 
 // ---- Recovery Turns (Continuation + Handoff) ---------------------------
 
-// A Session whose every Turn caps on Pass 1, so any unfinished work
-// triggers the Endgame Governor's recovery judgment immediately.
+// A Session whose every Turn caps on Pass 2 - one working Pass, then a
+// tool-insistent final Pass (refused at dispatch, ADR-0035) - so any
+// unfinished work triggers the Endgame Governor's recovery judgment.
 fn recovery_session(dir: &TempDir, shape: crate::session::RecoveryShape) -> Session {
     let root = dir.path().to_string_lossy().into_owned();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -817,7 +818,7 @@ fn recovery_session(dir: &TempDir, shape: crate::session::RecoveryShape) -> Sess
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(1),
+            turn_limit: Some(2),
             recovery_shape: Some(shape),
             ..Default::default()
         },
@@ -828,6 +829,13 @@ fn recovery_session(dir: &TempDir, shape: crate::session::RecoveryShape) -> Sess
 
 fn write_tool(id: &str, path: &str) -> Response {
     tool_use_result(id, "write_file", json!({ "path": path, "content": "x" }))
+}
+
+// A tool-insistent reply on the final Pass: the call is refused at dispatch
+// (ADR-0035; ADR-0015 withdrew the Tools), and the refusal carries the Turn
+// to its cap. (turn/loop_.rs keeps its own copy - see its note.)
+fn insistent_reply(id: &str) -> Response {
+    tool_use_result(id, "list_files", json!({ "path": "." }))
 }
 
 fn is_recovery_turn(e: &Event) -> bool {
@@ -853,7 +861,8 @@ async fn a_capped_unfinished_turn_opens_a_continuation_recovery_turn() {
     let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
     let session_dir = session.session_dir.clone();
     let script = vec![
-        Entry::just(write_tool("w1", "a.txt")), // Turn 1 caps unverified.
+        Entry::just(write_tool("w1", "a.txt")), // Turn 1 Pass 1: the write lands.
+        Entry::just(insistent_reply("x1")),     // Turn 1 Pass 2: refused, caps unverified.
         Entry::just(text_end("recovered and done")), // The Recovery Turn.
     ];
     let agent = start(session, FakeLlm::script(script));
@@ -902,7 +911,9 @@ async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_turn_never_re
     // unverified, but the request's budget (limit 1) is spent.
     let script = vec![
         Entry::just(write_tool("w1", "a.txt")),
+        Entry::just(insistent_reply("x1")),
         Entry::just(write_tool("w2", "b.txt")),
+        Entry::just(insistent_reply("x2")),
     ];
     let agent = start(session, FakeLlm::script(script));
     let mut rx = agent.subscribe();
@@ -926,9 +937,12 @@ async fn a_genuine_user_prompt_resets_the_recovery_count() {
     let script = vec![
         // Request 1: cap -> recovery -> cap (budget spent).
         Entry::just(write_tool("w1", "a.txt")),
+        Entry::just(insistent_reply("x1")),
         Entry::just(write_tool("w2", "b.txt")),
+        Entry::just(insistent_reply("x2")),
         // Request 2: cap -> the reset budget grants a fresh recovery.
         Entry::just(write_tool("w3", "c.txt")),
+        Entry::just(insistent_reply("x3")),
         Entry::just(text_end("second request recovered")),
     ];
     let agent = start(session, FakeLlm::script(script));
@@ -970,6 +984,9 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
             usage: Usage::default(),
             error: None,
         }),
+        // Turn 1 Pass 2: a tool-insistent reply, refused, caps the Turn with
+        // the write unverified and the verification dangling.
+        Entry::just(insistent_reply("x1")),
         // The Handoff's summarize call.
         Entry::just(text_end("## Task\nnarrative-of-dying-turn")),
         // The Recovery Turn over the seeded Conversation.
@@ -1049,7 +1066,8 @@ async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
     let dir = TempDir::new().unwrap();
     let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
     let script = vec![
-        Entry::just(write_tool("w1", "a.txt")), // Turn 1 caps unverified.
+        Entry::just(write_tool("w1", "a.txt")), // Turn 1 Pass 1: the write lands.
+        Entry::just(insistent_reply("x1")),     // Turn 1 Pass 2: refused, caps unverified.
         Entry::error("summarizer down"),        // The Handoff's LLM call fails.
         Entry::just(text_end("recovered anyway")),
     ];
@@ -1079,7 +1097,7 @@ async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(1),
+            turn_limit: Some(2),
             recovery_limit: Some(0),
             ..Default::default()
         },
@@ -1088,7 +1106,10 @@ async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
     .unwrap();
     let agent = start(
         session,
-        FakeLlm::script(vec![Entry::just(write_tool("w1", "a.txt"))]),
+        FakeLlm::script(vec![
+            Entry::just(write_tool("w1", "a.txt")),
+            Entry::just(insistent_reply("x1")),
+        ]),
     );
     let mut rx = agent.subscribe();
 

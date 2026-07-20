@@ -28,6 +28,7 @@
 
 use serde_json::Value;
 
+use crate::compaction::Compaction;
 use crate::content::ContentBlock;
 use crate::conversation::{self, Conversation};
 use crate::event::Event;
@@ -44,6 +45,7 @@ use crate::turn::governor::ledger::Ledger;
 use crate::turn::governor::{
     self, AnswerIntervention, FinishIntervention, Governors, RequestIntervention, Rider,
 };
+use crate::turn::offer::Offer;
 use crate::turn::{batch, finish};
 use crate::voice;
 
@@ -112,6 +114,10 @@ pub(super) struct LoopState<'a, D: TurnDeps> {
     pub(super) ledger: Ledger,
     pub(super) governors: Governors,
     pub(super) plan: Plan,
+    // The Pass's Offer (CONTEXT.md), shaped once per Pass in `build_request`
+    // after the Governors' NarrowTools Intervention; the batch refuses any
+    // Tool Call the Offer does not name (ADR-0035).
+    pub(super) offer: Offer,
     // The malformed-tool-call re-draw Setpoint (ADR-0030), resolved once from
     // the Session at Turn start: how many in-band re-draws a retryable
     // generation error may trigger this Turn (0 disables it). A Session fact,
@@ -144,6 +150,7 @@ pub async fn run<D: TurnDeps>(
         plugins,
         tool_ctx,
         ledger: Ledger::new(session.turn_limit),
+        offer: Offer::default(),
         governors: Governors::new(
             session.anchor_interval,
             session.plan_stale_after,
@@ -180,7 +187,7 @@ async fn maybe_compact_proactive<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Conversation {
-    if proactive_compaction_due(&conversation) {
+    if Compaction::proactive(&conversation) {
         match state.deps.compact(conversation.clone()).await {
             Ok(compacted) => {
                 state.ledger.note_compacted();
@@ -191,12 +198,6 @@ async fn maybe_compact_proactive<D: TurnDeps>(
     } else {
         conversation
     }
-}
-
-// baud's `Baud.Compaction.proactive?/1`: the estimate exceeds the Compaction
-// Target (the same low-water mark Eviction settles to).
-fn proactive_compaction_due(conv: &Conversation) -> bool {
-    conv.token_estimate() > conv.compaction_target()
 }
 
 async fn run_loop<D: TurnDeps>(
@@ -282,7 +283,12 @@ async fn build_request<D: TurnDeps>(
                     RequestIntervention::SilenceThinking => no_think = true,
                 }
             }
-            let request = LlmRequest::new(req.system, req.messages, tools).with_no_think(no_think);
+            // The specs move into the Pass's Offer and the request carries
+            // exactly what the Offer holds - one binding for the wire set and
+            // the set the batch enforces at dispatch (ADR-0035).
+            state.offer = Offer::new(tools);
+            let request = LlmRequest::new(req.system, req.messages, state.offer.specs())
+                .with_no_think(no_think);
             Ok((request, conversation))
         }
         Err(_) => {
@@ -2075,6 +2081,85 @@ mod tests {
         );
     }
 
+    // The Verification Pass's narrowing is enforced at DISPATCH, not only by
+    // the offered specs: a model that insists on a non-run_command call gets
+    // the Voice's refusal and the call never executes (no file content leaks
+    // into the result).
+    #[tokio::test]
+    async fn verification_pass_refuses_non_run_command_calls_without_executing() {
+        let root = root();
+        write(&root, "secret.txt", "SECRET-CONTENT");
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(4);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                // The Verification Pass offers run_command ONLY; the model
+                // insists on a read.
+                just(tool_use_result(
+                    "x1",
+                    "read_file",
+                    json!({"path": "secret.txt"}),
+                )),
+                just(text_end("done")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        let evs = events(&deps);
+        let result = find_tool_result(&evs, "x1").expect("x1 answered");
+        assert!(
+            matches!(result, Event::ToolResult { content, is_error: true, .. }
+                if content.contains("not offered") && !content.contains("SECRET-CONTENT"))
+        );
+        // The refused read never verified the write, so the capped Turn
+        // recovers (the refusal and the recovery judgment compose).
+        let (_conv, reason, recovery) = recover(&outcome);
+        assert_eq!(reason, log::StopReason::TurnLimit);
+        assert!(!recovery.verification_failing);
+    }
+
+    // The final Pass offers NO Tools (ADR-0015/0035); a tool-insistent reply's
+    // calls are refused at dispatch - never executed - and the Turn closes
+    // on the turn-limit marker (CONTEXT.md: Endgame).
+    #[tokio::test]
+    async fn final_pass_tool_insistence_is_refused_and_closes_on_the_marker() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                // The final Pass offers no Tools; the model insists anyway.
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "evil.txt", "content": "pwned"}),
+                )),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "small task", deps).await;
+        assert!(matches!(
+            outcome,
+            Outcome::Ok(_, OutcomeStop::Reason(log::StopReason::TurnLimit))
+        ));
+        assert!(!root.path().join("evil.txt").exists());
+        let evs = events(&deps);
+        let result = find_tool_result(&evs, "w1").expect("w1 answered");
+        assert!(
+            matches!(result, Event::ToolResult { content, is_error: true, .. }
+                if content.contains("not offered"))
+        );
+    }
+
     #[tokio::test]
     async fn verified_writes_ordinary_warning_and_full_tool_list() {
         let root = root();
@@ -2263,19 +2348,32 @@ mod tests {
         }
     }
 
+    // A tool-insistent reply on the final Pass (ADR-0035): the call is
+    // refused at dispatch, never executed, and the refusal is what closes the
+    // Turn at its cap. Used to drive capped-Turn tests: the work lands on an
+    // offered Pass, then the insistent reply carries the Turn to the limit.
+    // (agent/tests.rs keeps its own copy - the two test modules own separate
+    // Response builders by house pattern.)
+    fn insistent_reply(id: &str) -> Response {
+        tool_use_result(id, "list_files", json!({"path": "."}))
+    }
+
     #[tokio::test]
     async fn a_cap_with_unverified_writes_carries_the_recovery_directive_out() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(1);
+        opts.turn_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
-            vec![just(tool_use_result(
-                "w1",
-                "write_file",
-                json!({"path": "a.txt", "content": "hi"}),
-            ))],
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(insistent_reply("x1")),
+            ],
         );
 
         let (outcome, _deps) = run_with(&session, "write it", deps).await;
@@ -2304,23 +2402,26 @@ mod tests {
         // 2026-07-14). The recovery names the failing command.
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(1);
+        opts.turn_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
-            vec![just(Response {
-                content: vec![
-                    ContentBlock::tool_use(
-                        "w1",
-                        "write_file",
-                        json!({"path": "a.txt", "content": "hi"}),
-                    ),
-                    ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
-                ],
-                stop_reason: StopReason::ToolUse,
-                usage: Usage::default(),
-                error: None,
-            })],
+            vec![
+                just(Response {
+                    content: vec![
+                        ContentBlock::tool_use(
+                            "w1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "hi"}),
+                        ),
+                        ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error: None,
+                }),
+                just(insistent_reply("x1")),
+            ],
         )
         .with_approvals(vec![true]);
 
@@ -2334,16 +2435,19 @@ mod tests {
     async fn the_shape_setpoint_rides_the_directive() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(1);
+        opts.turn_limit = Some(2);
         opts.recovery_shape = Some(RecoveryShape::Continuation);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
-            vec![just(tool_use_result(
-                "w1",
-                "write_file",
-                json!({"path": "a.txt", "content": "hi"}),
-            ))],
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(insistent_reply("x1")),
+            ],
         );
 
         let (outcome, _deps) = run_with(&session, "write it", deps).await;
@@ -2352,18 +2456,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_run_command_on_the_final_pass_does_not_displace_the_real_failure() {
+        // The verification dangles red on Pass 1; the model insists on a
+        // fresh run on the final Pass and is refused (ADR-0035). The refusal
+        // never ran, so the recovery still names the GENUINE failure - the
+        // Handoff seed's verbatim-verification guarantee (ADR-0028) holds.
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(2);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(Response {
+                    content: vec![
+                        ContentBlock::tool_use(
+                            "w1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "hi"}),
+                        ),
+                        ContentBlock::tool_use("r1", "run_command", json!({"command": "false"})),
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    error: None,
+                }),
+                just(tool_use_result(
+                    "r2",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, _deps) = run_with(&session, "run it", deps).await;
+        let (_conv, _reason, recovery) = recover(&outcome);
+        assert!(recovery.verification_failing);
+        assert_eq!(recovery.failing_command.as_deref(), Some("false"));
+    }
+
+    #[tokio::test]
     async fn a_spent_recovery_budget_settles_a_plain_turn_limit() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(1);
+        opts.turn_limit = Some(2);
         let session = session_with(root.path(), opts);
         let mut deps = deps_for(
             &session,
-            vec![just(tool_use_result(
-                "w1",
-                "write_file",
-                json!({"path": "a.txt", "content": "hi"}),
-            ))],
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(insistent_reply("x1")),
+            ],
         );
 
         // The Agent stamps the recoveries this user request already consumed.
@@ -2391,16 +2538,19 @@ mod tests {
     async fn recovery_limit_zero_disables_the_mechanic() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(1);
+        opts.turn_limit = Some(2);
         opts.recovery_limit = Some(0);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
-            vec![just(tool_use_result(
-                "w1",
-                "write_file",
-                json!({"path": "a.txt", "content": "hi"}),
-            ))],
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(insistent_reply("x1")),
+            ],
         );
 
         let (outcome, _deps) = run_with(&session, "write it", deps).await;

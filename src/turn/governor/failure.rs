@@ -80,7 +80,7 @@ pub fn annotation(ledger: &Ledger, name: &str, content: &str) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::governor::ledger::ToolResult;
+    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
     use serde_json::json;
 
     fn ok() -> ToolResult<'static> {
@@ -103,7 +103,7 @@ mod tests {
     // the fact write (Ledger) and the opinion (this module), composed the way
     // the answering arbiter composes them.
     fn annotated(ledger: &mut Ledger, name: &str, result: &ToolResult) -> Option<String> {
-        ledger.record_result(name, &json!({}), result);
+        ledger.record(name, &json!({}), result, CallOutcome::Ran);
         annotation(ledger, name, result.content)
     }
 
@@ -148,9 +148,9 @@ mod tests {
     // ----- stuck? -----
 
     fn fail_thrice(ledger: &mut Ledger, name: &str) {
-        ledger.record_result(name, &json!({}), &err());
-        ledger.record_result(name, &json!({}), &err());
-        ledger.record_result(name, &json!({}), &err());
+        ledger.record(name, &json!({}), &err(), CallOutcome::Ran);
+        ledger.record(name, &json!({}), &err(), CallOutcome::Ran);
+        ledger.record(name, &json!({}), &err(), CallOutcome::Ran);
     }
 
     fn batches(ledger: &mut Ledger, n: u64) {
@@ -162,8 +162,8 @@ mod tests {
     #[test]
     fn below_the_failure_threshold_is_never_stuck() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &json!({}), &err());
-        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
         ledger.close_batch();
 
         assert!(!stuck(&ledger));
@@ -203,7 +203,7 @@ mod tests {
         let mut ledger = Ledger::new(25);
         fail_thrice(&mut ledger, "read_file");
         batches(&mut ledger, 10);
-        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
         ledger.close_batch();
 
         assert!(stuck(&ledger));
@@ -213,7 +213,7 @@ mod tests {
     fn a_success_clears_the_streak_entirely() {
         let mut ledger = Ledger::new(25);
         fail_thrice(&mut ledger, "read_file");
-        ledger.record_result("read_file", &json!({}), &ok());
+        ledger.record("read_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger.close_batch();
 
         assert!(!stuck(&ledger));

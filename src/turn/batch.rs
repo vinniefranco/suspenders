@@ -5,7 +5,9 @@
 //!
 //! [`execute_tools`] runs a Pass's Tool Calls in emission order. Each call goes
 //! through the gates in sequence: the malformed-input sentinel (the LLM layer
-//! tags inputs that never parsed - those are answered, never run), the Tool
+//! tags inputs that never parsed - those are answered, never run), the
+//! offered-set check (a call this Pass's request did not offer is refused,
+//! never run - ADR-0035), the Tool
 //! Call answering arbiter before execution ([`governor::answer_sent`],
 //! ADR-0026: an identical repeat draws a replacement Tool Result instead of a
 //! rerun), then the Plugin lifecycle (ADR-0007: pre_run - which may halt the
@@ -20,6 +22,8 @@
 //! The loop skeleton lives in [`super::loop_`]; how a Turn ends when the model
 //! stops calling tools lives in [`super::finish`].
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::approvals;
@@ -31,7 +35,7 @@ use crate::plan::Update;
 use crate::plugin::Token;
 use crate::plugins;
 use crate::turn::deps::TurnDeps;
-use crate::turn::governor::ledger::ToolResult;
+use crate::turn::governor::ledger::{CallOutcome, ToolResult};
 use crate::turn::governor::{self, AnswerIntervention};
 use crate::turn::loop_::LoopState;
 use crate::voice;
@@ -109,27 +113,29 @@ async fn execute_tool<D: TurnDeps>(
         display_input(&input),
     ));
 
-    let (raw_content, is_error, artifacts) = run_block(state, &name, &input).await;
+    let answer = run_block(state, &name, &input).await;
 
-    // The outcome's facts go on the Ledger first, written once at this firing
+    // The Answer's facts go on the Ledger first, written once at this firing
     // site (ADR-0026) - replaced results included: a replaced duplicate still
     // counts toward the failure tally, and a duplicated write/run_command
-    // still moves the verify state. Then the answering moment's second
+    // still moves the verify state. The batch states the typed fact of
+    // whether the call ran; the Ledger's one recording method owns the
+    // routing (a denial and an offered-set refusal move fewer facts), so the
+    // Ledger never sniffs Voice wording. Then the answering moment's second
     // consultation: the arbiter judges what the model will READ, possibly
     // annotating it with the consecutive-failure suffix.
-    let result = ToolResult {
-        content: &raw_content,
-        is_error,
+    let result = answer.result();
+    state.ledger.record(&name, &input, &result, answer.outcome);
+    let intervention =
+        governor::answer_read(&state.ledger, &mut state.governors, &name, &input, &result);
+    let is_error = answer.is_error;
+    let content = match intervention {
+        Some(AnswerIntervention::AnnotateResult(annotated)) => annotated,
+        Some(AnswerIntervention::ReplaceResult { .. } | AnswerIntervention::RideTail(_)) => {
+            unreachable!("only an annotation issues after execution")
+        }
+        None => answer.content,
     };
-    state.ledger.record_result(&name, &input, &result);
-    let content =
-        match governor::answer_read(&state.ledger, &mut state.governors, &name, &input, &result) {
-            Some(AnswerIntervention::AnnotateResult(annotated)) => annotated,
-            Some(AnswerIntervention::ReplaceResult { .. } | AnswerIntervention::RideTail(_)) => {
-                unreachable!("only an annotation issues after execution")
-            }
-            None => raw_content,
-        };
 
     maybe_store_plan(state, &name, &input, is_error);
 
@@ -138,7 +144,7 @@ async fn execute_tool<D: TurnDeps>(
         name.clone(),
         content.clone(),
         is_error,
-        artifacts,
+        answer.artifacts,
     ));
 
     ContentBlock::tool_result(id, content, is_error)
@@ -171,23 +177,114 @@ pub(super) fn display_input(input: &Value) -> Value {
     }
 }
 
+// How the batch answered one Tool Call (see CONTEXT.md: Answer): the Tool
+// Result the model will read plus the typed fact of whether the call ran.
+// Built only through the constructors below, each pairing the Voice's
+// wording with its [`CallOutcome`] so the two cannot drift; the Ledger
+// records an Answer through its one method and owns what each fact moves.
+struct Answer {
+    content: String,
+    is_error: bool,
+    artifacts: HashMap<String, Value>,
+    outcome: CallOutcome,
+}
+
+impl Answer {
+    /// A malformed-input answer is recorded like any error - it reads as a
+    /// run.
+    fn malformed(raw: &str) -> Self {
+        Answer {
+            content: voice::malformed_input(raw),
+            is_error: true,
+            artifacts: Default::default(),
+            outcome: CallOutcome::Ran,
+        }
+    }
+
+    /// An offered-set refusal (ADR-0035): the Pass did not offer the Tool,
+    /// so the call never ran.
+    fn refused(name: &str) -> Self {
+        Answer {
+            content: voice::tool_not_offered(name),
+            is_error: true,
+            artifacts: Default::default(),
+            outcome: CallOutcome::Refused,
+        }
+    }
+
+    /// A Governor's replaced result still reads as a run (ADR-0026).
+    fn replaced(content: String, is_error: bool) -> Self {
+        Answer {
+            content,
+            is_error,
+            artifacts: Default::default(),
+            outcome: CallOutcome::Ran,
+        }
+    }
+
+    /// A Plugin halt reads as a failed run.
+    fn halted(reason: String, artifacts: HashMap<String, Value>) -> Self {
+        Answer {
+            content: reason,
+            is_error: true,
+            artifacts,
+            outcome: CallOutcome::Ran,
+        }
+    }
+
+    /// An Approval denial (ADR-0005): the command never ran.
+    fn denied() -> Self {
+        Answer {
+            content: voice::command_denied().to_string(),
+            is_error: true,
+            artifacts: Default::default(),
+            outcome: CallOutcome::Denied,
+        }
+    }
+
+    /// The Plugin pipeline executed the call.
+    fn ran(result: plugins::PipelineResult) -> Self {
+        Answer {
+            content: result.content,
+            is_error: result.is_error,
+            artifacts: result.artifacts,
+            outcome: CallOutcome::Ran,
+        }
+    }
+
+    /// The Tool Result the model will read, borrowed for the Ledger and the
+    /// arbiter.
+    fn result(&self) -> ToolResult<'_> {
+        ToolResult {
+            content: &self.content,
+            is_error: self.is_error,
+        }
+    }
+}
+
 // The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs - never
 // run those (mechanics, not a Governor's judgment). Otherwise the answering
 // arbiter judges what the model SENT (a replaced Tool Result skips execution),
 // then pre_run, Approval on the plugin-adjusted command, and execution with
 // post_run and Shaping.
-async fn run_block<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    name: &str,
-    input: &Value,
-) -> (String, bool, std::collections::HashMap<String, Value>) {
+async fn run_block<D: TurnDeps>(state: &mut LoopState<'_, D>, name: &str, input: &Value) -> Answer {
     if let Some(raw) = malformed_tool_input(input) {
-        return (voice::malformed_input(raw), true, Default::default());
+        return Answer::malformed(raw);
+    }
+
+    // The Offer is enforced at dispatch (ADR-0035): a call naming a Tool
+    // the Pass's Offer does not name is answered with the Voice's refusal
+    // and never runs - mechanics, not a Governor's judgment, at the same
+    // seam as the malformed-input sentinel. This is what makes the
+    // Verification Pass's run_command-only narrowing and the final Pass's
+    // no-Tools withdrawal real for a model that insists anyway.
+    if !state.offer.offers(name) {
+        return Answer::refused(name);
     }
 
     match governor::answer_sent(&state.governors, name, input) {
         Some(AnswerIntervention::ReplaceResult { content, is_error }) => {
-            return (content, is_error, Default::default());
+            return Answer::replaced(content, is_error);
         }
         Some(AnswerIntervention::AnnotateResult(_) | AnswerIntervention::RideTail(_)) => {
             unreachable!("only a replacement Tool Result issues before execution")
@@ -202,14 +299,14 @@ async fn run_lifecycle<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
-) -> (String, bool, std::collections::HashMap<String, Value>) {
+) -> Answer {
     let token = Token::new(name, input.clone(), state.tool_ctx.clone());
     let (token, failures) = plugins::pre_run(state.plugins, token);
     emit_plugin_errors(state, &failures);
 
     if token.halted {
         let reason = token.halt_reason.clone().unwrap_or_default();
-        return (reason, true, token.artifacts.clone());
+        return Answer::halted(reason, token.artifacts.clone());
     }
 
     // The one Approval seam: Some(text) gates and text is exactly what the
@@ -221,24 +318,17 @@ async fn run_lifecycle<D: TurnDeps>(
             if state.deps.request_approval(id, text).await {
                 execute_token(state, token).await
             } else {
-                (
-                    voice::command_denied().to_string(),
-                    true,
-                    Default::default(),
-                )
+                Answer::denied()
             }
         }
         None => execute_token(state, token).await,
     }
 }
 
-async fn execute_token<D: TurnDeps>(
-    state: &mut LoopState<'_, D>,
-    token: Token,
-) -> (String, bool, std::collections::HashMap<String, Value>) {
+async fn execute_token<D: TurnDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
     let (result, failures) = plugins::execute(state.plugins, token).await;
     emit_plugin_errors(state, &failures);
-    (result.content, result.is_error, result.artifacts)
+    Answer::ran(result)
 }
 
 fn emit_plugin_errors<D: TurnDeps>(state: &mut LoopState<'_, D>, failures: &[plugins::Failure]) {
@@ -257,4 +347,59 @@ fn new_ref() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("approval-{n}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The Answer constructors fuse the Voice's wording with the ran-fact so
+    // the pairing cannot drift (CONTEXT.md: Answer).
+
+    #[test]
+    fn a_refusal_pairs_the_not_offered_voice_with_the_refused_fact() {
+        // ADR-0035: the Pass did not offer the Tool; the call never ran.
+        let answer = Answer::refused("write_file");
+        assert_eq!(answer.content, voice::tool_not_offered("write_file"));
+        assert!(answer.is_error);
+        assert!(matches!(answer.outcome, CallOutcome::Refused));
+        assert!(answer.artifacts.is_empty());
+    }
+
+    #[test]
+    fn a_denial_pairs_the_command_denied_voice_with_the_denied_fact() {
+        // ADR-0005: the Approval gate; the command never ran.
+        let answer = Answer::denied();
+        assert_eq!(answer.content, voice::command_denied());
+        assert!(answer.is_error);
+        assert!(matches!(answer.outcome, CallOutcome::Denied));
+    }
+
+    #[test]
+    fn a_malformed_input_answer_reads_as_a_run() {
+        // Recorded like any error - the Ledger sees a failed run.
+        let answer = Answer::malformed("{not json");
+        assert_eq!(answer.content, voice::malformed_input("{not json"));
+        assert!(answer.is_error);
+        assert!(matches!(answer.outcome, CallOutcome::Ran));
+    }
+
+    #[test]
+    fn a_plugin_halt_reads_as_a_failed_run() {
+        let answer = Answer::halted("blocked by plugin".to_string(), Default::default());
+        assert_eq!(answer.content, "blocked by plugin");
+        assert!(answer.is_error);
+        assert!(matches!(answer.outcome, CallOutcome::Ran));
+    }
+
+    #[test]
+    fn the_result_view_borrows_the_answers_content_and_flag() {
+        // What the Ledger records and the arbiter reads is exactly the Tool
+        // Result the model will read.
+        let answer = Answer::replaced("cached result".to_string(), false);
+        let result = answer.result();
+        assert_eq!(result.content, "cached result");
+        assert!(!result.is_error);
+        assert!(matches!(answer.outcome, CallOutcome::Ran));
+    }
 }

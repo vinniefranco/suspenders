@@ -1,5 +1,7 @@
 # The Turn Limit ends with a forced final Pass
 
+> Amended by ADR-0035: real Tool Calls emitted on the final Pass no longer run - they are refused at dispatch with an error Tool Result, and the Turn closes on the turn-limit marker. The tolerance stated below ("those Tools run") is reversed. The text-markup detection amendment is unaffected: serialized markup was never executed, only detected.
+
 Live driving (2026-07-10, Qwen3.5-9B) showed a repeating failure at the
 Turn Limit: open-ended tasks (evaluate a project, add a feature
 tests-first) burn all 25 Passes exploring or debugging and settle at the

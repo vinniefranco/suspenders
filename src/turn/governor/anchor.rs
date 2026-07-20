@@ -130,7 +130,7 @@ mod tests {
 
     // ---- stale_plan ----
 
-    use crate::turn::governor::ledger::ToolResult;
+    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
 
     fn ok_write() -> ToolResult<'static> {
         ToolResult {
@@ -151,7 +151,7 @@ mod tests {
     fn planned_then_wrote(pass: u64) -> Ledger {
         let mut ledger = ledger_at(1);
         ledger.note_plan_updated();
-        ledger.record_result("edit_file", &json!({}), &ok_write());
+        ledger.record("edit_file", &json!({}), &ok_write(), CallOutcome::Ran);
         for _ in 1..pass {
             ledger.advance_pass();
         }
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn no_plan_is_never_stale() {
         let mut ledger = ledger_at(20);
-        ledger.record_result("edit_file", &json!({}), &ok_write());
+        ledger.record("edit_file", &json!({}), &ok_write(), CallOutcome::Ran);
         assert_eq!(stale_after(8).stale_plan(&ledger), None);
     }
 

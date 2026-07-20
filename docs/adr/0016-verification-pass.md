@@ -1,5 +1,7 @@
 # The pass before the final one is a Verification Pass when writes are unverified
 
+> Amended by ADR-0035: Tool Calls outside the Verification Pass's run_command-only offer no longer run - they are refused at dispatch with an error Tool Result. The tolerance stated below ("gets them executed") is reversed.
+
 Live driving (2026-07-10, Qwen3.5-9B, scout-edit fixture) exposed a hole
 in the verification pressure: the finish-gate Nudges (Verify,
 Verify-failed) only fire when the model VOLUNTARILY finishes. A model that

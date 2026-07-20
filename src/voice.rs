@@ -94,6 +94,24 @@ pub fn command_denied() -> &'static str {
     "[command denied by user]"
 }
 
+/// Tool Result for a Tool Call naming a Tool the current Pass did not offer
+/// (the Endgame's Verification Pass offers run_command only; the final Pass
+/// offers none). The offered specs shape the request; this refusal is the
+/// mechanic that enforces the narrowing at dispatch (ADR-0035).
+pub fn tool_not_offered(name: &str) -> String {
+    format!("[{name} was not offered this pass - call only the offered tools]")
+}
+
+/// Tool Result for a Scout Tool Call outside the read-only subset
+/// (CONTEXT.md: Scout - a Scout cannot edit, run commands, or dispatch
+/// further Scouts). The offered specs shape the Scout's request; this
+/// refusal is the mechanic that enforces the subset at dispatch (ADR-0035).
+/// `subset` names the allowed Tools, derived from the registry at the call
+/// site so the wording can never drift from the enforced set.
+pub fn scout_tool_refusal(name: &str, subset: &str) -> String {
+    format!("[{name} is not available to a scout - scouts are read-only: {subset}]")
+}
+
 // The Anchor's opening line. Anchor blocks are recognized by this prefix, so
 // Eviction can tell a stale Anchor from an ordinary message.
 const ANCHOR_PREFIX: &str = "[anchor - current goal and plan";
@@ -900,6 +918,33 @@ mod tests {
         assert!(nudge.contains("3 consecutive read_file failures - step back:"));
         assert!(nudge.contains("re-read the file or try a different approach"));
         assert!(!nudge.contains("Stop editing"));
+    }
+
+    // ---- tool_not_offered/1 ----
+
+    #[test]
+    fn tool_not_offered_names_the_tool_and_the_rule() {
+        let refusal = tool_not_offered("read_file");
+        assert!(refusal.starts_with('['));
+        assert!(refusal.ends_with(']'));
+        assert!(refusal.contains("read_file"));
+        assert!(refusal.contains("not offered"));
+        assert!(!refusal.contains('\u{2014}')); // em-dash
+        assert!(!refusal.contains('\u{2013}')); // en-dash
+    }
+
+    // ---- scout_tool_refusal/2 ----
+
+    #[test]
+    fn scout_tool_refusal_names_the_tool_and_the_read_only_subset() {
+        let refusal = scout_tool_refusal("run_command", "read_file, list_files, grep");
+        assert!(refusal.starts_with('['));
+        assert!(refusal.ends_with(']'));
+        assert!(refusal.contains("run_command"));
+        assert!(refusal.contains("read-only"));
+        assert!(refusal.contains("read_file"));
+        assert!(!refusal.contains('\u{2014}')); // em-dash
+        assert!(!refusal.contains('\u{2013}')); // en-dash
     }
 
     // ---- explore_nudge/0 ----

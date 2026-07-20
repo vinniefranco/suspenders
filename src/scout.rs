@@ -333,6 +333,28 @@ mod tests {
         }
     }
 
+    // ---- read-only enforcement (CONTEXT.md: Scout) ----
+
+    // A Scout whose model hallucinates a command Tool Call gets the Voice's
+    // refusal as the Tool Result and the call NEVER executes: the read-only
+    // subset is enforced at dispatch, not just by the offered specs.
+    #[tokio::test]
+    async fn a_hallucinated_command_call_is_refused_and_never_executes() {
+        let root = root();
+        let fake = FakeLlm::script(vec![
+            Entry::just(tool_use_response(
+                "t1",
+                "run_command",
+                json!({"command": "touch pwned"}),
+            )),
+            Entry::just(text_response("read-only report")),
+        ]);
+
+        let outcome = Scout::run("explore", &fake, &connection(), opts(&root)).await;
+        assert_eq!(outcome, ScoutOutcome::Ok("read-only report".to_string()));
+        assert!(!root.path().join("pwned").exists());
+    }
+
     // ---- run/4 happy path ----
 
     #[tokio::test]

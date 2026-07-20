@@ -232,19 +232,20 @@ fn verification_pass(pass: u64, turn_limit: u64, ledger: &Ledger) -> bool {
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
-    use crate::turn::governor::ledger::ToolResult;
+    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
     use serde_json::json;
 
     // One successful edit_file leaves the Turn with unverified writes.
     fn unverified() -> Ledger {
         let mut ledger = Ledger::new(25);
-        ledger.record_result(
+        ledger.record(
             "edit_file",
             &json!({"path": "a.ex"}),
             &ToolResult {
                 content: "edited a.ex",
                 is_error: false,
             },
+            CallOutcome::Ran,
         );
         ledger
     }
@@ -335,13 +336,14 @@ mod tests {
 
         let mut stuck = Ledger::new(25);
         for _ in 0..3 {
-            stuck.record_result(
+            stuck.record(
                 "grep",
                 &json!({}),
                 &ToolResult {
                     content: "boom",
                     is_error: true,
                 },
+                CallOutcome::Ran,
             );
         }
 
@@ -355,21 +357,23 @@ mod tests {
     // dangling-failure arm requires (ADR-0028 addendum 2026-07-14).
     fn command_failing() -> Ledger {
         let mut ledger = Ledger::new(25);
-        ledger.record_result(
+        ledger.record(
             "edit_file",
             &json!({"path": "a.ex"}),
             &ToolResult {
                 content: "edited a.ex",
                 is_error: false,
             },
+            CallOutcome::Ran,
         );
-        ledger.record_result(
+        ledger.record(
             "run_command",
             &json!({"command": "cargo test"}),
             &ToolResult {
                 content: "exit 1",
                 is_error: true,
             },
+            CallOutcome::Ran,
         );
         ledger
     }
@@ -407,13 +411,14 @@ mod tests {
         // green. The full suite's failure dangles, so the judgment still
         // fires, naming the failure.
         let mut ledger = command_failing();
-        ledger.record_result(
+        ledger.record(
             "run_command",
             &json!({"command": "cargo test one_test"}),
             &ToolResult {
                 content: "ok",
                 is_error: false,
             },
+            CallOutcome::Ran,
         );
 
         assert_eq!(
@@ -434,13 +439,14 @@ mod tests {
         // dangling-failure arm must NOT fire - that is exploration, not
         // unfinished implementation.
         let mut ledger = Ledger::new(25);
-        ledger.record_result(
+        ledger.record(
             "run_command",
             &json!({"command": "cargo test --lib 2>&1 | head -200"}),
             &ToolResult {
                 content: "exit 101",
                 is_error: true,
             },
+            CallOutcome::Ran,
         );
         assert!(ledger.dangling_failure());
         assert!(!ledger.wrote_this_turn());

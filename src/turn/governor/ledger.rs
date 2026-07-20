@@ -11,7 +11,7 @@
 //! Governors read it and judge; no Governor reads another Governor's state.
 //!
 //! Only the loop writes here, at the firing sites: `crate::turn::batch`
-//! records each Tool Call outcome ([`Ledger::record_result`]) and closes the
+//! records each Tool Call's Answer ([`Ledger::record`]) and closes the
 //! batch, [`crate::turn::loop_`] records Pass advancement, Compaction, the
 //! Pass's carried calls, and the truncated batch's close (ADR-0009), and
 //! `crate::turn::finish` advances the Pass a finish Nudge grants.
@@ -27,7 +27,7 @@ pub mod failure_category;
 
 use serde_json::Value;
 
-use crate::voice::{self, FailureCategory};
+use crate::voice::FailureCategory;
 
 /// The Tools whose successful results are writes (they arm the
 /// unverified-writes fact and invalidate results from before them).
@@ -37,6 +37,20 @@ pub(super) const WRITE_TOOLS: &[&str] = &["edit_file", "write_file"];
 pub struct ToolResult<'a> {
     pub content: &'a str,
     pub is_error: bool,
+}
+
+/// The batch's typed fact of whether an answered Tool Call ran (CONTEXT.md:
+/// Answer): the batch states the fact, the Ledger owns what each fact moves
+/// (the Turn Ledger holds facts, never opinions).
+#[derive(Debug, Clone, Copy)]
+pub enum CallOutcome {
+    /// The call ran.
+    Ran,
+    /// The Approval gate denied the command; it never ran (ADR-0005).
+    Denied,
+    /// The Pass did not offer the Tool the call named; it never ran
+    /// (ADR-0035).
+    Refused,
 }
 
 // One Tool's consecutive-failure streak: how many in a row, the per-category
@@ -169,16 +183,41 @@ impl Ledger {
         self.pass_calls = calls;
     }
 
-    /// Records one executed (or replaced) Tool Call's outcome: the
-    /// consecutive-failure tally for its Tool (a success resets it), the
-    /// write/verification state, and the run_command outcomes - the last run
-    /// and the per-command-string record. Record EVERY outcome - a replaced
-    /// duplicate still counts toward the failure tally, and a duplicated
-    /// write/run_command still moves the verify state.
-    pub fn record_result(&mut self, name: &str, input: &Value, result: &ToolResult) {
-        self.record_failure(name, result);
-        self.record_write(name, result.is_error);
-        self.record_command(name, input, result);
+    /// Records how the batch answered one Tool Call (CONTEXT.md: Answer):
+    /// the batch states the typed [`CallOutcome`] fact, this method owns
+    /// what each fact moves. The batch knows structurally which fact it
+    /// answered, so the Ledger never sniffs Voice wording (facts, never
+    /// opinions - and the Voice is tuned per model, so wording must never
+    /// be load-bearing here).
+    ///
+    /// Record EVERY `Ran` outcome - a replaced duplicate still counts toward
+    /// the failure tally, and a duplicated write/run_command still moves the
+    /// verify state (ADR-0026).
+    pub fn record(&mut self, name: &str, input: &Value, result: &ToolResult, outcome: CallOutcome) {
+        match outcome {
+            // An executed (or replaced) call moves every fact: the
+            // consecutive-failure tally for its Tool (a success resets it),
+            // the write/verification state, and the run_command outcomes -
+            // the last run and the per-command-string record.
+            CallOutcome::Ran => {
+                self.record_failure(name, result);
+                self.record_write(name, result.is_error);
+                self.record_command(name, input, result);
+            }
+            // An Approval denial never ran, so the run_command outcomes
+            // stand - but a denial still answers the verify demand (a
+            // run_command verifies, denied alike, ADR-0005), so the write
+            // state moves like any run_command outcome, and the denial
+            // counts toward the failure tally.
+            CallOutcome::Denied => {
+                self.record_failure(name, result);
+                self.record_write(name, result.is_error);
+            }
+            // An offered-set refusal never ran, so only the
+            // consecutive-failure tally moves - the write/verify facts and
+            // the run_command outcomes stand (ADR-0035).
+            CallOutcome::Refused => self.record_failure(name, result),
+        }
     }
 
     /// A Tool Call batch closed: the failure-recency clock advances.
@@ -356,13 +395,14 @@ impl Ledger {
     // The most recent run_command this Turn: a failing one sets the fact, a
     // passing one clears it. The per-command-string record moves the same
     // way, keyed by the call's command string - a passing run clears only
-    // its own entry. Exactly one exemption: an Approval-denied command never
-    // ran, so it leaves the facts untouched. A plugin-halted run_command
-    // also never ran, but its halt DOES set the facts - the halt reads as a
-    // failed run and the verify-failed gate follows suit. Only run_command
-    // outcomes touch this.
+    // its own entry. Calls that never ran never reach here: [`Ledger::record`]
+    // routes a Denied or Refused Answer past this method (ADR-0005,
+    // ADR-0035). A plugin-halted run_command also never
+    // ran, but its halt DOES set the facts - the halt reads as a failed run
+    // and the verify-failed gate follows suit. Only run_command outcomes
+    // touch this.
     fn record_command(&mut self, name: &str, input: &Value, result: &ToolResult) {
-        if name != "run_command" || result.content == voice::command_denied() {
+        if name != "run_command" {
             return;
         }
         self.command_failing = result.is_error;
@@ -413,9 +453,9 @@ mod tests {
     #[test]
     fn consecutive_failures_tally_per_tool() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &json!({}), &err());
-        ledger.record_result("read_file", &json!({}), &err());
-        ledger.record_result("grep", &json!({}), &err());
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("grep", &json!({}), &err(), CallOutcome::Ran);
 
         assert_eq!(ledger.failure_streak("read_file").map(|(n, _)| n), Some(2));
         assert_eq!(ledger.failure_streak("grep").map(|(n, _)| n), Some(1));
@@ -425,9 +465,9 @@ mod tests {
     #[test]
     fn a_success_for_the_tool_resets_its_streak() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &json!({}), &err());
-        ledger.record_result("read_file", &json!({}), &err());
-        ledger.record_result("read_file", &json!({}), &ok());
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("read_file", &json!({}), &ok(), CallOutcome::Ran);
 
         assert_eq!(ledger.failure_streak("read_file"), None);
     }
@@ -435,14 +475,15 @@ mod tests {
     #[test]
     fn failures_carry_their_error_categories() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &json!({}), &err());
-        ledger.record_result(
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record(
             "read_file",
             &json!({}),
             &ToolResult {
                 content: "enoent: no such file",
                 is_error: true,
             },
+            CallOutcome::Ran,
         );
 
         let (count, categories) = ledger.failure_streak("read_file").unwrap();
@@ -456,7 +497,7 @@ mod tests {
     #[test]
     fn tallies_stamp_their_recency_against_the_batch_clock() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &json!({}), &err());
+        ledger.record("read_file", &json!({}), &err(), CallOutcome::Ran);
         ledger.close_batch();
         ledger.close_batch();
 
@@ -469,38 +510,38 @@ mod tests {
     #[test]
     fn a_successful_write_arms_unverified_a_failed_one_doesnt() {
         let mut a = Ledger::new(25);
-        a.record_result("write_file", &json!({}), &ok());
+        a.record("write_file", &json!({}), &ok(), CallOutcome::Ran);
         assert!(a.unverified_writes());
 
         let mut b = Ledger::new(25);
-        b.record_result("edit_file", &json!({}), &ok());
+        b.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         assert!(b.unverified_writes());
 
         let mut c = Ledger::new(25);
-        c.record_result("write_file", &json!({}), &err());
+        c.record("write_file", &json!({}), &err(), CallOutcome::Ran);
         assert!(!c.unverified_writes());
     }
 
     #[test]
     fn any_run_command_verifies() {
         let mut base = Ledger::new(25);
-        base.record_result("edit_file", &json!({}), &ok());
+        base.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
 
         let mut a = base.clone();
-        a.record_result("run_command", &json!({}), &ok());
+        a.record("run_command", &json!({}), &ok(), CallOutcome::Ran);
         assert!(!a.unverified_writes());
 
         let mut b = base.clone();
-        b.record_result("run_command", &json!({}), &err());
+        b.record("run_command", &json!({}), &err(), CallOutcome::Ran);
         assert!(!b.unverified_writes());
     }
 
     #[test]
     fn a_write_after_the_run_command_is_unverified_again() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("edit_file", &json!({}), &ok());
-        ledger.record_result("run_command", &json!({}), &ok());
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record("run_command", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
 
         assert!(ledger.unverified_writes());
     }
@@ -510,12 +551,17 @@ mod tests {
         let mut ledger = Ledger::new(25);
         assert!(!ledger.wrote_this_turn());
 
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         assert!(ledger.wrote_this_turn());
 
         // Monotonic: the run_command clears unverified_writes but never the
         // wrote-this-turn mark.
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
         assert!(!ledger.unverified_writes());
         assert!(ledger.wrote_this_turn());
     }
@@ -523,16 +569,21 @@ mod tests {
     #[test]
     fn a_failed_write_does_not_mark_the_turn() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("write_file", &json!({}), &err());
+        ledger.record("write_file", &json!({}), &err(), CallOutcome::Ran);
         assert!(!ledger.wrote_this_turn());
     }
 
     #[test]
     fn a_read_only_turn_never_marks_the_turn() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("read_file", &json!({}), &ok());
-        ledger.record_result("grep", &json!({}), &ok());
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        ledger.record("read_file", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record("grep", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &err(),
+            CallOutcome::Ran,
+        );
         assert!(!ledger.wrote_this_turn());
     }
 
@@ -541,27 +592,75 @@ mod tests {
     #[test]
     fn a_failing_run_command_sets_the_fact_a_passing_one_clears_it() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &json!({}), &err());
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Ran);
         assert!(ledger.command_failing());
 
-        ledger.record_result("run_command", &json!({}), &ok());
+        ledger.record("run_command", &json!({}), &ok(), CallOutcome::Ran);
         assert!(!ledger.command_failing());
     }
 
     #[test]
     fn a_denied_command_never_ran_so_the_fact_stands() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &json!({}), &err());
-        ledger.record_result(
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record(
             "run_command",
-            &json!({"command": "cargo test"}),
+            &json!({}),
             &ToolResult {
                 content: crate::voice::command_denied(),
                 is_error: true,
             },
+            CallOutcome::Denied,
         );
 
         assert!(ledger.command_failing());
+    }
+
+    #[test]
+    fn a_denied_command_still_answers_the_verify_demand() {
+        let mut ledger = Ledger::new(25);
+        ledger.record(
+            "write_file",
+            &json!({"path": "a.txt"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
+        assert!(ledger.unverified_writes());
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Denied);
+
+        assert!(!ledger.unverified_writes());
+    }
+
+    #[test]
+    fn a_refused_command_never_ran_so_the_fact_stands() {
+        let mut ledger = Ledger::new(25);
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &err(),
+            CallOutcome::Ran,
+        );
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Refused);
+
+        // The phantom run clears nothing and fails nothing: the genuine
+        // failure still dangles under ITS command string.
+        assert!(ledger.command_failing());
+        assert_eq!(ledger.dangling_command(), Some("cargo test"));
+    }
+
+    #[test]
+    fn a_refused_command_never_ran_so_unverified_writes_stand() {
+        let mut ledger = Ledger::new(25);
+        ledger.record(
+            "write_file",
+            &json!({"path": "a.txt"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
+        assert!(ledger.unverified_writes());
+        ledger.record("run_command", &json!({}), &err(), CallOutcome::Refused);
+
+        assert!(ledger.unverified_writes());
     }
 
     // ----- dangling failures per command string -----
@@ -569,11 +668,17 @@ mod tests {
     #[test]
     fn a_green_filtered_rerun_leaves_the_failure_dangling() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
-        ledger.record_result(
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &err(),
+            CallOutcome::Ran,
+        );
+        ledger.record(
             "run_command",
             &json!({"command": "cargo test one_test_name"}),
             &ok(),
+            CallOutcome::Ran,
         );
 
         assert!(!ledger.command_failing());
@@ -583,8 +688,18 @@ mod tests {
     #[test]
     fn a_green_rerun_of_the_same_command_clears_its_failure() {
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &err(),
+            CallOutcome::Ran,
+        );
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
 
         assert!(!ledger.dangling_failure());
     }
@@ -595,7 +710,12 @@ mod tests {
         assert!(!ledger.dangling_failure());
 
         // Only run_command outcomes touch the record.
-        ledger.record_result("edit_file", &json!({"path": "a.ex"}), &err());
+        ledger.record(
+            "edit_file",
+            &json!({"path": "a.ex"}),
+            &err(),
+            CallOutcome::Ran,
+        );
         assert!(!ledger.dangling_failure());
     }
 
@@ -604,11 +724,21 @@ mod tests {
         let mut ledger = Ledger::new(25);
         assert_eq!(ledger.dangling_command(), None);
 
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &err());
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &err(),
+            CallOutcome::Ran,
+        );
         assert_eq!(ledger.dangling_command(), Some("cargo test"));
 
         // A green rerun of the same string clears it - nothing dangles.
-        ledger.record_result("run_command", &json!({"command": "cargo test"}), &ok());
+        ledger.record(
+            "run_command",
+            &json!({"command": "cargo test"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
         assert_eq!(ledger.dangling_command(), None);
     }
 
@@ -618,16 +748,41 @@ mod tests {
         // failed; B cleared its own entry, so the newest-recorded entry that
         // still fails is A.
         let mut ledger = Ledger::new(25);
-        ledger.record_result("run_command", &json!({"command": "cmd A"}), &err());
-        ledger.record_result("run_command", &json!({"command": "cmd B"}), &err());
-        ledger.record_result("run_command", &json!({"command": "cmd B"}), &ok());
+        ledger.record(
+            "run_command",
+            &json!({"command": "cmd A"}),
+            &err(),
+            CallOutcome::Ran,
+        );
+        ledger.record(
+            "run_command",
+            &json!({"command": "cmd B"}),
+            &err(),
+            CallOutcome::Ran,
+        );
+        ledger.record(
+            "run_command",
+            &json!({"command": "cmd B"}),
+            &ok(),
+            CallOutcome::Ran,
+        );
 
         assert_eq!(ledger.dangling_command(), Some("cmd A"));
 
         // Now A red, B red (both dangle): the most-recently-recorded wins.
         let mut two = Ledger::new(25);
-        two.record_result("run_command", &json!({"command": "cmd A"}), &err());
-        two.record_result("run_command", &json!({"command": "cmd B"}), &err());
+        two.record(
+            "run_command",
+            &json!({"command": "cmd A"}),
+            &err(),
+            CallOutcome::Ran,
+        );
+        two.record(
+            "run_command",
+            &json!({"command": "cmd B"}),
+            &err(),
+            CallOutcome::Ran,
+        );
         assert_eq!(two.dangling_command(), Some("cmd B"));
     }
 
@@ -665,7 +820,7 @@ mod tests {
         assert_eq!(ledger.writes_since_plan_update(), None);
 
         // Writes before any Plan exists do not start a counter.
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger.advance_pass();
         assert_eq!(ledger.passes_since_plan_update(), None);
         assert_eq!(ledger.writes_since_plan_update(), None);
@@ -686,7 +841,7 @@ mod tests {
     fn a_plan_update_resets_both_counters_to_its_pass() {
         let mut ledger = Ledger::new(25);
         ledger.note_plan_carried();
-        ledger.record_result("edit_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger.advance_pass();
         ledger.advance_pass();
         assert_eq!(ledger.passes_since_plan_update(), Some(2));
@@ -705,11 +860,11 @@ mod tests {
         let mut ledger = Ledger::new(25);
         ledger.note_plan_updated();
 
-        ledger.record_result("edit_file", &json!({}), &ok());
-        ledger.record_result("write_file", &json!({}), &ok());
-        ledger.record_result("edit_file", &json!({}), &err());
-        ledger.record_result("run_command", &json!({}), &ok());
-        ledger.record_result("read_file", &json!({}), &ok());
+        ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record("write_file", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record("edit_file", &json!({}), &err(), CallOutcome::Ran);
+        ledger.record("run_command", &json!({}), &ok(), CallOutcome::Ran);
+        ledger.record("read_file", &json!({}), &ok(), CallOutcome::Ran);
 
         assert_eq!(ledger.writes_since_plan_update(), Some(2));
     }

@@ -71,7 +71,9 @@ impl Compaction {
 
     /// Checks whether the Conversation's token estimate exceeds the Compaction
     /// Target (the same low-water mark Eviction settles to), meaning Proactive
-    /// Compaction should fire before the Turn's first Pass.
+    /// Compaction should fire before the Turn's first Pass. The single
+    /// definition of the trigger (baud's `Baud.Compaction.proactive?/1`):
+    /// callers consult this rather than restating the comparison.
     pub fn proactive(conv: &Conversation) -> bool {
         conv.token_estimate() > conv.compaction_target()
     }
@@ -429,6 +431,24 @@ mod tests {
         let mut conv = Conversation::new("You are Baud.", ConversationOpts::new(1000, 200));
         conv.add_user_text("a ".repeat(700));
         conv.add_assistant_blocks(vec![ContentBlock::text("b ".repeat(700))]);
+        assert!(Compaction::proactive(&conv));
+    }
+
+    #[test]
+    fn holds_at_the_target_exactly_and_fires_one_token_over() {
+        // The trigger is strict: AT the Compaction Target the Conversation
+        // still fits, so nothing fires. The estimate rides the usage floor
+        // (`token_estimate` is the char estimate floored by the API's
+        // `input_tokens`), the binding term at Turn start when the previous
+        // Turn's usage is on record.
+        let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).eviction_slack(0.0));
+        conv.add_user_text("short");
+        assert_eq!(conv.compaction_target(), 800);
+
+        conv.note_usage(crate::conversation::Usage::with_input_tokens(800));
+        assert!(!Compaction::proactive(&conv));
+
+        conv.note_usage(crate::conversation::Usage::with_input_tokens(801));
         assert!(Compaction::proactive(&conv));
     }
 

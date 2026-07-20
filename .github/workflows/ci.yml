@@ -39,6 +39,36 @@ jobs:
       - name: Doctest
         run: cargo test --doc
 
+  # line coverage via tarpaulin (config in .tarpaulin.toml); runs alongside ci
+  # since coverage instrumentation forces a full rebuild either way
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Sync toolchain
+        run: rustup show active-toolchain
+
+      # coverage RUSTFLAGS produce different artifacts than the test job,
+      # so keep a separate cache keyspace
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      # prebuilt binary, no compile cost
+      - name: Install tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      - name: Coverage
+        run: cargo tarpaulin
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: coverage-report
+          path: target/tarpaulin
+          if-no-files-found: error
+
   # release binaries, built only when main advances (all deps are pure Rust
   # thanks to rustls + fancy-regex, so cross-arch darwin builds need no SDK fuss)
   build:
