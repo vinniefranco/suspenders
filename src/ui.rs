@@ -38,7 +38,6 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::agent::AgentHandle;
 use crate::approvals::Decision as AgentDecision;
 use crate::event::Event;
-use crate::history::History;
 use crate::session::log::SessionEntry;
 use crate::session::{Session, default_config_path};
 use picker::{Picker, PickerOutcome};
@@ -197,10 +196,10 @@ async fn run_loop(
     // Persistent prompt history (up/down recall ACROSS Sessions). The store
     // lives beside the Session Logs; the pure core keeps the in-memory ring -
     // the adapter loads it at mount and appends on each submit (HistoryAppend).
-    let history_store = history_path(session).and_then(|p| crate::history::open(&p).ok());
+    let history_store = history_path(session).and_then(|p| open_history(&p));
     let history = history_store
-        .as_ref()
-        .map(History::read)
+        .as_deref()
+        .map(read_history)
         .unwrap_or_default();
 
     let mut screen = Some(Screen::new(ScreenOpts {
@@ -270,7 +269,7 @@ async fn run_loop(
                                 // tested place.
                                 let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(map_key(&key_event));
-                                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_deref()).await);
                                 dirty = true;
                             }
                         }
@@ -281,7 +280,7 @@ async fn run_loop(
                             if let Some(key) = map_mouse(&mouse) {
                                 let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(key);
-                                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_deref()).await);
                             }
                             dirty = true;
                         }
@@ -311,7 +310,7 @@ async fn run_loop(
                     Ok(event) => {
                         let core = screen.take().unwrap();
                         let (core, effects) = core.apply_event(event);
-                        screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                        screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_deref()).await);
                     }
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
@@ -321,7 +320,7 @@ async fn run_loop(
                     Err(RecvError::Closed) => {
                         let core = screen.take().unwrap();
                         let (core, effects) = core.agent_down();
-                        screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                        screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_deref()).await);
                         let geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
                         // Nothing more will arrive; wait only on input now.
                         return drain_input(terminal, input, screen.take().unwrap(), viewport, geometry, conn, cache).await;
@@ -337,7 +336,7 @@ async fn run_loop(
             Some(event) = selector_rx.recv() => {
                 let core = screen.take().unwrap();
                 let (core, effects) = core.apply_event(event);
-                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_ref()).await);
+                screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_deref()).await);
                 // The fetch result never changes the model, but a pick could
                 // have raced in; refresh to stay truthful (still off the tick).
                 conn.model = agent.active_model().await;
@@ -479,7 +478,7 @@ async fn run_effects(
     ctx: &AdapterCtx<'_>,
     viewport: &mut Viewport,
     geometry: Geometry,
-    history: Option<&History>,
+    history: Option<&str>,
 ) -> Screen {
     for effect in effects {
         screen = run_effect(screen, effect, ctx, viewport, geometry, history).await;
@@ -493,7 +492,7 @@ async fn run_effect(
     ctx: &AdapterCtx<'_>,
     viewport: &mut Viewport,
     geometry: Geometry,
-    history: Option<&History>,
+    history: Option<&str>,
 ) -> Screen {
     let agent = ctx.agent;
     // Scroll effects clamp against the LAST draw's measure (see [`Geometry`]);
@@ -550,8 +549,8 @@ async fn run_effect(
         // Sessions. The pure core already added it to its in-memory ring; this
         // writes it through to the on-disk store (best-effort, never fatal).
         Effect::HistoryAppend(prompt) => {
-            if let Some(store) = history {
-                store.append(&prompt);
+            if let Some(path) = history {
+                append_history(path, &prompt);
             }
             screen
         }
@@ -576,6 +575,69 @@ fn history_path(session: &Session) -> Option<String> {
     std::path::Path::new(&session.session_dir)
         .parent()
         .map(|dir| dir.join("history").to_string_lossy().into_owned())
+}
+
+// The on-disk prompt-history store: a size-capped newline-delimited file (a
+// wrap log) - the oldest entries are discarded once the file exceeds the cap,
+// so history stays bounded without unbounded growth. baud backs this with
+// Erlang's `:disk_log` (a two-file wrap log at ~100 kB each); Rust has no
+// `:disk_log`, so this port keeps the same *contract* - a bounded,
+// append-only, order-preserving, crash-tolerant prompt ring - over a single
+// file trimmed to the cap. Prompts are line-oriented user text, so one prompt
+// per line round-trips without escaping; a torn tail is dropped on read,
+// never load-bearing. Reads and appends re-open the file by path, so a crash
+// between calls never loses committed rows.
+
+/// The combined cap across the wrap log (~200 kB, matching baud's 2×100 kB).
+const HISTORY_MAX_BYTES: usize = 200_000;
+
+/// Opens (or creates) the history store at `path`, returning the path on
+/// success. Safe to call multiple times per session. `None` on failure to
+/// create the parent directory (the session then runs without persistence).
+fn open_history(path: &str) -> Option<String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    // Touch the file so a subsequent read of a fresh log succeeds.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+    Some(path.to_string())
+}
+
+/// Reads all entries from oldest to newest. Returns an empty list when the
+/// store is empty or on any error (the history ring starts fresh).
+fn read_history(path: &str) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content.lines().map(|l| l.to_string()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Appends one prompt. Does not deduplicate or cap the *count* - that is the
+/// in-memory ring's job in the pure core - but trims the oldest rows to keep
+/// the file under the byte cap (the wrap). Silently ignores errors so a full
+/// disk or corrupted store never crashes the UI.
+fn append_history(path: &str, text: &str) {
+    use std::io::Write;
+
+    let mut rows = read_history(path);
+    rows.push(text.to_string());
+
+    // Wrap: drop oldest rows until the serialized size fits the cap.
+    while serialized_len(&rows) > HISTORY_MAX_BYTES && rows.len() > 1 {
+        rows.remove(0);
+    }
+
+    let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(body.as_bytes());
+    }
+}
+
+fn serialized_len(rows: &[String]) -> usize {
+    rows.iter().map(|r| r.len() + 1).sum()
 }
 
 fn to_agent_decision(decision: Decision) -> AgentDecision {
@@ -722,5 +784,93 @@ mod tests {
     async fn next_if_ready_returns_none_without_suspending_when_nothing_is_buffered() {
         let mut stream = futures_util::stream::pending::<u8>();
         assert_eq!(next_if_ready(&mut stream).await, None);
+    }
+
+    // The persistent prompt-history store (the on-disk wrap log the adapter
+    // owns): open/read/append over a size-capped newline-delimited file.
+
+    use tempfile::TempDir;
+
+    fn store(dir: &TempDir) -> String {
+        let path = dir.path().join("nested/history.log");
+        open_history(&path.to_string_lossy()).unwrap()
+    }
+
+    #[test]
+    fn open_creates_the_parent_directory_and_a_fresh_store_reads_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = store(&tmp);
+        assert_eq!(read_history(&path), Vec::<String>::new());
+    }
+
+    #[test]
+    fn append_then_read_returns_oldest_to_newest() {
+        let tmp = TempDir::new().unwrap();
+        let path = store(&tmp);
+        append_history(&path, "first prompt");
+        append_history(&path, "second prompt");
+        append_history(&path, "third prompt");
+
+        assert_eq!(
+            read_history(&path),
+            vec![
+                "first prompt".to_string(),
+                "second prompt".to_string(),
+                "third prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_does_not_deduplicate() {
+        let tmp = TempDir::new().unwrap();
+        let path = store(&tmp);
+        append_history(&path, "same");
+        append_history(&path, "same");
+        assert_eq!(
+            read_history(&path),
+            vec!["same".to_string(), "same".to_string()]
+        );
+    }
+
+    #[test]
+    fn reading_a_missing_store_yields_an_empty_list() {
+        assert_eq!(
+            read_history("/nonexistent/dir/history.log"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_wrap_discards_the_oldest_entries_past_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let path = store(&tmp);
+
+        // One long-lived marker, then enough bulk to blow past the cap.
+        append_history(&path, "OLDEST");
+        let bulk = "x".repeat(10_000);
+        for _ in 0..30 {
+            append_history(&path, &bulk);
+        }
+        append_history(&path, "NEWEST");
+
+        let rows = read_history(&path);
+        // The newest survives; the oldest was wrapped out; the file stays bounded.
+        assert_eq!(rows.last().unwrap(), "NEWEST");
+        assert!(!rows.contains(&"OLDEST".to_string()));
+        assert!(serialized_len(&rows) <= HISTORY_MAX_BYTES);
+    }
+
+    #[test]
+    fn open_is_idempotent_and_preserves_existing_rows() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.log");
+        let p = path.to_string_lossy().into_owned();
+
+        let opened = open_history(&p).unwrap();
+        append_history(&opened, "kept");
+
+        let reopened = open_history(&p).unwrap();
+        assert_eq!(read_history(&reopened), vec!["kept".to_string()]);
     }
 }

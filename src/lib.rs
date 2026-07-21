@@ -9,7 +9,6 @@ pub mod content;
 pub mod context_files;
 pub mod conversation;
 pub mod event;
-pub mod history;
 pub mod llm;
 pub mod plan;
 pub mod plugin;
