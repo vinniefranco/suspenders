@@ -142,12 +142,7 @@ fn sanitize_input(input: &Value) -> Value {
 /// result to the Result Cap: the plugin-free dispatch path.
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     let mut result = execute(name, input, ctx).await;
-    let start_line = if name == "read_file" {
-        input.get("start_line").and_then(|v| v.as_i64())
-    } else {
-        None
-    };
-    result.content = shaping::shape(name, &result.content, ctx.result_cap, start_line);
+    result.content = shaping::shape(name, input, &result.content, ctx.result_cap);
     result
 }
 

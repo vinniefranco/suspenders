@@ -125,9 +125,9 @@ pub async fn execute(plugins: &[Registered], token: Token) -> (PipelineResult, V
     let result = token.result.expect("result set before post_run fold");
     let content = shaping::shape(
         &token.tool,
+        &token.input,
         &result.content,
         token.ctx.result_cap,
-        read_start_line(&token.tool, &token.input),
     );
 
     (
@@ -300,16 +300,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "plugin panicked".to_string()
-    }
-}
-
-// Shaping reads read_file's `start_line` so a cut's resume marker is absolute
-// (mirrors `tools::run`); every other tool passes `None`.
-fn read_start_line(tool: &str, input: &Value) -> Option<i64> {
-    if tool == "read_file" {
-        input.get("start_line").and_then(|v| v.as_i64())
-    } else {
-        None
     }
 }
 

@@ -3,12 +3,15 @@
 //! Session.
 //!
 //! `Tools::run` shapes every Tool Result through here; individual tools carry
-//! no size logic. run_command keeps its start AND end (the exit code and last
-//! errors live at the end); read_file cuts at a line boundary and its marker
-//! names the exact `start_line` that continues the read; every other tool
-//! keeps the start.
+//! no size logic. Callers pass the raw Tool Call input; Shaping owns the
+//! read_file resume-marker rule (reading `start_line` from the input so a
+//! cut's resume point is file-absolute). run_command keeps its start AND end
+//! (the exit code and last errors live at the end); read_file cuts at a line
+//! boundary and its marker names the exact `start_line` that continues the
+//! read; every other tool keeps the start.
 
 use crate::voice;
+use serde_json::Value;
 
 /// Even a tiny Context Budget gets a usable file read (~1.1k tokens).
 const FLOOR_CHARS: usize = 4_000;
@@ -26,14 +29,31 @@ pub fn cap_for(context_budget: u64, max_tokens_reserve: u64) -> usize {
 }
 
 /// Shapes one Tool Result's content to the Result Cap. Content within the cap
-/// passes through untouched. `start_line` is read from read_file's cut so the
-/// resume point in the marker is absolute; pass `None` for other tools.
-pub fn shape(tool_name: &str, content: &str, cap: usize, start_line: Option<i64>) -> String {
+/// passes through untouched. `input` is the raw Tool Call input: for read_file
+/// Shaping reads its `start_line` so a cut's resume marker is file-absolute;
+/// every other tool's input is ignored.
+pub fn shape(tool_name: &str, input: &Value, content: &str, cap: usize) -> String {
     let total = content.chars().count();
     if total <= cap {
         content.to_string()
     } else {
-        cut(tool_name, content, cap, total, start_line)
+        cut(
+            tool_name,
+            content,
+            cap,
+            total,
+            read_start_line(tool_name, input),
+        )
+    }
+}
+
+// Only read_file's cut resumes at an absolute line; every other tool's input
+// carries nothing Shaping needs.
+fn read_start_line(tool_name: &str, input: &Value) -> Option<i64> {
+    if tool_name == "read_file" {
+        input.get("start_line").and_then(|v| v.as_i64())
+    } else {
+        None
     }
 }
 
@@ -126,6 +146,7 @@ fn char_slice(s: &str, start: usize, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // ---- cap_for/2 ----
 
@@ -147,25 +168,25 @@ mod tests {
         assert_eq!(cap_for(1, 1), 4_000);
     }
 
-    // ---- shape/3 ----
+    // ---- shape/4 ----
 
     #[test]
     fn content_within_the_cap_passes_through_untouched() {
-        assert_eq!(shape("read_file", "short", 100, None), "short");
-        assert_eq!(shape("run_command", "short", 100, None), "short");
+        assert_eq!(shape("read_file", &json!({}), "short", 100), "short");
+        assert_eq!(shape("run_command", &json!({}), "short", 100), "short");
     }
 
     #[test]
     fn content_exactly_at_the_cap_passes_through_untouched() {
         let content = "a".repeat(100);
-        assert_eq!(shape("read_file", &content, 100, None), content);
+        assert_eq!(shape("read_file", &json!({}), &content, 100), content);
     }
 
     #[test]
     fn head_only_shaping_keeps_first_cap_chars_and_appends_marker() {
         let content = "a".repeat(250);
         assert_eq!(
-            shape("grep", &content, 100, None),
+            shape("grep", &json!({}), &content, 100),
             format!(
                 "{}\n[truncated: output is 250 chars, showing the first 100]",
                 "a".repeat(100)
@@ -182,7 +203,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let shaped = shape("read_file", &content, 100, None);
+        let shaped = shape("read_file", &json!({}), &content, 100);
 
         assert!(shaped.ends_with(
             "line-0010\n[truncated at line 10 of 30 - continue with read_file start_line 11]"
@@ -197,11 +218,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let shaped = shape("read_file", &content, 100, Some(21));
+        let shaped = shape("read_file", &json!({"start_line": 21}), &content, 100);
 
         // The content is the slice from line 21 on, so its 10th line is 30.
         assert!(
             shaped.contains("[truncated at line 30 of 50 - continue with read_file start_line 31]")
+        );
+    }
+
+    #[test]
+    fn read_file_shaping_treats_a_missing_or_non_numeric_start_line_as_one() {
+        let content = (1..=30)
+            .map(|i| format!("line-{i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resume = "[truncated at line 10 of 30 - continue with read_file start_line 11]";
+
+        assert!(shape("read_file", &json!({"path": "a.txt"}), &content, 100).contains(resume));
+        assert!(shape("read_file", &json!({"start_line": "21"}), &content, 100).contains(resume));
+        assert!(shape("read_file", &json!({"start_line": 0}), &content, 100).contains(resume));
+    }
+
+    #[test]
+    fn non_read_file_tools_ignore_a_start_line_in_the_input() {
+        let content = "a".repeat(250);
+        assert_eq!(
+            shape("grep", &json!({"start_line": 21}), &content, 100),
+            format!(
+                "{}\n[truncated: output is 250 chars, showing the first 100]",
+                "a".repeat(100)
+            )
         );
     }
 
@@ -212,7 +258,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        let shaped = shape("read_file", &content, 100, None);
+        let shaped = shape("read_file", &json!({}), &content, 100);
 
         assert!(
             shaped.contains("[truncated at line 10 of 30 - continue with read_file start_line 11]")
@@ -223,7 +269,7 @@ mod tests {
     fn read_file_first_line_wider_than_cap_falls_back_to_head_cut() {
         let content = "a".repeat(250);
         assert_eq!(
-            shape("read_file", &content, 100, None),
+            shape("read_file", &json!({}), &content, 100),
             format!(
                 "{}\n[truncated: output is 250 chars, showing the first 100]",
                 "a".repeat(100)
@@ -234,7 +280,7 @@ mod tests {
     #[test]
     fn run_command_shaping_keeps_head_and_tail_with_omission_marker() {
         let content = format!("HEAD{}TAIL", "x".repeat(500));
-        let shaped = shape("run_command", &content, 100, None);
+        let shaped = shape("run_command", &json!({}), &content, 100);
 
         // head = 25 chars, tail = 75 chars, 408 of 508 omitted.
         assert!(shaped.starts_with("HEAD"));
