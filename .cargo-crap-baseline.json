@@ -2004,14 +2004,6 @@
     },
     {
       "file": "./src/plugins.rs",
-      "function": "read_start_line",
-      "line": 308,
-      "cyclomatic": 2.0,
-      "coverage": 100.0,
-      "crap": 2.0
-    },
-    {
-      "file": "./src/plugins.rs",
       "function": "stage",
       "line": 265,
       "cyclomatic": 3.0,
@@ -3213,7 +3205,7 @@
     {
       "file": "./src/tools.rs",
       "function": "execute",
-      "line": 157,
+      "line": 152,
       "cyclomatic": 6.0,
       "coverage": 100.0,
       "crap": 6.0
@@ -3222,9 +3214,9 @@
       "file": "./src/tools.rs",
       "function": "run",
       "line": 143,
-      "cyclomatic": 2.0,
+      "cyclomatic": 1.0,
       "coverage": 100.0,
-      "crap": 2.0
+      "crap": 1.0
     },
     {
       "file": "./src/tools.rs",
@@ -3741,7 +3733,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "cap_for",
-      "line": 22,
+      "line": 25,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -3749,7 +3741,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "char_slice",
-      "line": 122,
+      "line": 142,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -3757,7 +3749,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "cut",
-      "line": 40,
+      "line": 60,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -3765,7 +3757,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "cut_read_file",
-      "line": 65,
+      "line": 85,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -3773,7 +3765,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "head_cut",
-      "line": 81,
+      "line": 101,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -3781,7 +3773,15 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "line_count",
-      "line": 106,
+      "line": 126,
+      "cyclomatic": 2.0,
+      "coverage": 100.0,
+      "crap": 2.0
+    },
+    {
+      "file": "./src/tools/shaping.rs",
+      "function": "read_start_line",
+      "line": 52,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -3789,7 +3789,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "resolve_start_line",
-      "line": 114,
+      "line": 134,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -3797,7 +3797,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "shape",
-      "line": 31,
+      "line": 35,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -3805,7 +3805,7 @@
     {
       "file": "./src/tools/shaping.rs",
       "function": "whole_lines_within",
-      "line": 90,
+      "line": 110,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -4269,15 +4269,15 @@
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Empty::consume_rescue",
-      "line": 104,
-      "cyclomatic": 1.0,
+      "line": 124,
+      "cyclomatic": 2.0,
       "coverage": 100.0,
-      "crap": 1.0
+      "crap": 2.0
     },
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Empty::due",
-      "line": 70,
+      "line": 82,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -4285,7 +4285,7 @@
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Empty::new",
-      "line": 59,
+      "line": 72,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -4293,15 +4293,15 @@
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Empty::note_fired",
-      "line": 78,
-      "cyclomatic": 3.0,
+      "line": 91,
+      "cyclomatic": 4.0,
       "coverage": 100.0,
-      "crap": 3.0
+      "crap": 4.0
     },
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Empty::note_progress",
-      "line": 90,
+      "line": 109,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -4309,15 +4309,15 @@
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Empty::rescue_armed",
-      "line": 98,
-      "cyclomatic": 2.0,
+      "line": 117,
+      "cyclomatic": 1.0,
       "coverage": 100.0,
-      "crap": 2.0
+      "crap": 1.0
     },
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "Setpoints::default",
-      "line": 41,
+      "line": 42,
       "cyclomatic": 1.0,
       "coverage": 0.0,
       "crap": 2.0
@@ -4325,7 +4325,7 @@
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "is_empty_reply",
-      "line": 111,
+      "line": 133,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -4333,7 +4333,7 @@
     {
       "file": "./src/turn/governor/empty.rs",
       "function": "marker_parrot",
-      "line": 120,
+      "line": 142,
       "cyclomatic": 2.0,
       "coverage": 80.0,
       "crap": 2.032

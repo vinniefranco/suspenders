@@ -6,8 +6,9 @@
 //! * **Trigger**: [`is_empty_reply`], a pure predicate over the finishing
 //!   response's content blocks, gated by the private once-per-Turn cap
 //!   (`nudged`, re-armed by progress - [`Empty::note_progress`]) and the
-//!   rescue's private arming state (`rescue_next`, `rescue_sticky`,
-//!   `empty_count`). Progress never disarms the rescue.
+//!   rescue's private state machine (`RescueState`: Off, Armed for one Pass,
+//!   or Sticky for the rest of the Turn) alongside the running `empty_count`.
+//!   Progress never disarms the rescue.
 //! * **Interventions**: stands alone as a user message at the finish
 //!   settlement (the Empty-response Nudge - the model gets one more Pass),
 //!   and silences Thinking for a Pass at the request-shaping moment (the
@@ -45,13 +46,25 @@ impl Default for Setpoints {
     }
 }
 
+/// The no-think rescue's state machine: disarmed, armed for exactly one
+/// Pass, or sticky for the rest of the Turn. Sticky never downgrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RescueState {
+    /// Not armed: the next model call keeps Thinking.
+    #[default]
+    Off,
+    /// Armed for one Pass: consumed by the next request-shaping moment.
+    Armed,
+    /// Armed for the rest of the Turn: consuming leaves it armed.
+    Sticky,
+}
+
 /// The empty Governor's private trigger state and resolved Setpoints.
 #[derive(Debug, Clone, Default)]
 pub struct Empty {
     setpoints: Setpoints,
     nudged: bool,
-    rescue_next: bool,
-    rescue_sticky: bool,
+    rescue: RescueState,
     empty_count: u64,
 }
 
@@ -60,8 +73,7 @@ impl Empty {
         Empty {
             setpoints,
             nudged: false,
-            rescue_next: false,
-            rescue_sticky: false,
+            rescue: RescueState::Off,
             empty_count: 0,
         }
     }
@@ -74,12 +86,19 @@ impl Empty {
     /// The Empty-response Nudge fired: the once-per-Turn cap sets (UNTIL
     /// progress re-arms it), the empty count advances, and - when the
     /// setpoint allows - the no-think rescue arms for the very next model
-    /// call, going STICKY on the second empty of the Turn.
+    /// call, going STICKY on the second empty of the Turn. With the setpoint
+    /// off nothing arms, and a Sticky rescue never downgrades.
     pub fn note_fired(&mut self) {
         self.empty_count += 1;
-        self.rescue_next = self.setpoints.no_think_rescue;
-        self.rescue_sticky =
-            self.rescue_sticky || (self.setpoints.no_think_rescue && self.empty_count >= 2);
+        if self.rescue != RescueState::Sticky {
+            self.rescue = if !self.setpoints.no_think_rescue {
+                RescueState::Off
+            } else if self.empty_count >= 2 {
+                RescueState::Sticky
+            } else {
+                RescueState::Armed
+            };
+        }
         self.nudged = true;
     }
 
@@ -94,15 +113,18 @@ impl Empty {
         self.nudged = false;
     }
 
-    /// Should the next model call carry no_think? (armed or sticky)
+    /// Should the next model call carry no_think? (Armed or Sticky)
     pub fn rescue_armed(&self) -> bool {
-        self.rescue_next || self.rescue_sticky
+        matches!(self.rescue, RescueState::Armed | RescueState::Sticky)
     }
 
-    /// Consumes the one-Pass rescue arm: the rescue rides exactly the Pass
-    /// right after the Empty-response Nudge fired - unless it has gone sticky.
+    /// Consumes the one-Pass rescue arm: Armed reverts to Off (the rescue
+    /// rides exactly the Pass right after the Empty-response Nudge fired),
+    /// while Sticky stays Sticky.
     pub fn consume_rescue(&mut self) {
-        self.rescue_next = false;
+        if self.rescue == RescueState::Armed {
+            self.rescue = RescueState::Off;
+        }
     }
 }
 
@@ -199,6 +221,25 @@ mod tests {
 
         assert!(!empty.rescue_armed());
         assert_eq!(empty.empty_count, 2);
+    }
+
+    #[test]
+    fn consuming_a_disarmed_rescue_stays_off() {
+        let mut empty = on();
+        empty.consume_rescue();
+
+        assert!(!empty.rescue_armed());
+    }
+
+    #[test]
+    fn a_third_empty_keeps_the_rescue_sticky() {
+        let mut empty = on();
+        empty.note_fired();
+        empty.note_fired();
+        empty.note_fired();
+        empty.consume_rescue();
+
+        assert!(empty.rescue_armed());
     }
 
     #[test]
