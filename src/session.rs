@@ -210,9 +210,10 @@ impl SessionConfig {
         // Order is load-bearing (ADR-0031): the file overlay lands FIRST, then
         // `apply_env`, so the environment wins per-invocation over the file's
         // persistent baseline. The env-over-file precedence is not unit-tested:
-        // the suite deliberately never touches process env (edition 2024 makes
-        // `set_var` unsafe/racy), so proving it would mean mutating the ambient
-        // environment other tests share.
+        // `try_load` resolves the REAL XDG config path, so proving it would
+        // read (and need to plant) the user's actual config file. The env seam
+        // itself is covered through `apply_env` directly - see the env-overlay
+        // tests, which lean on nextest's process-per-test isolation.
         load_file_overlay(&mut cfg, &default_config_path())?;
         SessionConfig::apply_env(&mut cfg)?;
         Ok(cfg)
@@ -225,81 +226,29 @@ impl SessionConfig {
     ///
     /// This and [`FileConfig`] are the two serializations of one schema; a new
     /// user-tunable knob is added to both seams or to neither (ADR-0031: "the
-    /// file and env seams must be kept in lockstep").
+    /// file and env seams must be kept in lockstep"). [`ENV_OVERRIDES`] IS the
+    /// env half of that lockstep: one row per knob, walked in row order.
     fn apply_env(cfg: &mut SessionConfig) -> Result<(), SessionError> {
-        // Plain string overrides, set whenever present.
-        if let Ok(v) = std::env::var("SUSPENDERS_URL") {
-            cfg.base_url = v;
+        for (name, set) in ENV_OVERRIDES {
+            if let Ok(v) = std::env::var(name) {
+                set(cfg, &v)?;
+            }
         }
-        if let Ok(v) = std::env::var("SUSPENDERS_TOKEN") {
-            cfg.token = v;
-        }
-        if let Ok(v) = std::env::var("SUSPENDERS_MODEL") {
-            cfg.model = v;
-        }
-
-        // Integer.
-        if let Ok(v) = std::env::var("SUSPENDERS_CONTEXT_BUDGET") {
-            cfg.context_budget = parse_int(&v, "SUSPENDERS_CONTEXT_BUDGET")?;
-        }
-
-        // Positive integer.
-        if let Ok(v) = std::env::var("SUSPENDERS_MAX_TOKENS") {
-            cfg.max_tokens = parse_positive_int(&v)?;
-        }
-
-        // Float in [0.0, 2.0].
-        if let Ok(v) = std::env::var("SUSPENDERS_TEMPERATURE") {
-            cfg.temperature = Some(parse_temperature(&v)?);
-        }
-
-        // Fraction in [0.0, 1.0).
-        if let Ok(v) = std::env::var("SUSPENDERS_EVICTION_SLACK") {
-            cfg.eviction_slack = parse_eviction_slack(&v)?;
-        }
-
-        // Fraction in (0.0, 1.0).
-        if let Ok(v) = std::env::var("SUSPENDERS_DEAD_MASS_FRACTION") {
-            cfg.dead_mass_fraction = parse_dead_mass_fraction(&v)?;
-        }
-
-        // Fraction in (0.0, 1.0).
-        if let Ok(v) = std::env::var("SUSPENDERS_COMPACTION_KEEP") {
-            cfg.compaction_keep = parse_compaction_keep(&v)?;
-        }
-
-        // Positive integer.
-        if let Ok(v) = std::env::var("SUSPENDERS_PLAN_STALE_AFTER") {
-            cfg.plan_stale_after = parse_plan_stale_after(&v)?;
-        }
-
-        // Non-negative integer; 0 disables the Recovery Turn mechanic.
-        if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_LIMIT") {
-            cfg.recovery_limit = parse_int(&v, "SUSPENDERS_RECOVERY_LIMIT")?;
-        }
-
-        // "handoff" | "continuation". Note: the env parser trims whitespace
-        // (via `parse_recovery_shape`), but the JSON path does not - serde
-        // matches the string exactly. Accepted, not fixed: a stray space in
-        // a hand-typed env var is likelier than in an editor-formatted file.
-        if let Ok(v) = std::env::var("SUSPENDERS_RECOVERY_SHAPE") {
-            cfg.recovery_shape = parse_recovery_shape(&v)?;
-        }
-
-        // Non-negative integer; 0 disables the malformed-retry re-draw.
-        if let Ok(v) = std::env::var("SUSPENDERS_MALFORMED_RETRY_BUDGET") {
-            cfg.malformed_retry_budget = parse_int(&v, "SUSPENDERS_MALFORMED_RETRY_BUDGET")?;
-        }
-
-        // Booleans.
-        if let Ok(v) = std::env::var("SUSPENDERS_SCOUT_NO_THINK") {
-            cfg.scout_no_think = parse_bool(&v, "SUSPENDERS_SCOUT_NO_THINK")?;
-        }
-        if let Ok(v) = std::env::var("SUSPENDERS_NO_THINK_RESCUE") {
-            cfg.no_think_rescue = parse_bool(&v, "SUSPENDERS_NO_THINK_RESCUE")?;
-        }
-
         Ok(())
+    }
+
+    /// Resolves a `--write-config` target for [`write_template`]: an empty
+    /// path means the XDG default ([`default_config_path`]), anything else is
+    /// used verbatim. Lives here so the empty-means-default rule is a config
+    /// seam fact (ADR-0031), not a branch in `main`.
+    ///
+    /// [`write_template`]: Self::write_template
+    pub fn resolve_template_path(path: &str) -> String {
+        if path.is_empty() {
+            default_config_path()
+        } else {
+            path.to_string()
+        }
     }
 
     /// Writes a fully-populated `config.json` template to `path` from the
@@ -522,6 +471,94 @@ impl FileConfig {
 }
 
 // ---- SUSPENDERS_* env parsing/validation (mirrors the runtime overrides) ----
+
+/// One row's setter: validates the raw env value and lands it on the config,
+/// or carries the reason it is malformed.
+type EnvSetter = fn(&mut SessionConfig, &str) -> Result<(), SessionError>;
+
+/// The `SUSPENDERS_*` overlay table (ADR-0031): every env-settable knob, its
+/// name paired with the setter that validates and lands it.
+/// [`SessionConfig::apply_env`] walks the rows in order, so first-error-wins
+/// follows row order. This table and [`FileConfig`]'s field list are the two
+/// serializations of one schema, kept in lockstep: a new knob adds a row here
+/// and a field there, or neither.
+const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
+    // Plain string overrides, set whenever present.
+    ("SUSPENDERS_URL", |cfg, v| {
+        cfg.base_url = v.into();
+        Ok(())
+    }),
+    ("SUSPENDERS_TOKEN", |cfg, v| {
+        cfg.token = v.into();
+        Ok(())
+    }),
+    ("SUSPENDERS_MODEL", |cfg, v| {
+        cfg.model = v.into();
+        Ok(())
+    }),
+    // Integer.
+    ("SUSPENDERS_CONTEXT_BUDGET", |cfg, v| {
+        cfg.context_budget = parse_int(v, "SUSPENDERS_CONTEXT_BUDGET")?;
+        Ok(())
+    }),
+    // Positive integer.
+    ("SUSPENDERS_MAX_TOKENS", |cfg, v| {
+        cfg.max_tokens = parse_positive_int(v)?;
+        Ok(())
+    }),
+    // Float in [0.0, 2.0].
+    ("SUSPENDERS_TEMPERATURE", |cfg, v| {
+        cfg.temperature = Some(parse_temperature(v)?);
+        Ok(())
+    }),
+    // Fraction in [0.0, 1.0).
+    ("SUSPENDERS_EVICTION_SLACK", |cfg, v| {
+        cfg.eviction_slack = parse_eviction_slack(v)?;
+        Ok(())
+    }),
+    // Fraction in (0.0, 1.0).
+    ("SUSPENDERS_DEAD_MASS_FRACTION", |cfg, v| {
+        cfg.dead_mass_fraction = parse_dead_mass_fraction(v)?;
+        Ok(())
+    }),
+    // Fraction in (0.0, 1.0).
+    ("SUSPENDERS_COMPACTION_KEEP", |cfg, v| {
+        cfg.compaction_keep = parse_compaction_keep(v)?;
+        Ok(())
+    }),
+    // Positive integer.
+    ("SUSPENDERS_PLAN_STALE_AFTER", |cfg, v| {
+        cfg.plan_stale_after = parse_plan_stale_after(v)?;
+        Ok(())
+    }),
+    // Non-negative integer; 0 disables the Recovery Turn mechanic.
+    ("SUSPENDERS_RECOVERY_LIMIT", |cfg, v| {
+        cfg.recovery_limit = parse_int(v, "SUSPENDERS_RECOVERY_LIMIT")?;
+        Ok(())
+    }),
+    // "handoff" | "continuation". Note: the env parser trims whitespace
+    // (via `parse_recovery_shape`), but the JSON path does not - serde
+    // matches the string exactly. Accepted, not fixed: a stray space in
+    // a hand-typed env var is likelier than in an editor-formatted file.
+    ("SUSPENDERS_RECOVERY_SHAPE", |cfg, v| {
+        cfg.recovery_shape = parse_recovery_shape(v)?;
+        Ok(())
+    }),
+    // Non-negative integer; 0 disables the malformed-retry re-draw.
+    ("SUSPENDERS_MALFORMED_RETRY_BUDGET", |cfg, v| {
+        cfg.malformed_retry_budget = parse_int(v, "SUSPENDERS_MALFORMED_RETRY_BUDGET")?;
+        Ok(())
+    }),
+    // Booleans.
+    ("SUSPENDERS_SCOUT_NO_THINK", |cfg, v| {
+        cfg.scout_no_think = parse_bool(v, "SUSPENDERS_SCOUT_NO_THINK")?;
+        Ok(())
+    }),
+    ("SUSPENDERS_NO_THINK_RESCUE", |cfg, v| {
+        cfg.no_think_rescue = parse_bool(v, "SUSPENDERS_NO_THINK_RESCUE")?;
+        Ok(())
+    }),
+];
 
 fn parse_int(raw: &str, name: &str) -> Result<u64, SessionError> {
     raw.trim()
@@ -1666,6 +1703,222 @@ mod tests {
         assert!(fc.no_think_rescue.is_some());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_template_path_defaults_an_empty_path_to_the_xdg_config_path() {
+        assert_eq!(
+            SessionConfig::resolve_template_path(""),
+            default_config_path()
+        );
+        // A non-empty path is used verbatim.
+        assert_eq!(
+            SessionConfig::resolve_template_path("/tmp/custom.json"),
+            "/tmp/custom.json"
+        );
+    }
+
+    // ---- apply_env (ADR-0031: the SUSPENDERS_* overlay) ----------------------
+    //
+    // These tests mutate this process's environment, which edition 2024 marks
+    // unsafe (`set_var`/`remove_var` can race a concurrent `getenv`). Safety is
+    // the runner's execution model: cargo-nextest runs each test in its own
+    // process, and these tests spawn no threads, so nothing reads the
+    // environment concurrently.
+
+    fn set_env(name: &str, value: &str) {
+        // SAFETY: process-per-test (see the section comment above).
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    // Clears every SUSPENDERS_* override by walking ENV_OVERRIDES (a new table
+    // row is cleared for free), so each env test starts ambient-free.
+    fn clear_suspenders_env() {
+        for (name, _) in ENV_OVERRIDES {
+            // SAFETY: process-per-test (see the section comment above).
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    #[test]
+    fn apply_env_overlays_each_string_var_onto_its_field() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_URL", "http://elsewhere:9999/v1");
+        set_env("SUSPENDERS_TOKEN", "sekrit");
+        set_env("SUSPENDERS_MODEL", "env/model");
+
+        let mut cfg = SessionConfig::test_defaults();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+
+        assert_eq!(cfg.base_url, "http://elsewhere:9999/v1");
+        assert_eq!(cfg.token, "sekrit");
+        assert_eq!(cfg.model, "env/model");
+    }
+
+    #[test]
+    fn apply_env_overlays_each_numeric_var_onto_its_field() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_CONTEXT_BUDGET", "48000");
+        set_env("SUSPENDERS_MAX_TOKENS", "2048");
+        set_env("SUSPENDERS_TEMPERATURE", "1.5");
+        set_env("SUSPENDERS_EVICTION_SLACK", "0.25");
+        set_env("SUSPENDERS_DEAD_MASS_FRACTION", "0.3");
+        set_env("SUSPENDERS_COMPACTION_KEEP", "0.4");
+        set_env("SUSPENDERS_PLAN_STALE_AFTER", "6");
+        // The two 0-disables knobs prove non-negative (not positive) parsing.
+        set_env("SUSPENDERS_RECOVERY_LIMIT", "0");
+        set_env("SUSPENDERS_MALFORMED_RETRY_BUDGET", "0");
+
+        let mut cfg = SessionConfig::test_defaults();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+
+        assert_eq!(cfg.context_budget, 48_000);
+        assert_eq!(cfg.max_tokens, 2048);
+        assert_eq!(cfg.temperature, Some(1.5));
+        assert_eq!(cfg.eviction_slack, 0.25);
+        assert_eq!(cfg.dead_mass_fraction, 0.3);
+        assert_eq!(cfg.compaction_keep, 0.4);
+        assert_eq!(cfg.plan_stale_after, 6);
+        assert_eq!(cfg.recovery_limit, 0);
+        assert_eq!(cfg.malformed_retry_budget, 0);
+    }
+
+    #[test]
+    fn apply_env_overlays_the_shape_and_bool_vars_onto_their_fields() {
+        clear_suspenders_env();
+        // The shape parser trims a hand-typed stray space (documented quirk).
+        set_env("SUSPENDERS_RECOVERY_SHAPE", " continuation ");
+        set_env("SUSPENDERS_SCOUT_NO_THINK", "false");
+        set_env("SUSPENDERS_NO_THINK_RESCUE", "false");
+
+        // test_defaults has Handoff/true/true, so each landing is visible.
+        let mut cfg = SessionConfig::test_defaults();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+
+        assert_eq!(cfg.recovery_shape, RecoveryShape::Continuation);
+        assert!(!cfg.scout_no_think);
+        assert!(!cfg.no_think_rescue);
+    }
+
+    #[test]
+    fn apply_env_with_nothing_set_leaves_the_config_untouched() {
+        clear_suspenders_env();
+        let mut cfg = SessionConfig::test_defaults();
+        let before = cfg.clone();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+        assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn apply_env_rejects_a_malformed_integer() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_CONTEXT_BUDGET", "soon");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_CONTEXT_BUDGET must be an integer, got: \"soon\""
+        );
+    }
+
+    #[test]
+    fn apply_env_rejects_a_non_positive_integer() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_MAX_TOKENS", "0");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_MAX_TOKENS must be a positive integer, got: \"0\""
+        );
+
+        clear_suspenders_env();
+        set_env("SUSPENDERS_PLAN_STALE_AFTER", "0");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_PLAN_STALE_AFTER must be a positive integer, got: \"0\""
+        );
+    }
+
+    #[test]
+    fn apply_env_rejects_an_out_of_range_temperature() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_TEMPERATURE", "2.5");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_TEMPERATURE must be a float in [0.0, 2.0], got: \"2.5\""
+        );
+    }
+
+    #[test]
+    fn apply_env_rejects_an_out_of_range_fraction() {
+        // eviction_slack is half-open [0.0, 1.0): 1.0 falls outside.
+        clear_suspenders_env();
+        set_env("SUSPENDERS_EVICTION_SLACK", "1.0");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0), got: \"1.0\""
+        );
+
+        // dead_mass_fraction and compaction_keep are open (0.0, 1.0): the
+        // endpoints fall outside.
+        clear_suspenders_env();
+        set_env("SUSPENDERS_DEAD_MASS_FRACTION", "0.0");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0), got: \"0.0\""
+        );
+
+        clear_suspenders_env();
+        set_env("SUSPENDERS_COMPACTION_KEEP", "1.0");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_COMPACTION_KEEP must be a fraction in (0.0, 1.0), got: \"1.0\""
+        );
+    }
+
+    #[test]
+    fn apply_env_rejects_an_unrecognized_recovery_shape() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_RECOVERY_SHAPE", "retry");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_RECOVERY_SHAPE must be \"handoff\" or \"continuation\", got: \"retry\""
+        );
+    }
+
+    #[test]
+    fn apply_env_rejects_a_non_boolean_flag() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_SCOUT_NO_THINK", "yes");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_SCOUT_NO_THINK must be \"true\" or \"false\", got: \"yes\""
+        );
+
+        clear_suspenders_env();
+        set_env("SUSPENDERS_NO_THINK_RESCUE", "1");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_NO_THINK_RESCUE must be \"true\" or \"false\", got: \"1\""
+        );
+    }
+
+    #[test]
+    fn apply_env_reports_the_first_malformed_value_in_table_order() {
+        // Two malformed values: the error names the one whose row comes first
+        // (CONTEXT_BUDGET precedes SCOUT_NO_THINK in ENV_OVERRIDES).
+        clear_suspenders_env();
+        set_env("SUSPENDERS_CONTEXT_BUDGET", "nope");
+        set_env("SUSPENDERS_SCOUT_NO_THINK", "yes");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert!(err.0.contains("SUSPENDERS_CONTEXT_BUDGET"));
     }
 
     // ---- persist_model (ADR-0033: sparse, sticky /model write) --------------

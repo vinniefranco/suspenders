@@ -290,117 +290,134 @@ impl Composer {
             let in_selector = draft.rest.is_some()
                 && slash::lookup(&draft.name).is_some_and(|c| c.opens_selector);
 
-            if in_selector {
-                // -- SELECTOR sub-state (`/model qw`) --
-                // `draft` is owned and its name is not needed here: move the
-                // filter out rather than cloning it on every editing key.
-                let rest = draft.rest.unwrap_or_default();
-                match key {
-                    Key::ArrowUp | Key::WheelUp | Key::ArrowDown | Key::WheelDown => {
-                        if let Some(CommandSelector {
-                            status: SelectorStatus::Ready(sel),
-                            ..
-                        }) = self.selector.as_mut()
-                        {
-                            sel.handle_nav(key, &rest);
-                        }
-                        return consumed(vec![]);
-                    }
-                    Key::Enter => {
-                        // Only a Ready overlay with a highlighted row resolves;
-                        // Loading/Failed swallow Enter (no fetch to pick from).
-                        let chosen = match self.selector.as_mut() {
-                            Some(CommandSelector {
-                                command,
-                                status: SelectorStatus::Ready(sel),
-                                ..
-                            }) => sel.handle_nav(Key::Enter, &rest).and_then(
-                                |outcome| match outcome {
-                                    SelectorOutcome::Select(value) => {
-                                        Some(Effect::SelectorChosen {
-                                            command: command.clone(),
-                                            value,
-                                        })
-                                    }
-                                    SelectorOutcome::Cancel => None,
-                                },
-                            ),
-                            _ => None,
-                        };
-                        return match chosen {
-                            Some(effect) => {
-                                self.close_selector();
-                                consumed(vec![effect])
-                            }
-                            None => consumed(vec![]),
-                        };
-                    }
-                    Key::Escape => {
-                        // Close the overlay and empty the Composer (no Turn to
-                        // cancel - the overlay is a Composer state).
-                        self.close_selector();
-                        return consumed(vec![]);
-                    }
-                    // Editing keys (chars, Backspace, newline, cursor moves)
-                    // fall through so `rest` keeps filtering the rows. Note:
-                    // backspacing away the space (rest → None) drops us back
-                    // to the COMMAND MENU next fold, and the menu block there
-                    // closes this overlay so a re-activation re-fetches.
-                    _ => {}
-                }
+            return if in_selector {
+                // `draft` is owned and its name is not needed past the
+                // sub-state dispatch: move the filter out rather than cloning
+                // it on every editing key.
+                self.selector_key(key, draft.rest.unwrap_or_default(), status)
             } else {
-                // -- COMMAND MENU sub-state (`/mod`) --
-                // Every key reaching this block is CONSUMED (an arm below or
-                // the editing fall-through - the refusable keys bounced at
-                // the gate), so tidying eagerly is safe under the refusal
-                // contract: drop any overlay left over from backspacing out
-                // of a selector (the next commit must be a fresh activation,
-                // re-emitting Effect::Command) and clamp the highlight to the
-                // filtered rows.
-                self.selector = None;
-                let rows = slash::rows(&draft.name);
-                self.slash_cursor = self.slash_cursor.min(rows.len().saturating_sub(1));
-                match key {
-                    Key::ArrowUp | Key::WheelUp => {
-                        self.slash_cursor = self.slash_cursor.saturating_sub(1);
-                        return consumed(vec![]);
-                    }
-                    Key::ArrowDown | Key::WheelDown => {
-                        if self.slash_cursor + 1 < rows.len() {
-                            self.slash_cursor += 1;
-                        }
-                        return consumed(vec![]);
-                    }
-                    // Commit the highlighted command. An empty filtered menu
-                    // means the typed token matches no command: surface an
-                    // unknown-command notice, start no Turn, clear the draft.
-                    Key::Enter => {
-                        return self.commit_command(rows.into_iter().nth(self.slash_cursor));
-                    }
-                    // Typing a space after a command token also commits it
-                    // (the palette convention): the space is the menu→command
-                    // boundary, so it commits the highlighted row rather than
-                    // editing the draft. Only when a row is highlighted - a
-                    // bare space on an empty menu falls through as a normal
-                    // edit.
-                    Key::Char(' ') if rows.get(self.slash_cursor).is_some() => {
-                        return self.commit_command(rows.into_iter().nth(self.slash_cursor));
-                    }
-                    // Escape closes the menu by clearing the draft - there is
-                    // no Turn to cancel: the menu is a Composer state, so
-                    // leaving it empties the Composer.
-                    Key::Escape => {
-                        self.clear();
-                        return consumed(vec![]);
-                    }
-                    // Every other key (chars, Backspace, newline, cursor
-                    // moves) falls through to the editing arms below, so
-                    // typing filters the menu live.
-                    _ => {}
-                }
-            }
+                self.menu_key(key, &draft.name, status)
+            };
         }
 
+        self.editing_key(key, status)
+    }
+
+    // -- SELECTOR sub-state (`/model qw`, ADR-0033) --
+    // Dispatched by [`Composer::handle_key`] once a selector-opening command
+    // committed; `rest` is the filter over the committed command's rows.
+    // Every key offered here is consumed: an arm below, or the editing
+    // fall-through.
+    fn selector_key(&mut self, key: Key, rest: String, status: Status) -> KeyOutcome {
+        match key {
+            Key::ArrowUp | Key::WheelUp | Key::ArrowDown | Key::WheelDown => {
+                if let Some(CommandSelector {
+                    status: SelectorStatus::Ready(sel),
+                    ..
+                }) = self.selector.as_mut()
+                {
+                    sel.handle_nav(key, &rest);
+                }
+                consumed(vec![])
+            }
+            Key::Enter => {
+                // Only a Ready overlay with a highlighted row resolves;
+                // Loading/Failed swallow Enter (no fetch to pick from).
+                let chosen = match self.selector.as_mut() {
+                    Some(CommandSelector {
+                        command,
+                        status: SelectorStatus::Ready(sel),
+                        ..
+                    }) => sel
+                        .handle_nav(Key::Enter, &rest)
+                        .and_then(|outcome| match outcome {
+                            SelectorOutcome::Select(value) => Some(Effect::SelectorChosen {
+                                command: command.clone(),
+                                value,
+                            }),
+                            SelectorOutcome::Cancel => None,
+                        }),
+                    _ => None,
+                };
+                match chosen {
+                    Some(effect) => {
+                        self.close_selector();
+                        consumed(vec![effect])
+                    }
+                    None => consumed(vec![]),
+                }
+            }
+            Key::Escape => {
+                // Close the overlay and empty the Composer (no Turn to
+                // cancel - the overlay is a Composer state).
+                self.close_selector();
+                consumed(vec![])
+            }
+            // Editing keys (chars, Backspace, newline, cursor moves)
+            // fall through so `rest` keeps filtering the rows. Note:
+            // backspacing away the space (rest → None) drops us back
+            // to the COMMAND MENU next fold, and the menu block there
+            // closes this overlay so a re-activation re-fetches.
+            other => self.editing_key(other, status),
+        }
+    }
+
+    // -- COMMAND MENU sub-state (`/mod`, ADR-0032) --
+    // Dispatched by [`Composer::handle_key`] while the command token is still
+    // being typed; `name` is the token filtering the palette. Every key
+    // reaching this block is CONSUMED (an arm below or the editing
+    // fall-through - the refusable keys bounced at the gate), so tidying
+    // eagerly is safe under the refusal contract: drop any overlay left over
+    // from backspacing out of a selector (the next commit must be a fresh
+    // activation, re-emitting Effect::Command) and clamp the highlight to the
+    // filtered rows.
+    fn menu_key(&mut self, key: Key, name: &str, status: Status) -> KeyOutcome {
+        self.selector = None;
+        let rows = slash::rows(name);
+        self.slash_cursor = self.slash_cursor.min(rows.len().saturating_sub(1));
+        match key {
+            Key::ArrowUp | Key::WheelUp => {
+                self.slash_cursor = self.slash_cursor.saturating_sub(1);
+                consumed(vec![])
+            }
+            Key::ArrowDown | Key::WheelDown => {
+                if self.slash_cursor + 1 < rows.len() {
+                    self.slash_cursor += 1;
+                }
+                consumed(vec![])
+            }
+            // Commit the highlighted command. An empty filtered menu
+            // means the typed token matches no command: surface an
+            // unknown-command notice, start no Turn, clear the draft.
+            Key::Enter => self.commit_command(rows.into_iter().nth(self.slash_cursor)),
+            // Typing a space after a command token also commits it
+            // (the palette convention): the space is the menu→command
+            // boundary, so it commits the highlighted row rather than
+            // editing the draft. Only when a row is highlighted - a
+            // bare space on an empty menu falls through as a normal
+            // edit.
+            Key::Char(' ') if rows.get(self.slash_cursor).is_some() => {
+                self.commit_command(rows.into_iter().nth(self.slash_cursor))
+            }
+            // Escape closes the menu by clearing the draft - there is
+            // no Turn to cancel: the menu is a Composer state, so
+            // leaving it empties the Composer.
+            Key::Escape => {
+                self.clear();
+                consumed(vec![])
+            }
+            // Every other key (chars, Backspace, newline, cursor
+            // moves) falls through to the editing arms, so typing
+            // filters the menu live.
+            other => self.editing_key(other, status),
+        }
+    }
+
+    // -- Editing fall-through --
+    // The submit/steer/edit arms: the landing spot for every key that cleared
+    // the gate outside a slash sub-state, and for the editing keys the two
+    // sub-states above decline (so typing keeps filtering their popups).
+    fn editing_key(&mut self, key: Key, status: Status) -> KeyOutcome {
         match key {
             // Trailing-backslash continuation: Enter on a draft whose LAST
             // char is a literal `\` replaces that backslash with a hard

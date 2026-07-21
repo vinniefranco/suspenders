@@ -299,6 +299,60 @@ impl Screen {
             EventOutcome::Refused(event) => event,
         };
 
+        // The flat family dispatch: each arm names one event family and hands
+        // the whole event to that family's fold below.
+        match event {
+            event @ (Event::TurnStarted(..)
+            | Event::MessageStart { .. }
+            | Event::MessageUpdate { .. }
+            | Event::MessageEnd { .. }) => self.apply_streaming(event),
+
+            event @ (Event::ContextPressure { .. }
+            | Event::EvictionWave { .. }
+            | Event::CompactionProgress { .. }) => self.apply_pressure(event),
+
+            event @ (Event::ToolCall { .. }
+            | Event::ToolResult { .. }
+            | Event::PluginError { .. }) => self.apply_tooling(event),
+
+            event @ (Event::ApprovalRequest { .. }
+            | Event::ApprovalResolved { .. }
+            | Event::ApprovalAuto { .. }) => self.apply_approval(event),
+
+            event @ (Event::SteeringQueued { .. } | Event::SteeringDelivered { .. }) => {
+                self.apply_steering(event)
+            }
+
+            event @ (Event::SessionLogError { .. }
+            | Event::VerifyNudge { .. }
+            | Event::VerifyFailedNudge { .. }
+            | Event::EmptyResponseNudge { .. }
+            | Event::ExploreNudge { .. }
+            | Event::WrapUpWarning { .. }
+            | Event::VerificationPass { .. }
+            | Event::FinalPass { .. }
+            | Event::RecoveryTurn { .. }
+            | Event::Retry { .. }) => self.apply_voice(event),
+
+            event @ (Event::TurnFinished { .. }
+            | Event::TurnCancelled
+            | Event::TurnError { .. }) => self.apply_settlement(event),
+
+            // Unknown / display-irrelevant events are ignored.
+            _ => (self, vec![]),
+        }
+    }
+
+    // ---- Event families ------------------------------------------------------
+    //
+    // One private method per event family: [`Screen::apply_event`] stays the
+    // flat dispatch and each family holds its own branches. The dispatch owns
+    // family membership, so each method's trailing `_` arm restates the
+    // dispatch's own ignore rule - it is never a reachable behavior of its own.
+
+    // Streaming / message events: the Turn opening and the three-phase
+    // assistant stream, each delegating one store verb.
+    fn apply_streaming(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
             Event::TurnStarted(_reference) => {
                 self.status = Status::Running;
@@ -321,6 +375,14 @@ impl Screen {
                 (self, vec![])
             }
 
+            _ => (self, vec![]),
+        }
+    }
+
+    // Context pressure / Eviction / Compaction (ADR-0008; CONTEXT.md: Eviction,
+    // Dead Mass): the status-bar figures and the receded machinery lines.
+    fn apply_pressure(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
             // Live context-pressure indication: refresh the status bar's token
             // estimate, budget, and LIVE Dead Mass share mid-Turn and name the
             // semantic pressure level (ADR-0008). NEVER a Transcript item. The
@@ -344,6 +406,30 @@ impl Screen {
                 (self, vec![])
             }
 
+            // An Eviction wave rewrote the request copy (CONTEXT.md: Eviction,
+            // Dead Mass): recede ONE terse Info line naming the wave and its
+            // at-wave (pre-reclaim) snapshot. The status bar does NOT derive
+            // from this - it tracks the LIVE Dead Mass off `ContextPressure`,
+            // and this wave has just cleared what it found.
+            Event::EvictionWave { stats } => {
+                self.transcript.info(eviction_wave_line(&stats));
+                (self, vec![])
+            }
+
+            // Compaction made progress: recede one Info line.
+            Event::CompactionProgress { status } => {
+                self.transcript.info(format!("compaction: {status}"));
+                (self, vec![])
+            }
+
+            _ => (self, vec![]),
+        }
+    }
+
+    // Tool machinery: calls, results (paired by id in the store), and the
+    // Plugin failure report.
+    fn apply_tooling(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
             Event::ToolCall { id, name, input } => {
                 self.transcript.tool_call(id, name, &input);
                 (self, vec![])
@@ -372,6 +458,14 @@ impl Screen {
                 (self, vec![])
             }
 
+            _ => (self, vec![]),
+        }
+    }
+
+    // The Approval lifecycle: request opens the modal, resolved clears the
+    // matching pending, auto notes the Standing Approval.
+    fn apply_approval(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
             Event::ApprovalRequest {
                 approval_id,
                 command,
@@ -395,9 +489,15 @@ impl Screen {
                 (self, vec![])
             }
 
-            // Steering: queued shows a pending line; delivered promotes it to a
-            // user line (the text is now in the Conversation). The marker text
-            // and the promotion are the store's rule.
+            _ => (self, vec![]),
+        }
+    }
+
+    // Steering: queued shows a pending line; delivered promotes it to a
+    // user line (the text is now in the Conversation). The marker text
+    // and the promotion are the store's rule.
+    fn apply_steering(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
             Event::SteeringQueued { text } => {
                 self.transcript.steering_queued(&text);
                 (self, vec![Effect::PinBottom])
@@ -408,6 +508,15 @@ impl Screen {
                 (self, vec![])
             }
 
+            _ => (self, vec![]),
+        }
+    }
+
+    // Voiced / operator-news lines: everything whose display is one authored
+    // info line - the Session Log failure, the Nudges and Endgame riders, the
+    // Recovery Turn prompt, and the bounded re-draw marks.
+    fn apply_voice(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
             // The Session Log died (IO failure); the Session continues
             // unpersisted.
             Event::SessionLogError { message } => {
@@ -427,22 +536,6 @@ impl Screen {
             | Event::VerificationPass { text }
             | Event::FinalPass { text } => {
                 self.transcript.info(text);
-                (self, vec![])
-            }
-
-            // A finished Turn: salvage anything still streaming and note an
-            // abnormal stop reason - the note is this fold's Voice, the
-            // flush-before-note ordering the store's `close` - then record
-            // the closing estimate and budget.
-            Event::TurnFinished {
-                stop_reason,
-                token_estimate,
-                context_budget,
-            } => {
-                self.transcript.close(stop_reason_note(stop_reason));
-                self.status = Status::Idle;
-                self.token_estimate = Some(token_estimate);
-                self.context_budget = Some(context_budget);
                 (self, vec![])
             }
 
@@ -466,27 +559,33 @@ impl Screen {
                 (self, vec![])
             }
 
+            _ => (self, vec![]),
+        }
+    }
+
+    // Settlement: how a Turn ends - finished, cancelled, or errored.
+    fn apply_settlement(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
+            // A finished Turn: salvage anything still streaming and note an
+            // abnormal stop reason - the note is this fold's Voice, the
+            // flush-before-note ordering the store's `close` - then record
+            // the closing estimate and budget.
+            Event::TurnFinished {
+                stop_reason,
+                token_estimate,
+                context_budget,
+            } => {
+                self.transcript.close(stop_reason_note(stop_reason));
+                self.status = Status::Idle;
+                self.token_estimate = Some(token_estimate);
+                self.context_budget = Some(context_budget);
+                (self, vec![])
+            }
+
             Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
 
             Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
 
-            // An Eviction wave rewrote the request copy (CONTEXT.md: Eviction,
-            // Dead Mass): recede ONE terse Info line naming the wave and its
-            // at-wave (pre-reclaim) snapshot. The status bar does NOT derive
-            // from this - it tracks the LIVE Dead Mass off `ContextPressure`,
-            // and this wave has just cleared what it found.
-            Event::EvictionWave { stats } => {
-                self.transcript.info(eviction_wave_line(&stats));
-                (self, vec![])
-            }
-
-            // Compaction made progress: recede one Info line.
-            Event::CompactionProgress { status } => {
-                self.transcript.info(format!("compaction: {status}"));
-                (self, vec![])
-            }
-
-            // Unknown / display-irrelevant events are ignored.
             _ => (self, vec![]),
         }
     }
@@ -769,6 +868,7 @@ mod tests {
     use crate::content::ContentBlock;
     use crate::event::Stage;
     use crate::ui::transcript::TranscriptItem;
+    use std::collections::HashMap;
 
     // --- helpers mirroring transcript_test.exs -----------------------------
 
@@ -1198,6 +1298,36 @@ mod tests {
         assert_eq!(effects, vec![]);
     }
 
+    // The remaining voiced riders - the corrective tags beyond the three
+    // pinned above - each land as ONE info line with no effects, through the
+    // same shared arm.
+    #[test]
+    fn the_remaining_voiced_riders_show_as_info_lines() {
+        use crate::event::VoicedTag;
+        for tag in [
+            VoicedTag::VerifyFailedNudge,
+            VoicedTag::EmptyResponseNudge,
+            VoicedTag::ExploreNudge,
+            VoicedTag::FinalPass,
+        ] {
+            let (t, effects) = fresh().apply_event(Event::voiced(tag, "[rider text]"));
+            assert_eq!(effects, vec![], "{tag:?} minted effects");
+            assert_eq!(items(&t), vec![info("[rider text]")], "{tag:?}");
+        }
+    }
+
+    // A bounded re-draw (ADR-0030) is silent to the Conversation but never to
+    // the operator: one info line names the attempt against the budget.
+    #[test]
+    fn a_retry_recedes_one_bounded_redraw_info_line() {
+        let (t, effects) = fresh().apply_event(Event::retry("unknown tool", 1, 3));
+        assert_eq!(effects, vec![]);
+        assert_eq!(
+            items(&t),
+            vec![info("malformed tool call - re-drawing (1/3)")]
+        );
+    }
+
     #[test]
     fn approval_resolved_clears_only_matching_pending() {
         let a = approval();
@@ -1426,12 +1556,95 @@ mod tests {
         }
     }
 
+    // --- tool calls (the arms; the summary and pairing rules live with the
+    // store, tested at `ui::transcript`) ---------------------------------------
+
+    #[test]
+    fn a_tool_call_recedes_one_pending_call_line() {
+        let (t, effects) = fresh().apply_event(Event::tool_call(
+            "t1",
+            "read_file",
+            serde_json::json!({"path": "src/main.rs"}),
+        ));
+        assert_eq!(effects, vec![]);
+        assert_eq!(
+            items(&t),
+            vec![TranscriptItem::ToolCall {
+                id: "t1".into(),
+                name: "read_file".into(),
+                summary: "src/main.rs".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tool_result_merges_with_its_call_into_one_line() {
+        let t = fold(
+            fresh(),
+            vec![
+                Event::tool_call(
+                    "t1",
+                    "run_command",
+                    serde_json::json!({"command": "cargo test"}),
+                ),
+                Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
+            ],
+        );
+        let items = items(&t);
+        assert_eq!(items.len(), 1, "the call line was superseded");
+        match &items[0] {
+            TranscriptItem::ToolResult {
+                name,
+                is_error,
+                key_arg,
+                ..
+            } => {
+                assert_eq!(name, "run_command");
+                assert!(!is_error);
+                assert_eq!(key_arg.as_deref(), Some("cargo test"));
+            }
+            other => panic!("expected a merged result line, got {other:?}"),
+        }
+    }
+
     // --- Composer first refusal (ADR-0034) ----------------------------------
     //
     // The Composer's own rules - menu, selector, editing, history recall -
     // are tested at its interface in `ui::composer`; these pin the ROUTING
     // this fold owns: the fixed gate → Composer → own-arms order, the notice
     // wiring, and the refused key coming back by value.
+
+    // The Composer's first refusal covers EVENTS too: a selector fill
+    // delivered through this fold is consumed by the Composer - the overlay
+    // flips to Ready, no Transcript item, no effects - so a stale or
+    // overlay-less fill can never leak into the arms below.
+    #[test]
+    fn a_selector_fill_is_consumed_by_the_composer_never_this_folds_arms() {
+        use crate::ui::composer::{OverlayStatus, OverlayView};
+        use crate::ui::selector::SelectorRow;
+
+        // Commit `/model` through the Screen: a Loading overlay opens and one
+        // Command effect carries the activation generation to echo back.
+        let t = press(fresh(), typed("/model"));
+        let (t, effects) = t.handle_key(Key::Enter);
+        let generation = match effects.as_slice() {
+            [Effect::Command { name, generation }] if name == "model" => *generation,
+            other => panic!("expected one Command effect, got {other:?}"),
+        };
+
+        let rows = vec![SelectorRow::new("qwen", "qwen", None)];
+        let (t, effects) = t.apply_event(Event::selector_ready(generation, rows.clone()));
+        assert_eq!(effects, vec![]);
+        assert_eq!(items(&t), vec![], "never a Transcript item");
+        match t.composer().view().overlay {
+            Some(OverlayView::Selector {
+                status: OverlayStatus::Ready,
+                rows: got,
+                ..
+            }) => assert_eq!(got, rows),
+            other => panic!("expected a Ready selector overlay, got {other:?}"),
+        }
+    }
 
     // Escape with an open overlay closes the overlay - it must NOT cancel the
     // running Turn (Escape is only Cancellation when the Composer refuses it).
@@ -1557,6 +1770,16 @@ mod tests {
         );
         assert!(t.transcript().items().contains(&assistant("half an ans")));
         assert_eq!(effects, vec![Effect::FocusComposer]);
+    }
+
+    // --- info (adapter-side news) --------------------------------------------
+
+    // The adapter's direct line in: Resume drift notes and other
+    // adapter-authored news append as one info line through the store.
+    #[test]
+    fn info_appends_one_adapter_authored_line() {
+        let t = fresh().info("resume: 2 turns replayed with drift");
+        assert_eq!(items(&t), vec![info("resume: 2 turns replayed with drift")]);
     }
 
     // --- unknown input -----------------------------------------------------

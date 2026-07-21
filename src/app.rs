@@ -21,6 +21,9 @@ use crate::llm::AnthropicLlm;
 use crate::session::{Session, SessionOpts};
 use crate::ui::picker::PickerOutcome;
 
+#[cfg(test)]
+mod tests;
+
 /// Launches the interactive ratatui frontend (ADR-0001, ADR-0019). Builds the
 /// Session from config/env (a real `AnthropicLlm` + `Connection`), starts the
 /// Agent, and hands the terminal to [`crate::ui::run`] (which enters/leaves raw
@@ -30,31 +33,68 @@ const PICK: &str = "pick";
 
 pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::Result<()> {
     let session = build_session(root)?;
-    // Context files load once at launch, fail-open: the assembled prompt feeds
-    // the Agent, and a present-but-unusable file surfaces as one launch info
-    // line (never silently, never blocking the Session).
+    // The picker needs the Session first: the logs live in its session_dir.
+    let ResumeAction::Start(resume) = resolved_resume(resume, &session.session_dir).await? else {
+        // Leave without starting the Agent.
+        return Ok(());
+    };
+    start_and_run(session, resume).await
+}
+
+// The context files load once at launch, fail-open: the assembled prompt
+// feeds the Agent, and a present-but-unusable file surfaces as one launch
+// info line (never silently, never blocking the Session).
+async fn start_and_run(session: Session, resume: Option<String>) -> anyhow::Result<()> {
     let context = crate::context_files::load(&session.root);
     let launch_notices: Vec<String> = context.skipped.iter().map(|s| s.info_line()).collect();
-    let resume = if resume.as_deref() == Some(PICK) {
-        // The picker needs the Session first: the logs live in its
-        // session_dir. No sessions to pick from is silently a fresh start -
-        // we're pre-alt-screen, and a note would just flash and vanish.
-        let entries = crate::session::log::list(&session.session_dir);
-        if entries.is_empty() {
-            None
-        } else {
-            match crate::ui::pick_session(entries).await? {
-                PickerOutcome::Resume(path) => Some(path),
-                PickerOutcome::FreshSession => None,
-                // Leave without starting the Agent.
-                PickerOutcome::Quit => return Ok(()),
-            }
-        }
-    } else {
-        resume
-    };
     let agent = start_agent(session.clone(), resume, context.system_prompt)?;
     crate::ui::run(agent, &session, launch_notices).await
+}
+
+// Runs the picker for a bare `--resume` and resolves what launch does. Only
+// the terminal-touching pick_session call lives here; what the outcome MEANS
+// is resolve_resume's (pure, tested).
+async fn resolved_resume(
+    resume: Option<String>,
+    session_dir: &str,
+) -> anyhow::Result<ResumeAction> {
+    let outcome = if resume.as_deref() == Some(PICK) {
+        let entries = crate::session::log::list(session_dir);
+        if entries.is_empty() {
+            // No sessions to pick from is silently a fresh start - we're
+            // pre-alt-screen, and a note would just flash and vanish.
+            None
+        } else {
+            Some(crate::ui::pick_session(entries).await?)
+        }
+    } else {
+        None
+    };
+    Ok(resolve_resume(resume, outcome))
+}
+
+/// What launch does once the `--resume` argument is resolved.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeAction {
+    /// Start the Agent, resuming from this Session Log path when `Some`.
+    Start(Option<String>),
+    /// Leave without starting the Agent (the picker's q / Ctrl-C).
+    Quit,
+}
+
+/// The bare-`--resume` picker decision, pure. `outcome` is `None` when no
+/// picker ran: either a concrete resume value (or none) was passed, or bare
+/// `--resume` found no sessions to pick from - both of those pass straight
+/// through, the latter as a silent fresh start.
+fn resolve_resume(resume: Option<String>, outcome: Option<PickerOutcome>) -> ResumeAction {
+    if resume.as_deref() != Some(PICK) {
+        return ResumeAction::Start(resume);
+    }
+    match outcome {
+        None | Some(PickerOutcome::FreshSession) => ResumeAction::Start(None),
+        Some(PickerOutcome::Resume(path)) => ResumeAction::Start(Some(path)),
+        Some(PickerOutcome::Quit) => ResumeAction::Quit,
+    }
 }
 
 /// The stdout event-subscriber runner (ports `scripts/drive.exs`, ADR-0019).
@@ -72,31 +112,49 @@ pub async fn run_headless(
         anyhow::bail!(r#"--resume without a value needs the TUI; pass a path or "latest""#);
     }
 
+    let session = build_session(root)?;
+    let root_label = session.root.clone();
+    let system_prompt = headless_context(&session.root);
+    let agent = start_agent(session, resume, system_prompt)?;
+    drive(&agent, &root_label, prompts, &mut |line| println!("{line}")).await
+}
+
+// Same load as the TUI; headless has no Transcript, so a skip prints as a
+// plain line in the event stream instead.
+fn headless_context(root: &str) -> String {
+    let context = crate::context_files::load(root);
+    for skip in &context.skipped {
+        println!("!! {}", skip.info_line());
+    }
+    context.system_prompt
+}
+
+/// The per-prompt drive loop: submit each prompt as a sequential Turn and
+/// drain events until it settles. An empty `prompts` defaults to a single
+/// "evaluate this project" Turn (drive.exs's default). Every printed line
+/// goes through `out` - `run_headless` passes `println!`, tests capture the
+/// lines - so the loop runs against an Agent over any Llm double.
+async fn drive(
+    agent: &AgentHandle,
+    root_label: &str,
+    prompts: Vec<String>,
+    out: &mut impl FnMut(String),
+) -> anyhow::Result<()> {
     let prompts = if prompts.is_empty() {
         vec!["evaluate this project".to_string()]
     } else {
         prompts
     };
-
-    let session = build_session(root)?;
-    let root_label = session.root.clone();
-    // Same load as the TUI; headless has no Transcript, so a skip prints as a
-    // plain line in the event stream instead.
-    let context = crate::context_files::load(&session.root);
-    for skip in &context.skipped {
-        println!("!! {}", skip.info_line());
-    }
-    let agent = start_agent(session, resume, context.system_prompt)?;
     let mut events = agent.subscribe();
 
     for prompt in prompts {
         let started = std::time::Instant::now();
-        println!("\n== submit (root={root_label}): {prompt}");
+        out(format!("\n== submit (root={root_label}): {prompt}"));
         // A Turn boundary race with a still-running previous Turn is not
         // possible here: we drive Turns strictly sequentially, awaiting each
         // one's settlement before submitting the next.
         if let Err(_busy) = agent.submit(prompt).await {
-            println!("!! agent busy; skipping");
+            out("!! agent busy; skipping".to_string());
             continue;
         }
 
@@ -108,11 +166,12 @@ pub async fn run_headless(
             match events.recv().await {
                 Ok(event) => {
                     let settled = is_settled(&event);
-                    handle_event(&agent, &event, started).await;
+                    handle_event(agent, &event, started, &mut *out).await;
                     if settled {
-                        print_estimate(&agent).await;
+                        print_estimate(agent, &mut *out).await;
                         if agent.status().await == crate::agent::Status::Running {
-                            println!("   .. recovery turn running; draining until it settles");
+                            out("   .. recovery turn running; draining until it settles"
+                                .to_string());
                             continue;
                         }
                         break;
@@ -120,7 +179,7 @@ pub async fn run_headless(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    println!("!! agent stopped");
+                    out("!! agent stopped".to_string());
                     return Ok(());
                 }
             }
@@ -179,13 +238,33 @@ fn is_settled(event: &Event) -> bool {
     )
 }
 
-async fn handle_event(agent: &AgentHandle, event: &Event, started: std::time::Instant) {
-    let t = elapsed(started);
+/// The thin edge for one event: the pure [`event_lines`] decides what to say,
+/// this emits it - and answers the ONE arm that talks back to the Agent
+/// (run_command Approvals are auto-approved: a diagnostic harness, not a
+/// session for untrusted work).
+async fn handle_event(
+    agent: &AgentHandle,
+    event: &Event,
+    started: std::time::Instant,
+    out: &mut impl FnMut(String),
+) {
+    for line in event_lines(event, started.elapsed().as_secs_f64()) {
+        out(line);
+    }
+    if let Event::ApprovalRequest { approval_id, .. } = event {
+        agent.approve(approval_id.clone(), Decision::Approve).await;
+    }
+}
+
+/// The stdout lines for one event (ports Drive.handle/3), pure: elapsed time
+/// arrives as seconds, not a clock, so a test can pin the formatting. Leading
+/// blank lines ride inside the returned strings (each element is exactly one
+/// `println!` at the edge).
+fn event_lines(event: &Event, elapsed_secs: f64) -> Vec<String> {
+    let t = format!("{elapsed_secs:.1}");
     match event {
-        Event::MessageStart { pass } => {
-            println!("\n-- pass {pass} (t={t}s) model call");
-        }
-        Event::MessageUpdate { .. } => {}
+        Event::MessageStart { pass } => vec![format!("\n-- pass {pass} (t={t}s) model call")],
+        Event::MessageUpdate { .. } => vec![],
         Event::MessageEnd { content, .. } => {
             let text: Vec<&str> = content
                 .iter()
@@ -201,24 +280,28 @@ async fn handle_event(agent: &AgentHandle, event: &Event, started: std::time::In
                     _ => None,
                 })
                 .collect();
-            println!("   message_end (t={t}s) tools={tools:?}");
+            let mut lines = vec![format!("   message_end (t={t}s) tools={tools:?}")];
             let text = text.join(" | ");
             if !text.is_empty() {
-                println!("   text: {}", trunc(&text, 500));
+                lines.push(format!("   text: {}", trunc(&text, 500)));
             }
+            lines
         }
         Event::ToolCall { name, input, .. } => {
-            println!("   -> {name} {} (t={t}s)", trunc(&input.to_string(), 200));
+            vec![format!(
+                "   -> {name} {} (t={t}s)",
+                trunc(&input.to_string(), 200)
+            )]
         }
         Event::ToolResult {
             content, is_error, ..
         } => {
             let flag = if *is_error { "ERR" } else { "ok" };
-            println!(
+            vec![format!(
                 "   <- {flag} {}B (t={t}s): {}",
                 content.len(),
                 trunc(content, 160)
-            );
+            )]
         }
         Event::ContextPressure {
             token_estimate,
@@ -226,13 +309,13 @@ async fn handle_event(agent: &AgentHandle, event: &Event, started: std::time::In
             max_tokens_reserve,
             dead_mass,
         } => {
-            println!(
+            vec![format!(
                 "   ## pressure token_estimate={token_estimate} context_budget={context_budget} max_tokens_reserve={max_tokens_reserve} (dead_mass={}%) (t={t}s)",
                 dead_mass_pct(*dead_mass)
-            );
+            )]
         }
         Event::EvictionWave { stats } => {
-            println!(
+            vec![format!(
                 "   ## EVICTION wave: results={} cmd_superseded={} read_superseded={} edit_husked={} anchors={} (dead_mass={}%) (t={t}s)",
                 stats.results_elided,
                 stats.cmd_superseded,
@@ -240,48 +323,37 @@ async fn handle_event(agent: &AgentHandle, event: &Event, started: std::time::In
                 stats.edits_husked,
                 stats.anchors_elided,
                 dead_mass_pct(stats.dead_mass)
-            );
+            )]
         }
         Event::CompactionProgress { status } => {
-            println!("\n   ## COMPACTION {status} (t={t}s)");
+            vec![format!("\n   ## COMPACTION {status} (t={t}s)")]
         }
-        Event::ApprovalRequest {
-            approval_id,
-            command,
-        } => {
-            println!("   ?? approval for: {command} -- auto-approving");
-            agent.approve(approval_id.clone(), Decision::Approve).await;
+        Event::ApprovalRequest { command, .. } => {
+            vec![format!("   ?? approval for: {command} -- auto-approving")]
         }
         Event::TurnFinished {
             stop_reason,
             token_estimate,
             context_budget,
         } => {
-            println!(
+            vec![format!(
                 "\n== turn_finished (t={t}s): stop_reason={stop_reason} token_estimate={token_estimate} context_budget={context_budget}"
-            );
+            )]
         }
-        Event::TurnError { reason } => {
-            println!("\n== TURN ERROR (t={t}s): {reason}");
-        }
-        Event::TurnCancelled => {
-            println!("\n== turn_cancelled (t={t}s)");
-        }
-        other => {
-            println!("   .. {} (t={t}s)", trunc(&format!("{other:?}"), 200));
-        }
+        Event::TurnError { reason } => vec![format!("\n== TURN ERROR (t={t}s): {reason}")],
+        Event::TurnCancelled => vec![format!("\n== turn_cancelled (t={t}s)")],
+        other => vec![format!(
+            "   .. {} (t={t}s)",
+            trunc(&format!("{other:?}"), 200)
+        )],
     }
 }
 
-async fn print_estimate(agent: &AgentHandle) {
+async fn print_estimate(agent: &AgentHandle, out: &mut impl FnMut(String)) {
     let conv = agent.conversation().await;
-    println!("   token_estimate={}", conv.token_estimate());
-    println!("   messages={}", conv.messages.len());
-    println!("   plan={:?}", agent.plan().await);
-}
-
-fn elapsed(started: std::time::Instant) -> String {
-    format!("{:.1}", started.elapsed().as_secs_f64())
+    out(format!("   token_estimate={}", conv.token_estimate()));
+    out(format!("   messages={}", conv.messages.len()));
+    out(format!("   plan={:?}", agent.plan().await));
 }
 
 fn trunc(s: &str, n: usize) -> String {

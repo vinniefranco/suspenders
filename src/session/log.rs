@@ -339,76 +339,105 @@ impl Entry {
             "user_text" => Some(Entry::UserText(string_field(m, "text")?)),
             "steering" => Some(Entry::Steering(string_field(m, "text")?)),
             "nudge" => Some(Entry::Nudge(string_field(m, "text")?)),
-            "rider" => Some(Entry::Rider {
-                tag: RiderTag::from_str(m.get("tag")?.as_str()?)?,
-                text: string_field(m, "text")?,
-            }),
+            "rider" => parse_rider(m),
             "plan" => Some(Entry::Plan(string_field(m, "text")?)),
-            "assistant_blocks" => {
-                let blocks = decode_blocks(m.get("blocks")?)?;
-                Some(Entry::AssistantBlocks(blocks))
-            }
-            "tool_result" => {
-                let block: ContentBlock = serde_json::from_value(m.get("block")?.clone()).ok()?;
-                Some(Entry::ToolResult(block))
-            }
-            "message" => {
-                let role = decode_role(m.get("role")?.as_str()?)?;
-                let content = decode_blocks(m.get("content")?)?;
-                Some(Entry::Message(Message { role, content }))
-            }
-            "settled" => {
-                let outcome = Settled::from_str(m.get("outcome")?.as_str()?)?;
-                let stop_reason = StopReason::from_str(m.get("stop_reason")?.as_str()?);
-                // The old 3-element form has no "reason" key; it decodes as
-                // None, the same tolerance the compacted entry took.
-                let reason = m
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                Some(Entry::Settled {
-                    outcome,
-                    stop_reason,
-                    reason,
-                })
-            }
-            "compacted" => {
-                let file_ops = FileOps {
-                    read_files: decode_str_list(m.get("read_files")),
-                    modified_files: decode_str_list(m.get("modified_files")),
-                };
-                Some(Entry::Compacted {
-                    summary: string_field(m, "summary").unwrap_or_default(),
-                    skip_count: m.get("skip_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                    tokens_before: m.get("tokens_before").and_then(|v| v.as_u64()).unwrap_or(0),
-                    file_ops,
-                    original_task: m
-                        .get("original_task")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                })
-            }
-            "handoff" => Some(Entry::Handoff {
-                summary: string_field(m, "summary"),
-                file_ops: FileOps {
-                    read_files: decode_str_list(m.get("read_files")),
-                    modified_files: decode_str_list(m.get("modified_files")),
-                },
-                original_task: string_field(m, "original_task"),
-                verification: string_field(m, "verification"),
-            }),
-            "recovery" => Some(Entry::Recovery {
-                shape: RecoveryShape::parse(m.get("shape")?.as_str()?)?,
-                text: string_field(m, "text")?,
-            }),
-            "retry" => Some(Entry::Retry {
-                error: string_field(m, "error")?,
-                attempt: m.get("attempt")?.as_u64()?,
-                budget: m.get("budget")?.as_u64()?,
-            }),
+            "assistant_blocks" => parse_assistant_blocks(m),
+            "tool_result" => parse_tool_result(m),
+            "message" => parse_message(m),
+            "settled" => parse_settled(m),
+            "compacted" => parse_compacted(m),
+            "handoff" => parse_handoff(m),
+            "recovery" => parse_recovery(m),
+            "retry" => parse_retry(m),
             _ => None,
         }
     }
+}
+
+// Per-kind entry parsers. Each returns `None` on a shape mismatch - the same
+// torn-line tolerance `from_json` carries to the fold.
+
+fn parse_rider(m: &serde_json::Value) -> Option<Entry> {
+    Some(Entry::Rider {
+        tag: RiderTag::from_str(m.get("tag")?.as_str()?)?,
+        text: string_field(m, "text")?,
+    })
+}
+
+fn parse_assistant_blocks(m: &serde_json::Value) -> Option<Entry> {
+    let blocks = decode_blocks(m.get("blocks")?)?;
+    Some(Entry::AssistantBlocks(blocks))
+}
+
+fn parse_tool_result(m: &serde_json::Value) -> Option<Entry> {
+    let block: ContentBlock = serde_json::from_value(m.get("block")?.clone()).ok()?;
+    Some(Entry::ToolResult(block))
+}
+
+fn parse_message(m: &serde_json::Value) -> Option<Entry> {
+    let role = decode_role(m.get("role")?.as_str()?)?;
+    let content = decode_blocks(m.get("content")?)?;
+    Some(Entry::Message(Message { role, content }))
+}
+
+fn parse_settled(m: &serde_json::Value) -> Option<Entry> {
+    let outcome = Settled::from_str(m.get("outcome")?.as_str()?)?;
+    let stop_reason = StopReason::from_str(m.get("stop_reason")?.as_str()?);
+    // The old 3-element form has no "reason" key; it decodes as
+    // None, the same tolerance the compacted entry took.
+    let reason = m
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some(Entry::Settled {
+        outcome,
+        stop_reason,
+        reason,
+    })
+}
+
+fn parse_compacted(m: &serde_json::Value) -> Option<Entry> {
+    let file_ops = FileOps {
+        read_files: decode_str_list(m.get("read_files")),
+        modified_files: decode_str_list(m.get("modified_files")),
+    };
+    Some(Entry::Compacted {
+        summary: string_field(m, "summary").unwrap_or_default(),
+        skip_count: m.get("skip_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        tokens_before: m.get("tokens_before").and_then(|v| v.as_u64()).unwrap_or(0),
+        file_ops,
+        original_task: m
+            .get("original_task")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    })
+}
+
+fn parse_handoff(m: &serde_json::Value) -> Option<Entry> {
+    Some(Entry::Handoff {
+        summary: string_field(m, "summary"),
+        file_ops: FileOps {
+            read_files: decode_str_list(m.get("read_files")),
+            modified_files: decode_str_list(m.get("modified_files")),
+        },
+        original_task: string_field(m, "original_task"),
+        verification: string_field(m, "verification"),
+    })
+}
+
+fn parse_recovery(m: &serde_json::Value) -> Option<Entry> {
+    Some(Entry::Recovery {
+        shape: RecoveryShape::parse(m.get("shape")?.as_str()?)?,
+        text: string_field(m, "text")?,
+    })
+}
+
+fn parse_retry(m: &serde_json::Value) -> Option<Entry> {
+    Some(Entry::Retry {
+        error: string_field(m, "error")?,
+        attempt: m.get("attempt")?.as_u64()?,
+        budget: m.get("budget")?.as_u64()?,
+    })
 }
 
 fn role_str(role: Role) -> &'static str {

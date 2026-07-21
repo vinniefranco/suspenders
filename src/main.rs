@@ -27,15 +27,12 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // --write-config removes the hand-authoring friction (ADR-0031): resolve the
-    // path (empty = XDG default), write the base()-defaults template, and exit
-    // before any Session is built - works for both TUI and headless.
+    // --write-config removes the hand-authoring friction (ADR-0031): resolve
+    // the target (empty = XDG default, a rule the config seam owns), write the
+    // base()-defaults template, and exit before any Session is built - works
+    // for both TUI and headless.
     if let Some(path) = cli.write_config {
-        let path = if path.is_empty() {
-            suspenders::session::default_config_path()
-        } else {
-            path
-        };
+        let path = suspenders::session::SessionConfig::resolve_template_path(&path);
         suspenders::session::SessionConfig::write_template(&path, cli.force)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("wrote config template to {path}");

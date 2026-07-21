@@ -1734,6 +1734,163 @@ mod tests {
     use super::*;
     use crate::ui::transcript::Transcript;
 
+    // -----------------------------------------------------------------------
+    // The semantic MdStyle → Style mapping (ADR-0008): one assertion per
+    // vocabulary word, pinning the display fact each variant means.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn md_plain_maps_to_the_default_style() {
+        assert_eq!(md_style(MdStyle::Plain), Style::default());
+    }
+
+    #[test]
+    fn md_bold_maps_to_the_bold_modifier() {
+        assert_eq!(
+            md_style(MdStyle::Bold),
+            Style::default().add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn md_italic_maps_to_the_italic_modifier() {
+        assert_eq!(
+            md_style(MdStyle::Italic),
+            Style::default().add_modifier(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn md_bold_italic_carries_both_modifiers() {
+        let style = md_style(MdStyle::BoldItalic);
+        assert!(
+            style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn md_inline_code_reads_yellow() {
+        assert_eq!(md_style(MdStyle::Code).fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn md_code_block_carries_the_code_background() {
+        // The bg is the block treatment every code row keeps, highlighted or
+        // not; the fg is the plain-fallback tint syntect replaces when it can.
+        let style = md_style(MdStyle::CodeBlock);
+        assert_eq!(style.bg, Some(CODE_BG));
+        assert!(matches!(style.fg, Some(Color::Rgb(..))));
+    }
+
+    #[test]
+    fn md_heading_reads_bold_cyan() {
+        let style = md_style(MdStyle::Heading);
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn md_bullet_reads_cyan() {
+        assert_eq!(md_style(MdStyle::Bullet).fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn md_quote_reads_dim_italic() {
+        let style = md_style(MdStyle::Quote);
+        assert_eq!(style.fg, Some(Color::DarkGray));
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn md_link_reads_underlined_blue() {
+        let style = md_style(MdStyle::Link);
+        assert_eq!(style.fg, Some(Color::Blue));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    // -----------------------------------------------------------------------
+    // markdown_lines: the semantic-MdLine → ratatui-Line rendering, including
+    // the code-fence routing (syntect vs. the plain CodeBlock fallback).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn markdown_lines_styles_prose_spans_through_md_style() {
+        let lines = markdown_lines("plain **bold** text");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "plain bold text");
+        let bold = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "bold")
+            .expect("the bold span");
+        assert_eq!(bold.style, md_style(MdStyle::Bold));
+    }
+
+    #[test]
+    fn a_known_language_fence_is_highlighted_over_the_code_background() {
+        let lines = markdown_lines("```rust\nlet x = 1;\n```");
+        let code = lines
+            .iter()
+            .find(|l| line_text(l) == "let x = 1;")
+            .expect("the code line, text verbatim");
+        // Syntect fragments the line; every fragment keeps OUR code bg under
+        // its own syntect fg.
+        assert!(code.spans.len() > 1, "syntect splits the line");
+        for span in &code.spans {
+            assert_eq!(span.style.bg, Some(CODE_BG));
+            assert!(matches!(span.style.fg, Some(Color::Rgb(..))));
+        }
+    }
+
+    #[test]
+    fn an_unknown_language_fence_falls_back_to_the_plain_code_block_style() {
+        let lines = markdown_lines("```notareallanguage\nsome code\n```");
+        let code = lines
+            .iter()
+            .find(|l| line_text(l) == "some code")
+            .expect("the code line");
+        assert_eq!(code.spans.len(), 1);
+        assert_eq!(code.spans[0].style, md_style(MdStyle::CodeBlock));
+    }
+
+    #[test]
+    fn a_bare_fence_with_no_language_renders_the_plain_code_block_style() {
+        // A bare ``` fence carries `Some("")` - an empty lang must route to
+        // the plain path, never to syntect.
+        let lines = markdown_lines("```\nunlabeled code\n```");
+        let code = lines
+            .iter()
+            .find(|l| line_text(l) == "unlabeled code")
+            .expect("the code line");
+        assert_eq!(code.spans[0].style, md_style(MdStyle::CodeBlock));
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_highlighted_fence_keeps_the_code_background() {
+        let lines = markdown_lines("```rust\nlet a = 1;\n\nlet b = 2;\n```");
+        let a_idx = lines
+            .iter()
+            .position(|l| line_text(l) == "let a = 1;")
+            .expect("the first code line");
+        // The blank row between the statements yields no syntect fragments,
+        // so it takes the plain CodeBlock treatment - same bg, no hole.
+        let blank = &lines[a_idx + 1];
+        assert_eq!(line_text(blank), "");
+        assert_eq!(blank.spans[0].style, md_style(MdStyle::CodeBlock));
+    }
+
+    #[test]
+    fn prose_after_a_fence_returns_to_the_plain_path() {
+        let lines = markdown_lines("```rust\nlet x = 1;\n```\n\nafter the fence");
+        let after = lines
+            .iter()
+            .find(|l| line_text(l) == "after the fence")
+            .expect("the prose line");
+        assert_eq!(after.spans[0].style, md_style(MdStyle::Plain));
+    }
+
     /// The color of the first fragment whose text contains `needle`.
     fn color_of(lines: &[Vec<CodeFragment>], needle: &str) -> (u8, u8, u8) {
         lines
@@ -2592,5 +2749,266 @@ mod tests {
                 .collect();
             assert_eq!(per_item, wrapped_count(whole, width), "width {width}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame-level render tests (ratatui TestBackend): draw one frame into an
+    // in-memory buffer and assert the meaningful facts land - titles, known
+    // lines, the scrollbar gutter - not whole-screen snapshots.
+    // -----------------------------------------------------------------------
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::content::ContentBlock;
+    use crate::event::Event;
+    use crate::llm::stream::Delta;
+    use crate::ui::screen::ScreenOpts;
+
+    /// Draws one frame with `draw` on a fresh `width`×`height` test terminal
+    /// and returns the terminal for buffer inspection.
+    fn draw_frame(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame)).expect("draw one frame");
+        terminal
+    }
+
+    /// One buffer row's symbols, concatenated.
+    fn row_text(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
+            .collect()
+    }
+
+    /// The whole buffer as newline-joined rows, for `contains` assertions.
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| row_text(terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // --- render_composer_popup: the overlay variants ------------------------
+
+    #[test]
+    fn the_menu_popup_titles_commands_and_lists_the_rows_with_hints() {
+        let view = OverlayView::Menu {
+            rows: vec![
+                SelectorRow::new("model", "/model", Some("pick the model".to_string())),
+                SelectorRow::new("clear", "/clear", None),
+            ],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" commands "), "bordered title:\n{text}");
+        assert!(text.contains("/model"));
+        assert!(text.contains("pick the model"), "the hint rides its row");
+        assert!(text.contains("/clear"));
+    }
+
+    #[test]
+    fn the_menu_popup_reverses_the_highlighted_row() {
+        let view = OverlayView::Menu {
+            rows: vec![
+                SelectorRow::new("model", "/model", None),
+                SelectorRow::new("clear", "/clear", None),
+            ],
+            highlight: 1,
+        };
+        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        // Geometry: 2 body rows + borders = height 4, anchored above row 10,
+        // so the body sits at rows 7-8; the popup is inset one column and the
+        // border one more, so row text starts at x = 2.
+        let buf = terminal.backend().buffer();
+        assert!(row_text(&terminal, 8).contains("/clear"));
+        let highlighted = buf.cell((2u16, 8u16)).expect("highlight cell");
+        assert_eq!(highlighted.symbol(), "/");
+        assert!(
+            highlighted
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        let unhighlighted = buf.cell((2u16, 7u16)).expect("plain cell");
+        assert!(
+            !unhighlighted
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn an_empty_menu_popup_shows_no_matches() {
+        let view = OverlayView::Menu {
+            rows: vec![],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        assert!(buffer_text(&terminal).contains("no matches"));
+    }
+
+    #[test]
+    fn a_loading_selector_popup_shows_the_loading_line() {
+        let view = OverlayView::Selector {
+            command: "model".to_string(),
+            status: OverlayStatus::Loading,
+            rows: vec![],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" models "), "selector title:\n{text}");
+        assert!(text.contains("loading models…"));
+    }
+
+    #[test]
+    fn a_failed_selector_popup_shows_the_failure_message() {
+        let view = OverlayView::Selector {
+            command: "model".to_string(),
+            status: OverlayStatus::Failed("connection refused".to_string()),
+            rows: vec![],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        assert!(buffer_text(&terminal).contains("failed: connection refused"));
+    }
+
+    #[test]
+    fn a_ready_selector_popup_lists_the_model_rows() {
+        let view = OverlayView::Selector {
+            command: "model".to_string(),
+            status: OverlayStatus::Ready,
+            rows: vec![
+                SelectorRow::new("a", "qwen/qwen3-30b", None),
+                SelectorRow::new("b", "meta/llama-3.1", None),
+            ],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" models "));
+        assert!(text.contains("qwen/qwen3-30b"));
+        assert!(text.contains("meta/llama-3.1"));
+    }
+
+    #[test]
+    fn the_popup_scrolls_the_highlighted_row_into_view() {
+        // 20 rows against the POPUP_MAX_ROWS cap: highlighting the last row
+        // must scroll the top rows out and bring it on screen.
+        let rows: Vec<SelectorRow> = (0..20)
+            .map(|i| SelectorRow::new(format!("m{i}"), format!("model-{i:02}"), None))
+            .collect();
+        let view = OverlayView::Selector {
+            command: "model".to_string(),
+            status: OverlayStatus::Ready,
+            rows,
+            highlight: 19,
+        };
+        let terminal = draw_frame(40, 14, |f| render_composer_popup(f, 12, f.area(), &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("model-19"), "highlight scrolled into view");
+        assert!(!text.contains("model-00"), "the top rows scrolled out");
+    }
+
+    // --- render_viewport: geometry, the scrollbar gutter, streaming ---------
+
+    fn screen_with_notices(notices: Vec<String>) -> Screen {
+        Screen::new(ScreenOpts {
+            notices,
+            ..ScreenOpts::default()
+        })
+    }
+
+    #[test]
+    fn the_viewport_draws_the_transcript_and_returns_the_measured_geometry() {
+        let screen = screen_with_notices(vec!["a launch notice".to_string()]);
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let mut geometry = (0, 0);
+        let terminal = draw_frame(80, 20, |f| {
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+        });
+        let text = buffer_text(&terminal);
+        assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
+        assert!(text.contains("a launch notice"));
+        let (total_lines, height) = geometry;
+        assert_eq!(height, 20, "height is the drawn area's");
+        assert!(total_lines > 0 && total_lines <= height, "content fits");
+        // Fitting content draws no scrollbar, but the gutter column is still
+        // reserved: the rightmost column stays empty.
+        for y in 0..20 {
+            let row = row_text(&terminal, y);
+            assert_eq!(row.chars().last(), Some(' '), "row {y}: {row:?}");
+        }
+    }
+
+    #[test]
+    fn an_overflowing_transcript_pins_the_tail_and_draws_the_scrollbar() {
+        let notices: Vec<String> = (0..30).map(|i| format!("notice line {i:02}")).collect();
+        let screen = screen_with_notices(notices);
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let mut geometry = (0, 0);
+        let terminal = draw_frame(40, 8, |f| {
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+        });
+        let (total_lines, height) = geometry;
+        assert!(total_lines > height, "the content overflows");
+        let text = buffer_text(&terminal);
+        // A fresh viewport is pinned: the tail is on screen, the top is not.
+        assert!(text.contains("notice line 29"));
+        assert!(!text.contains("notice line 00"));
+        // The reserved gutter now carries scrollbar glyphs.
+        let gutter: Vec<char> = (0..8)
+            .filter_map(|y| row_text(&terminal, y).chars().last())
+            .collect();
+        assert!(
+            gutter.iter().any(|c| *c != ' '),
+            "scrollbar in the gutter: {gutter:?}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_thinking_snapshot_draws_the_one_line_indicator() {
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("pondering".to_string()),
+            vec![ContentBlock::Thinking {
+                text: "pondering the viewport".to_string(),
+            }],
+        ));
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(80, 20, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+        });
+        let text = buffer_text(&terminal);
+        // The in-flight indicator is the one-liner with a token estimate -
+        // never the thinking text itself.
+        assert!(text.contains("thinking… (~"), "the indicator:\n{text}");
+        assert!(text.contains("tokens)"));
+        assert!(!text.contains("pondering the viewport"));
+    }
+
+    #[test]
+    fn in_flight_assistant_text_renders_as_the_streaming_tail() {
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Text("a streaming reply".to_string()),
+            vec![ContentBlock::text("a streaming reply")],
+        ));
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(80, 20, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+        });
+        assert!(buffer_text(&terminal).contains("a streaming reply"));
     }
 }

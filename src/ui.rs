@@ -32,7 +32,7 @@ use crossterm::event::{
 };
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::agent::AgentHandle;
@@ -102,17 +102,21 @@ pub async fn pick_session(entries: Vec<SessionEntry>) -> anyhow::Result<PickerOu
     let mut terminal = ratatui::init();
     // Best-effort, like `run`: no mouse support still means a working picker.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
-    let result = pick_loop(&mut terminal, entries).await;
+    let result = pick_loop(&mut terminal, EventStream::new(), entries).await;
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
 
-async fn pick_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+async fn pick_loop<B, S>(
+    terminal: &mut Terminal<B>,
+    mut input: S,
     entries: Vec<SessionEntry>,
-) -> anyhow::Result<PickerOutcome> {
-    let mut input = EventStream::new();
+) -> anyhow::Result<PickerOutcome>
+where
+    B: Backend,
+    S: Stream<Item = std::io::Result<CtEvent>> + Unpin,
+{
     let mut picker = Picker::new(entries);
 
     terminal.draw(|frame| components::render_picker(frame, &picker))?;
@@ -357,15 +361,19 @@ async fn run_loop(
 /// After the Agent is gone we keep the TUI responsive to quit/scroll only. The
 /// Active Model can no longer change (no Agent to swap it), so the connection
 /// facts are frozen - carried as one owned [`components::ConnectionFacts`].
-async fn drain_input(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    mut input: EventStream,
+async fn drain_input<B, S>(
+    terminal: &mut Terminal<B>,
+    mut input: S,
     screen: Screen,
     mut viewport: Viewport,
     mut geometry: Geometry,
     conn: components::ConnectionFacts,
     mut cache: components::RenderCache,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    S: Stream<Item = std::io::Result<CtEvent>> + Unpin,
+{
     loop {
         let (total_lines, height) = geometry;
         match input.next().await {
@@ -654,8 +662,8 @@ fn to_agent_decision(decision: Decision) -> AgentDecision {
 /// the clamped offset, and draws only the visible slice + scrollbar - all
 /// inside [`components::render`]; the adapter only stores the measure for the
 /// scroll effects that arrive before the next draw.
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+fn draw<B: Backend>(
+    terminal: &mut Terminal<B>,
     screen: &Screen,
     viewport: &Viewport,
     conn: &components::ConnectionFacts,
@@ -714,6 +722,33 @@ mod tests {
         assert_eq!(map_key(&alt), Key::InsertNewline);
         let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(map_key(&plain), Key::Enter);
+    }
+
+    #[test]
+    fn escape_paging_arrows_and_backspace_map_to_their_named_variants() {
+        let cases = [
+            (KeyCode::Esc, Key::Escape),
+            (KeyCode::PageUp, Key::PageUp),
+            (KeyCode::PageDown, Key::PageDown),
+            (KeyCode::Up, Key::ArrowUp),
+            (KeyCode::Down, Key::ArrowDown),
+            (KeyCode::Backspace, Key::Backspace),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(map_key(&KeyEvent::new(code, KeyModifiers::NONE)), expected);
+        }
+    }
+
+    #[test]
+    fn keys_without_a_mapping_fall_through_to_other() {
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Key::Other
+        );
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
+            Key::Other
+        );
     }
 
     #[test]
@@ -872,5 +907,661 @@ mod tests {
 
         let reopened = open_history(&p).unwrap();
         assert_eq!(read_history(&reopened), vec!["kept".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // pick_loop / drain_input - the input loops, driven end-to-end over a
+    // ratatui TestBackend and a synthetic event stream (the same
+    // `io::Result<CtEvent>` items crossterm's EventStream yields). Outcomes
+    // and rendered state are asserted, never mere execution (ADR-0021).
+    // -----------------------------------------------------------------------
+
+    use crate::session::log::SessionEntry;
+    use futures_util::stream;
+    use ratatui::backend::TestBackend;
+
+    type InputEvents = Vec<std::io::Result<CtEvent>>;
+
+    fn press(code: KeyCode) -> std::io::Result<CtEvent> {
+        Ok(CtEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn ctrl_press(c: char) -> std::io::Result<CtEvent> {
+        Ok(CtEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        )))
+    }
+
+    fn release(code: KeyCode) -> std::io::Result<CtEvent> {
+        Ok(CtEvent::Key(KeyEvent::new_with_kind(
+            code,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )))
+    }
+
+    fn mouse_event(kind: MouseEventKind) -> std::io::Result<CtEvent> {
+        Ok(CtEvent::Mouse(mouse(kind)))
+    }
+
+    fn test_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(width, height)).unwrap()
+    }
+
+    /// The last drawn frame as plain rows of text (styling dropped).
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let cells: Vec<&str> = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        cells
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.concat())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn session_entries(n: usize) -> Vec<SessionEntry> {
+        (0..n)
+            .map(|i| SessionEntry {
+                path: format!("/logs/{i}.jsonl"),
+                stamp: format!("2026-07-1{i} 00:00"),
+                label: format!("prompt {i}"),
+            })
+            .collect()
+    }
+
+    async fn pick(events: InputEvents, n: usize) -> PickerOutcome {
+        let mut terminal = test_terminal(80, 24);
+        pick_loop(&mut terminal, stream::iter(events), session_entries(n))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pick_loop_ctrl_c_and_ctrl_q_quit() {
+        assert_eq!(pick(vec![ctrl_press('c')], 2).await, PickerOutcome::Quit);
+        assert_eq!(pick(vec![ctrl_press('q')], 2).await, PickerOutcome::Quit);
+    }
+
+    #[tokio::test]
+    async fn pick_loop_an_ended_input_stream_quits() {
+        assert_eq!(pick(vec![], 2).await, PickerOutcome::Quit);
+    }
+
+    #[tokio::test]
+    async fn pick_loop_arrow_navigation_then_enter_resumes_the_selected_row() {
+        let outcome = pick(vec![press(KeyCode::Down), press(KeyCode::Enter)], 3).await;
+        assert_eq!(outcome, PickerOutcome::Resume("/logs/1.jsonl".into()));
+    }
+
+    #[tokio::test]
+    async fn pick_loop_escape_starts_a_fresh_session() {
+        assert_eq!(
+            pick(vec![press(KeyCode::Esc)], 2).await,
+            PickerOutcome::FreshSession
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_loop_release_keys_are_skipped() {
+        // A Release-kind Enter must NOT resume; the stream then ends, so the
+        // loop quits - proof the release was skipped rather than folded.
+        assert_eq!(
+            pick(vec![release(KeyCode::Enter)], 2).await,
+            PickerOutcome::Quit
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_loop_the_wheel_moves_the_cursor() {
+        let outcome = pick(
+            vec![
+                mouse_event(MouseEventKind::ScrollDown),
+                press(KeyCode::Enter),
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(outcome, PickerOutcome::Resume("/logs/1.jsonl".into()));
+    }
+
+    #[tokio::test]
+    async fn pick_loop_ignores_non_wheel_mouse_and_survives_resize_and_read_errors() {
+        let outcome = pick(
+            vec![
+                mouse_event(MouseEventKind::Moved),
+                Ok(CtEvent::Resize(80, 24)),
+                Err(std::io::Error::other("tty gone")),
+                press(KeyCode::Enter),
+            ],
+            2,
+        )
+        .await;
+        // None of the noise moved the cursor or resolved the picker; Enter
+        // still resumes the first (newest) row.
+        assert_eq!(outcome, PickerOutcome::Resume("/logs/0.jsonl".into()));
+    }
+
+    #[tokio::test]
+    async fn pick_loop_renders_the_rows_into_the_terminal() {
+        let mut terminal = test_terminal(80, 24);
+        let outcome = pick_loop(
+            &mut terminal,
+            stream::iter(vec![ctrl_press('c')]),
+            session_entries(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, PickerOutcome::Quit);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("prompt 0"), "rows are drawn:\n{text}");
+    }
+
+    // drain_input keeps the TUI alive for quit/scroll only after the Agent is
+    // gone. The screen carries enough notice lines to overflow the viewport,
+    // so scrolling has observable effect on the drawn frame.
+
+    fn drained_screen() -> Screen {
+        Screen::new(ScreenOpts {
+            notices: (1..=40).map(|i| format!("notice-{i:02}")).collect(),
+            ..ScreenOpts::default()
+        })
+    }
+
+    fn facts() -> components::ConnectionFacts {
+        components::ConnectionFacts {
+            base_url: "http://test".into(),
+            model: "test-model".into(),
+        }
+    }
+
+    async fn drain(
+        terminal: &mut Terminal<TestBackend>,
+        events: InputEvents,
+    ) -> anyhow::Result<()> {
+        let screen = drained_screen();
+        let viewport = Viewport::new();
+        let mut cache = components::RenderCache::new();
+        let conn = facts();
+        // A real first draw, exactly like run_loop's hand-off: the measured
+        // geometry is what the scroll arms clamp against.
+        let geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache)?;
+        drain_input(
+            terminal,
+            stream::iter(events),
+            screen,
+            viewport,
+            geometry,
+            conn,
+            cache,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn drain_input_ctrl_q_quits() {
+        let mut terminal = test_terminal(40, 12);
+        assert!(drain(&mut terminal, vec![ctrl_press('q')]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_input_an_ended_stream_quits() {
+        let mut terminal = test_terminal(40, 12);
+        assert!(drain(&mut terminal, vec![]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_input_page_up_scrolls_the_tail_out_of_view() {
+        let mut terminal = test_terminal(40, 12);
+        // Pinned bottom shows the newest notice; a PageUp must scroll it out.
+        drain(&mut terminal, vec![press(KeyCode::PageUp), ctrl_press('q')])
+            .await
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("notice-40"),
+            "the tail scrolled out:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_input_page_down_returns_to_the_tail() {
+        let mut terminal = test_terminal(40, 12);
+        drain(
+            &mut terminal,
+            vec![
+                press(KeyCode::PageUp),
+                press(KeyCode::PageDown),
+                ctrl_press('q'),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(buffer_text(&terminal).contains("notice-40"));
+    }
+
+    #[tokio::test]
+    async fn drain_input_the_wheel_scrolls_up_and_back_down() {
+        let mut up = test_terminal(40, 12);
+        drain(
+            &mut up,
+            vec![mouse_event(MouseEventKind::ScrollUp), ctrl_press('c')],
+        )
+        .await
+        .unwrap();
+        assert!(!buffer_text(&up).contains("notice-40"));
+
+        let mut round_trip = test_terminal(40, 12);
+        drain(
+            &mut round_trip,
+            vec![
+                mouse_event(MouseEventKind::ScrollUp),
+                mouse_event(MouseEventKind::ScrollDown),
+                ctrl_press('c'),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(buffer_text(&round_trip).contains("notice-40"));
+    }
+
+    #[tokio::test]
+    async fn drain_input_other_keys_and_events_leave_the_tail_alone() {
+        let mut terminal = test_terminal(40, 12);
+        drain(
+            &mut terminal,
+            vec![
+                press(KeyCode::Char('x')),          // not a scroll key: redraw only
+                mouse_event(MouseEventKind::Moved), // non-wheel mouse: ignored
+                Ok(CtEvent::Resize(40, 12)),        // other event kinds: ignored
+                Err(std::io::Error::other("read")), // read error: keep going
+                ctrl_press('q'),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(buffer_text(&terminal).contains("notice-40"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run_effect - the Effect executor, over a REAL AgentHandle spawned on the
+    // FakeLlm test double (the same harness as src/agent/tests.rs).
+    // -----------------------------------------------------------------------
+
+    use crate::agent::StartOpts;
+    use crate::content::ContentBlock;
+    use crate::llm::response::{Response, StopReason};
+    use crate::session::{SessionConfig, SessionOpts};
+    use crate::test_support::{Entry, FakeLlm};
+    use crate::ui::transcript::TranscriptItem;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn agent_session(dir: &TempDir) -> Session {
+        let root = dir.path().to_string_lossy().into_owned();
+        let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+        Session::build(
+            SessionOpts {
+                root: Some(root),
+                session_dir: Some(session_dir),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .expect("session builds")
+    }
+
+    fn start_agent(dir: &TempDir, fake: FakeLlm) -> AgentHandle {
+        AgentHandle::start(
+            StartOpts::new(agent_session(dir), Arc::new(fake))
+                .with_system_prompt("You are a test agent."),
+        )
+        .expect("agent starts")
+    }
+
+    fn end_turn(text: &str) -> Response {
+        Response {
+            content: vec![ContentBlock::text(text)],
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+            error: None,
+        }
+    }
+
+    fn adapter_ctx(agent: &AgentHandle) -> AdapterCtx<'_> {
+        let (selector_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        AdapterCtx {
+            agent,
+            config_path: "/nonexistent/config.json".into(),
+            selector_tx,
+        }
+    }
+
+    fn has_user_line(screen: &Screen, text: &str) -> bool {
+        screen
+            .transcript()
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::User { text: t } if t == text))
+    }
+
+    fn last_info(screen: &Screen) -> Option<String> {
+        screen
+            .transcript()
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                TranscriptItem::Info { text } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_submit_records_the_user_line_pins_bottom_and_appends_history() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
+        let ctx = adapter_ctx(&agent);
+        let hist_dir = TempDir::new().unwrap();
+        let history = store(&hist_dir);
+
+        // Unpin first, so the threaded PinBottom is observable.
+        let mut viewport = Viewport::new();
+        viewport.scroll_up(5, 100, 20);
+        assert_eq!(viewport.top_offset(100, 20), 75);
+
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = run_effect(
+            screen,
+            Effect::Agent(AgentCommand::Submit("hello agent".into())),
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            Some(&history),
+        )
+        .await;
+
+        // The core recorded the accepted submit as a user line...
+        assert!(has_user_line(&screen, "hello agent"));
+        // ...its threaded PinBottom re-pinned the viewport...
+        assert_eq!(viewport.top_offset(100, 20), 80);
+        // ...and its threaded HistoryAppend wrote through to the store.
+        assert_eq!(read_history(&history), vec!["hello agent".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_steer_while_idle_retries_as_a_submit() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("ok"))]));
+        let ctx = adapter_ctx(&agent);
+        let mut viewport = Viewport::new();
+
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = run_effect(
+            screen,
+            Effect::Agent(AgentCommand::Steer("redirect".into())),
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            None,
+        )
+        .await;
+
+        // The Agent was Idle, so the steer came back Err(Idle) and the core
+        // retried it as a submit: the text lands as a user line.
+        assert!(has_user_line(&screen, "redirect"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_submit_while_busy_retries_as_steering() {
+        let dir = TempDir::new().unwrap();
+        let (entry, mut inflight) = Entry::barrier();
+        let agent = start_agent(&dir, FakeLlm::script(vec![entry]));
+
+        // Park a Turn mid-`complete`, so the Agent answers Busy.
+        agent.submit("first").await.unwrap();
+        let parked = tokio::time::timeout(Duration::from_secs(1), inflight.recv())
+            .await
+            .expect("the Turn parks")
+            .expect("the barrier signals");
+
+        let ctx = adapter_ctx(&agent);
+        let mut viewport = Viewport::new();
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = run_effect(
+            screen,
+            Effect::Agent(AgentCommand::Submit("second".into())),
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            None,
+        )
+        .await;
+
+        // Busy: no user line (steering is queued, not submitted); the core's
+        // retry flipped it to a truthful Running status.
+        assert_eq!(screen.status, Status::Running);
+        assert!(!has_user_line(&screen, "second"));
+        drop(parked); // release the barrier so the Turn can end
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_approve_and_cancel_reach_the_agent_without_hanging() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let ctx = adapter_ctx(&agent);
+        let mut viewport = Viewport::new();
+
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_effect(
+                screen,
+                Effect::Agent(AgentCommand::Approve("id-1".into(), Decision::Approve)),
+                &ctx,
+                &mut viewport,
+                (100, 20),
+                None,
+            ),
+        )
+        .await
+        .expect("approve returns");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_effect(
+                screen,
+                Effect::Agent(AgentCommand::Cancel),
+                &ctx,
+                &mut viewport,
+                (100, 20),
+                None,
+            ),
+        )
+        .await
+        .expect("cancel returns");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_scroll_effects_move_the_viewport_against_the_last_measure() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let ctx = adapter_ctx(&agent);
+        let geometry = (100, 20); // tail top offset is 80
+        let mut viewport = Viewport::new();
+
+        let mut screen = Screen::new(ScreenOpts::default());
+        screen = run_effect(
+            screen,
+            Effect::ScrollUp(ScrollStep::Line),
+            &ctx,
+            &mut viewport,
+            geometry,
+            None,
+        )
+        .await;
+        assert_eq!(viewport.top_offset(100, 20), 80 - WHEEL_LINES);
+
+        screen = run_effect(
+            screen,
+            Effect::ScrollUp(ScrollStep::Page),
+            &ctx,
+            &mut viewport,
+            geometry,
+            None,
+        )
+        .await;
+        assert_eq!(viewport.top_offset(100, 20), 58); // one page = height - 1
+
+        screen = run_effect(
+            screen,
+            Effect::ScrollDown(ScrollStep::Line),
+            &ctx,
+            &mut viewport,
+            geometry,
+            None,
+        )
+        .await;
+        assert_eq!(viewport.top_offset(100, 20), 61);
+
+        screen = run_effect(
+            screen,
+            Effect::ScrollDown(ScrollStep::Page),
+            &ctx,
+            &mut viewport,
+            geometry,
+            None,
+        )
+        .await;
+        assert_eq!(
+            viewport.top_offset(100, 20),
+            80,
+            "a full page down re-pins at the tail"
+        );
+
+        screen = run_effect(
+            screen,
+            Effect::ScrollUp(ScrollStep::Line),
+            &ctx,
+            &mut viewport,
+            geometry,
+            None,
+        )
+        .await;
+        let _ = run_effect(
+            screen,
+            Effect::PinBottom,
+            &ctx,
+            &mut viewport,
+            geometry,
+            None,
+        )
+        .await;
+        assert_eq!(viewport.top_offset(100, 20), 80, "PinBottom re-pins");
+        // Pinned again: the tail is followed as content grows.
+        assert_eq!(viewport.top_offset(200, 20), 180);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_focus_effects_are_noops_in_this_adapter() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let ctx = adapter_ctx(&agent);
+        let mut viewport = Viewport::new();
+
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = run_effect(
+            screen,
+            Effect::FocusModal,
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            None,
+        )
+        .await;
+        let screen = run_effect(
+            screen,
+            Effect::FocusComposer,
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            None,
+        )
+        .await;
+
+        assert_eq!(screen.status, Status::Idle);
+        assert_eq!(viewport.top_offset(100, 20), 80, "the viewport never moved");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_history_append_writes_through_and_tolerates_no_store() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let ctx = adapter_ctx(&agent);
+        let mut viewport = Viewport::new();
+        let hist_dir = TempDir::new().unwrap();
+        let history = store(&hist_dir);
+
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = run_effect(
+            screen,
+            Effect::HistoryAppend("saved".into()),
+            &ctx,
+            &mut viewport,
+            (0, 0),
+            Some(&history),
+        )
+        .await;
+        assert_eq!(read_history(&history), vec!["saved".to_string()]);
+
+        // No store opened (open_history failed at launch): the append is
+        // dropped, never fatal - and the store on disk is untouched.
+        let _ = run_effect(
+            screen,
+            Effect::HistoryAppend("dropped".into()),
+            &ctx,
+            &mut viewport,
+            (0, 0),
+            None,
+        )
+        .await;
+        assert_eq!(read_history(&history), vec!["saved".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_routes_unhandled_commands_and_choices_to_visible_info_lines() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let ctx = adapter_ctx(&agent);
+        let mut viewport = Viewport::new();
+
+        let screen = Screen::new(ScreenOpts::default());
+        let screen = run_effect(
+            screen,
+            Effect::Command {
+                name: "theme".into(),
+                generation: 0,
+            },
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            None,
+        )
+        .await;
+        assert_eq!(last_info(&screen).as_deref(), Some("/theme: no handler"));
+
+        let screen = run_effect(
+            screen,
+            Effect::SelectorChosen {
+                command: "nope".into(),
+                value: "dark".into(),
+            },
+            &ctx,
+            &mut viewport,
+            (100, 20),
+            None,
+        )
+        .await;
+        assert_eq!(last_info(&screen).as_deref(), Some("/nope: no handler"));
     }
 }
