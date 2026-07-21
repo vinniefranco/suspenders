@@ -65,7 +65,7 @@
 use crate::event::Event;
 use crate::ui::draft;
 use crate::ui::history::History;
-use crate::ui::screen::{AgentCommand, Effect, Key, Status};
+use crate::ui::screen::{AgentCommand, Effect, Key, Status, UngatedKey};
 use crate::ui::selector::{Selector, SelectorOutcome, SelectorRow};
 use crate::ui::slash;
 
@@ -217,9 +217,9 @@ impl Composer {
     /// Offers one key to the Composer (first refusal, ADR-0034). `status` is
     /// the Agent's status at this fold, so the Composer decides Submit vs
     /// Steer at the keypress; it is a read-only input - the Composer never
-    /// flips it. The caller's Approval gate MUST run first (the modal
-    /// swallows everything but y/n/a/Escape); the Composer has no modal
-    /// knowledge.
+    /// flips it. `key` is an [`UngatedKey`]: only the caller's Approval gate
+    /// can mint one, so this fold never sees a key the modal should have
+    /// swallowed - the Composer needs no modal knowledge.
     ///
     /// The routing contract - the interface the fold root leans on:
     ///
@@ -238,7 +238,8 @@ impl Composer {
     /// The refusal contract: a Refused key leaves the Composer BIT-IDENTICAL -
     /// refusal never reads a rule against mutated state, and the caller may
     /// treat it as "this fold never happened".
-    pub fn handle_key(&mut self, key: Key, status: Status) -> KeyOutcome {
+    pub fn handle_key(&mut self, key: UngatedKey, status: Status) -> KeyOutcome {
+        let key = key.into_key();
         // The ALWAYS-refused rows of the routing table, decided before any
         // state is touched (the refusal contract above). Every key past this
         // gate is consumed whenever a slash sub-state is open - the overlay
@@ -845,7 +846,7 @@ mod tests {
     // notice; returns the effects. (Named apart from the module's `consumed`
     // outcome constructor - this one FOLDS, that one builds.)
     fn fold_consumed(c: &mut Composer, key: Key) -> Vec<Effect> {
-        match c.handle_key(key, Status::Idle) {
+        match c.handle_key(UngatedKey::for_test(key), Status::Idle) {
             KeyOutcome::Consumed {
                 effects,
                 notice: None,
@@ -971,7 +972,7 @@ mod tests {
     #[test]
     fn enter_on_an_unknown_command_yields_a_notice_and_no_effects() {
         let mut c = slashing("/nope");
-        match c.handle_key(Key::Enter, Status::Idle) {
+        match c.handle_key(UngatedKey::for_test(Key::Enter), Status::Idle) {
             KeyOutcome::Consumed { effects, notice } => {
                 assert_eq!(effects, vec![], "no Turn, no command effect");
                 assert_eq!(notice, Some("unknown command: /nope".into()));
@@ -1027,7 +1028,7 @@ mod tests {
         // command - it is NOT Steering text.
         let mut c = slashing("/model");
         assert!(overlay(&c).is_some(), "menu opens while running");
-        match c.handle_key(Key::Enter, Status::Running) {
+        match c.handle_key(UngatedKey::for_test(Key::Enter), Status::Running) {
             KeyOutcome::Consumed { effects, .. } => assert_eq!(
                 effects,
                 vec![Effect::Command {
@@ -1324,7 +1325,7 @@ mod tests {
     #[test]
     fn enter_steers_when_running_instead_of_submitting() {
         let mut c = with_draft("  also check the README  ", 10);
-        match c.handle_key(Key::Enter, Status::Running) {
+        match c.handle_key(UngatedKey::for_test(Key::Enter), Status::Running) {
             KeyOutcome::Consumed { effects, .. } => assert_eq!(
                 effects,
                 vec![Effect::Agent(AgentCommand::Steer(
@@ -1347,7 +1348,7 @@ mod tests {
     // Asserts the refusal contract for `key` against a clone of `state`.
     fn assert_refusal_is_pure(state: &Composer, key: Key, status: Status) {
         let mut c = state.clone();
-        let outcome = c.handle_key(key.clone(), status);
+        let outcome = c.handle_key(UngatedKey::for_test(key.clone()), status);
         assert_eq!(outcome, KeyOutcome::Refused(key), "expected a refusal");
         assert_eq!(
             &c, state,
@@ -1411,7 +1412,7 @@ mod tests {
         // test held).
         let mut c = mid_recall();
         assert!(matches!(
-            c.handle_key(Key::Escape, Status::Running),
+            c.handle_key(UngatedKey::for_test(Key::Escape), Status::Running),
             KeyOutcome::Refused(_)
         ));
         fold_consumed(&mut c, Key::ArrowDown);
@@ -1547,7 +1548,7 @@ mod tests {
     #[test]
     fn enter_on_a_trailing_backslash_continues_while_running_too() {
         let mut c = with_draft("steer me\\", 9);
-        match c.handle_key(Key::Enter, Status::Running) {
+        match c.handle_key(UngatedKey::for_test(Key::Enter), Status::Running) {
             KeyOutcome::Consumed { effects, .. } => assert_eq!(effects, vec![]),
             other => panic!("expected a consumed continuation, got {other:?}"),
         }

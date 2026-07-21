@@ -113,6 +113,28 @@ pub enum Key {
     Named(String),
 }
 
+/// A key the Approval gate has already declined to swallow. The field is
+/// private and the only production mint sits inside the gate itself
+/// ([`Screen::handle_key`]), so [`Composer::handle_key`] - which takes this
+/// type - cannot run while the modal holds the keyboard: the FIXED routing
+/// order (ADR-0034) is a compile-time fact, not a rule callers must remember.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UngatedKey(Key);
+
+impl UngatedKey {
+    /// Unwraps the key for the Composer's own arms.
+    pub(crate) fn into_key(self) -> Key {
+        self.0
+    }
+
+    /// Test-only mint, so Composer unit tests can fold keys without standing
+    /// up a Screen. Production code has exactly one mint: the gate.
+    #[cfg(test)]
+    pub(crate) fn for_test(key: Key) -> Self {
+        UngatedKey(key)
+    }
+}
+
 /// The Agent command an [`Effect::Agent`] carries (baud's `{:agent, ...}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCommand {
@@ -470,7 +492,9 @@ impl Screen {
     /// Composer editing included - so every rule lives in the pure core
     /// (ADR-0001); the adapter only maps crossterm events to [`Key`]s. The
     /// routing order is FIXED (ADR-0034): the Approval gate first, then the
-    /// Composer's first refusal, then this fold's own arms.
+    /// Composer's first refusal, then this fold's own arms. The gate-first
+    /// leg is compiler-enforced: [`Composer::handle_key`] takes an
+    /// [`UngatedKey`], and only the gate below can mint one.
     ///
     /// While an Approval is pending, only `y`, `n`, `a` and `Escape` do
     /// anything; every other key is swallowed - in particular, plain chars
@@ -503,13 +527,15 @@ impl Screen {
         }
 
         // The Composer gets first refusal (ADR-0034): every key the modal did
-        // not swallow is offered to it, and only a Refused key reaches the
-        // arms below. This ordering is load-bearing - it is what lets a slash
+        // not swallow is offered to it - the UngatedKey minted here is the
+        // gate's receipt, and this is its ONLY production mint - and only a
+        // Refused key reaches the arms below. This ordering is load-bearing -
+        // it is what lets a slash
         // draft intercept Enter and the arrows, and an open overlay intercept
         // Escape and the wheel, without this fold knowing any overlay exists.
         // A notice is the Composer's one info line (the unknown-command case),
         // recorded through the store like every other adapter-side news.
-        let key = match self.composer.handle_key(key, self.status) {
+        let key = match self.composer.handle_key(UngatedKey(key), self.status) {
             KeyOutcome::Consumed { effects, notice } => {
                 if let Some(text) = notice {
                     self.transcript.info(text);
