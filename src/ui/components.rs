@@ -29,7 +29,7 @@ use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::selector::SelectorRow;
-use crate::ui::transcript::{LineStyle, StyledLine, Transcript, TranscriptItem};
+use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
 use crate::ui::viewport::Viewport;
 
 // ---------------------------------------------------------------------------
@@ -389,19 +389,19 @@ pub fn render_viewport(
     // One (lines, wrapped-count) entry per window "item": every settled
     // message, then the streaming tail - a single indexing shared by the
     // window selection and the slice assembly below.
-    let mut item_lines: Vec<&[Line<'static>]> = cache
-        .items
-        .iter()
-        .map(|item| item.lines.as_slice())
-        .collect();
-    let mut counts: Vec<usize> = cache.items.iter().map(|item| item.wrapped).collect();
+    let mut item_lines: Vec<&[Line<'static>]> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    for (lines, wrapped) in cache.settled() {
+        item_lines.push(lines);
+        counts.push(wrapped);
+    }
     if !thinking_lines.is_empty() {
         counts.push(wrapped_count(thinking_lines.clone(), text_area.width));
         item_lines.push(&thinking_lines);
     }
-    if let Some(streaming) = &cache.streaming {
-        counts.push(streaming.wrapped);
-        item_lines.push(&streaming.lines);
+    if let Some((lines, wrapped)) = cache.streaming_tail() {
+        counts.push(wrapped);
+        item_lines.push(lines);
     }
 
     let total_lines: usize = counts.iter().sum();
@@ -455,116 +455,290 @@ struct Toggles {
     tools_expanded: bool,
 }
 
-/// Per-item render state for the transcript viewport, owned by the adapter's
-/// run loop and threaded through [`render`]. Holds ratatui [`Line`]s, so it
-/// lives HERE, not in the pure modules (ADR-0019).
-pub struct RenderCache {
-    /// The text width everything below was built/measured at.
-    width: u16,
-    /// The [`Toggles`] the settled lines were built with (either flip changes
-    /// every affected item's lines, so it clears the cache wholesale).
-    toggles: Toggles,
-    /// The store's [`Transcript::revision`] the entries were built at: while
-    /// it holds still, the settled items only extend (the store's prefix
-    /// contract) and the cache extends with them; when it moves (a structural
-    /// edit), the cache rebuilds from scratch.
-    revision: u64,
-    /// One entry per settled [`Transcript::items`] item, same order.
-    items: Vec<CachedItem>,
-    /// The in-flight streaming markdown, keyed on its char length: within one
-    /// message the snapshot only grows, so the length is a cheap monotonic
-    /// key that changes exactly when the text does. Cleared between messages
-    /// (empty streaming text) so a new message can never collide with a stale
-    /// entry of the same length.
-    streaming: Option<CachedStreaming>,
-}
+pub use render_cache::RenderCache;
 
-/// One settled item's built lines and its wrapped row count at the cache's
-/// width - the numbers [`visible_window`] does its prefix-sum math over.
-struct CachedItem {
-    lines: Vec<Line<'static>>,
-    wrapped: usize,
-}
+/// The cache is a private child module (the same move ADR-0034 made for the
+/// store's streaming snapshot): still in `ui/components`, still ratatui
+/// [`Line`]s (ADR-0029 rejects a frame-free extraction). The boundary exists
+/// so the fields are genuinely private - the frame path reads through the two
+/// accessors - and the extend-vs-rebuild invariant is pinned by unit tests at
+/// this seam, next to the state they inspect, not through full-screen renders.
+mod render_cache {
+    use ratatui::text::Line;
 
-/// The cached streaming-markdown tail (see [`RenderCache::streaming`]).
-struct CachedStreaming {
-    char_len: usize,
-    lines: Vec<Line<'static>>,
-    wrapped: usize,
-}
+    use super::{Toggles, markdown_lines, message_lines, wrapped_count};
+    use crate::ui::transcript::Transcript;
 
-impl RenderCache {
-    pub fn new() -> Self {
-        RenderCache {
-            width: 0,
-            toggles: Toggles::default(),
-            revision: 0,
-            items: Vec::new(),
-            streaming: None,
-        }
+    /// Per-item render state for the transcript viewport, owned by the
+    /// adapter's run loop and threaded through [`super::render`]. Holds
+    /// ratatui [`Line`]s, so it lives HERE, not in the pure modules
+    /// (ADR-0019).
+    pub struct RenderCache {
+        /// The text width everything below was built/measured at.
+        width: u16,
+        /// The [`Toggles`] the settled lines were built with (either flip
+        /// changes every affected item's lines, so it clears the cache
+        /// wholesale).
+        toggles: Toggles,
+        /// The store's [`Transcript::revision`] the entries were built at:
+        /// while it holds still, the settled items only extend (the store's
+        /// prefix contract) and the cache extends with them; when it moves (a
+        /// structural edit), the cache rebuilds from scratch.
+        revision: u64,
+        /// One entry per settled [`Transcript::items`] item, same order.
+        items: Vec<CachedItem>,
+        /// The in-flight streaming markdown, keyed on its char length: within
+        /// one message the snapshot only grows, so the length is a cheap
+        /// monotonic key that changes exactly when the text does. Cleared
+        /// between messages (empty streaming text) so a new message can never
+        /// collide with a stale entry of the same length.
+        streaming: Option<CachedStreaming>,
     }
 
-    /// Brings the cache up to date with the Transcript at `width`: clears
-    /// wholesale when a key input changed (width, a [`Toggles`] flip, a
-    /// structural edit that moved the store's revision), then builds entries
-    /// for the newly appended items only - the steady-state cost of a frame is
-    /// zero rebuilt items. The extend-only fast path is safe because the store
-    /// guarantees the settled items are a PREFIX of the last read while the
-    /// revision holds still; the length check is cheap defense in kind.
-    fn sync(&mut self, t: &Transcript, toggles: Toggles, width: u16) {
-        if self.width != width
-            || self.toggles != toggles
-            || self.revision != t.revision()
-            || self.items.len() > t.items().len()
-        {
-            self.items.clear();
-            self.streaming = None;
-            self.width = width;
-            self.toggles = toggles;
-            self.revision = t.revision();
+    /// One settled item's built lines and its wrapped row count at the
+    /// cache's width - the numbers [`super::visible_window`] does its
+    /// prefix-sum math over.
+    struct CachedItem {
+        lines: Vec<Line<'static>>,
+        wrapped: usize,
+    }
+
+    /// The cached streaming-markdown tail (see [`RenderCache::streaming`]).
+    struct CachedStreaming {
+        char_len: usize,
+        lines: Vec<Line<'static>>,
+        wrapped: usize,
+    }
+
+    impl RenderCache {
+        pub fn new() -> Self {
+            RenderCache {
+                width: 0,
+                toggles: Toggles::default(),
+                revision: 0,
+                items: Vec::new(),
+                streaming: None,
+            }
         }
-        for item in &t.items()[self.items.len()..] {
-            let mut lines = message_lines(item, toggles.thinking_expanded, toggles.tools_expanded);
-            // One trailing blank row per settled item so turns read as
-            // distinct paragraphs rather than one wall. Building it into the
-            // cached lines keeps measurement (`wrapped`) and rendering exactly
-            // consistent - the viewport window math depends on that agreement.
-            lines.push(Line::default());
+
+        /// The settled entries in [`Transcript::items`] order: each item's
+        /// built lines with its wrapped row count at the cache's width.
+        pub(super) fn settled(&self) -> impl Iterator<Item = (&[Line<'static>], usize)> {
+            self.items
+                .iter()
+                .map(|item| (item.lines.as_slice(), item.wrapped))
+        }
+
+        /// The streaming-markdown tail, if a snapshot is in flight: its lines
+        /// with their wrapped row count. Always after every settled entry.
+        pub(super) fn streaming_tail(&self) -> Option<(&[Line<'static>], usize)> {
+            self.streaming
+                .as_ref()
+                .map(|s| (s.lines.as_slice(), s.wrapped))
+        }
+
+        /// Brings the cache up to date with the Transcript at `width`: clears
+        /// wholesale when [`Self::needs_rebuild`] says a key input changed,
+        /// then builds entries for the newly appended items only - the
+        /// steady-state cost of a frame is zero rebuilt items.
+        pub(super) fn sync(&mut self, t: &Transcript, toggles: Toggles, width: u16) {
+            if self.needs_rebuild(t, toggles, width) {
+                self.items.clear();
+                self.streaming = None;
+                self.width = width;
+                self.toggles = toggles;
+                self.revision = t.revision();
+            }
+            for item in &t.items()[self.items.len()..] {
+                let mut lines =
+                    message_lines(item, toggles.thinking_expanded, toggles.tools_expanded);
+                // One trailing blank row per settled item so turns read as
+                // distinct paragraphs rather than one wall. Building it into
+                // the cached lines keeps measurement (`wrapped`) and rendering
+                // exactly consistent - the viewport window math depends on
+                // that agreement.
+                lines.push(Line::default());
+                let wrapped = wrapped_count(lines.clone(), width);
+                self.items.push(CachedItem { lines, wrapped });
+            }
+            self.sync_streaming(&t.streaming_text(), width);
+        }
+
+        /// Whether [`Self::sync`] must clear wholesale instead of extending.
+        /// The extend-only fast path is safe because the store guarantees the
+        /// settled items are a strict PREFIX of the last read while the
+        /// revision holds still (appends never bump, structural edits always
+        /// do - see `ui/transcript`); a width or [`Toggles`] change restyles
+        /// every settled line, so either clears too. The length check is
+        /// cheap defense in kind: a store shorter than the cache (a swapped
+        /// Transcript whose revision happens to coincide) cannot extend it.
+        fn needs_rebuild(&self, t: &Transcript, toggles: Toggles, width: u16) -> bool {
+            self.width != width
+                || self.toggles != toggles
+                || self.revision != t.revision()
+                || self.items.len() > t.items().len()
+        }
+
+        /// Re-parses the streaming markdown only when its char length moved
+        /// (monotonic within a message - see the field doc); drops the entry
+        /// when streaming ended so the next message starts from nothing.
+        fn sync_streaming(&mut self, text: &str, width: u16) {
+            if text.is_empty() {
+                self.streaming = None;
+                return;
+            }
+            let char_len = text.chars().count();
+            if self
+                .streaming
+                .as_ref()
+                .is_some_and(|s| s.char_len == char_len)
+            {
+                return;
+            }
+            let lines = markdown_lines(text);
             let wrapped = wrapped_count(lines.clone(), width);
-            self.items.push(CachedItem { lines, wrapped });
+            self.streaming = Some(CachedStreaming {
+                char_len,
+                lines,
+                wrapped,
+            });
         }
-        self.sync_streaming(&t.streaming_text(), width);
     }
 
-    /// Re-parses the streaming markdown only when its char length moved
-    /// (monotonic within a message - see the field doc); drops the entry when
-    /// streaming ended so the next message starts from nothing.
-    fn sync_streaming(&mut self, text: &str, width: u16) {
-        if text.is_empty() {
-            self.streaming = None;
-            return;
+    impl Default for RenderCache {
+        fn default() -> Self {
+            RenderCache::new()
         }
-        let char_len = text.chars().count();
-        if self
-            .streaming
-            .as_ref()
-            .is_some_and(|s| s.char_len == char_len)
-        {
-            return;
-        }
-        let lines = markdown_lines(text);
-        let wrapped = wrapped_count(lines.clone(), width);
-        self.streaming = Some(CachedStreaming {
-            char_len,
-            lines,
-            wrapped,
-        });
     }
-}
 
-impl Default for RenderCache {
-    fn default() -> Self {
-        RenderCache::new()
+    // The extend-vs-rebuild invariant, pinned at the cache's own seam. These
+    // sync against a bare Transcript store (ADR-0034) seeded through its
+    // verbs, and they live INSIDE the module because proving "not rebuilt"
+    // takes a sentinel planted in the private entries - identity, not
+    // equality. Accessor-expressible cache tests stay in the outer module.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::content::ContentBlock;
+
+        fn line_text(line: &Line<'static>) -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        }
+
+        fn fresh_transcript() -> Transcript {
+            Transcript::new(Vec::new())
+        }
+
+        #[test]
+        fn cache_sync_extends_for_appends_without_rebuilding_settled_entries() {
+            let mut t = fresh_transcript();
+            t.info("first");
+            let mut cache = RenderCache::new();
+            cache.sync(&t, Toggles::default(), 80);
+
+            // Plant a sentinel in the built entry: an append extends the cache
+            // without touching settled entries, so the sentinel must survive
+            // the next sync - a rebuild would have replaced it with "first".
+            cache.items[0].lines[0] = Line::raw("sentinel");
+            t.info("appended");
+            cache.sync(&t, Toggles::default(), 80);
+            assert_eq!(cache.items.len(), 2);
+            assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
+            assert_eq!(line_text(&cache.items[1].lines[0]), "appended");
+        }
+
+        #[test]
+        fn cache_sync_rebuilds_when_the_revision_moves() {
+            let mut t = fresh_transcript();
+            t.steering_queued("check");
+            let mut cache = RenderCache::new();
+            cache.sync(&t, Toggles::default(), 80);
+            cache.items[0].lines[0] = Line::raw("sentinel");
+
+            // The delivered steering removes its pending marker - a structural
+            // edit that bumps the store's revision - so the cache rebuilds
+            // from scratch: the sentinel is gone and the promoted user line is
+            // seen.
+            t.steering_delivered("check");
+            cache.sync(&t, Toggles::default(), 80);
+            assert_eq!(cache.items.len(), 1);
+            assert_eq!(line_text(&cache.items[0].lines[0]), "› check");
+        }
+
+        #[test]
+        fn cache_sync_rebuilds_when_the_store_shrinks_below_the_cached_length() {
+            // No store verb shrinks without bumping (the prefix contract), so
+            // the only way here is a SWAPPED Transcript whose revision happens
+            // to coincide - two fresh stores both at revision 0. The length
+            // check catches it: the sentinel is gone, wholesale.
+            let mut t = fresh_transcript();
+            t.info("first");
+            t.info("second");
+            let mut cache = RenderCache::new();
+            cache.sync(&t, Toggles::default(), 80);
+            cache.items[0].lines[0] = Line::raw("sentinel");
+
+            let mut shorter = fresh_transcript();
+            shorter.info("replacement");
+            assert_eq!(t.revision(), shorter.revision());
+            cache.sync(&shorter, Toggles::default(), 80);
+            assert_eq!(cache.items.len(), 1);
+            assert_eq!(line_text(&cache.items[0].lines[0]), "replacement");
+        }
+
+        #[test]
+        fn the_streaming_tail_is_never_cached_as_a_settled_entry() {
+            let mut t = fresh_transcript();
+            t.info("settled");
+            t.message_start();
+            t.message_update(vec![ContentBlock::text("in flight")]);
+            let mut cache = RenderCache::new();
+            cache.sync(&t, Toggles::default(), 80);
+            // The in-flight snapshot lives ONLY in the streaming slot; the
+            // settled entries still mirror `Transcript::items` exactly.
+            assert_eq!(cache.items.len(), t.items().len());
+            assert_eq!(cache.items.len(), 1);
+            assert!(cache.streaming.is_some());
+
+            // Settling the message appends without bumping the revision, so
+            // the tail arrives as an EXTEND (the sentinel survives) and the
+            // streaming slot empties for the next message.
+            cache.items[0].lines[0] = Line::raw("sentinel");
+            t.message_end(&[ContentBlock::text("in flight")]);
+            cache.sync(&t, Toggles::default(), 80);
+            assert_eq!(cache.items.len(), 2);
+            assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
+            assert!(cache.streaming.is_none());
+        }
+
+        #[test]
+        fn streaming_cache_reparses_only_when_the_char_length_moves() {
+            let mut cache = RenderCache::new();
+            cache.sync_streaming("hello", 80);
+            assert_eq!(
+                line_text(&cache.streaming.as_ref().unwrap().lines[0]),
+                "hello"
+            );
+
+            // Same length, different text: the monotonic-key contract - within
+            // a message the snapshot only GROWS, so an equal length means
+            // unchanged and the cached lines are reused as-is.
+            cache.sync_streaming("world", 80);
+            assert_eq!(
+                line_text(&cache.streaming.as_ref().unwrap().lines[0]),
+                "hello"
+            );
+
+            // Growth re-parses; the end of streaming clears, so the next
+            // message can never collide with a stale entry of the same length.
+            cache.sync_streaming("hello more", 80);
+            assert_eq!(
+                line_text(&cache.streaming.as_ref().unwrap().lines[0]),
+                "hello more"
+            );
+            cache.sync_streaming("", 80);
+            assert!(cache.streaming.is_none());
+        }
     }
 }
 
@@ -1558,6 +1732,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::transcript::Transcript;
 
     /// The color of the first fragment whose text contains `needle`.
     fn color_of(lines: &[Vec<CodeFragment>], needle: &str) -> (u8, u8, u8) {
@@ -2095,11 +2270,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The render cache (sync + the streaming tail's monotonic key).
+    // The render cache, read through its accessors.
     //
     // The cache syncs against the Transcript STORE (ADR-0034): tests seed a
     // bare store through its verbs - the items Vec is not reachable, which is
     // the point (the extend-vs-rebuild contract is the store's revision).
+    // The tests HERE observe only what the frame path observes (`settled`,
+    // `streaming_tail`); the extend-vs-rebuild invariant itself is pinned by
+    // sentinel tests inside `render_cache`, next to the private entries.
     // -----------------------------------------------------------------------
 
     fn line_text(line: &Line<'static>) -> String {
@@ -2118,44 +2296,9 @@ mod tests {
         t.user("0123456789012345");
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 10);
-        assert_eq!(cache.items.len(), 1);
+        assert_eq!(cache.settled().count(), 1);
         // 3 wrapped rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[0].wrapped, 4);
-    }
-
-    #[test]
-    fn cache_sync_extends_for_appends_without_rebuilding_settled_entries() {
-        let mut t = fresh_transcript();
-        t.info("first");
-        let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80);
-
-        // Plant a sentinel in the built entry: an append extends the cache
-        // without touching settled entries, so the sentinel must survive the
-        // next sync - a rebuild would have replaced it with "first".
-        cache.items[0].lines[0] = Line::raw("sentinel");
-        t.info("appended");
-        cache.sync(&t, Toggles::default(), 80);
-        assert_eq!(cache.items.len(), 2);
-        assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
-        assert_eq!(line_text(&cache.items[1].lines[0]), "appended");
-    }
-
-    #[test]
-    fn cache_sync_rebuilds_when_the_revision_moves() {
-        let mut t = fresh_transcript();
-        t.steering_queued("check");
-        let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80);
-        cache.items[0].lines[0] = Line::raw("sentinel");
-
-        // The delivered steering removes its pending marker - a structural
-        // edit that bumps the store's revision - so the cache rebuilds from
-        // scratch: the sentinel is gone and the promoted user line is seen.
-        t.steering_delivered("check");
-        cache.sync(&t, Toggles::default(), 80);
-        assert_eq!(cache.items.len(), 1);
-        assert_eq!(line_text(&cache.items[0].lines[0]), "› check");
+        assert_eq!(cache.settled().next().unwrap().1, 4);
     }
 
     #[test]
@@ -2165,10 +2308,10 @@ mod tests {
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80);
         // 1 content row + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[0].wrapped, 2);
-        let wide = cache.items[0].wrapped;
+        let wide = cache.settled().next().unwrap().1;
+        assert_eq!(wide, 2);
         cache.sync(&t, Toggles::default(), 10); // resize: every wrapped count is stale
-        assert!(cache.items[0].wrapped > wide);
+        assert!(cache.settled().next().unwrap().1 > wide);
     }
 
     #[test]
@@ -2180,7 +2323,7 @@ mod tests {
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80);
         // Collapsed one-liner + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[0].lines.len(), 2);
+        assert_eq!(cache.settled().next().unwrap().0.len(), 2);
         cache.sync(
             &t,
             Toggles {
@@ -2190,7 +2333,7 @@ mod tests {
             80,
         );
         // Header + both rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[0].lines.len(), 4);
+        assert_eq!(cache.settled().next().unwrap().0.len(), 4);
     }
 
     #[test]
@@ -2210,9 +2353,10 @@ mod tests {
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80);
         // Collapsed one-liner + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[0].lines.len(), 2);
+        let collapsed = cache.settled().next().unwrap().0;
+        assert_eq!(collapsed.len(), 2);
         assert_eq!(
-            line_text(&cache.items[0].lines[0]),
+            line_text(&collapsed[0]),
             "  ⋯ edit_file src/foo.rs · ^O expand"
         );
         cache.sync(
@@ -2224,11 +2368,9 @@ mod tests {
             80,
         );
         // Title row + both body rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.items[0].lines.len(), 4);
-        assert_eq!(
-            line_text(&cache.items[0].lines[0]),
-            "  ⋯ edit_file src/foo.rs"
-        );
+        let expanded = cache.settled().next().unwrap().0;
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(line_text(&expanded[0]), "  ⋯ edit_file src/foo.rs");
     }
 
     // --- Stage 3: merged one-liners + semantic fold ------------------------
@@ -2395,7 +2537,7 @@ mod tests {
                 },
                 width,
             );
-            cache.items.iter().map(|i| i.wrapped).sum()
+            cache.settled().map(|(_, wrapped)| wrapped).sum()
         };
 
         // Collapsed: scroll up a few lines to an absolute offset (unpins).
@@ -2420,35 +2562,6 @@ mod tests {
             collapsed_top, collapsed_again_top,
             "a Ctrl-O round trip returns the viewport to the same position"
         );
-    }
-
-    #[test]
-    fn streaming_cache_reparses_only_when_the_char_length_moves() {
-        let mut cache = RenderCache::new();
-        cache.sync_streaming("hello", 80);
-        assert_eq!(
-            line_text(&cache.streaming.as_ref().unwrap().lines[0]),
-            "hello"
-        );
-
-        // Same length, different text: the monotonic-key contract - within a
-        // message the snapshot only GROWS, so an equal length means unchanged
-        // and the cached lines are reused as-is.
-        cache.sync_streaming("world", 80);
-        assert_eq!(
-            line_text(&cache.streaming.as_ref().unwrap().lines[0]),
-            "hello"
-        );
-
-        // Growth re-parses; the end of streaming clears, so the next
-        // message can never collide with a stale entry of the same length.
-        cache.sync_streaming("hello more", 80);
-        assert_eq!(
-            line_text(&cache.streaming.as_ref().unwrap().lines[0]),
-            "hello more"
-        );
-        cache.sync_streaming("", 80);
-        assert!(cache.streaming.is_none());
     }
 
     #[test]
