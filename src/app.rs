@@ -30,6 +30,11 @@ const PICK: &str = "pick";
 
 pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::Result<()> {
     let session = build_session(root)?;
+    // Context files load once at launch, fail-open: the assembled prompt feeds
+    // the Agent, and a present-but-unusable file surfaces as one launch info
+    // line (never silently, never blocking the Session).
+    let context = crate::context_files::load(&session.root);
+    let launch_notices: Vec<String> = context.skipped.iter().map(|s| s.info_line()).collect();
     let resume = if resume.as_deref() == Some(PICK) {
         // The picker needs the Session first: the logs live in its
         // session_dir. No sessions to pick from is silently a fresh start -
@@ -48,8 +53,8 @@ pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::R
     } else {
         resume
     };
-    let agent = start_agent(session.clone(), resume)?;
-    crate::ui::run(agent, &session).await
+    let agent = start_agent(session.clone(), resume, context.system_prompt)?;
+    crate::ui::run(agent, &session, launch_notices).await
 }
 
 /// The stdout event-subscriber runner (ports `scripts/drive.exs`, ADR-0019).
@@ -75,7 +80,13 @@ pub async fn run_headless(
 
     let session = build_session(root)?;
     let root_label = session.root.clone();
-    let agent = start_agent(session, resume)?;
+    // Same load as the TUI; headless has no Transcript, so a skip prints as a
+    // plain line in the event stream instead.
+    let context = crate::context_files::load(&session.root);
+    for skip in &context.skipped {
+        println!("!! {}", skip.info_line());
+    }
+    let agent = start_agent(session, resume, context.system_prompt)?;
     let mut events = agent.subscribe();
 
     for prompt in prompts {
@@ -133,11 +144,16 @@ fn build_session(root: Option<PathBuf>) -> anyhow::Result<Session> {
     Session::new(opts).map_err(|e| anyhow::anyhow!("session: {e}"))
 }
 
-/// Starts the Agent with the real `AnthropicLlm` boundary (ADR-0020), resuming
-/// a prior Session Log when asked.
-fn start_agent(session: Session, resume: Option<String>) -> anyhow::Result<AgentHandle> {
+/// Starts the Agent with the real `AnthropicLlm` boundary (ADR-0020) and the
+/// context-file-assembled system prompt, resuming a prior Session Log when
+/// asked.
+fn start_agent(
+    session: Session,
+    resume: Option<String>,
+    system_prompt: String,
+) -> anyhow::Result<AgentHandle> {
     let llm = Arc::new(AnthropicLlm::new());
-    let mut opts = StartOpts::new(session, llm);
+    let mut opts = StartOpts::new(session, llm).with_system_prompt(system_prompt);
     if let Some(resume) = resume {
         opts.resume = Some(parse_resume(&resume));
     }

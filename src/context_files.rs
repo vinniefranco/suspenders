@@ -15,8 +15,12 @@
 //!   * `~/.config/suspenders/AGENTS.md` / `~/.config/suspenders/CLAUDE.md` - global context
 //!     files in the user's XDG config directory, loaded last.
 //!
-//! Missing or unreadable files are silently skipped - context loading must
-//! never prevent the Session from starting.
+//! Context loading is fail-open - it must never prevent the Session from
+//! starting. A missing file is the normal case and stays silent; a file that
+//! EXISTS but could not be used (permission denied, I/O error, invalid UTF-8)
+//! is still skipped, but the skip is returned in [`ContextFiles::skipped`] so
+//! the frontend can surface the degradation instead of leaving the user to
+//! wonder why their SYSTEM.md had no effect.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -31,6 +35,60 @@ pub enum SourceType {
     Global,
 }
 
+/// Why a present context file was skipped. Only failure modes a file can
+/// exhibit while existing: absence is not a reason, it is silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    PermissionDenied,
+    /// The bytes are not valid UTF-8 (`read_to_string`'s `InvalidData`).
+    InvalidUtf8,
+    /// Any other I/O failure; carries the OS message.
+    Io(String),
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::PermissionDenied => write!(f, "permission denied"),
+            SkipReason::InvalidUtf8 => write!(f, "invalid UTF-8"),
+            SkipReason::Io(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// A context file that exists but could not be used. [`load`] returns these
+/// beside the loaded content; the fail-open policy is unchanged (the file is
+/// still skipped), only the silence is lifted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: SkipReason,
+}
+
+impl SkippedFile {
+    /// The launch info line the frontend shows for this skip, phrased plainly.
+    pub fn info_line(&self) -> String {
+        format!(
+            "context file {} exists but could not be read ({}); continuing without it",
+            self.path, self.reason
+        )
+    }
+}
+
+/// How reading one context file went, before the fail-open policy collapses
+/// it. [`read_outcome`] is the classifying seam; [`try_read`] and the loaders
+/// compose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// Present with non-empty content.
+    Loaded(String),
+    /// No file at this path, or an empty one. The normal case (most projects
+    /// have no context files; an empty one is deliberately blank), silent.
+    Absent,
+    /// Present but unusable - the one case worth surfacing.
+    Failed(SkipReason),
+}
+
 /// Result of loading context files for a Project Root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFiles {
@@ -39,109 +97,109 @@ pub struct ContextFiles {
     pub system_prompt: String,
     /// A list of `(type, path)` pairs describing what was loaded.
     pub sources: Vec<(SourceType, String)>,
+    /// Files that exist but could not be used, with the reason each was
+    /// skipped. Empty for the normal project (no context files at all).
+    pub skipped: Vec<SkippedFile>,
 }
 
 /// Loads context files from the Project Root and its ancestors, plus the global
-/// config directory. Always succeeds: missing/unreadable files are silently
-/// skipped. `system_prompt` falls back to the Voice default when no SYSTEM.md
-/// and no context files exist.
+/// config directory. Always succeeds: a missing file is silently normal, and a
+/// present-but-unusable file is skipped and reported in `skipped`.
+/// `system_prompt` falls back to the Voice default when no SYSTEM.md and no
+/// context files exist.
 pub fn load(root: &str) -> ContextFiles {
-    let mut sources: Vec<(SourceType, String)> = Vec::new();
-    let mut system_prompt = voice::system_prompt().to_string();
+    let mut acc = Acc {
+        system_prompt: voice::system_prompt().to_string(),
+        sources: Vec::new(),
+        skipped: Vec::new(),
+    };
 
-    load_system_md(root, &mut system_prompt, &mut sources);
-    load_append_md(root, &mut system_prompt, &mut sources);
-    load_project_context_files(root, &mut system_prompt, &mut sources);
-    load_global_context_files(&mut system_prompt, &mut sources);
+    load_system_md(root, &mut acc);
+    load_append_md(root, &mut acc);
+    load_project_context_files(root, &mut acc);
+    load_global_context_files(&mut acc);
 
     ContextFiles {
-        system_prompt,
-        sources,
+        system_prompt: acc.system_prompt,
+        sources: acc.sources,
+        skipped: acc.skipped,
     }
+}
+
+/// The in-progress load the section loaders thread through: the prompt being
+/// assembled, the loaded sources, and the present-but-unusable skips.
+struct Acc {
+    system_prompt: String,
+    sources: Vec<(SourceType, String)>,
+    skipped: Vec<SkippedFile>,
 }
 
 // -- SYSTEM.md (replaces default) --------------------------------------------
 
-fn load_system_md(root: &str, prompt: &mut String, sources: &mut Vec<(SourceType, String)>) {
+fn load_system_md(root: &str, acc: &mut Acc) {
     let path = join(root, ".suspenders/SYSTEM.md");
-    if let Some(content) = try_read(&path) {
-        *prompt = content.trim().to_string();
+    if let Some(content) = read_or_skip(&path, &mut acc.skipped) {
+        acc.system_prompt = content.trim().to_string();
         // baud prepends {type, path}; the sources list is display-only and its
         // order is not asserted, but we keep baud's newest-first ordering.
-        sources.insert(0, (SourceType::System, path));
+        acc.sources.insert(0, (SourceType::System, path));
     }
 }
 
 // -- APPEND_SYSTEM.md (appends to whatever the system prompt is) -------------
 
-fn load_append_md(root: &str, prompt: &mut String, sources: &mut Vec<(SourceType, String)>) {
+fn load_append_md(root: &str, acc: &mut Acc) {
     let path = join(root, ".suspenders/APPEND_SYSTEM.md");
-    if let Some(content) = try_read(&path) {
-        prompt.push_str("\n\n");
-        prompt.push_str(content.trim());
-        sources.insert(0, (SourceType::Append, path));
+    if let Some(content) = read_or_skip(&path, &mut acc.skipped) {
+        acc.system_prompt.push_str("\n\n");
+        acc.system_prompt.push_str(content.trim());
+        acc.sources.insert(0, (SourceType::Append, path));
     }
 }
 
 // -- AGENTS.md / CLAUDE.md in project and ancestors --------------------------
 
-fn load_project_context_files(
-    root: &str,
-    prompt: &mut String,
-    sources: &mut Vec<(SourceType, String)>,
-) {
+fn load_project_context_files(root: &str, acc: &mut Acc) {
     for dir in ancestor_dirs(root) {
-        load_context_file(
-            &dir,
-            ".suspenders/AGENTS.md",
-            SourceType::Context,
-            prompt,
-            sources,
-        );
-        load_context_file(
-            &dir,
-            ".suspenders/CLAUDE.md",
-            SourceType::Context,
-            prompt,
-            sources,
-        );
+        load_context_file(&dir, ".suspenders/AGENTS.md", SourceType::Context, acc);
+        load_context_file(&dir, ".suspenders/CLAUDE.md", SourceType::Context, acc);
     }
 }
 
 // -- Global AGENTS.md / CLAUDE.md --------------------------------------------
 
-fn load_global_context_files(prompt: &mut String, sources: &mut Vec<(SourceType, String)>) {
+fn load_global_context_files(acc: &mut Acc) {
     let config_dir = global_config_dir();
-    load_context_file(
-        &config_dir,
-        "AGENTS.md",
-        SourceType::Global,
-        prompt,
-        sources,
-    );
-    load_context_file(
-        &config_dir,
-        "CLAUDE.md",
-        SourceType::Global,
-        prompt,
-        sources,
-    );
+    load_context_file(&config_dir, "AGENTS.md", SourceType::Global, acc);
+    load_context_file(&config_dir, "CLAUDE.md", SourceType::Global, acc);
 }
 
 // -- Helpers -----------------------------------------------------------------
 
-fn load_context_file(
-    dir: &str,
-    filename: &str,
-    ty: SourceType,
-    prompt: &mut String,
-    sources: &mut Vec<(SourceType, String)>,
-) {
+fn load_context_file(dir: &str, filename: &str, ty: SourceType, acc: &mut Acc) {
     let path = join(dir, filename);
-    if let Some(content) = try_read(&path) {
+    if let Some(content) = read_or_skip(&path, &mut acc.skipped) {
         let header = context_header(ty, &path);
-        prompt.push_str(&format!("\n\n{header}\n{}", content.trim()));
-        sources.insert(0, (ty, path));
+        acc.system_prompt
+            .push_str(&format!("\n\n{header}\n{}", content.trim()));
+        acc.sources.insert(0, (ty, path));
+    }
+}
+
+/// The loaders' fail-open read: `Loaded` yields the content, `Absent` stays
+/// silent, and `Failed` is recorded before yielding nothing - the collapse to
+/// `Option` happens here, but the reason survives in `skipped`.
+fn read_or_skip(path: &str, skipped: &mut Vec<SkippedFile>) -> Option<String> {
+    match read_outcome(path) {
+        ReadOutcome::Loaded(content) => Some(content),
+        ReadOutcome::Absent => None,
+        ReadOutcome::Failed(reason) => {
+            skipped.push(SkippedFile {
+                path: path.to_string(),
+                reason,
+            });
+            None
+        }
     }
 }
 
@@ -165,12 +223,32 @@ pub fn ancestor_dirs(root: &str) -> Vec<String> {
     acc
 }
 
-/// Reads a file, returning `Some(content)` or `None` on any failure (including
-/// an empty file). Never panics.
-pub fn try_read(path: &str) -> Option<String> {
+/// Classifies one read: loaded, absent (missing or empty), or failed with the
+/// reason. Never panics. The policy split lives here: only `Failed` marks a
+/// file that exists but could not be used.
+pub fn read_outcome(path: &str) -> ReadOutcome {
+    use std::io::ErrorKind;
     match std::fs::read_to_string(path) {
-        Ok(content) if !content.is_empty() => Some(content),
-        _ => None,
+        Ok(content) if !content.is_empty() => ReadOutcome::Loaded(content),
+        // An empty file is treated as absent: deliberately blank, not degraded.
+        Ok(_) => ReadOutcome::Absent,
+        Err(e) => match e.kind() {
+            ErrorKind::NotFound => ReadOutcome::Absent,
+            ErrorKind::PermissionDenied => ReadOutcome::Failed(SkipReason::PermissionDenied),
+            // read_to_string reports non-UTF-8 bytes as InvalidData.
+            ErrorKind::InvalidData => ReadOutcome::Failed(SkipReason::InvalidUtf8),
+            _ => ReadOutcome::Failed(SkipReason::Io(e.to_string())),
+        },
+    }
+}
+
+/// Reads a file, returning `Some(content)` or `None` on any failure (including
+/// an empty file). The plain fail-open wrapper over [`read_outcome`], for
+/// callers with no skip to report. Never panics.
+pub fn try_read(path: &str) -> Option<String> {
+    match read_outcome(path) {
+        ReadOutcome::Loaded(content) => Some(content),
+        ReadOutcome::Absent | ReadOutcome::Failed(_) => None,
     }
 }
 
@@ -442,6 +520,112 @@ mod tests {
         let p = path(&tmp, "empty.txt");
         std::fs::write(&p, "").unwrap();
         assert_eq!(try_read(&p), None);
+    }
+
+    #[test]
+    fn try_read_collapses_a_failed_read_to_none() {
+        let tmp = temp_dir();
+        let p = path(&tmp, "binary.md");
+        std::fs::write(&p, [0xFF, 0xFE, 0x00]).unwrap();
+        assert_eq!(try_read(&p), None);
+    }
+
+    // ---- read_outcome/1 ----
+
+    #[test]
+    fn read_outcome_loads_a_readable_file() {
+        let tmp = temp_dir();
+        let p = path(&tmp, "test.txt");
+        std::fs::write(&p, "hello").unwrap();
+        assert_eq!(read_outcome(&p), ReadOutcome::Loaded("hello".to_string()));
+    }
+
+    #[test]
+    fn read_outcome_classifies_a_missing_file_as_absent() {
+        assert_eq!(read_outcome("/nonexistent/file.md"), ReadOutcome::Absent);
+    }
+
+    #[test]
+    fn read_outcome_classifies_an_empty_file_as_absent() {
+        let tmp = temp_dir();
+        let p = path(&tmp, "empty.txt");
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(read_outcome(&p), ReadOutcome::Absent);
+    }
+
+    #[test]
+    fn read_outcome_classifies_invalid_utf8_as_failed() {
+        let tmp = temp_dir();
+        let p = path(&tmp, "binary.md");
+        std::fs::write(&p, [0xFF, 0xFE, 0x00]).unwrap();
+        assert_eq!(
+            read_outcome(&p),
+            ReadOutcome::Failed(SkipReason::InvalidUtf8)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_outcome_classifies_permission_denied_as_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = temp_dir();
+        let p = path(&tmp, "locked.md");
+        std::fs::write(&p, "secret").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root bypasses mode bits, making the case unenforceable; skip then.
+        if std::fs::read_to_string(&p).is_ok() {
+            return;
+        }
+        assert_eq!(
+            read_outcome(&p),
+            ReadOutcome::Failed(SkipReason::PermissionDenied)
+        );
+    }
+
+    // ---- skips reported beside the loads ----
+
+    #[test]
+    fn load_reports_a_present_but_unusable_file_beside_the_loads() {
+        let tmp = temp_dir();
+        write(&tmp, ".suspenders/AGENTS.md", "Project conventions.");
+        let system = path(&tmp, ".suspenders/SYSTEM.md");
+        std::fs::write(&system, [0xFF, 0xFE, 0x00]).unwrap();
+
+        let result = load(&root(&tmp));
+
+        // The unusable SYSTEM.md is skipped exactly as before (fail-open, the
+        // default prompt stands), and the healthy file still loads.
+        assert!(result.system_prompt.contains(voice::system_prompt()));
+        assert!(result.system_prompt.contains("Project conventions."));
+        assert_eq!(
+            result.skipped,
+            vec![SkippedFile {
+                path: system,
+                reason: SkipReason::InvalidUtf8,
+            }]
+        );
+    }
+
+    #[test]
+    fn load_reports_no_skips_for_a_project_with_no_context_files() {
+        let tmp = temp_dir();
+        let result = load(&root(&tmp));
+        assert_eq!(result.skipped, Vec::new());
+    }
+
+    #[test]
+    fn skip_info_line_names_the_path_and_the_reason() {
+        let skip = SkippedFile {
+            path: ".suspenders/SYSTEM.md".to_string(),
+            reason: SkipReason::PermissionDenied,
+        };
+        assert_eq!(
+            skip.info_line(),
+            "context file .suspenders/SYSTEM.md exists but could not be read \
+             (permission denied); continuing without it"
+        );
     }
 
     // ---- system prompt assembly order ----

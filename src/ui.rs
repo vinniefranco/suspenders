@@ -73,11 +73,19 @@ type Geometry = (usize, usize);
 /// mouse disables the terminal's native text selection (shift-click usually
 /// bypasses the capture). Capture is released before the terminal is restored,
 /// on the error path too.
-pub async fn run(agent: AgentHandle, session: &Session) -> anyhow::Result<()> {
+///
+/// `launch_notices` are info lines from before the terminal existed (a
+/// context-file skip at load); the Screen records them right after the
+/// greeting.
+pub async fn run(
+    agent: AgentHandle,
+    session: &Session,
+    launch_notices: Vec<String>,
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // Best-effort: a terminal without mouse support still gets a working TUI.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
-    let result = run_loop(&mut terminal, agent, session).await;
+    let result = run_loop(&mut terminal, agent, session, launch_notices).await;
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -158,6 +166,7 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     agent: AgentHandle,
     session: &Session,
+    launch_notices: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut events = agent.subscribe();
     let mut input = EventStream::new();
@@ -199,6 +208,7 @@ async fn run_loop(
         eviction_slack: session.eviction_slack,
         plugins: crate::plugins::configured(&session.plugins),
         history,
+        notices: launch_notices,
     }));
     let mut viewport = Viewport::new();
 

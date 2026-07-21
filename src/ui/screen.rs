@@ -226,6 +226,10 @@ pub struct ScreenOpts {
     pub eviction_slack: f64,
     pub plugins: Vec<Registered>,
     pub history: Vec<String>,
+    /// Launch-time info lines the adapter authors (context-file skips today):
+    /// news from before the event loop existed, recorded right after the
+    /// greeting so it is visible without ever entering the Conversation.
+    pub notices: Vec<String>,
 }
 
 impl Screen {
@@ -235,6 +239,9 @@ impl Screen {
         // records what its owner authors.
         let mut transcript = Transcript::new(opts.plugins);
         transcript.info(GREETING);
+        for notice in opts.notices {
+            transcript.info(notice);
+        }
         Screen {
             transcript,
             status: Status::Idle,
@@ -831,6 +838,25 @@ mod tests {
         assert!(
             t.transcript().streaming_text().is_empty()
                 && t.transcript().streaming_thinking().is_empty()
+        );
+    }
+
+    #[test]
+    fn new_records_launch_notices_after_the_greeting() {
+        let t = fresh_opts(ScreenOpts {
+            notices: vec![
+                "context file .suspenders/SYSTEM.md exists but could not be read \
+                 (permission denied); continuing without it"
+                    .to_string(),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            items(&t),
+            vec![info(
+                "context file .suspenders/SYSTEM.md exists but could not be read \
+                 (permission denied); continuing without it"
+            )]
         );
     }
 
