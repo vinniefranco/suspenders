@@ -228,6 +228,16 @@ impl Conversation {
         )
     }
 
+    /// The Compaction Keep amount: the token-space figure of recent
+    /// Conversation that survives a Compaction verbatim.
+    pub fn compaction_keep_amount(&self) -> u64 {
+        compaction_keep_amount(
+            self.context_budget,
+            self.max_tokens_reserve,
+            self.compaction_keep,
+        )
+    }
+
     /// Applies Eviction, then returns wire-ready request data, or
     /// `Err(ContextBudgetExhausted)` when Eviction could not bring the
     /// estimate under `context_budget - max_tokens_reserve`. The fit check
@@ -369,40 +379,20 @@ impl Conversation {
     /// accumulating the char estimate; stops at the Compaction Keep, then
     /// adjusts the cutoff backward to the nearest turn-start user message.
     pub fn prepare_compaction(&self) -> Option<(Vec<Message>, usize, FileOps)> {
-        let live_window = self.context_budget.saturating_sub(self.max_tokens_reserve) as f64;
-        let keep_recent = ((self.compaction_keep * live_window).trunc()).max(0.0) as i64;
-
-        let msg_count = self.messages.len();
+        let keep_recent = self.compaction_keep_amount();
 
         // Indexes of turn-start user messages (turn_boundary owns the rule).
         let turn_start_indexes: Vec<usize> =
             turn_boundary::turn_start_indices(&self.messages).collect();
 
-        // Walk backwards from the newest message, accumulating char estimate.
-        // reversed idx increments; stop when accumulated >= keep_recent.
-        let mut reversed_cutoff: i64 = 0;
-        let mut acc: i64 = 0;
-        for msg in self.messages.iter().rev() {
-            let new_acc = acc + message_chars(msg) as i64;
-            if new_acc >= keep_recent {
-                acc = new_acc;
-                break;
-            } else {
-                reversed_cutoff += 1;
-                acc = new_acc;
-            }
-        }
-        let _ = acc;
-
-        // Convert reversed index to real message index.
-        let computed_cutoff = msg_count as i64 - 1 - reversed_cutoff;
-
         // Nearest turn-start at or before the computed cutoff.
-        let cutoff = turn_start_indexes
-            .iter()
-            .filter(|&&i| i as i64 <= computed_cutoff)
-            .max()
-            .copied();
+        let cutoff = keep_cutoff(&self.messages, keep_recent).and_then(|computed_cutoff| {
+            turn_start_indexes
+                .iter()
+                .filter(|&&i| i <= computed_cutoff)
+                .max()
+                .copied()
+        });
 
         match cutoff {
             None => None,
@@ -584,6 +574,22 @@ pub fn compaction_target(context_budget: u64, max_tokens_reserve: u64, eviction_
     target.saturating_sub(slack)
 }
 
+/// The Compaction Keep amount (CONTEXT.md: Compaction Keep) over plain
+/// numbers, for callers that hold the Session facts but no Conversation:
+/// `max(trunc(compaction_keep * (context_budget - max_tokens_reserve)), 0)`,
+/// the token-space figure of recent Conversation that survives a Compaction
+/// verbatim. Fire high, keep low: validation requires it below the compaction
+/// trigger ([`compaction_target`]). The cutoff walk currently measures
+/// progress toward it in raw chars (see the flagged ambiguity in CONTEXT.md).
+pub fn compaction_keep_amount(
+    context_budget: u64,
+    max_tokens_reserve: u64,
+    compaction_keep: f64,
+) -> u64 {
+    let live_window = context_budget.saturating_sub(max_tokens_reserve) as f64;
+    (compaction_keep * live_window).trunc().max(0.0) as u64
+}
+
 /// Extracts file operations from a list of messages. Scans tool_use blocks for
 /// read_file/list_files (reads) and write_file/edit_file (modifies).
 pub fn extract_file_ops(messages: &[Message]) -> FileOps {
@@ -699,6 +705,21 @@ fn is_evictable_tool_result(block: &ContentBlock) -> bool {
         if content != voice::elision_marker()
             && content != voice::superseded_command_marker()
             && content != voice::superseded_read_marker())
+}
+
+// The Compaction Keep walk: newest-first, accumulating raw `message_chars`
+// (not tokens - the flagged ambiguity in CONTEXT.md). Returns the index of the
+// message at which the running total first reaches `keep_recent` (that message
+// lands on the kept side), or `None` when the whole history stays within it.
+fn keep_cutoff(messages: &[Message], keep_recent: u64) -> Option<usize> {
+    let mut acc: u64 = 0;
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        acc += message_chars(msg) as u64;
+        if acc >= keep_recent {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 fn message_chars(msg: &Message) -> usize {
@@ -985,6 +1006,20 @@ mod tests {
     #[test]
     fn compaction_target_clamps_at_zero() {
         assert_eq!(compaction_target(1000, 900, 0.5), 0);
+    }
+
+    // ---- compaction_keep_amount/1 ----
+
+    #[test]
+    fn compaction_keep_amount_is_keep_fraction_of_live_window() {
+        let conv = Conversation::new("sys", ConversationOpts::new(1000, 200).compaction_keep(0.5));
+        assert_eq!(conv.compaction_keep_amount(), 400);
+        assert_eq!(compaction_keep_amount(1000, 200, 0.5), 400);
+    }
+
+    #[test]
+    fn compaction_keep_amount_clamps_at_zero_when_reserve_exceeds_budget() {
+        assert_eq!(compaction_keep_amount(1000, 1200, 0.5), 0);
     }
 
     // ---- for_request/1 ----
@@ -1337,6 +1372,41 @@ mod tests {
         assert_eq!(conv.evict(), conv);
     }
 
+    // ---- keep_cutoff/2 ----
+
+    fn user_msg_of_chars(n: usize) -> Message {
+        Message::user(vec![ContentBlock::text("x".repeat(n))])
+    }
+
+    #[test]
+    fn keep_cutoff_returns_the_index_of_the_crossing_message() {
+        // Newest-first: 100 < 150, then 200 >= 150 crosses at index 1.
+        let messages = vec![
+            user_msg_of_chars(100),
+            user_msg_of_chars(100),
+            user_msg_of_chars(100),
+        ];
+        assert_eq!(keep_cutoff(&messages, 150), Some(1));
+    }
+
+    #[test]
+    fn keep_cutoff_with_zero_keep_returns_the_newest_index() {
+        let messages = vec![user_msg_of_chars(10), user_msg_of_chars(10)];
+        assert_eq!(keep_cutoff(&messages, 0), Some(1));
+    }
+
+    #[test]
+    fn keep_cutoff_returns_none_when_the_whole_history_fits_within_keep() {
+        let messages = vec![user_msg_of_chars(100), user_msg_of_chars(100)];
+        assert_eq!(keep_cutoff(&messages, 1000), None);
+    }
+
+    #[test]
+    fn keep_cutoff_returns_none_for_empty_messages() {
+        assert_eq!(keep_cutoff(&[], 0), None);
+        assert_eq!(keep_cutoff(&[], 100), None);
+    }
+
     // ---- prepare_compaction/1 ----
 
     #[test]
@@ -1390,6 +1460,30 @@ mod tests {
         let (_, small_cutoff, _) = build(0.05).prepare_compaction().unwrap();
         let (_, large_cutoff, _) = build(0.3).prepare_compaction().unwrap();
         assert!(small_cutoff > large_cutoff);
+    }
+
+    #[test]
+    fn prepare_compaction_walk_measures_keep_in_chars_not_tokens() {
+        // Pins the flagged ambiguity in CONTEXT.md (preserved deliberately,
+        // pending a tuning decision): the Compaction Keep amount is a
+        // token-space figure, but the walk accumulates raw chars, so the
+        // executed keep is ~3.5x smaller than configured. Keep amount =
+        // 0.05 * 10_000 = 500. The newest message alone is 600 chars
+        // (~172 tokens): a char walk crosses on it, snapping the cutoff to
+        // the last turn start (index 6); a token walk would need three
+        // messages and snap to index 4.
+        let mut conv = Conversation::new(
+            "sys",
+            ConversationOpts::new(10_000, 0).compaction_keep(0.05),
+        );
+        for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
+            conv.add_user_text(u.repeat(600));
+            conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(600))]);
+        }
+
+        let (to_summarize, cutoff_idx, _) = conv.prepare_compaction().unwrap();
+        assert_eq!(cutoff_idx, 6);
+        assert_eq!(to_summarize.len(), 6);
     }
 
     #[test]

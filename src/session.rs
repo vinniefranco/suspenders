@@ -783,14 +783,19 @@ fn validate_budget_fits(s: &Session) -> Result<(), SessionError> {
 }
 
 // Fire high, keep low: the Compaction Keep amount must sit below the trigger.
+// Comparing in u64 matches the old f64 check: the trigger is integral, so
+// trunc(keep) < trigger iff keep < trigger for nonnegative keep.
 fn validate_keep_below_trigger(s: &Session) -> Result<(), SessionError> {
-    let live_window = (s.context_budget - s.connection.max_tokens) as f64;
-    let keep_amount = s.compaction_keep * live_window;
+    let keep_amount = conversation::compaction_keep_amount(
+        s.context_budget,
+        s.connection.max_tokens,
+        s.compaction_keep,
+    );
     let trigger = conversation::compaction_target(
         s.context_budget,
         s.connection.max_tokens,
         s.eviction_slack,
-    ) as f64;
+    );
 
     if keep_amount < trigger {
         Ok(())

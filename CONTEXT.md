@@ -250,6 +250,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - the **Compaction Target** was documented as the full budget target while the code fired at the low-water mark - resolved 2026-07: the trigger is the low-water mark, and the keep level is its own decoupled knob, the **Compaction Keep**.
 - "toggling thinking" was read as enabling/disabling the model's **Thinking** when it means expanding/collapsing settled Thinking items in the **Transcript** - resolved 2026-07: Ctrl-T is a display expansion toggle; whether the model thinks at all is a request-level knob (today fixed: on for the main Conversation, off for **Scouts**) with no user-facing toggle.
 - **Anchors** and Endgame prompts are Conversation events the model actually read, but only Nudges were persisted, so **Resume** rebuilt a Conversation the model never saw - resolved 2026-07: every rider is logged to the **Session Log** like a Nudge.
+- the **Compaction Keep** is configured and validated in token-space (a fraction of the live window), but the cutoff walk accumulates raw chars, so the executed keep is ~3.5x smaller than the configured fraction - discovered 2026-07-21, dates to the original port. Deliberately preserved and pinned by test for now; whether to fix the units (and retune the default) is an open tuning decision.
 
 ## Compaction
 
