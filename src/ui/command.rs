@@ -48,10 +48,16 @@ pub fn is_handled(name: &str) -> bool {
 /// Routes a committed Slash Command to its adapter work (ADR-0032/0033). An
 /// unrecognized name is a visible no-op-with-info-line, not a silent drop. The
 /// [`Handled`] match is exhaustive, so a new command is a compile error here
-/// until it is handled.
-pub(super) async fn run(screen: Screen, ctx: &AdapterCtx<'_>, name: &str) -> Screen {
+/// until it is handled. `generation` is the activation counter the effect
+/// carried; a selector-opening handler must echo it on its fill events.
+pub(super) async fn run(
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    name: &str,
+    generation: u64,
+) -> Screen {
     match handled(name) {
-        Some(Handled::Model) => model_command::run(screen, ctx).await,
+        Some(Handled::Model) => model_command::run(screen, ctx, generation).await,
         None => screen.info(format!("/{name}: no handler")),
     }
 }

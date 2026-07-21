@@ -190,7 +190,12 @@ pub enum Effect {
     /// a selector-opening command's sub-filter comes from the draft `rest`
     /// (the Composer's overlay view), not from this payload. The core does not
     /// know what any command does - this payload is command-agnostic.
-    Command { name: String },
+    /// `generation` is the Composer's activation counter: the adapter echoes
+    /// it back on the fill events (SelectorReady/SelectorFailed) so a late
+    /// fill can never land on a later activation's overlay. Meaningful only
+    /// for selector-opening commands; a fire-and-run command has no fill to
+    /// tag.
+    Command { name: String, generation: u64 },
     /// A row was chosen from a committed command's selector (ADR-0033): the
     /// opaque command `name` and the selected row's `value`. The adapter
     /// interprets it (e.g. `/model` swaps the Active Model and persists); the

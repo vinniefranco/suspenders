@@ -559,7 +559,7 @@ async fn run_effect(
         // through the single `command::run` seam - `is_handled` reflects exactly
         // what it routes, so an unwired registry entry is a visible info line,
         // never a silent drop.
-        Effect::Command { name } => command::run(screen, ctx, &name).await,
+        Effect::Command { name, generation } => command::run(screen, ctx, &name, generation).await,
         // A row was chosen from a command's selector (ADR-0033): routed through
         // the same seam as the command itself.
         Effect::SelectorChosen {

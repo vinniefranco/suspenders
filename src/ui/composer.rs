@@ -126,7 +126,9 @@ pub enum OverlayStatus {
 // The owned command-selector overlay (ADR-0033): the sub-state entered when a
 // selector-opening command (`/model`) is committed. `command` is the opaque
 // command name carried back out on selection (the Composer never learns what
-// the command does); `status` is the row list's lifecycle. Private on purpose
+// the command does); `status` is the row list's lifecycle; `generation` is the
+// activation counter value this overlay was opened with - the fill events must
+// echo it back or [`Composer::apply_event`] drops them. Private on purpose
 // - the view exposes it as [`OverlayView::Selector`], and nothing outside the
 // seam touches the state. The overlay does NOT own its filter: the draft
 // `rest` (after `/<name> `) filters the rows, consistent with the menu.
@@ -134,6 +136,7 @@ pub enum OverlayStatus {
 struct CommandSelector {
     command: String,
     status: SelectorStatus,
+    generation: u64,
 }
 
 /// The open Composer overlay for rendering (ADR-0032/0033), one enum the
@@ -195,6 +198,12 @@ pub struct Composer {
     /// folded to `Ready`/`Failed` by [`Composer::apply_event`], and cleared
     /// on selection, Escape, or backspacing out of the sub-state.
     selector: Option<CommandSelector>,
+    /// The selector activation counter: bumped each time a selector-opening
+    /// command commits, stamped onto the overlay and the [`Effect::Command`]
+    /// it emits. The fill events echo it back, and only a matching echo fills
+    /// the overlay - so a late fill from an earlier activation can never land
+    /// on a later one's `Loading` overlay.
+    selector_generation: u64,
     /// The prompt-history ring and its Readline-style recall rules. Owned by
     /// [`crate::ui::history`]; navigated from the Up/Down arms of
     /// [`Composer::handle_key`] and appended to by [`Composer::submitted_ok`].
@@ -210,6 +219,7 @@ impl Composer {
             cursor: 0,
             slash_cursor: 0,
             selector: None,
+            selector_generation: 0,
             history: History::new(history),
         }
     }
@@ -303,6 +313,7 @@ impl Composer {
                             Some(CommandSelector {
                                 command,
                                 status: SelectorStatus::Ready(sel),
+                                ..
                             }) => sel.handle_nav(Key::Enter, &rest).and_then(
                                 |outcome| match outcome {
                                     SelectorOutcome::Select(value) => {
@@ -507,18 +518,21 @@ impl Composer {
     /// effects - it must not resurrect a closed popup, and the caller must
     /// never see it. Every other event is refused untouched.
     ///
-    /// Caveat: the staleness guard absorbs fills by OVERLAY STATE, not by
-    /// activation. A late fill from a FIRST activation can therefore land on
-    /// a SECOND activation's fresh `Loading` overlay (backspace out of the
-    /// sub-state, re-commit, then the first delivery finally arrives).
-    /// Accepted for now - the eventual fix is an activation token threaded
-    /// through [`Effect::Command`] and the fill events.
+    /// Staleness is decided by ACTIVATION, not by delivery order: a fill only
+    /// lands when its `generation` echo matches the one the `Loading` overlay
+    /// was opened with (stamped in [`Composer::commit_command`], carried
+    /// through [`Effect::Command`]). A late fill from a FIRST activation
+    /// arriving on a SECOND activation's fresh overlay (backspace out,
+    /// re-commit, then the first delivery finally lands) is dropped by
+    /// construction - no ordering coincidence involved.
     pub fn apply_event(&mut self, event: Event) -> EventOutcome {
         match event {
-            // Flip a Loading overlay to Ready over a fresh Selector.
-            Event::SelectorReady(rows) => {
+            // Flip a Loading overlay to Ready over a fresh Selector - only
+            // for the activation that requested this fill.
+            Event::SelectorReady { generation, rows } => {
                 if let Some(cs) = self.selector.as_mut()
                     && matches!(cs.status, SelectorStatus::Loading)
+                    && cs.generation == generation
                 {
                     cs.status = SelectorStatus::Ready(Selector::new(rows));
                 }
@@ -526,9 +540,13 @@ impl Composer {
             }
             // The adapter could not produce the rows: flip a Loading overlay
             // to Failed. Same staleness guard as SelectorReady.
-            Event::SelectorFailed(message) => {
+            Event::SelectorFailed {
+                generation,
+                message,
+            } => {
                 if let Some(cs) = self.selector.as_mut()
                     && matches!(cs.status, SelectorStatus::Loading)
+                    && cs.generation == generation
                 {
                     cs.status = SelectorStatus::Failed(message);
                 }
@@ -649,17 +667,30 @@ impl Composer {
         if opens_selector {
             // Enter the selector sub-state: normalize to `/<name> ` so `rest`
             // becomes `Some("")`, set the Loading overlay, and fetch once.
+            // Each activation gets a fresh generation, stamped on the overlay
+            // AND the effect: the fill events echo it back, and only a
+            // matching echo lands (see [`Composer::apply_event`]).
+            self.selector_generation += 1;
             self.value = format!("/{} ", row.value);
             self.cursor = self.value.chars().count();
             self.slash_cursor = 0;
             self.selector = Some(CommandSelector {
                 command: row.value.clone(),
                 status: SelectorStatus::Loading,
+                generation: self.selector_generation,
             });
-            consumed(vec![Effect::Command { name: row.value }])
+            consumed(vec![Effect::Command {
+                name: row.value,
+                generation: self.selector_generation,
+            }])
         } else {
+            // Fire-and-run: no fill will echo this generation, so the current
+            // counter is carried unbumped (the payload field is uniform).
             self.clear();
-            consumed(vec![Effect::Command { name: row.value }])
+            consumed(vec![Effect::Command {
+                name: row.value,
+                generation: self.selector_generation,
+            }])
         }
     }
 
@@ -943,6 +974,7 @@ mod tests {
             effects,
             vec![Effect::Command {
                 name: "model".into(),
+                generation: 1,
             }]
         );
         // Selector-opening: draft normalized, NOT cleared; overlay is Loading.
@@ -965,6 +997,7 @@ mod tests {
             fold_consumed(&mut c, Key::Enter),
             vec![Effect::Command {
                 name: "model".into(),
+                generation: 1,
             }]
         );
     }
@@ -1033,6 +1066,7 @@ mod tests {
                 effects,
                 vec![Effect::Command {
                     name: "model".into(),
+                    generation: 1,
                 }]
             ),
             other => panic!("expected a consumed commit, got {other:?}"),
@@ -1046,12 +1080,21 @@ mod tests {
         SelectorRow::new(id, id, None)
     }
 
+    // The generation the one Command effect of a commit carried - the echo
+    // the fill events must repeat to land.
+    fn command_generation(effects: &[Effect]) -> u64 {
+        match effects {
+            [Effect::Command { generation, .. }] => *generation,
+            other => panic!("expected one Command effect, got {other:?}"),
+        }
+    }
+
     // The overlay after committing `/model` and delivering rows. The draft is
     // left at `"/model "` (rest = Some("")), the sub-state.
     fn model_selector_ready(rows: Vec<SelectorRow>) -> Composer {
         let mut c = slashing("/model");
-        fold_consumed(&mut c, Key::Enter);
-        deliver(&mut c, Event::selector_ready(rows));
+        let generation = command_generation(&fold_consumed(&mut c, Key::Enter));
+        deliver(&mut c, Event::selector_ready(generation, rows));
         c
     }
 
@@ -1071,6 +1114,7 @@ mod tests {
             fold_consumed(&mut c, Key::Enter),
             vec![Effect::Command {
                 name: "model".into(),
+                generation: 1,
             }]
         );
         // Draft normalized to `/model ` (rest = Some("")) - NOT cleared.
@@ -1093,6 +1137,7 @@ mod tests {
             fold_consumed(&mut c, Key::Char(' ')),
             vec![Effect::Command {
                 name: "model".into(),
+                generation: 1,
             }]
         );
         assert_eq!(c.view().draft, "/model ");
@@ -1189,8 +1234,8 @@ mod tests {
     #[test]
     fn selector_failed_shows_a_failed_overlay_and_enter_does_nothing() {
         let mut c = slashing("/model");
-        fold_consumed(&mut c, Key::Enter);
-        deliver(&mut c, Event::selector_failed("no server"));
+        let generation = command_generation(&fold_consumed(&mut c, Key::Enter));
+        deliver(&mut c, Event::selector_failed(generation, "no server"));
         assert!(matches!(
             overlay(&c),
             Some(OverlayView::Selector {
@@ -1225,11 +1270,13 @@ mod tests {
         assert_eq!(fold_consumed(&mut c, Key::Backspace), vec![]);
         assert_eq!(c.view().draft, "/model");
         assert!(matches!(overlay(&c), Some(OverlayView::Menu { .. })));
-        // Re-committing is a fresh activation: it re-emits Effect::Command.
+        // Re-committing is a fresh activation: it re-emits Effect::Command,
+        // with a NEW generation (the helper's commit was generation 1).
         assert_eq!(
             fold_consumed(&mut c, Key::Enter),
             vec![Effect::Command {
                 name: "model".into(),
+                generation: 2,
             }]
         );
         assert!(matches!(
@@ -1256,12 +1303,16 @@ mod tests {
     fn a_stale_selector_ready_after_the_overlay_closed_is_ignored() {
         // Commit, then Escape to close the overlay.
         let mut c = slashing("/model");
-        fold_consumed(&mut c, Key::Enter);
+        let generation = command_generation(&fold_consumed(&mut c, Key::Enter));
         fold_consumed(&mut c, Key::Escape);
         assert_eq!(overlay(&c), None);
         // A late SelectorReady is still CONSUMED (by variant - the caller
-        // never sees it) but must not resurrect the popup.
-        deliver(&mut c, Event::selector_ready(vec![model_row("qwen")]));
+        // never sees it) but must not resurrect the popup - even with the
+        // matching generation: there is no overlay to fill.
+        deliver(
+            &mut c,
+            Event::selector_ready(generation, vec![model_row("qwen")]),
+        );
         assert_eq!(overlay(&c), None, "stale event ignored");
     }
 
@@ -1269,18 +1320,20 @@ mod tests {
     fn selector_ready_is_ignored_when_no_overlay_is_loading() {
         // No slash draft at all: the event is consumed but changes nothing.
         let mut c = fresh();
-        deliver(&mut c, Event::selector_ready(vec![model_row("qwen")]));
+        deliver(&mut c, Event::selector_ready(1, vec![model_row("qwen")]));
         assert_eq!(overlay(&c), None);
     }
 
     #[test]
     fn a_second_selector_ready_does_not_overwrite_a_ready_overlay() {
         // Guard: once Ready, a duplicate delivery must not reset the cursor.
+        // The duplicate carries the SAME generation (1, the helper's commit),
+        // so it is the Loading check alone that absorbs it.
         let mut c = model_selector_ready(vec![model_row("qwen"), model_row("llama")]);
         fold_consumed(&mut c, Key::ArrowDown);
         assert_eq!(highlight_of(&c), 1);
         // A second (stale) ready arrives - the overlay is no longer Loading.
-        deliver(&mut c, Event::selector_ready(vec![model_row("gpt")]));
+        deliver(&mut c, Event::selector_ready(1, vec![model_row("gpt")]));
         match overlay(&c) {
             Some(OverlayView::Selector {
                 rows, highlight, ..
@@ -1290,6 +1343,72 @@ mod tests {
             }
             other => panic!("expected Ready selector, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_fill_from_a_previous_activation_never_lands_on_a_fresh_overlay() {
+        // The race the generation exists for: backspace out of a Loading
+        // sub-state, re-commit, and only THEN the first fetch delivers.
+        let mut c = slashing("/model");
+        let first = command_generation(&fold_consumed(&mut c, Key::Enter));
+        // Backspace removes the trailing space: back to the MENU, overlay
+        // dropped on the next consumed key. Re-commit: a SECOND activation.
+        fold_consumed(&mut c, Key::Backspace);
+        let second = command_generation(&fold_consumed(&mut c, Key::Enter));
+        assert_ne!(first, second, "each activation gets its own generation");
+        // The FIRST activation's fill finally arrives: dropped - the fresh
+        // overlay stays Loading, it never asked for these rows.
+        deliver(
+            &mut c,
+            Event::selector_ready(first, vec![model_row("stale")]),
+        );
+        assert!(matches!(
+            overlay(&c),
+            Some(OverlayView::Selector {
+                status: OverlayStatus::Loading,
+                ..
+            })
+        ));
+        // The SECOND activation's own fill lands.
+        deliver(
+            &mut c,
+            Event::selector_ready(second, vec![model_row("qwen")]),
+        );
+        match overlay(&c) {
+            Some(OverlayView::Selector {
+                status: OverlayStatus::Ready,
+                rows,
+                ..
+            }) => assert_eq!(rows, vec![model_row("qwen")], "the second fetch's rows"),
+            other => panic!("expected Ready selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_echo_applies_only_to_its_own_activation() {
+        // Same backspace-out-and-re-commit race, failure edition.
+        let mut c = slashing("/model");
+        let first = command_generation(&fold_consumed(&mut c, Key::Enter));
+        fold_consumed(&mut c, Key::Backspace);
+        let second = command_generation(&fold_consumed(&mut c, Key::Enter));
+        // The first activation's failure is stale: dropped, still Loading.
+        deliver(&mut c, Event::selector_failed(first, "no server"));
+        assert!(matches!(
+            overlay(&c),
+            Some(OverlayView::Selector {
+                status: OverlayStatus::Loading,
+                ..
+            })
+        ));
+        // The second activation's own failure lands.
+        deliver(&mut c, Event::selector_failed(second, "no server"));
+        assert!(matches!(
+            overlay(&c),
+            Some(OverlayView::Selector {
+                status: OverlayStatus::Failed(_),
+                ..
+            })
+        ));
     }
 
     #[test]

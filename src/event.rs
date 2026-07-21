@@ -214,10 +214,20 @@ pub enum Event {
     /// pure core flips its `Loading` overlay to a `Ready` [`SelectorRow`] list.
     /// The core stays command-agnostic - it neither fetches nor interprets;
     /// these are opaque rows the generic selector filters and renders.
-    SelectorReady(Vec<SelectorRow>),
+    /// `generation` echoes the activation counter the requesting
+    /// `Effect::Command` carried, so the core can drop a fill meant for an
+    /// earlier activation.
+    SelectorReady {
+        generation: u64,
+        rows: Vec<SelectorRow>,
+    },
     /// The adapter could not produce the rows (fetch failed, cache empty): the
-    /// pure core flips its `Loading` overlay to `Failed(message)`.
-    SelectorFailed(String),
+    /// pure core flips its `Loading` overlay to `Failed(message)`. Carries the
+    /// same `generation` echo as [`Event::SelectorReady`].
+    SelectorFailed {
+        generation: u64,
+        message: String,
+    },
 
     // ---- Settlement ----
     TurnFinished {
@@ -350,12 +360,15 @@ impl Event {
 
     // ---- Slash Command selector ----
 
-    pub fn selector_ready(rows: Vec<SelectorRow>) -> Self {
-        Event::SelectorReady(rows)
+    pub fn selector_ready(generation: u64, rows: Vec<SelectorRow>) -> Self {
+        Event::SelectorReady { generation, rows }
     }
 
-    pub fn selector_failed(message: impl Into<String>) -> Self {
-        Event::SelectorFailed(message.into())
+    pub fn selector_failed(generation: u64, message: impl Into<String>) -> Self {
+        Event::SelectorFailed {
+            generation,
+            message: message.into(),
+        }
     }
 
     // ---- The rest ----

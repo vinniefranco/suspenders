@@ -61,15 +61,17 @@ fn model_rows(ids: Vec<String>, current: &str) -> Vec<SelectorRow> {
 /// `agent.list_models()` OFF the select loop (ADR-0011) - on success it posts
 /// SelectorReady, on failure SelectorFailed - through `ctx.selector_tx`; the
 /// injected event arrives at the loop's `selector_rx` arm and flips the Loading
-/// overlay. The overlay stays Loading until it arrives.
-pub(super) async fn run(screen: Screen, ctx: &AdapterCtx<'_>) -> Screen {
+/// overlay. The overlay stays Loading until it arrives. `generation` is the
+/// activation counter the committing `Effect::Command` carried: both fill
+/// events echo it, so the core only fills the overlay that asked.
+pub(super) async fn run(screen: Screen, ctx: &AdapterCtx<'_>, generation: u64) -> Screen {
     let current = ctx.agent.active_model().await;
     let agent = ctx.agent.clone();
     let tx = ctx.selector_tx.clone();
     tokio::spawn(async move {
         let event = match agent.list_models().await {
-            Ok(ids) => Event::selector_ready(model_rows(ids, &current)),
-            Err(reason) => Event::selector_failed(reason),
+            Ok(ids) => Event::selector_ready(generation, model_rows(ids, &current)),
+            Err(reason) => Event::selector_failed(generation, reason),
         };
         let _ = tx.send(event);
     });
