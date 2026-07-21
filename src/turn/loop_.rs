@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::compaction::Compaction;
 use crate::content::ContentBlock;
-use crate::conversation::{self, Conversation};
+use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::request::LlmRequest;
 use crate::llm::response::{Response, StopReason};
@@ -222,7 +222,7 @@ async fn run_loop<D: TurnDeps>(
             response.stop_reason.clone(),
         ));
 
-        conversation.note_usage(usage_of(&response));
+        conversation.note_usage(response.usage.clone());
         emit_context_pressure(state, &conversation);
 
         match dispatch(state, conversation, response).await {
@@ -567,15 +567,6 @@ fn emit_context_pressure<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation
         conversation.max_tokens_reserve,
         conversation.dead_mass(),
     ));
-}
-
-// Maps the Response's content::Usage to the Conversation's Usage (only
-// input_tokens is load-bearing for the estimate floor).
-fn usage_of(response: &Response) -> conversation::Usage {
-    match response.usage.input_tokens {
-        Some(tokens) => conversation::Usage::with_input_tokens(tokens),
-        None => conversation::Usage::empty(),
-    }
 }
 
 #[cfg(test)]

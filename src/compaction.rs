@@ -438,17 +438,17 @@ mod tests {
     fn holds_at_the_target_exactly_and_fires_one_token_over() {
         // The trigger is strict: AT the Compaction Target the Conversation
         // still fits, so nothing fires. The estimate rides the usage floor
-        // (`token_estimate` is the char estimate floored by the API's
-        // `input_tokens`), the binding term at Turn start when the previous
+        // (`token_estimate` is the char estimate floored by the usage's
+        // context floor), the binding term at Turn start when the previous
         // Turn's usage is on record.
         let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).eviction_slack(0.0));
         conv.add_user_text("short");
         assert_eq!(conv.compaction_target(), 800);
 
-        conv.note_usage(crate::conversation::Usage::with_input_tokens(800));
+        conv.note_usage(Usage::with_input_tokens(800));
         assert!(!Compaction::proactive(&conv));
 
-        conv.note_usage(crate::conversation::Usage::with_input_tokens(801));
+        conv.note_usage(Usage::with_input_tokens(801));
         assert!(Compaction::proactive(&conv));
     }
 

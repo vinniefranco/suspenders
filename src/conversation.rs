@@ -20,7 +20,7 @@
 mod supersession;
 mod turn_boundary;
 
-use crate::content::{ContentBlock, Message, Role};
+use crate::content::{ContentBlock, Message, Role, Usage};
 use crate::voice::{self, FileOps};
 
 /// What one Eviction wave reclaimed, counted by kind, with the Dead Mass
@@ -76,25 +76,6 @@ pub struct Conversation {
     pub eviction_slack: f64,
     pub compaction_keep: f64,
     pub dead_mass_fraction: f64,
-}
-
-/// A usage signal from the API. Only `input_tokens` is load-bearing for the
-/// token estimate floor; the rest is carried opaquely.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Usage {
-    pub input_tokens: Option<u64>,
-}
-
-impl Usage {
-    pub fn with_input_tokens(input_tokens: u64) -> Self {
-        Usage {
-            input_tokens: Some(input_tokens),
-        }
-    }
-
-    pub fn empty() -> Self {
-        Usage { input_tokens: None }
-    }
 }
 
 /// The explicit options a Conversation is built from. `context_budget` and
@@ -228,10 +209,10 @@ impl Conversation {
 
     /// Estimates the Conversation's token count: `ceil(total chars / 3.5)` over
     /// overhead, system prompt, and content, floored by `last_usage`'s
-    /// `input_tokens` when present.
+    /// context floor when present.
     pub fn token_estimate(&self) -> u64 {
         let estimate = self.char_estimate();
-        match self.input_tokens() {
+        match self.usage_floor() {
             Some(tokens) => estimate.max(tokens),
             None => estimate,
         }
@@ -459,8 +440,8 @@ impl Conversation {
         tokens_for_chars(chars)
     }
 
-    fn input_tokens(&self) -> Option<u64> {
-        self.last_usage.as_ref().and_then(|u| u.input_tokens)
+    fn usage_floor(&self) -> Option<u64> {
+        self.last_usage.as_ref().and_then(|u| u.context_floor())
     }
 
     // The oldest-first live walk. Checks before eliding: a wave whose dead
@@ -966,8 +947,24 @@ mod tests {
     fn token_estimate_ignores_usage_without_input_tokens() {
         // 4 chars -> ceil(4 / 3.5) = 2
         let mut conv = Conversation::new("abcd", ConversationOpts::new(1000, 0));
-        conv.note_usage(Usage::empty());
+        conv.note_usage(Usage::default());
         assert_eq!(conv.token_estimate(), 2);
+    }
+
+    #[test]
+    fn token_estimate_floors_at_the_cache_inclusive_sum() {
+        // Warm cache: a tiny uncached remainder over a six-figure cached
+        // prefix. The floor holds at the cache-inclusive sum, not at
+        // input_tokens (ADR-0036).
+        let mut conv = Conversation::new("abcd", ConversationOpts::new(200_000, 0));
+        conv.add_user_text("hello");
+        conv.note_usage(Usage {
+            input_tokens: Some(200),
+            output_tokens: Some(300),
+            cache_read_input_tokens: Some(90_000),
+            cache_creation_input_tokens: None,
+        });
+        assert_eq!(conv.token_estimate(), 90_500);
     }
 
     // ---- compaction_target/1 ----

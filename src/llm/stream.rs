@@ -368,18 +368,28 @@ fn parse_usage(v: &Value) -> Usage {
     Usage {
         input_tokens: v.get("input_tokens").and_then(|n| n.as_u64()),
         output_tokens: v.get("output_tokens").and_then(|n| n.as_u64()),
+        cache_read_input_tokens: v.get("cache_read_input_tokens").and_then(|n| n.as_u64()),
+        cache_creation_input_tokens: v
+            .get("cache_creation_input_tokens")
+            .and_then(|n| n.as_u64()),
     }
 }
 
 /// Merges `delta` over `base` field-by-field (a present field wins). Mirrors
-/// baud's `Map.merge`: message_start supplies input_tokens, message_delta the
-/// final output_tokens.
+/// baud's `Map.merge`: message_start supplies input_tokens and the cache
+/// figures, message_delta the final output_tokens.
 fn merge_usage(base: &mut Usage, delta: &Usage) {
     if delta.input_tokens.is_some() {
         base.input_tokens = delta.input_tokens;
     }
     if delta.output_tokens.is_some() {
         base.output_tokens = delta.output_tokens;
+    }
+    if delta.cache_read_input_tokens.is_some() {
+        base.cache_read_input_tokens = delta.cache_read_input_tokens;
+    }
+    if delta.cache_creation_input_tokens.is_some() {
+        base.cache_creation_input_tokens = delta.cache_creation_input_tokens;
     }
 }
 
@@ -718,5 +728,48 @@ mod tests {
         ]);
         assert_eq!(r.usage.input_tokens, Some(11));
         assert_eq!(r.usage.output_tokens, Some(42));
+    }
+
+    #[test]
+    fn usage_parses_all_four_figures_from_message_start() {
+        let r = fold(vec![SseEvent::event(
+            "message_start",
+            json!({ "message": { "usage": {
+                "input_tokens": 11,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 90_000,
+                "cache_creation_input_tokens": 1_500
+            } } }),
+        )]);
+        assert_eq!(r.usage.input_tokens, Some(11));
+        assert_eq!(r.usage.output_tokens, Some(1));
+        assert_eq!(r.usage.cache_read_input_tokens, Some(90_000));
+        assert_eq!(r.usage.cache_creation_input_tokens, Some(1_500));
+    }
+
+    #[test]
+    fn usage_merge_carries_cache_figures_past_message_delta() {
+        // message_start supplies input_tokens and the cache figures,
+        // message_delta the final output_tokens; the merge holds all four.
+        let r = fold(vec![
+            SseEvent::event(
+                "message_start",
+                json!({ "message": { "usage": {
+                    "input_tokens": 11,
+                    "cache_read_input_tokens": 90_000,
+                    "cache_creation_input_tokens": 1_500
+                } } }),
+            ),
+            md("end_turn", json!({ "output_tokens": 42 })),
+        ]);
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: Some(11),
+                output_tokens: Some(42),
+                cache_read_input_tokens: Some(90_000),
+                cache_creation_input_tokens: Some(1_500),
+            }
+        );
     }
 }
