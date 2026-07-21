@@ -2105,9 +2105,12 @@ mod tests {
         let (outcome, deps) = run_with(&session, "write a file", deps).await;
         let evs = events(&deps);
         let result = find_tool_result(&evs, "x1").expect("x1 answered");
+        // The Answer is the refusal verbatim (batch.rs pairs this wording
+        // with CallOutcome::Refused): the exact match proves the read never
+        // ran, so nothing from secret.txt could leak into the result.
         assert!(
             matches!(result, Event::ToolResult { content, is_error: true, .. }
-                if content.contains("not offered") && !content.contains("SECRET-CONTENT"))
+                if *content == voice::tool_not_offered("read_file"))
         );
         // The refused read never verified the write, so the capped Turn
         // recovers (the refusal and the recovery judgment compose).
@@ -2145,9 +2148,11 @@ mod tests {
         assert!(!root.path().join("evil.txt").exists());
         let evs = events(&deps);
         let result = find_tool_result(&evs, "w1").expect("w1 answered");
+        // The Answer is the refusal verbatim (batch.rs pairs this wording
+        // with CallOutcome::Refused): the write was refused, never run.
         assert!(
             matches!(result, Event::ToolResult { content, is_error: true, .. }
-                if content.contains("not offered"))
+                if *content == voice::tool_not_offered("write_file"))
         );
     }
 
