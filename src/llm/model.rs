@@ -27,9 +27,9 @@ pub enum Api {
 
 /// The facts of one model at one Provider (CONTEXT.md: Model). Read from the
 /// Catalog for built-in Providers; synthesized from config for custom ones.
-/// Each Turn captures a Model when it begins (ADR-0033 amendment); the budget
-/// figures derive from that capture in Stage E - today the launch Model feeds
-/// the once-at-launch validation.
+/// Each Turn captures a Model when it begins (ADR-0033 amendment), and the
+/// Context Budget, the Eviction reserve, and the Result Cap derive from that
+/// capture at Turn start (ADR-0037).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     /// The Provider's identifier (the scope of the scoped id).
@@ -104,12 +104,12 @@ pub fn split_scoped(scoped: &str) -> Result<(&str, &str), String> {
 }
 
 /// Resolves a scoped identifier to a [`Model`] against the resolved Provider
-/// set. The Catalog supplies the figures for built-in Providers' known models;
-/// a custom Provider's window comes from its config entry, and anything the
-/// Catalog does not know falls back to `fallback_window` (the config
-/// `context_budget`, reinterpreted per ADR-0037) and `fallback_max_tokens`
-/// (the config `max_tokens` knob). An unknown Provider is an `Err` - failure
-/// stays loud (ADR-0031).
+/// set. The window precedence (ADR-0037, ADR-0031 amendment): the Catalog's
+/// figure for a built-in Provider's known model, else the Provider's own
+/// config `context_window`, else `fallback_window` (the config
+/// `context_budget` figure, or its default when unset). `fallback_max_tokens`
+/// (the config `max_tokens` knob) caps every Model the Catalog does not know.
+/// An unknown Provider is an `Err` - failure stays loud (ADR-0031).
 pub fn resolve(
     scoped: &str,
     providers: &[Provider],
@@ -153,6 +153,7 @@ mod tests {
             token: "".into(),
             api: Api::AnthropicMessages,
             context_window: Some(window),
+            custom: true,
         }
     }
 
@@ -203,6 +204,17 @@ mod tests {
         assert_eq!(model.id, "qwen/some-model");
         assert_eq!(model.api, Api::AnthropicMessages);
         assert_eq!(model.context_window, 32_768);
+        assert_eq!(model.max_tokens, 8_000);
+    }
+
+    #[test]
+    fn a_custom_provider_without_a_window_falls_back_to_the_global_figure() {
+        // The window precedence's last step (ADR-0031 amendment): no catalog
+        // entry, no per-provider window, so the fallback figure supplies it.
+        let mut provider = custom("local", 0);
+        provider.context_window = None;
+        let model = resolve("local/some-model", &[provider], 48_000, 8_000).unwrap();
+        assert_eq!(model.context_window, 48_000);
         assert_eq!(model.max_tokens, 8_000);
     }
 

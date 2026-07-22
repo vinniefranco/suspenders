@@ -112,6 +112,7 @@ pub fn builtin_providers() -> Vec<Provider> {
                 .unwrap_or_default(),
             api: p.api,
             context_window: None,
+            custom: false,
         })
         .collect()
 }

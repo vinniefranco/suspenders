@@ -127,10 +127,11 @@ Providers (ADR-0037) change the schema without keeping compatibility:
 - `model` becomes a scoped `provider/model-id` (e.g.
   `anthropic/claude-fable-5`, `lmstudio/qwen3.6-27b`).
 - The flat `base_url` and `token` keys retire. A `providers` table declares
-  custom hosts - `{ "base_url", "api", "context_window", optional "token" }`
-  per entry - while built-in Providers need no entry at all: their
+  custom hosts - `{ "base_url", "api", optional "context_window", optional
+  "token" }` per entry - while built-in Providers need no entry at all: their
   credential comes from their own environment key (`ANTHROPIC_API_KEY`, …),
-  not from this file.
+  not from this file. An entry's `context_window` beats the global
+  `context_budget` figure for that Provider's models (ADR-0037).
 - **"Schema is exactly the env-settable key set" narrows to the scalar
   knobs.** The `providers` table is file-only - structure the env cannot
   express - so the file/env lockstep rule now governs the scalar keys that

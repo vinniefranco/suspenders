@@ -254,6 +254,7 @@ mod tests {
             token: "test-token".into(),
             api: Api::OpenaiCompletions,
             context_window: Some(64_000),
+            custom: true,
         }
     }
 
@@ -451,6 +452,7 @@ mod tests {
             token: "t".into(),
             api: Api::OpenaiCompletions,
             context_window: Some(64_000),
+            custom: true,
         };
         let result = Dispatcher::new(vec![refused])
             .complete(&simple_request(), &test_model(), &mut no_op())
@@ -723,6 +725,7 @@ mod tests {
             token: "t".into(),
             api: Api::OpenaiCompletions,
             context_window: Some(64_000),
+            custom: true,
         };
         let result = Dispatcher::new(vec![refused.clone()])
             .list_models(&refused)

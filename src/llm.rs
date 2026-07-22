@@ -213,6 +213,53 @@ pub trait Llm: Send + Sync {
     async fn list_models(&self, provider: &Provider) -> Result<Vec<String>, String>;
 }
 
+/// One Provider's offering for the `/model` selector (ADR-0037): the Provider
+/// id and its bare model ids. The UI scopes them (`provider/model-id`) when it
+/// builds rows, keeping the wire's bare ids at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModels {
+    pub provider: String,
+    pub models: Vec<String>,
+}
+
+/// Lists every Provider's models for the `/model` selector, grouped by
+/// Provider in set order (ADR-0037): custom Providers by live discovery
+/// ([`Llm::list_models`], the ADR-0002 amendment machinery, now across every
+/// configured custom Provider), built-in Providers from the Catalog - and only
+/// when their credential resolved, because a Provider the user cannot call
+/// does not belong in the selector. A custom Provider whose discovery fails is
+/// skipped; when nothing listed at all, the collected reasons come back as the
+/// `Err` the selector surfaces.
+pub async fn offerings(
+    llm: &dyn Llm,
+    providers: &[Provider],
+) -> Result<Vec<ProviderModels>, String> {
+    let mut listings: Vec<ProviderModels> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for p in providers {
+        if p.custom {
+            match llm.list_models(p).await {
+                Ok(models) => listings.push(ProviderModels {
+                    provider: p.id.clone(),
+                    models,
+                }),
+                Err(reason) => failures.push(format!("{}: {reason}", p.id)),
+            }
+        } else if !p.token.is_empty() {
+            listings.push(ProviderModels {
+                provider: p.id.clone(),
+                models: catalog::provider(&p.id)
+                    .map(|c| c.models.iter().map(|m| m.id.clone()).collect())
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    if listings.iter().all(|l| l.models.is_empty()) && !failures.is_empty() {
+        return Err(failures.join("; "));
+    }
+    Ok(listings)
+}
+
 /// The production boundary (ADR-0037): holds the Session's resolved Provider
 /// set and routes each call on the captured Model's Api to that Api's adapter.
 /// Holds nothing else config-ish - the request and Model carry everything a
@@ -277,6 +324,15 @@ mod tests {
             token: "".into(),
             api,
             context_window: Some(64_000),
+            custom: true,
+        }
+    }
+
+    fn builtin(id: &str, token: &str) -> Provider {
+        Provider {
+            token: token.into(),
+            custom: false,
+            ..provider(id, Api::AnthropicMessages)
         }
     }
 
@@ -312,6 +368,75 @@ mod tests {
             .await;
         assert_eq!(result.stop_reason, StopReason::Error);
         assert!(result.error.unwrap().contains("unknown_provider"));
+    }
+
+    // ------------------------------------------------------------------
+    // offerings - the multi-Provider /model listing (ADR-0037)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn offerings_discovers_customs_live_and_lists_credentialed_builtins_from_the_catalog() {
+        use crate::test_support::FakeLlm;
+
+        let fake = FakeLlm::script(std::iter::empty())
+            .with_models(vec![Ok(vec!["m1".to_string(), "m2".to_string()])]);
+        let providers = vec![
+            provider("local", Api::AnthropicMessages),
+            builtin("anthropic", "sk-test"),
+        ];
+
+        let listings = offerings(&fake, &providers).await.unwrap();
+        assert_eq!(listings.len(), 2, "grouped by Provider, in set order");
+        assert_eq!(listings[0].provider, "local");
+        assert_eq!(listings[0].models, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(listings[1].provider, "anthropic");
+        assert!(
+            listings[1].models.iter().any(|m| m == "claude-fable-5"),
+            "builtins list the Catalog's models"
+        );
+    }
+
+    #[tokio::test]
+    async fn offerings_skips_builtins_without_a_resolved_credential() {
+        use crate::test_support::FakeLlm;
+
+        // No custom Providers, no credentials: an empty, error-free listing -
+        // the user configured nothing callable, which is not a fetch failure.
+        let fake = FakeLlm::script(std::iter::empty());
+        let providers = vec![builtin("anthropic", "")];
+        assert_eq!(offerings(&fake, &providers).await, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn offerings_with_every_discovery_failed_and_nothing_else_is_err() {
+        use crate::test_support::FakeLlm;
+
+        let fake =
+            FakeLlm::script(std::iter::empty()).with_models(vec![Err("refused".to_string())]);
+        let providers = vec![
+            provider("local", Api::AnthropicMessages),
+            builtin("anthropic", ""),
+        ];
+        let err = offerings(&fake, &providers).await.unwrap_err();
+        assert!(err.contains("local"), "names the Provider: {err}");
+        assert!(err.contains("refused"), "carries the reason: {err}");
+    }
+
+    #[tokio::test]
+    async fn offerings_keeps_surviving_listings_when_one_discovery_fails() {
+        use crate::test_support::FakeLlm;
+
+        // Two customs: the first fails, the second lists. The selector shows
+        // what it can rather than failing wholesale.
+        let fake = FakeLlm::script(std::iter::empty())
+            .with_models(vec![Err("down".to_string()), Ok(vec!["m1".to_string()])]);
+        let providers = vec![
+            provider("a-local", Api::AnthropicMessages),
+            provider("b-local", Api::AnthropicMessages),
+        ];
+        let listings = offerings(&fake, &providers).await.unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].provider, "b-local");
     }
 
     // ------------------------------------------------------------------

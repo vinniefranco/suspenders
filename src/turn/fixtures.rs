@@ -32,7 +32,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
     let mut conv = Conversation::new(
         "You are a test agent.",
         crate::conversation::ConversationOpts::new(
-            session.context_budget,
+            session.context_budget_for(&session.model),
             session.model.max_tokens,
         )
         .eviction_slack(session.eviction_slack)
@@ -44,7 +44,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
 }
 
 pub(super) fn tool_ctx(session: &Session) -> ToolCtx {
-    session.tool_ctx()
+    session.tool_ctx(&session.model)
 }
 
 // Response builders mirroring baud's text_result / tool_use_result.

@@ -23,8 +23,14 @@ pub struct Provider {
     pub api: Api,
     /// The window a custom Provider's Models synthesize from (its config
     /// `context_window`). `None` for built-ins, whose windows the Catalog
-    /// carries per Model.
+    /// carries per Model, and for custom entries that leave it to the config
+    /// `context_budget` figure (ADR-0031 amendment).
     pub context_window: Option<u64>,
+    /// Whether this Provider came from the config `providers` table (custom)
+    /// rather than the Catalog. Custom Providers discover their models live
+    /// (`GET {base_url}/models`, ADR-0037); built-ins list from the Catalog
+    /// and only when their credential resolved.
+    pub custom: bool,
 }
 
 /// Finds a Provider by id in a resolved set.

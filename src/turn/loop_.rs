@@ -922,7 +922,7 @@ mod tests {
             })
             .collect();
         assert_eq!(pressures.len(), 2);
-        assert_eq!(pressures[0].1, session.context_budget);
+        assert_eq!(pressures[0].1, session.context_budget_for(&session.model));
         assert_eq!(pressures[0].2, session.model.max_tokens);
         // Pressure grows Pass to Pass.
         assert!(pressures[1].0 >= pressures[0].0);
@@ -3761,7 +3761,7 @@ mod tests {
 
     fn ctx_with_scout(session: &Session, outcome: crate::scout::ScoutOutcome) -> ToolCtx {
         use std::sync::Arc;
-        let mut ctx = session.tool_ctx();
+        let mut ctx = session.tool_ctx(&session.model);
         let out = outcome;
         ctx.scout = Some(Arc::new(move |_task: String| {
             let out = out.clone();

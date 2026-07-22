@@ -38,9 +38,9 @@ use crate::compaction::Compaction;
 use crate::content::{ContentBlock, Provenance};
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
-use crate::llm::Llm;
 use crate::llm::model::Model;
 use crate::llm::response::StopReason as RespStopReason;
+use crate::llm::{Llm, ProviderModels};
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
 use crate::session::{RecoveryShape, Session};
 use crate::turn::AgentDeps;
@@ -213,12 +213,12 @@ pub enum Command {
     /// The Active Model identifier the next Turn will call (ADR-0033), so a
     /// caller can mark "(current)".
     ActiveModel(oneshot::Sender<String>),
-    /// List the models the Active Model's endpoint offers (ADR-0033, ADR-0002
-    /// amendment). The Agent owns the `Llm` and the mutable `connection`, so the
-    /// listed endpoint always matches the Active Model's; the fetch runs OFF the
-    /// actor (a spawned task over clones) so the network never blocks the actor
-    /// loop, and the oneshot carries the boundary's `Result<Vec<String>, String>`.
-    ListModels(oneshot::Sender<Result<Vec<String>, String>>),
+    /// List every Provider's models for the `/model` selector (ADR-0033,
+    /// ADR-0037): custom Providers by live `GET /models` discovery, built-ins
+    /// from the Catalog when their credential resolved. The fetch runs OFF
+    /// the actor (a spawned task over clones) so the network never blocks the
+    /// actor loop; the oneshot carries [`llm::offerings`]' result.
+    ListModels(oneshot::Sender<Result<Vec<ProviderModels>, String>>),
     Approve(String, Decision, oneshot::Sender<()>),
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
@@ -286,9 +286,19 @@ impl AgentHandle {
             .map(|s| s.chars().count() as u64)
             .unwrap_or(0);
 
+        // The Active Model lives here as mutable Agent state (ADR-0033,
+        // CONTEXT.md: Active Model), seeded from the Session's launch-resolved
+        // Model. Each Turn is spawned with a snapshot of THIS Model, so a
+        // `SetModel` between Turns lands on the next Turn and an in-flight
+        // Turn finishes on the Model it captured.
+        let model = session.model.clone();
+
+        // The budget figures derive from the launch Model here and are
+        // re-derived from the captured Model at every Turn start (ADR-0037,
+        // `reset_turn_state`).
         let mut conversation = Conversation::new(
             system_prompt,
-            ConversationOpts::new(session.context_budget, session.model.max_tokens)
+            ConversationOpts::new(session.context_budget_for(&model), model.max_tokens)
                 .overhead_chars(overhead)
                 .eviction_slack(session.eviction_slack)
                 .dead_mass_fraction(session.dead_mass_fraction)
@@ -310,13 +320,6 @@ impl AgentHandle {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (events, _rx0) = broadcast::channel(1024);
-
-        // The Active Model lives here as mutable Agent state (ADR-0033,
-        // CONTEXT.md: Active Model), seeded from the Session's launch-resolved
-        // Model. Each Turn is spawned with a snapshot of THIS Model, so a
-        // `SetModel` between Turns lands on the next Turn and an in-flight
-        // Turn finishes on the Model it captured.
-        let model = session.model.clone();
 
         let state = AgentState {
             session,
@@ -395,13 +398,13 @@ impl AgentHandle {
         self.query(Command::ActiveModel).await.expect("agent alive")
     }
 
-    /// Lists the models the Active Model's endpoint offers (ADR-0033), by
-    /// asking the Agent - the owner of the `Llm` and the mutable `connection` -
-    /// so the listed endpoint always matches the model the next Turn will
-    /// call. The Agent fetches off its actor loop; this awaits the reply. A
-    /// dead Agent (or a dropped reply) surfaces as `Err`, matching the
-    /// boundary's fallible shape.
-    pub async fn list_models(&self) -> Result<Vec<String>, String> {
+    /// Lists every Provider's models for the `/model` selector (ADR-0033,
+    /// ADR-0037), grouped by Provider: custom Providers by live discovery,
+    /// built-ins from the Catalog when their credential resolved. The Agent -
+    /// the owner of the `Llm` and the Session's Provider set - fetches off its
+    /// actor loop; this awaits the reply. A dead Agent (or a dropped reply)
+    /// surfaces as `Err`, matching the boundary's fallible shape.
+    pub async fn list_models(&self) -> Result<Vec<ProviderModels>, String> {
         self.query(Command::ListModels)
             .await
             .unwrap_or_else(|| Err("agent unavailable".to_string()))
@@ -474,8 +477,8 @@ struct AgentState {
     // Active Model): an owned Model seeded from `session.model` at launch and
     // read - not `session.model` - when spawning a Turn. `Command::SetModel`
     // swaps the whole Model (resolved against the Session's fixed Provider
-    // set); the budget figures keep their once-at-launch shape - per-Turn
-    // recomputation from the capture is a later stage.
+    // set, budget-checked); the budget figures re-derive from this capture at
+    // every Turn start (ADR-0037, `reset_turn_state`).
     model: Model,
     // The Provenance of the Model the RUNNING Turn captured at spawn
     // (ADR-0037): stamps assistant events in the Session Log. Snapshotted in
@@ -670,28 +673,31 @@ fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
 
 // The SetModel swap (ADR-0033 amendment): the whole Model swaps - the scoped
 // id resolves against the Session's fixed Provider set (Catalog figures for
-// known built-in models, config synthesis otherwise). The next spawned Turn
-// snapshots it; an in-flight Turn is unaffected. An unresolvable id leaves
-// the Active Model as-is and the Err rides back to the caller.
+// known built-in models, config synthesis otherwise), and the per-Model
+// budget invariants are re-checked (ADR-0037) so a pick that cannot fit is
+// rejected here with the reason, never accepted and exploded later. The next
+// spawned Turn snapshots it; an in-flight Turn is unaffected. A rejected pick
+// leaves the Active Model as-is and the Err rides back to the caller.
 fn swap_active_model(state: &mut AgentState, scoped: &str) -> Result<(), String> {
-    state.model = state.session.resolve_model(scoped)?;
+    let model = state.session.resolve_model(scoped)?;
+    state.session.validate_model_budget(&model)?;
+    state.model = model;
     Ok(())
 }
 
 // The ListModels fetch, OFF the actor (ADR-0011/0017: never block the actor
-// loop on the network). Clone the boundary and the Active Model's Provider so
-// the listed endpoint always matches the model the next Turn will call, then
-// answer the oneshot from the spawned task.
-fn spawn_list_models(state: &AgentState, reply: oneshot::Sender<Result<Vec<String>, String>>) {
-    let Some(provider) = state.session.provider_of(&state.model).cloned() else {
-        // Unreachable while resolution guards SetModel; answer rather than
-        // panic if it ever regresses.
-        let _ = reply.send(Err(format!("unknown provider {:?}", state.model.provider)));
-        return;
-    };
+// loop on the network). Clone the boundary and the Session's fixed Provider
+// set, then answer the oneshot from the spawned task: `llm::offerings` walks
+// every Provider - live discovery for customs, the Catalog for credentialed
+// built-ins (ADR-0037).
+fn spawn_list_models(
+    state: &AgentState,
+    reply: oneshot::Sender<Result<Vec<ProviderModels>, String>>,
+) {
     let llm = Arc::clone(&state.llm);
+    let providers = state.session.providers.clone();
     tokio::spawn(async move {
-        let _ = reply.send(llm.list_models(&provider).await);
+        let _ = reply.send(crate::llm::offerings(llm.as_ref(), &providers).await);
     });
 }
 
@@ -875,6 +881,13 @@ fn reset_turn_state(state: &mut AgentState) {
     state.approval_replies.clear();
     state.cancel_flag = false;
     state.turn_provenance = state.model.provenance();
+    // The captured Model's budget figures land at Turn start (ADR-0037): the
+    // Context Budget from its window (config may cap it), the Eviction reserve
+    // from its output cap. The Turn task clones this Conversation, so an
+    // in-flight Turn keeps the figures it captured, and a switch to a smaller
+    // window lands here as ordinary pressure on the next Turn.
+    state.conversation.context_budget = state.session.context_budget_for(&state.model);
+    state.conversation.max_tokens_reserve = state.model.max_tokens;
 }
 
 fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {

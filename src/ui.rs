@@ -211,7 +211,7 @@ async fn run_loop(
         .unwrap_or_default();
 
     let mut screen = Some(Screen::new(ScreenOpts {
-        context_budget: Some(session.context_budget),
+        context_budget: Some(session.context_budget_for(&session.model)),
         eviction_slack: session.eviction_slack,
         plugins: crate::plugins::configured(&session.plugins),
         history,
@@ -306,7 +306,10 @@ async fn run_loop(
                 // Committing a `/model` pick is a key press, so it lands in this
                 // batch; refresh the Active Model the status bar shows (a cheap
                 // in-process actor query, ADR-0017/0033 - never on the tick).
+                // The endpoint follows the scoped id's Provider (ADR-0037): a
+                // cross-Provider pick must not leave a stale base_url up.
                 conn.model = agent.active_model().await;
+                conn.base_url = provider_base_url(session, &conn.model);
                 if !dirty {
                     continue;
                 }
@@ -348,6 +351,7 @@ async fn run_loop(
                 // The fetch result never changes the model, but a pick could
                 // have raced in; refresh to stay truthful (still off the tick).
                 conn.model = agent.active_model().await;
+                conn.base_url = provider_base_url(session, &conn.model);
             }
         }
 
@@ -428,6 +432,17 @@ async fn next_if_ready<S: Stream + Unpin>(stream: &mut S) -> Option<Option<S::It
         })
     })
     .await
+}
+
+/// The endpoint the status bar shows for a scoped Active Model id: the id's
+/// Provider looked up in the Session's fixed set (ADR-0037). Empty when the
+/// id does not resolve (it always does - `set_model` validated it).
+fn provider_base_url(session: &Session, scoped: &str) -> String {
+    crate::llm::model::split_scoped(scoped)
+        .ok()
+        .and_then(|(provider, _)| crate::llm::provider::find(&session.providers, provider))
+        .map(|p| p.base_url.clone())
+        .unwrap_or_default()
 }
 
 /// Ctrl-C / Ctrl-Q quit the app (baud's global keybindings).
@@ -1259,6 +1274,26 @@ mod tests {
                 TranscriptItem::Info { text } => Some(text.clone()),
                 _ => None,
             })
+    }
+
+    #[test]
+    fn provider_base_url_follows_the_scoped_ids_provider() {
+        let dir = TempDir::new().unwrap();
+        let session = agent_session(&dir);
+        // The custom Provider's endpoint for its own scoped ids (the model id
+        // may itself contain slashes; the scope is the first segment only).
+        assert_eq!(
+            provider_base_url(&session, "local/qwen/Qwen3.6-27B-MTP-GGUF"),
+            "http://localhost:0/v1"
+        );
+        // A cross-Provider pick moves the endpoint with it (ADR-0037).
+        assert_eq!(
+            provider_base_url(&session, "anthropic/claude-fable-5"),
+            "https://api.anthropic.com/v1"
+        );
+        // Unresolvable ids degrade to empty, never panic.
+        assert_eq!(provider_base_url(&session, "unscoped"), "");
+        assert_eq!(provider_base_url(&session, "nowhere/m"), "");
     }
 
     #[tokio::test(flavor = "multi_thread")]

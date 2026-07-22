@@ -639,7 +639,10 @@ fn header(session: &Session) -> Header {
         version: 1,
         root: session.root.clone(),
         model: session.model.scoped_id(),
-        context_budget: session.context_budget,
+        // The launch Model's derived budget (ADR-0037): the budget is no
+        // longer a fixed fact, so the header records the launch figure and
+        // drift is judged against the resuming Session's launch figure.
+        context_budget: session.context_budget_for(&session.model),
         turn_limit: session.turn_limit,
     }
 }
@@ -907,12 +910,13 @@ fn drift(header: &serde_json::Value, session: &Session) -> Vec<Drift> {
         });
     }
 
+    let current_budget = session.context_budget_for(&session.model);
     let logged_budget = header.get("context_budget").and_then(|v| v.as_u64());
-    if logged_budget != Some(session.context_budget) {
+    if logged_budget != Some(current_budget) {
         out.push(Drift {
             key: "context_budget",
             logged: opt_num(logged_budget),
-            current: session.context_budget.to_string(),
+            current: current_budget.to_string(),
         });
     }
 
@@ -1858,9 +1862,12 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
         log.append(Entry::UserText("go".into()));
 
+        // A budget cap BELOW the model's window, so the derived launch budget
+        // actually changes (a cap above the window is a no-op, ADR-0037).
+        let logged_budget = session.context_budget_for(&session.model);
         let changed = session_with(
             tmp.path(),
-            Some(session.context_budget * 2),
+            Some(logged_budget / 2),
             Some(session.turn_limit + 5),
         );
 
@@ -1868,8 +1875,8 @@ mod tests {
 
         assert!(drift.contains(&Drift {
             key: "context_budget",
-            logged: session.context_budget.to_string(),
-            current: changed.context_budget.to_string(),
+            logged: logged_budget.to_string(),
+            current: changed.context_budget_for(&changed.model).to_string(),
         }));
         assert!(drift.contains(&Drift {
             key: "turn_limit",

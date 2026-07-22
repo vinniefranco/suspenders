@@ -217,17 +217,18 @@ pub async fn run(
     // Diff plugin; the test config carries `[]`.
     let plugins = plugins::configured(&session.plugins);
 
-    // The Tool ctx: the Session's Root/Result Cap/timeout, plus the `scout`
-    // capture wired to the Session's Llm and this Turn's captured Model (a
-    // Scout runs against the same captured Model - CONTEXT.md: Scout).
-    let mut tool_ctx = session.tool_ctx();
+    // The Tool ctx: the Session's Root and timeout plus the Result Cap derived
+    // from this Turn's captured Model (ADR-0037), and the `scout` capture
+    // wired to the Session's Llm and the same capture (a Scout runs against
+    // the same captured Model and budget - CONTEXT.md: Scout).
+    let mut tool_ctx = session.tool_ctx(&deps.model);
     tool_ctx.scout = Some(make_scout(
         Arc::clone(&deps.llm),
         deps.model.clone(),
         session.root.clone(),
         ScoutKnobs {
             pass_limit: session.scout_pass_limit,
-            context_budget: session.context_budget,
+            context_budget: session.context_budget_for(&deps.model),
             no_think: session.scout_no_think,
             temperature: session.temperature,
             command_timeout_ms: session.command_timeout_ms,

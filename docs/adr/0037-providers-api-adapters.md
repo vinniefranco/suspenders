@@ -133,7 +133,20 @@ recompute from that capture at Turn start:
 
 A switch to a smaller window lands as ordinary budget pressure on the next
 Turn - Eviction and Compaction already know what to do. An in-flight Turn
-finishes on the Model it captured; nothing swaps mid-flight.
+finishes on the Model it captured; nothing swaps mid-flight. Scout and
+Compaction run on the same captured figures.
+
+The precedence (implemented in Stage E): a Model's window is the Catalog's
+figure for a known built-in model, else its Provider's config
+`context_window` (the per-provider entry beats the global figure for that
+Provider's models), else the config `context_budget` figure, else the
+64K default. The effective Context Budget for a Turn is then
+`min(context_budget, window)` when the config key is set, and the window
+alone when it is not - the key is a cap and a fallback, never the budget
+itself. The budget invariant is per-Model: the effective budget must leave
+room past that Model's own output cap, checked at launch for the launch
+Model and at a `/model` swap for the picked Model, so a pick that cannot
+fit is rejected with the reason instead of exploding on a later Turn.
 
 ## Considered and rejected
 

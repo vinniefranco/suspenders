@@ -1,9 +1,11 @@
 //! The Session's fixed facts (CONTEXT.md: Session), resolved and validated
 //! once at launch: the Project Root, the Provider set, the launch Model, the
-//! sampling temperature, the Context Budget, the Eviction slack, the Dead
-//! Mass fraction, the Compaction Keep, the Result Cap, the Turn Limit, the
-//! Anchor cadence and stale-plan threshold, the Scout Pass cap, the no-think
-//! knobs, the command timeout, the Plugin list, and the LLM module.
+//! sampling temperature, the budget-cap knob, the Eviction slack, the Dead
+//! Mass fraction, the Compaction Keep, the Turn Limit, the Anchor cadence and
+//! stale-plan threshold, the Scout Pass cap, the no-think knobs, the command
+//! timeout, the Plugin list, and the LLM module. The Context Budget and the
+//! Result Cap are NOT fixed facts: they derive from the Model each Turn
+//! captures (ADR-0037).
 //!
 //! This is the composition seam for configuration. [`Session::new`] resolves
 //! these keys once (via [`SessionConfig::load`]) by overlaying, in order, the
@@ -11,12 +13,14 @@
 //! (ADR-0031), and the `SUSPENDERS_*` environment (the file is the persistent
 //! baseline; the environment still wins per-invocation over it); everything
 //! downstream receives values from this struct, so the cross-module invariants
-//! live in one constructor:
+//! live in one place:
 //!
-//! * the Eviction reserve IS the launch [`Model`]'s `max_tokens` - one field,
-//!   read by the Conversation and the LLM request alike, so they cannot drift
-//! * that output cap must leave room in the Context Budget
-//! * the Result Cap derives from the same two numbers, once, here
+//! * the Context Budget, the Eviction reserve, and the Result Cap are NOT
+//!   fixed facts (ADR-0037): they derive from the Model each Turn captures,
+//!   through [`Session::context_budget_for`] and [`Session::tool_ctx`]
+//! * a Model's output cap must leave room in its effective budget - checked
+//!   here at launch for the launch Model and by the Agent at a `/model` swap
+//!   for the picked Model ([`Session::validate_model_budget`])
 //!
 //! The Provider set (ADR-0037) resolves here too: custom Providers from the
 //! config `providers` table, built-ins from the generated Catalog with each one's
@@ -83,7 +87,12 @@ pub struct Session {
     pub llm_module: String,
     /// The Session's Plugin list (opaque here; entries carried as names).
     pub plugins: Vec<String>,
-    pub context_budget: u64,
+    /// The config `context_budget` knob, reinterpreted (ADR-0037, ADR-0031
+    /// amendment): an optional global cap on every Model's effective budget,
+    /// and the window figure for Models the Catalog does not know. The budget
+    /// itself is NOT a fixed fact - [`Session::context_budget_for`] derives it
+    /// from the Model each Turn captures.
+    pub context_budget: Option<u64>,
     pub eviction_slack: f64,
     /// The Eviction mechanic's Dead Mass Setpoint: the fraction of the
     /// Context Budget that elidable dead content may occupy before a wave
@@ -111,16 +120,13 @@ pub struct Session {
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
     pub command_timeout_ms: u64,
-    /// DERIVED: `cap_for(context_budget, model.max_tokens)`.
-    pub result_cap: usize,
     pub session_dir: String,
     /// The resolved Provider set (ADR-0037): custom Providers from config,
     /// built-ins from the generated Catalog with their environment credentials.
     pub providers: Vec<Provider>,
     /// The launch-resolved Model - the Active Model's seed (ADR-0033
-    /// amendment). Its output cap is the Eviction reserve and feeds the
-    /// Result Cap; per-Turn budget recomputation from the captured Model is
-    /// a later stage.
+    /// amendment). The budget figures derive from whichever Model each Turn
+    /// captures, this one until a `/model` swap.
     pub model: Model,
     /// The sampling temperature every request carries; `None` leaves sampling
     /// to the server's own defaults. Resolved once here, applied by the
@@ -157,7 +163,9 @@ pub struct SessionConfig {
     pub model: String,
     pub max_tokens: u64,
     pub temperature: Option<f64>,
-    pub context_budget: u64,
+    /// The optional global budget cap and catalog-less window figure
+    /// (ADR-0037); `None` leaves every Model's own window uncapped.
+    pub context_budget: Option<u64>,
     pub eviction_slack: f64,
     pub dead_mass_fraction: f64,
     pub compaction_keep: f64,
@@ -187,14 +195,16 @@ impl SessionConfig {
                 ProviderConfig {
                     base_url: "http://localhost:8888/v1".into(),
                     api: Api::AnthropicMessages,
-                    context_window: 64_000,
+                    context_window: Some(64_000),
                     token: None,
                 },
             )]),
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             max_tokens: 8_000,
             temperature: Some(0.7),
-            context_budget: 64_000,
+            // No global cap by default: every Model's own window is its
+            // budget, so a wide-window Catalog model works out of the box.
+            context_budget: None,
             eviction_slack: 0.2,
             dead_mass_fraction: 0.15,
             compaction_keep: 0.5,
@@ -309,7 +319,10 @@ impl SessionConfig {
             model: Some(base.model),
             max_tokens: Some(base.max_tokens),
             temperature: base.temperature,
-            context_budget: Some(base.context_budget),
+            // Absent from the template on purpose (ADR-0037): the base config
+            // carries no global cap, and baking one in would pin wide-window
+            // Catalog models under it.
+            context_budget: base.context_budget,
             eviction_slack: Some(base.eviction_slack),
             dead_mass_fraction: Some(base.dead_mass_fraction),
             compaction_keep: Some(base.compaction_keep),
@@ -405,7 +418,11 @@ fn merge_model(existing: Option<&str>, model: &str) -> Result<String, String> {
 pub struct ProviderConfig {
     pub base_url: String,
     pub api: Api,
-    pub context_window: u64,
+    /// The window this Provider's Models synthesize from. Absent, the global
+    /// `context_budget` figure supplies it (a present entry beats the global
+    /// figure for this Provider's models - the ADR-0037 precedence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// The credential; absent means none (local servers ignore it). Never
     /// written by the tool - the user adds it by hand.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -486,7 +503,7 @@ impl FileConfig {
             cfg.temperature = Some(v);
         }
         if let Some(v) = self.context_budget {
-            cfg.context_budget = v;
+            cfg.context_budget = Some(v);
         }
         if let Some(v) = self.eviction_slack {
             cfg.eviction_slack = v;
@@ -538,9 +555,9 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         cfg.model = v.into();
         Ok(())
     }),
-    // Integer.
+    // Integer: the optional global budget cap (ADR-0037).
     ("SUSPENDERS_CONTEXT_BUDGET", |cfg, v| {
-        cfg.context_budget = parse_int(v, "SUSPENDERS_CONTEXT_BUDGET")?;
+        cfg.context_budget = Some(parse_int(v, "SUSPENDERS_CONTEXT_BUDGET")?);
         Ok(())
     }),
     // Positive integer.
@@ -719,7 +736,7 @@ impl Session {
     /// Builds and validates against an explicit [`SessionConfig`] - the
     /// no-env path tests use. Every `None` opt falls back to `config`.
     pub fn build(opts: SessionOpts, config: &SessionConfig) -> Result<Session, SessionError> {
-        let context_budget = opts.context_budget.unwrap_or(config.context_budget);
+        let context_budget = opts.context_budget.or(config.context_budget);
 
         // The Provider set: custom entries from config, then every built-in
         // the customs do not shadow (ADR-0037).
@@ -730,8 +747,13 @@ impl Session {
         // fails launch loudly (ADR-0031).
         let launch_model = match opts.model.clone() {
             Some(m) => m,
-            None => model::resolve(&config.model, &providers, context_budget, config.max_tokens)
-                .map_err(SessionError)?,
+            None => model::resolve(
+                &config.model,
+                &providers,
+                context_budget.unwrap_or(FALLBACK_WINDOW),
+                config.max_tokens,
+            )
+            .map_err(SessionError)?,
         };
 
         let session = Session {
@@ -754,7 +776,6 @@ impl Session {
             scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
             command_timeout_ms: opts.command_timeout_ms.unwrap_or(config.command_timeout_ms),
-            result_cap: crate::tools::shaping::cap_for(context_budget, launch_model.max_tokens),
             session_dir: opts
                 .session_dir
                 .unwrap_or_else(|| config.session_dir.clone()),
@@ -776,9 +797,52 @@ impl Session {
         model::resolve(
             scoped,
             &self.providers,
-            self.context_budget,
+            self.context_budget.unwrap_or(FALLBACK_WINDOW),
             self.max_tokens,
         )
+    }
+
+    /// The effective Context Budget for `model` (ADR-0037): its own context
+    /// window, capped by the config `context_budget` when set. Derived from
+    /// whichever Model the Turn captured, never a fixed Session fact.
+    pub fn context_budget_for(&self, model: &Model) -> u64 {
+        match self.context_budget {
+            Some(cap) => cap.min(model.context_window),
+            None => model.context_window,
+        }
+    }
+
+    /// Checks the per-Model budget invariants for `model` (ADR-0037): its
+    /// output cap must leave room in its effective Context Budget, and the
+    /// Compaction Keep must sit below the compaction trigger at those figures.
+    /// Run at launch for the launch Model and by the Agent at a `/model` swap
+    /// for the picked Model, so a pick that cannot fit is rejected with the
+    /// reason instead of exploding on a later Turn.
+    pub fn validate_model_budget(&self, model: &Model) -> Result<(), String> {
+        let budget = self.context_budget_for(model);
+        if model.max_tokens >= budget {
+            return Err(format!(
+                "model {}: :max_tokens ({}) must leave room in the Context Budget ({})",
+                model.scoped_id(),
+                model.max_tokens,
+                budget
+            ));
+        }
+
+        // Fire high, keep low: the Compaction Keep amount must sit below the
+        // trigger. Comparing in u64 matches the old f64 check: the trigger is
+        // integral, so trunc(keep) < trigger iff keep < trigger.
+        let keep_amount =
+            conversation::compaction_keep_amount(budget, model.max_tokens, self.compaction_keep);
+        let trigger =
+            conversation::compaction_target(budget, model.max_tokens, self.eviction_slack);
+        if keep_amount >= trigger {
+            return Err(format!(
+                "model {}: :compaction_keep is too high - the Compaction Keep must sit below the compaction trigger (fire high, keep low)",
+                model.scoped_id()
+            ));
+        }
+        Ok(())
     }
 
     /// The Provider a Model belongs to, from the Session's fixed set.
@@ -787,17 +851,26 @@ impl Session {
     }
 
     /// The ctx every Tool Call executes with: the Project Root, the Result
-    /// Cap, and the command timeout. (The `scout` capture is added later
-    /// without changing tool signatures.)
-    pub fn tool_ctx(&self) -> ToolCtx {
+    /// Cap derived from `model` - the one the Turn captured (ADR-0037) - and
+    /// the command timeout. (The `scout` capture is added later without
+    /// changing tool signatures.)
+    pub fn tool_ctx(&self, model: &Model) -> ToolCtx {
         ToolCtx {
             root: std::path::PathBuf::from(&self.root),
-            result_cap: self.result_cap,
+            result_cap: crate::tools::shaping::cap_for(
+                self.context_budget_for(model),
+                model.max_tokens,
+            ),
             command_timeout_ms: self.command_timeout_ms,
             scout: None,
         }
     }
 }
+
+/// The window for Models nothing else supplies a figure for (ADR-0037): no
+/// Catalog entry, no per-Provider `context_window`, no global `context_budget`.
+/// The conservative small-local-model default the base config always shipped.
+const FALLBACK_WINDOW: u64 = 64_000;
 
 // The Provider set (ADR-0037): custom entries first (BTreeMap order keeps the
 // set deterministic), then every built-in Provider a custom entry does not
@@ -810,7 +883,8 @@ fn resolve_providers(customs: &BTreeMap<String, ProviderConfig>) -> Vec<Provider
             base_url: c.base_url.clone(),
             token: c.token.clone().unwrap_or_default(),
             api: c.api,
-            context_window: Some(c.context_window),
+            context_window: c.context_window,
+            custom: true,
         })
         .collect();
     for builtin in catalog::builtin_providers() {
@@ -879,13 +953,16 @@ fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionE
 fn validate(s: &Session) -> Result<(), SessionError> {
     validate_scalars(s)?;
     validate_providers(s)?;
-    validate_budget_fits(s)?;
-    validate_keep_below_trigger(s)?;
+    // The per-Model budget invariants, applied to the launch Model here; the
+    // Agent re-applies them to every `/model` pick (ADR-0037).
+    s.validate_model_budget(&s.model).map_err(SessionError)?;
     Ok(())
 }
 
 fn validate_scalars(s: &Session) -> Result<(), SessionError> {
-    pos_int(s.context_budget, ":context_budget")?;
+    if let Some(cap) = s.context_budget {
+        pos_int(cap, ":context_budget")?;
+    }
     pos_int(s.model.max_tokens, "model :max_tokens")?;
     pos_int(s.turn_limit, ":turn_limit")?;
     pos_int(s.anchor_interval, ":anchor_interval")?;
@@ -919,38 +996,6 @@ fn validate_providers(s: &Session) -> Result<(), SessionError> {
         }
     }
     Ok(())
-}
-
-// The reserve must leave room in the budget.
-fn validate_budget_fits(s: &Session) -> Result<(), SessionError> {
-    if s.model.max_tokens < s.context_budget {
-        Ok(())
-    } else {
-        Err(SessionError(
-            "model :max_tokens must leave room in :context_budget".into(),
-        ))
-    }
-}
-
-// Fire high, keep low: the Compaction Keep amount must sit below the trigger.
-// Comparing in u64 matches the old f64 check: the trigger is integral, so
-// trunc(keep) < trigger iff keep < trigger for nonnegative keep.
-fn validate_keep_below_trigger(s: &Session) -> Result<(), SessionError> {
-    let keep_amount = conversation::compaction_keep_amount(
-        s.context_budget,
-        s.model.max_tokens,
-        s.compaction_keep,
-    );
-    let trigger =
-        conversation::compaction_target(s.context_budget, s.model.max_tokens, s.eviction_slack);
-
-    if keep_amount < trigger {
-        Ok(())
-    } else {
-        Err(SessionError(
-            ":compaction_keep is too high - the Compaction Keep must sit below the compaction trigger (fire high, keep low)".into(),
-        ))
-    }
 }
 
 fn temperature(value: Option<f64>) -> Result<(), SessionError> {
@@ -1068,7 +1113,7 @@ mod tests {
             ProviderConfig {
                 base_url: "http://proxy:9000/v1".into(),
                 api: Api::AnthropicMessages,
-                context_window: 100_000,
+                context_window: Some(100_000),
                 token: Some("proxy-token".into()),
             },
         );
@@ -1129,7 +1174,7 @@ mod tests {
         let session = Session::build(o, &cfg()).unwrap();
         assert_eq!(session.llm_module, "SomeLLM");
         assert_eq!(session.plugins, vec!["SomePlugin".to_string()]);
-        assert_eq!(session.context_budget, 5_000);
+        assert_eq!(session.context_budget, Some(5_000));
         assert_eq!(session.eviction_slack, 0.1);
         assert_eq!(session.compaction_keep, 0.4);
         assert_eq!(session.turn_limit, 3);
@@ -1236,8 +1281,19 @@ mod tests {
         assert!(err.0.contains(":plan_stale_after"));
     }
 
+    // ---- the per-Model budget derivation (ADR-0037) ----
+
     #[test]
-    fn result_cap_is_derived_once() {
+    fn the_context_budget_is_the_captured_models_window_capped_by_config() {
+        // No cap: the Model's own window IS the budget.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.context_budget, None);
+        assert_eq!(
+            session.context_budget_for(&session.model),
+            session.model.context_window
+        );
+
+        // A cap set: the effective budget is min(cap, window), per Model.
         let session = Session::build(
             SessionOpts {
                 context_budget: Some(5_000),
@@ -1247,8 +1303,61 @@ mod tests {
             &cfg(),
         )
         .unwrap();
+        assert_eq!(session.context_budget_for(&session.model), 5_000);
+        let wide = Model::new("local", "wide", Api::AnthropicMessages, 1_000_000, 1_000);
+        assert_eq!(session.context_budget_for(&wide), 5_000);
+        let narrow = Model::new("local", "narrow", Api::AnthropicMessages, 3_000, 1_000);
+        assert_eq!(session.context_budget_for(&narrow), 3_000);
+    }
+
+    #[test]
+    fn a_wide_window_catalog_model_validates_out_of_the_box() {
+        // The Stage A sharp edge, fixed (ADR-0037): the launch validation runs
+        // against the resolved Model's OWN figures, so the 1M-window /
+        // 128K-output fable needs no config surgery.
+        let mut config = cfg();
+        config.model = "anthropic/claude-fable-5".into();
+        let session = Session::build(opts(), &config).unwrap();
+        assert_eq!(session.context_budget_for(&session.model), 1_000_000);
+        assert_eq!(session.model.max_tokens, 128_000);
+    }
+
+    #[test]
+    fn validate_model_budget_rejects_a_model_whose_cap_cannot_fit() {
+        // The `/model` swap check (ADR-0037): the Session's max_tokens knob
+        // (8_000) synthesizes a pick that cannot fit a 2_000 budget cap.
+        let session = Session::build(
+            SessionOpts {
+                context_budget: Some(2_000),
+                model: Some(test_model()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        let picked = session.resolve_model("local/another-model").unwrap();
+        let err = session.validate_model_budget(&picked).unwrap_err();
+        assert!(err.contains("local/another-model"), "error was: {err}");
+        assert!(err.contains("leave room"), "error was: {err}");
+
+        // The launch Model itself passes the same check.
+        assert_eq!(session.validate_model_budget(&session.model), Ok(()));
+    }
+
+    #[test]
+    fn the_result_cap_derives_from_the_captured_models_figures() {
+        let session = Session::build(
+            SessionOpts {
+                context_budget: Some(5_000),
+                model: Some(test_model()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        let ctx = session.tool_ctx(&session.model);
         assert_eq!(
-            session.result_cap,
+            ctx.result_cap,
             shaping::cap_for(5_000, session.model.max_tokens)
         );
     }
@@ -1264,7 +1373,7 @@ mod tests {
             &cfg(),
         )
         .unwrap_err();
-        assert!(err.0.contains("leave room in :context_budget"));
+        assert!(err.0.contains("leave room"), "error was: {err}");
     }
 
     #[test]
@@ -1709,9 +1818,15 @@ mod tests {
             &cfg(),
         )
         .unwrap();
-        let ctx = session.tool_ctx();
+        let ctx = session.tool_ctx(&session.model);
         assert_eq!(ctx.root, std::path::PathBuf::from("/tmp"));
-        assert_eq!(ctx.result_cap, session.result_cap);
+        assert_eq!(
+            ctx.result_cap,
+            shaping::cap_for(
+                session.context_budget_for(&session.model),
+                session.model.max_tokens
+            )
+        );
         assert_eq!(ctx.command_timeout_ms, 1_234);
     }
 
@@ -1758,8 +1873,19 @@ mod tests {
         let lmstudio = &providers["lmstudio"];
         assert_eq!(lmstudio.base_url, "http://localhost:1234/v1");
         assert_eq!(lmstudio.api, Api::OpenaiCompletions);
-        assert_eq!(lmstudio.context_window, 32_768);
+        assert_eq!(lmstudio.context_window, Some(32_768));
         assert_eq!(lmstudio.token, None);
+
+        // The window is optional (ADR-0037): an entry without one leaves its
+        // Models to the global `context_budget` figure.
+        let fc = FileConfig::parse(
+            r#"{"providers": {"lmstudio": {
+                "base_url": "http://localhost:1234/v1",
+                "api": "openai-completions"
+            }}}"#,
+        )
+        .unwrap();
+        assert_eq!(fc.providers.unwrap()["lmstudio"].context_window, None);
 
         // A provider entry is deny_unknown_fields too.
         assert!(
@@ -1876,7 +2002,7 @@ mod tests {
         let mut cfg = SessionConfig::test_defaults();
         load_file_overlay(&mut cfg, &path).unwrap();
         assert_eq!(cfg.model, "from/file");
-        assert_eq!(cfg.context_budget, 12345);
+        assert_eq!(cfg.context_budget, Some(12345));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1908,7 +2034,9 @@ mod tests {
         assert!(fc.model.is_some());
         assert!(fc.max_tokens.is_some());
         assert!(fc.temperature.is_some());
-        assert!(fc.context_budget.is_some());
+        // The one deliberate absence besides token (ADR-0037): the base config
+        // carries no global budget cap, so the template writes none.
+        assert!(fc.context_budget.is_none());
         assert!(fc.eviction_slack.is_some());
         assert!(fc.dead_mass_fraction.is_some());
         assert!(fc.compaction_keep.is_some());
@@ -1985,7 +2113,7 @@ mod tests {
         let mut cfg = SessionConfig::test_defaults();
         SessionConfig::apply_env(&mut cfg).unwrap();
 
-        assert_eq!(cfg.context_budget, 48_000);
+        assert_eq!(cfg.context_budget, Some(48_000));
         assert_eq!(cfg.max_tokens, 2048);
         assert_eq!(cfg.temperature, Some(1.5));
         assert_eq!(cfg.eviction_slack, 0.25);

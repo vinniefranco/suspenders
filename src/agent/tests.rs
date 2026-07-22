@@ -1628,21 +1628,115 @@ async fn a_turn_spawned_after_set_model_uses_the_new_model() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn list_models_returns_the_scripted_ids_then_propagates_an_error() {
-    // The Agent owns the Llm + connection, so `list_models` proxies the
-    // boundary through it (ADR-0033). A scripted Ok comes back verbatim; a
-    // scripted Err propagates (the boundary's fallible shape, not the never-Err
-    // `complete` algebra).
+async fn list_models_discovers_each_custom_provider_live() {
+    // The Agent owns the Llm + the Session's Provider set, so `list_models`
+    // walks it through `llm::offerings` (ADR-0037): the test config's one
+    // custom Provider (`local`) discovers its models from the scripted
+    // boundary. Built-ins ride the ambient credential environment, so the
+    // assertion pins only the custom listing (the hermetic Ok/Err matrix
+    // lives with `offerings` itself).
     let dir = TempDir::new().unwrap();
-    let fake = FakeLlm::script(vec![]).with_models(vec![
-        Ok(vec!["a/model".into(), "b/model".into()]),
-        Err("boom".into()),
-    ]);
+    let fake =
+        FakeLlm::script(vec![]).with_models(vec![Ok(vec!["a/model".into(), "b/model".into()])]);
     let agent = start(session_in(&dir), fake);
 
+    let listings = agent.list_models().await.unwrap();
+    let local = listings
+        .iter()
+        .find(|l| l.provider == "local")
+        .expect("the custom Provider lists");
     assert_eq!(
-        agent.list_models().await,
-        Ok(vec!["a/model".to_string(), "b/model".to_string()])
+        local.models,
+        vec!["a/model".to_string(), "b/model".to_string()]
     );
-    assert_eq!(agent.list_models().await, Err("boom".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_rejects_a_pick_that_cannot_fit_and_keeps_the_active_model() {
+    // The per-Model budget check at the swap (ADR-0037): with a 2_000 global
+    // cap, a pick synthesized at the config max_tokens knob (8_000) cannot
+    // fit - it is rejected with the reason, and nothing changes.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let session = Session::build(
+        SessionOpts {
+            root: Some(root),
+            session_dir: Some(session_dir),
+            context_budget: Some(2_000),
+            model: Some(Model::new(
+                "local",
+                "small",
+                Api::AnthropicMessages,
+                64_000,
+                500,
+            )),
+            ..Default::default()
+        },
+        &SessionConfig::test_defaults(),
+    )
+    .unwrap();
+    let agent = start(session, FakeLlm::script(vec![]));
+    let before = agent.active_model().await;
+
+    let err = agent
+        .set_model("local/way-too-big".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("leave room"), "error was: {err}");
+    assert!(err.contains("local/way-too-big"), "error was: {err}");
+    assert_eq!(agent.active_model().await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_budget_follows_the_captured_model_across_a_swap() {
+    // The budget derives from the Model each Turn captures (ADR-0037): the
+    // first Turn runs at the launch Model's window, and after a `/model` swap
+    // to a narrower Provider the NEXT Turn runs at the picked window - visible
+    // on TurnFinished, which carries the settling Conversation's budget.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
+    let mut config = SessionConfig::test_defaults();
+    config.max_tokens = 500;
+    config.providers.insert(
+        "tiny".to_string(),
+        crate::session::ProviderConfig {
+            base_url: "http://localhost:0/v1".into(),
+            api: Api::AnthropicMessages,
+            context_window: Some(4_000),
+            token: None,
+        },
+    );
+    let session = Session::build(
+        SessionOpts {
+            root: Some(root),
+            session_dir: Some(session_dir),
+            ..Default::default()
+        },
+        &config,
+    )
+    .unwrap();
+    let agent = start(
+        session,
+        FakeLlm::script(vec![
+            Entry::just(text_end("one")),
+            Entry::just(text_end("two")),
+        ]),
+    );
+    let mut rx = agent.subscribe();
+
+    let finished_budget = |e: &Event| match e {
+        Event::TurnFinished { context_budget, .. } => Some(*context_budget),
+        _ => None,
+    };
+
+    agent.submit("first").await.unwrap();
+    let ev = recv_match(&mut rx, is_turn_finished).await;
+    assert_eq!(finished_budget(&ev), Some(64_000), "the launch window");
+
+    agent.set_model("tiny/m".into()).await.unwrap();
+    agent.submit("second").await.unwrap();
+    let ev = recv_match(&mut rx, is_turn_finished).await;
+    assert_eq!(finished_budget(&ev), Some(4_000), "the captured window");
 }
