@@ -7,8 +7,8 @@
 //!
 //! - [`anthropic_messages`] - the Anthropic Messages API adapter (request
 //!   building, transport, SSE fold).
-//! - `openai_completions` - Stage B; the [`Api`] variant ships now and the
-//!   dispatcher answers it with an error-algebra Response.
+//! - [`openai_completions`] - the OpenAI Chat Completions adapter: LM Studio,
+//!   llama.cpp, DeepSeek, Groq, OpenRouter, and most OpenAI-compatible hosts.
 //!
 //! [`Dispatcher`] is the production [`Llm`]: it holds the Session's resolved
 //! Provider set and routes each call on the captured Model's Api. Logic tests
@@ -28,6 +28,7 @@
 pub mod anthropic_messages;
 pub mod catalog;
 pub mod model;
+pub mod openai_completions;
 pub mod provider;
 pub mod response;
 pub mod throttle;
@@ -129,11 +130,53 @@ pub fn malformed_input_marker(raw: &str) -> Value {
     json!({ MALFORMED_INPUT_SENTINEL: raw })
 }
 
+/// Decodes a Tool Call's accumulated input JSON - shared by every adapter's
+/// stream fold. Empty accumulation is a valid empty map; a non-object or
+/// unparseable accumulation becomes the malformed-input marker, so a mangled
+/// Tool Call stays distinguishable from a valid empty-input call.
+pub(crate) fn decode_tool_input(json: &str) -> Value {
+    if json.is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(json) {
+        Ok(v) if v.is_object() => v,
+        _ => malformed_input_marker(json),
+    }
+}
+
+/// Parses a models-list response body into `data[].id` (ADR-0002 amendment).
+/// The wire shape (`{"data": [{"id": …}]}`) is common to the Anthropic and
+/// OpenAI REST APIs, so one parse serves both adapters; entries without a
+/// string `id` are skipped leniently, and missing or empty `data` is
+/// `Ok(vec![])`. A body that isn't JSON is an `Err`.
+pub(crate) fn models_from_body(body: &str) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(body).map_err(|e| format!("request_failed: {e}"))?;
+    Ok(value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// The per-delta streaming callback. A named `for<'e>`-quantified trait object
 /// so the `&StreamEvent` borrow stays independent of the async future's
 /// lifetime (async-trait would otherwise unify an elided lifetime with the
 /// future, breaking short-lived local borrows inside `complete`).
 pub type OnEvent<'cb> = dyn FnMut(&StreamEvent) + Send + 'cb;
+
+/// Emits one event through the callback. A free function so the `&StreamEvent`
+/// borrow is a fresh, function-local lifetime rather than being unified with
+/// the calling future's lifetime (which triggers a spurious borrow error).
+/// Shared by every adapter's transport loop.
+pub(crate) fn emit(on_event: &mut OnEvent<'_>, ev: StreamEvent) {
+    on_event(&ev);
+}
 
 /// The LLM boundary seam. Object-safe so `Arc<dyn Llm>` works (ADR-0020).
 ///
@@ -202,7 +245,7 @@ impl Llm for Dispatcher {
                 anthropic_messages::complete(request, model, provider, on_event).await
             }
             Api::OpenaiCompletions => {
-                Response::error("no_adapter: the openai-completions adapter is not yet built")
+                openai_completions::complete(request, model, provider, on_event).await
             }
         }
     }
@@ -210,9 +253,7 @@ impl Llm for Dispatcher {
     async fn list_models(&self, provider: &Provider) -> Result<Vec<String>, String> {
         match provider.api {
             Api::AnthropicMessages => anthropic_messages::list_models(provider).await,
-            Api::OpenaiCompletions => {
-                Err("no_adapter: the openai-completions adapter is not yet built".to_string())
-            }
+            Api::OpenaiCompletions => openai_completions::list_models(provider).await,
         }
     }
 }
@@ -266,29 +307,6 @@ mod tests {
         assert!(result.error.unwrap().contains("unknown_provider"));
     }
 
-    #[tokio::test]
-    async fn the_openai_completions_arm_answers_with_the_no_adapter_error() {
-        let dispatcher = Dispatcher::new(vec![provider("groq", Api::OpenaiCompletions)]);
-        let result = dispatcher
-            .complete(
-                &simple_request(),
-                &model("groq", Api::OpenaiCompletions),
-                &mut no_op(),
-            )
-            .await;
-        assert_eq!(result.stop_reason, StopReason::Error);
-        assert!(result.error.unwrap().contains("no_adapter"));
-    }
-
-    #[tokio::test]
-    async fn list_models_on_an_openai_provider_is_a_plain_err() {
-        let dispatcher = Dispatcher::new(vec![]);
-        let result = dispatcher
-            .list_models(&provider("groq", Api::OpenaiCompletions))
-            .await;
-        assert!(result.unwrap_err().contains("no_adapter"));
-    }
-
     // ------------------------------------------------------------------
     // The malformed-input sentinel accessors
     // ------------------------------------------------------------------
@@ -299,6 +317,49 @@ mod tests {
         assert_eq!(malformed_tool_input(&marker), Some("{\"path\": tru"));
         assert_eq!(malformed_tool_input(&json!({ "path": "." })), None);
         assert_eq!(malformed_tool_input(&json!({})), None);
+    }
+
+    #[test]
+    fn decode_tool_input_covers_empty_valid_and_malformed() {
+        assert_eq!(decode_tool_input(""), json!({}));
+        assert_eq!(
+            decode_tool_input("{\"path\": \".\"}"),
+            json!({ "path": "." })
+        );
+        // A non-object and unparseable JSON both mark as malformed.
+        assert_eq!(
+            decode_tool_input("[1, 2]"),
+            malformed_input_marker("[1, 2]")
+        );
+        assert_eq!(
+            decode_tool_input("{\"path\": tru"),
+            malformed_input_marker("{\"path\": tru")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The shared models-list parse (ADR-0002 amendment)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn models_from_body_parses_ids_skipping_idless_entries() {
+        let body =
+            r#"{ "data": [{ "id": "a" }, { "id": 7 }, { "name": "no-id" }, { "id": "b" }] }"#;
+        assert_eq!(
+            models_from_body(body),
+            Ok(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn models_from_body_missing_or_empty_data_is_ok_empty() {
+        assert_eq!(models_from_body("{}"), Ok(vec![]));
+        assert_eq!(models_from_body(r#"{ "data": [] }"#), Ok(vec![]));
+    }
+
+    #[test]
+    fn models_from_body_non_json_is_err() {
+        assert!(models_from_body("not json").is_err());
     }
 
     // ------------------------------------------------------------------

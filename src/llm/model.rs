@@ -15,10 +15,6 @@ use crate::llm::provider::Provider;
 /// boundary: one hand-written adapter per Api, and every Provider is data that
 /// selects one. The serde forms are the config strings (`anthropic-messages`,
 /// `openai-completions`).
-///
-/// `OpenaiCompletions` ships now but has no adapter until Stage B: the
-/// dispatcher answers it with an error-algebra Response, never a panic
-/// (ADR-0002).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Api {
     #[serde(rename = "anthropic-messages")]

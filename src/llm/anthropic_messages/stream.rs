@@ -23,10 +23,10 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::content::{ContentBlock, Usage};
-use crate::llm::malformed_input_marker;
+use crate::llm::decode_tool_input;
 use crate::llm::response::{Response, StopReason};
 
 /// One parsed SSE frame handed to the fold. The transport turns each
@@ -294,16 +294,6 @@ fn finalize_block(block: OpenBlock) -> Option<ContentBlock> {
     }
 }
 
-fn decode_tool_input(json: &str) -> Value {
-    if json.is_empty() {
-        return json!({});
-    }
-    match serde_json::from_str::<Value>(json) {
-        Ok(v) if v.is_object() => v,
-        _ => malformed_input_marker(json),
-    }
-}
-
 fn stop_reason_of(wire: Option<&str>) -> StopReason {
     match wire {
         Some("end_turn") => StopReason::EndTurn,
@@ -347,7 +337,8 @@ fn merge_usage(base: &mut Usage, delta: &Usage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::malformed_tool_input;
+    use crate::llm::{malformed_input_marker, malformed_tool_input};
+    use serde_json::json;
 
     // Event constructors mirroring the baud test helpers.
     fn ms() -> SseEvent {

@@ -24,8 +24,8 @@ use serde_json::Value;
 use crate::llm::model::Model;
 use crate::llm::provider::Provider;
 use crate::llm::response::Response;
-use crate::llm::throttle::{Decision, Throttle};
-use crate::llm::{Delta, LlmRequest, OnEvent, StreamEvent};
+use crate::llm::throttle::{Decision, Throttle, monotonic_ms};
+use crate::llm::{Delta, LlmRequest, OnEvent, StreamEvent, emit, models_from_body};
 use stream::{SseEvent, StreamState};
 
 /// Minimum ms between streaming updates. At ~30fps the UI stays responsive to
@@ -136,38 +136,7 @@ pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, Stri
         .text()
         .await
         .map_err(|e| format!("request_failed: {e}"))?;
-    let value: Value = serde_json::from_str(&body).map_err(|e| format!("request_failed: {e}"))?;
-
-    // Parse `data[].id`, leniently skipping any entry that lacks a string
-    // `id`. Missing/empty `data` → empty vec.
-    let ids = value
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(ids)
-}
-
-/// Emits one event through the callback. A free function so the `&StreamEvent`
-/// borrow is a fresh, function-local lifetime rather than being unified with
-/// the calling future's lifetime (which triggers a spurious borrow error).
-fn emit(on_event: &mut OnEvent<'_>, ev: StreamEvent) {
-    on_event(&ev);
-}
-
-/// A process-monotonic millisecond clock for throttle pacing.
-fn monotonic_ms() -> i64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = START.get_or_init(Instant::now);
-    start.elapsed().as_millis() as i64
+    models_from_body(&body)
 }
 
 /// Turns a raw `event:`/`data:` frame into a parsed [`SseEvent`]. A data body

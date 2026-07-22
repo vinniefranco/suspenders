@@ -54,9 +54,27 @@ impl Throttle {
     }
 }
 
+/// The production clock: process-monotonic milliseconds for [`Throttle::tick`].
+/// Lives beside the pure decision so every adapter's transport loop paces from
+/// the same tick source; tests keep supplying plain integers.
+pub fn monotonic_ms() -> i64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monotonic_ms_never_runs_backwards() {
+        let a = monotonic_ms();
+        let b = monotonic_ms();
+        assert!(b >= a);
+    }
 
     #[test]
     fn the_first_tick_always_emits() {
