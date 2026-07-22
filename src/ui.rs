@@ -181,15 +181,19 @@ async fn run_loop(
     // the adapter owns this fetch, so it owns the channel.
     let (selector_tx, mut selector_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
-    // The connection facts the status bar shows - the fixed endpoint and the
-    // mutable Active Model (ADR-0033). The pure Screen core stays
-    // command-agnostic and holds neither, so the adapter carries them into the
-    // render as one named-field carrier (never a position-coupled pair). The
-    // model is seeded from the connection, then refreshed from the Agent after
-    // any batch that could have changed it (a `/model` pick), never on the tick.
+    // The connection facts the status bar shows - the launch Model's Provider
+    // endpoint and the mutable Active Model's scoped id (ADR-0033/0037). The
+    // pure Screen core stays command-agnostic and holds neither, so the
+    // adapter carries them into the render as one named-field carrier (never a
+    // position-coupled pair). The model is seeded from the launch Model, then
+    // refreshed from the Agent after any batch that could have changed it (a
+    // `/model` pick), never on the tick.
     let mut conn = components::ConnectionFacts {
-        base_url: session.connection.base_url.clone(),
-        model: session.connection.model.clone(),
+        base_url: session
+            .provider_of(&session.model)
+            .map(|p| p.base_url.clone())
+            .unwrap_or_default(),
+        model: session.model.scoped_id(),
     };
     let ctx = AdapterCtx {
         agent: &agent,

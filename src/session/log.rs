@@ -589,7 +589,7 @@ fn header(session: &Session) -> Header {
         kind: "session".into(),
         version: 1,
         root: session.root.clone(),
-        model: session.connection.model.clone(),
+        model: session.model.scoped_id(),
         context_budget: session.context_budget,
         turn_limit: session.turn_limit,
     }
@@ -850,11 +850,11 @@ fn drift(header: &serde_json::Value, session: &Session) -> Vec<Drift> {
     let mut out = Vec::new();
 
     let logged_model = header.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    if logged_model != session.connection.model {
+    if logged_model != session.model.scoped_id() {
         out.push(Drift {
             key: "model",
             logged: logged_model.to_string(),
-            current: session.connection.model.clone(),
+            current: session.model.scoped_id(),
         });
     }
 
@@ -1976,8 +1976,8 @@ mod tests {
     async fn a_live_compaction_and_its_logged_fold_reconstruct_byte_identical_messages() {
         use crate::compaction::Compaction;
         use crate::conversation::{Conversation, ConversationOpts};
+        use crate::llm::model::{Api, Model};
         use crate::llm::response::{Response, StopReason as LlmStop};
-        use crate::session::connection::Connection;
         use crate::test_support::{Entry as ScriptEntry, FakeLlm};
 
         // Arrange: a Conversation of several Turns (user text + assistant text),
@@ -2011,10 +2011,10 @@ mod tests {
             usage: crate::content::Usage::default(),
             error: None,
         })]);
-        let connection = Connection::new("http://test:4000/v1", "", "test-model", 4000);
+        let model = Model::new("local", "test-model", Api::AnthropicMessages, 64_000, 4000);
         let before = conv.clone();
         let (compacted, new_state) = Compaction::new()
-            .run(&conv, &fake, &connection)
+            .run(&conv, &fake, &model, None)
             .await
             .unwrap();
         // Sanity: compaction actually folded something into one summary message.

@@ -27,9 +27,8 @@ use std::future::Future;
 
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::request::LlmRequest;
 use crate::llm::response::Response;
-use crate::llm::stream::StreamEvent;
+use crate::llm::{LlmRequest, StreamEvent};
 
 /// The detached emission handle (ADR-0025): an owned sink for turn [`Event`]s,
 /// obtained once from [`TurnDeps::emitter`] and carried by the Loop alongside

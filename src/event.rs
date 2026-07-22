@@ -25,8 +25,8 @@ use serde_json::Value;
 
 use crate::content::ContentBlock;
 use crate::conversation::WaveStats;
+use crate::llm::Delta;
 use crate::llm::response::StopReason;
-use crate::llm::stream::Delta;
 use crate::session::RecoveryShape;
 use crate::ui::selector::SelectorRow;
 

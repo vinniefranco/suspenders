@@ -17,7 +17,7 @@ pub mod web_fetch;
 pub mod write_file;
 
 use crate::content::ContentBlock;
-use crate::llm::stream::malformed_tool_input;
+use crate::llm::malformed_tool_input;
 use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
 use serde_json::Value;
 
@@ -290,7 +290,7 @@ mod tests {
     // boundary's domain accessors, not the wire sentinel.
     #[test]
     fn sanitize_input_empties_a_malformed_marked_input() {
-        let tagged = crate::llm::stream::malformed_input_marker("{\"path\": tru");
+        let tagged = crate::llm::malformed_input_marker("{\"path\": tru");
         assert_eq!(sanitize_input(&tagged), json!({}));
 
         // A well-formed input passes through untouched.
@@ -350,7 +350,7 @@ mod tests {
         let blocks = vec![ContentBlock::tool_use(
             "t1",
             "read_file",
-            crate::llm::stream::malformed_input_marker("{\"path\": tru"),
+            crate::llm::malformed_input_marker("{\"path\": tru"),
         )];
         let results = run_read_only(&blocks, &ctx(tmp.path(), 10_000)).await;
 

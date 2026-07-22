@@ -119,3 +119,25 @@ setting only the `model` key, and writing it back. The user's other keys
 are preserved and `token` is still never written by the tool. Because the
 file sits below the environment, a write while `SUSPENDERS_MODEL` is set is
 accompanied by a warning that the env var will override it next launch.
+
+## Amendment (ADR-0037): the schema opens for Providers
+
+Providers (ADR-0037) change the schema without keeping compatibility:
+
+- `model` becomes a scoped `provider/model-id` (e.g.
+  `anthropic/claude-fable-5`, `lmstudio/qwen3.6-27b`).
+- The flat `base_url` and `token` keys retire. A `providers` table declares
+  custom hosts - `{ "base_url", "api", "context_window", optional "token" }`
+  per entry - while built-in Providers need no entry at all: their
+  credential comes from their own environment key (`ANTHROPIC_API_KEY`, …),
+  not from this file.
+- **"Schema is exactly the env-settable key set" narrows to the scalar
+  knobs.** The `providers` table is file-only - structure the env cannot
+  express - so the file/env lockstep rule now governs the scalar keys that
+  remain in both seams, and `SUSPENDERS_MODEL` carries the scoped id.
+- `context_budget` remains, reinterpreted (ADR-0037): the window for
+  Models the Catalog does not know, and an optional global cap - no longer
+  the budget itself, which derives from the captured Model per Turn.
+
+Loud failure, `deny_unknown_fields`, no-auto-create, and the `/model`
+sparse-write exception (which still never writes any `token`) all stand.

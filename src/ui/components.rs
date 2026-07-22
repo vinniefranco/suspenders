@@ -2762,7 +2762,7 @@ mod tests {
 
     use crate::content::ContentBlock;
     use crate::event::Event;
-    use crate::llm::stream::Delta;
+    use crate::llm::Delta;
     use crate::ui::screen::ScreenOpts;
 
     /// Draws one frame with `draw` on a fresh `width`×`height` test terminal

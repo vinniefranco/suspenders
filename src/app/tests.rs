@@ -29,7 +29,7 @@ fn message_start_prints_the_pass_header_with_elapsed_seconds() {
 #[test]
 fn message_update_prints_nothing() {
     let event = Event::MessageUpdate {
-        delta: crate::llm::stream::Delta::Text("hi".into()),
+        delta: crate::llm::Delta::Text("hi".into()),
         content: vec![ContentBlock::text("hi")],
     };
     assert!(event_lines(&event, 0.0).is_empty());

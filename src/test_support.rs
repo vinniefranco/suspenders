@@ -9,21 +9,20 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::request::{self, LlmRequest};
+use crate::llm::model::{Api, Model};
+use crate::llm::provider::Provider;
 use crate::llm::response::{Response, StopReason};
-use crate::llm::stream::{Delta, StreamEvent};
-use crate::llm::{Llm, OnEvent};
-use crate::session::connection::Connection;
+use crate::llm::{Delta, Llm, LlmRequest, OnEvent, StreamEvent};
 use crate::turn::deps::{AfterPass, CompactError, Emitter, TurnDeps};
 
-/// A callback that inspects the outgoing request and produces a [`Response`].
-/// The extension point for Phase 5 request-inspecting / barrier-blocking
-/// entries (busy/cancel handshakes): a closure sees the request and may block.
-pub type ResponseFn = Box<dyn Fn(&Value) -> Response + Send + Sync>;
+/// A callback that inspects the outgoing typed request (and the Model it is
+/// bound for) and produces a [`Response`]. The extension point for
+/// request-inspecting / barrier-blocking entries (busy/cancel handshakes):
+/// a closure sees the request and may block.
+pub type ResponseFn = Box<dyn Fn(&LlmRequest, &Model) -> Response + Send + Sync>;
 
 /// The release a [`Barrier`] entry awaits: the deltas to fire and the Response
 /// to return once the test lets the parked `complete` proceed. Sent back over
@@ -36,15 +35,16 @@ pub struct Release {
 }
 
 /// The in-flight signal a [`Barrier`] entry sends the test the moment `complete`
-/// is entered: the built request (so the test can inspect it, e.g. Rollover's
-/// carried prompt) and the oneshot the test answers with a [`Release`] to
-/// unpark the call. Dropping the oneshot without answering leaves `complete`
-/// parked forever - which is exactly what `JoinHandle::abort()` cancels for the
-/// cancellation tests.
+/// is entered: the typed request and its Model (so the test can inspect them,
+/// e.g. Rollover's carried prompt or the captured Active Model) and the
+/// oneshot the test answers with a [`Release`] to unpark the call. Dropping
+/// the oneshot without answering leaves `complete` parked forever - which is
+/// exactly what `JoinHandle::abort()` cancels for the cancellation tests.
 ///
 /// [`Barrier`]: Entry::Barrier
 pub struct InFlight {
-    pub request: Value,
+    pub request: LlmRequest,
+    pub model: Model,
     pub release: tokio::sync::oneshot::Sender<Release>,
 }
 
@@ -99,10 +99,10 @@ impl Entry {
         }
     }
 
-    /// A request-inspecting closure entry (Phase 5 extension point).
+    /// A request-inspecting closure entry.
     pub fn dynamic(
         deltas: Vec<Delta>,
-        respond: impl Fn(&Value) -> Response + Send + Sync + 'static,
+        respond: impl Fn(&LlmRequest, &Model) -> Response + Send + Sync + 'static,
     ) -> Self {
         Entry::Dynamic {
             deltas,
@@ -183,8 +183,8 @@ impl FakeLlm {
 impl Llm for FakeLlm {
     async fn complete(
         &self,
-        request: Value,
-        _connection: &Connection,
+        request: &LlmRequest,
+        model: &Model,
         on_event: &mut OnEvent<'_>,
     ) -> Response {
         let entry = self.script.lock().unwrap().pop_front();
@@ -196,7 +196,7 @@ impl Llm for FakeLlm {
             Some(Entry::Error { reason }) => Response::error(reason),
             Some(Entry::Dynamic { deltas, respond }) => {
                 Self::fire_deltas(&deltas, on_event);
-                respond(&request)
+                respond(request, model)
             }
             Some(Entry::Barrier { signal }) => {
                 let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -205,7 +205,8 @@ impl Llm for FakeLlm {
                 // error Response rather than blocking on nobody.
                 if signal
                     .send(InFlight {
-                        request,
+                        request: request.clone(),
+                        model: model.clone(),
                         release: release_tx,
                     })
                     .is_err()
@@ -229,7 +230,7 @@ impl Llm for FakeLlm {
         }
     }
 
-    async fn list_models(&self, _connection: &Connection) -> Result<Vec<String>, String> {
+    async fn list_models(&self, _provider: &Provider) -> Result<Vec<String>, String> {
         // An unseeded queue answers with an empty list (the benign default);
         // scripted entries drive the Ok/Err paths tests want to exercise.
         self.models
@@ -269,7 +270,7 @@ pub struct ApprovalAsk {
 /// after (or concurrently, from a spawned answerer).
 pub struct FakeDeps {
     llm: FakeLlm,
-    connection: Connection,
+    model: Model,
 
     /// Every emitted [`Event`], in order.
     pub events: Arc<Mutex<Vec<Event>>>,
@@ -302,10 +303,10 @@ pub struct FakeDeps {
 impl FakeDeps {
     /// A FakeDeps scripting `complete` from `llm`, with no approvals, steering,
     /// or overrides.
-    pub fn new(llm: FakeLlm, connection: Connection) -> Self {
+    pub fn new(llm: FakeLlm, model: Model) -> Self {
         FakeDeps {
             llm,
-            connection,
+            model,
             events: Arc::new(Mutex::new(Vec::new())),
             checkpoints: Arc::new(Mutex::new(Vec::new())),
             plans: Arc::new(Mutex::new(Vec::new())),
@@ -383,13 +384,9 @@ impl TurnDeps for FakeDeps {
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> Response {
         self.requests.lock().unwrap().push(req.clone());
-        // Render to wire JSON so a Dynamic entry can still inspect the request.
-        let wire = request::build_request(&req, &self.connection);
         // `FakeLlm::complete` wants an `OnEvent` (FnMut); adapt the &dyn.
         let mut adapter = |ev: &StreamEvent| on_event(ev);
-        self.llm
-            .complete(wire, &self.connection, &mut adapter)
-            .await
+        self.llm.complete(&req, &self.model, &mut adapter).await
     }
 
     fn emitter(&mut self) -> Emitter {
@@ -467,10 +464,13 @@ impl TurnDeps for FakeDeps {
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
-    use serde_json::json;
 
-    fn conn() -> Connection {
-        Connection::new("http://x/v1", "t", "m", 100)
+    fn model() -> Model {
+        Model::new("local", "m", Api::AnthropicMessages, 64_000, 100)
+    }
+
+    fn request() -> LlmRequest {
+        LlmRequest::new("s", vec![], vec![])
     }
 
     #[tokio::test]
@@ -487,7 +487,7 @@ mod tests {
 
         let mut deltas = Vec::new();
         let mut on_event = |ev: &StreamEvent| deltas.push(ev.delta.clone());
-        let r = fake.complete(json!({}), &conn(), &mut on_event).await;
+        let r = fake.complete(&request(), &model(), &mut on_event).await;
 
         assert_eq!(deltas, vec![Delta::Text("hi".into())]);
         assert_eq!(r.content, vec![ContentBlock::text("hi")]);
@@ -497,26 +497,27 @@ mod tests {
     async fn error_entry_becomes_error_response() {
         let fake = FakeLlm::script(vec![Entry::error("nope")]);
         let mut on_event = |_ev: &StreamEvent| {};
-        let r = fake.complete(json!({}), &conn(), &mut on_event).await;
+        let r = fake.complete(&request(), &model(), &mut on_event).await;
         assert_eq!(r.stop_reason, StopReason::Error);
         assert_eq!(r.error.as_deref(), Some("nope"));
     }
 
     #[tokio::test]
-    async fn dynamic_entry_inspects_request() {
-        let fake = FakeLlm::script(vec![Entry::dynamic(vec![], |req: &Value| {
-            let model = req["model"].as_str().unwrap_or("?").to_string();
-            Response {
-                content: vec![ContentBlock::text(model)],
-                stop_reason: StopReason::EndTurn,
-                usage: Default::default(),
-                error: None,
-            }
-        })]);
+    async fn dynamic_entry_inspects_the_typed_request_and_model() {
+        let fake = FakeLlm::script(vec![Entry::dynamic(
+            vec![],
+            |req: &LlmRequest, model: &Model| {
+                let line = format!("{}@{}", req.system, model.scoped_id());
+                Response {
+                    content: vec![ContentBlock::text(line)],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Default::default(),
+                    error: None,
+                }
+            },
+        )]);
         let mut on_event = |_ev: &StreamEvent| {};
-        let r = fake
-            .complete(json!({ "model": "m9" }), &conn(), &mut on_event)
-            .await;
-        assert_eq!(r.content, vec![ContentBlock::text("m9")]);
+        let r = fake.complete(&request(), &model(), &mut on_event).await;
+        assert_eq!(r.content, vec![ContentBlock::text("s@local/m")]);
     }
 }

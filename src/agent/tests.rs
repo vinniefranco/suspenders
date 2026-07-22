@@ -10,9 +10,9 @@
 // ===========================================================================
 use super::*;
 use crate::content::{ContentBlock, Message, Role, Usage};
+use crate::llm::model::Api;
 use crate::llm::response::{Response, StopReason as RStop};
-use crate::llm::stream::Delta;
-use crate::session::connection::Connection;
+use crate::llm::{Delta, LlmRequest};
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::test_support::{Entry, FakeLlm, InFlight, Release};
 use serde_json::{Value, json};
@@ -463,10 +463,10 @@ async fn steer_while_idle_is_idle() {
 async fn steer_mid_turn_is_drained_after_the_tool_batch_and_delivered_unadorned() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel::<Value>();
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel::<LlmRequest>();
     let script = vec![
         barrier,
-        Entry::dynamic(vec![], move |req: &Value| {
+        Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
             let _ = second_tx.send(req.clone());
             text_end("done")
         }),
@@ -500,14 +500,13 @@ async fn steer_mid_turn_is_drained_after_the_tool_batch_and_delivered_unadorned(
 
     // Unadorned, riding the SAME user message as the tool results.
     let request = second_rx.recv().await.expect("second request");
-    let messages = request["messages"].as_array().unwrap();
-    let last = messages.last().unwrap();
-    assert_eq!(last["role"], "user");
-    let content = last["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "tool_result");
-    assert_eq!(content[0]["tool_use_id"], "t1");
-    assert_eq!(content[1]["type"], "text");
-    assert_eq!(content[1]["text"], "also check the README");
+    let last = request.messages.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    assert!(matches!(
+        &last.content[0],
+        ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
+    ));
+    assert_eq!(last.content[1], ContentBlock::text("also check the README"));
 
     recv_match(&mut rx, is_turn_finished).await;
 }
@@ -516,10 +515,10 @@ async fn steer_mid_turn_is_drained_after_the_tool_batch_and_delivered_unadorned(
 async fn rollover_steering_the_turn_never_drained_auto_submits_the_next_turn() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let (roll_tx, mut roll_rx) = mpsc::unbounded_channel::<Value>();
+    let (roll_tx, mut roll_rx) = mpsc::unbounded_channel::<LlmRequest>();
     let script = vec![
         barrier,
-        Entry::dynamic(vec![], move |req: &Value| {
+        Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
             let _ = roll_tx.send(req.clone());
             text_end("second done")
         }),
@@ -543,12 +542,9 @@ async fn rollover_steering_the_turn_never_drained_auto_submits_the_next_turn() {
     recv_match(&mut rx, is_turn_started).await;
 
     let request = roll_rx.recv().await.expect("rollover request");
-    let messages = request["messages"].as_array().unwrap();
-    let last = messages.last().unwrap();
-    assert_eq!(last["role"], "user");
-    let content = last["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "and then this");
+    let last = request.messages.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    assert_eq!(last.content[0], ContentBlock::text("and then this"));
 
     recv_match(&mut rx, is_turn_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
@@ -1353,12 +1349,12 @@ async fn the_plan_survives_a_turn_boundary_and_is_restored_on_resume() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_through_resume() {
     let dir = TempDir::new().unwrap();
-    let connection = Connection::new("http://test:4000/v1", "", "test-model", 200);
+    let model = Model::new("local", "test-model", Api::AnthropicMessages, 64_000, 200);
     let session = Session::build(
         SessionOpts {
             root: Some(dir.path().to_string_lossy().into_owned()),
             session_dir: Some(dir.path().join("sessions").to_string_lossy().into_owned()),
-            connection: Some(connection),
+            model: Some(model),
             // Tuned so THREE small Turns cross the Compaction Target and
             // two do not: the tool-spec overhead rides the estimate, so
             // this number tracks the registry (web_fetch, ADR-0024, moved
@@ -1591,34 +1587,51 @@ async fn set_model_changes_what_active_model_returns() {
     let dir = TempDir::new().unwrap();
     let agent = start(session_in(&dir), FakeLlm::script(vec![]));
 
-    // Seeded from the Session's connection at launch.
+    // Seeded from the Session's launch-resolved Model (the scoped config id).
     assert_eq!(
         agent.active_model().await,
         SessionConfig::test_defaults().model
     );
 
-    agent.set_model("picked/model".into()).await;
-    assert_eq!(agent.active_model().await, "picked/model");
+    agent.set_model("local/picked-model".into()).await.unwrap();
+    assert_eq!(agent.active_model().await, "local/picked-model");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_rejects_an_unknown_provider_and_keeps_the_active_model() {
+    // Resolution against the Session's fixed Provider set guards the swap
+    // (ADR-0037): an unknown provider is an Err and nothing changes.
+    let dir = TempDir::new().unwrap();
+    let agent = start(session_in(&dir), FakeLlm::script(vec![]));
+    let before = agent.active_model().await;
+
+    let err = agent.set_model("nowhere/model".into()).await.unwrap_err();
+    assert!(err.contains("nowhere"), "error was: {err}");
+    assert_eq!(agent.active_model().await, before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_spawned_after_set_model_uses_the_new_model() {
-    // The next Turn captures the Agent's mutable connection, so the wire request
-    // carries the new model - not the Session's launch-time one (ADR-0033).
+    // The next Turn captures the Agent's mutable Model, so the boundary call
+    // carries the new one - not the Session's launch-time one (ADR-0033).
     let dir = TempDir::new().unwrap();
-    let (req_tx, mut req_rx) = mpsc::unbounded_channel::<Value>();
-    let script = vec![Entry::dynamic(vec![], move |req: &Value| {
-        let _ = req_tx.send(req.clone());
-        text_end("done")
-    })];
+    let (model_tx, mut model_rx) = mpsc::unbounded_channel::<Model>();
+    let script = vec![Entry::dynamic(
+        vec![],
+        move |_req: &LlmRequest, model: &Model| {
+            let _ = model_tx.send(model.clone());
+            text_end("done")
+        },
+    )];
     let agent = start(session_in(&dir), FakeLlm::script(script));
     let mut rx = agent.subscribe();
 
-    agent.set_model("picked/model".into()).await;
+    agent.set_model("local/picked-model".into()).await.unwrap();
     agent.submit("go").await.unwrap();
 
-    let request = req_rx.recv().await.expect("request");
-    assert_eq!(request["model"], json!("picked/model"));
+    let captured = model_rx.recv().await.expect("model");
+    assert_eq!(captured.scoped_id(), "local/picked-model");
+    assert_eq!(captured.id, "picked-model");
 
     recv_match(&mut rx, is_turn_finished).await;
 }

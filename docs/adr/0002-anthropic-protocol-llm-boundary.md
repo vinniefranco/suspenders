@@ -36,3 +36,15 @@ user-triggered query, not the streaming Turn loop, so a plain error the
 caller surfaces as an info line is simpler than the error algebra. A
 server with no `/models` route (404) is just an `Err` the `/model`
 command reports; nothing changes.
+
+## Amendment (ADR-0037): the single-protocol commitment is superseded
+
+Providers (ADR-0037) generalize this boundary: the Anthropic Messages API
+is now one **Api** adapter among several, with `openai-completions` beside
+it. What this ADR decided that survives, reaffirmed: one boundary module
+per wire protocol, the pure fold of stream events, and the error algebra
+(never `Err`, never panic; failure is a Response with partial content).
+What is superseded: "the wire protocol" singular, and `complete` taking
+wire JSON built outside the trait - each adapter now owns its wire format
+end to end, and callers speak only typed domain structs. `list_models`
+becomes per-Provider, serving custom Providers' live discovery.

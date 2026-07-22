@@ -39,8 +39,8 @@ use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
 use crate::llm::Llm;
+use crate::llm::model::Model;
 use crate::llm::response::StopReason as RespStopReason;
-use crate::session::connection::Connection;
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
 use crate::session::{RecoveryShape, Session};
 use crate::turn::AgentDeps;
@@ -100,7 +100,7 @@ pub struct StartOpts {
     /// and the app build the Session and pass it here.
     pub session: Session,
     /// The LLM boundary, injected per instance (ADR-0020). The real
-    /// `AnthropicLlm` or a test `FakeLlm` behind the same trait.
+    /// `Dispatcher` or a test `FakeLlm` behind the same trait.
     pub llm: Arc<dyn Llm>,
     /// The system prompt (baud defaults to the Voice; callers/tests may
     /// override).
@@ -204,10 +204,12 @@ pub enum TurnMsg {
 pub enum Command {
     Submit(String, oneshot::Sender<Result<(), Busy>>),
     Steer(String, oneshot::Sender<Result<(), Idle>>),
-    /// Swap the Active Model (ADR-0033). Takes effect on the next Turn - an
-    /// in-flight Turn is unaffected. No-op semantics (re-selecting the current
-    /// model) are the caller's job in a later phase, not here.
-    SetModel(String, oneshot::Sender<()>),
+    /// Swap the Active Model to a scoped `provider/model-id` (ADR-0033
+    /// amendment): resolved against the Session's fixed Provider set, so an
+    /// unknown Provider is an `Err` the caller surfaces. Takes effect on the
+    /// next Turn - an in-flight Turn is unaffected. No-op semantics
+    /// (re-selecting the current model) are the caller's job, not here.
+    SetModel(String, oneshot::Sender<Result<(), String>>),
     /// The Active Model identifier the next Turn will call (ADR-0033), so a
     /// caller can mark "(current)".
     ActiveModel(oneshot::Sender<String>),
@@ -277,19 +279,16 @@ impl AgentHandle {
 
         // The tool specs ride with every request but live outside the messages;
         // the estimate has to count them or Eviction fires late (baud's
-        // `String.length(JSON.encode!(Baud.Tools.specs()))`). Serialize each
-        // spec to its wire shape, exactly as a request would.
-        let specs_wire: Vec<_> = tools::specs()
-            .iter()
-            .map(crate::llm::request::wire_tool)
-            .collect();
-        let overhead = serde_json::to_string(&specs_wire)
+        // `String.length(JSON.encode!(Baud.Tools.specs()))`). A ToolSpec
+        // serializes to exactly its wire shape (name, description,
+        // input_schema), so serde counts what a request would carry.
+        let overhead = serde_json::to_string(&tools::specs())
             .map(|s| s.chars().count() as u64)
             .unwrap_or(0);
 
         let mut conversation = Conversation::new(
             system_prompt,
-            ConversationOpts::new(session.context_budget, session.connection.max_tokens)
+            ConversationOpts::new(session.context_budget, session.model.max_tokens)
                 .overhead_chars(overhead)
                 .eviction_slack(session.eviction_slack)
                 .dead_mass_fraction(session.dead_mass_fraction)
@@ -313,16 +312,15 @@ impl AgentHandle {
         let (events, _rx0) = broadcast::channel(1024);
 
         // The Active Model lives here as mutable Agent state (ADR-0033,
-        // CONTEXT.md: Active Model), seeded from the Session's connection at
-        // launch. Each Turn is spawned with a snapshot of THIS connection, so a
-        // `SetModel` between Turns lands on the next Turn and an in-flight Turn
-        // is unaffected. Only `model` ever changes on it - the endpoint, output
-        // cap, and temperature stay as launched, so nothing derived re-validates.
-        let connection = session.connection.clone();
+        // CONTEXT.md: Active Model), seeded from the Session's launch-resolved
+        // Model. Each Turn is spawned with a snapshot of THIS Model, so a
+        // `SetModel` between Turns lands on the next Turn and an in-flight
+        // Turn finishes on the Model it captured.
+        let model = session.model.clone();
 
         let state = AgentState {
             session,
-            connection,
+            model,
             llm,
             conversation,
             log,
@@ -380,14 +378,14 @@ impl AgentHandle {
         rx.await.unwrap_or(Err(Idle))
     }
 
-    /// Swaps the Active Model (ADR-0033). Takes effect on the next Turn; an
-    /// in-flight Turn finishes on the model it captured. A dead Agent is a
-    /// silent no-op (the reply channel drops), matching the fire-and-forget
-    /// handle methods.
-    pub async fn set_model(&self, model: String) {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Msg::Command(Command::SetModel(model, reply)));
-        let _ = rx.await;
+    /// Swaps the Active Model to a scoped `provider/model-id` (ADR-0033
+    /// amendment). Takes effect on the next Turn; an in-flight Turn finishes
+    /// on the Model it captured. An unresolvable id is an `Err` naming the
+    /// reason; a dead Agent answers `Err` too, matching `list_models`.
+    pub async fn set_model(&self, model: String) -> Result<(), String> {
+        self.query(move |reply| Command::SetModel(model, reply))
+            .await
+            .unwrap_or_else(|| Err("agent unavailable".to_string()))
     }
 
     /// The Active Model identifier the next Turn will call (ADR-0033), for a
@@ -471,12 +469,13 @@ impl AgentHandle {
 
 struct AgentState {
     session: Session,
-    // The Active Model as mutable Agent state (ADR-0033, CONTEXT.md: Active
-    // Model): an owned Connection seeded from `session.connection` at launch and
-    // read - not `session.connection` - when spawning a Turn. `Command::SetModel`
-    // swaps only its `model` field; everything else stays as launched, so no
-    // Session fact is re-derived or re-validated.
-    connection: Connection,
+    // The Active Model as mutable Agent state (ADR-0033 amendment, CONTEXT.md:
+    // Active Model): an owned Model seeded from `session.model` at launch and
+    // read - not `session.model` - when spawning a Turn. `Command::SetModel`
+    // swaps the whole Model (resolved against the Session's fixed Provider
+    // set); the budget figures keep their once-at-launch shape - per-Turn
+    // recomputation from the capture is a later stage.
+    model: Model,
     llm: Arc<dyn Llm>,
     conversation: Conversation,
     log: Option<Log>,
@@ -543,28 +542,13 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
                 let _ = reply.send(Err(Idle));
             }
         }
-        Command::SetModel(model, reply) => {
-            // Only the identifier changes; the endpoint/cap/temperature stay as
-            // launched, so nothing derived re-validates (ADR-0033). The next
-            // spawned Turn snapshots this; an in-flight Turn is unaffected.
-            state.connection.model = model;
-            let _ = reply.send(());
+        Command::SetModel(scoped, reply) => {
+            let _ = reply.send(swap_active_model(state, &scoped));
         }
         Command::ActiveModel(reply) => {
-            let _ = reply.send(state.connection.model.clone());
+            let _ = reply.send(state.model.scoped_id());
         }
-        Command::ListModels(reply) => {
-            // Fetch OFF the actor (ADR-0011/0017: never block the actor loop on
-            // the network). Clone the boundary and the current connection - the
-            // Active Model's endpoint - so the listed endpoint always matches the
-            // model the next Turn will call, then answer the oneshot from the
-            // spawned task.
-            let llm = Arc::clone(&state.llm);
-            let connection = state.connection.clone();
-            tokio::spawn(async move {
-                let _ = reply.send(llm.list_models(&connection).await);
-            });
-        }
+        Command::ListModels(reply) => spawn_list_models(state, reply),
         Command::Approve(id, decision, reply) => {
             approve(state, id, decision);
             let _ = reply.send(());
@@ -676,6 +660,33 @@ fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
             state.conversation = conversation;
         }
     }
+}
+
+// The SetModel swap (ADR-0033 amendment): the whole Model swaps - the scoped
+// id resolves against the Session's fixed Provider set (Catalog figures for
+// known built-in models, config synthesis otherwise). The next spawned Turn
+// snapshots it; an in-flight Turn is unaffected. An unresolvable id leaves
+// the Active Model as-is and the Err rides back to the caller.
+fn swap_active_model(state: &mut AgentState, scoped: &str) -> Result<(), String> {
+    state.model = state.session.resolve_model(scoped)?;
+    Ok(())
+}
+
+// The ListModels fetch, OFF the actor (ADR-0011/0017: never block the actor
+// loop on the network). Clone the boundary and the Active Model's Provider so
+// the listed endpoint always matches the model the next Turn will call, then
+// answer the oneshot from the spawned task.
+fn spawn_list_models(state: &AgentState, reply: oneshot::Sender<Result<Vec<String>, String>>) {
+    let Some(provider) = state.session.provider_of(&state.model).cloned() else {
+        // Unreachable while resolution guards SetModel; answer rather than
+        // panic if it ever regresses.
+        let _ = reply.send(Err(format!("unknown provider {:?}", state.model.provider)));
+        return;
+    };
+    let llm = Arc::clone(&state.llm);
+    tokio::spawn(async move {
+        let _ = reply.send(llm.list_models(&provider).await);
+    });
 }
 
 // A Standing Approval covering the exact string answers the Turn immediately -
@@ -821,14 +832,15 @@ fn start_turn(state: &mut AgentState, prompt: String) {
 fn spawn_turn(state: &mut AgentState) {
     reset_turn_state(state);
     // The AgentDeps wires each effect to the Agent's mpsc + the Session's Llm.
-    // The Turn captures a SNAPSHOT of the Agent's mutable connection (the Active
-    // Model), not `session.connection`: a `SetModel` between Turns lands on this
-    // next Turn, and an in-flight Turn keeps the connection it already captured
+    // The Turn captures a SNAPSHOT of the Agent's mutable Model (the Active
+    // Model), not `session.model`: a `SetModel` between Turns lands on this
+    // next Turn, and an in-flight Turn keeps the Model it already captured
     // (ADR-0017's read-only guest; ADR-0033).
     let deps = AgentDeps::new(
         state.self_tx.clone(),
         Arc::clone(&state.llm),
-        state.connection.clone(),
+        state.model.clone(),
+        state.session.temperature,
         state.compaction.clone(),
     );
     let conversation = state.conversation.clone();
@@ -933,10 +945,11 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
     let dying = state.conversation.clone();
     let compaction = state.compaction.clone();
     let llm = Arc::clone(&state.llm);
-    // A snapshot of the Agent's mutable connection (the Active Model), as
+    // A snapshot of the Agent's mutable Model (the Active Model), as
     // `spawn_turn` does - the seed narrative and the Recovery Turn both run on
     // the model current at spawn (ADR-0033).
-    let connection = state.connection.clone();
+    let model = state.model.clone();
+    let temperature = state.session.temperature;
     let session = state.session.clone();
     let opts = run_opts(state, None);
     let tx = state.self_tx.clone();
@@ -948,7 +961,8 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
                 &prompt,
                 failing_command.as_deref(),
                 llm.as_ref(),
-                &connection,
+                &model,
+                temperature,
             )
             .await;
         let _ = tx.send(Msg::Turn(TurnMsg::HandoffSeeded {
@@ -963,7 +977,8 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
         let deps = AgentDeps::new(
             tx.clone(),
             Arc::clone(&llm),
-            connection.clone(),
+            model.clone(),
+            temperature,
             seeded.state.clone(),
         );
         let opts = RunOpts {

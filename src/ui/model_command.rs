@@ -12,6 +12,7 @@
 //! committed command to this module lives in [`super::command`].
 
 use crate::event::Event;
+use crate::llm::model::split_scoped;
 use crate::session::{SessionConfig, SessionError};
 use crate::ui::AdapterCtx;
 use crate::ui::selector::SelectorRow;
@@ -44,11 +45,13 @@ pub fn applied_line(
 
 /// One `ids -> rows` builder shared by every path that populates `/model`'s
 /// selector (ADR-0033): server order preserved, the currently-Active Model
-/// marked "(current)".
+/// marked "(current)". The server lists bare model ids while the Active Model
+/// is scoped (ADR-0037), so the mark compares against the id part.
 fn model_rows(ids: Vec<String>, current: &str) -> Vec<SelectorRow> {
+    let current_id = split_scoped(current).map(|(_, id)| id).unwrap_or(current);
     ids.into_iter()
         .map(|id| {
-            let hint = (id == current).then(|| "(current)".to_string());
+            let hint = (id == current_id).then(|| "(current)".to_string());
             SelectorRow::new(id.clone(), id, hint)
         })
         .collect()
@@ -85,15 +88,37 @@ pub(super) async fn run(screen: Screen, ctx: &AdapterCtx<'_>, generation: u64) -
 /// pure [`applied_line`] for the info line. A persist failure is surfaced but
 /// the live swap still stands.
 pub(super) async fn choose(screen: Screen, ctx: &AdapterCtx<'_>, value: String) -> Screen {
-    // Re-selecting the current model changes nothing (no swap, no write, no
-    // warning - ADR-0033).
-    if value == ctx.agent.active_model().await {
-        return screen;
+    let current = ctx.agent.active_model().await;
+    apply_pick(screen, ctx, scoped_pick(&current, value)).await
+}
+
+/// The pure pick policy (ADR-0033, ADR-0037): the selector lists the Active
+/// Model's Provider's bare ids (the full multi-provider selector is a later
+/// stage), so a pick is scoped to that Provider - and a re-selection of the
+/// current model is no pick at all (`None`). An unscoped `current` cannot
+/// happen (the Active Model is always scoped); the pick then passes through
+/// bare for `set_model` to reject with a real reason.
+fn scoped_pick(current: &str, value: String) -> Option<String> {
+    let scoped = match split_scoped(current) {
+        Ok((provider, _)) => format!("{provider}/{value}"),
+        Err(_) => value,
+    };
+    (scoped != current).then_some(scoped)
+}
+
+// The impure application of a pick: swap the Active Model live, persist the
+// choice sticky, and describe what happened. No pick (a re-selection of the
+// current model) changes nothing - no swap, no write, no warning (ADR-0033).
+// A rejected swap (an unresolvable id) leaves the Active Model as-is; nothing
+// persists and the reason surfaces as the info line.
+async fn apply_pick(screen: Screen, ctx: &AdapterCtx<'_>, pick: Option<String>) -> Screen {
+    let Some(scoped) = pick else { return screen };
+    if let Err(reason) = ctx.agent.set_model(scoped.clone()).await {
+        return screen.info(format!("model → {scoped} (not applied: {reason})"));
     }
-    ctx.agent.set_model(value.clone()).await;
-    let persist = SessionConfig::persist_model(&ctx.config_path, &value);
+    let persist = SessionConfig::persist_model(&ctx.config_path, &scoped);
     let env_shadowed = std::env::var("SUSPENDERS_MODEL").is_ok();
-    screen.info(applied_line(&value, env_shadowed, &persist))
+    screen.info(applied_line(&scoped, env_shadowed, &persist))
 }
 
 #[cfg(test)]
@@ -127,5 +152,39 @@ mod tests {
     #[test]
     fn a_clean_persist_is_just_the_bare_line() {
         assert_eq!(applied_line("qwen/y", false, &Ok(())), "model → qwen/y");
+    }
+
+    // --- scoped_pick (the pure pick policy) ---------------------------------
+
+    #[test]
+    fn a_pick_is_scoped_to_the_active_models_provider() {
+        assert_eq!(
+            scoped_pick("local/old-model", "new-model".into()),
+            Some("local/new-model".to_string())
+        );
+        // Bare ids may themselves contain slashes; the scope is the Provider
+        // part of the CURRENT scoped id, split on its first slash only.
+        assert_eq!(
+            scoped_pick("local/qwen/Qwen3.6-27B-MTP-GGUF", "qwen/other".into()),
+            Some("local/qwen/other".to_string())
+        );
+    }
+
+    #[test]
+    fn re_selecting_the_current_model_is_no_pick() {
+        assert_eq!(
+            scoped_pick(
+                "local/qwen/Qwen3.6-27B-MTP-GGUF",
+                "qwen/Qwen3.6-27B-MTP-GGUF".into()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unscoped_current_passes_the_pick_through_bare() {
+        // Cannot happen (the Active Model is always scoped); the bare pick
+        // then reaches set_model, which rejects it with a real reason.
+        assert_eq!(scoped_pick("", "m".into()), Some("m".to_string()));
     }
 }

@@ -33,7 +33,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
         "You are a test agent.",
         crate::conversation::ConversationOpts::new(
             session.context_budget,
-            session.connection.max_tokens,
+            session.model.max_tokens,
         )
         .eviction_slack(session.eviction_slack)
         .dead_mass_fraction(session.dead_mass_fraction)
@@ -99,7 +99,7 @@ pub(super) async fn run_with(
 }
 
 pub(super) fn deps_for(session: &Session, entries: Vec<Entry>) -> FakeDeps {
-    FakeDeps::new(FakeLlm::script(entries), session.connection.clone())
+    FakeDeps::new(FakeLlm::script(entries), session.model.clone())
 }
 
 // Inspectors over recorded events.

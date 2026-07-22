@@ -17,7 +17,7 @@ use crate::agent::{AgentHandle, StartOpts};
 use crate::approvals::Decision;
 use crate::conversation::dead_mass_pct;
 use crate::event::Event;
-use crate::llm::AnthropicLlm;
+use crate::llm::Dispatcher;
 use crate::session::{Session, SessionOpts};
 use crate::ui::picker::PickerOutcome;
 
@@ -25,9 +25,10 @@ use crate::ui::picker::PickerOutcome;
 mod tests;
 
 /// Launches the interactive ratatui frontend (ADR-0001, ADR-0019). Builds the
-/// Session from config/env (a real `AnthropicLlm` + `Connection`), starts the
-/// Agent, and hands the terminal to [`crate::ui::run`] (which enters/leaves raw
-/// mode + the alternate screen around itself).
+/// Session from config/env (the resolved Provider set + launch Model behind a
+/// real `Dispatcher`), starts the Agent, and hands the terminal to
+/// [`crate::ui::run`] (which enters/leaves raw mode + the alternate screen
+/// around itself).
 /// Bare `--resume` (no value) arrives as this sentinel and opens the picker.
 const PICK: &str = "pick";
 
@@ -194,7 +195,7 @@ async fn drive(
 // ---------------------------------------------------------------------------
 
 /// Builds the Session's fixed facts from config/env (the single env seam),
-/// rooted at `root` (or the current dir), with a real `Connection`.
+/// rooted at `root` (or the current dir).
 fn build_session(root: Option<PathBuf>) -> anyhow::Result<Session> {
     let opts = SessionOpts {
         root: root.map(|p| p.to_string_lossy().into_owned()),
@@ -203,15 +204,15 @@ fn build_session(root: Option<PathBuf>) -> anyhow::Result<Session> {
     Session::new(opts).map_err(|e| anyhow::anyhow!("session: {e}"))
 }
 
-/// Starts the Agent with the real `AnthropicLlm` boundary (ADR-0020) and the
-/// context-file-assembled system prompt, resuming a prior Session Log when
-/// asked.
+/// Starts the Agent with the real `Dispatcher` boundary (ADR-0020, ADR-0037)
+/// over the Session's resolved Provider set, and the context-file-assembled
+/// system prompt, resuming a prior Session Log when asked.
 fn start_agent(
     session: Session,
     resume: Option<String>,
     system_prompt: String,
 ) -> anyhow::Result<AgentHandle> {
-    let llm = Arc::new(AnthropicLlm::new());
+    let llm = Arc::new(Dispatcher::new(session.providers.clone()));
     let mut opts = StartOpts::new(session, llm).with_system_prompt(system_prompt);
     if let Some(resume) = resume {
         opts.resume = Some(parse_resume(&resume));

@@ -32,9 +32,8 @@ use crate::compaction::Compaction;
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::request::LlmRequest;
 use crate::llm::response::{Response, StopReason};
-use crate::llm::stream::StreamEvent;
+use crate::llm::{LlmRequest, StreamEvent};
 use crate::plan::Plan;
 use crate::plugins::Registered;
 use crate::session::Session;
@@ -579,11 +578,11 @@ mod tests {
     use crate::content::Usage;
     use crate::content::{ContentBlock, Role};
     use crate::event::Stage;
+    use crate::llm::model::{Api, Model};
     use crate::llm::response::Response;
-    use crate::llm::stream::{Delta, malformed_input_marker};
+    use crate::llm::{Delta, malformed_input_marker};
     use crate::plugin::{Plugin, Token};
     use crate::plugins::Registered;
-    use crate::session::connection::Connection;
     use crate::session::{Session, SessionOpts};
     use crate::test_support::Entry;
     use crate::test_support::FakeDeps;
@@ -790,7 +789,7 @@ mod tests {
         let sentinel_log = Arc::clone(&events_log);
         let entry = Entry::dynamic(
             vec![Delta::Text("hi ".into()), Delta::Text("there".into())],
-            move |_req| {
+            move |_req, _model| {
                 sentinel_log
                     .lock()
                     .unwrap()
@@ -858,7 +857,7 @@ mod tests {
             .collect();
         assert_eq!(pressures.len(), 2);
         assert_eq!(pressures[0].1, session.context_budget);
-        assert_eq!(pressures[0].2, session.connection.max_tokens);
+        assert_eq!(pressures[0].2, session.model.max_tokens);
         // Pressure grows Pass to Pass.
         assert!(pressures[1].0 >= pressures[0].0);
     }
@@ -3088,7 +3087,7 @@ mod tests {
         let mut opts = SessionOpts::default();
         opts.context_budget = Some(60);
         opts.eviction_slack = Some(0.0);
-        opts.connection = Some(Connection::new("http://localhost:0/v1", "", "", 50));
+        opts.model = Some(Model::new("local", "m", Api::AnthropicMessages, 64_000, 50));
         let session = session_with(root.path(), opts);
         // No script entries: any complete call would surface a different error.
         let deps = deps_for(&session, vec![]);

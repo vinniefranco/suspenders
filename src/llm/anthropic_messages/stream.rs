@@ -13,9 +13,9 @@
 //!   block.
 //! - Malformed tool input JSON: tagged so a mangled Tool Call stays
 //!   distinguishable from a valid empty-input call, and vended across the
-//!   boundary as a domain signal via [`malformed_tool_input`] (the wire
-//!   sentinel that carries it stays private). Empty accumulated JSON decodes
-//!   to `{}`.
+//!   boundary as a domain signal via [`crate::llm::malformed_tool_input`]
+//!   (the sentinel that carries it stays private to the boundary). Empty
+//!   accumulated JSON decodes to `{}`.
 //! - Open blocks surviving a truncated or errored stream: their partial text
 //!   is preserved in the final content (the error algebra).
 //! - Thinking blocks: accumulated for the snapshot (UI rendering) and dropped
@@ -26,42 +26,8 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use crate::content::{ContentBlock, Usage};
+use crate::llm::malformed_input_marker;
 use crate::llm::response::{Response, StopReason};
-
-/// The sentinel key wrapping raw JSON that failed to parse, so a mangled
-/// tool call stays distinguishable from a valid empty-input call. Private to
-/// the boundary: callers read the fact through [`malformed_tool_input`], never
-/// the wire string.
-const MALFORMED_INPUT_SENTINEL: &str = "__suspenders_malformed_input__";
-
-/// The boundary's semantic verdict on a Tool Call's decoded `input`: if the
-/// input JSON never parsed, [`malformed_tool_input`] returns the raw unparsed
-/// text (`Some`); a valid input (including a valid empty map) returns `None`.
-///
-/// This is how the SSE-decoding fact that a tool_use's input was mangled
-/// crosses the LLM boundary as a domain signal. The sentinel string that
-/// carries it on the wire stays private to this module - domain code (the Turn
-/// batch, the tool registry) gates on this accessor without knowing the
-/// wire representation.
-///
-/// ADR-0002: malformation is DATA folded into the content path, so it rides in
-/// the durable `ContentBlock::ToolUse.input` `Value` unchanged and is
-/// interpreted here - never surfaced as an `Err`.
-pub fn malformed_tool_input(input: &Value) -> Option<&str> {
-    // The key's presence is the verdict; its value carries the raw unparsed
-    // text (always a string from the decoder, "" defensively otherwise).
-    input
-        .get(MALFORMED_INPUT_SENTINEL)
-        .map(|raw| raw.as_str().unwrap_or(""))
-}
-
-/// Builds the malformed-input marker `Value` from raw unparsed text - the
-/// counterpart to [`malformed_tool_input`]. The boundary produces these when
-/// input JSON fails to decode; construction stays here so no caller (or test)
-/// spells the wire sentinel itself.
-pub fn malformed_input_marker(raw: &str) -> Value {
-    json!({ MALFORMED_INPUT_SENTINEL: raw })
-}
 
 /// One parsed SSE frame handed to the fold. The transport turns each
 /// `event:`/`data:` frame into a [`SseEvent::Event`]; a framing/JSON failure
@@ -79,21 +45,6 @@ impl SseEvent {
             data,
         }
     }
-}
-
-/// The per-delta streaming snapshot the boundary emits to its callback: the
-/// delta itself plus the content accumulated so far (open blocks included).
-#[derive(Debug, Clone, PartialEq)]
-pub struct StreamEvent {
-    pub delta: Delta,
-    pub content: Vec<ContentBlock>,
-}
-
-/// A single streaming delta, tagged by kind.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Delta {
-    Thinking(String),
-    Text(String),
 }
 
 /// An in-flight content block (accumulating). Distinct from [`ContentBlock`]:
@@ -396,6 +347,7 @@ fn merge_usage(base: &mut Usage, delta: &Usage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::malformed_tool_input;
 
     // Event constructors mirroring the baud test helpers.
     fn ms() -> SseEvent {

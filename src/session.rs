@@ -1,9 +1,9 @@
 //! The Session's fixed facts (CONTEXT.md: Session), resolved and validated
-//! once at launch: the Project Root, the Context Budget, the Eviction slack,
-//! the Dead Mass fraction, the Compaction Keep, the Result Cap, the Turn
-//! Limit, the Anchor cadence and stale-plan threshold, the Scout Pass cap,
-//! the no-think knobs, the command timeout, the
-//! Plugin list, the LLM module, and the model connection.
+//! once at launch: the Project Root, the Provider set, the launch Model, the
+//! sampling temperature, the Context Budget, the Eviction slack, the Dead
+//! Mass fraction, the Compaction Keep, the Result Cap, the Turn Limit, the
+//! Anchor cadence and stale-plan threshold, the Scout Pass cap, the no-think
+//! knobs, the command timeout, the Plugin list, and the LLM module.
 //!
 //! This is the composition seam for configuration. [`Session::new`] resolves
 //! these keys once (via [`SessionConfig::load`]) by overlaying, in order, the
@@ -13,21 +13,30 @@
 //! downstream receives values from this struct, so the cross-module invariants
 //! live in one constructor:
 //!
-//! * the Eviction reserve IS `connection.max_tokens` - one field, read by the
-//!   Conversation and the LLM request alike, so they cannot drift
-//! * `connection.max_tokens` must leave room in the Context Budget
+//! * the Eviction reserve IS the launch [`Model`]'s `max_tokens` - one field,
+//!   read by the Conversation and the LLM request alike, so they cannot drift
+//! * that output cap must leave room in the Context Budget
 //! * the Result Cap derives from the same two numbers, once, here
 //!
+//! The Provider set (ADR-0037) resolves here too: custom Providers from the
+//! config `providers` table, built-ins from the seed Catalog with each one's
+//! own environment key. The launch `model` (a scoped `provider/model-id`)
+//! resolves against that set - an unknown Provider fails launch loudly.
+//!
 //! Tests use [`Session::build`] with an explicit [`SessionConfig`] (no env
-//! reads), so the config-default behavior is exercised without touching the
-//! process environment.
+//! reads beyond the built-in Providers' credential keys, which tests never
+//! assert on), so the config-default behavior is exercised without touching
+//! the process environment.
 
-pub mod connection;
 pub mod log;
 
+use std::collections::BTreeMap;
+
 use crate::conversation;
+use crate::llm::model::{Api, Model};
+use crate::llm::provider::Provider;
+use crate::llm::{catalog, model};
 use crate::tool::ToolCtx;
-use connection::Connection;
 use serde::{Deserialize, Serialize};
 
 /// The shape of a Recovery Turn (CONTEXT.md: Recovery Turn, Continuation,
@@ -102,10 +111,24 @@ pub struct Session {
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
     pub command_timeout_ms: u64,
-    /// DERIVED: `cap_for(context_budget, connection.max_tokens)`.
+    /// DERIVED: `cap_for(context_budget, model.max_tokens)`.
     pub result_cap: usize,
     pub session_dir: String,
-    pub connection: Connection,
+    /// The resolved Provider set (ADR-0037): custom Providers from config,
+    /// built-ins from the seed Catalog with their environment credentials.
+    pub providers: Vec<Provider>,
+    /// The launch-resolved Model - the Active Model's seed (ADR-0033
+    /// amendment). Its output cap is the Eviction reserve and feeds the
+    /// Result Cap; per-Turn budget recomputation from the captured Model is
+    /// a later stage.
+    pub model: Model,
+    /// The sampling temperature every request carries; `None` leaves sampling
+    /// to the server's own defaults. Resolved once here, applied by the
+    /// request-building callers (ADR-0037: temperature belongs to the request).
+    pub temperature: Option<f64>,
+    /// The output cap for Models the Catalog does not know (the config knob):
+    /// the synthesis fallback when a scoped id resolves at `/model` time.
+    pub max_tokens: u64,
 }
 
 /// Raised (returned) when a Session's fixed facts fail validation. The message
@@ -126,8 +149,11 @@ impl std::error::Error for SessionError {}
 /// [`SessionConfig::test_defaults`] explicitly (no file/env reads).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
-    pub base_url: String,
-    pub token: String,
+    /// Custom Providers, keyed by id (ADR-0031 amendment): file-only structure
+    /// the env cannot express. A custom entry shadows a built-in with the
+    /// same id.
+    pub providers: BTreeMap<String, ProviderConfig>,
+    /// The scoped `provider/model-id` the launch Model resolves from.
     pub model: String,
     pub max_tokens: u64,
     pub temperature: Option<f64>,
@@ -151,12 +177,21 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// The base config the app ships.
+    /// The base config the app ships: the `local` custom Provider carrying the
+    /// out-of-the-box endpoint (local servers speak the Anthropic protocol
+    /// today, ADR-0002), and the default model scoped to it.
     pub fn base() -> Self {
         SessionConfig {
-            base_url: "http://localhost:8888/v1".into(),
-            token: "".into(),
-            model: "qwen/Qwen3.6-27B-MTP-GGUF".into(),
+            providers: BTreeMap::from([(
+                "local".to_string(),
+                ProviderConfig {
+                    base_url: "http://localhost:8888/v1".into(),
+                    api: Api::AnthropicMessages,
+                    context_window: 64_000,
+                    token: None,
+                },
+            )]),
+            model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             max_tokens: 8_000,
             temperature: Some(0.7),
             context_budget: 64_000,
@@ -183,7 +218,10 @@ impl SessionConfig {
     /// list, tmp session dir.
     pub fn test_defaults() -> Self {
         let mut cfg = SessionConfig::base();
-        cfg.base_url = "http://localhost:0/v1".into();
+        cfg.providers
+            .get_mut("local")
+            .expect("base ships local")
+            .base_url = "http://localhost:0/v1".into();
         cfg.llm_module = "Suspenders.FakeLLM".into();
         cfg.plugins = vec![];
         cfg.session_dir = std::env::temp_dir()
@@ -265,9 +303,9 @@ impl SessionConfig {
 
         let base = SessionConfig::base();
         let template = FileConfig {
-            base_url: Some(base.base_url),
-            // token is deliberately left None: never persist a secret.
-            token: None,
+            // Per-provider tokens are deliberately absent from base(): the
+            // template never persists a secret.
+            providers: Some(base.providers),
             model: Some(base.model),
             max_tokens: Some(base.max_tokens),
             temperature: base.temperature,
@@ -358,26 +396,39 @@ fn merge_model(existing: Option<&str>, model: &str) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
 }
 
-/// The user config file's schema (ADR-0031): exactly the env-settable key set,
-/// every field `Option<T>` so an absent key is an empty overlay. The DTO and the
-/// env seam are two serializations of one schema; the deliberately excluded
-/// fields (`session_dir`, `llm_module`, `turn_limit`, `anchor_interval`,
-/// `scout_pass_limit`, `plugins`) are simply absent, so `deny_unknown_fields`
-/// rejects them for free. `token` is `Option` so [`write_template`] can omit it
-/// while the user may still add it by hand.
+/// One custom Provider's config entry (ADR-0031 amendment, ADR-0037): the
+/// host's endpoint, the Api its Models speak, the window its Models
+/// synthesize from, and an optional credential. File-only - structure the env
+/// cannot express - and `deny_unknown_fields` like its parent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub base_url: String,
+    pub api: Api,
+    pub context_window: u64,
+    /// The credential; absent means none (local servers ignore it). Never
+    /// written by the tool - the user adds it by hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// The user config file's schema (ADR-0031): the env-settable scalar knobs
+/// plus the file-only `providers` table (ADR-0037 narrowed the lockstep rule
+/// to the scalars). Every field `Option<T>` so an absent key is an empty
+/// overlay. The deliberately excluded fields (`session_dir`, `llm_module`,
+/// `turn_limit`, `anchor_interval`, `scout_pass_limit`, `plugins`) are simply
+/// absent, so `deny_unknown_fields` rejects them for free - as it now rejects
+/// the retired flat `base_url` and `token` keys.
 ///
-/// This and [`SessionConfig::apply_env`] are the two serializations of one
-/// schema; a new user-tunable knob is added to both seams or to neither
-/// (ADR-0031: "the file and env seams must be kept in lockstep").
-///
-/// [`write_template`]: SessionConfig::write_template
+/// The scalar fields and [`SessionConfig::apply_env`] are the two
+/// serializations of one schema; a new user-tunable knob is added to both
+/// seams or to neither (ADR-0031: "the file and env seams must be kept in
+/// lockstep").
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
+    providers: Option<BTreeMap<String, ProviderConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,11 +473,8 @@ impl FileConfig {
     /// `cfg` untouched. Private on purpose: a `SessionConfig` mutated this way
     /// must still pass through `validate()` on the built [`Session`].
     fn apply(&self, cfg: &mut SessionConfig) {
-        if let Some(v) = &self.base_url {
-            cfg.base_url = v.clone();
-        }
-        if let Some(v) = &self.token {
-            cfg.token = v.clone();
+        if let Some(v) = &self.providers {
+            cfg.providers = v.clone();
         }
         if let Some(v) = &self.model {
             cfg.model = v.clone();
@@ -483,15 +531,9 @@ type EnvSetter = fn(&mut SessionConfig, &str) -> Result<(), SessionError>;
 /// serializations of one schema, kept in lockstep: a new knob adds a row here
 /// and a field there, or neither.
 const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
-    // Plain string overrides, set whenever present.
-    ("SUSPENDERS_URL", |cfg, v| {
-        cfg.base_url = v.into();
-        Ok(())
-    }),
-    ("SUSPENDERS_TOKEN", |cfg, v| {
-        cfg.token = v.into();
-        Ok(())
-    }),
+    // The scoped `provider/model-id` (ADR-0037); resolution validates it at
+    // launch. The retired SUSPENDERS_URL / SUSPENDERS_TOKEN moved into the
+    // file-only `providers` table.
     ("SUSPENDERS_MODEL", |cfg, v| {
         cfg.model = v.into();
         Ok(())
@@ -660,7 +702,10 @@ pub struct SessionOpts {
     pub no_think_rescue: Option<bool>,
     pub command_timeout_ms: Option<u64>,
     pub session_dir: Option<String>,
-    pub connection: Option<Connection>,
+    /// A prebuilt launch Model, bypassing scoped-id resolution (the test seam;
+    /// the Provider set still resolves from config).
+    pub model: Option<Model>,
+    pub temperature: Option<Option<f64>>,
 }
 
 impl Session {
@@ -674,17 +719,20 @@ impl Session {
     /// Builds and validates against an explicit [`SessionConfig`] - the
     /// no-env path tests use. Every `None` opt falls back to `config`.
     pub fn build(opts: SessionOpts, config: &SessionConfig) -> Result<Session, SessionError> {
-        let connection = opts.connection.clone().unwrap_or_else(|| {
-            Connection::new(
-                config.base_url.clone(),
-                config.token.clone(),
-                config.model.clone(),
-                config.max_tokens,
-            )
-            .with_temperature(config.temperature)
-        });
-
         let context_budget = opts.context_budget.unwrap_or(config.context_budget);
+
+        // The Provider set: custom entries from config, then every built-in
+        // the customs do not shadow (ADR-0037).
+        let providers = resolve_providers(&config.providers);
+
+        // The launch Model: a prebuilt one from the opts (the test seam), or
+        // the scoped config id resolved against the set - an unknown Provider
+        // fails launch loudly (ADR-0031).
+        let launch_model = match opts.model.clone() {
+            Some(m) => m,
+            None => model::resolve(&config.model, &providers, context_budget, config.max_tokens)
+                .map_err(SessionError)?,
+        };
 
         let session = Session {
             root: opts.root.unwrap_or_else(default_root),
@@ -706,15 +754,36 @@ impl Session {
             scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
             command_timeout_ms: opts.command_timeout_ms.unwrap_or(config.command_timeout_ms),
-            result_cap: crate::tools::shaping::cap_for(context_budget, connection.max_tokens),
+            result_cap: crate::tools::shaping::cap_for(context_budget, launch_model.max_tokens),
             session_dir: opts
                 .session_dir
                 .unwrap_or_else(|| config.session_dir.clone()),
-            connection,
+            providers,
+            model: launch_model,
+            temperature: opts.temperature.unwrap_or(config.temperature),
+            max_tokens: config.max_tokens,
         };
 
         validate(&session)?;
         Ok(session)
+    }
+
+    /// Resolves a scoped `provider/model-id` against the Session's fixed
+    /// Provider set (the `/model` swap path, ADR-0033 amendment): Catalog
+    /// figures for known built-in models, the Provider's config window plus
+    /// the Session's `max_tokens` knob for everything else.
+    pub fn resolve_model(&self, scoped: &str) -> Result<Model, String> {
+        model::resolve(
+            scoped,
+            &self.providers,
+            self.context_budget,
+            self.max_tokens,
+        )
+    }
+
+    /// The Provider a Model belongs to, from the Session's fixed set.
+    pub fn provider_of(&self, model: &Model) -> Option<&Provider> {
+        crate::llm::provider::find(&self.providers, &model.provider)
     }
 
     /// The ctx every Tool Call executes with: the Project Root, the Result
@@ -728,6 +797,28 @@ impl Session {
             scout: None,
         }
     }
+}
+
+// The Provider set (ADR-0037): custom entries first (BTreeMap order keeps the
+// set deterministic), then every built-in Provider a custom entry does not
+// shadow, each with its credential resolved from its own environment key.
+fn resolve_providers(customs: &BTreeMap<String, ProviderConfig>) -> Vec<Provider> {
+    let mut providers: Vec<Provider> = customs
+        .iter()
+        .map(|(id, c)| Provider {
+            id: id.clone(),
+            base_url: c.base_url.clone(),
+            token: c.token.clone().unwrap_or_default(),
+            api: c.api,
+            context_window: Some(c.context_window),
+        })
+        .collect();
+    for builtin in catalog::builtin_providers() {
+        if !providers.iter().any(|p| p.id == builtin.id) {
+            providers.push(builtin);
+        }
+    }
+    providers
 }
 
 fn default_root() -> String {
@@ -787,6 +878,7 @@ fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionE
 // reasons stay legible.
 fn validate(s: &Session) -> Result<(), SessionError> {
     validate_scalars(s)?;
+    validate_providers(s)?;
     validate_budget_fits(s)?;
     validate_keep_below_trigger(s)?;
     Ok(())
@@ -794,7 +886,7 @@ fn validate(s: &Session) -> Result<(), SessionError> {
 
 fn validate_scalars(s: &Session) -> Result<(), SessionError> {
     pos_int(s.context_budget, ":context_budget")?;
-    pos_int(s.connection.max_tokens, "connection :max_tokens")?;
+    pos_int(s.model.max_tokens, "model :max_tokens")?;
     pos_int(s.turn_limit, ":turn_limit")?;
     pos_int(s.anchor_interval, ":anchor_interval")?;
     pos_int(s.plan_stale_after, ":plan_stale_after")?;
@@ -804,17 +896,38 @@ fn validate_scalars(s: &Session) -> Result<(), SessionError> {
     fraction_left_closed(s.eviction_slack, ":eviction_slack")?;
     fraction_open(s.dead_mass_fraction, ":dead_mass_fraction")?;
     fraction_open(s.compaction_keep, ":compaction_keep")?;
-    temperature(s.connection.temperature)?;
+    temperature(s.temperature)?;
+    Ok(())
+}
+
+// The Provider set is a fixed fact: every entry must be reachable data - a
+// non-empty endpoint, and a positive window on custom entries (built-ins
+// carry None; the Catalog owns their windows).
+fn validate_providers(s: &Session) -> Result<(), SessionError> {
+    for p in &s.providers {
+        if p.base_url.is_empty() {
+            return Err(SessionError(format!(
+                "provider {:?} :base_url must be non-empty",
+                p.id
+            )));
+        }
+        if p.context_window == Some(0) {
+            return Err(SessionError(format!(
+                "provider {:?} :context_window must be a positive integer",
+                p.id
+            )));
+        }
+    }
     Ok(())
 }
 
 // The reserve must leave room in the budget.
 fn validate_budget_fits(s: &Session) -> Result<(), SessionError> {
-    if s.connection.max_tokens < s.context_budget {
+    if s.model.max_tokens < s.context_budget {
         Ok(())
     } else {
         Err(SessionError(
-            "connection :max_tokens must leave room in :context_budget".into(),
+            "model :max_tokens must leave room in :context_budget".into(),
         ))
     }
 }
@@ -825,14 +938,11 @@ fn validate_budget_fits(s: &Session) -> Result<(), SessionError> {
 fn validate_keep_below_trigger(s: &Session) -> Result<(), SessionError> {
     let keep_amount = conversation::compaction_keep_amount(
         s.context_budget,
-        s.connection.max_tokens,
+        s.model.max_tokens,
         s.compaction_keep,
     );
-    let trigger = conversation::compaction_target(
-        s.context_budget,
-        s.connection.max_tokens,
-        s.eviction_slack,
-    );
+    let trigger =
+        conversation::compaction_target(s.context_budget, s.model.max_tokens, s.eviction_slack);
 
     if keep_amount < trigger {
         Ok(())
@@ -888,9 +998,19 @@ mod tests {
     use super::*;
     use crate::tools::shaping;
 
-    // A valid explicit connection, so tests never depend on config for it.
-    fn connection() -> Connection {
-        Connection::new("http://localhost:0/v1", "", "test-model", 1_000)
+    // A valid explicit launch Model, so tests never depend on config for it.
+    fn test_model() -> Model {
+        model_with_cap(1_000)
+    }
+
+    fn model_with_cap(max_tokens: u64) -> Model {
+        Model::new(
+            "local",
+            "test-model",
+            Api::AnthropicMessages,
+            64_000,
+            max_tokens,
+        )
     }
 
     fn cfg() -> SessionConfig {
@@ -912,8 +1032,83 @@ mod tests {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.llm_module, "Suspenders.FakeLLM");
         assert_eq!(session.context_budget, cfg().context_budget);
-        assert_eq!(session.connection.max_tokens, cfg().max_tokens);
+        assert_eq!(session.model.max_tokens, cfg().max_tokens);
         assert_eq!(session.plugins, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_launch_model_resolves_the_scoped_default_against_the_local_provider() {
+        // Out-of-the-box behavior (ADR-0037): the default custom `local`
+        // Provider carries today's default endpoint, and the default model is
+        // scoped to it - splitting on the FIRST slash only.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.model.provider, "local");
+        assert_eq!(session.model.id, "qwen/Qwen3.6-27B-MTP-GGUF");
+        assert_eq!(session.model.api, Api::AnthropicMessages);
+        assert_eq!(session.model.max_tokens, cfg().max_tokens);
+        assert_eq!(session.temperature, cfg().temperature);
+
+        let local = session.provider_of(&session.model).expect("local resolves");
+        assert_eq!(local.base_url, "http://localhost:0/v1");
+        assert_eq!(local.api, Api::AnthropicMessages);
+        assert_eq!(local.context_window, Some(64_000));
+    }
+
+    #[test]
+    fn the_provider_set_carries_customs_and_unshadowed_builtins() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let ids: Vec<&str> = session.providers.iter().map(|p| p.id.as_str()).collect();
+        assert!(ids.contains(&"local"));
+        assert!(ids.contains(&"anthropic"));
+
+        // A custom entry with a built-in's id shadows it (config wins).
+        let mut config = cfg();
+        config.providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                base_url: "http://proxy:9000/v1".into(),
+                api: Api::AnthropicMessages,
+                context_window: 100_000,
+                token: Some("proxy-token".into()),
+            },
+        );
+        let session = Session::build(opts(), &config).unwrap();
+        let anthropic: Vec<_> = session
+            .providers
+            .iter()
+            .filter(|p| p.id == "anthropic")
+            .collect();
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0].base_url, "http://proxy:9000/v1");
+        assert_eq!(anthropic[0].token, "proxy-token");
+    }
+
+    #[test]
+    fn an_unresolvable_launch_model_fails_launch_loudly() {
+        // Unknown provider.
+        let mut config = cfg();
+        config.model = "nowhere/some-model".into();
+        let err = Session::build(opts(), &config).unwrap_err();
+        assert!(err.0.contains("nowhere"), "error was: {err}");
+
+        // An unscoped id (no provider part) fails too.
+        let mut config = cfg();
+        config.model = "bare-model".into();
+        let err = Session::build(opts(), &config).unwrap_err();
+        assert!(err.0.contains("scoped"), "error was: {err}");
+    }
+
+    #[test]
+    fn resolve_model_synthesizes_from_the_session_knobs_for_unknown_models() {
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let model = session.resolve_model("local/another-model").unwrap();
+        assert_eq!(model.provider, "local");
+        assert_eq!(model.id, "another-model");
+        // The custom Provider's config window and the Session's output-cap knob.
+        assert_eq!(model.context_window, 64_000);
+        assert_eq!(model.max_tokens, session.max_tokens);
+
+        assert!(session.resolve_model("nowhere/m").is_err());
     }
 
     #[test]
@@ -928,7 +1123,7 @@ mod tests {
             turn_limit: Some(3),
             anchor_interval: Some(7),
             command_timeout_ms: Some(1_000),
-            connection: Some(connection()),
+            model: Some(test_model()),
             ..Default::default()
         };
         let session = Session::build(o, &cfg()).unwrap();
@@ -940,7 +1135,7 @@ mod tests {
         assert_eq!(session.turn_limit, 3);
         assert_eq!(session.anchor_interval, 7);
         assert_eq!(session.command_timeout_ms, 1_000);
-        assert_eq!(session.connection.max_tokens, 1_000);
+        assert_eq!(session.model.max_tokens, 1_000);
     }
 
     #[test]
@@ -951,7 +1146,7 @@ mod tests {
         let err = Session::build(
             SessionOpts {
                 anchor_interval: Some(0),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -974,7 +1169,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 dead_mass_fraction: Some(0.3),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -989,7 +1184,7 @@ mod tests {
             Session::build(
                 SessionOpts {
                     dead_mass_fraction: Some(f),
-                    connection: Some(connection()),
+                    model: Some(test_model()),
                     ..opts()
                 },
                 &cfg(),
@@ -1018,7 +1213,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 plan_stale_after: Some(12),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1032,7 +1227,7 @@ mod tests {
         let err = Session::build(
             SessionOpts {
                 plan_stale_after: Some(0),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1046,7 +1241,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 context_budget: Some(5_000),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1054,7 +1249,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             session.result_cap,
-            shaping::cap_for(5_000, session.connection.max_tokens)
+            shaping::cap_for(5_000, session.model.max_tokens)
         );
     }
 
@@ -1063,7 +1258,7 @@ mod tests {
         let err = Session::build(
             SessionOpts {
                 context_budget: Some(1_000),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1079,7 +1274,7 @@ mod tests {
         assert!(
             with(SessionOpts {
                 context_budget: Some(0),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             })
             .unwrap_err()
@@ -1090,7 +1285,7 @@ mod tests {
         assert!(
             with(SessionOpts {
                 eviction_slack: Some(1.0),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             })
             .unwrap_err()
@@ -1101,7 +1296,7 @@ mod tests {
         assert!(
             with(SessionOpts {
                 turn_limit: Some(0),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             })
             .unwrap_err()
@@ -1112,7 +1307,7 @@ mod tests {
         assert!(
             with(SessionOpts {
                 command_timeout_ms: Some(0),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             })
             .unwrap_err()
@@ -1122,12 +1317,7 @@ mod tests {
 
         assert!(
             with(SessionOpts {
-                connection: Some(Connection::new(
-                    "http://localhost:0/v1",
-                    "",
-                    "test-model",
-                    0
-                )),
+                model: Some(model_with_cap(0)),
                 ..opts()
             })
             .unwrap_err()
@@ -1142,7 +1332,7 @@ mod tests {
             Session::build(
                 SessionOpts {
                     compaction_keep: Some(k),
-                    connection: Some(connection()),
+                    model: Some(test_model()),
                     ..opts()
                 },
                 &cfg(),
@@ -1163,12 +1353,7 @@ mod tests {
                 context_budget: Some(10_000),
                 eviction_slack: Some(0.1),
                 compaction_keep: Some(0.95),
-                connection: Some(Connection::new(
-                    "http://localhost:0/v1",
-                    "",
-                    "test-model",
-                    1_000,
-                )),
+                model: Some(model_with_cap(1_000)),
                 ..opts()
             },
             &cfg(),
@@ -1185,12 +1370,7 @@ mod tests {
                 context_budget: Some(10_000),
                 eviction_slack: Some(0.1),
                 compaction_keep: Some(0.5),
-                connection: Some(Connection::new(
-                    "http://localhost:0/v1",
-                    "",
-                    "test-model",
-                    1_000,
-                )),
+                model: Some(model_with_cap(1_000)),
                 ..opts()
             },
             &cfg(),
@@ -1210,7 +1390,7 @@ mod tests {
             Session::build(
                 SessionOpts {
                     recovery_limit: Some(n),
-                    connection: Some(connection()),
+                    model: Some(test_model()),
                     ..opts()
                 },
                 &cfg(),
@@ -1230,7 +1410,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 recovery_shape: Some(RecoveryShape::Continuation),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1262,7 +1442,7 @@ mod tests {
             Session::build(
                 SessionOpts {
                     malformed_retry_budget: Some(n),
-                    connection: Some(connection()),
+                    model: Some(test_model()),
                     ..opts()
                 },
                 &cfg(),
@@ -1320,7 +1500,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 scout_pass_limit: Some(3),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1332,7 +1512,7 @@ mod tests {
             Session::build(
                 SessionOpts {
                     scout_pass_limit: Some(0),
-                    connection: Some(connection()),
+                    model: Some(test_model()),
                     ..opts()
                 },
                 &cfg()
@@ -1355,7 +1535,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 scout_no_think: Some(false),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1376,7 +1556,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 no_think_rescue: Some(false),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1523,7 +1703,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 command_timeout_ms: Some(1_234),
-                connection: Some(connection()),
+                model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
@@ -1543,7 +1723,7 @@ mod tests {
         assert_eq!(fc.model.as_deref(), Some("custom/model"));
         assert_eq!(fc.max_tokens, Some(4096));
         // Absent keys stay None.
-        assert_eq!(fc.base_url, None);
+        assert_eq!(fc.providers, None);
         assert_eq!(fc.recovery_shape, None);
     }
 
@@ -1557,6 +1737,42 @@ mod tests {
 
         // An excluded field (never in the DTO) is rejected the same way.
         assert!(FileConfig::parse(r#"{"turn_limit": 10}"#).is_err());
+
+        // The retired flat keys (ADR-0037: base_url and token moved into the
+        // providers table) are rejected, not silently honored.
+        assert!(FileConfig::parse(r#"{"base_url": "http://x/v1"}"#).is_err());
+        assert!(FileConfig::parse(r#"{"token": "sekrit"}"#).is_err());
+    }
+
+    #[test]
+    fn file_config_parses_a_providers_table() {
+        let fc = FileConfig::parse(
+            r#"{"providers": {"lmstudio": {
+                "base_url": "http://localhost:1234/v1",
+                "api": "openai-completions",
+                "context_window": 32768
+            }}}"#,
+        )
+        .unwrap();
+        let providers = fc.providers.clone().unwrap();
+        let lmstudio = &providers["lmstudio"];
+        assert_eq!(lmstudio.base_url, "http://localhost:1234/v1");
+        assert_eq!(lmstudio.api, Api::OpenaiCompletions);
+        assert_eq!(lmstudio.context_window, 32_768);
+        assert_eq!(lmstudio.token, None);
+
+        // A provider entry is deny_unknown_fields too.
+        assert!(
+            FileConfig::parse(
+                r#"{"providers": {"x": {
+                    "base_url": "http://x/v1",
+                    "api": "anthropic-messages",
+                    "context_window": 1000,
+                    "endpoint": "nope"
+                }}}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1626,7 +1842,9 @@ mod tests {
             fc.recovery_shape,
             Some(SessionConfig::base().recovery_shape)
         );
-        assert!(fc.token.is_none());
+        // The providers table rides the template, tokenless.
+        let providers = fc.providers.clone().unwrap();
+        assert!(providers["local"].token.is_none());
 
         // Refuses an existing target without force.
         let err = SessionConfig::write_template(&path, false).unwrap_err();
@@ -1686,8 +1904,7 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let fc = FileConfig::parse(&raw).unwrap();
 
-        assert!(fc.base_url.is_some());
-        assert!(fc.token.is_none());
+        assert!(fc.providers.is_some());
         assert!(fc.model.is_some());
         assert!(fc.max_tokens.is_some());
         assert!(fc.temperature.is_some());
@@ -1741,17 +1958,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_env_overlays_each_string_var_onto_its_field() {
+    fn apply_env_overlays_the_scoped_model_onto_its_field() {
         clear_suspenders_env();
-        set_env("SUSPENDERS_URL", "http://elsewhere:9999/v1");
-        set_env("SUSPENDERS_TOKEN", "sekrit");
         set_env("SUSPENDERS_MODEL", "env/model");
 
         let mut cfg = SessionConfig::test_defaults();
         SessionConfig::apply_env(&mut cfg).unwrap();
 
-        assert_eq!(cfg.base_url, "http://elsewhere:9999/v1");
-        assert_eq!(cfg.token, "sekrit");
         assert_eq!(cfg.model, "env/model");
     }
 

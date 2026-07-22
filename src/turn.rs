@@ -33,14 +33,12 @@ use crate::agent::{Msg, TurnMsg};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::Llm;
-use crate::llm::request::{self, LlmRequest};
+use crate::llm::model::Model;
 use crate::llm::response::Response;
-use crate::llm::stream::StreamEvent;
+use crate::llm::{Llm, LlmRequest, StreamEvent};
 use crate::plugins;
 use crate::scout::{Scout, ScoutOpts};
 use crate::session::Session;
-use crate::session::connection::Connection;
 use crate::turn::deps::{CompactError, Emitter, TurnDeps};
 use crate::turn::loop_::{Outcome, RunOpts};
 
@@ -49,7 +47,13 @@ use crate::turn::loop_::{Outcome, RunOpts};
 pub struct AgentDeps {
     tx: mpsc::UnboundedSender<Msg>,
     llm: Arc<dyn Llm>,
-    connection: Connection,
+    /// The Model this Turn captured at spawn (ADR-0033 amendment): every
+    /// request the Turn makes travels to it, and a `/model` swap mid-flight
+    /// never touches it.
+    model: Model,
+    /// The Session-resolved sampling temperature, applied to every request
+    /// this shell builds (ADR-0037: temperature rides the request).
+    temperature: Option<f64>,
     /// The accumulated Compaction state captured at Turn start; `compact`
     /// closes over it and, on success, notifies the Agent to log + update state
     /// (baud's compact_fn, ADR-0012).
@@ -60,13 +64,15 @@ impl AgentDeps {
     pub fn new(
         tx: mpsc::UnboundedSender<Msg>,
         llm: Arc<dyn Llm>,
-        connection: Connection,
+        model: Model,
+        temperature: Option<f64>,
         compaction: Compaction,
     ) -> Self {
         AgentDeps {
             tx,
             llm,
-            connection,
+            model,
+            temperature,
             compaction,
         }
     }
@@ -82,15 +88,15 @@ impl TurnDeps for AgentDeps {
         req: LlmRequest,
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> impl Future<Output = Response> + Send {
-        // Render the request to wire JSON, then call the injected boundary; each
-        // StreamEvent forwards to on_event (the Loop turns it into a
-        // message_update event).
-        let wire = request::build_request(&req, &self.connection);
+        // Attach the Session's temperature and call the injected boundary with
+        // the captured Model; each StreamEvent forwards to on_event (the Loop
+        // turns it into a message_update event).
+        let req = req.with_temperature(self.temperature);
         let llm = Arc::clone(&self.llm);
-        let connection = self.connection.clone();
+        let model = self.model.clone();
         async move {
             let mut adapter = |ev: &StreamEvent| on_event(ev);
-            llm.complete(wire, &connection, &mut adapter).await
+            llm.complete(&req, &model, &mut adapter).await
         }
     }
 
@@ -169,12 +175,13 @@ impl TurnDeps for AgentDeps {
         // {:compacted, ...} Session Log entry and update the accumulated state.
         let tx = self.tx.clone();
         let llm = Arc::clone(&self.llm);
-        let connection = self.connection.clone();
+        let model = self.model.clone();
+        let temperature = self.temperature;
         let compaction = self.compaction.clone();
         async move {
             let tokens_before = conversation.token_estimate();
             match compaction
-                .run(&conversation, llm.as_ref(), &connection)
+                .run(&conversation, llm.as_ref(), &model, temperature)
                 .await
             {
                 Ok((compacted, new_state)) => {
@@ -207,44 +214,55 @@ pub async fn run(
     let plugins = plugins::configured(&session.plugins);
 
     // The Tool ctx: the Session's Root/Result Cap/timeout, plus the `scout`
-    // capture wired to the Session's Llm + connection (baud wires this so
-    // explore can dispatch a Scout; the Rust Session carries the Llm via the
-    // injected boundary).
+    // capture wired to the Session's Llm and this Turn's captured Model (a
+    // Scout runs against the same captured Model - CONTEXT.md: Scout).
     let mut tool_ctx = session.tool_ctx();
     tool_ctx.scout = Some(make_scout(
         Arc::clone(&deps.llm),
-        session.connection.clone(),
+        deps.model.clone(),
         session.root.clone(),
-        session.scout_pass_limit,
-        session.context_budget,
-        session.scout_no_think,
-        session.command_timeout_ms,
+        ScoutKnobs {
+            pass_limit: session.scout_pass_limit,
+            context_budget: session.context_budget,
+            no_think: session.scout_no_think,
+            temperature: session.temperature,
+            command_timeout_ms: session.command_timeout_ms,
+        },
     ));
 
     loop_::run(conversation, &session, &plugins, &tool_ctx, &mut deps, opts).await
 }
 
-// Builds the `scout` capture on the Tool ctx: an effect that dispatches a Scout
-// for a task against the Session's Llm/connection and yields its outcome.
-fn make_scout(
-    llm: Arc<dyn Llm>,
-    connection: Connection,
-    root: String,
+// The Session knobs the `scout` capture carries into every dispatch, bundled
+// so `make_scout` stays a few named facts rather than a positional parade.
+struct ScoutKnobs {
     pass_limit: u64,
     context_budget: u64,
     no_think: bool,
+    temperature: Option<f64>,
     command_timeout_ms: u64,
+}
+
+// Builds the `scout` capture on the Tool ctx: an effect that dispatches a Scout
+// for a task against the Session's Llm and the captured Model and yields its
+// outcome.
+fn make_scout(
+    llm: Arc<dyn Llm>,
+    model: Model,
+    root: String,
+    knobs: ScoutKnobs,
 ) -> crate::scout::ScoutFn {
     Arc::new(move |task: String| {
         let llm = Arc::clone(&llm);
-        let connection = connection.clone();
+        let model = model.clone();
         let opts = ScoutOpts {
             root: std::path::PathBuf::from(&root),
-            pass_limit,
-            context_budget,
-            no_think,
-            command_timeout_ms,
+            pass_limit: knobs.pass_limit,
+            context_budget: knobs.context_budget,
+            no_think: knobs.no_think,
+            temperature: knobs.temperature,
+            command_timeout_ms: knobs.command_timeout_ms,
         };
-        Box::pin(async move { Scout::run(&task, llm.as_ref(), &connection, opts).await })
+        Box::pin(async move { Scout::run(&task, llm.as_ref(), &model, opts).await })
     })
 }

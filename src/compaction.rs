@@ -29,10 +29,9 @@
 //! `previous_summary`.
 
 use crate::conversation::Conversation;
-use crate::llm::Llm;
-use crate::llm::request::{self, LlmRequest};
+use crate::llm::model::Model;
 use crate::llm::response::StopReason;
-use crate::session::connection::Connection;
+use crate::llm::{Llm, LlmRequest};
 use crate::session::log::compose_summary;
 use crate::voice::{self, FileOps};
 
@@ -91,7 +90,8 @@ impl Compaction {
         &self,
         conv: &Conversation,
         llm: &dyn Llm,
-        connection: &Connection,
+        model: &Model,
+        temperature: Option<f64>,
     ) -> Result<(Conversation, Compaction), String> {
         let (to_summarize, cutoff_index, new_ops) = match conv.prepare_compaction() {
             None => return Err("nothing_to_compact".to_string()),
@@ -107,7 +107,9 @@ impl Compaction {
             .clone()
             .or_else(|| conv.original_task().map(|s| s.to_string()));
 
-        let narrative = self.summarize(&to_summarize, llm, connection).await?;
+        let narrative = self
+            .summarize(&to_summarize, llm, model, temperature)
+            .await?;
         // The model writes narrative; the harness appends the verbatim task
         // and accumulated file_ops mechanically, outside the LLM output.
         // compose_summary is the SINGLE source (reused by the log fold).
@@ -147,7 +149,8 @@ impl Compaction {
         prompt: &str,
         failing_command: Option<&str>,
         llm: &dyn Llm,
-        connection: &Connection,
+        model: &Model,
+        temperature: Option<f64>,
     ) -> Handoff {
         let merged_ops = merge_ops(
             &self.file_ops,
@@ -163,7 +166,10 @@ impl Compaction {
         }
         .map(|s| s.to_string());
 
-        let narrative = self.summarize(&conv.messages, llm, connection).await.ok();
+        let narrative = self
+            .summarize(&conv.messages, llm, model, temperature)
+            .await
+            .ok();
 
         let seed = crate::session::log::compose_handoff(
             narrative.as_deref(),
@@ -204,7 +210,8 @@ impl Compaction {
         &self,
         messages: &[crate::content::Message],
         llm: &dyn Llm,
-        connection: &Connection,
+        model: &Model,
+        temperature: Option<f64>,
     ) -> Result<String, String> {
         let serialized =
             voice::serialize_for_compaction(messages, self.previous_summary.as_deref());
@@ -217,14 +224,14 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
         );
 
         // A tool-free request over a single user message: no tools offered
-        // (build_request omits the `tools` key when empty), Thinking left on.
+        // (the adapter omits the `tools` key when empty), Thinking left on.
         let messages = vec![crate::content::Message::user(vec![
             crate::content::ContentBlock::text(prompt),
         ])];
-        let req = LlmRequest::new(COMPACTION_SYSTEM, messages, Vec::new());
-        let wire = request::build_request(&req, connection);
+        let req =
+            LlmRequest::new(COMPACTION_SYSTEM, messages, Vec::new()).with_temperature(temperature);
 
-        let response = llm.complete(wire, connection, &mut |_ev| {}).await;
+        let response = llm.complete(&req, model, &mut |_ev| {}).await;
 
         if response.stop_reason == StopReason::Error {
             return Err(response.error.unwrap_or_else(|| "llm_error".to_string()));
@@ -240,9 +247,10 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
         &self,
         conv: &Conversation,
         llm: &dyn Llm,
-        connection: &Connection,
+        model: &Model,
+        temperature: Option<f64>,
     ) -> Result<Conversation, String> {
-        self.run(conv, llm, connection)
+        self.run(conv, llm, model, temperature)
             .await
             .map(|(compacted, _new_state)| compacted)
     }
@@ -342,11 +350,12 @@ mod tests {
     use super::*;
     use crate::content::{ContentBlock, Role, Usage};
     use crate::conversation::ConversationOpts;
+    use crate::llm::model::Api;
     use crate::llm::response::{Response, StopReason};
     use crate::test_support::{Entry, FakeLlm};
 
-    fn connection() -> Connection {
-        Connection::new("http://test:4000/v1", "", "test-model", 4000)
+    fn test_model() -> Model {
+        Model::new("local", "test-model", Api::AnthropicMessages, 64_000, 4000)
     }
 
     fn ok_response(text: &str) -> Response {
@@ -465,7 +474,9 @@ mod tests {
     async fn returns_nothing_to_compact_for_a_bare_conversation() {
         let conv = Conversation::new("You are Baud.", ConversationOpts::new(2000, 500));
         let fake = FakeLlm::script(Vec::<Entry>::new());
-        let result = Compaction::new().run(&conv, &fake, &connection()).await;
+        let result = Compaction::new()
+            .run(&conv, &fake, &test_model(), None)
+            .await;
         assert_eq!(result, Err("nothing_to_compact".to_string()));
     }
 
@@ -476,7 +487,7 @@ mod tests {
         ))]);
         let conv = conversation_with_turns(5);
         let (compacted, new_state) = Compaction::new()
-            .run(&conv, &fake, &connection())
+            .run(&conv, &fake, &test_model(), None)
             .await
             .unwrap();
 
@@ -506,7 +517,9 @@ mod tests {
     async fn returns_error_when_llm_fails() {
         let fake = FakeLlm::script(vec![Entry::error("server_busy")]);
         let conv = conversation_with_turns(5);
-        let result = Compaction::new().run(&conv, &fake, &connection()).await;
+        let result = Compaction::new()
+            .run(&conv, &fake, &test_model(), None)
+            .await;
         assert_eq!(result, Err("server_busy".to_string()));
     }
 
@@ -524,7 +537,10 @@ mod tests {
             },
         };
 
-        let (_compacted, new_state) = prev_state.run(&conv, &fake, &connection()).await.unwrap();
+        let (_compacted, new_state) = prev_state
+            .run(&conv, &fake, &test_model(), None)
+            .await
+            .unwrap();
 
         assert_eq!(
             new_state.file_ops.read_files,
@@ -548,7 +564,7 @@ mod tests {
         add_turns(&mut conv, 5);
 
         let (_compacted, new_state) = Compaction::new()
-            .run(&conv, &fake, &connection())
+            .run(&conv, &fake, &test_model(), None)
             .await
             .unwrap();
         assert_eq!(new_state.original_task.as_deref(), Some(task));
@@ -566,7 +582,7 @@ mod tests {
         add_turns(&mut conv, 5);
 
         let (compacted, _new_state) = Compaction::new()
-            .run(&conv, &fake, &connection())
+            .run(&conv, &fake, &test_model(), None)
             .await
             .unwrap();
 
@@ -588,7 +604,10 @@ mod tests {
             },
         };
 
-        let (compacted, _new_state) = prev_state.run(&conv, &fake, &connection()).await.unwrap();
+        let (compacted, _new_state) = prev_state
+            .run(&conv, &fake, &test_model(), None)
+            .await
+            .unwrap();
 
         let summary_text = message_text(&compacted.messages[0]);
         assert!(summary_text.contains("lib/other.ex"));
@@ -608,7 +627,7 @@ mod tests {
         add_turns(&mut conv, 5);
 
         let (mut compacted1, state1) = Compaction::new()
-            .run(&conv, &fake, &connection())
+            .run(&conv, &fake, &test_model(), None)
             .await
             .unwrap();
         assert_eq!(state1.original_task.as_deref(), Some(task));
@@ -617,7 +636,10 @@ mod tests {
         // message the first compaction produced no longer starts with the
         // original user text, so only the carried state can preserve it.
         add_turns(&mut compacted1, 5);
-        let (compacted2, state2) = state1.run(&compacted1, &fake, &connection()).await.unwrap();
+        let (compacted2, state2) = state1
+            .run(&compacted1, &fake, &test_model(), None)
+            .await
+            .unwrap();
 
         assert_eq!(state2.original_task.as_deref(), Some(task));
 
@@ -659,7 +681,7 @@ mod tests {
         let conv = dying_conversation();
 
         let handoff = Compaction::new()
-            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &connection())
+            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &test_model(), None)
             .await;
 
         // One user message: the seed with the prompt merged onto it.
@@ -698,7 +720,7 @@ mod tests {
             file_ops: FileOps::default(),
         };
         let handoff = prev
-            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &connection())
+            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &test_model(), None)
             .await;
 
         assert_eq!(handoff.narrative, None);
@@ -722,7 +744,7 @@ mod tests {
         conv.add_assistant_blocks(vec![ContentBlock::text("[turn limit reached]")]);
 
         let handoff = Compaction::new()
-            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &connection())
+            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &test_model(), None)
             .await;
 
         assert_eq!(handoff.verification, None);
@@ -764,7 +786,8 @@ mod tests {
                 "[recovery prompt]",
                 Some("cargo test"),
                 &fake,
-                &connection(),
+                &test_model(),
+                None,
             )
             .await;
 
@@ -784,7 +807,7 @@ mod tests {
         let conv = conversation_with_turns(5);
 
         let compacted = Compaction::new()
-            .recovery_capture(&conv, &fake, &connection())
+            .recovery_capture(&conv, &fake, &test_model(), None)
             .await
             .unwrap();
         assert!(compacted.messages.len() < conv.messages.len());
@@ -795,7 +818,7 @@ mod tests {
         let fake = FakeLlm::script(vec![Entry::error("timeout")]);
         let conv = conversation_with_turns(5);
         let result = Compaction::new()
-            .recovery_capture(&conv, &fake, &connection())
+            .recovery_capture(&conv, &fake, &test_model(), None)
             .await;
         assert_eq!(result, Err("timeout".to_string()));
     }
@@ -836,7 +859,7 @@ mod tests {
         let fake = FakeLlm::script(vec![Entry::just(ok_response("narr"))]);
         let conv = conversation_with_turns(5);
         let (compacted, _state) = Compaction::new()
-            .run(&conv, &fake, &connection())
+            .run(&conv, &fake, &test_model(), None)
             .await
             .unwrap();
 

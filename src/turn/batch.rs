@@ -30,7 +30,7 @@ use crate::approvals;
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::stream::malformed_tool_input;
+use crate::llm::malformed_tool_input;
 use crate::plan::Update;
 use crate::plugin::Token;
 use crate::plugins;

@@ -1000,7 +1000,7 @@ mod tests {
             vec![
                 Event::message_start(1),
                 Event::message_update(
-                    crate::llm::stream::Delta::Text("stale".into()),
+                    crate::llm::Delta::Text("stale".into()),
                     vec![text_block("stale")],
                 ),
             ],
@@ -1027,7 +1027,7 @@ mod tests {
                 Event::turn_started("r1"),
                 Event::message_start(1),
                 Event::message_update(
-                    crate::llm::stream::Delta::Text("Done.".into()),
+                    crate::llm::Delta::Text("Done.".into()),
                     vec![text_block("Done.")],
                 ),
                 Event::TurnFinished {
@@ -1713,7 +1713,7 @@ mod tests {
                 Event::turn_started("r1"),
                 Event::message_start(1),
                 Event::message_update(
-                    crate::llm::stream::Delta::Thinking("half a thought".into()),
+                    crate::llm::Delta::Thinking("half a thought".into()),
                     vec![thinking_block("half a thought")],
                 ),
                 Event::TurnCancelled,
@@ -1755,7 +1755,7 @@ mod tests {
                 Event::turn_started("r1"),
                 Event::message_start(1),
                 Event::message_update(
-                    crate::llm::stream::Delta::Text("half an ans".into()),
+                    crate::llm::Delta::Text("half an ans".into()),
                     vec![text_block("half an ans")],
                 ),
             ],

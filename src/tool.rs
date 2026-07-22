@@ -23,8 +23,10 @@ use std::path::{Path, PathBuf};
 
 /// A tool's spec in Anthropic tool format: a name, a description, and a JSON
 /// Schema `input_schema` (an open edge, so it stays a `serde_json::Value`).
-/// Mirrors baud's `Baud.Tool.spec/0` shape.
-#[derive(Debug, Clone, PartialEq)]
+/// Mirrors baud's `Baud.Tool.spec/0` shape. Serializes to exactly its wire
+/// shape, so the Conversation's tool-spec overhead estimate counts what a
+/// request carries without reaching into an adapter.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,

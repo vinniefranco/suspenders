@@ -1,6 +1,6 @@
 //! Scout - the disposable read-only worker the model dispatches through the
 //! explore Tool (CONTEXT.md). It searches the Project Root in its own fresh
-//! Conversation against the same model connection, with a hard Pass cap and a
+//! Conversation against the same captured Model, with a hard Pass cap and a
 //! read-only Tool subset (read_file, list_files, grep), and returns a
 //! structured findings report.
 //!
@@ -9,9 +9,9 @@
 //! Like [`crate::compaction`], the Scout calls the [`Llm`] boundary directly -
 //! it is an effect that lives outside the Turn loop (ADR-0011, ADR-0013). The
 //! explore Tool reaches it through the `scout` capture on the Tool ctx, which
-//! wires the Session's llm and connection. The Turn loop never sees the
-//! Scout's Conversation; only the explore Tool Call and its Tool Result flow
-//! through the normal path.
+//! wires the Session's llm and the Turn's captured Model. The Turn loop never
+//! sees the Scout's Conversation; only the explore Tool Call and its Tool
+//! Result flow through the normal path.
 //!
 //! ## No nesting
 //!
@@ -45,10 +45,9 @@ use std::sync::Arc;
 
 use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
-use crate::llm::Llm;
-use crate::llm::request::{self, LlmRequest};
+use crate::llm::model::Model;
 use crate::llm::response::StopReason;
-use crate::session::connection::Connection;
+use crate::llm::{Llm, LlmRequest};
 use crate::tool::ToolCtx;
 use crate::tools;
 use crate::tools::shaping;
@@ -98,6 +97,9 @@ pub struct ScoutOpts {
     pub context_budget: u64,
     /// Carry the no-think wire field on every Scout request (ADR-0014).
     pub no_think: bool,
+    /// The Session-resolved sampling temperature, carried on every Scout
+    /// request (ADR-0037: temperature rides the request).
+    pub temperature: Option<f64>,
     /// The read-only registry has no run_command, so this is never read; it
     /// still must honor the ctx type.
     pub command_timeout_ms: u64,
@@ -110,61 +112,59 @@ impl Default for ScoutOpts {
             pass_limit: DEFAULT_PASS_LIMIT,
             context_budget: DEFAULT_CONTEXT_BUDGET,
             no_think: false,
+            temperature: None,
             command_timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
         }
     }
 }
 
-/// The Scout: `run` dispatches one over `task` against the same model
-/// `connection` and returns the structured findings report as a
-/// [`ScoutOutcome`]. Never panics.
+/// The Scout: `run` dispatches one over `task` against the same captured
+/// `model` and returns the structured findings report as a [`ScoutOutcome`].
+/// Never panics.
 pub struct Scout;
 
 // The Scout's own loop state, threaded across Passes.
 struct LoopState<'a> {
     llm: &'a dyn Llm,
-    connection: &'a Connection,
+    model: &'a Model,
     ctx: ToolCtx,
     pass_limit: u64,
     pass: u64,
     last_text: String,
     no_think: bool,
+    temperature: Option<f64>,
 }
 
 impl Scout {
-    /// Runs one Scout over `task` against the same model `connection`,
+    /// Runs one Scout over `task` against the same captured `model`,
     /// returning the structured findings report.
     ///
     /// Returns [`ScoutOutcome::Ok`] with the report, or an error variant
     /// (`LlmError`, `PassCap`, `Empty`) carrying whatever findings text was
     /// gathered (possibly empty). Never panics.
-    pub async fn run(
-        task: &str,
-        llm: &dyn Llm,
-        connection: &Connection,
-        opts: ScoutOpts,
-    ) -> ScoutOutcome {
+    pub async fn run(task: &str, llm: &dyn Llm, model: &Model, opts: ScoutOpts) -> ScoutOutcome {
         let ctx = ToolCtx {
             root: opts.root,
-            result_cap: shaping::cap_for(opts.context_budget, connection.max_tokens),
+            result_cap: shaping::cap_for(opts.context_budget, model.max_tokens),
             command_timeout_ms: opts.command_timeout_ms,
             scout: None,
         };
 
         let mut conversation = Conversation::new(
             voice::scout_system_prompt(),
-            ConversationOpts::new(opts.context_budget, connection.max_tokens),
+            ConversationOpts::new(opts.context_budget, model.max_tokens),
         );
         conversation.add_user_text(task);
 
         let state = LoopState {
             llm,
-            connection,
+            model,
             ctx,
             pass_limit: opts.pass_limit,
             pass: 1,
             last_text: String::new(),
             no_think: opts.no_think,
+            temperature: opts.temperature,
         };
 
         Self::loop_(conversation, state).await
@@ -210,12 +210,12 @@ impl Scout {
                 tools::scout_specs()
             };
             let scout_request = LlmRequest::new(req.system, req.messages, tools_specs)
-                .with_no_think(state.no_think);
-            let wire = request::build_request(&scout_request, state.connection);
+                .with_no_think(state.no_think)
+                .with_temperature(state.temperature);
 
             let response = state
                 .llm
-                .complete(wire, state.connection, &mut |_ev| {})
+                .complete(&scout_request, state.model, &mut |_ev| {})
                 .await;
 
             match response.stop_reason {
@@ -287,14 +287,15 @@ fn extract_text(content: &[ContentBlock]) -> String {
 mod tests {
     use super::*;
     use crate::content::{ContentBlock, Message, Role, Usage};
+    use crate::llm::model::Api;
     use crate::llm::response::{Response, StopReason};
     use crate::test_support::{Entry, FakeLlm};
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    fn connection() -> Connection {
-        Connection::new("http://localhost:0/v1", "", "m", 8)
+    fn model() -> Model {
+        Model::new("local", "m", Api::AnthropicMessages, 64_000, 8)
     }
 
     // A tmp Project Root with a widget file, mirroring baud's setup.
@@ -350,7 +351,7 @@ mod tests {
             Entry::just(text_response("read-only report")),
         ]);
 
-        let outcome = Scout::run("explore", &fake, &connection(), opts(&root)).await;
+        let outcome = Scout::run("explore", &fake, &model(), opts(&root)).await;
         assert_eq!(outcome, ScoutOutcome::Ok("read-only report".to_string()));
         assert!(!root.path().join("pwned").exists());
     }
@@ -363,7 +364,7 @@ mod tests {
         let report = "Locations: widget.ex:2. How it works: Widget.go returns :ok.";
         let fake = FakeLlm::script(vec![Entry::just(text_response(report))]);
 
-        let outcome = Scout::run("where does go live", &fake, &connection(), opts(&root)).await;
+        let outcome = Scout::run("where does go live", &fake, &model(), opts(&root)).await;
         assert_eq!(outcome, ScoutOutcome::Ok(report.to_string()));
     }
 
@@ -380,7 +381,7 @@ mod tests {
             Entry::just(text_response("Found Widget.go at widget.ex:2.")),
         ]);
 
-        let outcome = Scout::run("find go", &fake, &connection(), opts(&root)).await;
+        let outcome = Scout::run("find go", &fake, &model(), opts(&root)).await;
         assert_eq!(
             outcome,
             ScoutOutcome::Ok("Found Widget.go at widget.ex:2.".to_string())
@@ -392,12 +393,15 @@ mod tests {
         let root = root();
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let cap = Arc::clone(&captured);
-        let fake = FakeLlm::script(vec![Entry::dynamic(vec![], move |req: &Value| {
-            *cap.lock().unwrap() = Some(req["system"].as_str().unwrap_or("").to_string());
-            text_response("done")
-        })]);
+        let fake = FakeLlm::script(vec![Entry::dynamic(
+            vec![],
+            move |req: &LlmRequest, _model: &Model| {
+                *cap.lock().unwrap() = Some(req.system.clone());
+                text_response("done")
+            },
+        )]);
 
-        Scout::run("task", &fake, &connection(), opts(&root)).await;
+        Scout::run("task", &fake, &model(), opts(&root)).await;
 
         assert_eq!(
             captured.lock().unwrap().as_deref(),
@@ -412,18 +416,16 @@ mod tests {
         let root = root();
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let cap = Arc::clone(&captured);
-        let fake = FakeLlm::script(vec![Entry::dynamic(vec![], move |req: &Value| {
-            let names: Vec<String> = req["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["name"].as_str().unwrap().to_string())
-                .collect();
-            *cap.lock().unwrap() = names;
-            text_response("done")
-        })]);
+        let fake = FakeLlm::script(vec![Entry::dynamic(
+            vec![],
+            move |req: &LlmRequest, _model: &Model| {
+                let names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+                *cap.lock().unwrap() = names;
+                text_response("done")
+            },
+        )]);
 
-        Scout::run("task", &fake, &connection(), opts(&root)).await;
+        Scout::run("task", &fake, &model(), opts(&root)).await;
 
         let mut names = captured.lock().unwrap().clone();
         names.sort();
@@ -435,18 +437,16 @@ mod tests {
         let root = root();
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let cap = Arc::clone(&captured);
-        let fake = FakeLlm::script(vec![Entry::dynamic(vec![], move |req: &Value| {
-            let names: Vec<String> = req["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["name"].as_str().unwrap().to_string())
-                .collect();
-            *cap.lock().unwrap() = names;
-            text_response("done")
-        })]);
+        let fake = FakeLlm::script(vec![Entry::dynamic(
+            vec![],
+            move |req: &LlmRequest, _model: &Model| {
+                let names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+                *cap.lock().unwrap() = names;
+                text_response("done")
+            },
+        )]);
 
-        Scout::run("task", &fake, &connection(), opts(&root)).await;
+        Scout::run("task", &fake, &model(), opts(&root)).await;
 
         let names = captured.lock().unwrap().clone();
         for excluded in ["explore", "plan", "edit_file", "write_file", "run_command"] {
@@ -463,12 +463,12 @@ mod tests {
         let s1 = Arc::clone(&seen);
         let s2 = Arc::clone(&seen);
         let fake = FakeLlm::script(vec![
-            Entry::dynamic(vec![], move |req: &Value| {
-                s1.lock().unwrap().push(has_no_think(req));
+            Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
+                s1.lock().unwrap().push(req.no_think);
                 tool_use_response("t1", "list_files", json!({}))
             }),
-            Entry::dynamic(vec![], move |req: &Value| {
-                s2.lock().unwrap().push(has_no_think(req));
+            Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
+                s2.lock().unwrap().push(req.no_think);
                 text_response("done")
             }),
         ]);
@@ -477,7 +477,7 @@ mod tests {
             no_think: true,
             ..opts(&root)
         };
-        Scout::run("task", &fake, &connection(), opts).await;
+        Scout::run("task", &fake, &model(), opts).await;
 
         assert_eq!(seen.lock().unwrap().clone(), vec![true, true]);
     }
@@ -487,24 +487,17 @@ mod tests {
         let root = root();
         let seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
         let s = Arc::clone(&seen);
-        let fake = FakeLlm::script(vec![Entry::dynamic(vec![], move |req: &Value| {
-            *s.lock().unwrap() = Some(has_no_think(req));
-            text_response("done")
-        })]);
+        let fake = FakeLlm::script(vec![Entry::dynamic(
+            vec![],
+            move |req: &LlmRequest, _model: &Model| {
+                *s.lock().unwrap() = Some(req.no_think);
+                text_response("done")
+            },
+        )]);
 
-        Scout::run("task", &fake, &connection(), opts(&root)).await;
+        Scout::run("task", &fake, &model(), opts(&root)).await;
 
         assert_eq!(*seen.lock().unwrap(), Some(false));
-    }
-
-    // Mirrors baud's `Map.has_key?(request, :no_think)` - the wire field is
-    // the no-think key `chat_template_kwargs.enable_thinking == false`.
-    fn has_no_think(req: &Value) -> bool {
-        req.get("chat_template_kwargs")
-            .and_then(|k| k.get("enable_thinking"))
-            .and_then(|v| v.as_bool())
-            .map(|b| !b)
-            .unwrap_or(false)
     }
 
     // ---- the report Pass ----
@@ -516,12 +509,9 @@ mod tests {
         let cap = Arc::clone(&captured);
         let fake = FakeLlm::script(vec![
             Entry::just(tool_use_response("t1", "list_files", json!({}))),
-            Entry::dynamic(vec![], move |req: &Value| {
-                let tool_count = req["tools"].as_array().map(|a| a.len()).unwrap_or(0);
-                let messages: Vec<Message> =
-                    serde_json::from_value(req["messages"].clone()).unwrap();
-                let last = messages.last().cloned().unwrap();
-                *cap.lock().unwrap() = Some((tool_count, last));
+            Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
+                let last = req.messages.last().cloned().unwrap();
+                *cap.lock().unwrap() = Some((req.tools.len(), last));
                 text_response("Findings: widget.ex holds Widget.")
             }),
         ]);
@@ -530,7 +520,7 @@ mod tests {
             pass_limit: 2,
             ..opts(&root)
         };
-        let outcome = Scout::run("task", &fake, &connection(), scout_opts).await;
+        let outcome = Scout::run("task", &fake, &model(), scout_opts).await;
         assert_eq!(
             outcome,
             ScoutOutcome::Ok("Findings: widget.ex holds Widget.".to_string())
@@ -567,7 +557,7 @@ mod tests {
             pass_limit: 2,
             ..opts(&root)
         };
-        let outcome = Scout::run("task", &fake, &connection(), scout_opts).await;
+        let outcome = Scout::run("task", &fake, &model(), scout_opts).await;
         assert_eq!(
             outcome,
             ScoutOutcome::Empty {
@@ -591,7 +581,7 @@ mod tests {
             pass_limit: 3,
             ..opts(&root)
         };
-        let outcome = Scout::run("loop forever", &fake, &connection(), scout_opts).await;
+        let outcome = Scout::run("loop forever", &fake, &model(), scout_opts).await;
         match outcome {
             ScoutOutcome::PassCap { limit, partial: _ } => assert_eq!(limit, 3),
             other => panic!("expected PassCap, got {other:?}"),
@@ -605,7 +595,7 @@ mod tests {
         let forever: Vec<Entry> = (0..20)
             .map(|_| {
                 let c = Arc::clone(&count);
-                Entry::dynamic(vec![], move |_req: &Value| {
+                Entry::dynamic(vec![], move |_req: &LlmRequest, _model: &Model| {
                     *c.lock().unwrap() += 1;
                     tool_use_response("t", "list_files", json!({}))
                 })
@@ -617,7 +607,7 @@ mod tests {
             pass_limit: 4,
             ..opts(&root)
         };
-        Scout::run("loop", &fake, &connection(), scout_opts).await;
+        Scout::run("loop", &fake, &model(), scout_opts).await;
 
         assert_eq!(*count.lock().unwrap(), 4);
     }
@@ -629,7 +619,7 @@ mod tests {
         let root = root();
         let fake = FakeLlm::script(vec![Entry::error("connection_refused")]);
 
-        let outcome = Scout::run("task", &fake, &connection(), opts(&root)).await;
+        let outcome = Scout::run("task", &fake, &model(), opts(&root)).await;
         match outcome {
             ScoutOutcome::LlmError { partial: _ } => {}
             other => panic!("expected LlmError, got {other:?}"),
@@ -647,7 +637,7 @@ mod tests {
         };
         let fake = FakeLlm::script(vec![Entry::just(partial_response)]);
 
-        let outcome = Scout::run("task", &fake, &connection(), opts(&root)).await;
+        let outcome = Scout::run("task", &fake, &model(), opts(&root)).await;
         assert_eq!(
             outcome,
             ScoutOutcome::LlmError {
@@ -661,7 +651,7 @@ mod tests {
         let root = root();
         let fake = FakeLlm::script(vec![Entry::just(text_response("   "))]);
 
-        let outcome = Scout::run("task", &fake, &connection(), opts(&root)).await;
+        let outcome = Scout::run("task", &fake, &model(), opts(&root)).await;
         match outcome {
             ScoutOutcome::Empty { partial: _ } => {}
             other => panic!("expected Empty, got {other:?}"),

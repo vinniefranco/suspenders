@@ -1,6 +1,6 @@
 # Suspenders
 
-A terminal coding agent for small local models: a full-screen TUI where a locally-served LLM completes coding tasks in the user's project by calling tools.
+A terminal coding agent, local-first: a full-screen TUI where an LLM - a locally-served small model by default, any configured Provider's model when chosen - completes coding tasks in the user's project by calling tools.
 
 > This file is a glossary and nothing else - the ubiquitous language of the
 > domain. Implementation and architecture decisions live in `docs/adr/`.
@@ -8,14 +8,34 @@ A terminal coding agent for small local models: a full-screen TUI where a locall
 ## Language
 
 **Session**:
-One run of the Suspenders TUI, from launch to exit, holding exactly one Conversation. Its fixed facts - the Project Root, the Context Budget, the Result Cap, the Turn Limit, the command timeout, the Plugin list, and the model connection (endpoint, token, output cap, temperature) - are resolved and validated once at launch into a Session value; the Conversation and the Active Model are mutable state that live beside that value, owned by the Agent.
+One run of the Suspenders TUI, from launch to exit, holding exactly one Conversation. Its fixed facts - the Project Root, the Turn Limit, the command timeout, the Plugin list, the Provider set (each Provider's endpoint, credential, and Api), and the sampling temperature - are resolved and validated once at launch into a Session value; the Conversation and the Active Model are mutable state that live beside that value, owned by the Agent. The Context Budget and the Result Cap are not fixed facts: they derive from the Model each Turn captures.
 
 **Conversation**:
 The ordered message history sent to the model - user messages, assistant messages, and Tool Results.
 
 **Active Model**:
-The model identifier the next Turn will call. Owned by the Agent as mutable state beside the Session value - not one of the Session's fixed facts. Seeded from the model connection at launch and changed by the `/model` Slash Command; only the identifier changes, never the endpoint, the output cap, or any figure the Context Budget and Result Cap derive from, so a change needs no re-validation. A change takes effect on the next Turn: an in-flight Turn finishes on the model it captured when it began.
-_Avoid_: current model, model connection (the connection is the fixed endpoint and credentials; the Active Model is the mutable choice of which model to call over it).
+The Model the next Turn will call, named by a scoped identifier - `provider/model-id`. Owned by the Agent as mutable state beside the Session value - not one of the Session's fixed facts. Seeded from config at launch and changed by the `/model` Slash Command. A change takes effect on the next Turn: each Turn captures the whole Model (window, output cap, pricing, compat) when it begins, and the Context Budget, Result Cap, and Eviction reserve derive from that capture - so a switch needs no re-validation, and an in-flight Turn finishes on the Model it captured.
+_Avoid_: current model, model connection (retired with the single-connection era; the Provider owns the endpoint and credential, the Active Model is the mutable choice of which Model to call).
+
+**Provider**:
+A host that serves models: an identifier, a base URL, a credential, and the Api its Models speak. Built-in Providers (anthropic, openai, …) come from the Catalog and need only their environment key; custom Providers (a local LM Studio, a private proxy) are declared in config and discover their Models live via the host's models endpoint. Part of the Session's fixed facts.
+_Avoid_: backend, vendor, connection (the retired single-connection term)
+
+**Api**:
+A wire protocol an adapter speaks - `anthropic-messages`, `openai-completions`. The seam of the LLM boundary: Suspenders hand-writes one adapter per Api, and every Provider is data that selects one. Host quirks within an Api are per-Model compat facts, never subclasses.
+_Avoid_: protocol (ambiguous with transport), driver
+
+**Model**:
+The facts of one model at one Provider: scoped identifier, Api, context window, output cap, pricing, and compat quirks. Read from the Catalog for built-in Providers; synthesized from live discovery plus config for custom ones. The Turn captures a Model when it begins, and the budget figures derive from that capture.
+_Avoid_: model card, model info
+
+**Catalog**:
+The generated registry of known Providers and their Models, produced from models.dev by a committed generator and embedded in the binary. The baseline that live discovery overlays; custom Providers live beside it, not in it.
+_Avoid_: model list (that's a live models-endpoint answer), registry (implementation term)
+
+**Provenance**:
+The Provider and Model stamped on every assistant message as it enters the Conversation, persisted in the Session Log. Read at request-shaping: history whose Provenance matches the target Model replays verbatim; history from elsewhere is normalized (tool-call identifiers rewritten to the target Api's rules, orphaned Tool Calls answered in the Voice) so a Conversation crosses Providers without a restart.
+_Avoid_: origin, source model
 
 **Turn**:
 One user request and everything the Agent does to answer it - the model may make many Tool Calls within a single Turn.
@@ -102,7 +122,7 @@ The result of an approve-always answer: run_command Tool Calls whose command str
 _Avoid_: allowlist (implementation term), whitelist
 
 **Context Budget**:
-The token allowance the Conversation must fit within for the configured model.
+The token allowance the Conversation must fit within, derived each Turn from the captured Model's context window. Config supplies the window for Models the Catalog does not know, and may cap it globally.
 
 **Eviction**:
 Replacing the contents of dead Conversation blocks with an elision marker: old Tool Results, superseded Anchors, results made dead by Supersession, and the input bodies of successful writes. A wave fires when the Conversation presses the Context Budget or when Dead Mass crosses its threshold; once triggered, Eviction overshoots to a low-water mark, so elisions arrive in rare waves and the request prefix stays byte-stable for server-side prompt caching between them.
@@ -117,7 +137,7 @@ The rule that classifies Conversation content as dead: a newer result of an iden
 _Avoid_: deduplication (mechanism, not meaning), pruning
 
 **Result Cap**:
-The size ceiling one Tool Result may occupy in the Conversation, derived from the Context Budget once per Session. Oversized Tool Results are cut before they enter the Conversation: run_command keeps its start and end (the exit code lives at the end), every other Tool keeps its start.
+The size ceiling one Tool Result may occupy in the Conversation, derived from the Context Budget the Turn captured. Oversized Tool Results are cut before they enter the Conversation: run_command keeps its start and end (the exit code lives at the end), every other Tool keeps its start.
 _Avoid_: output limit, truncation (reserved for the server's failure mode)
 
 **Cancellation**:
@@ -193,7 +213,10 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 
 - A **Session** has exactly one **Conversation**, one **Transcript**, and one **Project Root**
 - A **Session**'s fixed facts are resolved and validated once at launch; every **Turn** and **Tool Call** reads them from that value, never from ambient configuration
-- The **Active Model** is the one thing a **Turn** does NOT read from the fixed **Session** value: the **Agent** owns it mutably and each **Turn** captures it when it begins, so a `/model` change lands on the next **Turn**, never mid-flight
+- The **Active Model** is the one thing a **Turn** does NOT read from the fixed **Session** value: the **Agent** owns it mutably and each **Turn** captures its whole **Model** when it begins, so a `/model` change lands on the next **Turn**, never mid-flight
+- A **Session** holds a fixed **Provider** set; the **Active Model** names one Provider's **Model**, and every request travels over that Provider's endpoint and credential through the adapter its **Api** selects
+- The **Context Budget**, the **Result Cap**, and the Eviction reserve derive from the **Model** the **Turn** captured, recomputed at each Turn's start
+- Every assistant message carries **Provenance**; request-shaping replays history that matches the target **Model** verbatim and normalizes the rest, so a **Conversation** crosses **Providers** without a restart
 - A **Conversation** is a sequence of **Turns**
 - A **Turn** is one or more **Passes**; the **Turn Limit** counts **Passes**
 - A **Turn** contains zero or more **Tool Calls**, each producing exactly one **Tool Result**
@@ -203,7 +226,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - **Eviction** targets dead content - old **Tool Results**, blocks dead by **Supersession**, the input bodies of successful writes, superseded **Anchors** - oldest first, and never the system prompt, the two most recent tool-result exchanges, or the most recent **Anchor**
 - **Eviction** fires in waves on either of two triggers - Context Budget pressure, or **Dead Mass** crossing its threshold; once triggered it elides down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
 - When **Eviction** cannot fit the **Conversation** within the **Context Budget**, the **Turn** fails loudly; an over-budget request is never sent
-- Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** once per **Session**
+- Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** the **Turn** captured
 - The system prompt, every **Nudge**, and every marker belong to the **Voice**; the **Governors** that fire them own the when, not the wording
 - Every **Nudge**, every **Anchor** placement, and every **Endgame** step is issued by a **Governor**; **Compaction** and **Eviction** are not
 - A **Governor** acts only through an **Intervention**; when several **Governors** fire at the same moment, one explicit precedence decides which speaks
@@ -222,7 +245,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the **Dangling Failure**'s own result verbatim - the command the recovery prompt names, not merely the last one run; a **Continuation** keeps the whole **Conversation**
 - **Steering** is delivered after a Tool Call batch completes and before the next model call; a Turn that ends first triggers **Rollover**, a **Cancellation** discards it
 - **Steering** belongs to the user's voice and is never part of the **Voice**
-- A **Scout** runs its own fresh **Conversation** against the same model connection; its report is an ordinary **Tool Result**, subject to the **Result Cap**, and its exploration never enters the main **Conversation**
+- A **Scout** runs its own fresh **Conversation** against the same captured **Model**; its report is an ordinary **Tool Result**, subject to the **Result Cap**, and its exploration never enters the main **Conversation**
 - A **Plan** is the model's voice, held by the harness outside the **Conversation**; only its **Anchor** copies enter the **Conversation**
 - An **Anchor** is refreshed immediately after every **Compaction** and periodically between them; stale **Anchors** are evictable like any old block
 - **Compaction** fires at the **Compaction Target** and retains the **Compaction Keep**; the two are decoupled so Compactions are rare and deep

@@ -84,3 +84,25 @@ Re-selecting the current model is a no-op - no swap, no write, no warning.
   without wiring it fails loudly.
 - The Active Model shows in the status bar beside the endpoint - the mutable
   connection fact is surfaced, not just the fixed one.
+
+## Amendment (ADR-0037): the single-connection premise is reversed
+
+This ADR rejected pi's model registry because "Suspenders has exactly one
+connection." Providers (ADR-0037) remove that premise, and with it two
+decisions here:
+
+- **"Only the model identifier changes" is superseded.** The Active Model
+  becomes a scoped `provider/model-id`, and each Turn captures the whole
+  Model - window, output cap, pricing, compat - not just the id. The
+  Context Budget, Result Cap, and Eviction reserve derive from that capture
+  at Turn start, so a cross-Provider switch lands as ordinary budget
+  pressure on the next Turn instead of a silent mismatch.
+- **The registry rejection is reversed.** A generated Catalog (models.dev)
+  is the source of truth for built-in Providers; the live `GET /models`
+  listing this ADR built survives for custom Providers, whose Models are
+  synthesized from discovery plus config.
+
+What survives unchanged: the Active Model as mutable Agent state beside the
+fixed Session facts, change-on-next-Turn semantics, no mid-stream swap, the
+no-op on re-selection, and the sticky sparse write of the `model` key (now
+scoped) with its env-shadow warning.

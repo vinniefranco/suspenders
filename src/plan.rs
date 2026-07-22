@@ -174,11 +174,7 @@ mod tests {
             Update::Unchanged
         );
         assert_eq!(
-            plan.update(
-                "plan",
-                &crate::llm::stream::malformed_input_marker("raw"),
-                false
-            ),
+            plan.update("plan", &crate::llm::malformed_input_marker("raw"), false),
             Update::Unchanged
         );
     }
