@@ -19,7 +19,7 @@
 //! * the Result Cap derives from the same two numbers, once, here
 //!
 //! The Provider set (ADR-0037) resolves here too: custom Providers from the
-//! config `providers` table, built-ins from the seed Catalog with each one's
+//! config `providers` table, built-ins from the generated Catalog with each one's
 //! own environment key. The launch `model` (a scoped `provider/model-id`)
 //! resolves against that set - an unknown Provider fails launch loudly.
 //!
@@ -115,7 +115,7 @@ pub struct Session {
     pub result_cap: usize,
     pub session_dir: String,
     /// The resolved Provider set (ADR-0037): custom Providers from config,
-    /// built-ins from the seed Catalog with their environment credentials.
+    /// built-ins from the generated Catalog with their environment credentials.
     pub providers: Vec<Provider>,
     /// The launch-resolved Model - the Active Model's seed (ADR-0033
     /// amendment). Its output cap is the Eviction reserve and feeds the

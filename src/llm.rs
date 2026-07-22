@@ -27,6 +27,7 @@
 
 pub mod anthropic_messages;
 pub mod catalog;
+pub mod cost;
 pub mod model;
 pub mod openai_completions;
 pub mod provider;

@@ -46,6 +46,12 @@ regex = "1"                                                  # grep, edit_file f
 directories = "5"                                            # XDG session_dir default
 time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UTC filenames
 
+# The Catalog data generator (ADR-0037): `cargo run --bin generate-models`
+# rewrites the committed src/llm/catalog/data/*.json from models.dev.
+[[bin]]
+name = "generate-models"
+path = "src/bin/generate_models.rs"
+
 [dev-dependencies]
 wiremock = "0.6"       # canned-SSE transport tests (ADR-0002)
 tempfile = "3"         # tmp-dir Project Root in tool tests

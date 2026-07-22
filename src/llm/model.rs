@@ -1,6 +1,6 @@
 //! Model - the facts of one model at one Provider (ADR-0037, CONTEXT.md:
-//! Model): scoped identifier, Api, context window, output cap. Pricing and
-//! compat quirks join in a later stage.
+//! Model): scoped identifier, Api, context window, output cap, pricing, and
+//! the reasoning capability flag.
 //!
 //! The scoped identifier is `provider/model-id`, split on the FIRST `/` only -
 //! model ids themselves contain slashes (`local/qwen/Qwen3.6-27B-MTP-GGUF`
@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::content::Usage;
 use crate::llm::catalog;
+use crate::llm::cost::{self, Cost, Pricing};
 use crate::llm::provider::Provider;
 
 /// A wire protocol an adapter speaks (CONTEXT.md: Api). The seam of the LLM
@@ -28,7 +30,7 @@ pub enum Api {
 /// Each Turn captures a Model when it begins (ADR-0033 amendment); the budget
 /// figures derive from that capture in Stage E - today the launch Model feeds
 /// the once-at-launch validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     /// The Provider's identifier (the scope of the scoped id).
     pub provider: String,
@@ -41,9 +43,17 @@ pub struct Model {
     /// The model's output cap in tokens - the wire `max_tokens` and the
     /// Eviction reserve.
     pub max_tokens: u64,
+    /// The Catalog's flat rates in dollars per million tokens. `None` for
+    /// Models the Catalog cannot price: custom Providers and catalog misses.
+    pub pricing: Option<Pricing>,
+    /// Whether the model can emit reasoning/thinking tokens (a Catalog fact;
+    /// `false` for synthesized Models).
+    pub reasoning: bool,
 }
 
 impl Model {
+    /// The catalog-less constructor: pricing and the reasoning flag stay at
+    /// their unpriced defaults. [`resolve`] fills both from the Catalog.
     pub fn new(
         provider: impl Into<String>,
         id: impl Into<String>,
@@ -57,12 +67,22 @@ impl Model {
             api,
             context_window,
             max_tokens,
+            pricing: None,
+            reasoning: false,
         }
     }
 
     /// The scoped identifier - `provider/model-id`.
     pub fn scoped_id(&self) -> String {
         format!("{}/{}", self.provider, self.id)
+    }
+
+    /// Prices one Response's [`Usage`] against this Model's Catalog rates:
+    /// the pure [`cost::cost`] fold, `None` when the Model carries no
+    /// pricing. Runs wherever usage is folded; the status bar surfaces the
+    /// figures in a later stage.
+    pub fn cost(&self, usage: &Usage) -> Option<Cost> {
+        self.pricing.as_ref().map(|p| cost::cost(p, usage))
     }
 }
 
@@ -96,7 +116,8 @@ pub fn resolve(
         .find(|p| p.id == provider_id)
         .ok_or_else(|| format!("unknown provider {provider_id:?} in model {scoped:?}"))?;
 
-    let (context_window, max_tokens) = match catalog::model(provider_id, model_id) {
+    let known = catalog::model(provider_id, model_id);
+    let (context_window, max_tokens) = match known {
         Some(known) => (known.context_window, known.max_tokens),
         None => (
             provider.context_window.unwrap_or(fallback_window),
@@ -110,6 +131,8 @@ pub fn resolve(
         api: provider.api,
         context_window,
         max_tokens,
+        pricing: known.and_then(|k| k.cost),
+        reasoning: known.is_some_and(|k| k.reasoning),
     })
 }
 
@@ -178,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn a_catalog_model_takes_the_catalog_figures() {
+    fn a_catalog_model_takes_the_catalog_figures_pricing_and_reasoning() {
         let providers = catalog::builtin_providers();
         let model = resolve("anthropic/claude-fable-5", &providers, 64_000, 8_000).unwrap();
         assert_eq!(model.provider, "anthropic");
@@ -186,6 +209,10 @@ mod tests {
         assert_eq!(model.api, Api::AnthropicMessages);
         assert_eq!(model.context_window, 1_000_000);
         assert_eq!(model.max_tokens, 128_000);
+        assert!(model.reasoning);
+        let pricing = model.pricing.expect("catalog pricing rides the Model");
+        assert!(pricing.input > 0.0);
+        assert!(pricing.output > pricing.input);
     }
 
     #[test]
@@ -194,6 +221,32 @@ mod tests {
         let model = resolve("anthropic/claude-experimental", &providers, 48_000, 4_000).unwrap();
         assert_eq!(model.context_window, 48_000);
         assert_eq!(model.max_tokens, 4_000);
+        assert_eq!(model.pricing, None);
+        assert!(!model.reasoning);
+    }
+
+    // ---- cost ----
+
+    #[test]
+    fn a_priced_model_prices_usage_an_unpriced_one_returns_none() {
+        let mut model = Model::new("p", "m", Api::OpenaiCompletions, 64_000, 8_000);
+        let usage = Usage {
+            input_tokens: Some(2_000_000),
+            output_tokens: Some(1_000_000),
+            ..Usage::default()
+        };
+        assert_eq!(model.cost(&usage), None, "catalog-less Models go unpriced");
+
+        model.pricing = Some(Pricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: None,
+            cache_write: None,
+        });
+        let cost = model.cost(&usage).unwrap();
+        assert_eq!(cost.input, 6.0);
+        assert_eq!(cost.output, 15.0);
+        assert_eq!(cost.total, 21.0);
     }
 
     #[test]

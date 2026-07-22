@@ -1,0 +1,46 @@
+{
+  "id": "cerebras",
+  "name": "Cerebras",
+  "api": "openai-completions",
+  "base_url": "https://api.cerebras.ai/v1",
+  "env": [
+    "CEREBRAS_API_KEY"
+  ],
+  "models": [
+    {
+      "id": "gemma-4-31b",
+      "name": "Gemma 4 31B IT",
+      "context_window": 131072,
+      "max_tokens": 40960,
+      "reasoning": true,
+      "cost": {
+        "input": 0.99,
+        "output": 1.49
+      }
+    },
+    {
+      "id": "gpt-oss-120b",
+      "name": "GPT OSS 120B",
+      "context_window": 131072,
+      "max_tokens": 40960,
+      "reasoning": true,
+      "cost": {
+        "input": 0.35,
+        "output": 0.75
+      }
+    },
+    {
+      "id": "zai-glm-4.7",
+      "name": "Z.AI GLM-4.7",
+      "context_window": 131072,
+      "max_tokens": 40960,
+      "reasoning": true,
+      "cost": {
+        "input": 2.25,
+        "output": 2.75,
+        "cache_read": 2.25,
+        "cache_write": 0.0
+      }
+    }
+  ]
+}

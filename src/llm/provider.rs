@@ -4,7 +4,7 @@
 //! per-Model compat facts, never subclasses.
 //!
 //! Custom Providers come from the config `providers` table (ADR-0031
-//! amendment); built-in Providers come from the seed [`crate::llm::catalog`]
+//! amendment); built-in Providers come from the generated [`crate::llm::catalog`]
 //! with the token resolved from their own environment key (`ANTHROPIC_API_KEY`
 //! for anthropic). The Session resolves the set once at launch; every request
 //! travels over the Active Model's Provider.

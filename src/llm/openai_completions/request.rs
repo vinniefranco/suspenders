@@ -26,8 +26,10 @@ use crate::llm::model::Model;
 use crate::tool::ToolSpec;
 
 /// The wire name of the output-cap field. Newer OpenAI models want
-/// `max_completion_tokens`; the per-Model compat flag that swaps the name
-/// lands in Stage C, and this constant is the one place it will plug in.
+/// `max_completion_tokens`; models.dev records no such compat fact, so the
+/// generated Catalog cannot carry it (Stage C outcome) - this constant stays
+/// the one place a per-Model compat flag would plug in, when a host we serve
+/// needs it. The Catalog's openai-completions hosts all accept `max_tokens`.
 const MAX_TOKENS_FIELD: &str = "max_tokens";
 
 /// Builds the complete Chat Completions payload as JSON.

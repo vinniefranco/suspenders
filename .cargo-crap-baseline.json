@@ -563,6 +563,70 @@
       "crap": 2.0
     },
     {
+      "file": "./src/bin/generate_models.rs",
+      "function": "fetch",
+      "line": 74,
+      "cyclomatic": 4.0,
+      "coverage": 0.0,
+      "crap": 20.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "generate",
+      "line": 94,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "main",
+      "line": 69,
+      "cyclomatic": 3.0,
+      "coverage": 0.0,
+      "crap": 12.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "map_cost",
+      "line": 202,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "map_model",
+      "line": 176,
+      "cyclomatic": 7.0,
+      "coverage": 100.0,
+      "crap": 7.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "map_provider",
+      "line": 128,
+      "cyclomatic": 9.0,
+      "coverage": 100.0,
+      "crap": 9.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "str_field",
+      "line": 211,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/bin/generate_models.rs",
+      "function": "write",
+      "line": 114,
+      "cyclomatic": 4.0,
+      "coverage": 0.0,
+      "crap": 20.0
+    },
+    {
       "file": "./src/compaction.rs",
       "function": "Compaction::default",
       "line": 284,
@@ -1541,7 +1605,7 @@
     {
       "file": "./src/llm.rs",
       "function": "Dispatcher::complete",
-      "line": 231,
+      "line": 232,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -1549,7 +1613,7 @@
     {
       "file": "./src/llm.rs",
       "function": "Dispatcher::list_models",
-      "line": 253,
+      "line": 254,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -1557,7 +1621,7 @@
     {
       "file": "./src/llm.rs",
       "function": "Dispatcher::new",
-      "line": 224,
+      "line": 225,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1565,7 +1629,7 @@
     {
       "file": "./src/llm.rs",
       "function": "LlmRequest::new",
-      "line": 62,
+      "line": 63,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1573,7 +1637,7 @@
     {
       "file": "./src/llm.rs",
       "function": "LlmRequest::with_no_think",
-      "line": 72,
+      "line": 73,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1581,7 +1645,7 @@
     {
       "file": "./src/llm.rs",
       "function": "LlmRequest::with_temperature",
-      "line": 77,
+      "line": 78,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1589,7 +1653,7 @@
     {
       "file": "./src/llm.rs",
       "function": "decode_tool_input",
-      "line": 137,
+      "line": 138,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -1597,7 +1661,7 @@
     {
       "file": "./src/llm.rs",
       "function": "emit",
-      "line": 177,
+      "line": 178,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1605,7 +1669,7 @@
     {
       "file": "./src/llm.rs",
       "function": "malformed_input_marker",
-      "line": 129,
+      "line": 130,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1613,7 +1677,7 @@
     {
       "file": "./src/llm.rs",
       "function": "malformed_tool_input",
-      "line": 117,
+      "line": 118,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1621,7 +1685,7 @@
     {
       "file": "./src/llm.rs",
       "function": "models_from_body",
-      "line": 152,
+      "line": 153,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -1805,7 +1869,7 @@
     {
       "file": "./src/llm/catalog.rs",
       "function": "builtin_providers",
-      "line": 77,
+      "line": 102,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1813,7 +1877,7 @@
     {
       "file": "./src/llm/catalog.rs",
       "function": "model",
-      "line": 66,
+      "line": 90,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -1821,7 +1885,31 @@
     {
       "file": "./src/llm/catalog.rs",
       "function": "provider",
-      "line": 61,
+      "line": 85,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/llm/catalog.rs",
+      "function": "providers",
+      "line": 75,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/llm/cost.rs",
+      "function": "cost",
+      "line": 42,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/llm/model.rs",
+      "function": "Model::cost",
+      "line": 84,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1829,7 +1917,7 @@
     {
       "file": "./src/llm/model.rs",
       "function": "Model::new",
-      "line": 47,
+      "line": 57,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1837,7 +1925,7 @@
     {
       "file": "./src/llm/model.rs",
       "function": "Model::scoped_id",
-      "line": 64,
+      "line": 76,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1845,7 +1933,7 @@
     {
       "file": "./src/llm/model.rs",
       "function": "resolve",
-      "line": 87,
+      "line": 107,
       "cyclomatic": 5.0,
       "coverage": 100.0,
       "crap": 5.0
@@ -1853,7 +1941,7 @@
     {
       "file": "./src/llm/model.rs",
       "function": "split_scoped",
-      "line": 71,
+      "line": 91,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -1909,7 +1997,7 @@
     {
       "file": "./src/llm/openai_completions/request.rs",
       "function": "build_request",
-      "line": 42,
+      "line": 44,
       "cyclomatic": 5.0,
       "coverage": 100.0,
       "crap": 5.0
@@ -1917,7 +2005,7 @@
     {
       "file": "./src/llm/openai_completions/request.rs",
       "function": "wire_messages",
-      "line": 99,
+      "line": 101,
       "cyclomatic": 13.0,
       "coverage": 100.0,
       "crap": 13.0
@@ -1925,7 +2013,7 @@
     {
       "file": "./src/llm/openai_completions/request.rs",
       "function": "wire_tool",
-      "line": 78,
+      "line": 80,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -1933,7 +2021,7 @@
     {
       "file": "./src/llm/openai_completions/request.rs",
       "function": "wire_tool_call",
-      "line": 144,
+      "line": 146,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
