@@ -16,20 +16,37 @@ use crate::ui::screen::Key;
 /// One row in a [`Selector`]: `value` is what a [`SelectorOutcome::Select`]
 /// returns, `label` is shown and filtered on, and `hint` is optional secondary
 /// text (a command's help, a "(current)" marker) that never affects filtering.
+/// A non-`selectable` row (a Provider group header, an "unavailable" note)
+/// renders and filters like any other but the cursor skips it and Enter never
+/// picks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectorRow {
     pub value: String,
     pub label: String,
     pub hint: Option<String>,
+    pub selectable: bool,
 }
 
 impl SelectorRow {
-    /// A row from a value, label, and optional hint.
+    /// A pickable row from a value, label, and optional hint.
     pub fn new(value: impl Into<String>, label: impl Into<String>, hint: Option<String>) -> Self {
         SelectorRow {
             value: value.into(),
             label: label.into(),
             hint,
+            selectable: true,
+        }
+    }
+
+    /// A non-selectable row: shown (and filtered) but never picked - the
+    /// navigation folds skip it. Carries no value; the optional hint rides
+    /// dimmed like any other (an "unavailable" note's terse reason).
+    pub fn header(label: impl Into<String>, hint: Option<String>) -> Self {
+        SelectorRow {
+            value: String::new(),
+            label: label.into(),
+            hint,
+            selectable: false,
         }
     }
 }
@@ -53,9 +70,11 @@ pub struct Selector {
 }
 
 impl Selector {
-    /// A selector over `rows`, cursor on the first row.
+    /// A selector over `rows`, cursor on the first SELECTABLE row (the first
+    /// row of a grouped list is a header).
     pub fn new(rows: Vec<SelectorRow>) -> Self {
-        Selector { rows, cursor: 0 }
+        let cursor = rows.iter().position(|r| r.selectable).unwrap_or(0);
+        Selector { rows, cursor }
     }
 
     /// The rows whose `label` contains `filter` (case-insensitive substring),
@@ -68,43 +87,86 @@ impl Selector {
             .collect()
     }
 
+    /// The display highlight into the filtered view: the cursor snapped onto a
+    /// selectable row exactly as the next [`Selector::handle_nav`] fold will
+    /// see it, so what renders reversed is what Enter picks.
+    pub fn highlight(&self, filter: &str) -> usize {
+        snap(&self.selectable_mask(filter), self.cursor)
+    }
+
     /// Folds one navigation key against the FILTERED view: Up/WheelUp and
-    /// Down/WheelDown move the cursor within that view, saturating at both ends;
-    /// Enter resolves to [`SelectorOutcome::Select`] of the highlighted filtered
-    /// row (a no-op / `None` on an empty filtered list); Escape resolves to
+    /// Down/WheelDown move the cursor to the adjacent SELECTABLE row (headers
+    /// and notes are skipped), saturating at both ends; Enter resolves to
+    /// [`SelectorOutcome::Select`] of the highlighted filtered row (a no-op /
+    /// `None` on an empty or all-header filtered list); Escape resolves to
     /// [`SelectorOutcome::Cancel`]. Every other key is ignored.
     ///
-    /// The cursor is clamped to the filtered length first, so a filter that
-    /// shrank the list since the last fold cannot leave the cursor dangling
-    /// past the end.
+    /// The cursor is snapped to a selectable row first (clamped to the
+    /// filtered length, then off any header), so a filter that shrank the
+    /// list since the last fold cannot leave the cursor dangling or parked on
+    /// a header.
     pub fn handle_nav(&mut self, key: Key, filter: &str) -> Option<SelectorOutcome> {
-        let len = self.filtered(filter).len();
-        self.clamp(len);
+        let mask = self.selectable_mask(filter);
+        self.cursor = snap(&mask, self.cursor);
         match key {
             Key::ArrowUp | Key::WheelUp => {
-                self.cursor = self.cursor.saturating_sub(1);
-                None
-            }
-            Key::ArrowDown | Key::WheelDown => {
-                if self.cursor + 1 < len {
-                    self.cursor += 1;
+                if let Some(prev) = nearest(&mask, self.cursor, Direction::Up) {
+                    self.cursor = prev;
                 }
                 None
             }
-            Key::Enter => self
-                .filtered(filter)
-                .get(self.cursor)
-                .map(|row| SelectorOutcome::Select(row.value.clone())),
+            Key::ArrowDown | Key::WheelDown => {
+                if let Some(next) = nearest(&mask, self.cursor, Direction::Down) {
+                    self.cursor = next;
+                }
+                None
+            }
+            Key::Enter => {
+                if !mask.get(self.cursor).copied().unwrap_or(false) {
+                    return None;
+                }
+                self.filtered(filter)
+                    .get(self.cursor)
+                    .map(|row| SelectorOutcome::Select(row.value.clone()))
+            }
             Key::Escape => Some(SelectorOutcome::Cancel),
             _ => None,
         }
     }
 
-    // Keep the cursor inside a filtered view of length `len`: clamp to the last
-    // row, or to 0 when the filter matches nothing.
-    fn clamp(&mut self, len: usize) {
-        self.cursor = self.cursor.min(len.saturating_sub(1));
+    // Which rows of the filtered view the cursor may land on.
+    fn selectable_mask(&self, filter: &str) -> Vec<bool> {
+        self.filtered(filter).iter().map(|r| r.selectable).collect()
     }
+}
+
+// The direction a skip searches in.
+enum Direction {
+    Up,
+    Down,
+}
+
+// The nearest selectable index strictly before/after `from`, or `None` when
+// no selectable row lies that way (the cursor saturates in place).
+fn nearest(mask: &[bool], from: usize, direction: Direction) -> Option<usize> {
+    match direction {
+        Direction::Up => (0..from).rev().find(|&i| mask[i]),
+        Direction::Down => ((from + 1)..mask.len()).find(|&i| mask[i]),
+    }
+}
+
+// Puts the cursor on a selectable row of a view with selectability `mask`:
+// clamp into the view, keep a selectable spot, else the nearest selectable
+// below, else above. An empty or all-header view returns the clamped index
+// unchanged - Enter guards on the mask, so nothing is pickable there.
+fn snap(mask: &[bool], cursor: usize) -> usize {
+    let clamped = cursor.min(mask.len().saturating_sub(1));
+    if mask.get(clamped).copied().unwrap_or(false) {
+        return clamped;
+    }
+    nearest(mask, clamped, Direction::Down)
+        .or_else(|| nearest(mask, clamped, Direction::Up))
+        .unwrap_or(clamped)
 }
 
 #[cfg(test)]
@@ -232,6 +294,77 @@ mod tests {
         assert_eq!(s.handle_nav(Key::Backspace, ""), None);
         assert_eq!(s.handle_nav(Key::PageUp, ""), None);
         assert_eq!(s.cursor, 0);
+    }
+
+    // --- non-selectable rows (group headers, notes) --------------------------
+
+    fn grouped() -> Selector {
+        Selector::new(vec![
+            SelectorRow::header("local", None),
+            row("local/qwen"),
+            SelectorRow::header("anthropic", None),
+            row("anthropic/claude-fable-5"),
+            row("anthropic/claude-haiku-4-5"),
+        ])
+    }
+
+    #[test]
+    fn a_grouped_selector_opens_on_the_first_selectable_row() {
+        assert_eq!(grouped().cursor, 1, "row 0 is a header");
+        assert_eq!(grouped().highlight(""), 1);
+    }
+
+    #[test]
+    fn navigation_skips_headers_in_both_directions() {
+        let mut s = grouped();
+        // Down from local/qwen (1) skips the anthropic header (2) to 3.
+        s.handle_nav(Key::ArrowDown, "");
+        assert_eq!(s.cursor, 3);
+        // Up from 3 skips the header back to 1.
+        s.handle_nav(Key::ArrowUp, "");
+        assert_eq!(s.cursor, 1);
+        // Up at the first selectable stays - the header above is not a stop.
+        s.handle_nav(Key::ArrowUp, "");
+        assert_eq!(s.cursor, 1);
+    }
+
+    #[test]
+    fn enter_never_picks_a_header() {
+        // Only headers survive this filter (no model label contains "thro"
+        // beyond anthropic's rows; use a filter matching the header alone).
+        let mut s = Selector::new(vec![SelectorRow::header("anthropic", None)]);
+        assert_eq!(s.handle_nav(Key::Enter, ""), None);
+        assert_eq!(s.handle_nav(Key::Escape, ""), Some(SelectorOutcome::Cancel));
+    }
+
+    #[test]
+    fn a_filter_that_lands_the_cursor_on_a_header_snaps_to_a_selectable_row() {
+        let mut s = grouped();
+        // Move deep, then filter down to the anthropic group: the stale
+        // cursor is re-snapped onto a selectable row and Enter picks it.
+        s.handle_nav(Key::ArrowDown, "");
+        s.handle_nav(Key::ArrowDown, "");
+        assert_eq!(s.cursor, 4);
+        // Filter "anthropic" keeps the header + its two models (indexes 0..3);
+        // cursor 4 clamps to 2, a selectable row.
+        assert_eq!(s.highlight("anthropic"), 2);
+        assert_eq!(
+            s.handle_nav(Key::Enter, "anthropic"),
+            Some(SelectorOutcome::Select("anthropic/claude-haiku-4-5".into()))
+        );
+    }
+
+    #[test]
+    fn headers_filter_like_any_other_row() {
+        let s = grouped();
+        assert_eq!(
+            labels(s.filtered("anthropic")),
+            vec![
+                "anthropic",
+                "anthropic/claude-fable-5",
+                "anthropic/claude-haiku-4-5"
+            ]
+        );
     }
 
     #[test]

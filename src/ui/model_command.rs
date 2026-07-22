@@ -48,15 +48,23 @@ pub fn applied_line(
     }
 }
 
-/// The `listings -> rows` builder for `/model`'s selector (ADR-0037): one row
-/// per model, its value AND label the scoped `provider/model-id`, grouped by
-/// Provider in the listing's order (the Session's set order), the
-/// currently-Active Model marked "(current)". Scoping happens here - the
-/// boundary lists bare ids per Provider - so a pick is a ready-to-apply
-/// scoped id.
+/// The `listings -> rows` builder for `/model`'s selector (ADR-0037): each
+/// Provider's models sit under a non-selectable header row naming the
+/// Provider, one selectable row per model - its value AND label the scoped
+/// `provider/model-id` - grouped in the listing's order (the Session's set
+/// order), the currently-Active Model marked "(current)". A Provider that
+/// lists nothing (discovery failed, empty Catalog listing) shows a
+/// non-selectable "unavailable" note carrying the boundary's terse reason
+/// instead of vanishing. Scoping happens here - the boundary lists bare ids
+/// per Provider - so a pick is a ready-to-apply scoped id, and the Selector's
+/// own skip rule keeps headers and notes unpickable.
 fn model_rows(listings: &[ProviderModels], current: &str) -> Vec<SelectorRow> {
     let mut rows = Vec::new();
     for listing in listings {
+        rows.push(SelectorRow::header(&listing.provider, None));
+        if let Some(reason) = &listing.unavailable {
+            rows.push(SelectorRow::header("  unavailable", Some(reason.clone())));
+        }
         for id in &listing.models {
             let scoped = format!("{}/{id}", listing.provider);
             let hint = (scoped == current).then(|| "(current)".to_string());
@@ -166,11 +174,12 @@ mod tests {
         ProviderModels {
             provider: provider.into(),
             models: models.iter().map(|m| m.to_string()).collect(),
+            unavailable: None,
         }
     }
 
     #[test]
-    fn rows_are_scoped_ids_grouped_by_provider_in_listing_order() {
+    fn rows_are_scoped_ids_under_a_header_per_provider_in_listing_order() {
         let rows = model_rows(
             &[
                 listing("local", &["qwen/Qwen3.6-27B-MTP-GGUF"]),
@@ -182,13 +191,22 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "local",
                 "local/qwen/Qwen3.6-27B-MTP-GGUF",
+                "anthropic",
                 "anthropic/claude-fable-5",
                 "anthropic/claude-haiku-4-5",
             ]
         );
-        // Values ARE the scoped ids - a pick needs no re-scoping.
-        assert!(rows.iter().all(|r| r.value == r.label));
+        // Headers are unpickable; model rows are pickable and their values
+        // ARE the scoped ids - a pick needs no re-scoping.
+        let selectable: Vec<bool> = rows.iter().map(|r| r.selectable).collect();
+        assert_eq!(selectable, vec![false, true, false, true, true]);
+        assert!(
+            rows.iter()
+                .filter(|r| r.selectable)
+                .all(|r| r.value == r.label)
+        );
     }
 
     #[test]
@@ -201,13 +219,36 @@ mod tests {
             ],
             "local/m",
         );
-        assert_eq!(rows[0].hint.as_deref(), Some("(current)"));
-        assert_eq!(rows[1].hint, None);
+        assert_eq!(rows[1].hint.as_deref(), Some("(current)"));
+        assert_eq!(rows[3].hint, None);
     }
 
     #[test]
-    fn an_empty_listing_yields_no_rows() {
-        assert_eq!(model_rows(&[listing("local", &[])], "local/m"), vec![]);
+    fn an_unavailable_provider_shows_a_note_under_its_header() {
+        // A down custom host (or a credentialed built-in with an empty
+        // Catalog listing) no longer vanishes: its header stays, with a
+        // non-selectable note carrying the boundary's terse reason.
+        let rows = model_rows(
+            &[ProviderModels {
+                provider: "local".into(),
+                models: vec![],
+                unavailable: Some("unreachable".into()),
+            }],
+            "anthropic/claude-fable-5",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "local");
+        assert_eq!(rows[1].label, "  unavailable");
+        assert_eq!(rows[1].hint.as_deref(), Some("unreachable"));
+        assert!(rows.iter().all(|r| !r.selectable), "nothing is pickable");
+    }
+
+    #[test]
+    fn an_empty_listing_yields_its_header_alone() {
+        let rows = model_rows(&[listing("local", &[])], "local/m");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "local");
+        assert!(!rows[0].selectable);
     }
 
     // --- pick (the pure pick policy) ----------------------------------------

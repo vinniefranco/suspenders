@@ -110,11 +110,11 @@ pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
-                ..
+                is_error,
             } => out.push(json!({
                 "role": "tool",
                 "tool_call_id": tool_use_id,
-                "content": content,
+                "content": tool_content(content, *is_error),
             })),
             ContentBlock::Thinking { .. } => {}
         }
@@ -138,6 +138,17 @@ pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
     // Results have already fanned out as role:"tool" messages above.
     if message.role == Role::Assistant || !text.is_empty() {
         out.push(Value::Object(wire));
+    }
+}
+
+// The tool message's content: this dialect has no error slot on `role:"tool"`
+// messages, so an error result carries the Voice's marker in-band (ADR-0037);
+// a successful result passes through byte-identical.
+fn tool_content(content: &str, is_error: bool) -> String {
+    if is_error {
+        format!("{} {content}", crate::voice::tool_error_marker())
+    } else {
+        content.to_string()
     }
 }
 
@@ -253,6 +264,9 @@ mod tests {
 
     #[test]
     fn tool_results_fan_out_as_role_tool_messages() {
+        // A successful result is byte-identical to before; an error result
+        // carries the Voice's in-band marker - this dialect's role:"tool"
+        // message has no error slot (ADR-0037).
         let mut out = Vec::new();
         wire_messages(
             &Message::user(vec![
@@ -265,8 +279,41 @@ mod tests {
             out,
             vec![
                 json!({ "role": "tool", "tool_call_id": "call_1", "content": "contents" }),
-                json!({ "role": "tool", "tool_call_id": "call_2", "content": "oops" }),
+                json!({ "role": "tool", "tool_call_id": "call_2", "content": "[tool error] oops" }),
             ]
+        );
+    }
+
+    #[test]
+    fn an_error_result_is_prefixed_with_the_voices_marker() {
+        let mut out = Vec::new();
+        wire_messages(
+            &Message::user(vec![ContentBlock::tool_result(
+                "call_1",
+                "No such file: mix.exs",
+                true,
+            )]),
+            &mut out,
+        );
+        assert_eq!(
+            out[0]["content"],
+            json!(format!(
+                "{} No such file: mix.exs",
+                crate::voice::tool_error_marker()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_successful_result_carries_no_marker() {
+        let mut out = Vec::new();
+        wire_messages(
+            &Message::user(vec![ContentBlock::tool_result("call_1", "ok", false)]),
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![json!({ "role": "tool", "tool_call_id": "call_1", "content": "ok" })]
         );
     }
 

@@ -627,12 +627,14 @@ impl Composer {
             let (command, status, rows, highlight) = match &self.selector {
                 Some(cs) => match &cs.status {
                     SelectorStatus::Ready(sel) => {
-                        let filtered = sel.filtered(&rest);
-                        let highlight = sel.cursor.min(filtered.len().saturating_sub(1));
+                        // The highlight is the Selector's own snapped cursor
+                        // (clamped into the filtered view, off any header row)
+                        // so what renders reversed is what Enter would pick.
+                        let highlight = sel.highlight(&rest);
                         (
                             cs.command.clone(),
                             OverlayStatus::Ready,
-                            filtered.into_iter().cloned().collect(),
+                            sel.filtered(&rest).into_iter().cloned().collect(),
                             highlight,
                         )
                     }

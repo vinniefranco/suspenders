@@ -203,6 +203,70 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
     );
 }
 
+// ---- session cost metering (ADR-0037 Stage F) --------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_priced_response_broadcasts_the_cumulative_session_cost() {
+    let dir = TempDir::new().unwrap();
+    // 1M input at $10/M + 100K output at $50/M = $15.
+    let priced = Response {
+        usage: Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(100_000),
+            ..Usage::default()
+        },
+        ..text_end("Hello")
+    };
+    let fake = FakeLlm::script(vec![Entry::just(priced)]);
+    let mut session = session_in(&dir);
+    session.model.pricing = Some(crate::llm::cost::Pricing {
+        input: 10.0,
+        output: 50.0,
+        cache_read: None,
+        cache_write: None,
+    });
+    let agent = start(session, fake);
+    let mut rx = agent.subscribe();
+
+    agent.submit("hi").await.unwrap();
+
+    let cost = recv_match(&mut rx, |e| matches!(e, Event::SessionCost { .. })).await;
+    assert_eq!(cost, Event::SessionCost { total: 15.0 });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpriced_model_broadcasts_no_session_cost() {
+    let dir = TempDir::new().unwrap();
+    // Usage rides the Response, but the test session's Model carries no
+    // pricing - a local-only Session must see no cost events at all.
+    let unpriced = Response {
+        usage: Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(100_000),
+            ..Usage::default()
+        },
+        ..text_end("Hello")
+    };
+    let agent = start(
+        session_in(&dir),
+        FakeLlm::script(vec![Entry::just(unpriced)]),
+    );
+    let mut rx = agent.subscribe();
+
+    agent.submit("hi").await.unwrap();
+
+    // Watch the whole Turn: a cost event anywhere in it fails (a metered
+    // zero is silence, not a $0.00), so the first match must be the finish.
+    let ev = recv_match(&mut rx, |e| {
+        matches!(e, Event::SessionCost { .. }) || is_turn_finished(e)
+    })
+    .await;
+    assert!(
+        is_turn_finished(&ev),
+        "unpriced model emitted a cost event: {ev:?}"
+    );
+}
+
 // ---- busy rejection ---------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]

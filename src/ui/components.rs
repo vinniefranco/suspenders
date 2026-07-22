@@ -113,6 +113,9 @@ pub fn segment_style(kind: SegmentKind) -> Style {
         SegmentKind::Thinking | SegmentKind::Tools => {
             Style::default().fg(Color::DarkGray).bg(SEGMENT_DARK_BG)
         }
+        // Cost is a quiet figure: the same muted read as tokens at Ok
+        // pressure, without the pressure routing (cost carries no level).
+        SegmentKind::Cost => Style::default().fg(Color::Gray).bg(SEGMENT_DARK_BG),
         // Tokens keep the single PressureLevel mapping - segment_style only
         // routes to it, it does not restate the colors.
         SegmentKind::Tokens(level) => pressure_style(level),
@@ -299,7 +302,9 @@ fn render_composer_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Ov
 const POPUP_MAX_ROWS: u16 = 8;
 
 /// One `Line` per [`SelectorRow`]: the label, then the hint dimmed; the
-/// highlighted row is reversed so it reads as the selection.
+/// highlighted row is reversed so it reads as the selection. A non-selectable
+/// row (a Provider group header, an "unavailable" note) draws dim bold and is
+/// never reversed - the Selector's cursor cannot land on it.
 fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
     if rows.is_empty() {
         return vec![Line::styled(
@@ -312,7 +317,14 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
-            let mut spans = vec![Span::raw(row.label.clone())];
+            let label_style = if row.selectable {
+                Style::default()
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let mut spans = vec![Span::styled(row.label.clone(), label_style)];
             if let Some(hint) = &row.hint {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
@@ -323,7 +335,7 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
                 ));
             }
             let line = Line::from(spans);
-            if i == highlight {
+            if i == highlight && row.selectable {
                 line.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
                 line
@@ -1162,6 +1174,14 @@ pub enum StatusSegment {
         /// Whether settled tool Blocks are currently expanded.
         expanded: bool,
     },
+    /// The Session's cumulative dollar cost (ADR-0037: Catalog pricing,
+    /// surfaced display-side). Carries the pre-formatted label (the pure
+    /// [`cost_label`] rule) so the segment stays `Eq`; assembled only when the
+    /// total is positive - an unpriced local Session never shows it.
+    Cost {
+        /// The [`cost_label`]-formatted total, e.g. `$0.42` or `<$0.01`.
+        label: String,
+    },
     /// Carries the [`PressureLevel`] verbatim so the Critical-renders-red rule
     /// (ADR-0008) is a semantic fact the painter merely routes to a color.
     Tokens {
@@ -1198,6 +1218,7 @@ impl StatusSegment {
             StatusSegment::Model { .. } => SegmentKind::Model,
             StatusSegment::Thinking { .. } => SegmentKind::Thinking,
             StatusSegment::Tools { .. } => SegmentKind::Tools,
+            StatusSegment::Cost { .. } => SegmentKind::Cost,
             StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
             StatusSegment::Position { .. } => SegmentKind::Position,
         }
@@ -1222,6 +1243,7 @@ impl StatusSegment {
             StatusSegment::Thinking { .. } => " M thinking ".chars().count(),
             // " M tools " - the marker is one col in either state.
             StatusSegment::Tools { .. } => " M tools ".chars().count(),
+            StatusSegment::Cost { label } => format!(" {label} ").chars().count(),
             StatusSegment::Tokens {
                 estimate,
                 dead_mass_pct,
@@ -1248,6 +1270,19 @@ fn tokens_label(estimate: u64, dead_mass_pct: Option<u64>) -> String {
     }
 }
 
+/// The Cost segment's display text (ADR-0037: the Session's cumulative
+/// Catalog-priced total, in dollars). Two decimals from a cent up; a flat
+/// `<$0.01` below that - a sub-cent figure would render `$0.00` and read as
+/// free. Only prices a positive total: the assembly hides the segment
+/// entirely at zero, so this never formats one.
+pub fn cost_label(total: f64) -> String {
+    if total < 0.01 {
+        "<$0.01".to_string()
+    } else {
+        format!("${total:.2}")
+    }
+}
+
 /// The status bar's assembled MEANING: an ordered left group (mode, then
 /// connection) and right group (thinking, tools, tokens, position), already
 /// fitted to the terminal width. Pure and ratatui-free - this is what the new
@@ -1262,22 +1297,25 @@ pub struct StatusBar {
 
 impl StatusBar {
     /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then model, then tools, then thinking, then tokens - mode
-    /// and position survive longest. Connection (the endpoint) drops BEFORE
-    /// model: the endpoint is a fixed, knowable fact, while the model is what
-    /// the user actively changes via `/model`, so the model earns the scarcer
-    /// columns. Tools drops before thinking (both are the same detail-on-demand
-    /// class; thinking is the older, more-referenced affordance). Which
-    /// segments to show at a given width is a SEMANTIC decision, so it lives
-    /// here in the pure layer; the width arithmetic reads each segment's own
-    /// [`StatusSegment::cells`]. Simple on purpose: a partially-truncated
-    /// segment would garble the powerline blocks.
+    /// connection, then model, then tools, then thinking, then cost, then
+    /// tokens - mode and position survive longest. Connection (the endpoint)
+    /// drops BEFORE model: the endpoint is a fixed, knowable fact, while the
+    /// model is what the user actively changes via `/model`, so the model
+    /// earns the scarcer columns. Tools drops before thinking (both are the
+    /// same detail-on-demand class; thinking is the older, more-referenced
+    /// affordance). Cost drops before tokens: tokens carry the pressure level
+    /// the operator steers by. Which segments to show at a given width is a
+    /// SEMANTIC decision, so it lives here in the pure layer; the width
+    /// arithmetic reads each segment's own [`StatusSegment::cells`]. Simple on
+    /// purpose: a partially-truncated segment would garble the powerline
+    /// blocks.
     fn fit(mut self, width: usize) -> StatusBar {
-        let drop_order: [fn(&StatusSegment) -> bool; 5] = [
+        let drop_order: [fn(&StatusSegment) -> bool; 6] = [
             |s| matches!(s, StatusSegment::Connection { .. }),
             |s| matches!(s, StatusSegment::Model { .. }),
             |s| matches!(s, StatusSegment::Tools { .. }),
             |s| matches!(s, StatusSegment::Thinking { .. }),
+            |s| matches!(s, StatusSegment::Cost { .. }),
             |s| matches!(s, StatusSegment::Tokens { .. }),
         ];
         for dropped in drop_order {
@@ -1319,16 +1357,30 @@ pub struct TokenView {
     pub dead_mass_pct: Option<u64>,
 }
 
+/// The figures the bar's right side draws beside the toggles: the token facts
+/// (`None` before any estimate exists) and the Session's cumulative dollar
+/// cost (ADR-0037). A `session_cost` of 0.0 hides the cost segment entirely -
+/// an unpriced local Session shows exactly the bar it always did. One struct,
+/// like [`TokenView`] before it, so the `status_bar` arg COUNT stays at 8 (the
+/// Stage 3 review's binding precondition against growing the
+/// already-suppressed signature).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FigureView {
+    pub tokens: Option<TokenView>,
+    pub session_cost: f64,
+}
+
 /// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
-/// ordered semantic segments the bar conveys, fitted to `width`. `tokens` is
-/// `None` when no token estimate exists yet. No colors, glyphs, or
-/// label strings are decided here - that is the painter's job
+/// ordered semantic segments the bar conveys, fitted to `width`. `figures`
+/// carries the token facts (`None` when no estimate exists yet) and the
+/// Session cost (segment hidden at zero). No colors, glyphs, or label
+/// strings are decided here - that is the painter's job
 /// ([`render_status_bar`]) - so every rule this expresses (segment order, the
 /// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
-/// tokens-absent-until-estimate rule) is a semantic fact assertable without a
-/// frame.
+/// tokens-absent-until-estimate and cost-hidden-at-zero rules) is a semantic
+/// fact assertable without a frame.
 // Each parameter is an independent display FACT the bar renders (status,
-// endpoint, model, the two detail-on-demand toggles, tokens, position); keeping
+// endpoint, model, the two detail-on-demand toggles, figures, position); keeping
 // them primitive is exactly what makes the assembly assertable without a
 // Transcript or a frame, so we take the extra argument rather than bundle them
 // into a struct that would only re-hide those facts behind one opaque type.
@@ -1340,7 +1392,7 @@ pub fn status_bar(
     model: &str,
     thinking_expanded: bool,
     tools_expanded: bool,
-    tokens: Option<TokenView>,
+    figures: FigureView,
     position: String,
 ) -> StatusBar {
     let mode = match status {
@@ -1369,12 +1421,19 @@ pub fn status_bar(
         estimate,
         level,
         dead_mass_pct,
-    }) = tokens
+    }) = figures.tokens
     {
         right.push(StatusSegment::Tokens {
             estimate,
             level,
             dead_mass_pct,
+        });
+    }
+    // The cost segment exists only once a priced Response landed: at zero the
+    // Session has spent nothing meterable and the bar stays as it always was.
+    if figures.session_cost > 0.0 {
+        right.push(StatusSegment::Cost {
+            label: cost_label(figures.session_cost),
         });
     }
     right.push(StatusSegment::Position { label: position });
@@ -1403,6 +1462,9 @@ pub enum SegmentKind {
     /// toggle has feedback even when no Blocks are on screen - the twin of
     /// `Thinking`.
     Tools,
+    /// The Session's cumulative dollar cost (ADR-0037) - a quiet figure like
+    /// tokens at `Ok` pressure. Present only once a priced Response landed.
+    Cost,
     /// The `~N tokens` estimate, colored by its [`PressureLevel`].
     Tokens(PressureLevel),
     /// The viewport scroll position (`Bot`/`Top`/`NN%`) - the bold accent.
@@ -1433,6 +1495,7 @@ impl StatusSegment {
                 let marker = if *expanded { "▾" } else { "▸" };
                 format!(" {marker} tools ")
             }
+            StatusSegment::Cost { label } => format!(" {label} "),
             StatusSegment::Tokens {
                 estimate,
                 dead_mass_pct,
@@ -1475,11 +1538,14 @@ pub fn render_status_bar(
         conn.model,
         t.thinking_expanded,
         t.tools_expanded,
-        t.token_estimate.map(|estimate| TokenView {
-            estimate,
-            level: t.pressure_level,
-            dead_mass_pct: t.dead_mass_pct,
-        }),
+        FigureView {
+            tokens: t.token_estimate.map(|estimate| TokenView {
+                estimate,
+                level: t.pressure_level,
+                dead_mass_pct: t.dead_mass_pct,
+            }),
+            session_cost: t.session_cost,
+        },
         position,
     );
 
@@ -1997,9 +2063,25 @@ mod tests {
     // The powerline segment assembly.
     // -----------------------------------------------------------------------
 
+    /// A [`FigureView`] with no token estimate and a zero (hidden) cost.
+    fn no_figures() -> FigureView {
+        FigureView {
+            tokens: None,
+            session_cost: 0.0,
+        }
+    }
+
+    /// A [`FigureView`] carrying only the token facts, cost hidden.
+    fn tokens_only(tokens: TokenView) -> FigureView {
+        FigureView {
+            tokens: Some(tokens),
+            session_cost: 0.0,
+        }
+    }
+
     /// Assembles the SEMANTIC bar at `width` with everything present: running,
-    /// tokens known at `Ok` pressure. Returns the pure [`StatusBar`] - no
-    /// drawing, no frame.
+    /// tokens known at `Ok` pressure, a priced Session total. Returns the pure
+    /// [`StatusBar`] - no drawing, no frame.
     fn bar_at(width: usize) -> StatusBar {
         status_bar(
             width,
@@ -2008,11 +2090,14 @@ mod tests {
             "qwen/model",
             false,
             false,
-            Some(TokenView {
-                estimate: 1200,
-                level: PressureLevel::Ok,
-                dead_mass_pct: None,
-            }),
+            FigureView {
+                tokens: Some(TokenView {
+                    estimate: 1200,
+                    level: PressureLevel::Ok,
+                    dead_mass_pct: None,
+                }),
+                session_cost: 0.42,
+            },
             "Bot".to_string(),
         )
     }
@@ -2041,6 +2126,7 @@ mod tests {
                 SegmentKind::Thinking,
                 SegmentKind::Tools,
                 SegmentKind::Tokens(PressureLevel::Ok),
+                SegmentKind::Cost,
                 SegmentKind::Position,
             ]
         );
@@ -2049,9 +2135,9 @@ mod tests {
 
     #[test]
     fn a_narrow_bar_drops_the_connection_then_the_model_segment() {
-        // At 60 cols the endpoint drops first (lowest value), then the model -
-        // both connection facts leave before mode/position/tokens.
-        let bar = bar_at(60);
+        // At 70 cols the endpoint drops first (lowest value), then the model -
+        // both connection facts leave before mode/position/tokens/cost.
+        let bar = bar_at(70);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
             kinds(&bar.right),
@@ -2059,13 +2145,29 @@ mod tests {
                 SegmentKind::Thinking,
                 SegmentKind::Tools,
                 SegmentKind::Tokens(PressureLevel::Ok),
+                SegmentKind::Cost,
                 SegmentKind::Position,
             ]
         );
     }
 
     #[test]
-    fn a_narrower_bar_drops_thinking_then_tokens() {
+    fn a_narrower_bar_drops_thinking_then_cost_then_tokens() {
+        // At 45 cols both toggles are gone but the figures survive - cost
+        // outlives thinking in the drop order.
+        let bar = bar_at(45);
+        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
+        assert_eq!(
+            kinds(&bar.right),
+            vec![
+                SegmentKind::Tokens(PressureLevel::Ok),
+                SegmentKind::Cost,
+                SegmentKind::Position,
+            ]
+        );
+
+        // At 40 cost drops next; tokens survive it (they carry the pressure
+        // level the operator steers by).
         let bar = bar_at(40);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
@@ -2101,7 +2203,7 @@ mod tests {
                 "qwen/model",
                 expanded,
                 false,
-                None,
+                no_figures(),
                 "Bot".to_string(),
             );
             bar.right
@@ -2138,7 +2240,7 @@ mod tests {
                 "qwen/model",
                 false,
                 expanded,
-                None,
+                no_figures(),
                 "Bot".to_string(),
             );
             bar.right
@@ -2171,7 +2273,7 @@ mod tests {
             "qwen/model",
             false,
             false,
-            None,
+            no_figures(),
             "Bot".to_string(),
         );
         assert_eq!(
@@ -2182,6 +2284,62 @@ mod tests {
                 SegmentKind::Position
             ]
         );
+    }
+
+    // --- the cost segment (ADR-0037: surfacing the priced Session total) ---
+
+    #[test]
+    fn cost_label_shows_two_decimals_and_a_sub_cent_floor() {
+        // A cent and up: plain two decimals.
+        assert_eq!(cost_label(0.42), "$0.42");
+        assert_eq!(cost_label(0.01), "$0.01");
+        assert_eq!(cost_label(12.3), "$12.30");
+        assert_eq!(cost_label(1234.567), "$1234.57");
+        // Sub-cent: never "$0.00" - a priced Session must not read as free.
+        assert_eq!(cost_label(0.0099), "<$0.01");
+        assert_eq!(cost_label(0.0001), "<$0.01");
+    }
+
+    #[test]
+    fn a_zero_cost_session_shows_no_cost_segment() {
+        // The local-only invariant: zero total means the segment is absent
+        // entirely, not shown as $0.00 - the bar is exactly the old bar.
+        let bar = status_bar(
+            200,
+            Status::Idle,
+            "http://localhost:8080",
+            "qwen/model",
+            false,
+            false,
+            tokens_only(TokenView {
+                estimate: 1200,
+                level: PressureLevel::Ok,
+                dead_mass_pct: None,
+            }),
+            "Bot".to_string(),
+        );
+        assert!(
+            !kinds(&bar.right).contains(&SegmentKind::Cost),
+            "zero cost must hide the segment"
+        );
+    }
+
+    #[test]
+    fn a_positive_cost_assembles_the_labelled_segment() {
+        let bar = bar_at(200);
+        let cost = bar
+            .right
+            .iter()
+            .find(|s| matches!(s, StatusSegment::Cost { .. }))
+            .expect("cost segment present once a priced Response landed");
+        assert_eq!(
+            *cost,
+            StatusSegment::Cost {
+                label: "$0.42".into()
+            }
+        );
+        assert_eq!(cost.paint(0), " $0.42 ");
+        assert_eq!(cost.cells(), " $0.42 ".chars().count());
     }
 
     #[test]
@@ -2196,7 +2354,7 @@ mod tests {
             "qwen/model",
             false,
             false,
-            Some(TokenView {
+            tokens_only(TokenView {
                 estimate: 99000,
                 level: PressureLevel::Critical,
                 dead_mass_pct: None,
@@ -2233,7 +2391,7 @@ mod tests {
                 "qwen/model",
                 false,
                 false,
-                Some(TokenView {
+                tokens_only(TokenView {
                     estimate: 1,
                     level,
                     dead_mass_pct: None,
@@ -2261,7 +2419,7 @@ mod tests {
                 "qwen/model",
                 false,
                 false,
-                None,
+                no_figures(),
                 "Bot".to_string(),
             )
             .left
@@ -2372,6 +2530,7 @@ mod tests {
             SegmentKind::Model,
             SegmentKind::Thinking,
             SegmentKind::Tools,
+            SegmentKind::Cost,
             SegmentKind::Tokens(PressureLevel::Ok),
             SegmentKind::Tokens(PressureLevel::Elevated),
             SegmentKind::Tokens(PressureLevel::Critical),

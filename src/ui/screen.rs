@@ -228,6 +228,12 @@ pub struct Screen {
     /// context reclamation is legible AS IT STANDS - not the pre-reclaim
     /// snapshot a past wave found (which a wave clears the instant it fires).
     pub dead_mass_pct: Option<u64>,
+    /// The Session's cumulative dollar cost from the most recent
+    /// [`Event::SessionCost`] (ADR-0037: pricing rides the Catalog Model;
+    /// surfacing is display-side only). Stays 0.0 on unpriced (local/custom)
+    /// Models - the metered boundary emits nothing - and the status bar hides
+    /// its cost segment at zero, so such a Session looks exactly as before.
+    pub session_cost: f64,
     /// The Composer (ADR-0034): the draft, the overlays, and the
     /// prompt-history ring, behind [`crate::ui::composer`]'s seam. Private on
     /// purpose - reads go through [`Screen::composer`] (the render
@@ -278,6 +284,7 @@ impl Screen {
             eviction_slack: opts.eviction_slack,
             pressure_level: PressureLevel::Ok,
             dead_mass_pct: None,
+            session_cost: 0.0,
             composer: Composer::new(opts.history),
             thinking_expanded: false,
             tools_expanded: false,
@@ -309,7 +316,8 @@ impl Screen {
 
             event @ (Event::ContextPressure { .. }
             | Event::EvictionWave { .. }
-            | Event::CompactionProgress { .. }) => self.apply_pressure(event),
+            | Event::CompactionProgress { .. }
+            | Event::SessionCost { .. }) => self.apply_pressure(event),
 
             event @ (Event::ToolCall { .. }
             | Event::ToolResult { .. }
@@ -419,6 +427,14 @@ impl Screen {
             // Compaction made progress: recede one Info line.
             Event::CompactionProgress { status } => {
                 self.transcript.info(format!("compaction: {status}"));
+                (self, vec![])
+            }
+
+            // A priced Response moved the Session's cumulative cost: refresh
+            // the status bar's figure. NEVER a Transcript item - cost is a
+            // bar fact, like the token estimate.
+            Event::SessionCost { total } => {
+                self.session_cost = total;
                 (self, vec![])
             }
 
@@ -1460,6 +1476,22 @@ mod tests {
             line.contains(&format!("{bar_pct}% dead mass")),
             "wave line {line:?} disagrees with bar percent {bar_pct}"
         );
+    }
+
+    // A Session cost update refreshes the bar figure and nothing else: no
+    // Transcript item, no effects - and later totals replace, never add.
+    #[test]
+    fn session_cost_refreshes_the_bar_figure_silently() {
+        let t = fresh();
+        assert_eq!(t.session_cost, 0.0);
+        let (t, effects) = t.apply_event(Event::session_cost(0.007));
+        assert_eq!(effects, vec![]);
+        assert_eq!(t.session_cost, 0.007);
+        assert_eq!(items(&t), vec![], "never a Transcript item");
+
+        // The event carries the cumulative total; the fold stores, not sums.
+        let (t, _) = t.apply_event(Event::session_cost(0.42));
+        assert_eq!(t.session_cost, 0.42);
     }
 
     // Compaction progress recedes one Info line.

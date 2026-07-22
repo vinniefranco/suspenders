@@ -155,6 +155,15 @@ pub enum Event {
     CompactionProgress {
         status: String,
     },
+    /// The Session's cumulative dollar cost after a priced Response (ADR-0037:
+    /// pricing rides the Catalog Model; surfacing is display-side only).
+    /// Emitted by the metered boundary for every priced call - main Turn,
+    /// Scout, and Compaction alike - and never for an unpriced (local/custom)
+    /// Model, so a local-only Session sees none of these. Never logged: cost
+    /// enters neither the Conversation nor the Session Log.
+    SessionCost {
+        total: f64,
+    },
     SessionLogError {
         message: String,
     },
@@ -409,6 +418,10 @@ impl Event {
         Event::CompactionProgress {
             status: status.into(),
         }
+    }
+
+    pub fn session_cost(total: f64) -> Self {
+        Event::SessionCost { total }
     }
 
     pub fn session_log_error(message: impl Into<String>) -> Self {

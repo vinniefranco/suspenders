@@ -28,6 +28,7 @@
 pub mod anthropic_messages;
 pub mod catalog;
 pub mod cost;
+pub mod metered;
 pub mod model;
 pub mod openai_completions;
 pub mod provider;
@@ -215,11 +216,39 @@ pub trait Llm: Send + Sync {
 
 /// One Provider's offering for the `/model` selector (ADR-0037): the Provider
 /// id and its bare model ids. The UI scopes them (`provider/model-id`) when it
-/// builds rows, keeping the wire's bare ids at the boundary.
+/// builds rows, keeping the wire's bare ids at the boundary. A configured
+/// Provider that lists nothing does not vanish: `unavailable` carries the
+/// terse reason (`unreachable` for a failed discovery, `no models` for an
+/// empty listing) the selector shows under the Provider's header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderModels {
     pub provider: String,
     pub models: Vec<String>,
+    pub unavailable: Option<String>,
+}
+
+impl ProviderModels {
+    /// A listing from the ids a Provider offered; empty means the host (or
+    /// the Catalog) answered with no models, marked unavailable so the
+    /// selector never drops a configured Provider silently.
+    fn listed(provider: &str, models: Vec<String>) -> Self {
+        let unavailable = models.is_empty().then(|| "no models".to_string());
+        ProviderModels {
+            provider: provider.to_string(),
+            models,
+            unavailable,
+        }
+    }
+
+    /// A listing for a Provider whose live discovery failed (host down,
+    /// non-2xx, unparseable body): no models, marked unreachable.
+    fn unreachable(provider: &str) -> Self {
+        ProviderModels {
+            provider: provider.to_string(),
+            models: Vec::new(),
+            unavailable: Some("unreachable".to_string()),
+        }
+    }
 }
 
 /// Lists every Provider's models for the `/model` selector, grouped by
@@ -227,9 +256,11 @@ pub struct ProviderModels {
 /// ([`Llm::list_models`], the ADR-0002 amendment machinery, now across every
 /// configured custom Provider), built-in Providers from the Catalog - and only
 /// when their credential resolved, because a Provider the user cannot call
-/// does not belong in the selector. A custom Provider whose discovery fails is
-/// skipped; when nothing listed at all, the collected reasons come back as the
-/// `Err` the selector surfaces.
+/// does not belong in the selector. A custom Provider whose discovery fails
+/// (and any Provider whose listing is empty) still appears, marked
+/// unavailable, so a down host is visible rather than silently missing; when
+/// nothing listed at all, the collected failure reasons come back as the
+/// `Err` the selector surfaces instead.
 pub async fn offerings(
     llm: &dyn Llm,
     providers: &[Provider],
@@ -239,19 +270,17 @@ pub async fn offerings(
     for p in providers {
         if p.custom {
             match llm.list_models(p).await {
-                Ok(models) => listings.push(ProviderModels {
-                    provider: p.id.clone(),
-                    models,
-                }),
-                Err(reason) => failures.push(format!("{}: {reason}", p.id)),
+                Ok(models) => listings.push(ProviderModels::listed(&p.id, models)),
+                Err(reason) => {
+                    failures.push(format!("{}: {reason}", p.id));
+                    listings.push(ProviderModels::unreachable(&p.id));
+                }
             }
         } else if !p.token.is_empty() {
-            listings.push(ProviderModels {
-                provider: p.id.clone(),
-                models: catalog::provider(&p.id)
-                    .map(|c| c.models.iter().map(|m| m.id.clone()).collect())
-                    .unwrap_or_default(),
-            });
+            let models = catalog::provider(&p.id)
+                .map(|c| c.models.iter().map(|m| m.id.clone()).collect())
+                .unwrap_or_default();
+            listings.push(ProviderModels::listed(&p.id, models));
         }
     }
     if listings.iter().all(|l| l.models.is_empty()) && !failures.is_empty() {
@@ -423,11 +452,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offerings_keeps_surviving_listings_when_one_discovery_fails() {
+    async fn offerings_marks_a_failed_discovery_unreachable_instead_of_dropping_it() {
         use crate::test_support::FakeLlm;
 
         // Two customs: the first fails, the second lists. The selector shows
-        // what it can rather than failing wholesale.
+        // what it can, and the down host stays visible as unavailable rather
+        // than vanishing silently (ADR-0037 Stage F).
         let fake = FakeLlm::script(std::iter::empty())
             .with_models(vec![Err("down".to_string()), Ok(vec!["m1".to_string()])]);
         let providers = vec![
@@ -435,8 +465,26 @@ mod tests {
             provider("b-local", Api::AnthropicMessages),
         ];
         let listings = offerings(&fake, &providers).await.unwrap();
+        assert_eq!(listings.len(), 2);
+        assert_eq!(listings[0].provider, "a-local");
+        assert_eq!(listings[0].models, Vec::<String>::new());
+        assert_eq!(listings[0].unavailable.as_deref(), Some("unreachable"));
+        assert_eq!(listings[1].provider, "b-local");
+        assert_eq!(listings[1].models, vec!["m1".to_string()]);
+        assert_eq!(listings[1].unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn offerings_marks_an_empty_listing_no_models() {
+        use crate::test_support::FakeLlm;
+
+        // A reachable host answering an empty model list is configured but
+        // unusable - visible as unavailable, not dropped.
+        let fake = FakeLlm::script(std::iter::empty()).with_models(vec![Ok(vec![])]);
+        let providers = vec![provider("local", Api::AnthropicMessages)];
+        let listings = offerings(&fake, &providers).await.unwrap();
         assert_eq!(listings.len(), 1);
-        assert_eq!(listings[0].provider, "b-local");
+        assert_eq!(listings[0].unavailable.as_deref(), Some("no models"));
     }
 
     // ------------------------------------------------------------------

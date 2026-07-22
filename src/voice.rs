@@ -233,6 +233,14 @@ pub fn orphaned_call_answer() -> &'static str {
     "[this call's result was lost in a model switch - re-issue the call if you still need it]"
 }
 
+/// Marker prefixed to an error Tool Result's content on the openai-completions
+/// wire (ADR-0037): that dialect's `role:"tool"` message has no error slot, so
+/// the failure fact rides in-band. The anthropic-messages wire keeps its
+/// native `is_error` field and never carries this marker.
+pub fn tool_error_marker() -> &'static str {
+    "[tool error]"
+}
+
 /// Assistant marker closing a Turn an after-Pass hook stopped.
 pub fn turn_stopped_marker() -> &'static str {
     "[turn stopped - reply to continue]"
@@ -953,6 +961,19 @@ mod tests {
         assert!(refusal.contains("read_file"));
         assert!(!refusal.contains('\u{2014}')); // em-dash
         assert!(!refusal.contains('\u{2013}')); // en-dash
+    }
+
+    // ---- tool_error_marker/0 ----
+
+    #[test]
+    fn tool_error_marker_is_a_short_bracketed_marker() {
+        let marker = tool_error_marker();
+        assert!(marker.starts_with('['));
+        assert!(marker.ends_with(']'));
+        assert!(marker.chars().count() < 40);
+        assert!(marker.contains("error"));
+        assert!(!marker.contains('\u{2014}')); // em-dash
+        assert!(!marker.contains('\u{2013}')); // en-dash
     }
 
     // ---- orphaned_call_answer/0 ----

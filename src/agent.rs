@@ -321,6 +321,19 @@ impl AgentHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let (events, _rx0) = broadcast::channel(1024);
 
+        // Session cost metering (ADR-0037): every model call this Session
+        // makes - Turn Passes, Scouts, Compaction, Handoff seeds - flows
+        // through this one Arc, so a single decorator prices them all against
+        // each call's captured Model. The running total rides the Agent's own
+        // mpsc like every Turn event, so Event order stays the single owner's;
+        // it is display-side only and never enters the Session Log.
+        let llm: Arc<dyn Llm> = {
+            let tx = tx.clone();
+            Arc::new(crate::llm::metered::Metered::new(llm, move |total| {
+                let _ = tx.send(Msg::Turn(TurnMsg::Emit(Event::session_cost(total))));
+            }))
+        };
+
         let state = AgentState {
             session,
             turn_provenance: model.provenance(),
