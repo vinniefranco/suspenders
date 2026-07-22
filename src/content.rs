@@ -79,16 +79,49 @@ pub enum Role {
     Assistant,
 }
 
-/// A Conversation message: a role and an ordered list of content blocks.
+/// Provenance (CONTEXT.md, ADR-0037): the Provider id and Model id that
+/// produced an assistant message, stamped as it enters the Conversation and
+/// persisted on assistant events in the Session Log. Two plain strings, not
+/// the Api: the Api is derivable from them, and provider configs can drift
+/// across sessions. Read at request-shaping ([`crate::llm::transform`]):
+/// history whose Provenance matches the target Model replays verbatim;
+/// history from elsewhere is normalized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// The Provider's identifier (the scope of the scoped id).
+    pub provider: String,
+    /// The model's own identifier at that Provider.
+    pub model: String,
+}
+
+impl Provenance {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Provenance {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+/// A Conversation message: a role, an ordered list of content blocks, and -
+/// on assistant messages a model produced - the Provenance of that model.
+/// `None` Provenance means unknown (user messages, Voice-authored markers):
+/// the transform pass treats unknown as a cross-Provider mismatch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
 
 impl Message {
     pub fn new(role: Role, content: Vec<ContentBlock>) -> Self {
-        Message { role, content }
+        Message {
+            role,
+            content,
+            provenance: None,
+        }
     }
 
     pub fn user(content: Vec<ContentBlock>) -> Self {
@@ -97,6 +130,16 @@ impl Message {
 
     pub fn assistant(content: Vec<ContentBlock>) -> Self {
         Message::new(Role::Assistant, content)
+    }
+
+    /// An assistant message stamped with the Provenance of the Model that
+    /// produced it (CONTEXT.md: Provenance).
+    pub fn assistant_from(content: Vec<ContentBlock>, provenance: Provenance) -> Self {
+        Message {
+            role: Role::Assistant,
+            content,
+            provenance: Some(provenance),
+        }
     }
 }
 

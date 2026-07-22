@@ -60,7 +60,8 @@ pub(super) async fn execute_tools<D: TurnDeps>(
     // checkpoint is only the settlement fallback, so one over the finished
     // batch is enough (and must not be dropped: it holds in-flight settlement
     // state should the Turn end here).
-    let checkpoint = build_checkpoint(&conversation, blocks, &results);
+    let provenance = state.deps.provenance();
+    let checkpoint = build_checkpoint(&conversation, blocks, &results, provenance);
     state.deps.checkpoint(&checkpoint);
     state.governors.next_pass();
     state.ledger.close_batch();
@@ -68,11 +69,14 @@ pub(super) async fn execute_tools<D: TurnDeps>(
 }
 
 // The end-of-batch checkpoint: only the answered Tool Calls, paired with their
-// results (never a bare, unanswered tool_use block).
+// results (never a bare, unanswered tool_use block). The kept blocks are the
+// model's, so the message carries the Turn's captured Provenance (ADR-0037) -
+// this checkpoint becomes the settled Conversation if the Turn ends here.
 fn build_checkpoint(
     conversation: &Conversation,
     blocks: &[ContentBlock],
     results: &[ContentBlock],
+    provenance: crate::content::Provenance,
 ) -> Conversation {
     use std::collections::HashSet;
     let answered: HashSet<&str> = results
@@ -93,7 +97,7 @@ fn build_checkpoint(
         .collect();
 
     let mut conv = conversation.clone();
-    conv.add_assistant_blocks(kept);
+    conv.add_assistant_response(kept, provenance);
     conv.add_tool_results(results.to_vec(), Vec::new());
     conv
 }

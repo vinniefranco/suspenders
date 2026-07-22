@@ -100,6 +100,10 @@ impl TurnDeps for AgentDeps {
         }
     }
 
+    fn provenance(&self) -> crate::content::Provenance {
+        self.model.provenance()
+    }
+
     fn emitter(&mut self) -> Emitter {
         // Fire-and-forget to the Agent, which broadcasts AND logs - routing
         // through the single owner keeps Event order deterministic (ADR-0017):

@@ -20,7 +20,7 @@
 mod supersession;
 mod turn_boundary;
 
-use crate::content::{ContentBlock, Message, Role, Usage};
+use crate::content::{ContentBlock, Message, Provenance, Role, Usage};
 use crate::voice::{self, FileOps};
 
 /// What one Eviction wave reclaimed, counted by kind, with the Dead Mass
@@ -155,9 +155,24 @@ impl Conversation {
         self
     }
 
-    /// Appends the model's content blocks as one assistant message.
+    /// Appends Voice-authored blocks (closing markers) as one assistant
+    /// message, unknown Provenance. Response content goes through
+    /// [`Conversation::add_assistant_response`] instead.
     pub fn add_assistant_blocks(&mut self, blocks: Vec<ContentBlock>) -> &mut Self {
         self.messages.push(Message::assistant(blocks));
+        self
+    }
+
+    /// Appends a Response's content blocks as one assistant message stamped
+    /// with the Provenance of the Model that produced them (CONTEXT.md:
+    /// Provenance, ADR-0037).
+    pub fn add_assistant_response(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        provenance: Provenance,
+    ) -> &mut Self {
+        self.messages
+            .push(Message::assistant_from(blocks, provenance));
         self
     }
 
@@ -873,6 +888,17 @@ mod tests {
         conv.add_user_text("hi");
         conv.add_assistant_blocks(blocks.clone());
         assert_eq!(conv.messages.last().unwrap(), &Message::assistant(blocks));
+    }
+
+    #[test]
+    fn add_assistant_response_stamps_the_message_add_assistant_blocks_does_not() {
+        let stamp = Provenance::new("anthropic", "claude-fable-5");
+        let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
+        conv.add_user_text("hi");
+        conv.add_assistant_response(vec![ContentBlock::text("reply")], stamp.clone());
+        conv.add_assistant_blocks(vec![ContentBlock::text("[marker]")]);
+        assert_eq!(conv.messages[1].provenance, Some(stamp));
+        assert_eq!(conv.messages[2].provenance, None);
     }
 
     #[test]

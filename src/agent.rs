@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::approvals::{ApprovalId, Approvals, Decide, Decision, Request};
 use crate::compaction::Compaction;
-use crate::content::ContentBlock;
+use crate::content::{ContentBlock, Provenance};
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
 use crate::llm::Llm;
@@ -320,6 +320,7 @@ impl AgentHandle {
 
         let state = AgentState {
             session,
+            turn_provenance: model.provenance(),
             model,
             llm,
             conversation,
@@ -476,6 +477,11 @@ struct AgentState {
     // set); the budget figures keep their once-at-launch shape - per-Turn
     // recomputation from the capture is a later stage.
     model: Model,
+    // The Provenance of the Model the RUNNING Turn captured at spawn
+    // (ADR-0037): stamps assistant events in the Session Log. Snapshotted in
+    // `reset_turn_state`, NOT read from `model` at log time - a mid-flight
+    // `SetModel` swaps `model` while the in-flight Turn keeps its capture.
+    turn_provenance: Provenance,
     llm: Arc<dyn Llm>,
     conversation: Conversation,
     log: Option<Log>,
@@ -755,7 +761,14 @@ fn log_entry(state: &mut AgentState, entry: LogEntry) {
 fn log_event(state: &mut AgentState, event: &Event) {
     match event {
         Event::MessageEnd { content, .. } => {
-            log_entry(state, LogEntry::AssistantBlocks(content.clone()));
+            let provenance = Some(state.turn_provenance.clone());
+            log_entry(
+                state,
+                LogEntry::AssistantBlocks {
+                    blocks: content.clone(),
+                    provenance,
+                },
+            );
         }
         Event::ToolResult {
             id,
@@ -852,12 +865,16 @@ fn spawn_turn(state: &mut AgentState) {
     watch_turn(state, turn);
 }
 
-// Resets the per-Turn state before a Turn task spawns.
+// Resets the per-Turn state before a Turn task spawns. The Provenance
+// snapshot here matches the Model the spawned Turn captures (both read
+// `state.model` at spawn), so logged assistant events carry the Turn's
+// capture even across a mid-flight SetModel.
 fn reset_turn_state(state: &mut AgentState) {
     state.settlement = Settlement::new();
     state.approvals = std::mem::take(&mut state.approvals).reset();
     state.approval_replies.clear();
     state.cancel_flag = false;
+    state.turn_provenance = state.model.provenance();
 }
 
 fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {

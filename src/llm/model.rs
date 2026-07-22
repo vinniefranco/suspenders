@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::content::Usage;
+use crate::content::{Provenance, Usage};
 use crate::llm::catalog;
 use crate::llm::cost::{self, Cost, Pricing};
 use crate::llm::provider::Provider;
@@ -75,6 +75,12 @@ impl Model {
     /// The scoped identifier - `provider/model-id`.
     pub fn scoped_id(&self) -> String {
         format!("{}/{}", self.provider, self.id)
+    }
+
+    /// The Provenance this Model stamps on assistant messages it produces
+    /// (CONTEXT.md: Provenance): the two ids, never the Api.
+    pub fn provenance(&self) -> Provenance {
+        Provenance::new(self.provider.clone(), self.id.clone())
     }
 
     /// Prices one Response's [`Usage`] against this Model's Catalog rates:

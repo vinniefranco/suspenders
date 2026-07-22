@@ -434,7 +434,10 @@ async fn next_pass<D: TurnDeps>(
 ) -> Flow {
     let steering = state.deps.drain_steering().await;
 
-    conversation.add_assistant_blocks(response.content.clone());
+    // The batch enters stamped with the captured Model's Provenance
+    // (ADR-0037): the request-shaping transform reads it to decide verbatim
+    // replay vs cross-Provider normalization.
+    conversation.add_assistant_response(response.content.clone(), state.deps.provenance());
     conversation.add_tool_results(results, steering.clone());
 
     for text in &steering {
@@ -478,11 +481,13 @@ async fn next_pass<D: TurnDeps>(
         Some(FinishIntervention::CloseRecover {
             reason, recovery, ..
         }) => {
-            // A tool-answering cap has no reply to keep: the marker closes.
+            // A tool-answering cap has no reply to keep: the marker closes
+            // (Voice-authored, so no Provenance).
             return Flow::Done(finish::close_recover(
                 state,
                 conversation,
                 vec![ContentBlock::text(voice::turn_limit_marker())],
+                None,
                 reason,
                 recovery,
             ));
@@ -725,6 +730,67 @@ mod tests {
             })
             .collect();
         assert_eq!(result_ids, vec!["tu_1", "tu_2"]);
+    }
+
+    // ---- Provenance stamping (ADR-0037) ------------------------------------
+
+    #[tokio::test]
+    async fn assistant_messages_enter_stamped_with_the_captured_models_provenance() {
+        let root = root();
+        write(&root, "marker.txt", "");
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        );
+
+        let (outcome, _deps) = run_with(&session, "go", deps).await;
+        let (conv, _) = ok(&outcome);
+
+        // Both the tool-answering Pass and the finish reply are stamped with
+        // the Turn's captured Model; user messages carry no Provenance.
+        let expected = Some(session.model.provenance());
+        let assistants: Vec<_> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        for m in &assistants {
+            assert_eq!(m.provenance, expected);
+        }
+        assert!(
+            conv.messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .all(|m| m.provenance.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_authored_close_marker_carries_no_provenance() {
+        let root = root();
+        let session = session(root.path());
+        let deps = deps_for(
+            &session,
+            vec![just(tool_use_result(
+                "t1",
+                "list_files",
+                json!({"path": "."}),
+            ))],
+        )
+        .with_after_pass(|_r, _c| AfterPass::Stop("budget_hook".to_string()));
+
+        let (outcome, _deps) = run_with(&session, "look", deps).await;
+        let (conv, _) = ok(&outcome);
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn stopped - reply to continue]")
+        );
+        assert_eq!(lm.provenance, None, "the Voice's marker is not the model's");
     }
 
     #[tokio::test]

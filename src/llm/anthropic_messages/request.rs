@@ -67,11 +67,16 @@ pub fn wire_tool(spec: &ToolSpec) -> Value {
     })
 }
 
-/// Converts one message to a wire-format map. The typed [`Message`] already
-/// serializes to the Anthropic wire shape via serde (the `#[serde(tag =
-/// "type")]` content-block enum matches text/tool_use/tool_result/thinking).
+/// Converts one message to a wire-format map: role plus content blocks, whose
+/// serde shapes (the `#[serde(tag = "type")]` content-block enum) match the
+/// Anthropic wire exactly. Built field by field, NOT by serializing the whole
+/// [`Message`]: Provenance (ADR-0037) is a Suspenders fact and never rides
+/// the wire.
 pub fn wire_message(message: &Message) -> Value {
-    serde_json::to_value(message).expect("Message serializes to JSON")
+    json!({
+        "role": message.role,
+        "content": message.content,
+    })
 }
 
 #[cfg(test)]
@@ -256,5 +261,20 @@ mod tests {
     fn role_serializes_lowercase() {
         let msg = Message::new(Role::Assistant, vec![]);
         assert_eq!(wire_message(&msg)["role"], json!("assistant"));
+    }
+
+    #[test]
+    fn provenance_never_rides_the_wire() {
+        let msg = Message::assistant_from(
+            vec![ContentBlock::text("hi")],
+            crate::content::Provenance::new("anthropic", "claude-fable-5"),
+        );
+        assert_eq!(
+            wire_message(&msg),
+            json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}]
+            })
+        );
     }
 }

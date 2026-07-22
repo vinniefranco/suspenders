@@ -137,7 +137,9 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
         ],
         text_end("Hello"),
     )]);
-    let agent = start(session_in(&dir), fake);
+    let session = session_in(&dir);
+    let provenance = session.model.provenance();
+    let agent = start(session, fake);
     let mut rx = agent.subscribe();
 
     assert_eq!(agent.status().await, Status::Idle);
@@ -194,14 +196,9 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
     assert_eq!(
         conv.messages,
         vec![
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::text("hi there")],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::text("Hello")],
-            },
+            Message::user(vec![ContentBlock::text("hi there")]),
+            // The reply enters stamped with the Turn's captured Model.
+            Message::assistant_from(vec![ContentBlock::text("Hello")], provenance),
         ]
     );
 }
@@ -596,17 +593,11 @@ async fn cancel_mid_turn_emits_turn_cancelled_and_records_the_cancellation() {
     let n = conv.messages.len();
     assert_eq!(
         conv.messages[n - 2],
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::text("do something slow")],
-        }
+        Message::user(vec![ContentBlock::text("do something slow")])
     );
     assert_eq!(
         conv.messages[n - 1],
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::text(voice::turn_cancelled_marker())],
-        }
+        Message::assistant(vec![ContentBlock::text(voice::turn_cancelled_marker())])
     );
 }
 
@@ -645,15 +636,12 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_turn() {
     let conv = agent.conversation().await;
     let tail: Vec<_> = conv.messages.iter().rev().take(3).rev().cloned().collect();
     assert!(matches!(&tail[0],
-        Message { role: Role::Assistant, content } if matches!(&content[0], ContentBlock::ToolUse { id, .. } if id == "t1")));
+        Message { role: Role::Assistant, content, .. } if matches!(&content[0], ContentBlock::ToolUse { id, .. } if id == "t1")));
     assert!(matches!(&tail[1],
-        Message { role: Role::User, content } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
+        Message { role: Role::User, content, .. } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
     assert_eq!(
         tail[2],
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::text(voice::turn_cancelled_marker())],
-        }
+        Message::assistant(vec![ContentBlock::text(voice::turn_cancelled_marker())])
     );
 }
 
@@ -662,10 +650,9 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn llm_error_emits_turn_error_keeps_user_message_and_closes_with_failure_marker() {
     let dir = TempDir::new().unwrap();
-    let agent = start(
-        session_in(&dir),
-        FakeLlm::script(vec![Entry::error("boom")]),
-    );
+    let session = session_in(&dir);
+    let provenance = session.model.provenance();
+    let agent = start(session, FakeLlm::script(vec![Entry::error("boom")]));
     let mut rx = agent.subscribe();
 
     agent.submit("hello?").await.unwrap();
@@ -681,17 +668,16 @@ async fn llm_error_emits_turn_error_keeps_user_message_and_closes_with_failure_m
     let n = conv.messages.len();
     assert_eq!(
         conv.messages[n - 2],
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::text("hello?")],
-        }
+        Message::user(vec![ContentBlock::text("hello?")])
     );
+    // The failed close keeps the response remnant's Provenance (the marker
+    // rides what the model produced, here nothing).
     assert_eq!(
         conv.messages[n - 1],
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::text(voice::turn_failed_marker())],
-        }
+        Message::assistant_from(
+            vec![ContentBlock::text(voice::turn_failed_marker())],
+            provenance
+        )
     );
 }
 
@@ -702,7 +688,9 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_turn_under_the_failure_
         Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
         Entry::error("boom"),
     ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
+    let session = session_in(&dir);
+    let provenance = session.model.provenance();
+    let agent = start(session, FakeLlm::script(script));
     let mut rx = agent.subscribe();
 
     agent.submit("explore then die").await.unwrap();
@@ -716,15 +704,15 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_turn_under_the_failure_
     let conv = agent.conversation().await;
     let tail: Vec<_> = conv.messages.iter().rev().take(3).rev().cloned().collect();
     assert!(matches!(&tail[0],
-        Message { role: Role::Assistant, content } if matches!(&content[0], ContentBlock::ToolUse { id, .. } if id == "t1")));
+        Message { role: Role::Assistant, content, .. } if matches!(&content[0], ContentBlock::ToolUse { id, .. } if id == "t1")));
     assert!(matches!(&tail[1],
-        Message { role: Role::User, content } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
+        Message { role: Role::User, content, .. } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
     assert_eq!(
         tail[2],
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::text(voice::turn_failed_marker())],
-        }
+        Message::assistant_from(
+            vec![ContentBlock::text(voice::turn_failed_marker())],
+            provenance
+        )
     );
 }
 
@@ -1036,7 +1024,10 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     assert!(seed.contains(voice::recovery_prompt(true)));
     assert_eq!(
         conv.messages[1],
-        Message::assistant(vec![ContentBlock::text("handoff recovered")])
+        Message::assistant_from(
+            vec![ContentBlock::text("handoff recovered")],
+            session.model.provenance()
+        )
     );
 
     // The Plan is harness-owned and survives the retirement verbatim.

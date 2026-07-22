@@ -242,7 +242,10 @@ impl Scout {
 
                     let results = tools::run_read_only(&response.content, &state.ctx).await;
 
-                    conversation.add_assistant_blocks(response.content);
+                    // Stamped with the Scout's captured Model (ADR-0037), so
+                    // the transform replays this history verbatim on the
+                    // Scout's own next Pass.
+                    conversation.add_assistant_response(response.content, state.model.provenance());
                     conversation.add_tool_results(results, Vec::new());
 
                     state.pass += 1;
@@ -386,6 +389,31 @@ mod tests {
             outcome,
             ScoutOutcome::Ok("Found Widget.go at widget.ex:2.".to_string())
         );
+    }
+
+    // ---- Provenance stamping (ADR-0037) ----
+
+    #[tokio::test]
+    async fn a_scouts_assistant_history_is_stamped_with_its_captured_model() {
+        let root = root();
+        let captured: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let fake = FakeLlm::script(vec![
+            Entry::just(tool_use_response("t1", "list_files", json!({}))),
+            Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
+                *cap.lock().unwrap() = req.messages.clone();
+                text_response("report")
+            }),
+        ]);
+
+        Scout::run("find go", &fake, &model(), opts(&root)).await;
+
+        let messages = captured.lock().unwrap().clone();
+        let assistant = messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("the tool pass entered the scout's conversation");
+        assert_eq!(assistant.provenance, Some(model().provenance()));
     }
 
     #[tokio::test]

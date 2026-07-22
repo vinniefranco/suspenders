@@ -219,7 +219,7 @@ fn rollover(event: &Event, steering: &[String]) -> Rollover {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::{ContentBlock, Message, Role};
+    use crate::content::{ContentBlock, Message};
     use crate::conversation::{Conversation, ConversationOpts};
     use serde_json::json;
 
@@ -251,10 +251,7 @@ mod tests {
     fn assert_closed_with(conversation: &Conversation, on_top_of: &Conversation, marker: &str) {
         assert_eq!(
             *last_message(conversation),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::text(marker)],
-            }
+            Message::assistant(vec![ContentBlock::text(marker)])
         );
 
         let mut expected = on_top_of.messages.clone();

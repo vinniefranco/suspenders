@@ -25,6 +25,7 @@
 
 use std::future::Future;
 
+use crate::content::Provenance;
 use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::response::Response;
@@ -90,6 +91,12 @@ pub trait TurnDeps: Send {
         request: LlmRequest,
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> impl Future<Output = Response> + Send;
+
+    /// The Provenance of the Model this Turn captured at spawn (ADR-0037,
+    /// CONTEXT.md: Provenance): stamped on every assistant message a Response
+    /// contributes to the Conversation. A fact of the capture, so it never
+    /// changes mid-Turn.
+    fn provenance(&self) -> Provenance;
 
     /// Hands out the owned emission handle (ADR-0025). Emission alone is a
     /// handle rather than a trait method because of the borrow split: the

@@ -33,6 +33,7 @@ pub mod openai_completions;
 pub mod provider;
 pub mod response;
 pub mod throttle;
+pub mod transform;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -241,12 +242,17 @@ impl Llm for Dispatcher {
         let Some(provider) = provider::find(&self.providers, &model.provider) else {
             return Response::error(format!("unknown_provider: {}", model.provider));
         };
+        // The cross-Provider transform pass (ADR-0037), run ONCE here before
+        // routing so both adapters get it for free: history whose Provenance
+        // matches `model` replays verbatim; the rest is normalized to the
+        // target Api's tool-id rules with orphaned Tool Calls answered.
+        let request = transform::normalize_request(request, model);
         match model.api {
             Api::AnthropicMessages => {
-                anthropic_messages::complete(request, model, provider, on_event).await
+                anthropic_messages::complete(&request, model, provider, on_event).await
             }
             Api::OpenaiCompletions => {
-                openai_completions::complete(request, model, provider, on_event).await
+                openai_completions::complete(&request, model, provider, on_event).await
             }
         }
     }

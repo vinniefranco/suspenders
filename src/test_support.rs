@@ -389,6 +389,10 @@ impl TurnDeps for FakeDeps {
         self.llm.complete(&req, &self.model, &mut adapter).await
     }
 
+    fn provenance(&self) -> crate::content::Provenance {
+        self.model.provenance()
+    }
+
     fn emitter(&mut self) -> Emitter {
         // The handle shares the SAME `Arc<Mutex<Vec<Event>>>` the fake records
         // into directly (approval request/resolved below), so a test sees one

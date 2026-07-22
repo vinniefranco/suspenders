@@ -11,8 +11,9 @@
 //! history):
 //!
 //!   * `user_text` - submit and Rollover alike
-//!   * `assistant_blocks` - each message-end, tool_use included; the fold
-//!     repairs a dangling batch
+//!   * `assistant_blocks{blocks, provider, model}` - each message-end,
+//!     tool_use included, stamped with the producing Model's Provenance
+//!     (ADR-0037); the fold repairs a dangling batch
 //!   * `tool_result` - per Tool Result
 //!   * `steering` - delivered Steering (user-voiced)
 //!   * `nudge` - a user-role Nudge (Verify Nudge, Explore Nudge). The fold
@@ -43,7 +44,7 @@ use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
-use crate::content::{ContentBlock, Message, Role};
+use crate::content::{ContentBlock, Message, Provenance, Role};
 use crate::conversation;
 use crate::session::{RecoveryShape, Session};
 use crate::voice::{self, FileOps};
@@ -198,7 +199,14 @@ impl RiderTag {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     UserText(String),
-    AssistantBlocks(Vec<ContentBlock>),
+    /// One message-end's content blocks, stamped with the Provenance of the
+    /// Model that produced them (ADR-0037). `None` decodes from a line
+    /// missing the provenance fields: unknown Provenance, which the
+    /// request-shaping transform treats as a cross-Provider mismatch.
+    AssistantBlocks {
+        blocks: Vec<ContentBlock>,
+        provenance: Option<Provenance>,
+    },
     ToolResult(ContentBlock),
     Steering(String),
     Nudge(String),
@@ -258,6 +266,15 @@ pub enum Entry {
 // ------------------------------------------------------------------
 
 impl Entry {
+    /// An `assistant_blocks` entry with unknown Provenance; the live Agent
+    /// appends stamped entries via the struct form.
+    pub fn assistant_blocks(blocks: Vec<ContentBlock>) -> Entry {
+        Entry::AssistantBlocks {
+            blocks,
+            provenance: None,
+        }
+    }
+
     fn to_json(&self) -> serde_json::Value {
         use serde_json::json;
         match self {
@@ -268,15 +285,21 @@ impl Entry {
                 json!({"e": "rider", "tag": tag.as_str(), "text": text})
             }
             Entry::Plan(text) => json!({"e": "plan", "text": text}),
-            Entry::AssistantBlocks(blocks) => {
-                json!({"e": "assistant_blocks", "blocks": blocks})
+            Entry::AssistantBlocks { blocks, provenance } => {
+                let mut value = json!({"e": "assistant_blocks", "blocks": blocks});
+                write_provenance(&mut value, provenance.as_ref());
+                value
             }
             Entry::ToolResult(block) => json!({"e": "tool_result", "block": block}),
-            Entry::Message(message) => json!({
-                "e": "message",
-                "role": role_str(message.role),
-                "content": message.content,
-            }),
+            Entry::Message(message) => {
+                let mut value = json!({
+                    "e": "message",
+                    "role": role_str(message.role),
+                    "content": message.content,
+                });
+                write_provenance(&mut value, message.provenance.as_ref());
+                value
+            }
             Entry::Settled {
                 outcome,
                 stop_reason,
@@ -366,7 +389,10 @@ fn parse_rider(m: &serde_json::Value) -> Option<Entry> {
 
 fn parse_assistant_blocks(m: &serde_json::Value) -> Option<Entry> {
     let blocks = decode_blocks(m.get("blocks")?)?;
-    Some(Entry::AssistantBlocks(blocks))
+    Some(Entry::AssistantBlocks {
+        blocks,
+        provenance: read_provenance(m),
+    })
 }
 
 fn parse_tool_result(m: &serde_json::Value) -> Option<Entry> {
@@ -377,7 +403,30 @@ fn parse_tool_result(m: &serde_json::Value) -> Option<Entry> {
 fn parse_message(m: &serde_json::Value) -> Option<Entry> {
     let role = decode_role(m.get("role")?.as_str()?)?;
     let content = decode_blocks(m.get("content")?)?;
-    Some(Entry::Message(Message { role, content }))
+    Some(Entry::Message(Message {
+        role,
+        content,
+        provenance: read_provenance(m),
+    }))
+}
+
+// The Provenance codec, shared by the assistant_blocks and message entries:
+// two flat keys beside the entry's own. Absent keys decode as `None`
+// (unknown Provenance) with the same optional-field tolerance the settled
+// entry's `reason` takes - the transform treats unknown as a mismatch, so a
+// missing stamp degrades to normalization, never to a torn line.
+fn write_provenance(value: &mut serde_json::Value, provenance: Option<&Provenance>) {
+    if let (Some(p), Some(obj)) = (provenance, value.as_object_mut()) {
+        obj.insert("provider".into(), p.provider.clone().into());
+        obj.insert("model".into(), p.model.clone().into());
+    }
+}
+
+fn read_provenance(m: &serde_json::Value) -> Option<Provenance> {
+    Some(Provenance::new(
+        m.get("provider")?.as_str()?,
+        m.get("model")?.as_str()?,
+    ))
 }
 
 fn parse_settled(m: &serde_json::Value) -> Option<Entry> {
@@ -894,11 +943,12 @@ fn decode_line(line: &str) -> Option<serde_json::Value> {
 // The fold: entries -> Conversation messages
 // ------------------------------------------------------------------
 
-// The open tool batch: the last assistant_blocks and the results/steering that
-// followed it, pending until the batch closes - mirroring how the Loop builds
-// the live Conversation.
+// The open tool batch: the last assistant_blocks (with the Provenance it was
+// logged under) and the results/steering that followed it, pending until the
+// batch closes - mirroring how the Loop builds the live Conversation.
 struct Batch {
     blocks: Vec<ContentBlock>,
+    provenance: Option<Provenance>,
     results: Vec<ContentBlock>,
     steering: Vec<String>,
 }
@@ -962,10 +1012,11 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
         // is forensic only and never becomes a message or disturbs an open
         // batch - the re-issued request lands as the next assistant_blocks.
         Entry::Retry { .. } => {}
-        Entry::AssistantBlocks(blocks) => {
+        Entry::AssistantBlocks { blocks, provenance } => {
             flush(messages, batch.take());
             *batch = Some(Batch {
                 blocks: blocks.clone(),
+                provenance: provenance.clone(),
                 results: Vec::new(),
                 steering: Vec::new(),
             });
@@ -1115,9 +1166,13 @@ fn flush_batch(messages: &mut Vec<Message>, batch: Batch, stop: StopReason) {
         kept = vec![text_block(marker)];
     }
 
+    // The batch re-enters under the Provenance it was logged with, so a
+    // resumed history normalizes at request-shaping exactly as the live one
+    // would (ADR-0037).
     messages.push(Message {
         role: Role::Assistant,
         content: kept,
+        provenance: batch.provenance,
     });
 
     let mut content = batch.results;
@@ -1140,10 +1195,7 @@ fn close_settled(messages: &mut Vec<Message>, outcome: Settled, stop_reason: Sto
                 } else {
                     voice::turn_stopped_marker()
                 };
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: vec![text_block(marker)],
-                });
+                messages.push(Message::assistant(vec![text_block(marker)]));
             }
         }
         Settled::Failed => close_with(messages, voice::turn_failed_marker()),
@@ -1162,18 +1214,12 @@ fn close_with(messages: &mut Vec<Message>, marker: &str) {
                 last.content.push(marker_block);
             }
         }
-        _ => messages.push(Message {
-            role: Role::Assistant,
-            content: vec![marker_block],
-        }),
+        _ => messages.push(Message::assistant(vec![marker_block])),
     }
 }
 
 fn user_message(content: Vec<ContentBlock>) -> Message {
-    Message {
-        role: Role::User,
-        content,
-    }
+    Message::user(content)
 }
 
 fn text_block(text: &str) -> ContentBlock {
@@ -1239,13 +1285,13 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("list the files".into()));
-        log.append(Entry::AssistantBlocks(vec![
+        log.append(Entry::assistant_blocks(vec![
             text("Let me look."),
             tool_use("t1", "list_files", json!({"path": "."})),
         ]));
         log.append(Entry::ToolResult(tool_result("t1", "a.txt\nb.txt")));
         log.append(Entry::Steering("also check the README".into()));
-        log.append(Entry::AssistantBlocks(vec![text("Two files.")]));
+        log.append(Entry::assistant_blocks(vec![text("Two files.")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1282,12 +1328,12 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![
+        log.append(Entry::assistant_blocks(vec![
             tool_use("t1", "read_file", json!({"path": "a.rs"})),
             tool_use("t2", "read_file", json!({"path": "b.rs"})),
         ]));
         log.append(Entry::ToolResult(tool_result("t1", "ok")));
-        log.append(Entry::AssistantBlocks(vec![text("done")]));
+        log.append(Entry::assistant_blocks(vec![text("done")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1317,7 +1363,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![
+        log.append(Entry::assistant_blocks(vec![
             tool_use("t1", "read_file", json!({"path": "a.rs"})),
             tool_use("t2", "read_file", json!({"path": "b.rs"})),
         ]));
@@ -1348,11 +1394,11 @@ mod tests {
 
         log.append(Entry::UserText("do the thing".into()));
         log.append(Entry::Plan("Goal: A. 1. read [x] 2. edit [ ]".into()));
-        log.append(Entry::AssistantBlocks(vec![text("planned")]));
+        log.append(Entry::assistant_blocks(vec![text("planned")]));
         log.append(Entry::Plan(
             "Goal: A. 1. read [x] 2. edit [x] 3. verify [ ]".into(),
         ));
-        log.append(Entry::AssistantBlocks(vec![text("done step 2")]));
+        log.append(Entry::assistant_blocks(vec![text("done step 2")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1378,7 +1424,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("hi".into()));
-        log.append(Entry::AssistantBlocks(vec![text("hello")]));
+        log.append(Entry::assistant_blocks(vec![text("hello")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1397,7 +1443,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "write_file",
             json!({"path": "a"}),
@@ -1407,7 +1453,7 @@ mod tests {
             "[response was cut...]",
             true,
         )));
-        log.append(Entry::AssistantBlocks(vec![text("re-issued")]));
+        log.append(Entry::assistant_blocks(vec![text("re-issued")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1438,7 +1484,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![
+        log.append(Entry::assistant_blocks(vec![
             text("thinking..."),
             tool_use("t1", "grep", json!({})),
         ]));
@@ -1462,7 +1508,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "grep",
             json!({}),
@@ -1491,7 +1537,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "grep",
             json!({}),
@@ -1517,7 +1563,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![text("partial")]));
+        log.append(Entry::assistant_blocks(vec![text("partial")]));
         log.append(Entry::Settled {
             outcome: Settled::Failed,
             stop_reason: StopReason::Error,
@@ -1542,11 +1588,11 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("write it".into()));
-        log.append(Entry::AssistantBlocks(vec![text("wrote it")]));
+        log.append(Entry::assistant_blocks(vec![text("wrote it")]));
         log.append(Entry::Nudge(
             "[files changed but nothing verified - ...]".into(),
         ));
-        log.append(Entry::AssistantBlocks(vec![text("verified")]));
+        log.append(Entry::assistant_blocks(vec![text("verified")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1572,7 +1618,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("evaluate this project".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "read_file",
             json!({"path": "a.txt"}),
@@ -1581,7 +1627,7 @@ mod tests {
         log.append(Entry::Nudge(
             "[reading file after file - dispatch explore instead]".into(),
         ));
-        log.append(Entry::AssistantBlocks(vec![text("ok, exploring")]));
+        log.append(Entry::assistant_blocks(vec![text("ok, exploring")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1620,7 +1666,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "list_files",
             json!({"path": "."}),
@@ -1634,7 +1680,7 @@ mod tests {
             tag: RiderTag::WrapUpWarning,
             text: "[2 passes remain - wrap up]".into(),
         });
-        log.append(Entry::AssistantBlocks(vec![text("wrapping")]));
+        log.append(Entry::assistant_blocks(vec![text("wrapping")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1665,7 +1711,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("edit it".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "edit_file",
             json!({"path": "a.ex"}),
@@ -1675,7 +1721,7 @@ mod tests {
             tag: RiderTag::VerificationPass,
             text: "[verify your changes now]".into(),
         });
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t2",
             "run_command",
             json!({"command": "mix test"}),
@@ -1685,7 +1731,7 @@ mod tests {
             tag: RiderTag::FinalPass,
             text: "[final pass - conclude]".into(),
         });
-        log.append(Entry::AssistantBlocks(vec![text("done, verified")]));
+        log.append(Entry::assistant_blocks(vec![text("done, verified")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1764,7 +1810,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("go".into()));
-        log.append(Entry::AssistantBlocks(vec![text("done")]));
+        log.append(Entry::assistant_blocks(vec![text("done")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1873,9 +1919,9 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("turn 1".into()));
-        log.append(Entry::AssistantBlocks(vec![text("old response")]));
+        log.append(Entry::assistant_blocks(vec![text("old response")]));
         log.append(Entry::UserText("turn 2".into()));
-        log.append(Entry::AssistantBlocks(vec![text("compacted response")]));
+        log.append(Entry::assistant_blocks(vec![text("compacted response")]));
         log.append(Entry::ToolResult(tool_result("t1", "compacted result")));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
@@ -1890,7 +1936,7 @@ mod tests {
             original_task: Some("the original task".into()),
         });
         log.append(Entry::UserText("turn 3".into()));
-        log.append(Entry::AssistantBlocks(vec![text("new response")]));
+        log.append(Entry::assistant_blocks(vec![text("new response")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1916,7 +1962,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("turn 1".into()));
-        log.append(Entry::AssistantBlocks(vec![text("old response")]));
+        log.append(Entry::assistant_blocks(vec![text("old response")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1933,7 +1979,7 @@ mod tests {
             original_task: Some("verbatim original task".into()),
         });
         log.append(Entry::UserText("turn 2".into()));
-        log.append(Entry::AssistantBlocks(vec![text("new response")]));
+        log.append(Entry::assistant_blocks(vec![text("new response")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -1994,7 +2040,7 @@ mod tests {
             conv.add_user_text(body.clone());
             conv.add_assistant_blocks(vec![ContentBlock::text(body.clone())]);
             log.append(Entry::UserText(body.clone()));
-            log.append(Entry::AssistantBlocks(vec![text(&body)]));
+            log.append(Entry::assistant_blocks(vec![text(&body)]));
         }
         // The Turn that triggers Compaction settles first, like the real path.
         log.append(Entry::Settled {
@@ -2045,7 +2091,7 @@ mod tests {
                     log.append(Entry::UserText(text));
                 }
                 Role::Assistant => {
-                    log.append(Entry::AssistantBlocks(msg.content.clone()));
+                    log.append(Entry::assistant_blocks(msg.content.clone()));
                 }
             }
         }
@@ -2072,7 +2118,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("fix the tests".into()));
-        log.append(Entry::AssistantBlocks(vec![tool_use(
+        log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
             "edit_file",
             json!({"path": "a.ex"}),
@@ -2087,7 +2133,7 @@ mod tests {
             shape: RecoveryShape::Continuation,
             text: "[recovery prompt]".into(),
         });
-        log.append(Entry::AssistantBlocks(vec![text("recovered")]));
+        log.append(Entry::assistant_blocks(vec![text("recovered")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -2116,7 +2162,7 @@ mod tests {
         let mut log = Log::open(&session).unwrap();
 
         log.append(Entry::UserText("fix the tests".into()));
-        log.append(Entry::AssistantBlocks(vec![text("failing attempt")]));
+        log.append(Entry::assistant_blocks(vec![text("failing attempt")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::TurnLimit,
@@ -2135,7 +2181,7 @@ mod tests {
             shape: RecoveryShape::Handoff,
             text: "[recovery prompt]".into(),
         });
-        log.append(Entry::AssistantBlocks(vec![text("recovered")]));
+        log.append(Entry::assistant_blocks(vec![text("recovered")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -2195,7 +2241,7 @@ mod tests {
             shape: RecoveryShape::Handoff,
             text: "[recovery prompt]".into(),
         });
-        log.append(Entry::AssistantBlocks(vec![text("done")]));
+        log.append(Entry::assistant_blocks(vec![text("done")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -2304,7 +2350,7 @@ mod tests {
             attempt: 1,
             budget: 3,
         });
-        log.append(Entry::AssistantBlocks(vec![text("re-drawn answer")]));
+        log.append(Entry::assistant_blocks(vec![text("re-drawn answer")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -2537,6 +2583,94 @@ mod tests {
         let (messages, drift) = resume(&log.path, &session).unwrap();
         assert_eq!(messages, vec![seeded]);
         assert_eq!(drift, Vec::new());
+    }
+
+    // ---- Provenance persistence (ADR-0037) ----
+
+    #[test]
+    fn assistant_provenance_round_trips_through_the_log_and_fold() {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        let stamp = Provenance::new("anthropic", "claude-fable-5");
+        log.append(Entry::UserText("go".into()));
+        log.append(Entry::AssistantBlocks {
+            blocks: vec![tool_use("t1", "grep", json!({}))],
+            provenance: Some(stamp.clone()),
+        });
+        log.append(Entry::ToolResult(tool_result("t1", "hits")));
+        log.append(Entry::AssistantBlocks {
+            blocks: vec![text("done")],
+            provenance: Some(stamp.clone()),
+        });
+        log.append(Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::EndTurn,
+            reason: None,
+        });
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+
+        assert_eq!(messages[1].provenance, Some(stamp.clone()));
+        assert_eq!(messages[3].provenance, Some(stamp));
+        assert_eq!(messages[0].provenance, None, "user messages carry none");
+        assert_eq!(messages[2].provenance, None);
+    }
+
+    #[test]
+    fn a_seeded_message_entry_keeps_its_provenance_across_log_generations() {
+        // Resume seeds a fresh log with `message` entries; the stamp must
+        // survive so a twice-resumed history still normalizes correctly.
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        let seeded = Message::assistant_from(
+            vec![text("stamped reply")],
+            Provenance::new("lmstudio", "qwen3.6-27b"),
+        );
+        log.append(Entry::Message(seeded.clone()));
+
+        let (messages, _) = resume(&log.path, &session).unwrap();
+        assert_eq!(messages, vec![seeded]);
+    }
+
+    // The documented decode choice: a logged assistant event MISSING the
+    // provenance fields decodes as `None` (unknown Provenance, a transform
+    // mismatch) rather than failing the fold - the same optional-field
+    // tolerance the settled entry's `reason` takes, and strictly safer than
+    // treating the line as torn (which would silently drop the rest of the
+    // log). No backwards compatibility is intended; unknown is simply the
+    // honest value for an unstamped line.
+    #[test]
+    fn a_line_missing_the_provenance_fields_decodes_as_unknown_provenance() {
+        let raw = r#"{"e":"assistant_blocks","blocks":[{"type":"text","text":"old"}]}"#;
+        let entry = Entry::from_json(&decode_line(raw).unwrap()).unwrap();
+        assert_eq!(
+            entry,
+            Entry::AssistantBlocks {
+                blocks: vec![text("old")],
+                provenance: None,
+            }
+        );
+
+        let raw = r#"{"e":"message","role":"assistant","content":[{"type":"text","text":"old"}]}"#;
+        let entry = Entry::from_json(&decode_line(raw).unwrap()).unwrap();
+        assert_eq!(entry, Entry::Message(Message::assistant(vec![text("old")])));
+    }
+
+    #[test]
+    fn provenance_rides_the_wire_as_flat_provider_and_model_keys() {
+        // The greppable-log thesis of ADR-0010: a human can read the stamp.
+        let entry = Entry::AssistantBlocks {
+            blocks: vec![text("hi")],
+            provenance: Some(Provenance::new("anthropic", "claude-fable-5")),
+        };
+        let value = entry.to_json();
+        assert_eq!(value["provider"], "anthropic");
+        assert_eq!(value["model"], "claude-fable-5");
+        assert_eq!(Entry::from_json(&value), Some(entry));
     }
 
     // ---- latest/1 ----

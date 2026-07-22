@@ -225,6 +225,14 @@ pub fn truncated_call_nudge() -> &'static str {
     "[response was cut by max_tokens - the call may be incomplete, re-issue it]"
 }
 
+/// Tool Result answering a Tool Call left unanswered when the Conversation
+/// crossed Providers (ADR-0037: the ADR-0004/0009 orphan machinery, relocated
+/// to the transform pass). An error answer, like ADR-0009's: the model should
+/// re-issue the call if it still needs the result.
+pub fn orphaned_call_answer() -> &'static str {
+    "[this call's result was lost in a model switch - re-issue the call if you still need it]"
+}
+
 /// Assistant marker closing a Turn an after-Pass hook stopped.
 pub fn turn_stopped_marker() -> &'static str {
     "[turn stopped - reply to continue]"
@@ -945,6 +953,19 @@ mod tests {
         assert!(refusal.contains("read_file"));
         assert!(!refusal.contains('\u{2014}')); // em-dash
         assert!(!refusal.contains('\u{2013}')); // en-dash
+    }
+
+    // ---- orphaned_call_answer/0 ----
+
+    #[test]
+    fn orphaned_call_answer_is_a_bracketed_error_telling_the_model_to_reissue() {
+        let answer = orphaned_call_answer();
+        assert!(answer.starts_with('['));
+        assert!(answer.ends_with(']'));
+        assert!(answer.contains("model switch"));
+        assert!(answer.contains("re-issue"));
+        assert!(!answer.contains('\u{2014}')); // em-dash
+        assert!(!answer.contains('\u{2013}')); // en-dash
     }
 
     // ---- explore_nudge/0 ----

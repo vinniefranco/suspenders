@@ -46,15 +46,21 @@ pub(super) fn close<D: TurnDeps>(
 // author for both recovery closes: `closing` is the turn-limit marker at the
 // tool-answering cap and on the tool-insistent reply (roles keep
 // alternating; the insistent markup never enters), or the model's own
-// final-Pass reply on the text settle (ADR-0028 addendum).
+// final-Pass reply on the text settle (ADR-0028 addendum). `provenance` is
+// the captured Model's when `closing` is that reply, `None` when it is the
+// Voice's marker (ADR-0037: Provenance marks what the model produced).
 pub(super) fn close_recover<D: TurnDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     closing: Vec<ContentBlock>,
+    provenance: Option<crate::content::Provenance>,
     stop_reason: log::StopReason,
     recovery: governor::endgame::Recovery,
 ) -> Outcome {
-    conversation.add_assistant_blocks(closing);
+    match provenance {
+        Some(p) => conversation.add_assistant_response(closing, p),
+        None => conversation.add_assistant_blocks(closing),
+    };
     state.deps.checkpoint(&conversation);
     Outcome::Recover(conversation, stop_reason, recovery)
 }
@@ -84,7 +90,9 @@ pub(super) fn fail<D: TurnDeps>(
         .cloned()
         .collect();
     blocks.push(ContentBlock::text(voice::turn_failed_marker()));
-    conversation.add_assistant_blocks(blocks);
+    // The partial text is the model's, so the message carries its Provenance
+    // (the appended marker rides the same message, as the fold's does).
+    conversation.add_assistant_response(blocks, state.deps.provenance());
     state.deps.checkpoint(&conversation);
     let reason = response.error.unwrap_or_default();
     Outcome::Failed(reason, conversation)
@@ -119,25 +127,31 @@ pub(super) fn finish<D: TurnDeps>(
             recovery,
             keep_reply,
         }) => {
-            let closing = if keep_reply {
-                close_blocks(&blocks, &stop_reason)
+            let (closing, provenance) = if keep_reply {
+                (
+                    close_blocks(&blocks, &stop_reason),
+                    Some(state.deps.provenance()),
+                )
             } else {
-                vec![ContentBlock::text(voice::turn_limit_marker())]
+                (vec![ContentBlock::text(voice::turn_limit_marker())], None)
             };
             Flow::Done(close_recover(
                 state,
                 conversation,
                 closing,
+                provenance,
                 reason,
                 recovery,
             ))
         }
         Some(FinishIntervention::Standalone { tag, text }) => {
-            conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));
+            let provenance = state.deps.provenance();
+            conversation.add_assistant_response(close_blocks(&blocks, &stop_reason), provenance);
             nudge_finish(state, conversation, &text, tag)
         }
         None => {
-            conversation.add_assistant_blocks(close_blocks(&blocks, &stop_reason));
+            let provenance = state.deps.provenance();
+            conversation.add_assistant_response(close_blocks(&blocks, &stop_reason), provenance);
             Flow::Done(Outcome::Ok(conversation, outcome_stop_of(&closed)))
         }
     }
