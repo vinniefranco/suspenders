@@ -42,13 +42,20 @@ pub struct SlashCommand {
     pub opens_selector: bool,
 }
 
-/// The available Slash Commands (ADR-0032's `&'static` registry). Seeded with
-/// `/model` only; `/theme`, `/compact`, … are each one more entry.
-pub const COMMANDS: &[SlashCommand] = &[SlashCommand {
-    name: "model",
-    help: "choose the model for this session",
-    opens_selector: true,
-}];
+/// The available Slash Commands (ADR-0032's `&'static` registry); `/compact`,
+/// … are each one more entry.
+pub const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "model",
+        help: "choose the model for this session",
+        opens_selector: true,
+    },
+    SlashCommand {
+        name: "theme",
+        help: "choose the theme for this session",
+        opens_selector: true,
+    },
+];
 
 /// A parsed slash draft: the command token and an optional remainder. For
 /// `"/mod"` → `{ name: "mod", rest: None }`; for `"/model qw"` →
@@ -200,16 +207,21 @@ mod tests {
     #[test]
     fn lookup_matches_a_registered_name_exactly() {
         assert_eq!(lookup("model"), Some(&COMMANDS[0]));
+        assert_eq!(lookup("theme"), Some(&COMMANDS[1]));
         assert_eq!(lookup("mod"), None, "partial names never resolve");
-        assert_eq!(lookup("theme"), None);
+        assert_eq!(lookup("compact"), None);
         assert_eq!(lookup(""), None);
     }
 
     #[test]
-    fn model_opens_a_selector_sub_state() {
+    fn model_and_theme_open_a_selector_sub_state() {
         assert!(
             lookup("model").expect("model is registered").opens_selector,
             "committing /model switches the popup to its own value list"
+        );
+        assert!(
+            lookup("theme").expect("theme is registered").opens_selector,
+            "committing /theme switches the popup to the theme list (ADR-0038)"
         );
     }
 

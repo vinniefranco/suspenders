@@ -965,13 +965,27 @@ mod tests {
 
     #[test]
     fn up_down_move_the_menu_highlight_clamped_to_the_filtered_rows() {
-        // One command today, so the highlight cannot leave row 0; the arrows
-        // are still consumed (never a scroll for the caller) and saturate.
+        // Two commands (model, theme): the arrows move between them and
+        // saturate at both ends - consumed either way (never a scroll for
+        // the caller).
         let mut c = slashing("/");
         assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
+        assert_eq!(menu_highlight(&c), 1);
+        assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
+        assert_eq!(menu_highlight(&c), 1, "saturates at the last row");
+        assert_eq!(fold_consumed(&mut c, Key::ArrowUp), vec![]);
         assert_eq!(menu_highlight(&c), 0);
         assert_eq!(fold_consumed(&mut c, Key::ArrowUp), vec![]);
         assert_eq!(menu_highlight(&c), 0);
+
+        // Typing narrows the menu to one row: the highlight clamps onto it.
+        let mut c = slashing("/");
+        assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
+        assert_eq!(menu_highlight(&c), 1);
+        for key in [Key::Char('m'), Key::Char('o'), Key::Char('d')] {
+            assert_eq!(fold_consumed(&mut c, key), vec![]);
+        }
+        assert_eq!(menu_highlight(&c), 0, "clamped to the one filtered row");
     }
 
     fn menu_highlight(c: &Composer) -> usize {

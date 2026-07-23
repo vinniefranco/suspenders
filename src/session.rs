@@ -128,6 +128,10 @@ pub struct Session {
     /// amendment). The budget figures derive from whichever Model each Turn
     /// captures, this one until a `/model` swap.
     pub model: Model,
+    /// The configured Theme name (ADR-0038), carried unvalidated: the UI
+    /// resolves it at launch and falls back to `dark` with a notice, so a
+    /// bad name never fails launch.
+    pub theme: String,
     /// The sampling temperature every request carries; `None` leaves sampling
     /// to the server's own defaults. Resolved once here, applied by the
     /// request-building callers (ADR-0037: temperature belongs to the request).
@@ -161,6 +165,11 @@ pub struct SessionConfig {
     pub providers: BTreeMap<String, ProviderConfig>,
     /// The scoped `provider/model-id` the launch Model resolves from.
     pub model: String,
+    /// The configured Theme name (ADR-0038): a built-in (`dark`, `light`) or a
+    /// user file's stem in the themes directory. Carried unvalidated - the UI
+    /// resolves it at launch and falls back to `dark` with a notice, so a bad
+    /// name never fails launch.
+    pub theme: String,
     pub max_tokens: u64,
     pub temperature: Option<f64>,
     /// The optional global budget cap and catalog-less window figure
@@ -200,6 +209,7 @@ impl SessionConfig {
                 },
             )]),
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
+            theme: "dark".into(),
             max_tokens: 8_000,
             temperature: Some(0.7),
             // No global cap by default: every Model's own window is its
@@ -317,6 +327,7 @@ impl SessionConfig {
             // template never persists a secret.
             providers: Some(base.providers),
             model: Some(base.model),
+            theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
             temperature: base.temperature,
             // Absent from the template on purpose (ADR-0037): the base config
@@ -350,63 +361,78 @@ impl SessionConfig {
     }
 
     /// Persists the Active Model choice by a sparse read-modify-write of the
-    /// config file (ADR-0033, ADR-0031 amendment): the user's other keys are
-    /// preserved and `token` is never introduced by the tool. This is the one
-    /// sanctioned exception to ADR-0031's no-auto-create - an explicit `/model`
-    /// pick is a deliberate act, so the file is created if absent.
-    ///
-    /// If `path` exists it is parsed as a JSON object and only the `"model"` key
-    /// is set; if absent, a `{"model": "..."}` file (and its parent dirs) is
-    /// created. Malformed existing JSON is an [`Err`] naming `path` (mirroring
-    /// [`load_file_overlay`]'s error style). Parsing splits into the pure
-    /// [`merge_model`] and this thin impure reader/writer, the same split as
-    /// [`FileConfig::parse`] vs [`load_file_overlay`].
+    /// config file (ADR-0033, ADR-0031 amendment): only the `"model"` key is
+    /// set, through the shared [`persist_key`] machinery.
     pub fn persist_model(path: &str, model: &str) -> Result<(), SessionError> {
-        let existing = match std::fs::read_to_string(path) {
-            Ok(raw) => Some(raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(SessionError(format!(
-                    "failed to read config at {path}: {e}"
-                )));
-            }
-        };
+        persist_key(path, "model", model)
+    }
 
-        let json = merge_model(existing.as_deref(), model)
-            .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?;
-
-        if let Some(parent) = std::path::Path::new(path).parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                SessionError(format!("failed to create config directory {parent:?}: {e}"))
-            })?;
-        }
-
-        std::fs::write(path, json)
-            .map_err(|e| SessionError(format!("failed to write config to {path}: {e}")))
+    /// Persists the active Theme choice (ADR-0038): only the `"theme"` key is
+    /// set - `/theme` shares `/model`'s sanctioned create-if-absent exception,
+    /// through the same [`persist_key`] machinery.
+    pub fn persist_theme(path: &str, theme: &str) -> Result<(), SessionError> {
+        persist_key(path, "theme", theme)
     }
 }
 
-/// Pure sparse merge of the `model` key into a config file's JSON (ADR-0033):
-/// `existing` is the current file contents (or `None` when absent), and the
-/// result is the pretty JSON to write back. Every other key is preserved; a
-/// `token` key is never introduced (only the caller's existing one, if any,
-/// survives). A malformed or non-object existing file is an [`Err`] carrying the
-/// path-agnostic reason (the caller wraps it with the resolved path). Path-free
-/// and side-effect-free, so it unit-tests with literals like [`FileConfig::parse`].
-fn merge_model(existing: Option<&str>, model: &str) -> Result<String, String> {
-    let mut value = match existing {
+/// The sparse sticky write behind [`SessionConfig::persist_model`] and
+/// [`SessionConfig::persist_theme`] (ADR-0033, ADR-0038): the user's other
+/// keys are preserved and `token` is never introduced by the tool. This is
+/// the one sanctioned exception to ADR-0031's no-auto-create - an explicit
+/// pick is a deliberate act, so the file is created if absent.
+///
+/// If `path` exists it is parsed as a JSON object and only `key` is set; if
+/// absent, a `{"<key>": "..."}` file (and its parent dirs) is created.
+/// Malformed existing JSON is an [`Err`] naming `path` (mirroring
+/// [`load_file_overlay`]'s error style). Parsing splits into the pure
+/// [`merge_key`] and this thin impure reader/writer, the same split as
+/// [`FileConfig::parse`] vs [`load_file_overlay`].
+fn persist_key(path: &str, key: &str, value: &str) -> Result<(), SessionError> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(SessionError(format!(
+                "failed to read config at {path}: {e}"
+            )));
+        }
+    };
+
+    let json = merge_key(existing.as_deref(), key, value)
+        .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?;
+
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            SessionError(format!("failed to create config directory {parent:?}: {e}"))
+        })?;
+    }
+
+    std::fs::write(path, json)
+        .map_err(|e| SessionError(format!("failed to write config to {path}: {e}")))
+}
+
+/// Pure sparse merge of one string `key` into a config file's JSON (ADR-0033,
+/// ADR-0038): `existing` is the current file contents (or `None` when absent),
+/// and the result is the pretty JSON to write back. Every other key is
+/// preserved; a `token` key is never introduced (only the caller's existing
+/// one, if any, survives). A malformed or non-object existing file is an
+/// [`Err`] carrying the path-agnostic reason (the caller wraps it with the
+/// resolved path). Path-free and side-effect-free, so it unit-tests with
+/// literals like [`FileConfig::parse`].
+fn merge_key(existing: Option<&str>, key: &str, value: &str) -> Result<String, String> {
+    let mut root = match existing {
         None => serde_json::Value::Object(serde_json::Map::new()),
         Some(raw) => serde_json::from_str(raw).map_err(|e| e.to_string())?,
     };
 
-    let obj = value
+    let obj = root
         .as_object_mut()
         .ok_or_else(|| "config root must be a JSON object".to_string())?;
-    obj.insert("model".into(), serde_json::Value::String(model.to_string()));
+    obj.insert(key.into(), serde_json::Value::String(value.to_string()));
 
-    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
 }
 
 /// One custom Provider's config entry (ADR-0031 amendment, ADR-0037): the
@@ -448,6 +474,8 @@ pub(crate) struct FileConfig {
     providers: Option<BTreeMap<String, ProviderConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
     /// Presence sets `Some`; the file cannot null it out (same limitation as the
@@ -495,6 +523,9 @@ impl FileConfig {
         }
         if let Some(v) = &self.model {
             cfg.model = v.clone();
+        }
+        if let Some(v) = &self.theme {
+            cfg.theme = v.clone();
         }
         if let Some(v) = self.max_tokens {
             cfg.max_tokens = v;
@@ -553,6 +584,12 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
     // file-only `providers` table.
     ("SUSPENDERS_MODEL", |cfg, v| {
         cfg.model = v.into();
+        Ok(())
+    }),
+    // The Theme name (ADR-0038); unvalidated here, like the model - the UI
+    // resolves it at launch and falls back to `dark` with a notice.
+    ("SUSPENDERS_THEME", |cfg, v| {
+        cfg.theme = v.into();
         Ok(())
     }),
     // Integer: the optional global budget cap (ADR-0037).
@@ -781,6 +818,7 @@ impl Session {
                 .unwrap_or_else(|| config.session_dir.clone()),
             providers,
             model: launch_model,
+            theme: config.theme.clone(),
             temperature: opts.temperature.unwrap_or(config.temperature),
             max_tokens: config.max_tokens,
         };
@@ -918,14 +956,25 @@ fn default_session_dir() -> String {
 // The user config file lives beside the Session Logs (ADR-0031): XDG config
 // home, mirroring `default_session_dir` (empty var == unset, per XDG).
 pub fn default_config_path() -> String {
-    let base = std::env::var("XDG_CONFIG_HOME")
+    format!("{}/suspenders/config.json", xdg_config_base())
+}
+
+/// The user themes directory (ADR-0038): `themes/` beside `config.json` in
+/// the XDG config home. Resolved once at the launch edge, like the config
+/// path; a missing directory just means no user themes.
+pub fn default_themes_dir() -> String {
+    format!("{}/suspenders/themes", xdg_config_base())
+}
+
+// The XDG config home both paths above hang off (empty var == unset, per XDG).
+fn xdg_config_base() -> String {
+    std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             format!("{home}/.config")
-        });
-    format!("{base}/suspenders/config.json")
+        })
 }
 
 // The thin impure reader (ADR-0031): reads the config at `path` and overlays it
@@ -2032,6 +2081,7 @@ mod tests {
 
         assert!(fc.providers.is_some());
         assert!(fc.model.is_some());
+        assert!(fc.theme.is_some());
         assert!(fc.max_tokens.is_some());
         assert!(fc.temperature.is_some());
         // The one deliberate absence besides token (ADR-0037): the base config
@@ -2315,10 +2365,102 @@ mod tests {
     }
 
     #[test]
-    fn merge_model_starts_from_empty_when_absent() {
+    fn merge_key_starts_from_empty_when_absent() {
         // The pure seam: absent existing → a lone `model` object.
-        let json = merge_model(None, "solo/model").unwrap();
+        let json = merge_key(None, "model", "solo/model").unwrap();
         let fc = FileConfig::parse(&json).unwrap();
         assert_eq!(fc.model.as_deref(), Some("solo/model"));
+    }
+
+    // ---- persist_theme (ADR-0038: the same sparse sticky write as /model) ----
+
+    #[test]
+    fn persist_theme_creates_the_file_when_absent() {
+        // `/theme` shares `/model`'s sanctioned create-if-absent exception.
+        let path = temp_config_path("persist_theme_creates");
+        let _ = std::fs::remove_file(&path);
+
+        SessionConfig::persist_theme(&path, "gruvbox").unwrap();
+
+        let fc = FileConfig::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(fc.theme.as_deref(), Some("gruvbox"));
+        assert_eq!(fc.model, None, "nothing but the theme key is written");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_theme_sets_only_the_theme_key_preserving_the_rest() {
+        let path = temp_config_path("persist_theme_merges");
+        std::fs::write(&path, r#"{"model": "kept/model", "theme": "light"}"#).unwrap();
+
+        SessionConfig::persist_theme(&path, "gruvbox").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"token\""));
+        let fc = FileConfig::parse(&raw).unwrap();
+        assert_eq!(fc.theme.as_deref(), Some("gruvbox"));
+        assert_eq!(
+            fc.model.as_deref(),
+            Some("kept/model"),
+            "other keys survive"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- the theme key (ADR-0038: file + env, precedence like `model`) -------
+
+    #[test]
+    fn theme_defaults_to_dark_and_the_session_carries_it_unvalidated() {
+        assert_eq!(cfg().theme, "dark");
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.theme, "dark");
+
+        // Any name rides through - resolution (and the dark fallback) is the
+        // UI's launch concern, never a Session validation failure.
+        let mut config = cfg();
+        config.theme = "no-such-theme".into();
+        let session = Session::build(opts(), &config).unwrap();
+        assert_eq!(session.theme, "no-such-theme");
+    }
+
+    #[test]
+    fn file_config_theme_overlays_like_model() {
+        let mut cfg = SessionConfig::test_defaults();
+        FileConfig::parse(r#"{"theme": "solarized"}"#)
+            .unwrap()
+            .apply(&mut cfg);
+        assert_eq!(cfg.theme, "solarized");
+    }
+
+    #[test]
+    fn apply_env_overlays_the_theme_onto_its_field() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_THEME", "gruvbox");
+
+        let mut cfg = SessionConfig::test_defaults();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+
+        assert_eq!(cfg.theme, "gruvbox");
+    }
+
+    #[test]
+    fn env_theme_shadows_a_file_theme() {
+        // The same precedence as `model`: the file overlay lands first, the
+        // env overlay wins per-invocation over it (ADR-0031/0038).
+        clear_suspenders_env();
+        set_env("SUSPENDERS_THEME", "from-env");
+
+        let path = temp_config_path("theme_precedence");
+        std::fs::write(&path, r#"{"theme": "from-file"}"#).unwrap();
+
+        let mut cfg = SessionConfig::test_defaults();
+        load_file_overlay(&mut cfg, &path).unwrap();
+        assert_eq!(cfg.theme, "from-file");
+        SessionConfig::apply_env(&mut cfg).unwrap();
+        assert_eq!(cfg.theme, "from-env");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

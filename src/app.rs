@@ -20,6 +20,7 @@ use crate::event::Event;
 use crate::llm::Dispatcher;
 use crate::session::{Session, SessionOpts};
 use crate::ui::picker::PickerOutcome;
+use crate::ui::theme_command::ThemeSelection;
 
 #[cfg(test)]
 mod tests;
@@ -34,22 +35,37 @@ const PICK: &str = "pick";
 
 pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::Result<()> {
     let session = build_session(root)?;
+    // The configured Theme resolves ONCE at this edge (ADR-0038): the themes
+    // dir is captured like the config path, and a missing or broken name
+    // falls back to the built-in dark with a notice - never a launch block.
+    // Resolved before the picker so it, too, draws in the user's theme.
+    let themes_dir = PathBuf::from(crate::session::default_themes_dir());
+    let (themes, theme_notice) = ThemeSelection::launch(&session.theme, themes_dir);
     // The picker needs the Session first: the logs live in its session_dir.
-    let ResumeAction::Start(resume) = resolved_resume(resume, &session.session_dir).await? else {
+    let ResumeAction::Start(resume) =
+        resolved_resume(resume, &session.session_dir, themes.active()).await?
+    else {
         // Leave without starting the Agent.
         return Ok(());
     };
-    start_and_run(session, resume).await
+    start_and_run(session, resume, themes, theme_notice).await
 }
 
 // The context files load once at launch, fail-open: the assembled prompt
 // feeds the Agent, and a present-but-unusable file surfaces as one launch
-// info line (never silently, never blocking the Session).
-async fn start_and_run(session: Session, resume: Option<String>) -> anyhow::Result<()> {
+// info line (never silently, never blocking the Session) - the theme
+// fallback notice rides the same seam into the Transcript.
+async fn start_and_run(
+    session: Session,
+    resume: Option<String>,
+    themes: ThemeSelection,
+    theme_notice: Option<String>,
+) -> anyhow::Result<()> {
     let context = crate::context_files::load(&session.root);
-    let launch_notices: Vec<String> = context.skipped.iter().map(|s| s.info_line()).collect();
+    let mut launch_notices: Vec<String> = context.skipped.iter().map(|s| s.info_line()).collect();
+    launch_notices.extend(theme_notice);
     let agent = start_agent(session.clone(), resume, context.system_prompt)?;
-    crate::ui::run(agent, &session, launch_notices).await
+    crate::ui::run(agent, &session, launch_notices, themes).await
 }
 
 // Runs the picker for a bare `--resume` and resolves what launch does. Only
@@ -58,6 +74,7 @@ async fn start_and_run(session: Session, resume: Option<String>) -> anyhow::Resu
 async fn resolved_resume(
     resume: Option<String>,
     session_dir: &str,
+    theme: &crate::ui::theme::Theme,
 ) -> anyhow::Result<ResumeAction> {
     let outcome = if resume.as_deref() == Some(PICK) {
         let entries = crate::session::log::list(session_dir);
@@ -66,7 +83,7 @@ async fn resolved_resume(
             // pre-alt-screen, and a note would just flash and vanish.
             None
         } else {
-            Some(crate::ui::pick_session(entries).await?)
+            Some(crate::ui::pick_session(entries, theme).await?)
         }
     } else {
         None

@@ -2,31 +2,35 @@
 //! name crosses to reach its adapter work (ADR-0032/0033). The pure core emits
 //! a command-agnostic [`Effect::Command`](crate::ui::screen::Effect::Command)
 //! (and [`SelectorChosen`](crate::ui::screen::Effect::SelectorChosen)); this
-//! module classifies the opaque name and routes it to the owning module (today
-//! only [`super::model_command`]).
+//! module classifies the opaque name and routes it to the owning module
+//! ([`super::model_command`], [`super::theme_command`]).
 //!
 //! ## Drift is impossible by construction
 //!
 //! [`handled`] is the ONE place a command-name string literal lives on the
 //! adapter side; [`is_handled`] is derived from it, so the two cannot disagree.
 //! [`run`] and [`choose`] match [`Handled`] EXHAUSTIVELY (no `_` arm), so adding
-//! a `Handled::Theme` variant is a COMPILE error until both are handled. The
-//! colocated coverage test drives the real classifier over every
+//! a variant is a COMPILE error until both are handled. The colocated coverage
+//! test drives the real classifier over every
 //! [`slash::COMMANDS`](crate::ui::slash::COMMANDS) entry, so a registered
 //! command without a `handled` mapping fails the test rather than silently
 //! becoming a no-op-with-info-line at runtime.
 
 use crate::ui::AdapterCtx;
+use crate::ui::theme_command::ThemeSelection;
 
 use super::model_command;
 use super::screen::Screen;
+use super::theme_command;
 
-/// The Slash Commands the adapter knows how to run (today: just [`Handled::Model`]).
+/// The Slash Commands the adapter knows how to run.
 /// Not named `Command` - that collides with [`crate::agent::Command`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handled {
     /// `/model` - [`super::model_command`].
     Model,
+    /// `/theme` - [`super::theme_command`].
+    Theme,
 }
 
 /// The SINGLE name→command mapping. The only place command-name string literals
@@ -35,6 +39,7 @@ enum Handled {
 fn handled(name: &str) -> Option<Handled> {
     match name {
         "model" => Some(Handled::Model),
+        "theme" => Some(Handled::Theme),
         _ => None,
     }
 }
@@ -50,14 +55,18 @@ pub fn is_handled(name: &str) -> bool {
 /// [`Handled`] match is exhaustive, so a new command is a compile error here
 /// until it is handled. `generation` is the activation counter the effect
 /// carried; a selector-opening handler must echo it on its fill events.
+/// `themes` is the adapter-owned Theme state `/theme` reads and swaps
+/// (ADR-0038) - threaded like the run loop's other mutable adapter state.
 pub(super) async fn run(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
+    themes: &mut ThemeSelection,
     name: &str,
     generation: u64,
 ) -> Screen {
     match handled(name) {
         Some(Handled::Model) => model_command::run(screen, ctx, generation).await,
+        Some(Handled::Theme) => theme_command::run(screen, ctx, themes, generation),
         None => screen.info(format!("/{name}: no handler")),
     }
 }
@@ -68,11 +77,13 @@ pub(super) async fn run(
 pub(super) async fn choose(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
+    themes: &mut ThemeSelection,
     command: &str,
     value: String,
 ) -> Screen {
     match handled(command) {
         Some(Handled::Model) => model_command::choose(screen, ctx, value).await,
+        Some(Handled::Theme) => theme_command::choose(screen, ctx, themes, value),
         None => screen.info(format!("/{command}: no handler")),
     }
 }
@@ -83,9 +94,10 @@ mod tests {
     use crate::ui::slash;
 
     #[test]
-    fn model_is_handled_and_an_unknown_name_is_not() {
+    fn model_and_theme_are_handled_and_an_unknown_name_is_not() {
         assert!(is_handled("model"));
-        assert!(!is_handled("theme"));
+        assert!(is_handled("theme"));
+        assert!(!is_handled("compact"));
         assert!(!is_handled(""));
     }
 

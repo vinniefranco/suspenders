@@ -284,34 +284,42 @@ fn render_composer_popup(
     theme: &Theme,
 ) {
     // The lines the popup body holds, plus the title.
-    let (title, lines): (&str, Vec<Line>) = match view {
-        OverlayView::Menu { rows, highlight } => ("commands", popup_rows(rows, *highlight, theme)),
+    let (title, lines): (String, Vec<Line>) = match view {
+        OverlayView::Menu { rows, highlight } => {
+            ("commands".into(), popup_rows(rows, *highlight, theme))
+        }
         OverlayView::Selector {
+            command,
             status,
             rows,
             highlight,
-            ..
-        } => match status {
-            OverlayStatus::Loading => (
-                "models",
-                vec![Line::styled(
-                    "loading models…",
-                    Style::default()
-                        .fg(tui_color(theme.muted))
-                        .add_modifier(Modifier::ITALIC),
-                )],
-            ),
-            OverlayStatus::Failed(msg) => (
-                "models",
-                vec![Line::styled(
-                    format!("failed: {msg}"),
-                    Style::default()
-                        .fg(tui_color(theme.error))
-                        .add_modifier(Modifier::BOLD),
-                )],
-            ),
-            OverlayStatus::Ready => ("models", popup_rows(rows, *highlight, theme)),
-        },
+        } => {
+            // The popup titles itself after the command's own values -
+            // "models" for /model, "themes" for /theme - by pluralizing the
+            // opaque command name the overlay carries.
+            let title = format!("{command}s");
+            match status {
+                OverlayStatus::Loading => {
+                    let line = Line::styled(
+                        format!("loading {title}…"),
+                        Style::default()
+                            .fg(tui_color(theme.muted))
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                    (title, vec![line])
+                }
+                OverlayStatus::Failed(msg) => (
+                    title,
+                    vec![Line::styled(
+                        format!("failed: {msg}"),
+                        Style::default()
+                            .fg(tui_color(theme.error))
+                            .add_modifier(Modifier::BOLD),
+                    )],
+                ),
+                OverlayStatus::Ready => (title, popup_rows(rows, *highlight, theme)),
+            }
+        }
     };
 
     // Body rows + top/bottom border, capped so a long list never eats the
@@ -3442,6 +3450,24 @@ mod tests {
         assert!(text.contains(" models "));
         assert!(text.contains("qwen/qwen3-30b"));
         assert!(text.contains("meta/llama-3.1"));
+    }
+
+    #[test]
+    fn the_selector_popup_titles_itself_after_its_command() {
+        // The title pluralizes the opaque command name, so /theme's selector
+        // reads " themes " without the renderer knowing any command.
+        let view = OverlayView::Selector {
+            command: "theme".to_string(),
+            status: OverlayStatus::Loading,
+            rows: vec![],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" themes "), "selector title:\n{text}");
+        assert!(text.contains("loading themes…"));
     }
 
     #[test]
