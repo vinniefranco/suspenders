@@ -730,11 +730,12 @@
       "id": "google/gemma-4-26b-a4b-it",
       "name": "Gemma 4 26B A4B IT",
       "context_window": 262144,
-      "max_tokens": 16384,
+      "max_tokens": 262144,
       "reasoning": true,
       "cost": {
-        "input": 0.07,
-        "output": 0.34
+        "input": 0.12,
+        "output": 0.35,
+        "cache_read": 0.05
       }
     },
     {
@@ -752,11 +753,12 @@
       "id": "google/gemma-4-31b-it",
       "name": "Gemma 4 31B IT",
       "context_window": 262144,
-      "max_tokens": 16384,
+      "max_tokens": 262144,
       "reasoning": true,
       "cost": {
         "input": 0.12,
-        "output": 0.37
+        "output": 0.35,
+        "cache_read": 0.09
       }
     },
     {
@@ -1387,9 +1389,9 @@
       "max_tokens": 16384,
       "reasoning": true,
       "cost": {
-        "input": 0.6,
-        "output": 3.6,
-        "cache_read": 0.2
+        "input": 0.5,
+        "output": 2.2,
+        "cache_read": 0.1
       }
     },
     {
@@ -2272,11 +2274,11 @@
       "id": "qwen/qwen3-14b",
       "name": "Qwen3 14B",
       "context_window": 131072,
-      "max_tokens": 16384,
+      "max_tokens": 8192,
       "reasoning": true,
       "cost": {
-        "input": 0.12,
-        "output": 0.24
+        "input": 0.2275,
+        "output": 0.91
       }
     },
     {
@@ -2459,9 +2461,8 @@
       "max_tokens": 262144,
       "reasoning": false,
       "cost": {
-        "input": 0.1,
-        "output": 1.1,
-        "cache_read": 0.07
+        "input": 0.15,
+        "output": 1.2
       }
     },
     {
@@ -2502,11 +2503,11 @@
       "id": "qwen/qwen3-vl-30b-a3b-instruct",
       "name": "Qwen3 VL 30B A3B Instruct",
       "context_window": 262144,
-      "max_tokens": 32768,
+      "max_tokens": 16384,
       "reasoning": false,
       "cost": {
-        "input": 0.13,
-        "output": 0.52
+        "input": 0.15,
+        "output": 0.6
       }
     },
     {
@@ -2646,11 +2647,12 @@
       "id": "qwen/qwen3.6-27b",
       "name": "Qwen3.6 27B",
       "context_window": 262144,
-      "max_tokens": 65536,
+      "max_tokens": 262144,
       "reasoning": true,
       "cost": {
-        "input": 0.45,
-        "output": 2.7
+        "input": 0.6,
+        "output": 3.6,
+        "cache_read": 0.12
       }
     },
     {
@@ -2832,7 +2834,7 @@
     {
       "id": "thinkingmachines/inkling",
       "name": "Inkling",
-      "context_window": 524288,
+      "context_window": 1048576,
       "max_tokens": 1048576,
       "reasoning": true,
       "cost": {
@@ -3001,11 +3003,12 @@
       "id": "z-ai/glm-4.7-flash",
       "name": "GLM-4.7-Flash",
       "context_window": 202752,
-      "max_tokens": 131072,
+      "max_tokens": 16384,
       "reasoning": true,
       "cost": {
-        "input": 0.0605,
-        "output": 0.4
+        "input": 0.06,
+        "output": 0.4,
+        "cache_read": 0.01
       }
     },
     {
@@ -3051,9 +3054,9 @@
       "max_tokens": 131072,
       "reasoning": true,
       "cost": {
-        "input": 0.8008,
-        "output": 2.5168,
-        "cache_read": 0.14872
+        "input": 0.7756,
+        "output": 2.4376,
+        "cache_read": 0.14404
       }
     },
     {
