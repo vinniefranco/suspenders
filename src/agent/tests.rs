@@ -1417,8 +1417,9 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             // from 4200; the no-invented-line-numbers Voice rule moved it
             // from 4230; the grow-in-verified-steps Voice rule moved it
             // from 4320; the run-commands-whole Voice rule moved it from
-            // 4480).
-            context_budget: Some(4640),
+            // 4480; the quiet-flags Voice rule and run_command description
+            // moved it from 4640).
+            context_budget: Some(4800),
             eviction_slack: Some(0.3),
             compaction_keep: Some(0.1),
             ..Default::default()

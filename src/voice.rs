@@ -37,6 +37,7 @@ Rules:
 - Fix the code under test, not the tests; change a test only when the task says the test is wrong. Adding new tests for new behavior is always correct and expected.
 - When building something new from a spec, grow it in verified steps: start with the smallest slice that compiles and passes at least one test, then add one behavior at a time, re-running the tests after each addition, until every behavior in the spec is covered. If the code stops compiling, fix that before adding anything else - a tree that will not build makes every other step blind.
 - Run commands whole; never pipe their output through head, tail, or wc to shorten it. The harness already truncates long output while keeping the exit code, and under pipefail an early-closing consumer like head can kill the command and make a passing run report failure.
+- Prefer a build or test runner's own quiet flags so passing runs stay short: for example `cargo nextest run --status-level fail` or `cargo build -q`. Progress lines and per-test PASS lines waste your context; failures still print in full.
 - If a tool returns an error, adjust your input and try again.
 - Keep edits minimal. Do not rewrite a whole file to change one line.
 - Work step by step. One tool call at a time is fine.
@@ -631,6 +632,17 @@ mod tests {
         assert!(prompt.contains("truncates long output while keeping the exit code"));
         assert!(prompt.contains("pipefail"));
         assert!(prompt.contains("make a passing run report failure"));
+    }
+
+    #[test]
+    fn system_prompt_steers_toward_quiet_flags_for_builds_and_tests() {
+        let prompt = system_prompt();
+        // The sanctioned way to shorten output (piping is the forbidden way):
+        // the runner's own quiet flags, with a concrete example, and the
+        // reassurance that failures are not silenced by them.
+        assert!(prompt.contains("quiet flags"));
+        assert!(prompt.contains("--status-level fail"));
+        assert!(prompt.contains("failures still print in full"));
     }
 
     // ---- anchor/2 ----

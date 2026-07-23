@@ -28,7 +28,8 @@ impl Tool for RunCommand {
                 inspect the project after making changes. Long-running commands are killed when \
                 they exceed the configured timeout. The user must approve each command before it \
                 runs. Do not pipe long output through head or tail; output is trimmed \
-                automatically."
+                automatically. Prefer a runner's own quiet flags (e.g. \
+                `cargo nextest run --status-level fail`, `-q`) so passing runs stay short."
                     .into(),
             input_schema: json!({
                 "type": "object",
