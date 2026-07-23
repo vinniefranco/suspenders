@@ -109,6 +109,10 @@ _Avoid_: input line (it is not a line; drafts may span many), prompt (that's wha
 A directive the user invokes from the Composer, never sent to the model. Typing `/` opens a menu of the available commands that filters as the user types; selecting one runs it. Always available whatever the Agent is doing - a running Turn never suppresses the menu, though a command's effect may land at a Turn boundary (a model change applies to the next Turn). Distinct from a prompt (which starts a Turn) and from Steering (mid-Turn user text that joins the Conversation unadorned): a Slash Command enters neither the Conversation nor the Transcript as user text; it drives the harness or the Session (e.g. choosing the model), and the Transcript may show its outcome as an info line. The set of commands is open - adding one is routine.
 _Avoid_: command (that's the Agent's internal actor message), directive, colon-command
 
+**Theme**:
+A named coloring of the semantic display vocabulary - which colors the Transcript's semantics draw in, stated sparsely so a Theme lists only what it changes and everything unstated reads from the built-in default. Colors only: what a thing means, and the emphasis that meaning carries (bold, italic, underline), is never a Theme's to change. Display-side only - a Theme never enters the Conversation. Chosen live through the `/theme` Slash Command; the choice outlives the Session.
+_Avoid_: color scheme (narrower; a Theme also names the code-highlighting look), skin, style (overloaded with the terminal's style type)
+
 **Project Root**:
 The directory Suspenders was launched from, captured once per Session as a value. Every Tool Call is confined to it: paths must not escape it, and run_command executes in it.
 _Avoid_: cwd (that's ambient process state; the Project Root is captured once and passed explicitly)
@@ -240,6 +244,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Plugin** denial still produces exactly one **Tool Result**, voiced by that Plugin
 - An **Artifact** travels with its **Tool Result** to **Presentment** and appears only in the **Transcript**, never the **Conversation**
 - A **Plugin** failure never fails the **Turn** and never reaches the model; the **Transcript** records it as an info line and the Tool Call proceeds without that Plugin
+- A **Session** draws with exactly one active **Theme**; the `/theme` **Slash Command** changes it live, and the choice outlives the Session
+- A **Theme** shapes only how the **Transcript** and the **Screen**'s chrome are colored, never what anything means; a broken Theme is refused whole, and the Session falls back to the built-in default rather than drawing half-right
 - A **Turn** ends in exactly one **Turn Settlement**: completed, failed, or cancelled
 - A **Recovery Turn** opens only off a Turn that settled at its **Turn Limit** with unverified writes, or a **Dangling Failure** alongside a write that landed this Turn (a failing command with no writes is exploration, not unfinished work); its prompt belongs to the **Voice**, and a **Setpoint** bounds how many may serve one user request
 - A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the **Dangling Failure**'s own result verbatim - the command the recovery prompt names, not merely the last one run; a **Continuation** keeps the whole **Conversation**
