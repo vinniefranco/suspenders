@@ -409,7 +409,14 @@ fn persist_key(path: &str, key: &str, value: &str) -> Result<(), SessionError> {
         })?;
     }
 
-    std::fs::write(path, json)
+    // Write-then-rename, never in place: a crash mid-write must not leave a
+    // torn config.json. The temp file sits in the SAME directory, because a
+    // same-directory rename is atomic on POSIX (a cross-filesystem one is
+    // not even a rename).
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|e| SessionError(format!("failed to write config to {tmp}: {e}")))?;
+    std::fs::rename(&tmp, path)
         .map_err(|e| SessionError(format!("failed to write config to {path}: {e}")))
 }
 
@@ -515,54 +522,45 @@ impl FileConfig {
     }
 
     /// Overlays only the present (`Some`) fields onto `cfg`; absent fields leave
-    /// `cfg` untouched. Private on purpose: a `SessionConfig` mutated this way
-    /// must still pass through `validate()` on the built [`Session`].
+    /// `cfg` untouched. One [`overlay`]/[`overlay_opt`] call per key, so the
+    /// present-wins branch exists (and is covered) once, not once per field.
+    /// Private on purpose: a `SessionConfig` mutated this way must still pass
+    /// through `validate()` on the built [`Session`].
     fn apply(&self, cfg: &mut SessionConfig) {
-        if let Some(v) = &self.providers {
-            cfg.providers = v.clone();
-        }
-        if let Some(v) = &self.model {
-            cfg.model = v.clone();
-        }
-        if let Some(v) = &self.theme {
-            cfg.theme = v.clone();
-        }
-        if let Some(v) = self.max_tokens {
-            cfg.max_tokens = v;
-        }
-        if let Some(v) = self.temperature {
-            cfg.temperature = Some(v);
-        }
-        if let Some(v) = self.context_budget {
-            cfg.context_budget = Some(v);
-        }
-        if let Some(v) = self.eviction_slack {
-            cfg.eviction_slack = v;
-        }
-        if let Some(v) = self.dead_mass_fraction {
-            cfg.dead_mass_fraction = v;
-        }
-        if let Some(v) = self.compaction_keep {
-            cfg.compaction_keep = v;
-        }
-        if let Some(v) = self.plan_stale_after {
-            cfg.plan_stale_after = v;
-        }
-        if let Some(v) = self.recovery_limit {
-            cfg.recovery_limit = v;
-        }
-        if let Some(v) = self.recovery_shape {
-            cfg.recovery_shape = v;
-        }
-        if let Some(v) = self.malformed_retry_budget {
-            cfg.malformed_retry_budget = v;
-        }
-        if let Some(v) = self.scout_no_think {
-            cfg.scout_no_think = v;
-        }
-        if let Some(v) = self.no_think_rescue {
-            cfg.no_think_rescue = v;
-        }
+        overlay(&self.providers, &mut cfg.providers);
+        overlay(&self.model, &mut cfg.model);
+        overlay(&self.theme, &mut cfg.theme);
+        overlay(&self.max_tokens, &mut cfg.max_tokens);
+        overlay_opt(&self.temperature, &mut cfg.temperature);
+        overlay_opt(&self.context_budget, &mut cfg.context_budget);
+        overlay(&self.eviction_slack, &mut cfg.eviction_slack);
+        overlay(&self.dead_mass_fraction, &mut cfg.dead_mass_fraction);
+        overlay(&self.compaction_keep, &mut cfg.compaction_keep);
+        overlay(&self.plan_stale_after, &mut cfg.plan_stale_after);
+        overlay(&self.recovery_limit, &mut cfg.recovery_limit);
+        overlay(&self.recovery_shape, &mut cfg.recovery_shape);
+        overlay(
+            &self.malformed_retry_budget,
+            &mut cfg.malformed_retry_budget,
+        );
+        overlay(&self.scout_no_think, &mut cfg.scout_no_think);
+        overlay(&self.no_think_rescue, &mut cfg.no_think_rescue);
+    }
+}
+
+/// One file key onto its config slot: a present value wins, an absent one
+/// leaves the target untouched (ADR-0031's overlay rule, stated once).
+fn overlay<T: Clone>(value: &Option<T>, target: &mut T) {
+    if let Some(v) = value {
+        *target = v.clone();
+    }
+}
+
+/// The [`overlay`] variant for `Option` targets: presence sets `Some` - the
+/// file cannot null a value out (the same limitation as the env seam).
+fn overlay_opt<T: Clone>(value: &Option<T>, target: &mut Option<T>) {
+    if let Some(v) = value {
+        *target = Some(v.clone());
     }
 }
 
@@ -587,9 +585,13 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         Ok(())
     }),
     // The Theme name (ADR-0038); unvalidated here, like the model - the UI
-    // resolves it at launch and falls back to `dark` with a notice.
+    // resolves it at launch and falls back to `dark` with a notice. A
+    // set-but-empty value is UNSET (the XDG idiom `xdg_config_base` uses):
+    // "" would otherwise become a theme named "" and a per-launch notice.
     ("SUSPENDERS_THEME", |cfg, v| {
-        cfg.theme = v.into();
+        if !v.is_empty() {
+            cfg.theme = v.into();
+        }
         Ok(())
     }),
     // Integer: the optional global budget cap (ADR-0037).
@@ -2312,6 +2314,19 @@ mod tests {
         assert!(err.0.contains("SUSPENDERS_CONTEXT_BUDGET"));
     }
 
+    #[test]
+    fn apply_env_treats_a_set_but_empty_theme_as_unset() {
+        // The XDG idiom, applied to THEME only: SUSPENDERS_THEME="" must not
+        // become a theme named "" (a guaranteed per-launch fallback notice).
+        clear_suspenders_env();
+        set_env("SUSPENDERS_THEME", "");
+
+        let mut cfg = SessionConfig::test_defaults();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+
+        assert_eq!(cfg.theme, SessionConfig::test_defaults().theme);
+    }
+
     // ---- persist_model (ADR-0033: sparse, sticky /model write) --------------
 
     #[test]
@@ -2404,6 +2419,27 @@ mod tests {
             fc.model.as_deref(),
             Some("kept/model"),
             "other keys survive"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_key_replaces_via_a_same_dir_temp_file_and_cleans_it_up() {
+        // The atomic shape: write-then-rename, so a crash mid-write can tear
+        // only the temp file, never config.json. Observable from outside: the
+        // write lands whole and no `.tmp` residue survives a clean persist.
+        let path = temp_config_path("persist_atomic");
+        std::fs::write(&path, r#"{"model": "kept/model"}"#).unwrap();
+
+        SessionConfig::persist_theme(&path, "gruvbox").unwrap();
+
+        let fc = FileConfig::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(fc.theme.as_deref(), Some("gruvbox"));
+        assert_eq!(fc.model.as_deref(), Some("kept/model"));
+        assert!(
+            !std::path::Path::new(&format!("{path}.tmp")).exists(),
+            "the temp file was renamed away"
         );
 
         let _ = std::fs::remove_file(&path);

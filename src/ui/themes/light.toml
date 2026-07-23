@@ -25,7 +25,7 @@ code = "#953800"
 code_block = "#24292f"
 # Matches base16-ocean.light's background, so highlighted and plain code
 # blocks share one surface.
-code_bg = "#eff1f5"
+code_block_bg = "#eff1f5"
 
 # Chrome.
 popup_border = "#0969da"

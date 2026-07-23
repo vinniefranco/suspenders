@@ -20,7 +20,7 @@ use crate::event::Event;
 use crate::llm::Dispatcher;
 use crate::session::{Session, SessionOpts};
 use crate::ui::picker::PickerOutcome;
-use crate::ui::theme_command::ThemeSelection;
+use crate::ui::theme::ActiveTheme;
 
 #[cfg(test)]
 mod tests;
@@ -40,7 +40,7 @@ pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::R
     // falls back to the built-in dark with a notice - never a launch block.
     // Resolved before the picker so it, too, draws in the user's theme.
     let themes_dir = PathBuf::from(crate::session::default_themes_dir());
-    let (themes, theme_notice) = ThemeSelection::launch(&session.theme, themes_dir);
+    let (themes, theme_notice) = ActiveTheme::launch(&session.theme, themes_dir);
     // The picker needs the Session first: the logs live in its session_dir.
     let ResumeAction::Start(resume) =
         resolved_resume(resume, &session.session_dir, themes.active()).await?
@@ -58,7 +58,7 @@ pub async fn run_tui(root: Option<PathBuf>, resume: Option<String>) -> anyhow::R
 async fn start_and_run(
     session: Session,
     resume: Option<String>,
-    themes: ThemeSelection,
+    themes: ActiveTheme,
     theme_notice: Option<String>,
 ) -> anyhow::Result<()> {
     let context = crate::context_files::load(&session.root);

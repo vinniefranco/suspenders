@@ -24,6 +24,10 @@ use crate::ui::selector::SelectorRow;
 
 use super::screen::Screen;
 
+/// The command's registered name - what [`super::command::handled`] routes
+/// here, minted once beside the module that owns the command.
+pub(crate) const NAME: &str = "model";
+
 /// The Transcript info line an applied `/model` pick emits (ADR-0033). Pure
 /// message construction over the two facts the impure orchestration gathered -
 /// whether `SUSPENDERS_MODEL` shadows the sticky file, and how the persist

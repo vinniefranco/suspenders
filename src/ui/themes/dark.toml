@@ -23,7 +23,7 @@ quote = "dark_gray"
 link = "blue"
 code = "yellow"
 code_block = "#b9d7b4"
-code_bg = "#191923"
+code_block_bg = "#191923"
 
 # Chrome.
 popup_border = "cyan"

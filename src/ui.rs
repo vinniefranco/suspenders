@@ -46,7 +46,7 @@ use picker::{Picker, PickerOutcome};
 use screen::{
     AgentCommand, Busy, Decision, Effect, Idle, Key, Screen, ScreenOpts, ScrollStep, Status,
 };
-use theme_command::ThemeSelection;
+use theme::ActiveTheme;
 use viewport::{Viewport, WHEEL_LINES};
 
 /// How often the status-bar spinner advances while a Turn is running (~10 fps).
@@ -85,7 +85,7 @@ pub async fn run(
     agent: AgentHandle,
     session: &Session,
     launch_notices: Vec<String>,
-    themes: ThemeSelection,
+    themes: ActiveTheme,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // Best-effort: a terminal without mouse support still gets a working TUI.
@@ -177,12 +177,24 @@ pub(crate) struct AdapterCtx<'a> {
     pub(crate) selector_tx: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
+/// The adapter-side MUTABLE state the [`Effect`] handlers act on - the
+/// mutable twin of [`AdapterCtx`]: the active Theme state a `/theme` pick
+/// swaps (ADR-0038), the pure scroll state, and the on-disk prompt-history
+/// path. Owned by [`run_loop`] and passed as ONE `&mut` through the [`Effect`]
+/// plumbing, so the recursion sites re-thread a single carrier instead of a
+/// parameter per field.
+pub(crate) struct AdapterState {
+    pub(crate) themes: ActiveTheme,
+    pub(crate) viewport: Viewport,
+    pub(crate) history: Option<String>,
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     agent: AgentHandle,
     session: &Session,
     launch_notices: Vec<String>,
-    mut themes: ThemeSelection,
+    themes: ActiveTheme,
 ) -> anyhow::Result<()> {
     let mut events = agent.subscribe();
     let mut input = EventStream::new();
@@ -230,7 +242,14 @@ async fn run_loop(
         history,
         notices: launch_notices,
     }));
-    let mut viewport = Viewport::new();
+
+    // The mutable adapter state the Effect handlers thread as one carrier:
+    // the Theme state (ADR-0038), the scroll state, the history path.
+    let mut state = AdapterState {
+        themes,
+        viewport: Viewport::new(),
+        history: history_store,
+    };
 
     // The per-item render cache: settled items' lines and wrapped counts are
     // built once (per width / Ctrl-T state) instead of on every frame. Owned
@@ -255,11 +274,10 @@ async fn run_loop(
     let mut geometry = draw_previewed(
         terminal,
         screen.as_ref().unwrap(),
-        &viewport,
         &conn,
         spinner,
         &mut cache,
-        &themes,
+        &state,
     )?;
 
     loop {
@@ -269,7 +287,7 @@ async fn run_loop(
             _ = ticker.tick() => {
                 if screen.as_ref().unwrap().status == Status::Running {
                     spinner = spinner.wrapping_add(1);
-                    geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache, &themes)?;
+                    geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &conn, spinner, &mut cache, &state)?;
                 }
                 continue;
             }
@@ -296,7 +314,7 @@ async fn run_loop(
                                 // tested place.
                                 let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(map_key(&key_event));
-                                screen = Some(run_effects(core, effects, &ctx, &mut themes, &mut viewport, geometry, history_store.as_deref()).await);
+                                screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
                                 dirty = true;
                             }
                         }
@@ -307,7 +325,7 @@ async fn run_loop(
                             if let Some(key) = map_mouse(&mouse) {
                                 let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(key);
-                                screen = Some(run_effects(core, effects, &ctx, &mut themes, &mut viewport, geometry, history_store.as_deref()).await);
+                                screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
                             }
                             dirty = true;
                         }
@@ -340,7 +358,7 @@ async fn run_loop(
                     Ok(event) => {
                         let core = screen.take().unwrap();
                         let (core, effects) = core.apply_event(event);
-                        screen = Some(run_effects(core, effects, &ctx, &mut themes, &mut viewport, geometry, history_store.as_deref()).await);
+                        screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
                     }
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
@@ -350,12 +368,13 @@ async fn run_loop(
                     Err(RecvError::Closed) => {
                         let core = screen.take().unwrap();
                         let (core, effects) = core.agent_down();
-                        screen = Some(run_effects(core, effects, &ctx, &mut themes, &mut viewport, geometry, history_store.as_deref()).await);
-                        let geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache, &themes)?;
+                        screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
+                        let geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &conn, spinner, &mut cache, &state)?;
                         // Nothing more will arrive; wait only on input now. The
                         // frozen frames draw in the ACTIVE Theme - any open
                         // /theme preview ends with the Agent.
-                        return drain_input(terminal, input, screen.take().unwrap(), viewport, geometry, conn, cache, themes.active().clone()).await;
+                        let active = state.themes.active().clone();
+                        return drain_input(terminal, input, screen.take().unwrap(), state.viewport, geometry, conn, cache, active).await;
                     }
                 }
             }
@@ -368,7 +387,7 @@ async fn run_loop(
             Some(event) = selector_rx.recv() => {
                 let core = screen.take().unwrap();
                 let (core, effects) = core.apply_event(event);
-                screen = Some(run_effects(core, effects, &ctx, &mut themes, &mut viewport, geometry, history_store.as_deref()).await);
+                screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
                 // The fetch result never changes the model, but a pick could
                 // have raced in; refresh to stay truthful (still off the tick).
                 conn.model = agent.active_model().await;
@@ -379,11 +398,10 @@ async fn run_loop(
         geometry = draw_previewed(
             terminal,
             screen.as_ref().unwrap(),
-            &viewport,
             &conn,
             spinner,
             &mut cache,
-            &themes,
+            &state,
         )?;
     }
 }
@@ -522,20 +540,19 @@ fn map_mouse(mouse: &MouseEvent) -> Option<Key> {
 }
 
 /// Carries out the Effects the pure core returned, threading the Screen
-/// through the Agent retries (submit↔steer) the core asks for. `themes` is
-/// the adapter-owned Theme state a `/theme` pick swaps (ADR-0038), mutable
-/// adapter state like `viewport`.
+/// through the Agent retries (submit↔steer) the core asks for. `state` is
+/// the ONE mutable adapter-state carrier ([`AdapterState`], the mutable twin
+/// of [`AdapterCtx`]): the Theme state a `/theme` pick swaps, the viewport
+/// the scroll effects move, the history path the appends write through.
 async fn run_effects(
     mut screen: Screen,
     effects: Vec<Effect>,
     ctx: &AdapterCtx<'_>,
-    themes: &mut ThemeSelection,
-    viewport: &mut Viewport,
+    state: &mut AdapterState,
     geometry: Geometry,
-    history: Option<&str>,
 ) -> Screen {
     for effect in effects {
-        screen = run_effect(screen, effect, ctx, themes, viewport, geometry, history).await;
+        screen = run_effect(screen, effect, ctx, state, geometry).await;
     }
     screen
 }
@@ -544,10 +561,8 @@ async fn run_effect(
     screen: Screen,
     effect: Effect,
     ctx: &AdapterCtx<'_>,
-    themes: &mut ThemeSelection,
-    viewport: &mut Viewport,
+    state: &mut AdapterState,
     geometry: Geometry,
-    history: Option<&str>,
 ) -> Screen {
     let agent = ctx.agent;
     // Scroll effects clamp against the LAST draw's measure (see [`Geometry`]);
@@ -560,19 +575,13 @@ async fn run_effect(
             // retries as steer) and may emit MORE effects.
             let outcome = result.map_err(|_| Busy);
             let (core, effects) = screen.submitted(prompt, outcome);
-            Box::pin(run_effects(
-                core, effects, ctx, themes, viewport, geometry, history,
-            ))
-            .await
+            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
         }
         Effect::Agent(AgentCommand::Steer(text)) => {
             let result = agent.steer(text.clone()).await;
             let outcome = result.map_err(|_| Idle);
             let (core, effects) = screen.steered(text, outcome);
-            Box::pin(run_effects(
-                core, effects, ctx, themes, viewport, geometry, history,
-            ))
-            .await
+            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
         }
         Effect::Agent(AgentCommand::Approve(id, decision)) => {
             agent.approve(id, to_agent_decision(decision)).await;
@@ -583,23 +592,23 @@ async fn run_effect(
             screen
         }
         Effect::PinBottom => {
-            viewport.pin_bottom();
+            state.viewport.pin_bottom();
             screen
         }
         Effect::ScrollUp(ScrollStep::Line) => {
-            viewport.scroll_up(WHEEL_LINES, total_lines, height);
+            state.viewport.scroll_up(WHEEL_LINES, total_lines, height);
             screen
         }
         Effect::ScrollUp(ScrollStep::Page) => {
-            viewport.page_up(total_lines, height);
+            state.viewport.page_up(total_lines, height);
             screen
         }
         Effect::ScrollDown(ScrollStep::Line) => {
-            viewport.scroll_down(WHEEL_LINES, total_lines, height);
+            state.viewport.scroll_down(WHEEL_LINES, total_lines, height);
             screen
         }
         Effect::ScrollDown(ScrollStep::Page) => {
-            viewport.page_down(total_lines, height);
+            state.viewport.page_down(total_lines, height);
             screen
         }
         // Focus effects are a no-op in the ratatui adapter: there is no separate
@@ -610,7 +619,7 @@ async fn run_effect(
         // Sessions. The pure core already added it to its in-memory ring; this
         // writes it through to the on-disk store (best-effort, never fatal).
         Effect::HistoryAppend(prompt) => {
-            if let Some(path) = history {
+            if let Some(path) = state.history.as_deref() {
                 append_history(path, &prompt);
             }
             screen
@@ -620,14 +629,14 @@ async fn run_effect(
         // what it routes, so an unwired registry entry is a visible info line,
         // never a silent drop.
         Effect::Command { name, generation } => {
-            command::run(screen, ctx, themes, &name, generation).await
+            command::run(screen, ctx, state, &name, generation).await
         }
         // A row was chosen from a command's selector (ADR-0033): routed through
         // the same seam as the command itself.
         Effect::SelectorChosen {
             command: cmd,
             value,
-        } => command::choose(screen, ctx, themes, &cmd, value).await,
+        } => command::choose(screen, ctx, state, &cmd, value).await,
     }
 }
 
@@ -717,19 +726,28 @@ fn to_agent_decision(decision: Decision) -> AgentDecision {
 /// pure core's own selector state - so Escape's exact revert is nothing but
 /// the next frame, and a Theme change makes [`components::RenderCache`]
 /// rebuild (it keys on the Theme), repainting everything including code
-/// fences.
+/// fences. The non-allocating [`composer::Composer::selector_highlight`]
+/// answers exactly what the preview needs, so this pre-draw read never
+/// clones the selector rows the render builds again anyway.
 fn draw_previewed<B: Backend>(
     terminal: &mut Terminal<B>,
     screen: &Screen,
-    viewport: &Viewport,
     conn: &components::ConnectionFacts,
     spinner: u64,
     cache: &mut components::RenderCache,
-    themes: &ThemeSelection,
+    state: &AdapterState,
 ) -> anyhow::Result<Geometry> {
-    let overlay = screen.composer().view().overlay;
-    let theme = themes.render_theme(overlay.as_ref());
-    draw(terminal, screen, viewport, conn, spinner, cache, theme)
+    let preview = theme_command::preview_name(screen.composer().selector_highlight());
+    let theme = state.themes.render_theme(preview);
+    draw(
+        terminal,
+        screen,
+        &state.viewport,
+        conn,
+        spinner,
+        cache,
+        theme,
+    )
 }
 
 /// Draws one frame and returns the measured viewport [`Geometry`]: the render
@@ -1329,11 +1347,15 @@ mod tests {
         }
     }
 
-    /// A launch-shaped ThemeSelection over no themes dir: active = dark. A
-    /// fresh one per run_effect call - the tests that watch it swap build
-    /// their own and hold it across calls.
-    fn test_themes() -> ThemeSelection {
-        ThemeSelection::launch("dark", std::path::PathBuf::from("/nonexistent/themes")).0
+    /// A launch-shaped AdapterState over no themes dir: active = dark, a
+    /// fresh viewport, no history store. Tests that watch a field mutate
+    /// hold one across calls; the rest build one per call.
+    fn test_state() -> AdapterState {
+        AdapterState {
+            themes: ActiveTheme::launch("dark", std::path::PathBuf::from("/nonexistent/themes")).0,
+            viewport: Viewport::new(),
+            history: None,
+        }
     }
 
     fn has_user_line(screen: &Screen, text: &str) -> bool {
@@ -1385,26 +1407,25 @@ mod tests {
         let history = store(&hist_dir);
 
         // Unpin first, so the threaded PinBottom is observable.
-        let mut viewport = Viewport::new();
-        viewport.scroll_up(5, 100, 20);
-        assert_eq!(viewport.top_offset(100, 20), 75);
+        let mut state = test_state();
+        state.history = Some(history.clone());
+        state.viewport.scroll_up(5, 100, 20);
+        assert_eq!(state.viewport.top_offset(100, 20), 75);
 
         let screen = Screen::new(ScreenOpts::default());
         let screen = run_effect(
             screen,
             Effect::Agent(AgentCommand::Submit("hello agent".into())),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             (100, 20),
-            Some(&history),
         )
         .await;
 
         // The core recorded the accepted submit as a user line...
         assert!(has_user_line(&screen, "hello agent"));
         // ...its threaded PinBottom re-pinned the viewport...
-        assert_eq!(viewport.top_offset(100, 20), 80);
+        assert_eq!(state.viewport.top_offset(100, 20), 80);
         // ...and its threaded HistoryAppend wrote through to the store.
         assert_eq!(read_history(&history), vec!["hello agent".to_string()]);
     }
@@ -1414,17 +1435,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("ok"))]));
         let ctx = adapter_ctx(&agent);
-        let mut viewport = Viewport::new();
 
         let screen = Screen::new(ScreenOpts::default());
         let screen = run_effect(
             screen,
             Effect::Agent(AgentCommand::Steer("redirect".into())),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut test_state(),
             (100, 20),
-            None,
         )
         .await;
 
@@ -1447,16 +1465,13 @@ mod tests {
             .expect("the barrier signals");
 
         let ctx = adapter_ctx(&agent);
-        let mut viewport = Viewport::new();
         let screen = Screen::new(ScreenOpts::default());
         let screen = run_effect(
             screen,
             Effect::Agent(AgentCommand::Submit("second".into())),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut test_state(),
             (100, 20),
-            None,
         )
         .await;
 
@@ -1472,7 +1487,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![]));
         let ctx = adapter_ctx(&agent);
-        let mut viewport = Viewport::new();
 
         let screen = Screen::new(ScreenOpts::default());
         let screen = tokio::time::timeout(
@@ -1481,10 +1495,8 @@ mod tests {
                 screen,
                 Effect::Agent(AgentCommand::Approve("id-1".into(), Decision::Approve)),
                 &ctx,
-                &mut test_themes(),
-                &mut viewport,
+                &mut test_state(),
                 (100, 20),
-                None,
             ),
         )
         .await
@@ -1496,10 +1508,8 @@ mod tests {
                 screen,
                 Effect::Agent(AgentCommand::Cancel),
                 &ctx,
-                &mut test_themes(),
-                &mut viewport,
+                &mut test_state(),
                 (100, 20),
-                None,
             ),
         )
         .await
@@ -1512,57 +1522,49 @@ mod tests {
         let agent = start_agent(&dir, FakeLlm::script(vec![]));
         let ctx = adapter_ctx(&agent);
         let geometry = (100, 20); // tail top offset is 80
-        let mut viewport = Viewport::new();
+        let mut state = test_state();
 
         let mut screen = Screen::new(ScreenOpts::default());
         screen = run_effect(
             screen,
             Effect::ScrollUp(ScrollStep::Line),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             geometry,
-            None,
         )
         .await;
-        assert_eq!(viewport.top_offset(100, 20), 80 - WHEEL_LINES);
+        assert_eq!(state.viewport.top_offset(100, 20), 80 - WHEEL_LINES);
 
         screen = run_effect(
             screen,
             Effect::ScrollUp(ScrollStep::Page),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             geometry,
-            None,
         )
         .await;
-        assert_eq!(viewport.top_offset(100, 20), 58); // one page = height - 1
+        assert_eq!(state.viewport.top_offset(100, 20), 58); // one page = height - 1
 
         screen = run_effect(
             screen,
             Effect::ScrollDown(ScrollStep::Line),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             geometry,
-            None,
         )
         .await;
-        assert_eq!(viewport.top_offset(100, 20), 61);
+        assert_eq!(state.viewport.top_offset(100, 20), 61);
 
         screen = run_effect(
             screen,
             Effect::ScrollDown(ScrollStep::Page),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             geometry,
-            None,
         )
         .await;
         assert_eq!(
-            viewport.top_offset(100, 20),
+            state.viewport.top_offset(100, 20),
             80,
             "a full page down re-pins at the tail"
         );
@@ -1571,25 +1573,14 @@ mod tests {
             screen,
             Effect::ScrollUp(ScrollStep::Line),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             geometry,
-            None,
         )
         .await;
-        let _ = run_effect(
-            screen,
-            Effect::PinBottom,
-            &ctx,
-            &mut test_themes(),
-            &mut viewport,
-            geometry,
-            None,
-        )
-        .await;
-        assert_eq!(viewport.top_offset(100, 20), 80, "PinBottom re-pins");
+        let _ = run_effect(screen, Effect::PinBottom, &ctx, &mut state, geometry).await;
+        assert_eq!(state.viewport.top_offset(100, 20), 80, "PinBottom re-pins");
         // Pinned again: the tail is followed as content grows.
-        assert_eq!(viewport.top_offset(200, 20), 180);
+        assert_eq!(state.viewport.top_offset(200, 20), 180);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1597,32 +1588,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![]));
         let ctx = adapter_ctx(&agent);
-        let mut viewport = Viewport::new();
+        let mut state = test_state();
 
         let screen = Screen::new(ScreenOpts::default());
-        let screen = run_effect(
-            screen,
-            Effect::FocusModal,
-            &ctx,
-            &mut test_themes(),
-            &mut viewport,
-            (100, 20),
-            None,
-        )
-        .await;
-        let screen = run_effect(
-            screen,
-            Effect::FocusComposer,
-            &ctx,
-            &mut test_themes(),
-            &mut viewport,
-            (100, 20),
-            None,
-        )
-        .await;
+        let screen = run_effect(screen, Effect::FocusModal, &ctx, &mut state, (100, 20)).await;
+        let screen = run_effect(screen, Effect::FocusComposer, &ctx, &mut state, (100, 20)).await;
 
         assert_eq!(screen.status, Status::Idle);
-        assert_eq!(viewport.top_offset(100, 20), 80, "the viewport never moved");
+        assert_eq!(
+            state.viewport.top_offset(100, 20),
+            80,
+            "the viewport never moved"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1630,33 +1607,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![]));
         let ctx = adapter_ctx(&agent);
-        let mut viewport = Viewport::new();
         let hist_dir = TempDir::new().unwrap();
         let history = store(&hist_dir);
+        let mut state = test_state();
+        state.history = Some(history.clone());
 
         let screen = Screen::new(ScreenOpts::default());
         let screen = run_effect(
             screen,
             Effect::HistoryAppend("saved".into()),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             (0, 0),
-            Some(&history),
         )
         .await;
         assert_eq!(read_history(&history), vec!["saved".to_string()]);
 
         // No store opened (open_history failed at launch): the append is
         // dropped, never fatal - and the store on disk is untouched.
+        state.history = None;
         let _ = run_effect(
             screen,
             Effect::HistoryAppend("dropped".into()),
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             (0, 0),
-            None,
         )
         .await;
         assert_eq!(read_history(&history), vec!["saved".to_string()]);
@@ -1667,7 +1642,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![]));
         let ctx = adapter_ctx(&agent);
-        let mut viewport = Viewport::new();
+        let mut state = test_state();
 
         let screen = Screen::new(ScreenOpts::default());
         let screen = run_effect(
@@ -1677,10 +1652,8 @@ mod tests {
                 generation: 0,
             },
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             (100, 20),
-            None,
         )
         .await;
         assert_eq!(last_info(&screen).as_deref(), Some("/compact: no handler"));
@@ -1692,10 +1665,8 @@ mod tests {
                 value: "dark".into(),
             },
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut state,
             (100, 20),
-            None,
         )
         .await;
         assert_eq!(last_info(&screen).as_deref(), Some("/nope: no handler"));
@@ -1703,7 +1674,8 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The /theme flow through the Effect executor (ADR-0038): the same seam
-    // /model routes through, with the adapter-owned ThemeSelection threaded.
+    // /model routes through, with the Theme domain's ActiveTheme threaded
+    // inside the AdapterState carrier.
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1716,7 +1688,6 @@ mod tests {
             config_path: "/nonexistent/config.json".into(),
             selector_tx,
         };
-        let mut viewport = Viewport::new();
 
         let _ = run_effect(
             Screen::new(ScreenOpts::default()),
@@ -1725,10 +1696,8 @@ mod tests {
                 generation: 7,
             },
             &ctx,
-            &mut test_themes(),
-            &mut viewport,
+            &mut test_state(),
             (100, 20),
-            None,
         )
         .await;
 
@@ -1761,8 +1730,7 @@ mod tests {
             config_path: config_path.clone(),
             selector_tx,
         };
-        let mut viewport = Viewport::new();
-        let mut themes = test_themes();
+        let mut state = test_state();
 
         let screen = run_effect(
             Screen::new(ScreenOpts::default()),
@@ -1771,15 +1739,13 @@ mod tests {
                 value: "light".into(),
             },
             &ctx,
-            &mut themes,
-            &mut viewport,
+            &mut state,
             (100, 20),
-            None,
         )
         .await;
 
         // The live swap: the run loop's next frame draws light.
-        assert_eq!(themes.active(), theme::light());
+        assert_eq!(state.themes.active(), theme::light());
         // The applied info line (its env/persist variants are pinned in
         // theme_command's pure tests; ambient env must not fail this one).
         let info = last_info(&screen).expect("an applied line lands");
@@ -1805,8 +1771,7 @@ mod tests {
             config_path: config_path.clone(),
             selector_tx,
         };
-        let mut viewport = Viewport::new();
-        let mut themes = test_themes();
+        let mut state = test_state();
 
         let screen = run_effect(
             Screen::new(ScreenOpts::default()),
@@ -1815,20 +1780,88 @@ mod tests {
                 value: "dark".into(),
             },
             &ctx,
-            &mut themes,
-            &mut viewport,
+            &mut state,
             (100, 20),
-            None,
         )
         .await;
 
         // No swap, no write, no info line (ADR-0038, matching /model): the
         // Transcript's last info is still the greeting, untouched.
-        assert_eq!(themes.active(), theme::dark());
+        assert_eq!(state.themes.active(), theme::dark());
         assert_eq!(
             last_info(&screen),
             last_info(&Screen::new(ScreenOpts::default()))
         );
         assert!(!std::path::Path::new(&config_path).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_effect_theme_choice_of_a_file_broken_after_open_refuses_and_persists_nothing() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let cfg_dir = TempDir::new().unwrap();
+        let config_path = cfg_dir
+            .path()
+            .join("config.json")
+            .to_string_lossy()
+            .into_owned();
+        let (selector_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = AdapterCtx {
+            agent: &agent,
+            config_path: config_path.clone(),
+            selector_tx,
+        };
+
+        // A valid theme at open time, broken before the pick lands: Enter
+        // must re-load from disk (never the open-time previews cache), refuse
+        // with the reason, and persist nothing - a stale swap here would
+        // write a now-dangling name and silently fall back next launch.
+        let themes_dir = TempDir::new().unwrap();
+        std::fs::write(
+            themes_dir.path().join("mine.toml"),
+            "[colors]\nadded = \"#101010\"\n",
+        )
+        .unwrap();
+        let mut state = test_state();
+        state.themes = ActiveTheme::launch("dark", themes_dir.path().to_path_buf()).0;
+        let _ = run_effect(
+            Screen::new(ScreenOpts::default()),
+            Effect::Command {
+                name: "theme".into(),
+                generation: 1,
+            },
+            &ctx,
+            &mut state,
+            (100, 20),
+        )
+        .await;
+        std::fs::write(
+            themes_dir.path().join("mine.toml"),
+            "[colors]\nadded = \"greenish\"\n",
+        )
+        .unwrap();
+
+        let screen = run_effect(
+            Screen::new(ScreenOpts::default()),
+            Effect::SelectorChosen {
+                command: "theme".into(),
+                value: "mine".into(),
+            },
+            &ctx,
+            &mut state,
+            (100, 20),
+        )
+        .await;
+
+        let info = last_info(&screen).expect("the refusal surfaces");
+        assert!(
+            info.starts_with("theme → mine (not applied: colors.added:"),
+            "info was: {info}"
+        );
+        assert_eq!(state.themes.active(), theme::dark(), "nothing swapped");
+        assert!(
+            !std::path::Path::new(&config_path).exists(),
+            "nothing persisted"
+        );
     }
 }

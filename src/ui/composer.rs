@@ -611,6 +611,29 @@ impl Composer {
         }
     }
 
+    /// The open READY selector's highlight, without building the full
+    /// [`OverlayView`] (no row cloning - this backs the per-frame `/theme`
+    /// live preview): the command that opened the selector and the row under
+    /// the cursor in the `rest`-filtered view, derived by the same rules as
+    /// [`Composer::view`]. `None` for the menu, a Loading/Failed selector, an
+    /// empty filtered view, or no overlay at all.
+    pub fn selector_highlight(&self) -> Option<(&str, &SelectorRow)> {
+        if !slash::is_slash(&self.value) {
+            return None;
+        }
+        let draft = slash::parse(&self.value);
+        let rest = draft.rest?;
+        if !slash::lookup(&draft.name).is_some_and(|c| c.opens_selector) {
+            return None;
+        }
+        let cs = self.selector.as_ref()?;
+        let SelectorStatus::Ready(sel) = &cs.status else {
+            return None;
+        };
+        let row = sel.filtered(&rest).into_iter().nth(sel.highlight(&rest))?;
+        Some((cs.command.as_str(), row))
+    }
+
     // ---- Internals ---------------------------------------------------------
 
     // The open overlay, derived from the draft (the one filter) and the
@@ -1137,6 +1160,44 @@ mod tests {
             Some(OverlayView::Selector { highlight, .. }) => highlight,
             other => panic!("expected a selector overlay, got {other:?}"),
         }
+    }
+
+    // --- selector_highlight (the non-allocating per-frame preview read) -----
+
+    #[test]
+    fn selector_highlight_names_the_command_and_the_highlighted_filtered_row() {
+        let mut c = model_selector_ready(vec![model_row("qwen"), model_row("llama")]);
+        let (command, row) = c.selector_highlight().expect("a Ready selector");
+        assert_eq!(command, "model");
+        assert_eq!(row, &model_row("qwen"));
+
+        // It tracks the cursor and the rest filter, like the OverlayView.
+        fold_consumed(&mut c, Key::ArrowDown);
+        assert_eq!(c.selector_highlight().unwrap().1, &model_row("llama"));
+        press(&mut c, typed("qw"));
+        assert_eq!(
+            c.selector_highlight().unwrap().1,
+            &model_row("qwen"),
+            "the filter narrowed and the highlight snapped"
+        );
+    }
+
+    #[test]
+    fn selector_highlight_is_none_outside_a_ready_selector() {
+        // No overlay, the menu, and a Loading selector all read None.
+        assert_eq!(fresh().selector_highlight(), None);
+        assert_eq!(with_draft("fix the bug", 11).selector_highlight(), None);
+        assert_eq!(slashing("/model").selector_highlight(), None, "the menu");
+        let mut c = slashing("/model");
+        fold_consumed(&mut c, Key::Enter);
+        assert_eq!(c.selector_highlight(), None, "Loading has no rows");
+    }
+
+    #[test]
+    fn selector_highlight_is_none_when_the_filter_leaves_nothing() {
+        let mut c = model_selector_ready(vec![model_row("qwen")]);
+        press(&mut c, typed("zzz"));
+        assert_eq!(c.selector_highlight(), None, "an empty filtered view");
     }
 
     #[test]

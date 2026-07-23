@@ -19,7 +19,6 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 use thousands::Separable;
@@ -29,6 +28,7 @@ use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::selector::SelectorRow;
+use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
 use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
 use crate::ui::viewport::Viewport;
@@ -92,7 +92,7 @@ pub fn md_style(style: MdStyle, theme: &Theme) -> Style {
         MdStyle::Code => Style::default().fg(tui_color(theme.code)),
         MdStyle::CodeBlock => Style::default()
             .fg(tui_color(theme.code_block))
-            .bg(tui_color(theme.code_bg)),
+            .bg(tui_color(theme.code_block_bg)),
         MdStyle::Heading => Style::default()
             .fg(tui_color(theme.heading))
             .add_modifier(Modifier::BOLD),
@@ -295,9 +295,12 @@ fn render_composer_popup(
             highlight,
         } => {
             // The popup titles itself after the command's own values -
-            // "models" for /model, "themes" for /theme - by pluralizing the
-            // opaque command name the overlay carries.
-            let title = format!("{command}s");
+            // "models" for /model, "themes" for /theme - from the registry
+            // descriptor's `list_title` (grammar belongs to the registry, not
+            // the painter); an unregistered name falls back to the raw name.
+            let title = slash::lookup(command)
+                .map(|c| c.list_title.to_string())
+                .unwrap_or_else(|| command.clone());
             match status {
                 OverlayStatus::Loading => {
                     let line = Line::styled(
@@ -1035,21 +1038,14 @@ fn message_lines(
 // markdown.rs carries only the semantic fact, the fence's language).
 // ---------------------------------------------------------------------------
 
-/// The bundled syntax definitions + every bundled syntect theme. Lazy:
-/// headless runs that never render pay nothing for `load_defaults`. All
-/// themes load once; the active Theme's `syntax` slot picks per call.
-struct Highlighter {
-    syntaxes: SyntaxSet,
-    themes: ThemeSet,
-}
+/// The bundled syntax definitions, lazy: headless runs that never render pay
+/// nothing for the load. The syntect themes are NOT here - the theme module
+/// owns that set ([`theme::syntax_theme_set`]), so the names its validation
+/// accepts and the themes this highlighter draws from are one loaded copy.
+static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 
-static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
-
-fn highlighter() -> &'static Highlighter {
-    HIGHLIGHTER.get_or_init(|| Highlighter {
-        syntaxes: SyntaxSet::load_defaults_newlines(),
-        themes: ThemeSet::load_defaults(),
-    })
+fn syntaxes() -> &'static SyntaxSet {
+    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
 /// One highlighted fragment: the `(r, g, b)` foreground and the text it colors.
@@ -1068,22 +1064,21 @@ fn highlight_code(
     lang: &str,
     syntax_theme: &str,
 ) -> Option<Vec<Vec<CodeFragment>>> {
-    let hl = highlighter();
+    let syntaxes = syntaxes();
     // `find_syntax_by_token` matches the syntax name ("rust", "python") AND
     // file extensions ("rs", "py"), case-insensitively - the widest net for
     // fence tags.
-    let syntax = hl.syntaxes.find_syntax_by_token(lang)?;
-    let colors = hl
-        .themes
-        .themes
+    let syntax = syntaxes.find_syntax_by_token(lang)?;
+    let themes = &theme::syntax_theme_set().themes;
+    let colors = themes
         .get(syntax_theme)
-        .unwrap_or(&hl.themes.themes["base16-ocean.dark"]);
+        .unwrap_or(&themes["base16-ocean.dark"]);
     let mut state = HighlightLines::new(syntax, colors);
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         // The newlines-variant SyntaxSet expects each line `\n`-terminated.
         let with_newline = format!("{line}\n");
-        let ranges = state.highlight_line(&with_newline, &hl.syntaxes).ok()?;
+        let ranges = state.highlight_line(&with_newline, syntaxes).ok()?;
         let mut fragments = Vec::new();
         for (style, text) in ranges {
             let text = text.trim_end_matches('\n');
@@ -1143,7 +1138,7 @@ fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                                         text,
                                         Style::default()
                                             .fg(Color::Rgb(r, g, b))
-                                            .bg(tui_color(theme.code_bg)),
+                                            .bg(tui_color(theme.code_block_bg)),
                                     )
                                 })
                                 .collect::<Vec<_>>(),
@@ -1961,7 +1956,7 @@ mod tests {
         // The bg is the block treatment every code row keeps, highlighted or
         // not; the fg is the plain-fallback tint syntect replaces when it can.
         let style = md_style(MdStyle::CodeBlock, theme::dark());
-        assert_eq!(style.bg, Some(tui_color(theme::dark().code_bg)));
+        assert_eq!(style.bg, Some(tui_color(theme::dark().code_block_bg)));
         assert!(matches!(style.fg, Some(Color::Rgb(..))));
     }
 
@@ -2125,7 +2120,7 @@ mod tests {
         );
         // The ex-constants, now slots: the code, bar, and quiet-segment
         // backgrounds keep their exact legacy values under dark.
-        assert_eq!(tui_color(t.code_bg), Color::Rgb(25, 25, 35));
+        assert_eq!(tui_color(t.code_block_bg), Color::Rgb(25, 25, 35));
         assert_eq!(tui_color(t.bar_bg), Color::Rgb(30, 30, 40));
         assert_eq!(tui_color(t.segment_muted_bg), Color::Rgb(40, 44, 58));
     }
@@ -2171,7 +2166,7 @@ mod tests {
         // its own syntect fg.
         assert!(code.spans.len() > 1, "syntect splits the line");
         for span in &code.spans {
-            assert_eq!(span.style.bg, Some(tui_color(theme::dark().code_bg)));
+            assert_eq!(span.style.bg, Some(tui_color(theme::dark().code_block_bg)));
             assert!(matches!(span.style.fg, Some(Color::Rgb(..))));
         }
     }

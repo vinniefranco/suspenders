@@ -7,17 +7,18 @@
 //!
 //! ## Drift is impossible by construction
 //!
-//! [`handled`] is the ONE place a command-name string literal lives on the
-//! adapter side; [`is_handled`] is derived from it, so the two cannot disagree.
-//! [`run`] and [`choose`] match [`Handled`] EXHAUSTIVELY (no `_` arm), so adding
-//! a variant is a COMPILE error until both are handled. The colocated coverage
-//! test drives the real classifier over every
-//! [`slash::COMMANDS`](crate::ui::slash::COMMANDS) entry, so a registered
-//! command without a `handled` mapping fails the test rather than silently
-//! becoming a no-op-with-info-line at runtime.
+//! Each command module mints its name ONCE (`model_command::NAME`,
+//! `theme_command::NAME`); [`handled`] is the ONE place those names are
+//! classified on the adapter side, and [`is_handled`] is derived from it, so
+//! the router and any other reader of a command's name (the `/theme` live
+//! preview) cannot disagree. [`run`] and [`choose`] match [`Handled`]
+//! EXHAUSTIVELY (no `_` arm), so adding a variant is a COMPILE error until
+//! both are handled. The colocated coverage test drives the real classifier
+//! over every [`slash::COMMANDS`](crate::ui::slash::COMMANDS) entry, so a
+//! registered command without a `handled` mapping fails the test rather than
+//! silently becoming a no-op-with-info-line at runtime.
 
-use crate::ui::AdapterCtx;
-use crate::ui::theme_command::ThemeSelection;
+use crate::ui::{AdapterCtx, AdapterState};
 
 use super::model_command;
 use super::screen::Screen;
@@ -33,13 +34,13 @@ enum Handled {
     Theme,
 }
 
-/// The SINGLE name→command mapping. The only place command-name string literals
-/// live on the adapter side, so [`is_handled`], [`run`], and [`choose`] cannot
-/// disagree about what `"model"` means.
+/// The SINGLE name→command mapping, over each module's own minted `NAME`, so
+/// [`is_handled`], [`run`], [`choose`], and every other reader of a command's
+/// name resolve the same string.
 fn handled(name: &str) -> Option<Handled> {
     match name {
-        "model" => Some(Handled::Model),
-        "theme" => Some(Handled::Theme),
+        n if n == model_command::NAME => Some(Handled::Model),
+        n if n == theme_command::NAME => Some(Handled::Theme),
         _ => None,
     }
 }
@@ -55,18 +56,18 @@ pub fn is_handled(name: &str) -> bool {
 /// [`Handled`] match is exhaustive, so a new command is a compile error here
 /// until it is handled. `generation` is the activation counter the effect
 /// carried; a selector-opening handler must echo it on its fill events.
-/// `themes` is the adapter-owned Theme state `/theme` reads and swaps
-/// (ADR-0038) - threaded like the run loop's other mutable adapter state.
+/// `state` is the run loop's one mutable adapter-state carrier
+/// ([`AdapterState`]); `/theme` reads and swaps its Theme state (ADR-0038).
 pub(super) async fn run(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
-    themes: &mut ThemeSelection,
+    state: &mut AdapterState,
     name: &str,
     generation: u64,
 ) -> Screen {
     match handled(name) {
         Some(Handled::Model) => model_command::run(screen, ctx, generation).await,
-        Some(Handled::Theme) => theme_command::run(screen, ctx, themes, generation),
+        Some(Handled::Theme) => theme_command::run(screen, ctx, &mut state.themes, generation),
         None => screen.info(format!("/{name}: no handler")),
     }
 }
@@ -77,13 +78,13 @@ pub(super) async fn run(
 pub(super) async fn choose(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
-    themes: &mut ThemeSelection,
+    state: &mut AdapterState,
     command: &str,
     value: String,
 ) -> Screen {
     match handled(command) {
         Some(Handled::Model) => model_command::choose(screen, ctx, value).await,
-        Some(Handled::Theme) => theme_command::choose(screen, ctx, themes, value),
+        Some(Handled::Theme) => theme_command::choose(screen, ctx, &mut state.themes, value),
         None => screen.info(format!("/{command}: no handler")),
     }
 }

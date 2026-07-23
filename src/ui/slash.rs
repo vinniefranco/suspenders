@@ -40,6 +40,11 @@ pub struct SlashCommand {
     pub name: &'static str,
     pub help: &'static str,
     pub opens_selector: bool,
+    /// The selector popup's title - the plural noun for the command's own
+    /// values ("models", "themes"). Stated here because pluralization is
+    /// English grammar: the painter looks it up instead of conjugating the
+    /// command name.
+    pub list_title: &'static str,
 }
 
 /// The available Slash Commands (ADR-0032's `&'static` registry); `/compact`,
@@ -49,11 +54,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "model",
         help: "choose the model for this session",
         opens_selector: true,
+        list_title: "models",
     },
     SlashCommand {
         name: "theme",
         help: "choose the theme for this session",
         opens_selector: true,
+        list_title: "themes",
     },
 ];
 
@@ -211,6 +218,17 @@ mod tests {
         assert_eq!(lookup("mod"), None, "partial names never resolve");
         assert_eq!(lookup("compact"), None);
         assert_eq!(lookup(""), None);
+    }
+
+    #[test]
+    fn every_selector_command_states_its_list_title() {
+        // The popup titles itself from the descriptor, so a selector-opening
+        // command without a plural noun would paint an empty title.
+        for c in COMMANDS.iter().filter(|c| c.opens_selector) {
+            assert!(!c.list_title.is_empty(), "/{} has no list_title", c.name);
+        }
+        assert_eq!(lookup("model").unwrap().list_title, "models");
+        assert_eq!(lookup("theme").unwrap().list_title, "themes");
     }
 
     #[test]

@@ -10,7 +10,7 @@ themes ship day one - the file format is the feature, not a later add.
 ## Decision
 
 **Keys are the semantic slots themselves, sparse.** A theme's `[colors]` table
-names the app's own slots (~20: `added`, `removed`, `heading`, `code_bg`,
+names the app's own slots (~20: `added`, `removed`, `heading`, `code_block_bg`,
 `bar_bg`, the status-bar segment pairs, ...), not a base16-style abstract
 palette. Unstated keys fall back to the built-in default, so a three-line theme
 is valid. Base16 roles were rejected: portable, but a user cannot retune one

@@ -26,12 +26,15 @@
 //!   reason ([`ThemeError`]); `/theme` will show it verbatim. Resilience
 //!   (falling back to `dark` with a notice) is the caller's job.
 
-use std::collections::BTreeSet;
+pub mod active;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 use syntect::highlighting::ThemeSet;
+
+pub use active::ActiveTheme;
 
 // ---------------------------------------------------------------------------
 // Color - this module's own, ratatui-free (ADR-0019).
@@ -80,30 +83,18 @@ impl std::str::FromStr for Color {
     }
 }
 
-/// One `rr`/`gg`/`bb` pair of `digits` as a byte; `None` off the string's end,
-/// on a non-hex digit, or on a non-ASCII boundary (`get` guards the slice).
-fn hex_pair(digits: &str, at: usize) -> Option<u8> {
-    u8::from_str_radix(digits.get(at..at + 2)?, 16).ok()
-}
-
-/// Parses a `#`-prefixed hex color; exactly six hex digits or rejection.
+/// Parses a `#`-prefixed hex color; exactly six ASCII hex digits or rejection.
+/// The digit check is explicit because `from_str_radix` alone accepts a
+/// leading sign ("+12345" would sneak through a pairwise parse).
 fn parse_hex(s: &str) -> Result<Color, String> {
     let digits = s.strip_prefix('#').unwrap_or(s);
-    let rgb = (digits.len() == 6)
-        .then(|| {
-            Some((
-                hex_pair(digits, 0)?,
-                hex_pair(digits, 2)?,
-                hex_pair(digits, 4)?,
-            ))
-        })
-        .flatten();
-    match rgb {
-        Some((r, g, b)) => Ok(Color::Rgb(r, g, b)),
-        None => Err(format!(
-            "\"{s}\" is not a valid hex color: expected \"#rrggbb\""
-        )),
+    if digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let rgb = u32::from_str_radix(digits, 16).expect("six hex digits parse");
+        return Ok(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
     }
+    Err(format!(
+        "\"{s}\" is not a valid hex color: expected \"#rrggbb\""
+    ))
 }
 
 /// The ANSI-16 name table: snake_case, mirroring the terminal palette's
@@ -174,7 +165,7 @@ impl std::error::Error for ThemeError {}
 /// slot rejects the file), the sparse Theme, the total Theme, and the
 /// per-slot parse/resolve plumbing.
 macro_rules! theme_slots {
-    ($($slot:ident),* $(,)?) => {
+    ($($(#[$doc:meta])* $slot:ident),* $(,)?) => {
         /// The raw `[colors]` table as the file states it: every slot an
         /// optional string, unknown keys rejected. A DTO in the
         /// `FileConfig` mold (ADR-0031) - parsing to [`Color`] happens after,
@@ -192,7 +183,7 @@ macro_rules! theme_slots {
         pub struct SparseTheme {
             /// The bundled syntect theme for code blocks, when stated.
             pub syntax: Option<String>,
-            $(pub $slot: Option<Color>,)*
+            $($(#[$doc])* pub $slot: Option<Color>,)*
         }
 
         /// A total Theme: every slot carries a color, `syntax` names a
@@ -201,7 +192,7 @@ macro_rules! theme_slots {
         pub struct Theme {
             /// The bundled syntect theme code blocks highlight with.
             pub syntax: String,
-            $(pub $slot: Color,)*
+            $($(#[$doc])* pub $slot: Color,)*
         }
 
         impl ColorsFile {
@@ -241,45 +232,72 @@ macro_rules! theme_slots {
 }
 
 // One line per color decision in ui::components (the single semantic → color
-// mapping, ADR-0008). Grouped by the surface the slot colors; the `fg`/`bg`
-// suffixes mark the two halves of a powerline segment pair.
+// mapping, ADR-0008). The per-slot docs land on the generated `Theme` and
+// `SparseTheme` fields - the user-facing contract; the `fg`/`bg` suffixes
+// mark the two halves of a powerline segment pair.
 theme_slots! {
-    // The conversation plane: diff lines, dimmed machinery, the gutters.
+    /// Diff added lines in the conversation plane.
     added,
+    /// Diff removed lines in the conversation plane.
     removed,
+    /// Diff context (unchanged) lines.
     context,
+    /// Dimmed secondary text: info lines, hints, quiet chrome.
     muted,
+    /// Tool-call/result machinery lines.
     machinery,
+    /// Error lines and failure notices.
     error,
+    /// Extended-thinking lines (Ctrl-T's plane).
     thinking,
+    /// The `>` gutter marking the user's own prompts.
     prompt_gutter,
-    // Assistant markdown.
+    /// Assistant markdown headings.
     heading,
+    /// Assistant markdown list bullets.
     bullet,
+    /// Assistant markdown block quotes.
     quote,
+    /// Assistant markdown links.
     link,
+    /// Inline code spans.
     code,
+    /// Code-block text (the fallback fg when syntect has no syntax).
     code_block,
-    code_bg,
-    // Chrome.
+    /// The code-block background, behind `code_block` and syntect fragments.
+    code_block_bg,
+    /// The Composer popup and modal border.
     popup_border,
-    // The powerline status bar. `segment_muted_bg` is the shared quiet
-    // background of the low-emphasis segments (thinking/tools toggles, cost,
-    // tokens at Ok pressure).
+    /// The powerline status bar's base background.
     bar_bg,
+    /// The shared quiet background of the low-emphasis segments
+    /// (thinking/tools toggles, cost, tokens at Ok pressure).
     segment_muted_bg,
+    /// The idle status segment's text.
     segment_idle_fg,
+    /// The idle status segment's block.
     segment_idle_bg,
+    /// The running status segment's text.
     segment_running_fg,
+    /// The running status segment's block.
     segment_running_bg,
+    /// The model segment's text.
     segment_model_fg,
+    /// The model segment's block.
     segment_model_bg,
+    /// The thinking/tools toggle segments' text.
     segment_toggle_fg,
+    /// The session-cost segment's text.
     segment_cost_fg,
+    /// The tokens segment's text at Ok pressure.
     pressure_ok_fg,
+    /// The tokens segment's text at Elevated pressure.
     pressure_elevated_fg,
+    /// The tokens segment's block at Elevated pressure.
     pressure_elevated_bg,
+    /// The tokens segment's text at Critical pressure.
     pressure_critical_fg,
+    /// The tokens segment's block at Critical pressure.
     pressure_critical_bg,
 }
 
@@ -327,24 +345,25 @@ impl SparseTheme {
     }
 }
 
-/// The bundled syntect theme names, loaded once. Only bundled themes are
-/// nameable (ADR-0038 defers user `.tmTheme` loading).
-fn syntax_theme_names() -> &'static BTreeSet<String> {
-    static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
-    NAMES.get_or_init(|| ThemeSet::load_defaults().themes.into_keys().collect())
+/// The bundled syntect [`ThemeSet`], loaded once and owned HERE: the ONE copy
+/// [`validate_syntax`] and the code-fence highlighter both read, so a name
+/// that validates is a name the highlighter has - agreement by construction,
+/// not coincidence. Only bundled themes are nameable (ADR-0038 defers user
+/// `.tmTheme` loading). syntect is not a terminal crate, so exposing it here
+/// leaves the ADR-0019 boundary untouched.
+pub fn syntax_theme_set() -> &'static ThemeSet {
+    static SET: OnceLock<ThemeSet> = OnceLock::new();
+    SET.get_or_init(ThemeSet::load_defaults)
 }
 
 /// Rejects a `syntax` value naming no bundled syntect theme; the reason lists
 /// what IS available, so the fix is in the message.
 fn validate_syntax(name: &str) -> Result<(), ThemeError> {
-    if syntax_theme_names().contains(name) {
+    let themes = &syntax_theme_set().themes;
+    if themes.contains_key(name) {
         return Ok(());
     }
-    let available = syntax_theme_names()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let available = themes.keys().cloned().collect::<Vec<_>>().join(", ");
     Err(ThemeError::Invalid(format!(
         "syntax: \"{name}\" is not a bundled syntax theme (available: {available})"
     )))
@@ -354,9 +373,22 @@ fn validate_syntax(name: &str) -> Result<(), ThemeError> {
 // Built-ins - embedded TOML, so the parser is dogfooded (ADR-0038).
 // ---------------------------------------------------------------------------
 
-/// The built-in theme names. Reserved: a user file with one of these stems is
-/// refused ([`ThemeError::ShadowsBuiltIn`]), so a built-in is never shadowed.
-pub const BUILT_INS: [&str; 2] = ["dark", "light"];
+/// The built-in theme names, in `/theme`'s listing order. Reserved: a user
+/// file with one of these stems is refused ([`ThemeError::ShadowsBuiltIn`]),
+/// so a built-in is never shadowed. A drift test pins that every name here
+/// resolves through [`built_in`].
+pub const BUILT_INS: &[&str] = &["dark", "light"];
+
+/// THE built-in name → Theme mapping. [`is_built_in`] and [`load`] derive
+/// from it, so a built-in cannot half-exist (listed but unloadable, or
+/// loadable but shadowable).
+pub fn built_in(name: &str) -> Option<&'static Theme> {
+    match name {
+        "dark" => Some(dark()),
+        "light" => Some(light()),
+        _ => None,
+    }
+}
 
 const DARK_TOML: &str = include_str!("themes/dark.toml");
 const LIGHT_TOML: &str = include_str!("themes/light.toml");
@@ -387,7 +419,7 @@ pub fn light() -> &'static Theme {
 }
 
 fn is_built_in(name: &str) -> bool {
-    BUILT_INS.contains(&name)
+    built_in(name).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -446,10 +478,9 @@ fn read_theme(name: &str, path: &Path) -> Result<SparseTheme, ThemeError> {
 /// startup fallback: a missing or broken configured theme falls back to
 /// `dark` with a visible notice, never a crash (ADR-0038).
 pub fn load(name: &str, dir: &Path) -> Result<Theme, ThemeError> {
-    match name {
-        "dark" => Ok(dark().clone()),
-        "light" => Ok(light().clone()),
-        _ => load_user(name, dir),
+    match built_in(name) {
+        Some(theme) => Ok(theme.clone()),
+        None => load_user(name, dir),
     }
 }
 
@@ -504,7 +535,11 @@ mod tests {
 
     #[test]
     fn bad_hex_is_rejected_with_the_expected_shape() {
-        for bad in ["#12345", "#1234567", "#12345g", "#", "#ééé"] {
+        // "#+1+2+3" and "#-0-0-0" pin the from_str_radix sign hazard: a
+        // pairwise u8 parse accepts "+1" as 1, so these MUST reject.
+        for bad in [
+            "#12345", "#1234567", "#12345g", "#", "#ééé", "#+1+2+3", "#-0-0-0",
+        ] {
             let err = bad.parse::<Color>().unwrap_err();
             assert_eq!(
                 err,
@@ -658,7 +693,7 @@ mod tests {
         assert_eq!(theme.link, Color::Blue);
         assert_eq!(theme.code, Color::Yellow);
         assert_eq!(theme.code_block, Color::Rgb(185, 215, 180));
-        assert_eq!(theme.code_bg, Color::Rgb(25, 25, 35));
+        assert_eq!(theme.code_block_bg, Color::Rgb(25, 25, 35));
         assert_eq!(theme.popup_border, Color::Cyan);
         assert_eq!(theme.bar_bg, Color::Rgb(30, 30, 40));
         assert_eq!(theme.segment_muted_bg, Color::Rgb(40, 44, 58));
@@ -760,6 +795,21 @@ mod tests {
         let nowhere = Path::new("/no/such/dir");
         assert_eq!(load("dark", nowhere).expect("built-in"), *dark());
         assert_eq!(load("light", nowhere).expect("built-in"), *light());
+    }
+
+    #[test]
+    fn every_built_ins_name_resolves_through_the_built_in_mapping() {
+        // The drift guard: a name added to BUILT_INS without a built_in() arm
+        // would be listed and reserved but unloadable - this catches it.
+        let nowhere = Path::new("/no/such/dir");
+        for name in BUILT_INS {
+            assert_eq!(
+                load(name, nowhere).as_ref().ok(),
+                built_in(name),
+                "BUILT_INS entry \"{name}\" must resolve via built_in()"
+            );
+            assert!(built_in(name).is_some(), "{name} has no built_in() arm");
+        }
     }
 
     #[test]
