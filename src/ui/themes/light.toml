@@ -1,0 +1,48 @@
+# The built-in light theme (ADR-0038): the light-background counterpart that
+# proves the schema covers both polarities. Stated in full - a light theme
+# leaning on dark fallbacks would be unreadable - and in hex, since a light
+# look needs designed values, not the terminal's ANSI palette.
+
+syntax = "base16-ocean.light"
+
+[colors]
+# The conversation plane.
+added = "#1a7f37"
+removed = "#cf222e"
+context = "#6e7781"
+muted = "#6e7781"
+machinery = "#8c959f"
+error = "#cf222e"
+thinking = "#6e7781"
+prompt_gutter = "#0969da"
+
+# Assistant markdown.
+heading = "#0550ae"
+bullet = "#0969da"
+quote = "#6e7781"
+link = "#0969da"
+code = "#953800"
+code_block = "#24292f"
+# Matches base16-ocean.light's background, so highlighted and plain code
+# blocks share one surface.
+code_bg = "#eff1f5"
+
+# Chrome.
+popup_border = "#0969da"
+
+# The powerline status bar.
+bar_bg = "#e7ebf0"
+segment_muted_bg = "#d6dce4"
+segment_idle_fg = "#ffffff"
+segment_idle_bg = "#1a7f37"
+segment_running_fg = "#24292f"
+segment_running_bg = "#eac54f"
+segment_model_fg = "#3f4a5c"
+segment_model_bg = "#c3ccd8"
+segment_toggle_fg = "#57606a"
+segment_cost_fg = "#57606a"
+pressure_ok_fg = "#57606a"
+pressure_elevated_fg = "#24292f"
+pressure_elevated_bg = "#eac54f"
+pressure_critical_fg = "#ffffff"
+pressure_critical_bg = "#cf222e"

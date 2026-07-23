@@ -23,6 +23,7 @@ pub mod picker;
 pub mod screen;
 pub mod selector;
 pub mod slash;
+pub mod theme;
 pub mod transcript;
 pub mod viewport;
 

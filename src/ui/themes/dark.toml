@@ -1,0 +1,46 @@
+# The built-in dark theme (ADR-0038): today's palette, stated in full.
+# This is the fallback floor every sparse theme resolves over, so every slot
+# is present. ANSI names stay names - they draw from the user's terminal
+# palette; hex values are the exact RGB the app has always used.
+
+syntax = "base16-ocean.dark"
+
+[colors]
+# The conversation plane.
+added = "green"
+removed = "red"
+context = "dark_gray"
+muted = "dark_gray"
+machinery = "dark_gray"
+error = "red"
+thinking = "dark_gray"
+prompt_gutter = "cyan"
+
+# Assistant markdown.
+heading = "cyan"
+bullet = "cyan"
+quote = "dark_gray"
+link = "blue"
+code = "yellow"
+code_block = "#b9d7b4"
+code_bg = "#191923"
+
+# Chrome.
+popup_border = "cyan"
+
+# The powerline status bar.
+bar_bg = "#1e1e28"
+segment_muted_bg = "#282c3a"
+segment_idle_fg = "black"
+segment_idle_bg = "green"
+segment_running_fg = "black"
+segment_running_bg = "yellow"
+segment_model_fg = "#96a0b9"
+segment_model_bg = "#343a52"
+segment_toggle_fg = "dark_gray"
+segment_cost_fg = "gray"
+pressure_ok_fg = "gray"
+pressure_elevated_fg = "black"
+pressure_elevated_bg = "yellow"
+pressure_critical_fg = "black"
+pressure_critical_bg = "red"
