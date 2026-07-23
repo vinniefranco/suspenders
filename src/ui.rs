@@ -120,7 +120,9 @@ where
 {
     let mut picker = Picker::new(entries);
 
-    terminal.draw(|frame| components::render_picker(frame, &picker))?;
+    // The picker runs before any config is read; it draws in the built-in
+    // dark Theme (Stage C wires the configured one).
+    terminal.draw(|frame| components::render_picker(frame, &picker, theme::dark()))?;
 
     loop {
         // An ended input stream means the terminal is gone: quit, don't spin.
@@ -147,7 +149,7 @@ where
         if let Some(outcome) = outcome {
             return Ok(outcome);
         }
-        terminal.draw(|frame| components::render_picker(frame, &picker))?;
+        terminal.draw(|frame| components::render_picker(frame, &picker, theme::dark()))?;
     }
 }
 
@@ -226,6 +228,11 @@ async fn run_loop(
     // layer (ADR-0019), never in the pure core.
     let mut cache = components::RenderCache::new();
 
+    // The active resolved Theme every frame draws with (ADR-0038). Owned by
+    // the run loop so Stage C's `/theme` can swap it at runtime; for now it
+    // is the built-in dark - today's exact palette.
+    let theme = theme::dark().clone();
+
     // Drives the running-spinner animation: the event loop is otherwise idle
     // while the model thinks, so nothing would repaint. `spinner` is the frame
     // counter (only meaningful while running).
@@ -242,6 +249,7 @@ async fn run_loop(
         &conn,
         spinner,
         &mut cache,
+        &theme,
     )?;
 
     loop {
@@ -251,7 +259,7 @@ async fn run_loop(
             _ = ticker.tick() => {
                 if screen.as_ref().unwrap().status == Status::Running {
                     spinner = spinner.wrapping_add(1);
-                    geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
+                    geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache, &theme)?;
                 }
                 continue;
             }
@@ -333,9 +341,9 @@ async fn run_loop(
                         let core = screen.take().unwrap();
                         let (core, effects) = core.agent_down();
                         screen = Some(run_effects(core, effects, &ctx, &mut viewport, geometry, history_store.as_deref()).await);
-                        let geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache)?;
+                        let geometry = draw(terminal, screen.as_ref().unwrap(), &viewport, &conn, spinner, &mut cache, &theme)?;
                         // Nothing more will arrive; wait only on input now.
-                        return drain_input(terminal, input, screen.take().unwrap(), viewport, geometry, conn, cache).await;
+                        return drain_input(terminal, input, screen.take().unwrap(), viewport, geometry, conn, cache, theme).await;
                     }
                 }
             }
@@ -363,6 +371,7 @@ async fn run_loop(
             &conn,
             spinner,
             &mut cache,
+            &theme,
         )?;
     }
 }
@@ -370,6 +379,7 @@ async fn run_loop(
 /// After the Agent is gone we keep the TUI responsive to quit/scroll only. The
 /// Active Model can no longer change (no Agent to swap it), so the connection
 /// facts are frozen - carried as one owned [`components::ConnectionFacts`].
+#[allow(clippy::too_many_arguments)] // the run loop's frozen state, handed over whole
 async fn drain_input<B, S>(
     terminal: &mut Terminal<B>,
     mut input: S,
@@ -378,6 +388,7 @@ async fn drain_input<B, S>(
     mut geometry: Geometry,
     conn: components::ConnectionFacts,
     mut cache: components::RenderCache,
+    theme: theme::Theme,
 ) -> anyhow::Result<()>
 where
     B: Backend,
@@ -395,7 +406,7 @@ where
                     Key::PageDown => viewport.page_down(total_lines, height),
                     _ => {}
                 }
-                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache)?;
+                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache, &theme)?;
             }
             // The wheel still scrolls after the Agent is gone; other mouse
             // kinds are ignored.
@@ -405,7 +416,7 @@ where
                     Some(Key::WheelDown) => viewport.scroll_down(WHEEL_LINES, total_lines, height),
                     _ => continue,
                 }
-                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache)?;
+                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache, &theme)?;
             }
             Some(_) => {}
             None => return Ok(()),
@@ -689,10 +700,11 @@ fn draw<B: Backend>(
     conn: &components::ConnectionFacts,
     spinner: u64,
     cache: &mut components::RenderCache,
+    theme: &theme::Theme,
 ) -> anyhow::Result<Geometry> {
     let mut geometry: Geometry = (0, 0);
     terminal.draw(|frame| {
-        geometry = components::render(frame, screen, conn.view(), spinner, viewport, cache);
+        geometry = components::render(frame, screen, conn.view(), spinner, viewport, cache, theme);
     })?;
     Ok(geometry)
 }
@@ -1105,7 +1117,15 @@ mod tests {
         let conn = facts();
         // A real first draw, exactly like run_loop's hand-off: the measured
         // geometry is what the scroll arms clamp against.
-        let geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache)?;
+        let geometry = draw(
+            terminal,
+            &screen,
+            &viewport,
+            &conn,
+            0,
+            &mut cache,
+            theme::dark(),
+        )?;
         drain_input(
             terminal,
             stream::iter(events),
@@ -1114,6 +1134,7 @@ mod tests {
             geometry,
             conn,
             cache,
+            theme::dark().clone(),
         )
         .await
     }

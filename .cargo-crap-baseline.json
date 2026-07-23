@@ -5797,7 +5797,7 @@
     {
       "file": "./src/ui.rs",
       "function": "append_history",
-      "line": 649,
+      "line": 661,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -5805,7 +5805,7 @@
     {
       "file": "./src/ui.rs",
       "function": "drain_input",
-      "line": 372,
+      "line": 383,
       "cyclomatic": 15.0,
       "coverage": 100.0,
       "crap": 15.0
@@ -5813,7 +5813,7 @@
     {
       "file": "./src/ui.rs",
       "function": "draw",
-      "line": 684,
+      "line": 696,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -5821,7 +5821,7 @@
     {
       "file": "./src/ui.rs",
       "function": "history_path",
-      "line": 601,
+      "line": 613,
       "cyclomatic": 1.0,
       "coverage": 0.0,
       "crap": 2.0
@@ -5829,7 +5829,7 @@
     {
       "file": "./src/ui.rs",
       "function": "is_quit",
-      "line": 449,
+      "line": 461,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -5837,7 +5837,7 @@
     {
       "file": "./src/ui.rs",
       "function": "map_key",
-      "line": 459,
+      "line": 471,
       "cyclomatic": 18.0,
       "coverage": 100.0,
       "crap": 18.0
@@ -5845,7 +5845,7 @@
     {
       "file": "./src/ui.rs",
       "function": "map_mouse",
-      "line": 492,
+      "line": 504,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -5853,7 +5853,7 @@
     {
       "file": "./src/ui.rs",
       "function": "next_if_ready",
-      "line": 427,
+      "line": 439,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -5861,7 +5861,7 @@
     {
       "file": "./src/ui.rs",
       "function": "open_history",
-      "line": 624,
+      "line": 636,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -5869,7 +5869,7 @@
     {
       "file": "./src/ui.rs",
       "function": "pick_loop",
-      "line": 111,
+      "line": 112,
       "cyclomatic": 13.0,
       "coverage": 100.0,
       "crap": 13.0
@@ -5877,7 +5877,7 @@
     {
       "file": "./src/ui.rs",
       "function": "pick_session",
-      "line": 101,
+      "line": 102,
       "cyclomatic": 1.0,
       "coverage": 0.0,
       "crap": 2.0
@@ -5885,7 +5885,7 @@
     {
       "file": "./src/ui.rs",
       "function": "provider_base_url",
-      "line": 440,
+      "line": 452,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -5893,7 +5893,7 @@
     {
       "file": "./src/ui.rs",
       "function": "read_history",
-      "line": 638,
+      "line": 650,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -5901,7 +5901,7 @@
     {
       "file": "./src/ui.rs",
       "function": "run",
-      "line": 79,
+      "line": 80,
       "cyclomatic": 1.0,
       "coverage": 0.0,
       "crap": 2.0
@@ -5909,7 +5909,7 @@
     {
       "file": "./src/ui.rs",
       "function": "run_effect",
-      "line": 516,
+      "line": 528,
       "cyclomatic": 15.0,
       "coverage": 100.0,
       "crap": 15.0
@@ -5917,7 +5917,7 @@
     {
       "file": "./src/ui.rs",
       "function": "run_effects",
-      "line": 502,
+      "line": 514,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -5925,7 +5925,7 @@
     {
       "file": "./src/ui.rs",
       "function": "run_loop",
-      "line": 168,
+      "line": 171,
       "cyclomatic": 4.0,
       "coverage": 0.0,
       "crap": 20.0
@@ -5933,7 +5933,7 @@
     {
       "file": "./src/ui.rs",
       "function": "serialized_len",
-      "line": 666,
+      "line": 678,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -5941,7 +5941,7 @@
     {
       "file": "./src/ui.rs",
       "function": "to_agent_decision",
-      "line": 670,
+      "line": 682,
       "cyclomatic": 4.0,
       "coverage": 60.0,
       "crap": 5.024
@@ -5981,7 +5981,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "ConnectionFacts::view",
-      "line": 161,
+      "line": 200,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -5989,7 +5989,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::default",
-      "line": 621,
+      "line": 692,
       "cyclomatic": 1.0,
       "coverage": 0.0,
       "crap": 2.0
@@ -5997,15 +5997,15 @@
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::needs_rebuild",
-      "line": 587,
-      "cyclomatic": 4.0,
+      "line": 651,
+      "cyclomatic": 5.0,
       "coverage": 100.0,
-      "crap": 4.0
+      "crap": 5.0
     },
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::new",
-      "line": 526,
+      "line": 584,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6013,7 +6013,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::settled",
-      "line": 538,
+      "line": 597,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6021,7 +6021,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::streaming_tail",
-      "line": 546,
+      "line": 605,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6029,7 +6029,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::sync",
-      "line": 556,
+      "line": 615,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -6037,7 +6037,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "RenderCache::sync_streaming",
-      "line": 597,
+      "line": 668,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -6045,7 +6045,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "StatusBar::cells",
-      "line": 1334,
+      "line": 1412,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6053,7 +6053,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "StatusBar::fit",
-      "line": 1312,
+      "line": 1390,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -6061,7 +6061,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "StatusSegment::cells",
-      "line": 1233,
+      "line": 1311,
       "cyclomatic": 10.0,
       "coverage": 100.0,
       "crap": 10.0
@@ -6069,7 +6069,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "StatusSegment::kind",
-      "line": 1213,
+      "line": 1291,
       "cyclomatic": 10.0,
       "coverage": 100.0,
       "crap": 10.0
@@ -6077,7 +6077,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "StatusSegment::paint",
-      "line": 1480,
+      "line": 1558,
       "cyclomatic": 12.0,
       "coverage": 100.0,
       "crap": 12.0
@@ -6085,7 +6085,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "block_line",
-      "line": 1097,
+      "line": 1183,
       "cyclomatic": 2.0,
       "coverage": 80.0,
       "crap": 2.032
@@ -6093,7 +6093,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "centered_rect",
-      "line": 1787,
+      "line": 1891,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6101,7 +6101,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "cost_label",
-      "line": 1278,
+      "line": 1356,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -6109,7 +6109,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "first_line",
-      "line": 1782,
+      "line": 1886,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6117,7 +6117,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "highlight_code",
-      "line": 983,
+      "line": 1058,
       "cyclomatic": 6.0,
       "coverage": 100.0,
       "crap": 6.0
@@ -6125,7 +6125,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "highlighter",
-      "line": 968,
+      "line": 1040,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6133,7 +6133,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "join_arg",
-      "line": 1766,
+      "line": 1870,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -6141,7 +6141,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "join_merged",
-      "line": 1775,
+      "line": 1879,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -6149,7 +6149,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "join_summary",
-      "line": 1741,
+      "line": 1845,
       "cyclomatic": 2.0,
       "coverage": 0.0,
       "crap": 6.0
@@ -6157,15 +6157,15 @@
     {
       "file": "./src/ui/components.rs",
       "function": "line_style",
-      "line": 41,
+      "line": 70,
       "cyclomatic": 7.0,
-      "coverage": 40.0,
-      "crap": 17.584
+      "coverage": 100.0,
+      "crap": 7.0
     },
     {
       "file": "./src/ui/components.rs",
       "function": "machinery_style",
-      "line": 798,
+      "line": 869,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6173,7 +6173,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "markdown_lines",
-      "line": 1015,
+      "line": 1099,
       "cyclomatic": 10.0,
       "coverage": 100.0,
       "crap": 10.0
@@ -6181,7 +6181,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "md_line_text",
-      "line": 1081,
+      "line": 1167,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6189,7 +6189,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "md_style",
-      "line": 57,
+      "line": 86,
       "cyclomatic": 11.0,
       "coverage": 100.0,
       "crap": 11.0
@@ -6197,15 +6197,15 @@
     {
       "file": "./src/ui/components.rs",
       "function": "message_lines",
-      "line": 809,
+      "line": 880,
       "cyclomatic": 14.0,
-      "coverage": 95.3125,
-      "crap": 14.020187377929688
+      "coverage": 95.45454545454545,
+      "crap": 14.018407212622089
     },
     {
       "file": "./src/ui/components.rs",
       "function": "plain_md_line",
-      "line": 1070,
+      "line": 1156,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6213,7 +6213,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "popup_rows",
-      "line": 308,
+      "line": 358,
       "cyclomatic": 2.0,
       "coverage": 88.0,
       "crap": 2.006912
@@ -6221,7 +6221,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "present_arg",
-      "line": 1753,
+      "line": 1857,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6229,7 +6229,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "pressure_style",
-      "line": 83,
+      "line": 114,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -6237,7 +6237,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "render",
-      "line": 181,
+      "line": 220,
       "cyclomatic": 3.0,
       "coverage": 91.66666666666666,
       "crap": 3.0052083333333335
@@ -6245,7 +6245,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "render_approval_modal",
-      "line": 1648,
+      "line": 1744,
       "cyclomatic": 1.0,
       "coverage": 0.0,
       "crap": 2.0
@@ -6253,7 +6253,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "render_composer",
-      "line": 1614,
+      "line": 1701,
       "cyclomatic": 4.0,
       "coverage": 95.0,
       "crap": 4.002
@@ -6261,7 +6261,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "render_composer_popup",
-      "line": 237,
+      "line": 279,
       "cyclomatic": 8.0,
       "coverage": 100.0,
       "crap": 8.0
@@ -6269,7 +6269,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "render_picker",
-      "line": 1695,
+      "line": 1796,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6277,15 +6277,15 @@
     {
       "file": "./src/ui/components.rs",
       "function": "render_status_bar",
-      "line": 1519,
+      "line": 1598,
       "cyclomatic": 3.0,
-      "coverage": 92.5,
-      "crap": 3.003796875
+      "coverage": 93.33333333333333,
+      "crap": 3.002666666666667
     },
     {
       "file": "./src/ui/components.rs",
       "function": "render_viewport",
-      "line": 360,
+      "line": 410,
       "cyclomatic": 6.0,
       "coverage": 100.0,
       "crap": 6.0
@@ -6293,7 +6293,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "scroll_position_label",
-      "line": 1590,
+      "line": 1677,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -6301,7 +6301,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "segment_bg",
-      "line": 126,
+      "line": 163,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6309,7 +6309,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "segment_style",
-      "line": 98,
+      "line": 133,
       "cyclomatic": 7.0,
       "coverage": 100.0,
       "crap": 7.0
@@ -6317,7 +6317,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "starts_with_status_glyph",
-      "line": 1760,
+      "line": 1864,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -6325,7 +6325,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "status_bar",
-      "line": 1388,
+      "line": 1466,
       "cyclomatic": 5.0,
       "coverage": 100.0,
       "crap": 5.0
@@ -6333,7 +6333,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "text_rows",
-      "line": 1090,
+      "line": 1176,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -6341,15 +6341,23 @@
     {
       "file": "./src/ui/components.rs",
       "function": "tokens_label",
-      "line": 1265,
+      "line": 1343,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
     },
     {
       "file": "./src/ui/components.rs",
+      "function": "tui_color",
+      "line": 45,
+      "cyclomatic": 18.0,
+      "coverage": 100.0,
+      "crap": 18.0
+    },
+    {
+      "file": "./src/ui/components.rs",
       "function": "visible_window",
-      "line": 771,
+      "line": 842,
       "cyclomatic": 5.0,
       "coverage": 100.0,
       "crap": 5.0
@@ -6357,7 +6365,7 @@
     {
       "file": "./src/ui/components.rs",
       "function": "wrapped_count",
-      "line": 760,
+      "line": 831,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7057,6 +7065,150 @@
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "Color::from_str",
+      "line": 73,
+      "cyclomatic": 2.0,
+      "coverage": 100.0,
+      "crap": 2.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "SparseTheme::parse",
+      "line": 320,
+      "cyclomatic": 4.0,
+      "coverage": 100.0,
+      "crap": 4.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "ThemeError::fmt",
+      "line": 154,
+      "cyclomatic": 4.0,
+      "coverage": 100.0,
+      "crap": 4.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "ansi_by_name",
+      "line": 111,
+      "cyclomatic": 18.0,
+      "coverage": 100.0,
+      "crap": 18.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "dark",
+      "line": 368,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "discover",
+      "line": 403,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "hex_pair",
+      "line": 85,
+      "cyclomatic": 2.0,
+      "coverage": 100.0,
+      "crap": 2.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "is_built_in",
+      "line": 389,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "light",
+      "line": 380,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "load",
+      "line": 448,
+      "cyclomatic": 4.0,
+      "coverage": 100.0,
+      "crap": 4.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "load_user",
+      "line": 457,
+      "cyclomatic": 4.0,
+      "coverage": 100.0,
+      "crap": 4.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "missing_slot",
+      "line": 297,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "parse_hex",
+      "line": 90,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "parse_slot",
+      "line": 287,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "read_theme",
+      "line": 435,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "syntax_theme_names",
+      "line": 332,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "theme_files",
+      "line": 415,
+      "cyclomatic": 1.0,
+      "coverage": 100.0,
+      "crap": 1.0
+    },
+    {
+      "file": "./src/ui/theme.rs",
+      "function": "validate_syntax",
+      "line": 339,
+      "cyclomatic": 2.0,
+      "coverage": 100.0,
+      "crap": 2.0
     },
     {
       "file": "./src/ui/transcript.rs",

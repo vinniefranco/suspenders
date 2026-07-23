@@ -19,7 +19,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 use thousands::Separable;
@@ -29,23 +29,52 @@ use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::selector::SelectorRow;
+use crate::ui::theme::{self, Theme};
 use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
 use crate::ui::viewport::Viewport;
 
 // ---------------------------------------------------------------------------
-// The single semantic → color mapping (ADR-0008).
+// The single semantic → color mapping (ADR-0008), colored by the active
+// Theme (ADR-0038): every mapping reads its color from a slot; the
+// attributes (bold/italic/underline) are meaning and stay fixed here.
 // ---------------------------------------------------------------------------
 
+/// The one [`theme::Color`] → ratatui translation, at the presentation
+/// boundary: `ui::theme` never imports ratatui (ADR-0019 invariant), so the
+/// terminal type appears only here.
+fn tui_color(color: theme::Color) -> Color {
+    match color {
+        theme::Color::Black => Color::Black,
+        theme::Color::Red => Color::Red,
+        theme::Color::Green => Color::Green,
+        theme::Color::Yellow => Color::Yellow,
+        theme::Color::Blue => Color::Blue,
+        theme::Color::Magenta => Color::Magenta,
+        theme::Color::Cyan => Color::Cyan,
+        theme::Color::Gray => Color::Gray,
+        theme::Color::DarkGray => Color::DarkGray,
+        theme::Color::LightRed => Color::LightRed,
+        theme::Color::LightGreen => Color::LightGreen,
+        theme::Color::LightYellow => Color::LightYellow,
+        theme::Color::LightBlue => Color::LightBlue,
+        theme::Color::LightMagenta => Color::LightMagenta,
+        theme::Color::LightCyan => Color::LightCyan,
+        theme::Color::White => Color::White,
+        theme::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
 /// The ONE mapping from a semantic [`LineStyle`] to a ratatui [`Style`]
-/// (ADR-0008). Plugins produce styles; this turns them into colors.
-pub fn line_style(style: LineStyle) -> Style {
+/// (ADR-0008). Plugins produce styles; this turns them into the active
+/// Theme's colors.
+pub fn line_style(style: LineStyle, theme: &Theme) -> Style {
     match style {
-        LineStyle::Added => Style::default().fg(Color::Green),
-        LineStyle::Removed => Style::default().fg(Color::Red),
-        LineStyle::Context => Style::default().fg(Color::DarkGray),
+        LineStyle::Added => Style::default().fg(tui_color(theme.added)),
+        LineStyle::Removed => Style::default().fg(tui_color(theme.removed)),
+        LineStyle::Context => Style::default().fg(tui_color(theme.context)),
         LineStyle::Emphasis => Style::default().add_modifier(Modifier::BOLD),
         LineStyle::Muted => Style::default()
-            .fg(Color::DarkGray)
+            .fg(tui_color(theme.muted))
             .add_modifier(Modifier::ITALIC),
         LineStyle::Default => Style::default(),
     }
@@ -53,24 +82,26 @@ pub fn line_style(style: LineStyle) -> Style {
 
 /// The ONE mapping from a semantic markdown [`MdStyle`] to a ratatui [`Style`]
 /// (ADR-0008's move, applied to assistant markdown): [`markdown::to_lines`]
-/// speaks semantics; this is where they become colors.
-pub fn md_style(style: MdStyle) -> Style {
+/// speaks semantics; this is where they become the active Theme's colors.
+pub fn md_style(style: MdStyle, theme: &Theme) -> Style {
     match style {
         MdStyle::Plain => Style::default(),
         MdStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
         MdStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
         MdStyle::BoldItalic => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        MdStyle::Code => Style::default().fg(Color::Yellow),
-        MdStyle::CodeBlock => Style::default().fg(Color::Rgb(185, 215, 180)).bg(CODE_BG),
+        MdStyle::Code => Style::default().fg(tui_color(theme.code)),
+        MdStyle::CodeBlock => Style::default()
+            .fg(tui_color(theme.code_block))
+            .bg(tui_color(theme.code_bg)),
         MdStyle::Heading => Style::default()
-            .fg(Color::Cyan)
+            .fg(tui_color(theme.heading))
             .add_modifier(Modifier::BOLD),
-        MdStyle::Bullet => Style::default().fg(Color::Cyan),
+        MdStyle::Bullet => Style::default().fg(tui_color(theme.bullet)),
         MdStyle::Quote => Style::default()
-            .fg(Color::DarkGray)
+            .fg(tui_color(theme.quote))
             .add_modifier(Modifier::ITALIC),
         MdStyle::Link => Style::default()
-            .fg(Color::Blue)
+            .fg(tui_color(theme.link))
             .add_modifier(Modifier::UNDERLINED),
     }
 }
@@ -80,14 +111,18 @@ pub fn md_style(style: MdStyle) -> Style {
 /// alarms. Segment form (fg ON a bg) because the status bar is a powerline of
 /// colored blocks - the semantics are unchanged, only the presentation moved
 /// from colored text to colored blocks.
-pub fn pressure_style(level: PressureLevel) -> Style {
+pub fn pressure_style(level: PressureLevel, theme: &Theme) -> Style {
     match level {
         PressureLevel::Critical => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Red)
+            .fg(tui_color(theme.pressure_critical_fg))
+            .bg(tui_color(theme.pressure_critical_bg))
             .add_modifier(Modifier::BOLD),
-        PressureLevel::Elevated => Style::default().fg(Color::Black).bg(Color::Yellow),
-        PressureLevel::Ok => Style::default().fg(Color::Gray).bg(SEGMENT_DARK_BG),
+        PressureLevel::Elevated => Style::default()
+            .fg(tui_color(theme.pressure_elevated_fg))
+            .bg(tui_color(theme.pressure_elevated_bg)),
+        PressureLevel::Ok => Style::default()
+            .fg(tui_color(theme.pressure_ok_fg))
+            .bg(tui_color(theme.segment_muted_bg)),
     }
 }
 
@@ -95,36 +130,40 @@ pub fn pressure_style(level: PressureLevel) -> Style {
 /// (ADR-0008: this is the only place segment semantics become colors). Every
 /// segment style carries a bg - the powerline separators are drawn from the
 /// adjacent segments' bgs ([`segment_bg`]).
-pub fn segment_style(kind: SegmentKind) -> Style {
+pub fn segment_style(kind: SegmentKind, theme: &Theme) -> Style {
     match kind {
         SegmentKind::ModeIdle | SegmentKind::Position => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
+            .fg(tui_color(theme.segment_idle_fg))
+            .bg(tui_color(theme.segment_idle_bg))
             .add_modifier(Modifier::BOLD),
         SegmentKind::ModeRunning => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
+            .fg(tui_color(theme.segment_running_fg))
+            .bg(tui_color(theme.segment_running_bg))
             .add_modifier(Modifier::BOLD),
         // Model + Connection are the two connection facts, styled identically.
         SegmentKind::Connection | SegmentKind::Model => Style::default()
-            .fg(Color::Rgb(150, 160, 185))
-            .bg(Color::Rgb(52, 58, 82)),
+            .fg(tui_color(theme.segment_model_fg))
+            .bg(tui_color(theme.segment_model_bg)),
         // Thinking + Tools are the two detail-on-demand toggles, styled alike.
-        SegmentKind::Thinking | SegmentKind::Tools => {
-            Style::default().fg(Color::DarkGray).bg(SEGMENT_DARK_BG)
-        }
+        SegmentKind::Thinking | SegmentKind::Tools => Style::default()
+            .fg(tui_color(theme.segment_toggle_fg))
+            .bg(tui_color(theme.segment_muted_bg)),
         // Cost is a quiet figure: the same muted read as tokens at Ok
         // pressure, without the pressure routing (cost carries no level).
-        SegmentKind::Cost => Style::default().fg(Color::Gray).bg(SEGMENT_DARK_BG),
+        SegmentKind::Cost => Style::default()
+            .fg(tui_color(theme.segment_cost_fg))
+            .bg(tui_color(theme.segment_muted_bg)),
         // Tokens keep the single PressureLevel mapping - segment_style only
         // routes to it, it does not restate the colors.
-        SegmentKind::Tokens(level) => pressure_style(level),
+        SegmentKind::Tokens(level) => pressure_style(level, theme),
     }
 }
 
 /// A segment's background - what the powerline separator glyphs blend with.
-fn segment_bg(kind: SegmentKind) -> Color {
-    segment_style(kind).bg.unwrap_or(BAR_BG)
+fn segment_bg(kind: SegmentKind, theme: &Theme) -> Color {
+    segment_style(kind, theme)
+        .bg
+        .unwrap_or_else(|| tui_color(theme.bar_bg))
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +224,7 @@ pub fn render(
     spinner: u64,
     viewport: &Viewport,
     cache: &mut RenderCache,
+    theme: &Theme,
 ) -> (usize, usize) {
     let area = frame.area();
     // The Composer's one render window (ADR-0034): the draft, the char-index
@@ -211,19 +251,21 @@ pub fn render(
     // The viewport renders FIRST: the status bar's position segment reads the
     // measured geometry (and the Viewport's clamped top) from this frame, not
     // a stale one.
-    let geometry = render_viewport(frame, chunks[0], t, viewport, cache);
-    render_status_bar(frame, chunks[1], t, conn, spinner, viewport, geometry);
-    render_composer(frame, chunks[2], t, &layout);
+    let geometry = render_viewport(frame, chunks[0], t, viewport, cache, theme);
+    render_status_bar(
+        frame, chunks[1], t, conn, spinner, viewport, geometry, theme,
+    );
+    render_composer(frame, chunks[2], t, &layout, theme);
 
     // The Composer overlay (ADR-0032/0033) floats just above the status bar +
     // Composer - an inline popup, a Composer state, not a modal. Drawn after
     // the Composer so it sits on top; skipped entirely when none is open.
     if let Some(overlay) = composer_view.overlay {
-        render_composer_popup(frame, chunks[1].y, area, &overlay);
+        render_composer_popup(frame, chunks[1].y, area, &overlay, theme);
     }
 
     if let Some(pending) = &t.pending_approval {
-        render_approval_modal(frame, area, &pending.command);
+        render_approval_modal(frame, area, &pending.command, theme);
     }
     geometry
 }
@@ -234,10 +276,16 @@ pub fn render(
 /// dimmed. The `Selector`'s `Loading`/`Failed` states draw a single status
 /// line instead of rows. Inline and height-bounded - never the full screen:
 /// the overlay is a Composer state, not a modal.
-fn render_composer_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &OverlayView) {
+fn render_composer_popup(
+    frame: &mut Frame,
+    anchor_y: u16,
+    area: Rect,
+    view: &OverlayView,
+    theme: &Theme,
+) {
     // The lines the popup body holds, plus the title.
     let (title, lines): (&str, Vec<Line>) = match view {
-        OverlayView::Menu { rows, highlight } => ("commands", popup_rows(rows, *highlight)),
+        OverlayView::Menu { rows, highlight } => ("commands", popup_rows(rows, *highlight, theme)),
         OverlayView::Selector {
             status,
             rows,
@@ -249,7 +297,7 @@ fn render_composer_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Ov
                 vec![Line::styled(
                     "loading models…",
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(tui_color(theme.muted))
                         .add_modifier(Modifier::ITALIC),
                 )],
             ),
@@ -257,10 +305,12 @@ fn render_composer_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Ov
                 "models",
                 vec![Line::styled(
                     format!("failed: {msg}"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tui_color(theme.error))
+                        .add_modifier(Modifier::BOLD),
                 )],
             ),
-            OverlayStatus::Ready => ("models", popup_rows(rows, *highlight)),
+            OverlayStatus::Ready => ("models", popup_rows(rows, *highlight, theme)),
         },
     };
 
@@ -282,7 +332,7 @@ fn render_composer_popup(frame: &mut Frame, anchor_y: u16, area: Rect, view: &Ov
     let block = Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(tui_color(theme.popup_border)));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -305,12 +355,12 @@ const POPUP_MAX_ROWS: u16 = 8;
 /// highlighted row is reversed so it reads as the selection. A non-selectable
 /// row (a Provider group header, an "unavailable" note) draws dim bold and is
 /// never reversed - the Selector's cursor cannot land on it.
-fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
+fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line<'static>> {
     if rows.is_empty() {
         return vec![Line::styled(
             "no matches",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(tui_color(theme.muted))
                 .add_modifier(Modifier::ITALIC),
         )];
     }
@@ -321,7 +371,7 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
                 Style::default()
             } else {
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(tui_color(theme.muted))
                     .add_modifier(Modifier::BOLD)
             };
             let mut spans = vec![Span::styled(row.label.clone(), label_style)];
@@ -330,7 +380,7 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize) -> Vec<Line<'static>> {
                 spans.push(Span::styled(
                     hint.clone(),
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(tui_color(theme.muted))
                         .add_modifier(Modifier::ITALIC),
                 ));
             }
@@ -363,6 +413,7 @@ pub fn render_viewport(
     t: &Screen,
     viewport: &Viewport,
     cache: &mut RenderCache,
+    theme: &Theme,
 ) -> (usize, usize) {
     // The rightmost column is ALWAYS the scrollbar gutter, occupied or not:
     // reserving it only when the scrollbar shows would make the wrap width
@@ -378,6 +429,7 @@ pub fn render_viewport(
             tools_expanded: t.tools_expanded,
         },
         text_area.width,
+        theme,
     );
 
     // The live streaming snapshot renders below the settled items: the
@@ -393,7 +445,7 @@ pub fn render_viewport(
                 crate::conversation::tokens_for_chars(thinking.chars().count() as u64)
             ),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(tui_color(theme.thinking))
                 .add_modifier(Modifier::ITALIC),
         )]
     };
@@ -479,6 +531,7 @@ mod render_cache {
     use ratatui::text::Line;
 
     use super::{Toggles, markdown_lines, message_lines, wrapped_count};
+    use crate::ui::theme::{self, Theme};
     use crate::ui::transcript::Transcript;
 
     /// Per-item render state for the transcript viewport, owned by the
@@ -492,6 +545,11 @@ mod render_cache {
         /// changes every affected item's lines, so it clears the cache
         /// wholesale).
         toggles: Toggles,
+        /// The [`Theme`] every cached line was colored with. Cached lines
+        /// BAKE their colors (styled spans, syntect-highlighted code), so a
+        /// theme swap (Stage C's live preview) stales them all: any
+        /// difference clears the cache wholesale, exactly like a resize.
+        theme: Theme,
         /// The store's [`Transcript::revision`] the entries were built at:
         /// while it holds still, the settled items only extend (the store's
         /// prefix contract) and the cache extends with them; when it moves (a
@@ -527,6 +585,7 @@ mod render_cache {
             RenderCache {
                 width: 0,
                 toggles: Toggles::default(),
+                theme: theme::dark().clone(),
                 revision: 0,
                 items: Vec::new(),
                 streaming: None,
@@ -553,17 +612,22 @@ mod render_cache {
         /// wholesale when [`Self::needs_rebuild`] says a key input changed,
         /// then builds entries for the newly appended items only - the
         /// steady-state cost of a frame is zero rebuilt items.
-        pub(super) fn sync(&mut self, t: &Transcript, toggles: Toggles, width: u16) {
-            if self.needs_rebuild(t, toggles, width) {
+        pub(super) fn sync(&mut self, t: &Transcript, toggles: Toggles, width: u16, theme: &Theme) {
+            if self.needs_rebuild(t, toggles, width, theme) {
                 self.items.clear();
                 self.streaming = None;
                 self.width = width;
                 self.toggles = toggles;
+                self.theme = theme.clone();
                 self.revision = t.revision();
             }
             for item in &t.items()[self.items.len()..] {
-                let mut lines =
-                    message_lines(item, toggles.thinking_expanded, toggles.tools_expanded);
+                let mut lines = message_lines(
+                    item,
+                    toggles.thinking_expanded,
+                    toggles.tools_expanded,
+                    theme,
+                );
                 // One trailing blank row per settled item so turns read as
                 // distinct paragraphs rather than one wall. Building it into
                 // the cached lines keeps measurement (`wrapped`) and rendering
@@ -573,7 +637,7 @@ mod render_cache {
                 let wrapped = wrapped_count(lines.clone(), width);
                 self.items.push(CachedItem { lines, wrapped });
             }
-            self.sync_streaming(&t.streaming_text(), width);
+            self.sync_streaming(&t.streaming_text(), width, theme);
         }
 
         /// Whether [`Self::sync`] must clear wholesale instead of extending.
@@ -584,9 +648,16 @@ mod render_cache {
         /// every settled line, so either clears too. The length check is
         /// cheap defense in kind: a store shorter than the cache (a swapped
         /// Transcript whose revision happens to coincide) cannot extend it.
-        fn needs_rebuild(&self, t: &Transcript, toggles: Toggles, width: u16) -> bool {
+        fn needs_rebuild(
+            &self,
+            t: &Transcript,
+            toggles: Toggles,
+            width: u16,
+            theme: &Theme,
+        ) -> bool {
             self.width != width
                 || self.toggles != toggles
+                || self.theme != *theme
                 || self.revision != t.revision()
                 || self.items.len() > t.items().len()
         }
@@ -594,7 +665,7 @@ mod render_cache {
         /// Re-parses the streaming markdown only when its char length moved
         /// (monotonic within a message - see the field doc); drops the entry
         /// when streaming ended so the next message starts from nothing.
-        fn sync_streaming(&mut self, text: &str, width: u16) {
+        fn sync_streaming(&mut self, text: &str, width: u16, theme: &Theme) {
             if text.is_empty() {
                 self.streaming = None;
                 return;
@@ -607,7 +678,7 @@ mod render_cache {
             {
                 return;
             }
-            let lines = markdown_lines(text);
+            let lines = markdown_lines(text, theme);
             let wrapped = wrapped_count(lines.clone(), width);
             self.streaming = Some(CachedStreaming {
                 char_len,
@@ -646,14 +717,14 @@ mod render_cache {
             let mut t = fresh_transcript();
             t.info("first");
             let mut cache = RenderCache::new();
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
 
             // Plant a sentinel in the built entry: an append extends the cache
             // without touching settled entries, so the sentinel must survive
             // the next sync - a rebuild would have replaced it with "first".
             cache.items[0].lines[0] = Line::raw("sentinel");
             t.info("appended");
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 2);
             assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
             assert_eq!(line_text(&cache.items[1].lines[0]), "appended");
@@ -664,7 +735,7 @@ mod render_cache {
             let mut t = fresh_transcript();
             t.steering_queued("check");
             let mut cache = RenderCache::new();
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
             cache.items[0].lines[0] = Line::raw("sentinel");
 
             // The delivered steering removes its pending marker - a structural
@@ -672,7 +743,7 @@ mod render_cache {
             // from scratch: the sentinel is gone and the promoted user line is
             // seen.
             t.steering_delivered("check");
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 1);
             assert_eq!(line_text(&cache.items[0].lines[0]), "› check");
         }
@@ -687,13 +758,13 @@ mod render_cache {
             t.info("first");
             t.info("second");
             let mut cache = RenderCache::new();
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
             cache.items[0].lines[0] = Line::raw("sentinel");
 
             let mut shorter = fresh_transcript();
             shorter.info("replacement");
             assert_eq!(t.revision(), shorter.revision());
-            cache.sync(&shorter, Toggles::default(), 80);
+            cache.sync(&shorter, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 1);
             assert_eq!(line_text(&cache.items[0].lines[0]), "replacement");
         }
@@ -705,7 +776,7 @@ mod render_cache {
             t.message_start();
             t.message_update(vec![ContentBlock::text("in flight")]);
             let mut cache = RenderCache::new();
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
             // The in-flight snapshot lives ONLY in the streaming slot; the
             // settled entries still mirror `Transcript::items` exactly.
             assert_eq!(cache.items.len(), t.items().len());
@@ -717,7 +788,7 @@ mod render_cache {
             // streaming slot empties for the next message.
             cache.items[0].lines[0] = Line::raw("sentinel");
             t.message_end(&[ContentBlock::text("in flight")]);
-            cache.sync(&t, Toggles::default(), 80);
+            cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 2);
             assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
             assert!(cache.streaming.is_none());
@@ -726,7 +797,7 @@ mod render_cache {
         #[test]
         fn streaming_cache_reparses_only_when_the_char_length_moves() {
             let mut cache = RenderCache::new();
-            cache.sync_streaming("hello", 80);
+            cache.sync_streaming("hello", 80, theme::dark());
             assert_eq!(
                 line_text(&cache.streaming.as_ref().unwrap().lines[0]),
                 "hello"
@@ -735,7 +806,7 @@ mod render_cache {
             // Same length, different text: the monotonic-key contract - within
             // a message the snapshot only GROWS, so an equal length means
             // unchanged and the cached lines are reused as-is.
-            cache.sync_streaming("world", 80);
+            cache.sync_streaming("world", 80, theme::dark());
             assert_eq!(
                 line_text(&cache.streaming.as_ref().unwrap().lines[0]),
                 "hello"
@@ -743,12 +814,12 @@ mod render_cache {
 
             // Growth re-parses; the end of streaming clears, so the next
             // message can never collide with a stale entry of the same length.
-            cache.sync_streaming("hello more", 80);
+            cache.sync_streaming("hello more", 80, theme::dark());
             assert_eq!(
                 line_text(&cache.streaming.as_ref().unwrap().lines[0]),
                 "hello more"
             );
-            cache.sync_streaming("", 80);
+            cache.sync_streaming("", 80, theme::dark());
             assert!(cache.streaming.is_none());
         }
     }
@@ -795,8 +866,8 @@ fn visible_window(counts: &[usize], top: usize, height: usize) -> (std::ops::Ran
 /// italic (italic stays reserved for Thinking/Info so those remain
 /// distinguishable). Paired with a two-space indent + "⋯" gutter, it makes
 /// tool machinery recede so the conversation owns the foreground.
-fn machinery_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+fn machinery_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.machinery))
 }
 
 /// The lines one Transcript item renders as. `Block` is the semantic display
@@ -810,6 +881,7 @@ fn message_lines(
     item: &TranscriptItem,
     thinking_expanded: bool,
     tools_expanded: bool,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     // Detail-on-demand collapse (Ctrl-O), keyed on the SEMANTIC fold predicate
     // (Stage 2 review C2 / S1): any item with a `foldable_body` collapses to its
@@ -824,7 +896,7 @@ fn message_lines(
     {
         return vec![Line::styled(
             format!("  ⋯ {title} · ^O expand"),
-            machinery_style(),
+            machinery_style(theme),
         )];
     }
 
@@ -833,7 +905,7 @@ fn message_lines(
         // aligned under it. Multi-line input renders as multiple rows.
         TranscriptItem::User { text } => {
             let gutter = Style::default()
-                .fg(Color::Cyan)
+                .fg(tui_color(theme.prompt_gutter))
                 .add_modifier(Modifier::BOLD);
             text_rows(text)
                 .into_iter()
@@ -847,14 +919,14 @@ fn message_lines(
         // Assistant text is markdown: the pure ui::markdown fold produces
         // semantic lines and [`md_style`] turns them into colors here.
         // Width-wrapping is left to the viewport Paragraph's Wrap.
-        TranscriptItem::Assistant { text } => markdown_lines(text),
+        TranscriptItem::Assistant { text } => markdown_lines(text, theme),
         // Settled Thinking: collapsed is the one-line form; expanded (Ctrl-T)
         // is a header row then the full text, all in the same dim italic. The
         // in-flight "🧠 thinking… (N chars)" streaming indicator is rendered by
         // the viewport and is unaffected by the toggle.
         TranscriptItem::Thinking { text } => {
             let style = Style::default()
-                .fg(Color::DarkGray)
+                .fg(tui_color(theme.thinking))
                 .add_modifier(Modifier::ITALIC);
             if thinking_expanded {
                 let mut out = vec![Line::styled("🧠 thought:", style)];
@@ -877,7 +949,7 @@ fn message_lines(
         // two-space indent, and a quiet "⋯" glyph in place of the loud "⚙".
         TranscriptItem::ToolCall { name, summary, .. } => vec![Line::styled(
             format!("  ⋯ {}", join_summary(name, summary)),
-            machinery_style(),
+            machinery_style(theme),
         )],
         // A merged one-liner (Stage 3): a paired call+result reads
         // `⋯ name  <key_arg> · <result>`; an unpaired result (no live call, so
@@ -889,7 +961,7 @@ fn message_lines(
             key_arg,
         } => vec![Line::styled(
             format!("  ⋯ {}", join_merged(name, key_arg.as_deref(), summary)),
-            machinery_style(),
+            machinery_style(theme),
         )],
         // Errors are the exception that belongs in the foreground: they keep
         // red + bold and the ⚙ gutter, share the two-space indent, and ALWAYS
@@ -916,7 +988,9 @@ fn message_lines(
                     "  ⚙ {} {glyph}{summary}",
                     join_arg(name, key_arg.as_deref())
                 ),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(tui_color(theme.error))
+                    .add_modifier(Modifier::BOLD),
             )]
         }
         // A foldable Block reaches here only EXPANDED (Ctrl-O on) or when it has
@@ -925,11 +999,11 @@ fn message_lines(
         // keep their semantic diff colors (added/removed/context) indented under
         // the gutter.
         TranscriptItem::Block { title, lines } => {
-            let mut out = vec![Line::styled(format!("  ⋯ {title}"), machinery_style())];
+            let mut out = vec![Line::styled(format!("  ⋯ {title}"), machinery_style(theme))];
             // Body rows keep their semantic diff colors (added/removed/context)
             // but sit indented under the gutter.
             out.extend(lines.iter().map(|line| {
-                let styled = block_line(line);
+                let styled = block_line(line, theme);
                 let mut spans = vec![Span::raw("  ")];
                 spans.extend(styled.spans);
                 Line::from(spans)
@@ -938,7 +1012,7 @@ fn message_lines(
         }
         TranscriptItem::Info { text } => {
             let style = Style::default()
-                .fg(Color::DarkGray)
+                .fg(tui_color(theme.muted))
                 .add_modifier(Modifier::ITALIC);
             text_rows(text)
                 .into_iter()
@@ -953,14 +1027,12 @@ fn message_lines(
 // markdown.rs carries only the semantic fact, the fence's language).
 // ---------------------------------------------------------------------------
 
-/// The code block background every code line keeps, highlighted or not.
-const CODE_BG: Color = Color::Rgb(25, 25, 35);
-
-/// The bundled syntax definitions + the one theme we color code with. Lazy:
-/// headless runs that never render pay nothing for `load_defaults`.
+/// The bundled syntax definitions + every bundled syntect theme. Lazy:
+/// headless runs that never render pay nothing for `load_defaults`. All
+/// themes load once; the active Theme's `syntax` slot picks per call.
 struct Highlighter {
     syntaxes: SyntaxSet,
-    theme: Theme,
+    themes: ThemeSet,
 }
 
 static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
@@ -968,25 +1040,37 @@ static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
 fn highlighter() -> &'static Highlighter {
     HIGHLIGHTER.get_or_init(|| Highlighter {
         syntaxes: SyntaxSet::load_defaults_newlines(),
-        theme: ThemeSet::load_defaults().themes["base16-ocean.dark"].clone(),
+        themes: ThemeSet::load_defaults(),
     })
 }
 
 /// One highlighted fragment: the `(r, g, b)` foreground and the text it colors.
 type CodeFragment = ((u8, u8, u8), String);
 
-/// Highlights one code block: per input line, the [`CodeFragment`]s syntect
+/// Highlights one code block with the named bundled syntect theme (the active
+/// Theme's `syntax` slot): per input line, the [`CodeFragment`]s syntect
 /// colors it with - pure data in/out, no ratatui types. `None` when `lang`
 /// resolves to no bundled syntax (caller falls back to the plain
 /// [`MdStyle::CodeBlock`] rendering). Parse state carries across the lines, so
 /// multi-line constructs (block comments, raw strings) color correctly.
-fn highlight_code(lines: &[&str], lang: &str) -> Option<Vec<Vec<CodeFragment>>> {
+/// An unknown `syntax` name falls back to `base16-ocean.dark` - theme parsing
+/// validates names (ADR-0038), so this is belt-and-suspenders, not a path.
+fn highlight_code(
+    lines: &[&str],
+    lang: &str,
+    syntax_theme: &str,
+) -> Option<Vec<Vec<CodeFragment>>> {
     let hl = highlighter();
     // `find_syntax_by_token` matches the syntax name ("rust", "python") AND
     // file extensions ("rs", "py"), case-insensitively - the widest net for
     // fence tags.
     let syntax = hl.syntaxes.find_syntax_by_token(lang)?;
-    let mut state = HighlightLines::new(syntax, &hl.theme);
+    let colors = hl
+        .themes
+        .themes
+        .get(syntax_theme)
+        .unwrap_or(&hl.themes.themes["base16-ocean.dark"]);
+    let mut state = HighlightLines::new(syntax, colors);
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         // The newlines-variant SyntaxSet expects each line `\n`-terminated.
@@ -1012,7 +1096,7 @@ fn highlight_code(lines: &[&str], lang: &str) -> Option<Vec<Vec<CodeFragment>>> 
 /// `code_lang` are highlighted as one block via [`highlight_code`] - syntect
 /// fg over OUR code background; blocks with no/unknown language fall back to
 /// the plain CodeBlock style.
-fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let md_lines = markdown::to_lines(text);
     let mut out = Vec::with_capacity(md_lines.len());
     let mut i = 0;
@@ -1020,7 +1104,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
         let lang = match md_lines[i].code_lang.as_deref() {
             Some(lang) if !lang.is_empty() => lang.to_string(),
             _ => {
-                out.push(plain_md_line(&md_lines[i]));
+                out.push(plain_md_line(&md_lines[i], theme));
                 i += 1;
                 continue;
             }
@@ -1032,7 +1116,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
         let block = &md_lines[i..end];
         let texts: Vec<String> = block.iter().map(md_line_text).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        match highlight_code(&refs, &lang) {
+        match highlight_code(&refs, &lang, &theme.syntax) {
             Some(highlighted) => {
                 for (fragments, text) in highlighted.into_iter().zip(&texts) {
                     if fragments.is_empty() {
@@ -1040,7 +1124,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
                         // bg treatment the plain path gives it.
                         out.push(Line::from(Span::styled(
                             text.clone(),
-                            md_style(MdStyle::CodeBlock),
+                            md_style(MdStyle::CodeBlock, theme),
                         )));
                     } else {
                         out.push(Line::from(
@@ -1049,7 +1133,9 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
                                 .map(|((r, g, b), text)| {
                                     Span::styled(
                                         text,
-                                        Style::default().fg(Color::Rgb(r, g, b)).bg(CODE_BG),
+                                        Style::default()
+                                            .fg(Color::Rgb(r, g, b))
+                                            .bg(tui_color(theme.code_bg)),
                                     )
                                 })
                                 .collect::<Vec<_>>(),
@@ -1058,7 +1144,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
                 }
             }
             // Unknown language: the existing plain CodeBlock rendering.
-            None => out.extend(block.iter().map(plain_md_line)),
+            None => out.extend(block.iter().map(|line| plain_md_line(line, theme))),
         }
         i = end;
     }
@@ -1067,11 +1153,11 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 
 /// One [`MdLine`] rendered the plain way: each span through the single
 /// [`md_style`] mapping.
-fn plain_md_line(line: &MdLine) -> Line<'static> {
+fn plain_md_line(line: &MdLine, theme: &Theme) -> Line<'static> {
     Line::from(
         line.spans
             .iter()
-            .map(|span| Span::styled(span.text.clone(), md_style(span.style)))
+            .map(|span| Span::styled(span.text.clone(), md_style(span.style, theme)))
             .collect::<Vec<_>>(),
     )
 }
@@ -1094,13 +1180,13 @@ fn text_rows(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn block_line(line: &StyledLine) -> Line<'static> {
+fn block_line(line: &StyledLine, theme: &Theme) -> Line<'static> {
     let text = if line.text.is_empty() {
         " ".to_string()
     } else {
         line.text.replace('\t', "  ")
     };
-    Line::styled(text, line_style(line.style))
+    Line::styled(text, line_style(line.style, theme))
 }
 
 /// The running-spinner animation frames (braille), advanced by the adapter's
@@ -1110,14 +1196,6 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // ---------------------------------------------------------------------------
 // The powerline status bar.
 // ---------------------------------------------------------------------------
-
-/// The status bar's base background - what the middle gap and the outermost
-/// separators fade into.
-const BAR_BG: Color = Color::Rgb(30, 30, 40);
-
-/// The shared dark bg of the low-emphasis right-side segments (thinking,
-/// tokens at `Ok` pressure).
-const SEGMENT_DARK_BG: Color = Color::Rgb(40, 44, 58);
 
 /// Powerline separators (Nerd Font): right-pointing after left-side segments,
 /// left-pointing before right-side segments. Drawn fg = the segment's bg over
@@ -1516,6 +1594,7 @@ impl StatusSegment {
 /// segments, in what order, at what [`PressureLevel`]) are decided there; this
 /// turns each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
 /// and [`segment_style`].
+#[allow(clippy::too_many_arguments)] // one painter input per bar fact, like status_bar above
 pub fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
@@ -1524,6 +1603,7 @@ pub fn render_status_bar(
     spinner: u64,
     viewport: &Viewport,
     geometry: (usize, usize),
+    theme: &Theme,
 ) {
     let (total_lines, height) = geometry;
     let position = scroll_position_label(
@@ -1549,36 +1629,43 @@ pub fn render_status_bar(
         position,
     );
 
+    let bar_bg = tui_color(theme.bar_bg);
     let mut spans: Vec<Span> = Vec::new();
     for (i, segment) in bar.left.iter().enumerate() {
         let kind = segment.kind();
-        spans.push(Span::styled(segment.paint(spinner), segment_style(kind)));
+        spans.push(Span::styled(
+            segment.paint(spinner),
+            segment_style(kind, theme),
+        ));
         // The separator wears THIS segment's bg over the NEXT one's (the base
         // bg after the last segment) - that is what draws the triangle.
         let next_bg = bar
             .left
             .get(i + 1)
-            .map(|s| segment_bg(s.kind()))
-            .unwrap_or(BAR_BG);
+            .map(|s| segment_bg(s.kind(), theme))
+            .unwrap_or(bar_bg);
         spans.push(Span::styled(
             SEP_RIGHT,
-            Style::default().fg(segment_bg(kind)).bg(next_bg),
+            Style::default().fg(segment_bg(kind, theme)).bg(next_bg),
         ));
     }
     let gap = (area.width as usize).saturating_sub(bar.cells());
-    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(BAR_BG)));
-    let mut prev_bg = BAR_BG;
+    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(bar_bg)));
+    let mut prev_bg = bar_bg;
     for segment in &bar.right {
         let kind = segment.kind();
         spans.push(Span::styled(
             SEP_LEFT,
-            Style::default().fg(segment_bg(kind)).bg(prev_bg),
+            Style::default().fg(segment_bg(kind, theme)).bg(prev_bg),
         ));
-        spans.push(Span::styled(segment.paint(spinner), segment_style(kind)));
-        prev_bg = segment_bg(kind);
+        spans.push(Span::styled(
+            segment.paint(spinner),
+            segment_style(kind, theme),
+        ));
+        prev_bg = segment_bg(kind, theme);
     }
 
-    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(BAR_BG));
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
     frame.render_widget(bar, area);
 }
 
@@ -1611,14 +1698,20 @@ fn scroll_position_label(top: usize, total_lines: usize, height: usize) -> Strin
 /// the bottom like a terminal. The REAL terminal cursor is placed at the
 /// cursor's cell - except while the Approval modal owns the keyboard, when a
 /// blinking composer cursor would misstate where keys go.
-pub fn render_composer(frame: &mut Frame, area: Rect, t: &Screen, layout: &ComposerLayout) {
+pub fn render_composer(
+    frame: &mut Frame,
+    area: Rect,
+    t: &Screen,
+    layout: &ComposerLayout,
+    theme: &Theme,
+) {
     let visible = area.height as usize;
     if visible == 0 || area.width < 2 {
         return;
     }
     let top = composer::first_visible_row(layout.cursor_row, visible);
     let gutter = Style::default()
-        .fg(Color::Cyan)
+        .fg(tui_color(theme.prompt_gutter))
         .add_modifier(Modifier::BOLD);
     let lines: Vec<Line> = layout
         .rows
@@ -1645,7 +1738,10 @@ pub fn render_composer(frame: &mut Frame, area: Rect, t: &Screen, layout: &Compo
 
 /// The Approval modal for a run_command Tool Call: `y` approves, `n` denies,
 /// `a` approves-always. Key handling lives in the Screen core; this draws it.
-pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str) {
+/// The accents ride existing slots: the command reads as code, and the
+/// yes/no pair takes the added/removed polarity (approve adds the run,
+/// deny removes it); always is the link-blue accent.
+pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str, theme: &Theme) {
     let width = (command.chars().count() as u16 + 8)
         .max(44)
         .min(area.width.saturating_sub(4));
@@ -1662,25 +1758,30 @@ pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str) {
             "Run command?",
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Line::styled(command.to_string(), Style::default().fg(Color::Yellow)),
+        Line::styled(
+            command.to_string(),
+            Style::default().fg(tui_color(theme.code)),
+        ),
         Line::raw(""),
         Line::from(vec![
             Span::styled(
                 "[y]es",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(tui_color(theme.added))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" / "),
             Span::styled(
                 "[n]o",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(tui_color(theme.removed))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" / "),
             Span::styled(
                 "[a]lways",
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(tui_color(theme.link))
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -1692,7 +1793,7 @@ pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str) {
 /// The `--resume` Session Picker: a centered bordered list, one row per
 /// Session (`stamp  label`), the cursor row reversed+bold, and a dim key-hint
 /// footer. Key handling lives in the pure [`Picker`] core; this only draws.
-pub fn render_picker(frame: &mut Frame, picker: &Picker) {
+pub fn render_picker(frame: &mut Frame, picker: &Picker, theme: &Theme) {
     const FOOTER: &str = "↑/↓ select · Enter resume · Esc fresh session · q quit";
 
     let area = frame.area();
@@ -1730,7 +1831,10 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker) {
             Line::styled(format!("{}  {}", entry.stamp, entry.label), style)
         })
         .collect();
-    lines.push(Line::styled(FOOTER, Style::default().fg(Color::DarkGray)));
+    lines.push(Line::styled(
+        FOOTER,
+        Style::default().fg(tui_color(theme.muted)),
+    ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1807,13 +1911,13 @@ mod tests {
 
     #[test]
     fn md_plain_maps_to_the_default_style() {
-        assert_eq!(md_style(MdStyle::Plain), Style::default());
+        assert_eq!(md_style(MdStyle::Plain, theme::dark()), Style::default());
     }
 
     #[test]
     fn md_bold_maps_to_the_bold_modifier() {
         assert_eq!(
-            md_style(MdStyle::Bold),
+            md_style(MdStyle::Bold, theme::dark()),
             Style::default().add_modifier(Modifier::BOLD)
         );
     }
@@ -1821,14 +1925,14 @@ mod tests {
     #[test]
     fn md_italic_maps_to_the_italic_modifier() {
         assert_eq!(
-            md_style(MdStyle::Italic),
+            md_style(MdStyle::Italic, theme::dark()),
             Style::default().add_modifier(Modifier::ITALIC)
         );
     }
 
     #[test]
     fn md_bold_italic_carries_both_modifiers() {
-        let style = md_style(MdStyle::BoldItalic);
+        let style = md_style(MdStyle::BoldItalic, theme::dark());
         assert!(
             style
                 .add_modifier
@@ -1838,42 +1942,196 @@ mod tests {
 
     #[test]
     fn md_inline_code_reads_yellow() {
-        assert_eq!(md_style(MdStyle::Code).fg, Some(Color::Yellow));
+        assert_eq!(
+            md_style(MdStyle::Code, theme::dark()).fg,
+            Some(Color::Yellow)
+        );
     }
 
     #[test]
     fn md_code_block_carries_the_code_background() {
         // The bg is the block treatment every code row keeps, highlighted or
         // not; the fg is the plain-fallback tint syntect replaces when it can.
-        let style = md_style(MdStyle::CodeBlock);
-        assert_eq!(style.bg, Some(CODE_BG));
+        let style = md_style(MdStyle::CodeBlock, theme::dark());
+        assert_eq!(style.bg, Some(tui_color(theme::dark().code_bg)));
         assert!(matches!(style.fg, Some(Color::Rgb(..))));
     }
 
     #[test]
     fn md_heading_reads_bold_cyan() {
-        let style = md_style(MdStyle::Heading);
+        let style = md_style(MdStyle::Heading, theme::dark());
         assert_eq!(style.fg, Some(Color::Cyan));
         assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn md_bullet_reads_cyan() {
-        assert_eq!(md_style(MdStyle::Bullet).fg, Some(Color::Cyan));
+        assert_eq!(
+            md_style(MdStyle::Bullet, theme::dark()).fg,
+            Some(Color::Cyan)
+        );
     }
 
     #[test]
     fn md_quote_reads_dim_italic() {
-        let style = md_style(MdStyle::Quote);
+        let style = md_style(MdStyle::Quote, theme::dark());
         assert_eq!(style.fg, Some(Color::DarkGray));
         assert!(style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
     fn md_link_reads_underlined_blue() {
-        let style = md_style(MdStyle::Link);
+        let style = md_style(MdStyle::Link, theme::dark());
         assert_eq!(style.fg, Some(Color::Blue));
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    // -----------------------------------------------------------------------
+    // Themes (ADR-0038): the mappings read the active Theme's slots. The dark
+    // Theme must render byte-identically to the pre-theme hardcoded palette
+    // (the pinning tests below), and a non-default Theme must actually change
+    // what the mappings produce.
+    // -----------------------------------------------------------------------
+
+    /// A Theme differing from `dark` only in the slots `overrides` states.
+    fn themed(overrides: &str) -> Theme {
+        theme::SparseTheme::parse(overrides)
+            .expect("the test theme parses")
+            .over(theme::dark())
+    }
+
+    #[test]
+    fn theme_colors_translate_one_to_one_to_ratatui() {
+        let pairs: [(theme::Color, Color); 17] = [
+            (theme::Color::Black, Color::Black),
+            (theme::Color::Red, Color::Red),
+            (theme::Color::Green, Color::Green),
+            (theme::Color::Yellow, Color::Yellow),
+            (theme::Color::Blue, Color::Blue),
+            (theme::Color::Magenta, Color::Magenta),
+            (theme::Color::Cyan, Color::Cyan),
+            (theme::Color::Gray, Color::Gray),
+            (theme::Color::DarkGray, Color::DarkGray),
+            (theme::Color::LightRed, Color::LightRed),
+            (theme::Color::LightGreen, Color::LightGreen),
+            (theme::Color::LightYellow, Color::LightYellow),
+            (theme::Color::LightBlue, Color::LightBlue),
+            (theme::Color::LightMagenta, Color::LightMagenta),
+            (theme::Color::LightCyan, Color::LightCyan),
+            (theme::Color::White, Color::White),
+            (theme::Color::Rgb(1, 2, 3), Color::Rgb(1, 2, 3)),
+        ];
+        for (theme_color, expected) in pairs {
+            assert_eq!(tui_color(theme_color), expected, "{theme_color:?}");
+        }
+    }
+
+    #[test]
+    fn dark_line_styles_pin_the_legacy_palette() {
+        let t = theme::dark();
+        assert_eq!(
+            line_style(LineStyle::Added, t),
+            Style::default().fg(Color::Green)
+        );
+        assert_eq!(
+            line_style(LineStyle::Removed, t),
+            Style::default().fg(Color::Red)
+        );
+        assert_eq!(
+            line_style(LineStyle::Context, t),
+            Style::default().fg(Color::DarkGray)
+        );
+        assert_eq!(
+            line_style(LineStyle::Emphasis, t),
+            Style::default().add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            line_style(LineStyle::Muted, t),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
+        );
+        assert_eq!(line_style(LineStyle::Default, t), Style::default());
+    }
+
+    #[test]
+    fn dark_pressure_styles_pin_the_legacy_palette() {
+        let t = theme::dark();
+        assert_eq!(
+            pressure_style(PressureLevel::Critical, t),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            pressure_style(PressureLevel::Elevated, t),
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        );
+        assert_eq!(
+            pressure_style(PressureLevel::Ok, t),
+            Style::default().fg(Color::Gray).bg(Color::Rgb(40, 44, 58))
+        );
+    }
+
+    #[test]
+    fn dark_segment_styles_pin_the_legacy_palette() {
+        let t = theme::dark();
+        let bold = |fg, bg| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+        let plain = |fg, bg| Style::default().fg(fg).bg(bg);
+        assert_eq!(
+            segment_style(SegmentKind::ModeIdle, t),
+            bold(Color::Black, Color::Green)
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Position, t),
+            bold(Color::Black, Color::Green)
+        );
+        assert_eq!(
+            segment_style(SegmentKind::ModeRunning, t),
+            bold(Color::Black, Color::Yellow)
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Connection, t),
+            plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Model, t),
+            plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Thinking, t),
+            plain(Color::DarkGray, Color::Rgb(40, 44, 58))
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Tools, t),
+            plain(Color::DarkGray, Color::Rgb(40, 44, 58))
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Cost, t),
+            plain(Color::Gray, Color::Rgb(40, 44, 58))
+        );
+        assert_eq!(
+            segment_style(SegmentKind::Tokens(PressureLevel::Critical), t),
+            pressure_style(PressureLevel::Critical, t)
+        );
+        // The ex-constants, now slots: the code, bar, and quiet-segment
+        // backgrounds keep their exact legacy values under dark.
+        assert_eq!(tui_color(t.code_bg), Color::Rgb(25, 25, 35));
+        assert_eq!(tui_color(t.bar_bg), Color::Rgb(30, 30, 40));
+        assert_eq!(tui_color(t.segment_muted_bg), Color::Rgb(40, 44, 58));
+    }
+
+    #[test]
+    fn a_non_default_theme_recolors_the_mappings() {
+        let t = themed("[colors]\nadded = \"#123456\"\nheading = \"magenta\"\n");
+        assert_eq!(
+            line_style(LineStyle::Added, &t).fg,
+            Some(Color::Rgb(0x12, 0x34, 0x56))
+        );
+        assert_eq!(md_style(MdStyle::Heading, &t).fg, Some(Color::Magenta));
+        // Unstated slots still read the dark floor.
+        assert_eq!(line_style(LineStyle::Removed, &t).fg, Some(Color::Red));
     }
 
     // -----------------------------------------------------------------------
@@ -1883,7 +2141,7 @@ mod tests {
 
     #[test]
     fn markdown_lines_styles_prose_spans_through_md_style() {
-        let lines = markdown_lines("plain **bold** text");
+        let lines = markdown_lines("plain **bold** text", theme::dark());
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "plain bold text");
         let bold = lines[0]
@@ -1891,12 +2149,12 @@ mod tests {
             .iter()
             .find(|s| s.content.as_ref() == "bold")
             .expect("the bold span");
-        assert_eq!(bold.style, md_style(MdStyle::Bold));
+        assert_eq!(bold.style, md_style(MdStyle::Bold, theme::dark()));
     }
 
     #[test]
     fn a_known_language_fence_is_highlighted_over_the_code_background() {
-        let lines = markdown_lines("```rust\nlet x = 1;\n```");
+        let lines = markdown_lines("```rust\nlet x = 1;\n```", theme::dark());
         let code = lines
             .iter()
             .find(|l| line_text(l) == "let x = 1;")
@@ -1905,37 +2163,43 @@ mod tests {
         // its own syntect fg.
         assert!(code.spans.len() > 1, "syntect splits the line");
         for span in &code.spans {
-            assert_eq!(span.style.bg, Some(CODE_BG));
+            assert_eq!(span.style.bg, Some(tui_color(theme::dark().code_bg)));
             assert!(matches!(span.style.fg, Some(Color::Rgb(..))));
         }
     }
 
     #[test]
     fn an_unknown_language_fence_falls_back_to_the_plain_code_block_style() {
-        let lines = markdown_lines("```notareallanguage\nsome code\n```");
+        let lines = markdown_lines("```notareallanguage\nsome code\n```", theme::dark());
         let code = lines
             .iter()
             .find(|l| line_text(l) == "some code")
             .expect("the code line");
         assert_eq!(code.spans.len(), 1);
-        assert_eq!(code.spans[0].style, md_style(MdStyle::CodeBlock));
+        assert_eq!(
+            code.spans[0].style,
+            md_style(MdStyle::CodeBlock, theme::dark())
+        );
     }
 
     #[test]
     fn a_bare_fence_with_no_language_renders_the_plain_code_block_style() {
         // A bare ``` fence carries `Some("")` - an empty lang must route to
         // the plain path, never to syntect.
-        let lines = markdown_lines("```\nunlabeled code\n```");
+        let lines = markdown_lines("```\nunlabeled code\n```", theme::dark());
         let code = lines
             .iter()
             .find(|l| line_text(l) == "unlabeled code")
             .expect("the code line");
-        assert_eq!(code.spans[0].style, md_style(MdStyle::CodeBlock));
+        assert_eq!(
+            code.spans[0].style,
+            md_style(MdStyle::CodeBlock, theme::dark())
+        );
     }
 
     #[test]
     fn a_blank_line_inside_a_highlighted_fence_keeps_the_code_background() {
-        let lines = markdown_lines("```rust\nlet a = 1;\n\nlet b = 2;\n```");
+        let lines = markdown_lines("```rust\nlet a = 1;\n\nlet b = 2;\n```", theme::dark());
         let a_idx = lines
             .iter()
             .position(|l| line_text(l) == "let a = 1;")
@@ -1944,17 +2208,23 @@ mod tests {
         // so it takes the plain CodeBlock treatment - same bg, no hole.
         let blank = &lines[a_idx + 1];
         assert_eq!(line_text(blank), "");
-        assert_eq!(blank.spans[0].style, md_style(MdStyle::CodeBlock));
+        assert_eq!(
+            blank.spans[0].style,
+            md_style(MdStyle::CodeBlock, theme::dark())
+        );
     }
 
     #[test]
     fn prose_after_a_fence_returns_to_the_plain_path() {
-        let lines = markdown_lines("```rust\nlet x = 1;\n```\n\nafter the fence");
+        let lines = markdown_lines("```rust\nlet x = 1;\n```\n\nafter the fence", theme::dark());
         let after = lines
             .iter()
             .find(|l| line_text(l) == "after the fence")
             .expect("the prose line");
-        assert_eq!(after.spans[0].style, md_style(MdStyle::Plain));
+        assert_eq!(
+            after.spans[0].style,
+            md_style(MdStyle::Plain, theme::dark())
+        );
     }
 
     /// The color of the first fragment whose text contains `needle`.
@@ -1971,30 +2241,46 @@ mod tests {
     fn highlight_code_colors_keywords_differently_from_string_literals() {
         // Syntect fragments the literal (quotes vs contents); the contents
         // fragment is what must differ from the `fn` keyword.
-        let lines = highlight_code(&["fn main() { let s = \"hi\"; }"], "rust").unwrap();
+        let lines = highlight_code(
+            &["fn main() { let s = \"hi\"; }"],
+            "rust",
+            "base16-ocean.dark",
+        )
+        .unwrap();
         assert_ne!(color_of(&lines, "fn"), color_of(&lines, "hi"));
     }
 
     #[test]
     fn highlight_code_resolves_extension_tokens_too() {
         // `find_syntax_by_token` matches extensions, not just names.
-        assert!(highlight_code(&["let x = 1;"], "rs").is_some());
-        assert!(highlight_code(&["x = 1"], "py").is_some());
+        assert!(highlight_code(&["let x = 1;"], "rs", "base16-ocean.dark").is_some());
+        assert!(highlight_code(&["x = 1"], "py", "base16-ocean.dark").is_some());
     }
 
     #[test]
     fn highlight_code_returns_none_for_an_unknown_lang() {
-        assert_eq!(highlight_code(&["whatever"], "notareallanguage"), None);
+        assert_eq!(
+            highlight_code(&["whatever"], "notareallanguage", "base16-ocean.dark"),
+            None
+        );
     }
 
     #[test]
     fn highlight_code_on_empty_input_is_some_empty() {
-        assert_eq!(highlight_code(&[], "rust"), Some(vec![]));
+        assert_eq!(
+            highlight_code(&[], "rust", "base16-ocean.dark"),
+            Some(vec![])
+        );
     }
 
     #[test]
     fn highlight_code_blank_line_yields_no_fragments() {
-        let lines = highlight_code(&["let a = 1;", "", "let b = 2;"], "rust").unwrap();
+        let lines = highlight_code(
+            &["let a = 1;", "", "let b = 2;"],
+            "rust",
+            "base16-ocean.dark",
+        )
+        .unwrap();
         assert_eq!(lines.len(), 3);
         assert!(lines[1].is_empty());
         assert!(!lines[0].is_empty() && !lines[2].is_empty());
@@ -2003,8 +2289,12 @@ mod tests {
     #[test]
     fn highlight_code_carries_parse_state_across_lines() {
         // A block comment opened on line 1 must color line 2 as comment, not code.
-        let lines =
-            highlight_code(&["/* comment", "still comment */", "let x = 1;"], "rust").unwrap();
+        let lines = highlight_code(
+            &["/* comment", "still comment */", "let x = 1;"],
+            "rust",
+            "base16-ocean.dark",
+        )
+        .unwrap();
         let comment = color_of(&lines[..1], "comment");
         assert_eq!(color_of(&lines[1..2], "still comment"), comment);
         assert_ne!(color_of(&lines[2..], "let"), comment);
@@ -2013,9 +2303,39 @@ mod tests {
     #[test]
     fn highlight_code_preserves_the_line_text_verbatim() {
         let source = "fn add(a: u32, b: u32) -> u32 { a + b }";
-        let lines = highlight_code(&[source], "rust").unwrap();
+        let lines = highlight_code(&[source], "rust", "base16-ocean.dark").unwrap();
         let joined: String = lines[0].iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(joined, source);
+    }
+
+    #[test]
+    fn highlighting_follows_the_named_syntax_theme() {
+        // The Theme's `syntax` slot picks the syntect theme: the same code
+        // colors differently under a dark and a light bundled theme.
+        let dark = highlight_code(&["let x = 1;"], "rust", "base16-ocean.dark").unwrap();
+        let light = highlight_code(&["let x = 1;"], "rust", "InspiredGitHub").unwrap();
+        assert_ne!(dark, light, "two syntax themes color differently");
+        // An unknown name falls back to the default rather than panicking
+        // (unreachable through Theme parsing, which validates names).
+        let fallback = highlight_code(&["let x = 1;"], "rust", "no-such-theme").unwrap();
+        assert_eq!(fallback, dark);
+    }
+
+    #[test]
+    fn markdown_code_highlights_with_the_themes_syntax_slot() {
+        // End to end through markdown_lines: a Theme naming a different
+        // bundled syntect theme recolors the fence's spans.
+        let fence = "```rust\nlet x = 1;\n```";
+        let span_fgs = |t: &Theme| -> Vec<Option<Color>> {
+            markdown_lines(fence, t)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.style.fg))
+                .collect()
+        };
+        assert_ne!(
+            span_fgs(theme::dark()),
+            span_fgs(&themed("syntax = \"InspiredGitHub\"\n"))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2536,7 +2856,10 @@ mod tests {
             SegmentKind::Tokens(PressureLevel::Critical),
             SegmentKind::Position,
         ] {
-            assert!(segment_style(kind).bg.is_some(), "{kind:?} has no bg");
+            assert!(
+                segment_style(kind, theme::dark()).bg.is_some(),
+                "{kind:?} has no bg"
+            );
         }
     }
 
@@ -2611,7 +2934,7 @@ mod tests {
         // below the "› " gutter row and splits it: 3 rows.
         t.user("0123456789012345");
         let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 10);
+        cache.sync(&t, Toggles::default(), 10, theme::dark());
         assert_eq!(cache.settled().count(), 1);
         // 3 wrapped rows + 1 trailing inter-turn blank separator.
         assert_eq!(cache.settled().next().unwrap().1, 4);
@@ -2622,11 +2945,11 @@ mod tests {
         let mut t = fresh_transcript();
         t.user("0123456789012345");
         let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80);
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
         // 1 content row + 1 trailing inter-turn blank separator.
         let wide = cache.settled().next().unwrap().1;
         assert_eq!(wide, 2);
-        cache.sync(&t, Toggles::default(), 10); // resize: every wrapped count is stale
+        cache.sync(&t, Toggles::default(), 10, theme::dark()); // resize: every wrapped count is stale
         assert!(cache.settled().next().unwrap().1 > wide);
     }
 
@@ -2637,7 +2960,7 @@ mod tests {
             text: "line one\nline two".to_string(),
         });
         let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80);
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
         // Collapsed one-liner + 1 trailing inter-turn blank separator.
         assert_eq!(cache.settled().next().unwrap().0.len(), 2);
         cache.sync(
@@ -2647,6 +2970,7 @@ mod tests {
                 ..Toggles::default()
             },
             80,
+            theme::dark(),
         );
         // Header + both rows + 1 trailing inter-turn blank separator.
         assert_eq!(cache.settled().next().unwrap().0.len(), 4);
@@ -2667,7 +2991,7 @@ mod tests {
             ],
         });
         let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80);
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
         // Collapsed one-liner + 1 trailing inter-turn blank separator.
         let collapsed = cache.settled().next().unwrap().0;
         assert_eq!(collapsed.len(), 2);
@@ -2682,11 +3006,63 @@ mod tests {
                 ..Toggles::default()
             },
             80,
+            theme::dark(),
         );
         // Title row + both body rows + 1 trailing inter-turn blank separator.
         let expanded = cache.settled().next().unwrap().0;
         assert_eq!(expanded.len(), 4);
         assert_eq!(line_text(&expanded[0]), "  ⋯ edit_file src/foo.rs");
+    }
+
+    /// Every fg across the cache's first settled item, in order: each line's
+    /// own style fg (styled Lines carry their color there), then its spans'.
+    fn settled_span_fgs(cache: &RenderCache) -> Vec<Option<Color>> {
+        cache
+            .settled()
+            .next()
+            .expect("one settled item")
+            .0
+            .iter()
+            .flat_map(|l| std::iter::once(l.style.fg).chain(l.spans.iter().map(|s| s.style.fg)))
+            .collect()
+    }
+
+    #[test]
+    fn cache_sync_rebuilds_when_the_theme_changes() {
+        // Cached lines BAKE their colors, so a Theme swap (Stage C's live
+        // preview) must clear the cache: after syncing with a Theme that
+        // recolors `muted`, the settled info line carries the new color.
+        let mut t = fresh_transcript();
+        t.info("a notice");
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
+        assert_eq!(settled_span_fgs(&cache)[0], Some(Color::DarkGray));
+
+        let recolored = themed("[colors]\nmuted = \"#ff00ff\"\n");
+        cache.sync(&t, Toggles::default(), 80, &recolored);
+        assert_eq!(settled_span_fgs(&cache)[0], Some(Color::Rgb(255, 0, 255)));
+    }
+
+    #[test]
+    fn cache_sync_repaints_highlighted_code_on_a_syntax_theme_swap() {
+        // The stale-highlight hazard: syntect colors are baked into cached
+        // spans, so a Theme differing only in its `syntax` slot must also
+        // rebuild - the swap may not serve the old code colors.
+        let mut t = fresh_transcript();
+        t.push(TranscriptItem::Assistant {
+            text: "```rust\nlet x = 1;\n```".to_string(),
+        });
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
+        let dark_colors = settled_span_fgs(&cache);
+
+        let light_syntax = themed("syntax = \"InspiredGitHub\"\n");
+        cache.sync(&t, Toggles::default(), 80, &light_syntax);
+        assert_ne!(
+            settled_span_fgs(&cache),
+            dark_colors,
+            "the swap repainted the cached code block"
+        );
     }
 
     // --- Stage 3: merged one-liners + semantic fold ------------------------
@@ -2699,7 +3075,7 @@ mod tests {
             is_error: false,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false);
+        let lines = message_lines(&item, false, false, theme::dark());
         assert_eq!(lines.len(), 1);
         assert_eq!(
             line_text(&lines[0]),
@@ -2716,7 +3092,7 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let lines = message_lines(&item, false, false);
+        let lines = message_lines(&item, false, false, theme::dark());
         assert_eq!(line_text(&lines[0]), "  ⋯ run_command → injected");
     }
 
@@ -2730,7 +3106,7 @@ mod tests {
             is_error: true,
             key_arg: Some("cargo test".to_string()),
         };
-        let lines = message_lines(&item, false, false);
+        let lines = message_lines(&item, false, false, theme::dark());
         assert_eq!(line_text(&lines[0]), "  ⚙ run_command  cargo test ✗ exit 1");
     }
 
@@ -2745,7 +3121,7 @@ mod tests {
             is_error: true,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false);
+        let lines = message_lines(&item, false, false, theme::dark());
         assert_eq!(
             line_text(&lines[0]),
             "  ⚙ edit_file  src/foo.rs ✗ old_str not found"
@@ -2763,7 +3139,7 @@ mod tests {
                 is_error: true,
                 key_arg: None,
             };
-            let lines = message_lines(&item, false, false);
+            let lines = message_lines(&item, false, false, theme::dark());
             assert_eq!(line_text(&lines[0]), format!("  ⚙ run_command {badge}"));
         }
     }
@@ -2807,14 +3183,14 @@ mod tests {
             ],
         };
         // Collapsed (tools_expanded = false): one title line with the affordance.
-        let collapsed = message_lines(&block, false, false);
+        let collapsed = message_lines(&block, false, false, theme::dark());
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]),
             "  ⋯ edit_file src/foo.rs (+1 -1) · ^O expand"
         );
         // Expanded: title + both body rows.
-        let expanded = message_lines(&block, false, true);
+        let expanded = message_lines(&block, false, true, theme::dark());
         assert_eq!(expanded.len(), 3);
     }
 
@@ -2852,6 +3228,7 @@ mod tests {
                     ..Toggles::default()
                 },
                 width,
+                theme::dark(),
             );
             cache.settled().map(|(_, wrapped)| wrapped).sum()
         };
@@ -2900,11 +3277,11 @@ mod tests {
         for width in [10u16, 24, 80] {
             let per_item: usize = items
                 .iter()
-                .map(|item| wrapped_count(message_lines(item, false, false), width))
+                .map(|item| wrapped_count(message_lines(item, false, false, theme::dark()), width))
                 .sum();
             let whole: Vec<Line> = items
                 .iter()
-                .flat_map(|item| message_lines(item, false, false))
+                .flat_map(|item| message_lines(item, false, false, theme::dark()))
                 .collect();
             assert_eq!(per_item, wrapped_count(whole, width), "width {width}");
         }
@@ -2961,7 +3338,9 @@ mod tests {
             ],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
         let text = buffer_text(&terminal);
         assert!(text.contains(" commands "), "bordered title:\n{text}");
         assert!(text.contains("/model"));
@@ -2978,7 +3357,9 @@ mod tests {
             ],
             highlight: 1,
         };
-        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
         // Geometry: 2 body rows + borders = height 4, anchored above row 10,
         // so the body sits at rows 7-8; the popup is inset one column and the
         // border one more, so row text starts at x = 2.
@@ -3007,7 +3388,9 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
         assert!(buffer_text(&terminal).contains("no matches"));
     }
 
@@ -3019,7 +3402,9 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
         let text = buffer_text(&terminal);
         assert!(text.contains(" models "), "selector title:\n{text}");
         assert!(text.contains("loading models…"));
@@ -3033,7 +3418,9 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
         assert!(buffer_text(&terminal).contains("failed: connection refused"));
     }
 
@@ -3048,7 +3435,9 @@ mod tests {
             ],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| render_composer_popup(f, 10, f.area(), &view));
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
         let text = buffer_text(&terminal);
         assert!(text.contains(" models "));
         assert!(text.contains("qwen/qwen3-30b"));
@@ -3068,7 +3457,9 @@ mod tests {
             rows,
             highlight: 19,
         };
-        let terminal = draw_frame(40, 14, |f| render_composer_popup(f, 12, f.area(), &view));
+        let terminal = draw_frame(40, 14, |f| {
+            render_composer_popup(f, 12, f.area(), &view, theme::dark())
+        });
         let text = buffer_text(&terminal);
         assert!(text.contains("model-19"), "highlight scrolled into view");
         assert!(!text.contains("model-00"), "the top rows scrolled out");
@@ -3090,7 +3481,7 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         let terminal = draw_frame(80, 20, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
         });
         let text = buffer_text(&terminal);
         assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
@@ -3114,7 +3505,7 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         let terminal = draw_frame(40, 8, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
         });
         let (total_lines, height) = geometry;
         assert!(total_lines > height, "the content overflows");
@@ -3145,7 +3536,7 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
         });
         let text = buffer_text(&terminal);
         // The in-flight indicator is the one-liner with a token estimate -
@@ -3166,7 +3557,7 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache);
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
         });
         assert!(buffer_text(&terminal).contains("a streaming reply"));
     }
