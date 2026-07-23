@@ -25,6 +25,7 @@
 //! [`Failure`] recorded. It reads only the Artifacts riding the `:tool_result`
 //! event and does no IO.
 
+pub mod condense;
 pub mod diff;
 pub mod run_command;
 
@@ -229,9 +230,10 @@ pub fn normalize(entry: impl Into<PluginSpec>) -> PluginSpec {
 /// instances, in registration order. Each name maps to its plugin
 /// implementation ([`build`]); an unknown name is skipped (it cannot be
 /// registered, so it has no effect and cannot fail a stage). This is the
-/// production registry: the shipped config resolves `["diff", "run_command"]`
-/// into the Diff plugin and the run_command exit-badge plugin, so the live app
-/// runs the Turn/Presentment pipeline with both.
+/// production registry: the shipped config resolves
+/// `["diff", "run_command", "condense"]` into the Diff plugin, the run_command
+/// exit-badge plugin, and the condense noise-collapse plugin, so the live app
+/// runs the Turn/Presentment pipeline with all three.
 pub fn configured(names: &[String]) -> Vec<Registered> {
     names
         .iter()
@@ -251,6 +253,11 @@ fn build(spec: &PluginSpec) -> Option<Registered> {
         "run_command" => Some(Registered::new(
             "run_command",
             Box::new(run_command::RunCommand),
+            spec.opts.clone(),
+        )),
+        "condense" => Some(Registered::new(
+            "condense",
+            Box::new(condense::Condense),
             spec.opts.clone(),
         )),
         _ => None,

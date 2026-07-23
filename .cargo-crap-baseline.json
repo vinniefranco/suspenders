@@ -2469,7 +2469,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "PluginSpec::bare",
-      "line": 192,
+      "line": 193,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2477,7 +2477,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "PluginSpec::from",
-      "line": 209,
+      "line": 210,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2485,7 +2485,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "PluginSpec::from",
-      "line": 215,
+      "line": 216,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2493,7 +2493,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "PluginSpec::with_opts",
-      "line": 200,
+      "line": 201,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2501,7 +2501,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "Registered::new",
-      "line": 52,
+      "line": 53,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2509,15 +2509,15 @@
     {
       "file": "./src/plugins.rs",
       "function": "build",
-      "line": 244,
-      "cyclomatic": 4.0,
-      "coverage": 72.72727272727273,
-      "crap": 4.324567993989482
+      "line": 246,
+      "cyclomatic": 5.0,
+      "coverage": 80.0,
+      "crap": 5.2
     },
     {
       "file": "./src/plugins.rs",
       "function": "configured",
-      "line": 235,
+      "line": 237,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2525,7 +2525,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "execute",
-      "line": 102,
+      "line": 103,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -2533,7 +2533,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "normalize",
-      "line": 224,
+      "line": 225,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -2541,7 +2541,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "panic_message",
-      "line": 296,
+      "line": 303,
       "cyclomatic": 3.0,
       "coverage": 50.0,
       "crap": 4.125
@@ -2549,7 +2549,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "pre_run",
-      "line": 84,
+      "line": 85,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -2557,7 +2557,7 @@
     {
       "file": "./src/plugins.rs",
       "function": "present",
-      "line": 147,
+      "line": 148,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -2565,7 +2565,55 @@
     {
       "file": "./src/plugins.rs",
       "function": "stage",
-      "line": 265,
+      "line": 272,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/plugins/condense.rs",
+      "function": "Condense::post_run",
+      "line": 65,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/plugins/condense.rs",
+      "function": "NoiseClass::label",
+      "line": 53,
+      "cyclomatic": 3.0,
+      "coverage": 100.0,
+      "crap": 3.0
+    },
+    {
+      "file": "./src/plugins/condense.rs",
+      "function": "classify",
+      "line": 78,
+      "cyclomatic": 5.0,
+      "coverage": 100.0,
+      "crap": 5.0
+    },
+    {
+      "file": "./src/plugins/condense.rs",
+      "function": "condense",
+      "line": 96,
+      "cyclomatic": 2.0,
+      "coverage": 100.0,
+      "crap": 2.0
+    },
+    {
+      "file": "./src/plugins/condense.rs",
+      "function": "emit_run",
+      "line": 125,
+      "cyclomatic": 2.0,
+      "coverage": 100.0,
+      "crap": 2.0
+    },
+    {
+      "file": "./src/plugins/condense.rs",
+      "function": "run_end",
+      "line": 115,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -4325,7 +4373,7 @@
     {
       "file": "./src/tools/run_command.rs",
       "function": "RunCommand::run",
-      "line": 46,
+      "line": 47,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -4341,7 +4389,7 @@
     {
       "file": "./src/tools/run_command.rs",
       "function": "parse_exit_code",
-      "line": 155,
+      "line": 156,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -4349,7 +4397,7 @@
     {
       "file": "./src/tools/run_command.rs",
       "function": "parse_timed_out",
-      "line": 164,
+      "line": 165,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -4357,7 +4405,7 @@
     {
       "file": "./src/tools/run_command.rs",
       "function": "report",
-      "line": 139,
+      "line": 140,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -4365,7 +4413,7 @@
     {
       "file": "./src/tools/run_command.rs",
       "function": "spawn_and_wait",
-      "line": 67,
+      "line": 68,
       "cyclomatic": 8.0,
       "coverage": 84.375,
       "crap": 8.244140625
@@ -4373,7 +4421,7 @@
     {
       "file": "./src/tools/run_command.rs",
       "function": "spawn_and_wait",
-      "line": 131,
+      "line": 132,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7813,7 +7861,7 @@
     {
       "file": "./src/voice.rs",
       "function": "anchor",
-      "line": 128,
+      "line": 129,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7821,7 +7869,7 @@
     {
       "file": "./src/voice.rs",
       "function": "anchor_elision_marker",
-      "line": 151,
+      "line": 152,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7829,7 +7877,7 @@
     {
       "file": "./src/voice.rs",
       "function": "command_denied",
-      "line": 93,
+      "line": 94,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7837,7 +7885,7 @@
     {
       "file": "./src/voice.rs",
       "function": "compaction_facts",
-      "line": 492,
+      "line": 493,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7845,7 +7893,7 @@
     {
       "file": "./src/voice.rs",
       "function": "compaction_prompt",
-      "line": 477,
+      "line": 478,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7853,7 +7901,7 @@
     {
       "file": "./src/voice.rs",
       "function": "describe_categories",
-      "line": 345,
+      "line": 346,
       "cyclomatic": 6.0,
       "coverage": 72.72727272727273,
       "crap": 6.730277986476334
@@ -7861,7 +7909,7 @@
     {
       "file": "./src/voice.rs",
       "function": "describe_category",
-      "line": 330,
+      "line": 331,
       "cyclomatic": 9.0,
       "coverage": 50.0,
       "crap": 19.125
@@ -7869,7 +7917,7 @@
     {
       "file": "./src/voice.rs",
       "function": "duplicate_call_nudge",
-      "line": 166,
+      "line": 167,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7877,7 +7925,7 @@
     {
       "file": "./src/voice.rs",
       "function": "elision_marker",
-      "line": 54,
+      "line": 55,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7885,7 +7933,7 @@
     {
       "file": "./src/voice.rs",
       "function": "empty_response_marker",
-      "line": 255,
+      "line": 256,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7893,7 +7941,7 @@
     {
       "file": "./src/voice.rs",
       "function": "empty_response_nudge",
-      "line": 272,
+      "line": 273,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7901,7 +7949,7 @@
     {
       "file": "./src/voice.rs",
       "function": "explore_nudge",
-      "line": 278,
+      "line": 279,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7909,7 +7957,7 @@
     {
       "file": "./src/voice.rs",
       "function": "failure_nudge",
-      "line": 309,
+      "line": 310,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -7917,7 +7965,7 @@
     {
       "file": "./src/voice.rs",
       "function": "file_list",
-      "line": 501,
+      "line": 502,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -7925,7 +7973,7 @@
     {
       "file": "./src/voice.rs",
       "function": "final_pass_prompt",
-      "line": 218,
+      "line": 219,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7933,7 +7981,7 @@
     {
       "file": "./src/voice.rs",
       "function": "handoff_no_narrative",
-      "line": 198,
+      "line": 199,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7941,7 +7989,7 @@
     {
       "file": "./src/voice.rs",
       "function": "handoff_verification",
-      "line": 191,
+      "line": 192,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7949,7 +7997,7 @@
     {
       "file": "./src/voice.rs",
       "function": "is_anchor",
-      "line": 156,
+      "line": 157,
       "cyclomatic": 4.0,
       "coverage": 100.0,
       "crap": 4.0
@@ -7957,7 +8005,7 @@
     {
       "file": "./src/voice.rs",
       "function": "is_write_input_husk",
-      "line": 75,
+      "line": 76,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7965,7 +8013,7 @@
     {
       "file": "./src/voice.rs",
       "function": "malformed_input",
-      "line": 367,
+      "line": 368,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7973,7 +8021,7 @@
     {
       "file": "./src/voice.rs",
       "function": "omitted_middle",
-      "line": 388,
+      "line": 389,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7981,7 +8029,7 @@
     {
       "file": "./src/voice.rs",
       "function": "orphaned_call_answer",
-      "line": 232,
+      "line": 233,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7989,7 +8037,7 @@
     {
       "file": "./src/voice.rs",
       "function": "plan_confirmation",
-      "line": 120,
+      "line": 121,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -7997,7 +8045,7 @@
     {
       "file": "./src/voice.rs",
       "function": "recovery_prompt",
-      "line": 180,
+      "line": 181,
       "cyclomatic": 2.0,
       "coverage": 100.0,
       "crap": 2.0
@@ -8005,7 +8053,7 @@
     {
       "file": "./src/voice.rs",
       "function": "scout_empty_findings",
-      "line": 433,
+      "line": 434,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8013,7 +8061,7 @@
     {
       "file": "./src/voice.rs",
       "function": "scout_llm_error",
-      "line": 428,
+      "line": 429,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8021,7 +8069,7 @@
     {
       "file": "./src/voice.rs",
       "function": "scout_pass_cap",
-      "line": 443,
+      "line": 444,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8029,7 +8077,7 @@
     {
       "file": "./src/voice.rs",
       "function": "scout_report_now",
-      "line": 438,
+      "line": 439,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8037,7 +8085,7 @@
     {
       "file": "./src/voice.rs",
       "function": "scout_system_prompt",
-      "line": 423,
+      "line": 424,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8045,7 +8093,7 @@
     {
       "file": "./src/voice.rs",
       "function": "scout_tool_refusal",
-      "line": 111,
+      "line": 112,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8053,7 +8101,7 @@
     {
       "file": "./src/voice.rs",
       "function": "serialize_for_compaction",
-      "line": 527,
+      "line": 528,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
@@ -8061,7 +8109,7 @@
     {
       "file": "./src/voice.rs",
       "function": "serialize_message",
-      "line": 539,
+      "line": 540,
       "cyclomatic": 3.0,
       "coverage": 90.9090909090909,
       "crap": 3.006761833208114
@@ -8069,7 +8117,7 @@
     {
       "file": "./src/voice.rs",
       "function": "stale_plan_line",
-      "line": 142,
+      "line": 143,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8077,7 +8125,7 @@
     {
       "file": "./src/voice.rs",
       "function": "summary_block",
-      "line": 516,
+      "line": 517,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8085,7 +8133,7 @@
     {
       "file": "./src/voice.rs",
       "function": "superseded_command_marker",
-      "line": 82,
+      "line": 83,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8093,7 +8141,7 @@
     {
       "file": "./src/voice.rs",
       "function": "superseded_read_marker",
-      "line": 88,
+      "line": 89,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8101,7 +8149,7 @@
     {
       "file": "./src/voice.rs",
       "function": "system_prompt",
-      "line": 49,
+      "line": 50,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8109,7 +8157,7 @@
     {
       "file": "./src/voice.rs",
       "function": "tool_error_marker",
-      "line": 240,
+      "line": 241,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8117,7 +8165,7 @@
     {
       "file": "./src/voice.rs",
       "function": "tool_not_offered",
-      "line": 101,
+      "line": 102,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8125,7 +8173,7 @@
     {
       "file": "./src/voice.rs",
       "function": "truncate_for_serialization",
-      "line": 576,
+      "line": 577,
       "cyclomatic": 2.0,
       "coverage": 60.0,
       "crap": 2.2560000000000002
@@ -8133,7 +8181,7 @@
     {
       "file": "./src/voice.rs",
       "function": "truncated_call_nudge",
-      "line": 224,
+      "line": 225,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8141,7 +8189,7 @@
     {
       "file": "./src/voice.rs",
       "function": "truncated_file",
-      "line": 379,
+      "line": 380,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8149,7 +8197,7 @@
     {
       "file": "./src/voice.rs",
       "function": "truncated_output",
-      "line": 373,
+      "line": 374,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8157,7 +8205,7 @@
     {
       "file": "./src/voice.rs",
       "function": "truncation_marker",
-      "line": 250,
+      "line": 251,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8165,7 +8213,7 @@
     {
       "file": "./src/voice.rs",
       "function": "turn_cancelled_marker",
-      "line": 283,
+      "line": 284,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8173,7 +8221,7 @@
     {
       "file": "./src/voice.rs",
       "function": "turn_failed_marker",
-      "line": 288,
+      "line": 289,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8181,7 +8229,7 @@
     {
       "file": "./src/voice.rs",
       "function": "turn_limit_marker",
-      "line": 171,
+      "line": 172,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8189,7 +8237,7 @@
     {
       "file": "./src/voice.rs",
       "function": "turn_stopped_marker",
-      "line": 245,
+      "line": 246,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8197,7 +8245,7 @@
     {
       "file": "./src/voice.rs",
       "function": "verification_pass_prompt",
-      "line": 212,
+      "line": 213,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8205,7 +8253,7 @@
     {
       "file": "./src/voice.rs",
       "function": "verify_failed_nudge",
-      "line": 266,
+      "line": 267,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8213,7 +8261,7 @@
     {
       "file": "./src/voice.rs",
       "function": "verify_nudge",
-      "line": 260,
+      "line": 261,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8221,7 +8269,7 @@
     {
       "file": "./src/voice.rs",
       "function": "wrap_up_warning",
-      "line": 204,
+      "line": 205,
       "cyclomatic": 1.0,
       "coverage": 100.0,
       "crap": 1.0
@@ -8229,7 +8277,7 @@
     {
       "file": "./src/voice.rs",
       "function": "write_input_husk",
-      "line": 66,
+      "line": 67,
       "cyclomatic": 3.0,
       "coverage": 100.0,
       "crap": 3.0
