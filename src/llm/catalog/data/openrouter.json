@@ -722,8 +722,9 @@
       "max_tokens": 131072,
       "reasoning": false,
       "cost": {
-        "input": 0.1,
-        "output": 0.3
+        "input": 0.08,
+        "output": 0.45,
+        "cache_read": 0.04
       }
     },
     {
@@ -818,6 +819,17 @@
         "input": 0.01,
         "output": 0.03,
         "cache_read": 0.002
+      }
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash:free",
+      "name": "Ling-3.0-flash (free)",
+      "context_window": 262144,
+      "max_tokens": 32768,
+      "reasoning": true,
+      "cost": {
+        "input": 0.0,
+        "output": 0.0
       }
     },
     {
@@ -966,9 +978,8 @@
       "max_tokens": 131072,
       "reasoning": true,
       "cost": {
-        "input": 0.3,
-        "output": 1.2,
-        "cache_read": 0.03
+        "input": 0.255,
+        "output": 1.02
       }
     },
     {
@@ -2569,11 +2580,11 @@
       "id": "qwen/qwen3.5-27b",
       "name": "Qwen3.5 27B",
       "context_window": 262144,
-      "max_tokens": 81920,
+      "max_tokens": 65536,
       "reasoning": true,
       "cost": {
-        "input": 0.26,
-        "output": 2.6
+        "input": 0.195,
+        "output": 1.56
       }
     },
     {
@@ -3054,9 +3065,9 @@
       "max_tokens": 131072,
       "reasoning": true,
       "cost": {
-        "input": 0.7756,
-        "output": 2.4376,
-        "cache_read": 0.14404
+        "input": 0.8036,
+        "output": 2.5256,
+        "cache_read": 0.14924
       }
     },
     {
