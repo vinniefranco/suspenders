@@ -28,8 +28,9 @@ pub struct Provider {
     pub context_window: Option<u64>,
     /// Whether this Provider came from the config `providers` table (custom)
     /// rather than the Catalog. Custom Providers discover their models live
-    /// (`GET {base_url}/models`, ADR-0037); built-ins list from the Catalog
-    /// and only when their credential resolved.
+    /// (`GET {base_url}/models`, ADR-0037); built-ins list from the Catalog,
+    /// shown unavailable with the environment key to set when their
+    /// credential did not resolve.
     pub custom: bool,
 }
 

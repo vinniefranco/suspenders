@@ -18,7 +18,7 @@ The Model the next Turn will call, named by a scoped identifier - `provider/mode
 _Avoid_: current model, model connection (retired with the single-connection era; the Provider owns the endpoint and credential, the Active Model is the mutable choice of which Model to call).
 
 **Provider**:
-A host that serves models: an identifier, a base URL, a credential, and the Api its Models speak. Built-in Providers (anthropic, openai, …) come from the Catalog and need only their environment key; custom Providers (a local LM Studio, a private proxy) are declared in config and discover their Models live via the host's models endpoint. Part of the Session's fixed facts.
+A host that serves models: an identifier, a base URL, a credential, and the Api its Models speak. Built-in Providers (anthropic, openai, …) come from the Catalog and need only their environment key; custom Providers (a local LM Studio, a private proxy) are declared in config and discover their Models live via the host's models endpoint. Part of the Session's fixed facts. A Provider the user cannot yet call never vanishes from the selector - it appears unavailable, naming the environment key that would enable it.
 _Avoid_: backend, vendor, connection (the retired single-connection term)
 
 **Api**:

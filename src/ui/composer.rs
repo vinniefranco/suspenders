@@ -66,7 +66,7 @@ use crate::event::Event;
 use crate::ui::draft;
 use crate::ui::history::History;
 use crate::ui::screen::{AgentCommand, Effect, Key, Status, UngatedKey};
-use crate::ui::selector::{Selector, SelectorOutcome, SelectorRow};
+use crate::ui::selector::{FilteredRow, Selector, SelectorOutcome, SelectorRow};
 use crate::ui::slash;
 
 /// How the Composer answered an offered key (first refusal, ADR-0034).
@@ -143,10 +143,11 @@ struct CommandSelector {
 /// adapter matches once. `Menu` is the Slash Command palette (`rest = None`):
 /// the registry filtered by the command token. `Selector` is the
 /// committed-command sub-state (`rest = Some`): the overlay `status` plus,
-/// when `Ready`, the rows filtered by the draft `rest` and the highlighted
-/// index into that filtered view. A new overlay kind (a history search, a
-/// path-completion popup) is a new variant here plus a render arm - never a
-/// fold-root change.
+/// when `Ready`, the rows filtered by the draft `rest` (a note whose group's
+/// collapsed reveal was capped carries the "· N more" count merged into its
+/// hint) and the highlighted index into that filtered view. A new overlay
+/// kind (a history search, a path-completion popup) is a new variant here
+/// plus a render arm - never a fold-root change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayView {
     Menu {
@@ -630,11 +631,30 @@ impl Composer {
         let SelectorStatus::Ready(sel) = &cs.status else {
             return None;
         };
-        let row = sel.filtered(&rest).into_iter().nth(sel.highlight(&rest))?;
+        let row = sel
+            .filtered(&rest)
+            .into_iter()
+            .nth(sel.highlight(&rest))?
+            .row;
         Some((cs.command.as_str(), row))
     }
 
     // ---- Internals ---------------------------------------------------------
+
+    // The overlay's own copy of a filtered row: the reveal cap's truncation
+    // count, when present, joins the note's hint here ("set X_API_KEY · 266
+    // more"), so the seam stays a plain row list and the render layer draws
+    // one dimmed string.
+    fn overlay_row(f: FilteredRow<'_>) -> SelectorRow {
+        let mut row = f.row.clone();
+        if let Some(more) = f.overflow {
+            row.hint = Some(match row.hint.take() {
+                Some(hint) => format!("{hint} · {more} more"),
+                None => format!("{more} more"),
+            });
+        }
+        row
+    }
 
     // The open overlay, derived from the draft (the one filter) and the
     // owned selector state.
@@ -651,13 +671,17 @@ impl Composer {
                 Some(cs) => match &cs.status {
                     SelectorStatus::Ready(sel) => {
                         // The highlight is the Selector's own snapped cursor
-                        // (clamped into the filtered view, off any header row)
-                        // so what renders reversed is what Enter would pick.
+                        // (clamped into the filtered view, onto a cursor
+                        // stop) so what renders reversed is where the cursor
+                        // really is.
                         let highlight = sel.highlight(&rest);
                         (
                             cs.command.clone(),
                             OverlayStatus::Ready,
-                            sel.filtered(&rest).into_iter().cloned().collect(),
+                            sel.filtered(&rest)
+                                .into_iter()
+                                .map(Self::overlay_row)
+                                .collect(),
                             highlight,
                         )
                     }
@@ -1270,6 +1294,35 @@ mod tests {
                 assert_eq!(rows, vec![model_row("qwen")], "only 'qwen' contains 'q'");
             }
             other => panic!("expected filtered selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_capped_reveals_note_hint_carries_the_overflow_count() {
+        // A greyed group with more matches than the reveal cap: the overlay's
+        // note row reads "set OPENROUTER_API_KEY · 3 more", so the user sees
+        // how much of the catalog the cap held back.
+        use crate::ui::selector::COLLAPSED_REVEAL_CAP;
+        let mut rows = vec![SelectorRow::header("openrouter")];
+        rows.extend(
+            (0..COLLAPSED_REVEAL_CAP + 3)
+                .map(|i| SelectorRow::collapsed(format!("openrouter/m{i}"))),
+        );
+        rows.push(SelectorRow::note(
+            "  unavailable",
+            Some("set OPENROUTER_API_KEY".into()),
+        ));
+        let mut c = model_selector_ready(rows);
+        press(&mut c, typed("openrouter"));
+        match overlay(&c) {
+            Some(OverlayView::Selector { rows, .. }) => {
+                let note = rows.last().expect("the note trails the group");
+                assert_eq!(
+                    note.hint.as_deref(),
+                    Some("set OPENROUTER_API_KEY · 3 more")
+                );
+            }
+            other => panic!("expected a Ready selector, got {other:?}"),
         }
     }
 

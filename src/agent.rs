@@ -215,10 +215,12 @@ pub enum Command {
     ActiveModel(oneshot::Sender<String>),
     /// List every Provider's models for the `/model` selector (ADR-0033,
     /// ADR-0037): custom Providers by live `GET /models` discovery, built-ins
-    /// from the Catalog when their credential resolved. The fetch runs OFF
-    /// the actor (a spawned task over clones) so the network never blocks the
-    /// actor loop; the oneshot carries [`llm::offerings`]' result.
-    ListModels(oneshot::Sender<Result<Vec<ProviderModels>, String>>),
+    /// from the Catalog, credential-less built-ins marked unavailable with
+    /// the environment key to set. The fetch runs OFF the actor (a spawned
+    /// task over clones) so the network never blocks the actor loop; the
+    /// oneshot carries [`llm::offerings`]' listings, which always come back
+    /// whole - a failed discovery is its group's unreachable note.
+    ListModels(oneshot::Sender<Vec<ProviderModels>>),
     Approve(String, Decision, oneshot::Sender<()>),
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
@@ -413,14 +415,16 @@ impl AgentHandle {
 
     /// Lists every Provider's models for the `/model` selector (ADR-0033,
     /// ADR-0037), grouped by Provider: custom Providers by live discovery,
-    /// built-ins from the Catalog when their credential resolved. The Agent -
+    /// built-ins from the Catalog, credentialed or not. The Agent -
     /// the owner of the `Llm` and the Session's Provider set - fetches off its
-    /// actor loop; this awaits the reply. A dead Agent (or a dropped reply)
-    /// surfaces as `Err`, matching the boundary's fallible shape.
+    /// actor loop; this awaits the reply. The listings themselves always come
+    /// back whole (a down host is its group's unreachable note), so the one
+    /// `Err` left - what the selector's Failed state shows - is a dead Agent
+    /// or a dropped reply.
     pub async fn list_models(&self) -> Result<Vec<ProviderModels>, String> {
         self.query(Command::ListModels)
             .await
-            .unwrap_or_else(|| Err("agent unavailable".to_string()))
+            .ok_or_else(|| "agent unavailable".to_string())
     }
 
     /// Resolves a pending run_command Approval (baud's `approve/3`).
@@ -701,12 +705,9 @@ fn swap_active_model(state: &mut AgentState, scoped: &str) -> Result<(), String>
 // The ListModels fetch, OFF the actor (ADR-0011/0017: never block the actor
 // loop on the network). Clone the boundary and the Session's fixed Provider
 // set, then answer the oneshot from the spawned task: `llm::offerings` walks
-// every Provider - live discovery for customs, the Catalog for credentialed
-// built-ins (ADR-0037).
-fn spawn_list_models(
-    state: &AgentState,
-    reply: oneshot::Sender<Result<Vec<ProviderModels>, String>>,
-) {
+// every Provider - live discovery for customs, the Catalog for built-ins
+// (ADR-0037).
+fn spawn_list_models(state: &AgentState, reply: oneshot::Sender<Vec<ProviderModels>>) {
     let llm = Arc::clone(&state.llm);
     let providers = state.session.providers.clone();
     tokio::spawn(async move {

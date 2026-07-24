@@ -215,28 +215,54 @@ pub trait Llm: Send + Sync {
 }
 
 /// One Provider's offering for the `/model` selector (ADR-0037): the Provider
-/// id and its bare model ids. The UI scopes them (`provider/model-id`) when it
-/// builds rows, keeping the wire's bare ids at the boundary. A configured
-/// Provider that lists nothing does not vanish: `unavailable` carries the
-/// terse reason (`unreachable` for a failed discovery, `no models` for an
-/// empty listing) the selector shows under the Provider's header.
+/// id, its PICKABLE bare model ids, and its [`Availability`]. The UI scopes
+/// the ids (`provider/model-id`) when it builds rows, keeping the wire's bare
+/// ids at the boundary. A configured Provider that lists nothing pickable
+/// does not vanish: `availability` states why, as a fact the UI turns into
+/// display strings, not a pre-rendered reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderModels {
     pub provider: String,
     pub models: Vec<String>,
-    pub unavailable: Option<String>,
+    pub availability: Availability,
+}
+
+/// Why a configured Provider's listing holds what it holds - a fact, not a
+/// display string (the RescueState precedent: the boundary states what
+/// happened, the UI derives what to show).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Availability {
+    /// The listing's models are live and pickable.
+    Available,
+    /// Live discovery failed (host down, non-2xx, unparseable body).
+    Unreachable,
+    /// The host (or the Catalog) answered with no models.
+    NoModels,
+    /// A built-in whose credential did not resolve: a configuration fact,
+    /// never a discovery failure. `env` names the keys (any one suffices)
+    /// whose export would open the door; `catalog` carries the Catalog's
+    /// model ids so the selector can show them greyed - what one export
+    /// would unlock - without letting them count as listed.
+    MissingCredential {
+        env: Vec<String>,
+        catalog: Vec<String>,
+    },
 }
 
 impl ProviderModels {
     /// A listing from the ids a Provider offered; empty means the host (or
-    /// the Catalog) answered with no models, marked unavailable so the
-    /// selector never drops a configured Provider silently.
+    /// the Catalog) answered with no models, marked so the selector never
+    /// drops a configured Provider silently.
     fn listed(provider: &str, models: Vec<String>) -> Self {
-        let unavailable = models.is_empty().then(|| "no models".to_string());
+        let availability = if models.is_empty() {
+            Availability::NoModels
+        } else {
+            Availability::Available
+        };
         ProviderModels {
             provider: provider.to_string(),
             models,
-            unavailable,
+            availability,
         }
     }
 
@@ -246,7 +272,19 @@ impl ProviderModels {
         ProviderModels {
             provider: provider.to_string(),
             models: Vec::new(),
-            unavailable: Some("unreachable".to_string()),
+            availability: Availability::Unreachable,
+        }
+    }
+
+    /// A listing for a built-in Provider whose credential did not resolve:
+    /// nothing pickable, the environment keys and the Catalog's ids riding in
+    /// the availability - the selector shows the way in rather than a
+    /// mystery gap.
+    fn missing_credential(provider: &str, env: Vec<String>, catalog: Vec<String>) -> Self {
+        ProviderModels {
+            provider: provider.to_string(),
+            models: Vec::new(),
+            availability: Availability::MissingCredential { env, catalog },
         }
     }
 }
@@ -254,39 +292,46 @@ impl ProviderModels {
 /// Lists every Provider's models for the `/model` selector, grouped by
 /// Provider in set order (ADR-0037): custom Providers by live discovery
 /// ([`Llm::list_models`], the ADR-0002 amendment machinery, now across every
-/// configured custom Provider), built-in Providers from the Catalog - and only
-/// when their credential resolved, because a Provider the user cannot call
-/// does not belong in the selector. A custom Provider whose discovery fails
-/// (and any Provider whose listing is empty) still appears, marked
-/// unavailable, so a down host is visible rather than silently missing; when
-/// nothing listed at all, the collected failure reasons come back as the
-/// `Err` the selector surfaces instead.
-pub async fn offerings(
-    llm: &dyn Llm,
-    providers: &[Provider],
-) -> Result<Vec<ProviderModels>, String> {
+/// configured custom Provider), built-in Providers from the Catalog. A
+/// built-in whose credential did not resolve still appears - nothing
+/// pickable, its [`Availability::MissingCredential`] carrying the environment
+/// keys to set and the Catalog's ids for the selector's greyed preview -
+/// because a Provider the user could call with one export deserves a
+/// signpost, not a silent gap. A custom Provider whose discovery fails (and
+/// any Provider whose listing is empty) likewise appears marked, so a down
+/// host is visible rather than silently missing. The listings ALWAYS come
+/// back whole: a failed discovery IS its group's unreachable note, never an
+/// error that swallows the other Providers' signposts - even with every
+/// discovery down and no credential set, the selector shows what exists and
+/// how to reach it. (The `/model` overlay's Failed state remains for the one
+/// failure with no listings to show: the Agent itself gone - see
+/// `Agent::list_models`.)
+pub async fn offerings(llm: &dyn Llm, providers: &[Provider]) -> Vec<ProviderModels> {
     let mut listings: Vec<ProviderModels> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
     for p in providers {
         if p.custom {
             match llm.list_models(p).await {
                 Ok(models) => listings.push(ProviderModels::listed(&p.id, models)),
-                Err(reason) => {
-                    failures.push(format!("{}: {reason}", p.id));
-                    listings.push(ProviderModels::unreachable(&p.id));
-                }
+                Err(_) => listings.push(ProviderModels::unreachable(&p.id)),
             }
         } else if !p.token.is_empty() {
             let models = catalog::provider(&p.id)
                 .map(|c| c.models.iter().map(|m| m.id.clone()).collect())
                 .unwrap_or_default();
             listings.push(ProviderModels::listed(&p.id, models));
+        } else {
+            let (env, catalog) = catalog::provider(&p.id)
+                .map(|c| {
+                    (
+                        c.env.clone(),
+                        c.models.iter().map(|m| m.id.clone()).collect(),
+                    )
+                })
+                .unwrap_or_default();
+            listings.push(ProviderModels::missing_credential(&p.id, env, catalog));
         }
     }
-    if listings.iter().all(|l| l.models.is_empty()) && !failures.is_empty() {
-        return Err(failures.join("; "));
-    }
-    Ok(listings)
+    listings
 }
 
 /// The production boundary (ADR-0037): holds the Session's resolved Provider
@@ -414,7 +459,7 @@ mod tests {
             builtin("anthropic", "sk-test"),
         ];
 
-        let listings = offerings(&fake, &providers).await.unwrap();
+        let listings = offerings(&fake, &providers).await;
         assert_eq!(listings.len(), 2, "grouped by Provider, in set order");
         assert_eq!(listings[0].provider, "local");
         assert_eq!(listings[0].models, vec!["m1".to_string(), "m2".to_string()]);
@@ -426,29 +471,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offerings_skips_builtins_without_a_resolved_credential() {
+    async fn offerings_marks_a_builtin_without_a_credential_with_env_keys_and_its_catalog() {
         use crate::test_support::FakeLlm;
 
-        // No custom Providers, no credentials: an empty, error-free listing -
-        // the user configured nothing callable, which is not a fetch failure.
+        // A built-in whose environment key is unset does not vanish from the
+        // selector: nothing pickable, its availability naming the keys to
+        // export and carrying the Catalog's ids for the greyed preview. Not
+        // a failure, so the listing is error-free.
         let fake = FakeLlm::script(std::iter::empty());
         let providers = vec![builtin("anthropic", "")];
-        assert_eq!(offerings(&fake, &providers).await, Ok(vec![]));
+        let listings = offerings(&fake, &providers).await;
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].provider, "anthropic");
+        assert_eq!(listings[0].models, Vec::<String>::new());
+        let Availability::MissingCredential { env, catalog } = &listings[0].availability else {
+            panic!(
+                "expected MissingCredential, got {:?}",
+                listings[0].availability
+            );
+        };
+        assert_eq!(env, &vec!["ANTHROPIC_API_KEY".to_string()]);
+        assert!(
+            catalog.iter().any(|m| m == "claude-fable-5"),
+            "the Catalog's ids ride along for the greyed rows: {catalog:?}"
+        );
     }
 
     #[tokio::test]
-    async fn offerings_with_every_discovery_failed_and_nothing_else_is_err() {
+    async fn offerings_with_every_discovery_failed_still_lists_every_signpost() {
         use crate::test_support::FakeLlm;
 
+        // The worst morning: the one custom host down, no credential set
+        // anywhere. The listings still come back whole - the down host as
+        // its unreachable note, every built-in as its env-key signpost -
+        // because an error screen here would hide the very map (what exists,
+        // which key to export) the user needs to get out.
         let fake =
             FakeLlm::script(std::iter::empty()).with_models(vec![Err("refused".to_string())]);
         let providers = vec![
             provider("local", Api::AnthropicMessages),
             builtin("anthropic", ""),
+            builtin("openrouter", ""),
         ];
-        let err = offerings(&fake, &providers).await.unwrap_err();
-        assert!(err.contains("local"), "names the Provider: {err}");
-        assert!(err.contains("refused"), "carries the reason: {err}");
+        let listings = offerings(&fake, &providers).await;
+        assert_eq!(listings.len(), 3, "nothing vanishes");
+        assert_eq!(listings[0].provider, "local");
+        assert_eq!(listings[0].availability, Availability::Unreachable);
+        for listing in &listings[1..] {
+            assert!(
+                matches!(listing.availability, Availability::MissingCredential { .. }),
+                "{} keeps its signpost",
+                listing.provider
+            );
+        }
     }
 
     #[tokio::test]
@@ -464,14 +539,14 @@ mod tests {
             provider("a-local", Api::AnthropicMessages),
             provider("b-local", Api::AnthropicMessages),
         ];
-        let listings = offerings(&fake, &providers).await.unwrap();
+        let listings = offerings(&fake, &providers).await;
         assert_eq!(listings.len(), 2);
         assert_eq!(listings[0].provider, "a-local");
         assert_eq!(listings[0].models, Vec::<String>::new());
-        assert_eq!(listings[0].unavailable.as_deref(), Some("unreachable"));
+        assert_eq!(listings[0].availability, Availability::Unreachable);
         assert_eq!(listings[1].provider, "b-local");
         assert_eq!(listings[1].models, vec!["m1".to_string()]);
-        assert_eq!(listings[1].unavailable, None);
+        assert_eq!(listings[1].availability, Availability::Available);
     }
 
     #[tokio::test]
@@ -482,9 +557,9 @@ mod tests {
         // unusable - visible as unavailable, not dropped.
         let fake = FakeLlm::script(std::iter::empty()).with_models(vec![Ok(vec![])]);
         let providers = vec![provider("local", Api::AnthropicMessages)];
-        let listings = offerings(&fake, &providers).await.unwrap();
+        let listings = offerings(&fake, &providers).await;
         assert_eq!(listings.len(), 1);
-        assert_eq!(listings[0].unavailable.as_deref(), Some("no models"));
+        assert_eq!(listings[0].availability, Availability::NoModels);
     }
 
     // ------------------------------------------------------------------

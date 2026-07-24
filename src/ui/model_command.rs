@@ -2,10 +2,11 @@
 //! adapter (ADR-0033, ADR-0037, ADR-0001's pure-core/adapter split).
 //!
 //! `/model` lists every Provider's models grouped by Provider - custom
-//! Providers by live discovery, built-ins from the Catalog when their
-//! credential resolved - lets the user pick one scoped id, swaps the Active
-//! Model live this Session, and persists the choice sticky for the next
-//! launch. The DECISIONS - rows are scoped ids grouped by Provider,
+//! Providers by live discovery, built-ins from the Catalog, a credential-less
+//! built-in greyed out with the key to set and its Catalog collapsed until a
+//! filter matches - lets the user pick one scoped id, swaps the Active Model
+//! live this Session, and persists the choice sticky for the next launch.
+//! The DECISIONS - rows are scoped ids grouped by Provider,
 //! re-selecting the current model is a no-op, an `SUSPENDERS_MODEL` env value
 //! shadows the sticky write, a persist failure is surfaced but the live swap
 //! still stands - live in the pure parts ([`model_rows`], [`pick`],
@@ -17,7 +18,7 @@
 //! [`super::command`].
 
 use crate::event::Event;
-use crate::llm::ProviderModels;
+use crate::llm::{Availability, ProviderModels};
 use crate::session::{SessionConfig, SessionError};
 use crate::ui::AdapterCtx;
 use crate::ui::selector::SelectorRow;
@@ -53,21 +54,48 @@ pub fn applied_line(
 }
 
 /// The `listings -> rows` builder for `/model`'s selector (ADR-0037): each
-/// Provider's models sit under a non-selectable header row naming the
-/// Provider, one selectable row per model - its value AND label the scoped
+/// Provider's models sit under a header row naming the Provider, one
+/// pickable row per model - its value AND label the scoped
 /// `provider/model-id` - grouped in the listing's order (the Session's set
-/// order), the currently-Active Model marked "(current)". A Provider that
-/// lists nothing (discovery failed, empty Catalog listing) shows a
-/// non-selectable "unavailable" note carrying the boundary's terse reason
-/// instead of vanishing. Scoping happens here - the boundary lists bare ids
-/// per Provider - so a pick is a ready-to-apply scoped id, and the Selector's
-/// own skip rule keeps headers and notes unpickable.
+/// order), the currently-Active Model marked "(current)". A Provider whose
+/// [`Availability`] is not `Available` shows an "unavailable" note instead
+/// of vanishing - the display string derived HERE from the boundary's fact.
+/// A missing-credential built-in additionally gets one collapsed row per
+/// Catalog model, scoped like any pickable row, so filtering for a model
+/// name reveals the greyed row - and ITS note trails the collapsed rows,
+/// because the popup window ends at the highlight: the note is the cursor
+/// stop that pulls the whole capped reveal into view. Unreachable and
+/// no-models notes sit right under their headers (nothing collapsed to
+/// anchor). Scoping happens here - the boundary lists bare ids per
+/// Provider - so a pick is a ready-to-apply scoped id, and the Selector's
+/// own role rules keep headers, notes, and collapsed rows unpickable.
 fn model_rows(listings: &[ProviderModels], current: &str) -> Vec<SelectorRow> {
     let mut rows = Vec::new();
     for listing in listings {
-        rows.push(SelectorRow::header(&listing.provider, None));
-        if let Some(reason) = &listing.unavailable {
-            rows.push(SelectorRow::header("  unavailable", Some(reason.clone())));
+        rows.push(SelectorRow::header(&listing.provider));
+        match &listing.availability {
+            Availability::Available => {}
+            Availability::Unreachable => {
+                rows.push(SelectorRow::note(
+                    "  unavailable",
+                    Some("unreachable".to_string()),
+                ));
+            }
+            Availability::NoModels => {
+                rows.push(SelectorRow::note(
+                    "  unavailable",
+                    Some("no models".to_string()),
+                ));
+            }
+            Availability::MissingCredential { env, catalog } => {
+                for id in catalog {
+                    rows.push(SelectorRow::collapsed(format!("{}/{id}", listing.provider)));
+                }
+                rows.push(SelectorRow::note(
+                    "  unavailable",
+                    Some(format!("set {}", env.join(" or "))),
+                ));
+            }
         }
         for id in &listing.models {
             let scoped = format!("{}/{id}", listing.provider);
@@ -80,8 +108,8 @@ fn model_rows(listings: &[ProviderModels], current: &str) -> Vec<SelectorRow> {
 
 /// Populates `/model`'s selector (ADR-0033, ADR-0037). ALWAYS a live fetch:
 /// the Agent's `list_models` walks the Session's whole Provider set - live
-/// `GET /models` discovery per custom Provider, the Catalog for credentialed
-/// built-ins. The fetch spawns a task that awaits it OFF the select loop
+/// `GET /models` discovery per custom Provider, the Catalog for built-ins.
+/// The fetch spawns a task that awaits it OFF the select loop
 /// (ADR-0011) - on success it posts SelectorReady, on failure SelectorFailed -
 /// through `ctx.selector_tx`; the injected event arrives at the loop's
 /// `selector_rx` arm and flips the Loading overlay. The overlay stays Loading
@@ -174,11 +202,13 @@ mod tests {
 
     // --- model_rows (the multi-Provider selector rows, ADR-0037) ------------
 
+    use crate::ui::selector::RowRole;
+
     fn listing(provider: &str, models: &[&str]) -> ProviderModels {
         ProviderModels {
             provider: provider.into(),
             models: models.iter().map(|m| m.to_string()).collect(),
-            unavailable: None,
+            availability: Availability::Available,
         }
     }
 
@@ -204,11 +234,11 @@ mod tests {
         );
         // Headers are unpickable; model rows are pickable and their values
         // ARE the scoped ids - a pick needs no re-scoping.
-        let selectable: Vec<bool> = rows.iter().map(|r| r.selectable).collect();
-        assert_eq!(selectable, vec![false, true, false, true, true]);
+        let pickable: Vec<bool> = rows.iter().map(|r| r.pickable()).collect();
+        assert_eq!(pickable, vec![false, true, false, true, true]);
         assert!(
             rows.iter()
-                .filter(|r| r.selectable)
+                .filter(|r| r.pickable())
                 .all(|r| r.value == r.label)
         );
     }
@@ -229,30 +259,87 @@ mod tests {
 
     #[test]
     fn an_unavailable_provider_shows_a_note_under_its_header() {
-        // A down custom host (or a credentialed built-in with an empty
-        // Catalog listing) no longer vanishes: its header stays, with a
-        // non-selectable note carrying the boundary's terse reason.
+        // A down custom host no longer vanishes: its header stays, with a
+        // note whose hint is derived from the boundary's availability fact -
+        // right under the header, since nothing collapsed needs anchoring.
         let rows = model_rows(
             &[ProviderModels {
                 provider: "local".into(),
                 models: vec![],
-                unavailable: Some("unreachable".into()),
+                availability: Availability::Unreachable,
             }],
             "anthropic/claude-fable-5",
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "local");
+        assert_eq!(rows[0].role, RowRole::Header);
         assert_eq!(rows[1].label, "  unavailable");
+        assert_eq!(rows[1].role, RowRole::Note);
         assert_eq!(rows[1].hint.as_deref(), Some("unreachable"));
-        assert!(rows.iter().all(|r| !r.selectable), "nothing is pickable");
+        assert!(rows.iter().all(|r| !r.pickable()), "nothing is pickable");
     }
 
     #[test]
-    fn an_empty_listing_yields_its_header_alone() {
-        let rows = model_rows(&[listing("local", &[])], "local/m");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "local");
-        assert!(!rows[0].selectable);
+    fn an_empty_listing_shows_a_no_models_note() {
+        let rows = model_rows(
+            &[ProviderModels {
+                provider: "local".into(),
+                models: vec![],
+                availability: Availability::NoModels,
+            }],
+            "anthropic/claude-fable-5",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].role, RowRole::Note);
+        assert_eq!(rows[1].hint.as_deref(), Some("no models"));
+    }
+
+    #[test]
+    fn a_credential_less_builtin_lists_its_collapsed_catalog_then_the_note() {
+        // A built-in whose environment key is unset appears greyed out: its
+        // header, one collapsed row per Catalog model - scoped like a
+        // pickable row, so a model-name filter reveals it - and LAST the
+        // note whose hint names the key to export: the trailing note is the
+        // cursor stop that anchors the popup window below the capped reveal.
+        // No row of it is pickable.
+        let rows = model_rows(
+            &[ProviderModels {
+                provider: "openrouter".into(),
+                models: vec![],
+                availability: Availability::MissingCredential {
+                    env: vec!["OPENROUTER_API_KEY".into()],
+                    catalog: vec!["qwen3.5-27b".into(), "kimi-k2".into()],
+                },
+            }],
+            "anthropic/claude-fable-5",
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].label, "openrouter");
+        assert_eq!(rows[0].role, RowRole::Header);
+        assert_eq!(rows[1].label, "openrouter/qwen3.5-27b");
+        assert_eq!(rows[1].role, RowRole::Collapsed);
+        assert_eq!(rows[2].label, "openrouter/kimi-k2");
+        assert_eq!(rows[2].role, RowRole::Collapsed);
+        assert_eq!(rows[3].label, "  unavailable");
+        assert_eq!(rows[3].role, RowRole::Note);
+        assert_eq!(rows[3].hint.as_deref(), Some("set OPENROUTER_API_KEY"));
+        assert!(rows.iter().all(|r| !r.pickable()), "nothing is pickable");
+    }
+
+    #[test]
+    fn two_env_keys_read_as_either_or_in_the_hint() {
+        let rows = model_rows(
+            &[ProviderModels {
+                provider: "vertex".into(),
+                models: vec![],
+                availability: Availability::MissingCredential {
+                    env: vec!["A_KEY".into(), "B_KEY".into()],
+                    catalog: vec![],
+                },
+            }],
+            "anthropic/claude-fable-5",
+        );
+        assert_eq!(rows[1].hint.as_deref(), Some("set A_KEY or B_KEY"));
     }
 
     // --- pick (the pure pick policy) ----------------------------------------

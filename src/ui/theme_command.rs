@@ -66,10 +66,12 @@ fn applied_line(chosen: &str, env_shadowed: bool, persist: &Result<(), SessionEr
 /// built-ins first (`dark`, `light`), then the user themes in discovery order
 /// (sorted by name). A valid theme is a pickable row - value and label its
 /// name, the active one marked "(current)" like `/model`. A broken user file
-/// stays LISTED but unselectable, its whole-file rejection reason riding as
-/// the dimmed hint (the shared Selector's non-selectable rows already render
-/// muted, skip the cursor, and refuse Enter - the same affordance as
-/// `/model`'s unavailable notes).
+/// stays LISTED but unpickable, its whole-file rejection reason riding as
+/// the dimmed hint - a note, not a header, because the theme list has no
+/// groups and a broken file must not adopt the rows after it under the
+/// Selector's group-aware filtering (notes render muted and take the cursor,
+/// but Enter refuses them - the same affordance as `/model`'s unavailable
+/// notes).
 fn theme_rows(
     discovered: &[(String, Result<SparseTheme, ThemeError>)],
     current: &str,
@@ -81,7 +83,7 @@ fn theme_rows(
     for (name, parsed) in discovered {
         rows.push(match parsed {
             Ok(_) => theme_row(name, current),
-            Err(reason) => SelectorRow::header(name.clone(), Some(reason.to_string())),
+            Err(reason) => SelectorRow::note(name.clone(), Some(reason.to_string())),
         });
     }
     rows
@@ -101,13 +103,14 @@ fn pick(current: &str, value: String) -> Option<String> {
 /// Which theme name the open selector previews, if any (ADR-0038).
 /// `highlight` is the Composer's Ready-selector highlight
 /// ([`crate::ui::composer::Composer::selector_highlight`]): the command that
-/// opened the selector and the row under the cursor. Only a pickable row of
-/// THIS command previews - a broken theme (unselectable) previews nothing, as
-/// does any other command's selector (`None` covers the menu, Loading/Failed,
-/// and no overlay at all).
+/// opened the selector and the row under the cursor. Only a PICKABLE row of
+/// THIS command previews - a broken theme's note is a cursor stop the
+/// highlight can rest on, but it previews nothing, as does any other
+/// command's selector (`None` covers the menu, Loading/Failed, and no
+/// overlay at all).
 pub(crate) fn preview_name<'a>(highlight: Option<(&'a str, &'a SelectorRow)>) -> Option<&'a str> {
     match highlight {
-        Some((command, row)) if command == NAME && row.selectable => Some(row.value.as_str()),
+        Some((command, row)) if command == NAME && row.pickable() => Some(row.value.as_str()),
         _ => None,
     }
 }
@@ -207,10 +210,10 @@ mod tests {
         let rows = theme_rows(&[valid("aurora"), valid("zebra")], "dark");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["dark", "light", "aurora", "zebra"]);
-        assert!(rows.iter().all(|r| r.selectable));
+        assert!(rows.iter().all(|r| r.pickable()));
         assert!(
             rows.iter()
-                .filter(|r| r.selectable)
+                .filter(|r| r.pickable())
                 .all(|r| r.value == r.label),
             "a pick is the theme name itself"
         );
@@ -225,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_theme_is_listed_unselectable_with_its_reason() {
+    fn a_broken_theme_is_listed_unpickable_with_its_reason() {
         // ADR-0038: strict per-file, resilient app - the file is refused
         // whole, but /theme shows it with the reason instead of hiding it.
         let rows = theme_rows(
@@ -233,9 +236,19 @@ mod tests {
             "dark",
         );
         assert_eq!(rows[2].label, "typo");
-        assert!(!rows[2].selectable, "Enter can never pick a broken theme");
+        assert!(!rows[2].pickable(), "Enter can never pick a broken theme");
+        assert!(
+            rows[2].is_stop(),
+            "the cursor may rest on it, so its reason is reachable"
+        );
         assert_eq!(rows[2].hint.as_deref(), Some("colors.added: bad"));
-        assert!(rows[3].selectable, "the valid neighbor stays pickable");
+        assert_eq!(
+            rows[2].role,
+            crate::ui::selector::RowRole::Note,
+            "a note, not a header: a broken file starts no group, so the \
+             valid neighbors never travel with it under filtering"
+        );
+        assert!(rows[3].pickable(), "the valid neighbor stays pickable");
     }
 
     // --- pick (the pure pick policy) -----------------------------------------
@@ -259,10 +272,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unselectable_highlight_previews_nothing() {
-        // A filter that leaves only a broken row parks the highlight on it;
-        // the active Theme keeps rendering (what Escape would keep).
-        let row = SelectorRow::header("typo", Some("colors.added: bad".into()));
+    fn an_unpickable_highlight_previews_nothing() {
+        // A broken theme's note is a cursor stop, so the highlight can rest
+        // on it; the active Theme keeps rendering (what Escape would keep).
+        let row = SelectorRow::note("typo", Some("colors.added: bad".into()));
         assert_eq!(preview_name(Some((NAME, &row))), None);
     }
 

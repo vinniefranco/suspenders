@@ -27,7 +27,7 @@ use crate::ui::composer::{self, ComposerLayout, OverlayStatus, OverlayView};
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
-use crate::ui::selector::SelectorRow;
+use crate::ui::selector::{RowRole, SelectorRow};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
 use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
@@ -362,10 +362,15 @@ fn render_composer_popup(
 /// the overlay compact even against a long model list.
 const POPUP_MAX_ROWS: u16 = 8;
 
-/// One `Line` per [`SelectorRow`]: the label, then the hint dimmed; the
-/// highlighted row is reversed so it reads as the selection. A non-selectable
-/// row (a Provider group header, an "unavailable" note) draws dim bold and is
-/// never reversed - the Selector's cursor cannot land on it.
+/// One `Line` per [`SelectorRow`]: the label, then the hint dimmed (a note's
+/// hint may carry the reveal cap's "· N more" count, merged upstream by the
+/// Composer's overlay view); the highlighted row is reversed so it reads as
+/// the cursor. The row's role picks the label treatment - a header or note
+/// (a Provider group header, an "unavailable" note) draws dim bold, a
+/// collapsed member draws dim WITHOUT bold so it reads as a greyed model
+/// rather than a header. Only a cursor stop (a member or a note) ever draws
+/// reversed: a highlighted note is the stop anchoring a greyed group's view,
+/// while headers and collapsed rows can never hold the cursor.
 fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line<'static>> {
     if rows.is_empty() {
         return vec![Line::styled(
@@ -378,12 +383,12 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
-            let label_style = if row.selectable {
-                Style::default()
-            } else {
-                Style::default()
+            let label_style = match row.role {
+                RowRole::Member => Style::default(),
+                RowRole::Collapsed => Style::default().fg(tui_color(theme.muted)),
+                RowRole::Header | RowRole::Note => Style::default()
                     .fg(tui_color(theme.muted))
-                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::BOLD),
             };
             let mut spans = vec![Span::styled(row.label.clone(), label_style)];
             if let Some(hint) = &row.hint {
@@ -396,7 +401,7 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line
                 ));
             }
             let line = Line::from(spans);
-            if i == highlight && row.selectable {
+            if i == highlight && row.is_stop() {
                 line.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
                 line
@@ -3445,6 +3450,88 @@ mod tests {
         assert!(text.contains(" models "));
         assert!(text.contains("qwen/qwen3-30b"));
         assert!(text.contains("meta/llama-3.1"));
+    }
+
+    #[test]
+    fn a_collapsed_row_draws_muted_without_the_headers_bold() {
+        let view = OverlayView::Selector {
+            command: "model".to_string(),
+            status: OverlayStatus::Ready,
+            rows: vec![
+                SelectorRow::header("openrouter"),
+                SelectorRow::collapsed("openrouter/kimi-k2"),
+            ],
+            highlight: 0,
+        };
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
+        // Geometry as above: 2 body rows + borders = height 4 above row 10,
+        // so the header sits at row 7 and the collapsed row at 8, text from
+        // x = 2.
+        let buf = terminal.backend().buffer();
+        let header = buf.cell((2u16, 7u16)).expect("header cell");
+        assert!(header.style().add_modifier.contains(Modifier::BOLD));
+        let collapsed = buf.cell((2u16, 8u16)).expect("collapsed cell");
+        assert!(
+            !collapsed.style().add_modifier.contains(Modifier::BOLD),
+            "a collapsed member reads as a greyed model, not a header"
+        );
+        assert_eq!(collapsed.style().fg, header.style().fg, "both muted");
+    }
+
+    #[test]
+    fn a_highlighted_note_draws_reversed_like_the_cursor_stop_it_is() {
+        let view = OverlayView::Selector {
+            command: "model".to_string(),
+            status: OverlayStatus::Ready,
+            rows: vec![
+                SelectorRow::header("openrouter"),
+                SelectorRow::note("  unavailable", Some("set OPENROUTER_API_KEY".into())),
+            ],
+            highlight: 1,
+        };
+        let terminal = draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), &view, theme::dark())
+        });
+        // Geometry as above: body rows 7 (header) and 8 (note), text at x = 2.
+        let buf = terminal.backend().buffer();
+        let header = buf.cell((2u16, 7u16)).expect("header cell");
+        assert!(
+            !header.style().add_modifier.contains(Modifier::REVERSED),
+            "the cursor can never rest on a header"
+        );
+        let note = buf.cell((2u16, 8u16)).expect("note cell");
+        assert!(note.style().add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn a_capped_group_fits_the_popup_window_when_its_note_is_highlighted() {
+        use crate::ui::selector::{COLLAPSED_REVEAL_CAP, RowRole, Selector};
+
+        // The reachability contract behind note-last ordering and the cap:
+        // the popup window shows POPUP_MAX_ROWS body rows ending at the
+        // highlight (composer::first_visible_row), and a fully-capped group
+        // is header + COLLAPSED_REVEAL_CAP rows + note - so the cursor
+        // resting on the trailing note pulls the whole group into view.
+        let mut rows = vec![SelectorRow::header("openrouter")];
+        rows.extend((0..300).map(|i| SelectorRow::collapsed(format!("openrouter/m{i:03}"))));
+        rows.push(SelectorRow::note(
+            "  unavailable",
+            Some("set OPENROUTER_API_KEY".into()),
+        ));
+        let s = Selector::new(rows);
+        let highlight = s.highlight("openrouter");
+        let view = s.filtered("openrouter");
+        assert_eq!(
+            view[highlight].row.role,
+            RowRole::Note,
+            "snapped to the note"
+        );
+        assert_eq!(view.len(), 1 + COLLAPSED_REVEAL_CAP + 1);
+        assert!(view.len() <= POPUP_MAX_ROWS as usize);
+        let top = composer::first_visible_row(highlight, POPUP_MAX_ROWS as usize);
+        assert_eq!(top, 0, "the group's header is the window's first row");
     }
 
     #[test]
