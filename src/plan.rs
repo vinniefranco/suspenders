@@ -108,6 +108,7 @@ fn is_fence(line: &str) -> bool {
     t.starts_with("```") || t.starts_with("~~~")
 }
 
+// qual:allow(coupling, oi) reason: "Plan also names the plan Tool (tools::plan); this impl sits with its own value type - OI is a name-collision false positive resolved by file-discovery order, which differs between local and CI"
 impl Plan {
     /// Builds the Run's Plan value: `content` restored from the previous Run
     /// (the Agent holds it), `original_task` from a durable copy when one

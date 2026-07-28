@@ -49,6 +49,7 @@ pub struct Explore {
     streak: u64,
 }
 
+// qual:allow(coupling, oi) reason: "Explore also names the explore Tool (tools::explore); this impl sits with its own Governor type - OI is a name-collision false positive resolved by file-discovery order, which differs between local and CI"
 impl Explore {
     pub fn new() -> Self {
         Explore::default()
