@@ -253,6 +253,11 @@ theme_slots! {
     /// The live `✦ Thinking` header over the streaming reasoning tail
     /// (ADR-0040): the animated brain, where motion sits during a Turn.
     thinking_header,
+    /// The lull "waiting" animation + its elapsed timer (the spellcast scenes):
+    /// quiet chrome under the running lane, so it reads muted by default. Named
+    /// for the lull it fills - a quiet stretch WITHIN a running Turn, distinct
+    /// from the Agent being Idle (the `segment_idle_*` slots).
+    lull,
     /// The `>` gutter marking the user's own prompts.
     prompt_gutter,
     /// The dim `│` turn-lane spine the agent's whole Turn hangs off (ADR-0040):

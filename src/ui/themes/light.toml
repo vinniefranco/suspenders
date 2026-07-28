@@ -15,6 +15,7 @@ machinery = "#8c959f"
 error = "#cf222e"
 thinking = "#6e7781"
 thinking_header = "#6e7781"
+lull = "#8839ef"
 prompt_gutter = "#0969da"
 lane_spine = "#8c959f"
 

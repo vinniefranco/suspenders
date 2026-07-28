@@ -24,6 +24,7 @@ use syntect::parsing::SyntaxSet;
 use thousands::Separable;
 
 use crate::ui::composer::{self, ComposerLayout, OverlayStatus, OverlayView};
+use crate::ui::lull;
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
@@ -205,6 +206,21 @@ impl ConnectionFacts {
     }
 }
 
+/// The frame-animation clocks the adapter advances each ~100ms tick while a
+/// Turn runs. One value object so the render path takes a single animation
+/// argument and new clocks are a field, not another parameter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Anim {
+    /// The braille `✦ Thinking` spinner frame (advances every running tick).
+    pub spinner: u64,
+    /// Ticks of unbroken quiet in the CURRENT lull (reset when output streams,
+    /// or when the Turn ends). Drives the lull animation + its elapsed timer.
+    pub quiet_ticks: u64,
+    /// Which lull this is, session-wide (bumped when a new lull begins). Seeds
+    /// the per-lull scene pick, so a fresh wait usually brings a fresh scene.
+    pub lull_seq: u64,
+}
+
 /// Renders the whole frame: the transcript viewport, the status bar, the
 /// Composer, and - when an Approval is pending - the modal on top. The
 /// [`Viewport`] holds the pure scroll state; the returned `(total_lines,
@@ -221,7 +237,7 @@ pub fn render(
     frame: &mut Frame,
     t: &Screen,
     conn: ConnectionView,
-    spinner: u64,
+    anim: Anim,
     viewport: &Viewport,
     cache: &mut RenderCache,
     theme: &Theme,
@@ -251,7 +267,7 @@ pub fn render(
     // The viewport renders FIRST: the status bar's position segment reads the
     // measured geometry (and the Viewport's clamped top) from this frame, not
     // a stale one.
-    let geometry = render_viewport(frame, chunks[0], t, viewport, cache, spinner, theme);
+    let geometry = render_viewport(frame, chunks[0], t, viewport, cache, anim, theme);
     render_status_bar(frame, chunks[1], t, conn, viewport, geometry, theme);
     render_composer(frame, chunks[2], t, &layout, theme);
 
@@ -427,7 +443,7 @@ pub fn render_viewport(
     t: &Screen,
     viewport: &Viewport,
     cache: &mut RenderCache,
-    spinner: u64,
+    anim: Anim,
     theme: &Theme,
 ) -> (usize, usize) {
     // The rightmost column is ALWAYS the scrollbar gutter, occupied or not:
@@ -467,7 +483,7 @@ pub fn render_viewport(
     // [`RenderCache::sync`]). `streaming_thinking()` stays whole in the store;
     // the last-N windowing is a display policy, so it lives here (ADR-0029).
     let thinking = t.transcript().streaming_thinking();
-    let thinking_lines = live_thinking_lines(&thinking, spinner, content_area.width, theme);
+    let thinking_lines = live_thinking_lines(&thinking, anim.spinner, content_area.width, theme);
 
     // One (lines, wrapped-count, gutter-kind) entry per window "item": every
     // KEPT settled message, then the live tail - a single indexing shared by the
@@ -503,11 +519,34 @@ pub fn render_viewport(
         item_lines.push(&thinking_lines);
         gutters.push(GutterKind::Spine);
     }
-    if let Some((lines, wrapped)) = cache.streaming_tail() {
+    // Captured once so the lull gate below can test `is_none()` without a
+    // second borrow of `cache` (streaming_tail borrows it immutably).
+    let tail = cache.streaming_tail();
+    if let Some((lines, wrapped)) = tail {
         counts.push(wrapped);
         item_lines.push(lines);
         gutters.push(GutterKind::Spine);
     }
+    // The lull "waiting" row is the third live entry, mutually exclusive with
+    // the two above BY CONSTRUCTION: it draws only when the Turn runs and
+    // NEITHER a reasoning tail nor a streaming answer is on screen. Declared
+    // in this scope so the `&lull_lines` reference `item_lines` holds outlives
+    // the draw, exactly like `thinking_lines`. `push_live_entry` folds the
+    // emptiness branch out of this body so appending the row does not raise
+    // `render_viewport`'s complexity past its baseline (the settle window and
+    // the gate already keep the row empty when it must not show).
+    let lull_lines = if lull_visible(t.status, thinking_lines.is_empty(), tail.is_some()) {
+        live_lull_lines(anim, content_area.width, theme)
+    } else {
+        Vec::new()
+    };
+    push_live_entry(
+        &lull_lines,
+        &mut item_lines,
+        &mut counts,
+        &mut gutters,
+        content_area.width,
+    );
 
     // The ONE per-visual-row mapping both the content and the gutter consume:
     // expanding the per-item kinds over each item's wrapped rows yields a flat
@@ -592,6 +631,69 @@ fn live_thinking_lines(
             .map(|row| Line::styled(format!("  {}", truncate_visual(row, row_width)), row_style)),
     );
     out
+}
+
+/// The lull "waiting" row shown while a Turn runs but nothing streams: an
+/// elapsed timer (left, fixed-width so the animation column never jitters) then
+/// the current [`lull`] scene frame, indented two columns under the running
+/// lane like the reasoning tail. Empty until the lull passes the settle window
+/// (so a brief token gap never flashes a scene) and empty whenever output is
+/// streaming (the caller gates on that - see [`render_viewport`]).
+///
+/// `width` is the `content_area` width this draws in (the same measured==drawn
+/// width the rest of the viewport uses, ADR-0029). The row is truncated to that
+/// width so it stays exactly one visual row and cannot desync the lane spine.
+/// Appends one live entry (a reasoning tail, a streaming answer, or the lull
+/// row) to the render window as a single lane-spine item - but only when it
+/// carries lines. Borrows `lines` for as long as `item_lines` holds the
+/// reference, so the caller must keep the backing `Vec` alive until the draw.
+/// The emptiness branch lives HERE so appending a live entry does not raise
+/// [`render_viewport`]'s cyclomatic complexity.
+fn push_live_entry<'a>(
+    lines: &'a [Line<'static>],
+    item_lines: &mut Vec<&'a [Line<'static>]>,
+    counts: &mut Vec<usize>,
+    gutters: &mut Vec<GutterKind>,
+    width: u16,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    counts.push(wrapped_count(lines.to_vec(), width));
+    item_lines.push(lines);
+    gutters.push(GutterKind::Spine);
+}
+
+/// Whether the lull "waiting" row should draw this frame: the Turn is Running
+/// and NEITHER live entry (the reasoning tail, the streaming answer) is on
+/// screen. The one gate, matching [`Screen::has_live_stream`] by construction
+/// (`thinking_empty == streaming_thinking().is_empty()` and `tail_present ==
+/// !streaming_text().is_empty()`) so the row and the adapter's lull clock never
+/// disagree. Pulled out of [`render_viewport`] so the multi-clause boolean and
+/// its emptiness branch stay off that function's cyclomatic complexity.
+fn lull_visible(status: Status, thinking_empty: bool, tail_present: bool) -> bool {
+    status == Status::Running && thinking_empty && !tail_present
+}
+
+fn live_lull_lines(anim: Anim, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(glyph) = lull::frame(anim.quiet_ticks, anim.lull_seq) else {
+        return vec![];
+    };
+    // Ticks -> seconds via the adapter's tick cadence (the one place ticks
+    // become real time, a display decision - the pure `lull` clock stays in
+    // ticks). TICK_MS is the adapter's frame interval.
+    let secs = anim.quiet_ticks.saturating_mul(crate::ui::TICK_MS) / 1000;
+    // A fixed-width timer field keeps the animation anchored as the label grows
+    // ("7s" -> "2m 03s"). 7 cols holds up to "59m 59s"; longer just shifts.
+    let timer = format!("{:<7}", lull::format_elapsed(secs));
+    let style = Style::default()
+        .fg(tui_color(theme.lull))
+        .add_modifier(Modifier::ITALIC);
+    // Two-column indent (like the reasoning tail's sub-block), then timer, a
+    // gap, and the scene. Truncated as a whole to one visual row.
+    let text = format!("  {timer} {glyph}");
+    let budget = width as usize;
+    vec![Line::styled(truncate_visual(&text, budget), style)]
 }
 
 /// Truncates `text` to at most `width` display columns, replacing the trimmed
@@ -2531,6 +2633,71 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The lull "waiting" row: the render gate and the row builder.
+    // -----------------------------------------------------------------------
+
+    // The gate draws the lull ONLY when the Turn is Running and NEITHER live
+    // entry is on screen. Each of the three clauses must be able to veto it.
+    #[test]
+    fn lull_visible_only_when_running_and_no_live_entry() {
+        // Running, no thinking tail, no streaming answer => the lull shows.
+        assert!(lull_visible(Status::Running, true, false));
+        // A running Turn but the reasoning tail is on screen => no lull.
+        assert!(!lull_visible(Status::Running, false, false));
+        // A running Turn but the streaming answer is on screen => no lull.
+        assert!(!lull_visible(Status::Running, true, true));
+        // Not running (idle) => no lull, even with both live entries clear.
+        assert!(!lull_visible(Status::Idle, true, false));
+    }
+
+    // Inside the settle window `lull::frame` is None, so the row builder yields
+    // nothing - a brief token gap never flashes a scene.
+    #[test]
+    fn live_lull_lines_is_empty_within_the_settle_window() {
+        let lines = live_lull_lines(Anim::default(), 40, theme::dark());
+        assert!(
+            lines.is_empty(),
+            "quiet_ticks 0 < SETTLE_TICKS: no lull row yet"
+        );
+    }
+
+    // At the settle close the row appears: exactly ONE line (the single-row
+    // invariant), carrying the timer that opens at "5s" (SETTLE_TICKS * TICK_MS
+    // = 50 * 100ms = 5s).
+    #[test]
+    fn live_lull_lines_opens_one_row_with_the_five_second_timer() {
+        let anim = Anim {
+            quiet_ticks: lull::SETTLE_TICKS,
+            ..Default::default()
+        };
+        let lines = live_lull_lines(anim, 40, theme::dark());
+        assert_eq!(lines.len(), 1, "the lull is a single row");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("5s"), "the timer opens at 5s: {text:?}");
+        assert!(!text.trim().is_empty(), "the row carries the scene glyph");
+    }
+
+    // The single-row invariant holds no matter how long the wait: a huge
+    // `quiet_ticks` still yields one line, truncated to the width passed so it
+    // can never desync the lane spine (ADR-0029).
+    #[test]
+    fn live_lull_lines_stays_one_truncated_row_for_a_long_wait() {
+        let width = 20u16;
+        let anim = Anim {
+            quiet_ticks: lull::SETTLE_TICKS + 100_000,
+            ..Default::default()
+        };
+        let lines = live_lull_lines(anim, width, theme::dark());
+        assert_eq!(lines.len(), 1, "still exactly one row");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.chars().count() <= width as usize,
+            "the row is truncated to the width passed: {} chars",
+            text.chars().count()
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Themes (ADR-0038): the mappings read the active Theme's slots. The dark
     // Theme must render byte-identically to the pre-theme hardcoded palette
     // (the pinning tests below), and a non-default Theme must actually change
@@ -4205,7 +4372,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4234,7 +4401,7 @@ mod tests {
                 &Screen::demo(),
                 &Viewport::new(),
                 &mut RenderCache::new(),
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4299,7 +4466,7 @@ mod tests {
                 &Screen::demo(),
                 &Viewport::new(),
                 &mut RenderCache::new(),
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4328,7 +4495,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4346,6 +4513,37 @@ mod tests {
         }
     }
 
+    // The lull row draws through the full render path: a Running Turn with
+    // nothing streaming, quiet past the settle window, paints the timer into the
+    // buffer as a third live entry under the running lane.
+    #[test]
+    fn the_viewport_draws_the_lull_row_when_running_and_quiet() {
+        let (screen, _) = screen_with_notices(vec!["a launch notice".to_string()])
+            .apply_event(Event::turn_started("r1"));
+        assert!(
+            !screen.has_live_stream(),
+            "the Turn runs but nothing streams"
+        );
+        let anim = Anim {
+            quiet_ticks: lull::SETTLE_TICKS + 4,
+            lull_seq: 0,
+            ..Default::default()
+        };
+        let terminal = draw_frame(80, 20, |f| {
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &Viewport::new(),
+                &mut RenderCache::new(),
+                anim,
+                theme::dark(),
+            );
+        });
+        let text = buffer_text(&terminal);
+        assert!(text.contains("5s"), "the lull timer opens at 5s:\n{text}");
+    }
+
     #[test]
     fn an_overflowing_transcript_pins_the_tail_and_draws_the_scrollbar() {
         let notices: Vec<String> = (0..30).map(|i| format!("notice line {i:02}")).collect();
@@ -4360,7 +4558,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4605,7 +4803,7 @@ mod tests {
                 &screen,
                 &Viewport::new(),
                 &mut RenderCache::new(),
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4694,7 +4892,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4751,7 +4949,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4811,7 +5009,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4826,7 +5024,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -4894,7 +5092,7 @@ mod tests {
                 &screen,
                 &Viewport::new(),
                 &mut RenderCache::new(),
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         })
@@ -4921,7 +5119,7 @@ mod tests {
                 &screen,
                 &Viewport::new(),
                 &mut RenderCache::new(),
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -5023,7 +5221,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -5061,7 +5259,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -5093,7 +5291,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });
@@ -5128,7 +5326,7 @@ mod tests {
                 &screen,
                 &viewport,
                 &mut cache,
-                0,
+                Anim::default(),
                 theme::dark(),
             );
         });

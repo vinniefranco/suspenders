@@ -93,6 +93,10 @@ _Avoid_: allowlist, whitelist (a filter's framing; the Offer is a fact of the Pa
 The model's reasoning stream, displayed but never fed back into the Conversation.
 _Avoid_: reasoning content, chain of thought
 
+**Lull**:
+A quiet stretch within a running Turn - the Agent is Running but nothing is streaming (waiting on the first token, or a Tool executing). Distinct from Idle, which is no Turn running at all. A Lull that outlasts a short settle (~5s) is filled with a whimsical single-row waiting animation and an elapsed timer, drawn under the running Turn's lane; it vanishes the instant Thinking or answer text streams again (ADR-0041). Display-only, never in the Conversation.
+_Avoid_: idle (that is no Turn at all - the opposite state), stall, hang (a Lull is healthy waiting, not a fault)
+
 **Transcript**:
 The display-side history of a Session - everything the user saw, in order: user prompts, assistant text, collapsed Thinking, Tool Call and Tool Result summaries, and info lines. Not the Conversation: Thinking and info lines live in the Transcript but never in the Conversation.
 _Avoid_: message list, chat log

@@ -902,6 +902,15 @@ impl Screen {
         &self.transcript
     }
 
+    /// Whether live model output is currently streaming - reasoning under the
+    /// `✦ Thinking` tail or assistant answer text. The adapter resets the lull
+    /// clock while this holds, and the render gate shows the idle animation only
+    /// while it does NOT - one predicate, so the two can never disagree.
+    pub fn has_live_stream(&self) -> bool {
+        !self.transcript().streaming_thinking().is_empty()
+            || !self.transcript().streaming_text().is_empty()
+    }
+
     /// The Composer, read-only - the render adapter's window (ADR-0034). It
     /// reads everything it draws through [`Composer::view`]: the draft, the
     /// char-index cursor, and the open overlay. No `&mut` counterpart on
@@ -1180,6 +1189,51 @@ mod tests {
                 "context file .suspenders/SYSTEM.md exists but could not be read \
                  (permission denied); continuing without it"
             )]
+        );
+    }
+
+    // --- has_live_stream (the render gate's one predicate) ------------------
+
+    // The lull/tail gate: a fresh Screen streams nothing, a reasoning delta
+    // trips the `streaming_thinking` operand, and an answer-text delta trips the
+    // `streaming_text` operand - both `||` arms covered.
+    #[test]
+    fn has_live_stream_tracks_reasoning_and_answer_streams() {
+        // Fresh: nothing on the wire.
+        assert!(!fresh().has_live_stream(), "a fresh Screen streams nothing");
+
+        // A reasoning delta => the thinking arm holds.
+        let thinking_stream = fold(
+            fresh(),
+            vec![
+                Event::turn_started("r1"),
+                Event::message_start(1),
+                Event::message_update(
+                    crate::llm::Delta::Thinking("half a thought".into()),
+                    vec![thinking_block("half a thought")],
+                ),
+            ],
+        );
+        assert!(
+            thinking_stream.has_live_stream(),
+            "a streaming reasoning delta is a live stream"
+        );
+
+        // An answer-text delta => the text arm holds.
+        let text_stream = fold(
+            fresh(),
+            vec![
+                Event::turn_started("r1"),
+                Event::message_start(1),
+                Event::message_update(
+                    crate::llm::Delta::Text("half an ans".into()),
+                    vec![text_block("half an ans")],
+                ),
+            ],
+        );
+        assert!(
+            text_stream.has_live_stream(),
+            "a streaming answer delta is a live stream"
         );
     }
 
