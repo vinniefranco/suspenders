@@ -18,6 +18,7 @@
 
 pub mod request;
 pub mod stream;
+pub mod text_tool_call;
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -69,8 +70,10 @@ pub(super) async fn complete(
         return Response::error(format!("request_failed: HTTP {status}: {body}"));
     }
 
-    // Fold the SSE frames into the pure state machine, pacing `on_event`.
-    let mut state = StreamState::new();
+    // Fold the SSE frames into the pure state machine, pacing `on_event`. The
+    // request's Tool Call style rides into the fold so finalization knows
+    // whether to recover a text-emitted call (qwen parity).
+    let mut state = StreamState::with_style(req.tool_call_style);
     let mut throttle = Throttle::new(STREAM_INTERVAL_MS);
     let mut sse = resp.bytes_stream().eventsource();
 
@@ -398,6 +401,42 @@ mod tests {
                 malformed_input_marker(malformed)
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn text_emitted_tool_call_markup_finalizes_as_tool_use() {
+        // Qwen3-Coder emits the call as content text, chunked across deltas,
+        // with finish_reason "stop". The adapter recovers it end to end.
+        let server = MockServer::start().await;
+        serve_sse(
+            &server,
+            sse_body(&[
+                delta_frame(json!({ "content": "I'll run the tests:\n\n" })),
+                delta_frame(json!({ "content": "<tool_call>\n<function=run_command>\n" })),
+                delta_frame(json!({ "content": "<parameter=command>\nmix test\n" })),
+                delta_frame(json!({ "content": "</parameter>\n</function>\n</tool_call>" })),
+                finish_frame("stop"),
+                done(),
+            ]),
+        )
+        .await;
+
+        let result = dispatcher_for(&server)
+            .complete(&simple_request(), &test_model(), &mut no_op())
+            .await;
+
+        assert_eq!(
+            result.content,
+            vec![
+                ContentBlock::text("I'll run the tests:"),
+                ContentBlock::tool_use(
+                    "text-call-0",
+                    "run_command",
+                    json!({ "command": "mix test" })
+                ),
+            ]
+        );
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
     }
 
     #[tokio::test]

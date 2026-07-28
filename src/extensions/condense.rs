@@ -150,7 +150,6 @@ mod tests {
             root: "/nowhere".into(),
             result_cap: 10_000,
             command_timeout_ms: 120_000,
-            scout: None,
         }
     }
 

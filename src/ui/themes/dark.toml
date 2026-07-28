@@ -9,6 +9,11 @@ syntax = "base16-ocean.dark"
 # The conversation plane.
 added = "green"
 removed = "red"
+# Subtle full-width diff tints (ADR-0008): low-luminance green/red that
+# composite over the dark ground without fighting the syntect foreground, in
+# the same dark register as code_block_bg="#191923".
+added_bg = "#12291b"
+removed_bg = "#331a1d"
 context = "dark_gray"
 muted = "dark_gray"
 machinery = "dark_gray"

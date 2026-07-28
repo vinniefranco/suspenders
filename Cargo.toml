@@ -14,6 +14,11 @@ futures-util = "0.3"
 # bottom-anchored viewport (ui::viewport) needs to follow the tail.
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
+# display-column widths for the diff render path (ui::components only, ADR-0008):
+# a wide CJK/emoji glyph counts 2 columns, so a tinted diff row stays exactly
+# `content_width` columns and the viewport never re-wraps it. Pinned to the same
+# 0.2 ratatui already resolves, so no extra copy is pulled.
+unicode-width = "0.2"
 
 # LLM boundary: Anthropic wire protocol over SSE (ADR-0002)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -53,6 +58,13 @@ time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UT
 [[bin]]
 name = "generate-models"
 path = "src/bin/generate_models.rs"
+
+# The diff-render demo (ADR-0008): `cargo run --bin diff-demo` renders a seeded
+# Screen of `Diff` items through the real frame path so the tint + syntect
+# highlighting can be eyeballed live, no Agent/Session/IO.
+[[bin]]
+name = "diff-demo"
+path = "src/bin/diff_demo.rs"
 
 [dev-dependencies]
 wiremock = "0.6"       # canned-SSE transport tests (ADR-0002)

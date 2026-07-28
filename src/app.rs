@@ -15,8 +15,7 @@ use std::sync::Arc;
 
 use crate::agent::{AgentHandle, StartOpts};
 use crate::approvals::Decision;
-use crate::conversation::dead_mass_pct;
-use crate::event::Event;
+use crate::event::{Event, dead_mass_pct};
 use crate::llm::Dispatcher;
 use crate::session::{Session, SessionOpts};
 use crate::ui::picker::PickerOutcome;

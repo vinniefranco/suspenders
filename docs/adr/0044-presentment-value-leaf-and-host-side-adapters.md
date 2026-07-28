@@ -21,11 +21,12 @@ new abstraction:
    CONTEXT.md already draws the line: Presentment "decides WHAT a Transcript item
    is," rendering is "the terminal drawing the Transcript." The value types that
    cross that seam - a marker's `Tone`, a selector's `SelectorRow`/`RowRole`, the
-   `TranscriptItem` (and its `StyledLine`/`LineStyle`) the core produces for the
-   display - are Presentment vocabulary, not rendering machinery. They now live
-   in `src/view_model.rs`, a leaf that imports nothing from the crate (In-only,
-   instability 0.00). The functional core produces them (an `Event` carries a
-   `Tone` or a row list; the diff extension builds a `Block` of `StyledLine`s),
+   `TranscriptItem` (and its `Diff`'s `DiffHunk`/`DiffLine`/`DiffSide`) the core
+   produces for the display - are Presentment vocabulary, not rendering machinery.
+   They now live in `src/view_model.rs`, a leaf that imports nothing from the
+   crate (In-only, instability 0.00). The functional core produces them (an
+   `Event` carries a `Tone` or a row list; the diff extension builds a `Diff` of
+   `DiffLine`s),
    and `ui` renders them; neither the core nor `view_model` depends on the
    rendering layer. The interactive widgets and the tone-to-colour mapping stay
    in `ui` - only the value types moved.

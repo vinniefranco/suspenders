@@ -33,14 +33,14 @@
 //!   `a` is approve-always (Standing Approval); Escape means Cancellation,
 //!   which wins over the Approval.
 
-use crate::conversation::{WaveStats, compaction_target, dead_mass_pct};
-use crate::event::Event;
+use crate::conversation::compaction_target;
+use crate::event::{Event, WaveStats, dead_mass_pct};
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
 use crate::ui::transcript::Transcript;
 use crate::view_model::Tone;
-use crate::view_model::TranscriptItem;
+use crate::view_model::{DiffHunk, DiffLine, DiffSide, TranscriptItem};
 
 /// The greeting line a fresh Screen opens its Transcript with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
@@ -270,6 +270,123 @@ pub struct ScreenOpts {
     pub notices: Vec<String>,
 }
 
+// ---- diff-demo fixtures (Screen::demo_diffs) ----------------------------
+//
+// These build `TranscriptItem::Diff`s directly, in the shape the diff
+// extension's Presenter emits: raw marker-free code lines tagged by `DiffSide`,
+// a header per hunk (`None` for a created file), and a `lang` from the file
+// extension. Used only by [`Screen::demo_diffs`] for the live `diff-demo`.
+
+// One tagged code line (raw text, no `+`/`-` marker - the adapter adds it).
+fn diff_line(side: DiffSide, text: &str) -> DiffLine {
+    DiffLine::new(side, text)
+}
+
+// An edit_file diff of a Rust file with an interleaved context/removed/added
+// hunk, so both tint bands and the two-pass highlighting are on screen.
+fn rust_edit_diff() -> TranscriptItem {
+    let lines = vec![
+        diff_line(DiffSide::Context, "/// Splits `src` into tokens."),
+        diff_line(
+            DiffSide::Context,
+            "pub fn tokenize(src: &str) -> Vec<Token> {",
+        ),
+        diff_line(DiffSide::Removed, "    let mut out = Vec::new();"),
+        diff_line(DiffSide::Removed, "    // TODO: actually tokenize"),
+        diff_line(DiffSide::Added, "    let mut out = Vec::with_capacity(16);"),
+        diff_line(DiffSide::Added, "    for word in src.split_whitespace() {"),
+        diff_line(DiffSide::Added, "        out.push(Token::word(word));"),
+        diff_line(DiffSide::Added, "    }"),
+        diff_line(DiffSide::Context, "    out"),
+        diff_line(DiffSide::Context, "}"),
+    ];
+    TranscriptItem::Diff {
+        title: "edit_file src/lexer.rs (+4 -2)".into(),
+        lang: Some("rs".into()),
+        hunks: vec![DiffHunk {
+            header: Some("@@ -1,6 +1,8 @@".into()),
+            lines,
+        }],
+        elided: 0,
+    }
+}
+
+// A created JavaScript file: one all-added hunk = the whole file (header None),
+// leading with a multi-line /** … */ JSDoc block so the created-file coherent
+// comment coloring shows across every line, plus strings/keywords/numbers.
+fn js_created_diff() -> TranscriptItem {
+    let body = [
+        "/**",
+        " * Greets a user by name.",
+        " * @param {string} name - who to greet",
+        " * @returns {string} the greeting",
+        " */",
+        "export function greet(name) {",
+        "  const times = 3;",
+        "  const hi = `Hello, ${name}!`;",
+        "  return Array(times).fill(hi).join(\" \");",
+        "}",
+    ];
+    let lines = body.iter().map(|t| diff_line(DiffSide::Added, t)).collect();
+    TranscriptItem::Diff {
+        title: "write_file src/greet.js (new file, +10)".into(),
+        lang: Some("js".into()),
+        hunks: vec![DiffHunk {
+            header: None,
+            lines,
+        }],
+        elided: 0,
+    }
+}
+
+// A created JSON file (a package.json fragment) - a second language on screen.
+fn json_created_diff() -> TranscriptItem {
+    let body = [
+        "{",
+        "  \"name\": \"greet\",",
+        "  \"version\": \"1.0.0\",",
+        "  \"type\": \"module\",",
+        "  \"scripts\": {",
+        "    \"test\": \"node --test\"",
+        "  },",
+        "  \"license\": \"MIT\"",
+        "}",
+    ];
+    let lines = body.iter().map(|t| diff_line(DiffSide::Added, t)).collect();
+    TranscriptItem::Diff {
+        title: "write_file package.json (new file, +9)".into(),
+        lang: Some("json".into()),
+        hunks: vec![DiffHunk {
+            header: None,
+            lines,
+        }],
+        elided: 0,
+    }
+}
+
+// A capped diff: `elided > 0` renders the muted "… N more lines" tail, and one
+// very long added line exercises the display-width clip.
+fn capped_diff() -> TranscriptItem {
+    let long = format!(
+        "const HAY = \"{}\"; // a very long line to clip",
+        "x".repeat(160)
+    );
+    let lines = vec![
+        diff_line(DiffSide::Context, "// generated - do not edit"),
+        diff_line(DiffSide::Added, &long),
+        diff_line(DiffSide::Added, "const B = 2;"),
+    ];
+    TranscriptItem::Diff {
+        title: "write_file src/generated.js (new file, +2)".into(),
+        lang: Some("js".into()),
+        hunks: vec![DiffHunk {
+            header: None,
+            lines,
+        }],
+        elided: 37,
+    }
+}
+
 impl Screen {
     /// A fresh Screen, opened with the greeting info line and idle status.
     pub fn new(opts: ScreenOpts) -> Self {
@@ -320,9 +437,9 @@ impl Screen {
         t.push(thought("The user wants me to evaluate this project. Let me start by understanding what kind of project this is and its structure before forming an evaluation, then look at dependencies and code quality."));
         t.push(tool("list_files", ".", ".claude/ (+19 more lines)", false));
         t.push(tool(
-            "explore",
-            "What is the overall architecture and purpose of this projec…",
-            "## Locations (+29 more lines)",
+            "grep",
+            "fn main|pub fn run",
+            "src/main.rs:12 (+29 more lines)",
             false,
         ));
         t.push(thought("Let me gather more details about the project structure, dependencies, code quality, and documentation."));
@@ -341,7 +458,7 @@ impl Screen {
         t.push(thought("Let me continue exploring the project structure to understand the codebase more thoroughly."));
         t.push(tool("list_files", "src", "agent/ (+32 more lines)", false));
         t.push(tool("list_files", "docs", "adr/ (+2 more lines)", false));
-        t.marker("» [reading file after file fills your context - dispatch explore with one focused question instead; a Scout searches and reports back]", Tone::Aid);
+        t.marker("» [reading file after file fills your context - grep for the symbol you actually need first instead; then read only what you will change]", Tone::Aid);
         t.push(thought("Let me explore more of the project structure to understand the codebase depth, test coverage, and ADRs."));
         t.push(tool(
             "list_files",
@@ -374,6 +491,45 @@ impl Screen {
         t.push(TranscriptItem::Assistant {
             text: "The project is a well-structured Rust terminal agent. Here is the tokenizer entry point:\n\n```rust\nfn tokenize(src: &str) -> Vec<Token> {\n    let mut out = Vec::new();\n    out\n}\n```\n\nOverall the codebase is clean and well-tested.".into(),
         });
+        screen
+    }
+
+    /// A populated Screen that showcases the first-class `Diff` item (ADR-0008):
+    /// its marker glyph, the added/removed background tint, and the two-pass,
+    /// hunk-coherent syntect highlighting. Built for the `diff-demo` binary to
+    /// eyeball the LIVE render path; authored directly (no IO, no events). NOT a
+    /// test helper - the render snapshot tests pin [`Screen::demo`], so this one
+    /// is free to grow without churning them.
+    ///
+    /// One user request opens the lane; the diffs hang off its spine and fold
+    /// under Ctrl-O exactly like a real edit would. Each Diff is shaped as the
+    /// diff extension's Presenter emits it (raw marker-free lines, a
+    /// `display::title`-style title, the file extension as `lang`).
+    pub fn demo_diffs() -> Self {
+        let mut screen = Screen::new(ScreenOpts::default());
+        let t = &mut screen.transcript;
+
+        t.user("clean up the tokenizer and scaffold the package");
+        t.push(TranscriptItem::Assistant {
+            text: "I'll tighten the tokenizer, add a small JS helper with docs, and drop in a package.json.".into(),
+        });
+
+        // 1. An edit_file diff of a RUST file: interleaved context/removed/added
+        //    lines, so both tint bands and the two-pass highlighting show.
+        t.push(rust_edit_diff());
+
+        // 2. A created JavaScript file with a multi-line /** … */ JSDoc block
+        //    (proves the created-file coherent multi-line comment coloring) plus
+        //    strings, keywords, and numbers.
+        t.push(js_created_diff());
+
+        // 3. A created JSON file (a package.json fragment) - a second language.
+        t.push(json_created_diff());
+
+        // 4. A capped diff: `elided > 0` shows the muted "… N more lines" tail,
+        //    and one very long line exercises the display-width clip.
+        t.push(capped_diff());
+
         screen
     }
 
@@ -420,17 +576,9 @@ impl Screen {
             }
 
             event @ (Event::SessionLogError { .. }
-            | Event::VerifyNudge { .. }
-            | Event::VerifyFailedNudge { .. }
-            | Event::EmptyResponseNudge { .. }
-            | Event::ExploreNudge { .. }
-            | Event::WrapUpWarning { .. }
-            | Event::VerificationPass { .. }
-            | Event::FinalPass { .. }
-            | Event::RecoveryRun { .. }
-            | Event::Anchor { .. }
             | Event::ToolsNarrowed { .. }
-            | Event::Retry { .. }) => self.apply_voice(event),
+            | Event::Retry { .. }
+            | Event::LoopStall { .. }) => self.apply_voice(event),
 
             event @ (Event::RunFinished { .. } | Event::RunCancelled | Event::RunError { .. }) => {
                 self.apply_settlement(event)
@@ -627,13 +775,9 @@ impl Screen {
     }
 
     // Voiced / operator-news lines: everything whose display is one authored
-    // info line - the Session Log failure, the Nudges and Endgame riders, the
-    // Recovery Run prompt, and the bounded re-draw marks.
+    // info line - the Session Log failure, the tools-narrowed marker, and the
+    // bounded re-draw marks.
     fn apply_voice(mut self, event: Event) -> (Self, Vec<Effect>) {
-        // The rider's marker-plane tone (ADR-0040) is decided at the firing
-        // site ([`VoicedTag::tone`]) and recovered here BEFORE the match moves
-        // the event - the Screen carries it, it never classifies.
-        let rider_tone = event.voiced_tone();
         match event {
             // The Session Log died (IO failure); the Session continues
             // unpersisted. Adapter news, not a harness marker - stays Info.
@@ -641,47 +785,6 @@ impl Screen {
                 self.transcript.info(format!(
                     "session log failed ({message}); this session will not resume"
                 ));
-                (self, vec![])
-            }
-
-            // A Nudge / Endgame rider entered the Conversation; it is always
-            // visible, so the Transcript shows it as a toned marker. The glyph
-            // rides the authored display line ([`marker_glyph`]), so the
-            // adapter tints by tone alone and never sniffs the text.
-            Event::VerifyNudge { text }
-            | Event::VerifyFailedNudge { text }
-            | Event::EmptyResponseNudge { text }
-            | Event::ExploreNudge { text }
-            | Event::WrapUpWarning { text }
-            | Event::VerificationPass { text }
-            | Event::FinalPass { text } => {
-                // Every variant in this arm is a voiced rider, so
-                // `voiced_tone` returned `Some` above; asserting it here runs a
-                // future drift (a rider added to this arm but not to
-                // `voiced_tone`) into a test failure instead of a silently
-                // mistinted (Plain) marker (LOW-1).
-                let tone = rider_tone.expect("a voiced rider must carry a tone");
-                self.transcript.marker(marker_line(tone, &text), tone);
-                (self, vec![])
-            }
-
-            // A Recovery Run opened: its Voice prompt entered the
-            // Conversation, so the Transcript shows it like every Nudge - a
-            // Governor aiding the model, so an Aid-toned marker.
-            Event::RecoveryRun { text, .. } => {
-                self.transcript
-                    .marker(marker_line(Tone::Aid, &text), Tone::Aid);
-                self.status = Status::Running;
-                (self, vec![Effect::PinBottom])
-            }
-
-            // The anchor Governor refreshed the Plan (CONTEXT.md: Anchor): the
-            // Session Log holds the full anchor block the model read; the
-            // Transcript shows only a concise Aid marker, never the plan body.
-            // The `⚑` glyph is intrinsic to this marker, so it is baked into
-            // the fixed wording rather than derived from the tone.
-            Event::Anchor { .. } => {
-                self.transcript.marker("⚑ plan refreshed", Tone::Aid);
                 (self, vec![])
             }
 
@@ -704,6 +807,18 @@ impl Screen {
                 self.transcript.info(format!(
                     "malformed tool call - re-drawing ({attempt}/{budget})"
                 ));
+                (self, vec![])
+            }
+
+            // The loop-detector tripped (CONTEXT.md: the passive circuit
+            // breaker): the model repeated the same Tool Call batch `count`
+            // times, so the Run was ended. A Constrain marker - a guard
+            // limiting the model, not the model's own Voice.
+            Event::LoopStall { count } => {
+                self.transcript.marker(
+                    format!("loop detected - stopped after {count} identical tool batches"),
+                    Tone::Constrain,
+                );
                 (self, vec![])
             }
 
@@ -1030,37 +1145,12 @@ fn compaction_line(status: &str) -> String {
 // One tools-narrowed marker line (CONTEXT.md: Endgame, Offer): the `⊘` glyph
 // then the surviving tool names, or "withdrawn" when the final Pass offers
 // none. The glyph is intrinsic to this Constrain marker, so it lives in the
-// text rather than in `marker_glyph`; the tint still comes from the tone.
+// text; the tint still comes from the tone.
 fn tools_narrowed_line(tools: &[String]) -> String {
     if tools.is_empty() {
         "⊘ tools withdrawn".to_string()
     } else {
         format!("⊘ tools narrowed to {}", tools.join(", "))
-    }
-}
-
-// The marker-plane glyph the Screen's display Voice prefixes to a toned line
-// (ADR-0040), chosen by TONE so the adapter tints by tone alone and never
-// reads the text. Aid riders (Nudges, Recovery) wear `»`/`↺`-family warmth via
-// `»`; the Endgame's run-closing Constrain riders wear `▪`. Housekeeping and
-// Steering author their own glyphs at their own sites (`✂`/`⟨⟩`, `↳`).
-fn marker_glyph(tone: Tone) -> &'static str {
-    match tone {
-        Tone::Aid => "»",
-        Tone::Constrain => "▪",
-        Tone::Housekeeping | Tone::Steering | Tone::Plain => "",
-    }
-}
-
-// A toned marker's display line: the tone's glyph (when it carries one) then
-// the authored text. Kept beside `marker_glyph` so the glyph choice and the
-// spacing live in one place.
-fn marker_line(tone: Tone, text: &str) -> String {
-    let glyph = marker_glyph(tone);
-    if glyph.is_empty() {
-        text.to_string()
-    } else {
-        format!("{glyph} {text}")
     }
 }
 
@@ -1506,64 +1596,6 @@ mod tests {
         assert_eq!(effects, vec![]);
     }
 
-    #[test]
-    fn verify_nudge_shows_info_after_materialized_assistant_text() {
-        let t = fold(
-            fresh(),
-            vec![
-                Event::message_start(1),
-                Event::message_end(vec![text_block("all done")], StopReason::EndTurn),
-            ],
-        );
-        let (t, effects) = t.apply_event(Event::voiced(
-            crate::event::VoicedTag::VerifyNudge,
-            "[files changed but not verified]",
-        ));
-        // A Nudge is a Governor aiding the model: an Aid marker with the `»`
-        // glyph, after the materialized assistant text.
-        assert_eq!(
-            items(&t),
-            vec![
-                assistant("all done"),
-                marker("» [files changed but not verified]", Tone::Aid)
-            ]
-        );
-        assert_eq!(effects, vec![]);
-    }
-
-    #[test]
-    fn recovery_run_shows_its_prompt_as_an_aid_marker_and_marks_running() {
-        use crate::session::ReopenReason;
-        let prompt = crate::voice::recovery_prompt(ReopenReason::DanglingFailure);
-        let (t, effects) = fresh().apply_event(Event::recovery_run(
-            crate::session::RecoveryShape::Handoff,
-            ReopenReason::DanglingFailure,
-            prompt,
-        ));
-        assert_eq!(items(&t), vec![marker(&format!("» {prompt}"), Tone::Aid)]);
-        assert_eq!(t.status, Status::Running);
-        assert_eq!(effects, vec![Effect::PinBottom]);
-    }
-
-    // A Plan refresh (CONTEXT.md: Anchor) shows a CONCISE Aid marker, never the
-    // plan body: the full anchor text stays on the Session-Log emit seam.
-    #[test]
-    fn an_anchor_shows_a_concise_plan_refreshed_aid_marker() {
-        let full_anchor = "[anchor - current goal and plan]\n\nOriginal task:\nfix it\n\n\
-                           Current plan:\n- step one\n- step two";
-        let (t, effects) = fresh().apply_event(Event::anchor(full_anchor));
-        assert_eq!(effects, vec![]);
-        // The concise marker, not the plan body.
-        assert_eq!(items(&t), vec![marker("⚑ plan refreshed", Tone::Aid)]);
-        let TranscriptItem::Marker { text, .. } = &items(&t)[0] else {
-            panic!("expected a Marker");
-        };
-        assert!(
-            !text.contains("step one"),
-            "the plan body must not reach the Transcript"
-        );
-    }
-
     // The Endgame narrowing to run_command (the Verification Pass) shows a
     // Constrain marker naming the surviving tool.
     #[test]
@@ -1587,57 +1619,6 @@ mod tests {
             items(&t),
             vec![marker("⊘ tools withdrawn", Tone::Constrain)]
         );
-    }
-
-    #[test]
-    fn wrap_up_warning_shows_as_a_constrain_marker() {
-        let warning = crate::voice::wrap_up_warning(2);
-        let (t, effects) = fresh().apply_event(Event::voiced(
-            crate::event::VoicedTag::WrapUpWarning,
-            warning.clone(),
-        ));
-        // The Endgame run-close schedule limits the model: a Constrain marker.
-        assert_eq!(
-            items(&t),
-            vec![marker(&format!("▪ {warning}"), Tone::Constrain)]
-        );
-        assert_eq!(effects, vec![]);
-    }
-
-    #[test]
-    fn verification_pass_shows_as_a_constrain_marker() {
-        let prompt = crate::voice::verification_pass_prompt();
-        let (t, effects) = fresh().apply_event(Event::voiced(
-            crate::event::VoicedTag::VerificationPass,
-            prompt,
-        ));
-        assert_eq!(
-            items(&t),
-            vec![marker(&format!("▪ {prompt}"), Tone::Constrain)]
-        );
-        assert_eq!(effects, vec![]);
-    }
-
-    // The remaining voiced riders each land as ONE toned marker with no
-    // effects, through the same shared arm: the corrective Nudges are Aid
-    // (`»`), the Endgame's FinalPass is Constrain (`▪`).
-    #[test]
-    fn the_remaining_voiced_riders_show_as_toned_markers() {
-        use crate::event::VoicedTag;
-        for (tag, tone, glyph) in [
-            (VoicedTag::VerifyFailedNudge, Tone::Aid, "»"),
-            (VoicedTag::EmptyResponseNudge, Tone::Aid, "»"),
-            (VoicedTag::ExploreNudge, Tone::Aid, "»"),
-            (VoicedTag::FinalPass, Tone::Constrain, "▪"),
-        ] {
-            let (t, effects) = fresh().apply_event(Event::voiced(tag, "[rider text]"));
-            assert_eq!(effects, vec![], "{tag:?} minted effects");
-            assert_eq!(
-                items(&t),
-                vec![marker(&format!("{glyph} [rider text]"), tone)],
-                "{tag:?}"
-            );
-        }
     }
 
     // A bounded re-draw (ADR-0030) is silent to the Conversation but never to
@@ -1843,35 +1824,6 @@ mod tests {
             ..WaveStats::default()
         };
         assert_eq!(eviction_wave_line(&none), "✂ context wave · 20% dead mass");
-    }
-
-    // Every tone's glyph branch (ADR-0040): Aid/Constrain wear a glyph; the
-    // three tones that author their own glyph elsewhere (Housekeeping,
-    // Steering, Plain) carry none here.
-    #[test]
-    fn marker_glyph_covers_every_tone() {
-        assert_eq!(marker_glyph(Tone::Aid), "»");
-        assert_eq!(marker_glyph(Tone::Constrain), "▪");
-        assert_eq!(marker_glyph(Tone::Housekeeping), "");
-        assert_eq!(marker_glyph(Tone::Steering), "");
-        assert_eq!(marker_glyph(Tone::Plain), "");
-    }
-
-    // A toned line prefixes its glyph and a space when the tone carries one,
-    // and passes the text through unchanged when it does not (the empty-glyph
-    // branch).
-    #[test]
-    fn marker_line_prefixes_a_glyph_only_when_the_tone_has_one() {
-        // Non-empty glyph: prefix plus a space.
-        assert_eq!(marker_line(Tone::Aid, "plan refreshed"), "» plan refreshed");
-        assert_eq!(
-            marker_line(Tone::Constrain, "tools withdrawn"),
-            "▪ tools withdrawn"
-        );
-        // Empty glyph: the text is returned verbatim, no leading space.
-        assert_eq!(marker_line(Tone::Housekeeping, "✂ evicted"), "✂ evicted");
-        assert_eq!(marker_line(Tone::Steering, "↳ queued: x"), "↳ queued: x");
-        assert_eq!(marker_line(Tone::Plain, "news"), "news");
     }
 
     #[test]

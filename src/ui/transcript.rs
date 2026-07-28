@@ -448,7 +448,7 @@ fn truncate(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::presenter::Presenter;
-    use crate::view_model::{LineStyle, StyledLine};
+    use crate::view_model::{DiffHunk, DiffLine, DiffSide};
     use serde_json::json;
 
     // --- helpers ------------------------------------------------------------
@@ -821,8 +821,21 @@ mod tests {
 
     // --- presentment -----------------------------------------------------------
 
-    struct BlockPresenter;
-    impl Presenter for BlockPresenter {
+    // A first-class Diff item as the Diff extension's Presenter would emit.
+    fn diff_item(name: &str) -> TranscriptItem {
+        TranscriptItem::Diff {
+            title: format!("diff {name}"),
+            lang: None,
+            hunks: vec![DiffHunk {
+                header: None,
+                lines: vec![DiffLine::new(DiffSide::Added, "new line")],
+            }],
+            elided: 0,
+        }
+    }
+
+    struct DiffPresenter;
+    impl Presenter for DiffPresenter {
         fn present(
             &self,
             item: TranscriptItem,
@@ -834,10 +847,7 @@ mod tests {
                     name,
                     is_error: false,
                     ..
-                } if artifacts.contains_key("diff") => TranscriptItem::Block {
-                    title: format!("diff {name}"),
-                    lines: vec![StyledLine::new(LineStyle::Added, "+ new line")],
-                },
+                } if artifacts.contains_key("diff") => diff_item(name),
                 _ => item,
             }
         }
@@ -867,7 +877,7 @@ mod tests {
 
     #[test]
     fn extension_replaces_tool_result_summary_using_artifacts() {
-        let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
+        let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_result(
             "t1",
             "edit_file".into(),
@@ -875,18 +885,12 @@ mod tests {
             false,
             &diff_artifacts(),
         );
-        assert_eq!(
-            t.items(),
-            vec![TranscriptItem::Block {
-                title: "diff edit_file".into(),
-                lines: vec![StyledLine::new(LineStyle::Added, "+ new line")],
-            }]
-        );
+        assert_eq!(t.items(), vec![diff_item("edit_file")]);
     }
 
     #[test]
     fn without_matching_artifact_default_summary_survives() {
-        let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
+        let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_result("t1", "edit_file".into(), "edited x", false, &HashMap::new());
         assert_eq!(
             t.items(),
@@ -896,7 +900,7 @@ mod tests {
 
     #[test]
     fn tool_call_items_pass_through_present() {
-        let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
+        let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_call("t1".into(), "grep".into(), &json!({}));
         assert_eq!(t.items(), vec![tool_call_item("t1", "grep", "")]);
     }
@@ -942,25 +946,19 @@ mod tests {
         }
     }
 
-    // The diff-Block redundancy case: because the paired call is removed, the
-    // Diff extension's Block (whose title summarizes the call) stands alone.
+    // The diff redundancy case: because the paired call is removed, the Diff
+    // extension's Diff item (whose title summarizes the call) stands alone.
     #[test]
-    fn a_diff_block_stands_alone_after_the_paired_call_is_removed() {
-        let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
+    fn a_diff_stands_alone_after_the_paired_call_is_removed() {
+        let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_call(
             "t1".into(),
             "edit_file".into(),
             &json!({"path": "src/x.rs"}),
         );
         t.tool_result("t1", "edit_file".into(), "edited", false, &diff_artifacts());
-        // Only the Block remains - the redundant call line is gone.
-        assert_eq!(
-            t.items(),
-            vec![TranscriptItem::Block {
-                title: "diff edit_file".into(),
-                lines: vec![StyledLine::new(LineStyle::Added, "+ new line")],
-            }]
-        );
+        // Only the Diff remains - the redundant call line is gone.
+        assert_eq!(t.items(), vec![diff_item("edit_file")]);
         assert_eq!(t.revision(), 1);
     }
 
@@ -983,15 +981,7 @@ mod tests {
                 Box::new(|t| t.marker("✂ evicted 3 stale results", Tone::Housekeeping)),
             ),
             ("user", Box::new(|t| t.user("hello"))),
-            (
-                "push",
-                Box::new(|t| {
-                    t.push(TranscriptItem::Block {
-                        title: "block".into(),
-                        lines: vec![StyledLine::new(LineStyle::Added, "+ a")],
-                    })
-                }),
-            ),
+            ("push", Box::new(|t| t.push(diff_item("edit_file")))),
             ("message_start", Box::new(|t| t.message_start())),
             (
                 "message_update",
@@ -1079,24 +1069,31 @@ mod tests {
     // --- item vocabulary ---------------------------------------------------------
 
     // The predicate and its title travel together in the pure core (S1): a
-    // non-empty Block has both; everything else (empty Block, one-line result)
+    // non-empty Diff has both; everything else (empty Diff, one-line result)
     // has neither, so the view never re-implements the fold rule.
     #[test]
     fn foldable_body_and_fold_title_agree_on_what_collapses() {
-        let block = TranscriptItem::Block {
+        let diff = TranscriptItem::Diff {
             title: "edit_file x (+1 -1)".into(),
-            lines: vec![StyledLine::new(LineStyle::Added, "+ a")],
+            lang: None,
+            hunks: vec![DiffHunk {
+                header: None,
+                lines: vec![DiffLine::new(DiffSide::Added, "a")],
+            }],
+            elided: 0,
         };
-        assert!(block.foldable_body().is_some());
-        assert_eq!(block.fold_title(), Some("edit_file x (+1 -1)"));
+        assert!(diff.has_foldable_body());
+        assert_eq!(diff.fold_title(), Some("edit_file x (+1 -1)"));
 
-        // An empty Block: no body to fold. (It still HAS a title, but the view
-        // gates on `foldable_body().is_some()`, so it never collapses.)
-        let empty = TranscriptItem::Block {
+        // A Diff with no hunk lines: no body to fold. (It still HAS a title, but
+        // the view gates on `has_foldable_body()`, so it never collapses.)
+        let empty = TranscriptItem::Diff {
             title: "empty".into(),
-            lines: vec![],
+            lang: None,
+            hunks: vec![],
+            elided: 0,
         };
-        assert!(empty.foldable_body().is_none());
+        assert!(!empty.has_foldable_body());
 
         // A merged one-line ToolResult: neither.
         let result = TranscriptItem::ToolResult {
@@ -1105,7 +1102,7 @@ mod tests {
             is_error: false,
             key_arg: Some("src/foo.rs".into()),
         };
-        assert!(result.foldable_body().is_none());
+        assert!(!result.has_foldable_body());
         assert_eq!(result.fold_title(), None);
     }
 }

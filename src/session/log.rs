@@ -16,14 +16,6 @@
 //!     (ADR-0037); the fold repairs a dangling batch
 //!   * `tool_result` - per Tool Result
 //!   * `steering` - delivered Steering (user-voiced)
-//!   * `nudge` - a user-role Nudge (Verify Nudge, Explore Nudge). The fold
-//!     merges it into an open tool-results batch when one is open (the Explore
-//!     Nudge rode that message live), else stands it alone (the Verify Nudge)
-//!   * `rider{tag, text}` - a results-tail rider the model read: the Anchor or
-//!     an Endgame prompt (wrap-up warning, Verification Pass prompt, final-Pass
-//!     prompt), logged as injected. The fold closes the open batch (every
-//!     result of the Pass precedes its riders) and re-injects the text through
-//!     the same merge seam the live Run used
 //!   * `plan` - the model's Plan; held OUTSIDE the Conversation, so the fold
 //!     never runs it into a message; [`plan`] reads the last one back
 //!   * `message` - a verbatim Conversation message; seeds a fresh log on Resume
@@ -45,9 +37,7 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentBlock, Message, Provenance, Role};
-use crate::conversation;
-use crate::session::ReopenReason;
-use crate::session::{RecoveryShape, Session};
+use crate::session::Session;
 use crate::voice::{self, FileOps};
 
 // ------------------------------------------------------------------
@@ -160,38 +150,6 @@ impl SettledEntry {
     }
 }
 
-/// Which rider a `rider` entry carries: the Anchor or one of the Endgame's
-/// tail prompts. Forensic - every kind replays through the one tail-merge
-/// seam it rode live, so the tag never changes the fold's shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiderTag {
-    Anchor,
-    WrapUpWarning,
-    VerificationPass,
-    FinalPass,
-}
-
-impl RiderTag {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RiderTag::Anchor => "anchor",
-            RiderTag::WrapUpWarning => "wrap_up_warning",
-            RiderTag::VerificationPass => "verification_pass",
-            RiderTag::FinalPass => "final_pass",
-        }
-    }
-
-    fn from_str(s: &str) -> Option<RiderTag> {
-        match s {
-            "anchor" => Some(RiderTag::Anchor),
-            "wrap_up_warning" => Some(RiderTag::WrapUpWarning),
-            "verification_pass" => Some(RiderTag::VerificationPass),
-            "final_pass" => Some(RiderTag::FinalPass),
-            _ => None,
-        }
-    }
-}
-
 // ------------------------------------------------------------------
 // The entry enum
 // ------------------------------------------------------------------
@@ -210,11 +168,6 @@ pub enum Entry {
     },
     ToolResult(ContentBlock),
     Steering(String),
-    Nudge(String),
-    Rider {
-        tag: RiderTag,
-        text: String,
-    },
     Plan(String),
     Message(Message),
     Settled {
@@ -228,30 +181,6 @@ pub enum Entry {
         tokens_before: u64,
         file_ops: FileOps,
         original_task: Option<String>,
-    },
-    /// A Handoff seeded a fresh Conversation (CONTEXT.md: Handoff): the
-    /// model's narrative (`None` when the summarization call failed and the
-    /// seed degraded to the mechanical skeleton), the harness-owned facts,
-    /// and the final verification result verbatim. Like `Compacted`, the fold
-    /// discards everything before it and emits the recomposed seed message.
-    Handoff {
-        summary: Option<String>,
-        file_ops: FileOps,
-        original_task: Option<String>,
-        verification: Option<String>,
-    },
-    /// The Voice-authored prompt that opened a Recovery Run (CONTEXT.md:
-    /// Recovery Run) - a Run-starting prompt like `user_text`, but
-    /// distinguishable as Suspenders' voice; `shape` is forensic. `reason`
-    /// (ADR-0043) records which of the three evidences reopened the Run, so an
-    /// Open-Plan continuation greps distinctly AND the fold restores the right
-    /// per-request budget: a broken-state entry restores `recoveries_used`, an
-    /// Open-Plan entry restores `advances_used`. The fold merges the prompt
-    /// through the same seam the live path used.
-    Recovery {
-        shape: RecoveryShape,
-        reason: ReopenReason,
-        text: String,
     },
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
     /// classified error and the attempt number against the budget, forensic
@@ -286,10 +215,6 @@ impl Entry {
         match self {
             Entry::UserText(text) => json!({"e": "user_text", "text": text}),
             Entry::Steering(text) => json!({"e": "steering", "text": text}),
-            Entry::Nudge(text) => json!({"e": "nudge", "text": text}),
-            Entry::Rider { tag, text } => {
-                json!({"e": "rider", "tag": tag.as_str(), "text": text})
-            }
             Entry::Plan(text) => json!({"e": "plan", "text": text}),
             Entry::AssistantBlocks { blocks, provenance } => {
                 let mut value = json!({"e": "assistant_blocks", "blocks": blocks});
@@ -331,26 +256,6 @@ impl Entry {
                 "modified_files": file_ops.modified_files,
                 "original_task": original_task,
             }),
-            Entry::Handoff {
-                summary,
-                file_ops,
-                original_task,
-                verification,
-            } => json!({
-                "e": "handoff",
-                "summary": summary,
-                "read_files": file_ops.read_files,
-                "modified_files": file_ops.modified_files,
-                "original_task": original_task,
-                "verification": verification,
-            }),
-            Entry::Recovery {
-                shape,
-                reason,
-                text,
-            } => {
-                json!({"e": "recovery", "shape": shape.as_str(), "reason": reason.as_str(), "text": text})
-            }
             Entry::Retry {
                 error,
                 attempt,
@@ -371,16 +276,12 @@ impl Entry {
         match e {
             "user_text" => Some(Entry::UserText(string_field(m, "text")?)),
             "steering" => Some(Entry::Steering(string_field(m, "text")?)),
-            "nudge" => Some(Entry::Nudge(string_field(m, "text")?)),
-            "rider" => parse_rider(m),
             "plan" => Some(Entry::Plan(string_field(m, "text")?)),
             "assistant_blocks" => parse_assistant_blocks(m),
             "tool_result" => parse_tool_result(m),
             "message" => parse_message(m),
             "settled" => parse_settled(m),
             "compacted" => parse_compacted(m),
-            "handoff" => parse_handoff(m),
-            "recovery" => parse_recovery(m),
             "retry" => parse_retry(m),
             _ => None,
         }
@@ -389,13 +290,6 @@ impl Entry {
 
 // Per-kind entry parsers. Each returns `None` on a shape mismatch - the same
 // torn-line tolerance `from_json` carries to the fold.
-
-fn parse_rider(m: &serde_json::Value) -> Option<Entry> {
-    Some(Entry::Rider {
-        tag: RiderTag::from_str(m.get("tag")?.as_str()?)?,
-        text: string_field(m, "text")?,
-    })
-}
 
 fn parse_assistant_blocks(m: &serde_json::Value) -> Option<Entry> {
     let blocks = decode_blocks(m.get("blocks")?)?;
@@ -469,34 +363,6 @@ fn parse_compacted(m: &serde_json::Value) -> Option<Entry> {
             .get("original_task")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-    })
-}
-
-fn parse_handoff(m: &serde_json::Value) -> Option<Entry> {
-    Some(Entry::Handoff {
-        summary: string_field(m, "summary"),
-        file_ops: FileOps {
-            read_files: decode_str_list(m.get("read_files")),
-            modified_files: decode_str_list(m.get("modified_files")),
-        },
-        original_task: string_field(m, "original_task"),
-        verification: string_field(m, "verification"),
-    })
-}
-
-fn parse_recovery(m: &serde_json::Value) -> Option<Entry> {
-    Some(Entry::Recovery {
-        shape: RecoveryShape::parse(m.get("shape")?.as_str()?)?,
-        // A pre-ADR-0043 entry (or a foreign token) has no valid reason: it
-        // degrades to a broken-state recovery, never a torn line - the same
-        // optional-field tolerance the settled entry's `reason` takes. Every
-        // logged recovery before ADR-0043 was broken-state, so this is exact.
-        reason: m
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .and_then(ReopenReason::parse)
-            .unwrap_or(ReopenReason::UnverifiedWrites),
-        text: string_field(m, "text")?,
     })
 }
 
@@ -820,73 +686,21 @@ pub fn plan(path: &str) -> Option<String> {
     last
 }
 
-/// Broken-state Recovery Runs the logged Session consumed serving its CURRENT
-/// user request: `recovery` entries whose `reason` is NOT `OpenPlan`, since the
-/// last `user_text` (a genuine or rolled-over prompt resets the count exactly
-/// as the live Agent's does on a submit). Restores the `repair_limit` bound on
-/// Resume so a resumed Session cannot re-trigger recoveries unboundedly. A torn
-/// line stops the scan, like the fold.
-pub fn recoveries_used(path: &str) -> u64 {
-    recovery_counts(path).0
-}
-
-/// Open-Plan continuations the logged Session consumed serving its CURRENT user
-/// request (ADR-0043): `recovery` entries whose `reason` IS `OpenPlan`, since
-/// the last `user_text`. Restores the `advance_limit` bound on Resume,
-/// symmetrically to [`recoveries_used`].
-pub fn advances_used(path: &str) -> u64 {
-    recovery_counts(path).1
-}
-
-// The two per-request recovery budgets a Resume restores, from one scan:
-// `(recoveries, advances)` since the last `user_text`, split by the entry's
-// reason. A torn line stops the scan, like the fold; a foreign/missing reason
-// decoded as `UnverifiedWrites` counts as a broken-state recovery.
-fn recovery_counts(path: &str) -> (u64, u64) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return (0, 0);
-    };
-    let mut recoveries = 0;
-    let mut advances = 0;
-    // Skip the header line: it is not an entry.
-    for line in content.lines().filter(|l| !l.is_empty()).skip(1) {
-        match decode_line(line).and_then(|v| Entry::from_json(&v)) {
-            Some(Entry::UserText(_)) => {
-                recoveries = 0;
-                advances = 0;
-            }
-            Some(Entry::Recovery { reason, .. }) => {
-                if reason == ReopenReason::OpenPlan {
-                    advances += 1;
-                } else {
-                    recoveries += 1;
-                }
-            }
-            Some(_) => {}
-            None => break,
-        }
-    }
-    (recoveries, advances)
-}
-
 // ------------------------------------------------------------------
 // Resume: fold a log file into Conversation messages
 // ------------------------------------------------------------------
 
 /// A resumed log, folded once. Carries the Conversation `messages` and header
-/// `drift` (the Transcript-facing facts), plus two governance facts derived from
-/// the SAME entry stream the fold walked: the last logged `plan` and the
-/// `recoveries` consumed by the logged request. Because all four come from one
-/// pass that stops at the first torn line, `plan`/`recoveries` here match
-/// [`plan`]/[`recoveries_used`] on the same file exactly, and stay consistent
-/// with the Conversation the fold produced. Private: the Agent unpacks it and
-/// keeps `plan`/`recoveries` outside the Transcript-facing `ResumeInfo`.
+/// `drift` (the Transcript-facing facts), plus the last logged `plan` derived
+/// from the SAME entry stream the fold walked. Because all three come from one
+/// pass that stops at the first torn line, `plan` here matches [`plan`] on the
+/// same file exactly, and stays consistent with the Conversation the fold
+/// produced. Private: the Agent unpacks it and keeps `plan` outside the
+/// Transcript-facing `ResumeInfo`.
 pub(crate) struct Resumed {
     pub(crate) messages: Vec<Message>,
     pub(crate) drift: Vec<Drift>,
     pub(crate) plan: Option<String>,
-    pub(crate) recoveries: u64,
-    pub(crate) advances: u64,
 }
 
 /// Folds a log file into the messages of a Conversation.
@@ -899,12 +713,11 @@ pub fn resume(path: &str, session: &Session) -> Result<(Vec<Message>, Vec<Drift>
     Ok((r.messages, r.drift))
 }
 
-/// Like [`resume`], but also returns the governance facts ([`Resumed::plan`],
-/// [`Resumed::recoveries`]) computed in the SAME single fold - so the Agent
-/// resumes the Plan and the recovery bound without re-reading the file. The two
-/// facts are derived from `entries`, which the loop below stops populating at
-/// the first torn line, so they inherit the fold's tolerance and match the
-/// standalone [`plan`]/[`recoveries_used`] queries line for line.
+/// Like [`resume`], but also returns the last logged Plan ([`Resumed::plan`])
+/// computed in the SAME single fold - so the Agent resumes the Plan without
+/// re-reading the file. It is derived from `entries`, which the loop below stops
+/// populating at the first torn line, so it inherits the fold's tolerance and
+/// matches the standalone [`plan`] query line for line.
 pub(crate) fn resume_governed(path: &str, session: &Session) -> Result<Resumed, ResumeError> {
     let content = std::fs::read_to_string(path).map_err(|e| ResumeError::Read(e.to_string()))?;
 
@@ -924,39 +737,24 @@ pub(crate) fn resume_governed(path: &str, session: &Session) -> Result<Resumed, 
         }
     }
 
-    let (plan, recoveries, advances) = governance_counts(&entries);
+    let plan = last_plan(&entries);
 
     Ok(Resumed {
         messages: fold(&entries),
         drift: drift(&header, session),
         plan,
-        recoveries,
-        advances,
     })
 }
 
-// Derive the governance facts from the same tolerated entry stream,
-// mirroring `plan`/`recoveries_used`/`advances_used` exactly: `plan` is the
-// last Plan seen; `recoveries` counts broken-state Recovery entries and
-// `advances` counts Open-Plan ones since the last UserText (reset on a
-// genuine or rolled-over prompt, as the live Agent resets on submit).
-fn governance_counts(entries: &[Entry]) -> (Option<String>, u64, u64) {
+// The last Plan seen in the tolerated entry stream, mirroring [`plan`] exactly.
+fn last_plan(entries: &[Entry]) -> Option<String> {
     let mut plan: Option<String> = None;
-    let mut recoveries: u64 = 0;
-    let mut advances: u64 = 0;
     for entry in entries {
-        match entry {
-            Entry::Plan(text) => plan = Some(text.clone()),
-            Entry::UserText(_) => {
-                recoveries = 0;
-                advances = 0;
-            }
-            Entry::Recovery { reason, .. } if *reason == ReopenReason::OpenPlan => advances += 1,
-            Entry::Recovery { .. } => recoveries += 1,
-            _ => {}
+        if let Entry::Plan(text) = entry {
+            plan = Some(text.clone());
         }
     }
-    (plan, recoveries, advances)
+    plan
 }
 
 fn check_root(header: &serde_json::Value, session: &Session) -> Result<(), ResumeError> {
@@ -1063,23 +861,6 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             flush(messages, batch.take());
             messages.push(user_message(vec![text_block(text)]));
         }
-        // A Nudge is user-role text. With an open batch it folds INTO the
-        // tool-results user message via the steering carrier (the Explore
-        // Nudge rode that message live); standing alone (Verify Nudge) with no
-        // results, flush emits `assistant + user([nudge])` identically.
-        Entry::Nudge(text) => match batch {
-            Some(b) => b.steering.push(text.clone()),
-            None => messages.push(user_message(vec![text_block(text)])),
-        },
-        // A rider rode the trailing tool-results user message live, after
-        // every result of its Pass - the open batch is complete, so it can
-        // flush before the rider re-injects through the same merge seam
-        // `apply_tail` used ([`conversation::merge_user_text`]; the Anchor's
-        // `inject_anchor` IS that seam). The tag never varies the shape.
-        Entry::Rider { text, .. } => {
-            flush(messages, batch.take());
-            conversation::merge_user_text(messages, text.clone());
-        }
         Entry::Message(message) => {
             flush(messages, batch.take());
             messages.push(message.clone());
@@ -1126,34 +907,6 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             *batch = None;
             messages.push(user_message(vec![voice::summary_block(&composed)]));
         }
-        // A Handoff retired the Conversation and seeded a fresh one: like
-        // Compacted, everything folded before this point is discarded and the
-        // seed message is recomposed byte-identically to the live one. The
-        // recovery prompt follows as its own `recovery` entry.
-        Entry::Handoff {
-            summary,
-            file_ops,
-            original_task,
-            verification,
-        } => {
-            let composed = compose_handoff(
-                summary.as_deref(),
-                original_task.as_deref(),
-                file_ops,
-                verification.as_deref(),
-            );
-            messages.clear();
-            *batch = None;
-            messages.push(user_message(vec![voice::summary_block(&composed)]));
-        }
-        // The recovery prompt entered the Conversation on the same seam a
-        // rider crosses: merged into a trailing user message (the Handoff's
-        // seed) or standing as a fresh one (a Continuation, after the
-        // run-limit marker).
-        Entry::Recovery { text, .. } => {
-            flush(messages, batch.take());
-            conversation::merge_user_text(messages, text.clone());
-        }
         Entry::Settled {
             outcome,
             stop_reason,
@@ -1175,29 +928,6 @@ pub fn compose_summary(narrative: &str, original_task: Option<&str>, file_ops: &
     format!(
         "{narrative}\n{}",
         voice::compaction_facts(original_task, file_ops)
-    )
-}
-
-/// The Handoff seed (CONTEXT.md: Handoff): the compaction composition plus the
-/// final verification result verbatim. A `None` narrative is the degraded
-/// mechanical skeleton (the summarization call failed - bounded downside, the
-/// recovery still happens). One author for the live seeding
-/// ([`crate::compaction::Compaction::seed_handoff`]) and the fold's
-/// reconstruction, so Resume rebuilds the same bytes.
-pub fn compose_handoff(
-    narrative: Option<&str>,
-    original_task: Option<&str>,
-    file_ops: &FileOps,
-    verification: Option<&str>,
-) -> String {
-    format!(
-        "{}{}",
-        compose_summary(
-            narrative.unwrap_or(voice::handoff_no_narrative()),
-            original_task,
-            file_ops
-        ),
-        voice::handoff_verification(verification)
     )
 }
 
@@ -1268,12 +998,10 @@ fn close_settled(messages: &mut Vec<Message>, outcome: Settled, stop_reason: Sto
     match outcome {
         Settled::Completed => {
             if matches!(messages.last(), Some(m) if m.role == Role::User) {
-                let marker = if stop_reason == StopReason::RunLimit
-                    || stop_reason == StopReason::RunLimitStuck
-                {
-                    voice::run_limit_marker()
-                } else {
-                    voice::run_stopped_marker()
+                let marker = match stop_reason {
+                    StopReason::RunLimit => voice::run_limit_marker(),
+                    StopReason::RunLimitStuck => voice::loop_stall_marker(),
+                    _ => voice::run_stopped_marker(),
                 };
                 messages.push(Message::assistant(vec![text_block(marker)]));
             }
@@ -1636,216 +1364,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_verify_nudge_entry_folds_as_a_user_message() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("write it".into()));
-        log.append(Entry::assistant_blocks(vec![text("wrote it")]));
-        log.append(Entry::Nudge(
-            "[files changed but nothing verified - ...]".into(),
-        ));
-        log.append(Entry::assistant_blocks(vec![text("verified")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[1].role, Role::Assistant);
-        assert_eq!(messages[2].role, Role::User);
-        assert!(
-            matches!(&messages[2].content[0], ContentBlock::Text { text } if text.starts_with("[files changed"))
-        );
-        assert_eq!(messages[3].role, Role::Assistant);
-    }
-
-    #[test]
-    fn an_explore_nudge_folds_into_the_tool_results_user_message_it_rode_live() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("evaluate this project".into()));
-        log.append(Entry::assistant_blocks(vec![tool_use(
-            "t1",
-            "read_file",
-            json!({"path": "a.txt"}),
-        )]));
-        log.append(Entry::ToolResult(tool_result("t1", "defmodule A")));
-        log.append(Entry::Nudge(
-            "[reading file after file - dispatch explore instead]".into(),
-        ));
-        log.append(Entry::assistant_blocks(vec![text("ok, exploring")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(
-            messages[0],
-            user_message(vec![text("evaluate this project")])
-        );
-        assert_eq!(messages[1].role, Role::Assistant);
-        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { id, .. } if id == "t1"));
-        assert_eq!(messages[2].role, Role::User);
-        assert!(matches!(
-            &messages[2].content[0],
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
-        ));
-        assert!(
-            matches!(&messages[2].content[1], ContentBlock::Text { text } if text.starts_with("[reading file after file"))
-        );
-        assert_eq!(messages[3].role, Role::Assistant);
-        assert!(
-            matches!(&messages[3].content[0], ContentBlock::Text { text } if text == "ok, exploring")
-        );
-    }
-
-    // ---- riders (the Anchor + the Endgame's tail prompts) ----
-
-    #[test]
-    fn riders_fold_into_the_tool_results_user_message_they_rode_live() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("go".into()));
-        log.append(Entry::assistant_blocks(vec![tool_use(
-            "t1",
-            "list_files",
-            json!({"path": "."}),
-        )]));
-        log.append(Entry::ToolResult(tool_result("t1", "a.txt")));
-        log.append(Entry::Rider {
-            tag: RiderTag::Anchor,
-            text: "[anchor] the goal: go".into(),
-        });
-        log.append(Entry::Rider {
-            tag: RiderTag::WrapUpWarning,
-            text: "[2 passes remain - wrap up]".into(),
-        });
-        log.append(Entry::assistant_blocks(vec![text("wrapping")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        assert_eq!(
-            messages,
-            vec![
-                user_message(vec![text("go")]),
-                Message::assistant(vec![tool_use("t1", "list_files", json!({"path": "."}))]),
-                user_message(vec![
-                    tool_result("t1", "a.txt"),
-                    text("[anchor] the goal: go"),
-                    text("[2 passes remain - wrap up]"),
-                ]),
-                Message::assistant(vec![text("wrapping")]),
-            ]
-        );
-    }
-
-    #[test]
-    fn the_verification_and_final_pass_prompts_fold_on_the_same_seam() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("edit it".into()));
-        log.append(Entry::assistant_blocks(vec![tool_use(
-            "t1",
-            "edit_file",
-            json!({"path": "a.ex"}),
-        )]));
-        log.append(Entry::ToolResult(tool_result("t1", "edited")));
-        log.append(Entry::Rider {
-            tag: RiderTag::VerificationPass,
-            text: "[verify your changes now]".into(),
-        });
-        log.append(Entry::assistant_blocks(vec![tool_use(
-            "t2",
-            "run_command",
-            json!({"command": "mix test"}),
-        )]));
-        log.append(Entry::ToolResult(tool_result("t2", "0 failures")));
-        log.append(Entry::Rider {
-            tag: RiderTag::FinalPass,
-            text: "[final pass - conclude]".into(),
-        });
-        log.append(Entry::assistant_blocks(vec![text("done, verified")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        assert_eq!(
-            messages,
-            vec![
-                user_message(vec![text("edit it")]),
-                Message::assistant(vec![tool_use("t1", "edit_file", json!({"path": "a.ex"}))]),
-                user_message(vec![
-                    tool_result("t1", "edited"),
-                    text("[verify your changes now]"),
-                ]),
-                Message::assistant(vec![tool_use(
-                    "t2",
-                    "run_command",
-                    json!({"command": "mix test"}),
-                )]),
-                user_message(vec![
-                    tool_result("t2", "0 failures"),
-                    text("[final pass - conclude]"),
-                ]),
-                Message::assistant(vec![text("done, verified")]),
-            ]
-        );
-    }
-
-    #[test]
-    fn every_rider_tag_survives_the_file_round_trip() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("go".into()));
-        for (tag, text) in [
-            (RiderTag::Anchor, "[a]"),
-            (RiderTag::WrapUpWarning, "[w]"),
-            (RiderTag::VerificationPass, "[v]"),
-            (RiderTag::FinalPass, "[f]"),
-        ] {
-            log.append(Entry::Rider {
-                tag,
-                text: text.into(),
-            });
-        }
-
-        // No open batch: each rider merges into the trailing user message -
-        // the same role-alternation rule the live seam applies. The log ends
-        // mid-Run, so the fold settles it as failed.
-        let (messages, _) = resume(&log.path, &session).unwrap();
-        assert_eq!(
-            messages,
-            vec![
-                user_message(vec![
-                    text("go"),
-                    text("[a]"),
-                    text("[w]"),
-                    text("[v]"),
-                    text("[f]"),
-                ]),
-                Message::assistant(vec![text("[turn failed]")]),
-            ]
-        );
-    }
-
     // ---- crash modes ----
 
     #[test]
@@ -2145,215 +1663,6 @@ mod tests {
         assert_eq!(folded, compacted.messages);
     }
 
-    // ---- Recovery Run entries (Continuation + Handoff) ----
-
-    #[test]
-    fn a_continuation_recovery_prompt_folds_as_a_fresh_user_message_after_the_marker() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("fix the tests".into()));
-        log.append(Entry::assistant_blocks(vec![tool_use(
-            "t1",
-            "edit_file",
-            json!({"path": "a.ex"}),
-        )]));
-        log.append(Entry::ToolResult(tool_result("t1", "edited")));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::RunLimit,
-            reason: None,
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
-            reason: ReopenReason::UnverifiedWrites,
-            text: "[recovery prompt]".into(),
-        });
-        log.append(Entry::assistant_blocks(vec![text("recovered")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        assert_eq!(
-            messages,
-            vec![
-                user_message(vec![text("fix the tests")]),
-                Message::assistant(vec![tool_use("t1", "edit_file", json!({"path": "a.ex"}))]),
-                user_message(vec![tool_result("t1", "edited")]),
-                Message::assistant(vec![text("[turn limit reached - reply to continue]")]),
-                user_message(vec![text("[recovery prompt]")]),
-                Message::assistant(vec![text("recovered")]),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_handoff_fold_discards_history_and_recomposes_the_seed_with_the_prompt_merged() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("fix the tests".into()));
-        log.append(Entry::assistant_blocks(vec![text("failing attempt")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::RunLimit,
-            reason: None,
-        });
-        log.append(Entry::Handoff {
-            summary: Some("narrative of the dying turn".into()),
-            file_ops: FileOps {
-                read_files: vec!["lib/a.ex".into()],
-                modified_files: vec!["lib/b.ex".into()],
-            },
-            original_task: Some("fix the tests".into()),
-            verification: Some("exit 1\n2 tests failed".into()),
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::DanglingFailure,
-            text: "[recovery prompt]".into(),
-        });
-        log.append(Entry::assistant_blocks(vec![text("recovered")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        // Everything before the handoff is gone; the seed message is the
-        // composed handoff plus the prompt merged onto the same message -
-        // byte-identical to the live seeding path.
-        assert_eq!(messages.len(), 2);
-        let composed = compose_handoff(
-            Some("narrative of the dying turn"),
-            Some("fix the tests"),
-            &FileOps {
-                read_files: vec!["lib/a.ex".into()],
-                modified_files: vec!["lib/b.ex".into()],
-            },
-            Some("exit 1\n2 tests failed"),
-        );
-        assert_eq!(
-            messages[0],
-            user_message(vec![
-                voice::summary_block(&composed),
-                text("[recovery prompt]"),
-            ])
-        );
-        assert_eq!(messages[1], Message::assistant(vec![text("recovered")]));
-
-        // The composed seed carries every mechanical fact.
-        let seed = match &messages[0].content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            other => panic!("expected text, got {other:?}"),
-        };
-        assert!(seed.contains("fix the tests"));
-        assert!(seed.contains("narrative of the dying turn"));
-        assert!(seed.contains("lib/a.ex"));
-        assert!(seed.contains("lib/b.ex"));
-        assert!(seed.contains("exit 1\n2 tests failed"));
-    }
-
-    #[test]
-    fn a_degraded_handoff_folds_without_a_narrative() {
-        let (_tmp, session, mut log) = open_log();
-
-        log.append(Entry::UserText("go".into()));
-        log.append(Entry::Handoff {
-            summary: None,
-            file_ops: FileOps::default(),
-            original_task: Some("go".into()),
-            verification: None,
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::DanglingFailure,
-            text: "[recovery prompt]".into(),
-        });
-        log.append(Entry::assistant_blocks(vec![text("done")]));
-        log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::EndTurn,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-        let seed = match &messages[0].content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            other => panic!("expected text, got {other:?}"),
-        };
-        assert!(seed.contains(voice::handoff_no_narrative()));
-        assert!(seed.contains("go"));
-        assert!(seed.contains("- none was run"));
-    }
-
-    #[test]
-    fn recovery_entries_round_trip_the_file_with_their_shape_and_reason() {
-        let (_tmp, _session, mut log) = open_log();
-
-        // Every (shape, reason) combination the mechanic produces: broken-state
-        // reasons on either shape, and the Open Plan always on Continuation.
-        let cases = [
-            (
-                RecoveryShape::Handoff,
-                ReopenReason::DanglingFailure,
-                "[df]",
-            ),
-            (
-                RecoveryShape::Handoff,
-                ReopenReason::UnverifiedWrites,
-                "[uw]",
-            ),
-            (RecoveryShape::Continuation, ReopenReason::OpenPlan, "[op]"),
-        ];
-        for (shape, reason, text) in cases {
-            log.append(Entry::Recovery {
-                shape,
-                reason,
-                text: text.into(),
-            });
-        }
-
-        let content = std::fs::read_to_string(&log.path).unwrap();
-        let entries: Vec<Entry> = content
-            .lines()
-            .skip(1)
-            .filter_map(|l| decode_line(l).and_then(|v| Entry::from_json(&v)))
-            .collect();
-        assert_eq!(
-            entries,
-            cases
-                .iter()
-                .map(|(shape, reason, text)| Entry::Recovery {
-                    shape: *shape,
-                    reason: *reason,
-                    text: (*text).into(),
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn a_pre_adr_0043_recovery_entry_without_a_reason_decodes_as_broken_state() {
-        // Backward compatibility: a `recovery` line missing the `reason` key
-        // (every recovery logged before ADR-0043 was broken-state) decodes as
-        // UnverifiedWrites, never a torn line.
-        let line = r#"{"e":"recovery","shape":"handoff","text":"[r]"}"#;
-        let decoded = decode_line(line).and_then(|v| Entry::from_json(&v));
-        assert_eq!(
-            decoded,
-            Some(Entry::Recovery {
-                shape: RecoveryShape::Handoff,
-                reason: ReopenReason::UnverifiedWrites,
-                text: "[r]".into(),
-            })
-        );
-    }
-
     // ---- retry entries (ADR-0030) ----
 
     #[test]
@@ -2425,81 +1734,7 @@ mod tests {
         );
     }
 
-    // ---- recoveries_used/1 ----
-
-    #[test]
-    fn recoveries_used_counts_recovery_entries_since_the_last_user_prompt() {
-        let (_tmp, _session, mut log) = open_log();
-
-        assert_eq!(recoveries_used(&log.path), 0);
-
-        log.append(Entry::UserText("first request".into()));
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
-            reason: ReopenReason::UnverifiedWrites,
-            text: "[r1]".into(),
-        });
-        assert_eq!(recoveries_used(&log.path), 1);
-
-        // A genuine user prompt starts a new request: the count resets.
-        log.append(Entry::UserText("second request".into()));
-        assert_eq!(recoveries_used(&log.path), 0);
-
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::DanglingFailure,
-            text: "[r2]".into(),
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::UnverifiedWrites,
-            text: "[r3]".into(),
-        });
-        assert_eq!(recoveries_used(&log.path), 2);
-    }
-
-    #[test]
-    fn advances_used_counts_only_open_plan_recovery_entries_since_the_last_prompt() {
-        // ADR-0043: the two budgets are separate counters over the same
-        // `recovery` entries, split by reason.
-        let (_tmp, _session, mut log) = open_log();
-
-        assert_eq!(advances_used(&log.path), 0);
-
-        log.append(Entry::UserText("request".into()));
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::DanglingFailure,
-            text: "[broken]".into(),
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
-            reason: ReopenReason::OpenPlan,
-            text: "[open1]".into(),
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
-            reason: ReopenReason::OpenPlan,
-            text: "[open2]".into(),
-        });
-
-        // The broken-state entry counts as a recovery, the two Open-Plan
-        // entries as advances - neither budget bleeds into the other.
-        assert_eq!(recoveries_used(&log.path), 1);
-        assert_eq!(advances_used(&log.path), 2);
-
-        // A genuine user prompt resets BOTH.
-        log.append(Entry::UserText("next request".into()));
-        assert_eq!(recoveries_used(&log.path), 0);
-        assert_eq!(advances_used(&log.path), 0);
-    }
-
-    #[test]
-    fn recoveries_used_is_zero_for_missing_or_foreign_files() {
-        assert_eq!(recoveries_used("/definitely/not/here.jsonl"), 0);
-    }
-
-    // ---- plan/recoveries_used read under the fold's torn-line tolerance ----
+    // ---- plan read under the fold's torn-line tolerance ----
 
     // A torn line is a truncated JSON object (a crash mid-write), the shape the
     // fold's `a_torn_last_line_is_dropped` uses. The header const and the
@@ -2525,17 +1760,15 @@ mod tests {
         assert_eq!(plan(&path), None);
     }
 
-    // A torn HEADER line: [`plan`] and [`recoveries_used`] both skip line 1
-    // unconditionally (header validation is [`resume`]'s job, not theirs), so a
-    // single torn header alone leaves nothing to scan - both read empty. The
-    // point of the test is that the two agree, the consistency the fix
-    // establishes; neither invents an entry from a log with no valid entries.
+    // A torn HEADER line: [`plan`] skips line 1 unconditionally (header
+    // validation is [`resume`]'s job, not its), so a single torn header alone
+    // leaves nothing to scan - it reads empty, never inventing an entry from a
+    // log with no valid entries.
     #[test]
-    fn plan_and_recoveries_used_agree_when_the_header_line_is_torn() {
+    fn plan_is_none_when_the_header_line_is_torn() {
         let tmp = TempDir::new().unwrap();
         let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[TORN_LINE]);
         assert_eq!(plan(&path), None);
-        assert_eq!(recoveries_used(&path), 0);
     }
 
     #[test]
@@ -2558,85 +1791,35 @@ mod tests {
     }
 
     #[test]
-    fn recoveries_used_stops_at_the_first_torn_line() {
-        let tmp = TempDir::new().unwrap();
-        let path = write_log(
-            tmp.path(),
-            "20260101-000000-1.jsonl",
-            &[
-                TEST_HEADER,
-                r#"{"e":"user_text","text":"go"}"#,
-                r#"{"e":"recovery","shape":"continuation","text":"[r1]"}"#,
-                TORN_LINE,
-                r#"{"e":"recovery","shape":"continuation","text":"[r2]"}"#,
-            ],
-        );
-        // Only the recovery before the tear is counted; the one after it is
-        // dropped just as the fold drops everything past a torn line.
-        assert_eq!(recoveries_used(&path), 1);
-    }
-
-    #[test]
-    fn recoveries_used_and_plan_are_zero_none_for_a_header_only_log() {
+    fn plan_is_none_for_a_header_only_log_again() {
         let tmp = TempDir::new().unwrap();
         let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[TEST_HEADER]);
-        assert_eq!(recoveries_used(&path), 0);
         assert_eq!(plan(&path), None);
     }
 
-    #[test]
-    fn recoveries_used_is_zero_for_an_empty_file() {
-        let tmp = TempDir::new().unwrap();
-        let path = write_log(tmp.path(), "20260101-000000-1.jsonl", &[]);
-        assert_eq!(recoveries_used(&path), 0);
-    }
-
-    // ---- resume_governed folds the governance facts once ----
+    // ---- resume_governed folds the Plan once ----
     //
-    // The single fold's `plan`/`recoveries` MUST equal the standalone
-    // `plan`/`recoveries_used` queries on the same file: same last-Plan and
-    // same recovery-since-last-user_text semantics, same torn-line tolerance.
+    // The single fold's `plan` MUST equal the standalone `plan` query on the
+    // same file: same last-Plan semantics, same torn-line tolerance.
 
     #[test]
-    fn resume_governed_plan_and_recoveries_match_the_standalone_queries() {
+    fn resume_governed_plan_matches_the_standalone_query() {
         let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::Plan("Goal: A. 1. read [x]".into()));
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::UnverifiedWrites,
-            text: "[r1]".into(),
-        });
-        // A fresh prompt resets the recovery count (matching the live Agent's
-        // reset on submit); the later Plan is the one that resumes.
+        // A fresh prompt then a new Plan; the later Plan is the one that resumes.
         log.append(Entry::UserText("now do B".into()));
         log.append(Entry::Plan("Goal: B. 1. edit [ ]".into()));
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            reason: ReopenReason::UnverifiedWrites,
-            text: "[r2]".into(),
-        });
-        // An Open-Plan continuation this request too: it feeds `advances`, not
-        // `recoveries`, so the two governance counters stay separate (ADR-0043).
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
-            reason: ReopenReason::OpenPlan,
-            text: "[r3]".into(),
-        });
 
         let r = resume_governed(&log.path, &session).unwrap();
 
         assert_eq!(r.plan, plan(&log.path));
-        assert_eq!(r.recoveries, recoveries_used(&log.path));
-        assert_eq!(r.advances, advances_used(&log.path));
         assert_eq!(r.plan, Some("Goal: B. 1. edit [ ]".to_string()));
-        assert_eq!(r.recoveries, 1);
-        assert_eq!(r.advances, 1);
     }
 
     #[test]
-    fn resume_governed_matches_the_standalone_queries_under_a_tear() {
+    fn resume_governed_plan_matches_the_standalone_query_under_a_tear() {
         let tmp = TempDir::new().unwrap();
         // The header's root is `/r`; resume needs a Session rooted there.
         let session = Session::build(
@@ -2655,22 +1838,18 @@ mod tests {
                 TEST_HEADER,
                 r#"{"e":"user_text","text":"go"}"#,
                 r#"{"e":"plan","text":"before the tear"}"#,
-                r#"{"e":"recovery","shape":"continuation","text":"[r1]"}"#,
                 TORN_LINE,
                 r#"{"e":"plan","text":"after the tear"}"#,
-                r#"{"e":"recovery","shape":"continuation","text":"[r2]"}"#,
             ],
         );
 
         let r = resume_governed(&path, &session).unwrap();
 
-        // The tear stops the scan for all three derivations identically: the fold
-        // drops the post-tear messages, and `plan`/`recoveries` never observe the
-        // Plan or Recovery after it.
+        // The tear stops the scan for both derivations identically: the fold
+        // drops the post-tear messages, and `plan` never observes the Plan after
+        // it.
         assert_eq!(r.plan, plan(&path));
-        assert_eq!(r.recoveries, recoveries_used(&path));
         assert_eq!(r.plan, Some("before the tear".to_string()));
-        assert_eq!(r.recoveries, 1);
     }
 
     #[test]

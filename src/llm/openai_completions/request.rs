@@ -37,10 +37,11 @@ const MAX_TOKENS_FIELD: &str = "max_tokens";
 /// Sets the model (the Model's bare id - scoping is a Suspenders fact, not a
 /// wire one), the leading system message, the output cap, the streaming flag
 /// plus `stream_options` (usage rides the final chunk only when asked), the
-/// fanned-out messages, tool specs, and (conditionally) temperature and the
-/// no-think field. Keys the server should default are omitted, not sent
-/// empty: no `"tools"` when `tools` is empty, no `"temperature"` when the
-/// request carries `None`.
+/// fanned-out messages, tool specs, and (conditionally) the sampling knobs
+/// (`temperature`, `top_p`, `top_k`) and the no-think field. Keys the server
+/// should default are omitted, not sent empty: no `"tools"` when `tools` is
+/// empty, no `"temperature"`/`"top_p"`/`"top_k"` when the request carries
+/// `None`.
 pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
     let mut obj = Map::new();
     obj.insert("model".into(), json!(model.id));
@@ -63,6 +64,16 @@ pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
 
     if let Some(temp) = request.temperature {
         obj.insert("temperature".into(), json!(temp));
+    }
+
+    // Sampling cutoffs (Qwen3-Coder tuning): each omitted, not sent empty,
+    // when the request carries `None` - the same discipline as temperature.
+    if let Some(top_p) = request.top_p {
+        obj.insert("top_p".into(), json!(top_p));
+    }
+
+    if let Some(top_k) = request.top_k {
+        obj.insert("top_k".into(), json!(top_k));
     }
 
     if request.no_think {
@@ -410,6 +421,30 @@ mod tests {
             &model(),
         );
         assert_eq!(with_temp["temperature"], json!(0.7));
+    }
+
+    #[test]
+    fn nil_top_p_omits_key_configured_one_rides() {
+        let req = build("s", vec![], vec![]);
+        assert!(req.as_object().unwrap().get("top_p").is_none());
+
+        let with_top_p = build_request(
+            &LlmRequest::new("s", vec![], vec![]).with_top_p(Some(0.8)),
+            &model(),
+        );
+        assert_eq!(with_top_p["top_p"], json!(0.8));
+    }
+
+    #[test]
+    fn nil_top_k_omits_key_configured_one_rides() {
+        let req = build("s", vec![], vec![]);
+        assert!(req.as_object().unwrap().get("top_k").is_none());
+
+        let with_top_k = build_request(
+            &LlmRequest::new("s", vec![], vec![]).with_top_k(Some(20)),
+            &model(),
+        );
+        assert_eq!(with_top_k["top_k"], json!(20));
     }
 
     #[test]

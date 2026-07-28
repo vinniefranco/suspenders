@@ -24,11 +24,40 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::content::ContentBlock;
-use crate::conversation::WaveStats;
 use crate::llm::Delta;
 use crate::llm::response::StopReason;
-use crate::session::{RecoveryShape, ReopenReason};
-use crate::view_model::{SelectorRow, Tone};
+use crate::view_model::SelectorRow;
+
+/// What one Eviction wave reclaimed, counted by kind, with the Dead Mass
+/// share at wave time. Retained as a dormant display-side type after the
+/// bespoke Eviction mechanic was retired (Group D): [`Event::EvictionWave`]
+/// and the UI that renders it are no longer emitted, pending a follow-up
+/// prune, so this stub keeps them compiling.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WaveStats {
+    /// Live Tool Results elided by the budget-pressure walk.
+    pub results_elided: u64,
+    /// Older run_command results superseded by an identical later call.
+    pub cmd_superseded: u64,
+    /// Older read_file results superseded by an identical later call.
+    pub read_superseded: u64,
+    /// Successful writes' input bodies replaced with the path-keeping husk.
+    pub edits_husked: u64,
+    /// Superseded Anchors elided.
+    pub anchors_elided: u64,
+    /// The Dead Mass at wave time, as a fraction of the Context Budget.
+    pub dead_mass: f64,
+}
+
+/// Converts a fraction to integer percent (multiplier).
+const PERCENT_MULTIPLIER: f64 = 100.0;
+
+/// The SINGLE rounding rule for a Dead Mass fraction to integer percent, shared
+/// by every surface that shows it (the status bar, the transcript wave line, the
+/// engine's stdout wave print) so they can never disagree. Rounds to nearest.
+pub fn dead_mass_pct(fraction: f64) -> u64 {
+    (fraction * PERCENT_MULTIPLIER).round() as u64
+}
 
 /// The `extension_error` stage: which point in the extension's lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
@@ -49,41 +78,6 @@ impl Stage {
             Stage::PreRun => "pre_run",
             Stage::PostRun => "post_run",
             Stage::Present => "present",
-        }
-    }
-}
-
-/// Baud-voiced text that entered the Conversation (CONTEXT.md: Voice, and a
-/// Nudge is always visible): the finish Nudges, the Explore Nudge, and the
-/// Endgame's tail riders. In baud these share the `voiced/0` type and each
-/// carries `%{text: ...}`; here they are distinct [`Event`] variants (so the
-/// Transcript match stays exhaustive), and [`Event::voiced`] is the shared
-/// constructor keyed by [`VoicedTag`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoicedTag {
-    VerifyNudge,
-    VerifyFailedNudge,
-    EmptyResponseNudge,
-    ExploreNudge,
-    WrapUpWarning,
-    VerificationPass,
-    FinalPass,
-}
-
-impl VoicedTag {
-    /// The marker-plane [`Tone`] this rider carries (ADR-0040), stamped HERE at
-    /// the firing-site authority so no downstream fold classifies by kind or
-    /// text. A Governor's Nudge helps the model along ([`Tone::Aid`]); the
-    /// Endgame's run-closing schedule limits it ([`Tone::Constrain`]).
-    pub fn tone(self) -> Tone {
-        match self {
-            VoicedTag::VerifyNudge
-            | VoicedTag::VerifyFailedNudge
-            | VoicedTag::EmptyResponseNudge
-            | VoicedTag::ExploreNudge => Tone::Aid,
-            VoicedTag::WrapUpWarning | VoicedTag::VerificationPass | VoicedTag::FinalPass => {
-                Tone::Constrain
-            }
         }
     }
 }
@@ -186,55 +180,15 @@ pub enum Event {
         message: String,
     },
 
-    // ---- Baud-voiced text entering the Conversation ----
-    VerifyNudge {
-        text: String,
-    },
-    VerifyFailedNudge {
-        text: String,
-    },
-    EmptyResponseNudge {
-        text: String,
-    },
-    ExploreNudge {
-        text: String,
-    },
-    WrapUpWarning {
-        text: String,
-    },
-    VerificationPass {
-        text: String,
-    },
-    FinalPass {
-        text: String,
-    },
-    /// An Anchor entered the Conversation (CONTEXT.md: Anchor). Placement is
-    /// the anchor Governor's; the content is the Plan's - the model's voice,
-    /// so it carries no [`VoicedTag`]. The `text` is the FULL anchor block the
-    /// Session Log persists (the model read it verbatim); the Transcript shows
-    /// only a concise `⚑ plan refreshed` marker (ADR-0040: an Aid tone), never
-    /// the plan body.
-    Anchor {
-        text: String,
-    },
-
-    /// A Recovery Run opened (CONTEXT.md: Recovery Run): carries the arm
-    /// taken, the reason it reopened (ADR-0043 - so an Open-Plan continuation
-    /// greps distinctly from a broken-state recovery), and the Voice-authored
-    /// prompt that starts it - the prompt enters the Conversation, so the
-    /// Transcript must show it.
-    RecoveryRun {
-        shape: RecoveryShape,
-        reason: ReopenReason,
-        text: String,
-    },
-
     /// The Endgame narrowed the offered Tools (CONTEXT.md: Endgame, Offer;
     /// ADR-0035): carries the surviving tool names (empty on the final Pass,
     /// `run_command` alone on the Verification Pass). Display-side only - the
     /// narrowing itself shapes the request, this event just lets the Transcript
     /// show a concise `⊘ tools narrowed` marker (ADR-0040: a Constrain tone).
-    /// A Governor limiting the model, so it carries no [`VoicedTag`].
+    /// A Governor limiting the model, so it carries no rider tone. Currently
+    /// dormant: the Governor-free loop emits no narrowing (Group C teardown);
+    /// the variant and its Transcript arm remain so a later Offer mechanic can
+    /// re-emit it without re-plumbing the Screen.
     ToolsNarrowed {
         tools: Vec<String>,
     },
@@ -248,6 +202,15 @@ pub enum Event {
         error: String,
         attempt: u64,
         budget: u64,
+    },
+
+    /// The loop-detector terminated a Run: the model emitted the identical
+    /// Tool Call batch `count` times in a row (the configured stall limit).
+    /// A passive circuit breaker - NO steering text enters the Conversation,
+    /// only this operator-visible event and the Run's close marker. Display-side
+    /// only; the durable fact rides the Run's `turn_limit_stuck` settlement.
+    LoopStall {
+        count: u64,
     },
 
     // ---- Slash Command selector (ADR-0032/0033) ----
@@ -332,57 +295,6 @@ impl Event {
         }
     }
 
-    // ---- Baud-voiced text entering the Conversation ----
-
-    /// The shared constructor for the voiced Nudges and Endgame riders,
-    /// mirroring baud's `voiced/2` keyed by tag.
-    pub fn voiced(tag: VoicedTag, text: impl Into<String>) -> Self {
-        let text = text.into();
-        match tag {
-            VoicedTag::VerifyNudge => Event::VerifyNudge { text },
-            VoicedTag::VerifyFailedNudge => Event::VerifyFailedNudge { text },
-            VoicedTag::EmptyResponseNudge => Event::EmptyResponseNudge { text },
-            VoicedTag::ExploreNudge => Event::ExploreNudge { text },
-            VoicedTag::WrapUpWarning => Event::WrapUpWarning { text },
-            VoicedTag::VerificationPass => Event::VerificationPass { text },
-            VoicedTag::FinalPass => Event::FinalPass { text },
-        }
-    }
-
-    /// The marker-plane [`Tone`] a voiced rider carries (ADR-0040), recovered
-    /// from the variant back to its [`VoicedTag`] so the tone decision stays in
-    /// ONE place ([`VoicedTag::tone`]) and the Screen fold never classifies.
-    /// `None` for a non-rider event.
-    pub fn voiced_tone(&self) -> Option<Tone> {
-        let tag = match self {
-            Event::VerifyNudge { .. } => VoicedTag::VerifyNudge,
-            Event::VerifyFailedNudge { .. } => VoicedTag::VerifyFailedNudge,
-            Event::EmptyResponseNudge { .. } => VoicedTag::EmptyResponseNudge,
-            Event::ExploreNudge { .. } => VoicedTag::ExploreNudge,
-            Event::WrapUpWarning { .. } => VoicedTag::WrapUpWarning,
-            Event::VerificationPass { .. } => VoicedTag::VerificationPass,
-            Event::FinalPass { .. } => VoicedTag::FinalPass,
-            _ => return None,
-        };
-        Some(tag.tone())
-    }
-
-    pub fn anchor(text: impl Into<String>) -> Self {
-        Event::Anchor { text: text.into() }
-    }
-
-    pub fn recovery_run(
-        shape: RecoveryShape,
-        reason: ReopenReason,
-        text: impl Into<String>,
-    ) -> Self {
-        Event::RecoveryRun {
-            shape,
-            reason,
-            text: text.into(),
-        }
-    }
-
     pub fn tools_narrowed(tools: Vec<String>) -> Self {
         Event::ToolsNarrowed { tools }
     }
@@ -393,6 +305,10 @@ impl Event {
             attempt,
             budget,
         }
+    }
+
+    pub fn loop_stall(count: u64) -> Self {
+        Event::LoopStall { count }
     }
 
     // ---- Steering ----

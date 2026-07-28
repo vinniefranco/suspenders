@@ -53,7 +53,6 @@ mod tests {
             root: std::path::PathBuf::from("/nowhere"),
             result_cap: 10_000,
             command_timeout_ms: 120_000,
-            scout: None,
         }
     }
 

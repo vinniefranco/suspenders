@@ -9,8 +9,8 @@
 
 /// The semantic TONE of a harness-authored marker (ADR-0040): names WHO acted
 /// and in what spirit, so the adapter tints the marker plane without ever
-/// sniffing the line's text. Like [`crate::ui::transcript::LineStyle`], the
-/// tone is the semantic fact; the terminal color mapping lives in
+/// sniffing the line's text. Like a diff's [`DiffSide`], the tone is the
+/// semantic fact; the terminal color mapping lives in
 /// `ui/components` (a Theme slot per tone). Stamped at the firing site (the
 /// Event that voiced the marker), carried into
 /// [`crate::ui::transcript::Transcript::marker`]; the store never classifies
@@ -124,43 +124,52 @@ impl SelectorRow {
     }
 }
 
-/// The semantic style of one display line inside a [`TranscriptItem::Block`]
-/// (ADR-0008). Names WHAT the line is; the terminal color mapping is
-/// `ui/components`. Mirrors baud's `block_style :: :added | :removed | :context
-/// | :emphasis | :muted`, plus a plain [`LineStyle::Default`] for unstyled text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LineStyle {
+/// Which side of a diff one line sits on (ADR-0008): diff STRUCTURE, not a
+/// display style. Mirrors baud's `{:eq | :del | :ins}` tag. The adapter maps a
+/// side to its marker glyph (`+`/`-`/` `), its background tint, and its fallback
+/// foreground; the two-pass syntect highlighting keys on it (an added or context
+/// line belongs to the after-image, a removed or context line to the before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSide {
     /// An added line (a `+` line in a diff).
     Added,
     /// A removed line (a `-` line in a diff).
     Removed,
-    /// A context line (unchanged, shown for orientation).
+    /// A context line (unchanged, shown for orientation on both sides).
     Context,
-    /// Emphasised text.
-    Emphasis,
-    /// De-emphasised / secondary text (diff headers, elision tails).
-    Muted,
-    /// Plain, unstyled text.
-    #[default]
-    Default,
 }
 
-/// One styled display line inside a [`TranscriptItem::Block`]: a semantic
-/// [`LineStyle`] plus its text. Mirrors baud's `{style, text}` line tuple.
+/// One code line inside a [`DiffHunk`] (ADR-0008): the [`DiffSide`] it sits on
+/// and its RAW code text - no `+`/`-` marker prefix (the adapter adds it), so
+/// the same text also feeds the syntect highlighter. Mirrors baud's
+/// `{tag, text}` line tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StyledLine {
-    pub style: LineStyle,
+pub struct DiffLine {
+    pub side: DiffSide,
     pub text: String,
 }
 
-impl StyledLine {
-    /// A styled line from any style and text.
-    pub fn new(style: LineStyle, text: impl Into<String>) -> Self {
-        StyledLine {
-            style,
+impl DiffLine {
+    /// A diff line from a side and its raw text.
+    pub fn new(side: DiffSide, text: impl Into<String>) -> Self {
+        DiffLine {
+            side,
             text: text.into(),
         }
     }
+}
+
+/// One hunk of a [`TranscriptItem::Diff`] (ADR-0008): an optional unified-diff
+/// header (`@@ -a,b +c,d @@`, `None` for a created file where the header is
+/// noise) and the run of tagged code lines. Structure the Presenter carries and
+/// the adapter renders - the header is a location string, the lines are RAW code
+/// tagged by [`DiffSide`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffHunk {
+    /// The `@@ … @@` unified-diff header, or `None` for a created file.
+    pub header: Option<String>,
+    /// The hunk's tagged code lines, in display order.
+    pub lines: Vec<DiffLine>,
 }
 
 /// A Transcript Item (CONTEXT.md): one entry in the display history.
@@ -179,8 +188,11 @@ impl StyledLine {
 ///   summary a extension's `present` may replace; `key_arg` is the salient input
 ///   arg (path/command/pattern) carried over from the paired call so the merged
 ///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
-/// * `Block { title, lines }` - `{:block, title, lines}`: a titled block of
-///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
+/// * `Diff { title, lang, hunks, elided }` - a first-class diff (ADR-0008): a
+///   title, the source language (derived from the file path, `None` when
+///   unknown), the tagged hunks, and the count of lines elided by the display
+///   cap. The adapter renders the marker glyph, the added/removed background
+///   tint, and the syntect foreground.
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
 ///   plane (the greeting, launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
@@ -215,9 +227,17 @@ pub enum TranscriptItem {
         /// (e.g. governor-injected) - the line falls back to `name → result`.
         key_arg: Option<String>,
     },
-    Block {
+    Diff {
         title: String,
-        lines: Vec<StyledLine>,
+        /// The source language token (a file extension like `rs`/`js`/`json`),
+        /// or `None` when the path has no extension the adapter can resolve. The
+        /// core never names a syntect syntax - it carries the language fact and
+        /// the adapter resolves it (ADR-0019).
+        lang: Option<String>,
+        hunks: Vec<DiffHunk>,
+        /// Lines the display cap elided, rendered as a muted `… N more lines`
+        /// tail; `0` when nothing was cut.
+        elided: usize,
     },
     Info {
         text: String,
@@ -229,38 +249,38 @@ pub enum TranscriptItem {
 }
 
 impl TranscriptItem {
-    /// The body this item collapses to under the global tools toggle (Ctrl-O),
-    /// or `None` if the item has nothing to fold and always renders in full.
+    /// Whether this item has a body that collapses under the global tools
+    /// toggle (Ctrl-O), or `false` if it always renders in full.
     ///
     /// This is the SEMANTIC collapse predicate (Stage 2 review C2): the view's
-    /// fold keys on `foldable_body().is_some()`, not on a structural
-    /// `matches!(item, Block)`, so the merge is free to choose an item's shape
-    /// without re-implementing the fold rule. Today only a [`Block`] with a
-    /// non-empty body folds; a merged one-line `ToolResult` has no body, so it
-    /// never collapses. Stays pure - returns the pure-core [`StyledLine`] slice,
-    /// never a ratatui type (ADR-0019).
+    /// fold keys on `has_foldable_body()`, not on a structural
+    /// `matches!(item, Diff)`, so the merge is free to choose an item's shape
+    /// without re-implementing the fold rule. Today only a [`Diff`] with a
+    /// non-empty hunk folds; a merged one-line `ToolResult` has no body, so it
+    /// never collapses. Stays pure - inspects the pure-core structure, never a
+    /// ratatui type (ADR-0019).
     ///
-    /// [`Block`]: TranscriptItem::Block
-    pub fn foldable_body(&self) -> Option<&[StyledLine]> {
+    /// [`Diff`]: TranscriptItem::Diff
+    pub fn has_foldable_body(&self) -> bool {
         match self {
-            TranscriptItem::Block { lines, .. } if !lines.is_empty() => Some(lines),
-            _ => None,
+            TranscriptItem::Diff { hunks, .. } => hunks.iter().any(|hunk| !hunk.lines.is_empty()),
+            _ => false,
         }
     }
 
     /// The title an item collapses TO under the global tools toggle (Ctrl-O):
-    /// the one-liner the view shows in place of the folded [`foldable_body`].
-    /// Kept beside `foldable_body` so the collapse rule - predicate AND title -
-    /// lives entirely in the pure core (Stage 2 review C2 / S1): the view
-    /// composes the collapsed line from this accessor without matching on
-    /// `Block`, so a future non-Block foldable item collapses the same way.
-    /// Today only a [`Block`] has a fold title.
+    /// the one-liner the view shows in place of the folded body. Kept beside
+    /// [`has_foldable_body`] so the collapse rule - predicate AND title - lives
+    /// entirely in the pure core (Stage 2 review C2 / S1): the view composes the
+    /// collapsed line from this accessor without matching on `Diff`, so a future
+    /// non-Diff foldable item collapses the same way. Today only a [`Diff`] has
+    /// a fold title.
     ///
-    /// [`foldable_body`]: TranscriptItem::foldable_body
-    /// [`Block`]: TranscriptItem::Block
+    /// [`has_foldable_body`]: TranscriptItem::has_foldable_body
+    /// [`Diff`]: TranscriptItem::Diff
     pub fn fold_title(&self) -> Option<&str> {
         match self {
-            TranscriptItem::Block { title, .. } => Some(title),
+            TranscriptItem::Diff { title, .. } => Some(title),
             _ => None,
         }
     }

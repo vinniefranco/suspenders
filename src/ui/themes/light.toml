@@ -9,6 +9,10 @@ syntax = "base16-ocean.light"
 # The conversation plane.
 added = "#1a7f37"
 removed = "#cf222e"
+# Subtle full-width diff tints (ADR-0008): pale green/red on the light ground,
+# GitHub's diff-highlight register, clear of the syntect foreground.
+added_bg = "#e6ffec"
+removed_bg = "#ffebe9"
 context = "#6e7781"
 muted = "#6e7781"
 machinery = "#8c959f"

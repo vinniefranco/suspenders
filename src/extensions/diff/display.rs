@@ -1,17 +1,20 @@
 //! Display formatting for diff artifacts (ADR-0008 semantic display
 //! vocabulary).
 //!
-//! Produces a title string and a list of [`StyledLine`]s from a diff artifact.
-//! Extracted from [`crate::extensions::diff`] so the rendering logic is
-//! unit-testable without a Middleware lifecycle.
+//! Produces a title, the source language, and the tagged [`DiffHunk`]s from a
+//! diff artifact. Extracted from [`crate::extensions::diff`] so the rendering
+//! logic is unit-testable without a Middleware lifecycle.
 //!
-//! Lines carry semantic styles - [`LineStyle::Added`], `Removed`, `Context`,
-//! `Muted` - that a later `ui/components` phase maps to terminal colors.
+//! Lines carry a [`DiffSide`] - `Added`, `Removed`, `Context` - and RAW code
+//! text (no `+`/`-` marker); a later `ui/components` phase maps the side to a
+//! background tint, adds the marker glyph, and layers the syntect foreground.
+//! The Presenter decides WHAT to show (this language, these hunks, this much
+//! elided); the adapter decides HOW.
 
 use serde::{Deserialize, Serialize};
 
 use crate::extensions::diff::hunks::{Hunk, Line, Tag};
-use crate::view_model::{LineStyle, StyledLine};
+use crate::view_model::{DiffHunk, DiffLine, DiffSide};
 
 /// The default display cap: hunks render at most this many lines before eliding
 /// with a muted tail (baud's `lines/2` default). Artifacts cost no Context
@@ -45,60 +48,71 @@ pub fn title(name: &str, diff: &Diff) -> String {
     }
 }
 
-/// Builds a list of display lines for a diff block, capped at `max_lines`.
-///
-/// Created files omit the hunk header (no `@@` lines); otherwise each hunk
-/// starts with a muted unified-diff header. Lines beyond `max_lines` are elided
-/// with a trailing muted entry.
-pub fn lines(diff: &Diff, max_lines: usize) -> Vec<StyledLine> {
-    let all: Vec<StyledLine> = diff
-        .hunks
-        .iter()
-        .flat_map(|hunk| hunk_lines(hunk, diff.created))
-        .collect();
+/// The source-language token for a diff's path: the file extension (`rs`, `js`,
+/// `json`, …), which the adapter resolves to a syntax. `None` when the path has
+/// no extension - the core never names a syntect syntax, it carries the language
+/// fact (ADR-0019). An unknown extension still rides through as `Some(ext)`; the
+/// adapter falls back when it resolves no syntax.
+pub fn lang(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_string)
+}
 
-    if all.len() <= max_lines {
-        all
-    } else {
-        let rest = all.len() - max_lines;
-        let mut shown: Vec<StyledLine> = all.into_iter().take(max_lines).collect();
-        shown.push(StyledLine::new(
-            LineStyle::Muted,
-            format!("… {rest} more lines"),
-        ));
-        shown
+/// Builds the tagged [`DiffHunk`]s for a diff, capped at `max_lines` code lines
+/// across all hunks. Returns the hunks and the count of lines the cap elided
+/// (`0` when nothing was cut) - the adapter renders that count as a muted
+/// `… N more lines` tail.
+///
+/// Created files omit the hunk header (no `@@` line - it would be noise on an
+/// all-added file); otherwise each hunk carries its unified-diff header. Every
+/// line's text is RAW code with NO `+`/`-` marker: the adapter adds the marker
+/// glyph and the tint, so the same text can also feed the syntect highlighter.
+pub fn hunks(diff: &Diff, max_lines: usize) -> (Vec<DiffHunk>, usize) {
+    // Counts CODE lines only (the elision tail reports elided code, not the
+    // per-hunk `@@` headers, which the adapter always keeps for shown hunks).
+    let total: usize = diff.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+    let mut budget = max_lines;
+    let mut out = Vec::with_capacity(diff.hunks.len());
+
+    for hunk in &diff.hunks {
+        if budget == 0 {
+            break;
+        }
+        let take = hunk.lines.len().min(budget);
+        budget -= take;
+        out.push(DiffHunk {
+            header: hunk_header(hunk, diff.created),
+            lines: hunk.lines[..take].iter().map(diff_line).collect(),
+        });
     }
+
+    (out, total.saturating_sub(max_lines))
 }
 
 // A created file is one all-added hunk; the @@ header would be noise.
-fn hunk_lines(hunk: &Hunk, created: bool) -> Vec<StyledLine> {
+fn hunk_header(hunk: &Hunk, created: bool) -> Option<String> {
     if created {
-        hunk.lines.iter().map(display_line).collect()
+        None
     } else {
-        let header = StyledLine::new(
-            LineStyle::Muted,
-            format!(
-                "@@ -{},{} +{},{} @@",
-                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-            ),
-        );
-        std::iter::once(header)
-            .chain(hunk.lines.iter().map(display_line))
-            .collect()
+        Some(format!(
+            "@@ -{},{} +{},{} @@",
+            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+        ))
     }
 }
 
-// Minimal diff lines (ADR-0040 Decision D): the `+`/`-`/context markers carry
-// the change and the semantic [`LineStyle`] carries the color, while the
-// `@@ … @@` hunk header carries the location - so the line-number gutter is
-// dropped. This is a Extension display choice (ADR-0008: the Extension decides WHAT
-// to show; the adapter maps the style to a color).
-fn display_line(line: &Line) -> StyledLine {
-    match line.tag {
-        Tag::Context => StyledLine::new(LineStyle::Context, format!("  {}", line.text)),
-        Tag::Added => StyledLine::new(LineStyle::Added, format!("+ {}", line.text)),
-        Tag::Removed => StyledLine::new(LineStyle::Removed, format!("- {}", line.text)),
-    }
+// The line's [`DiffSide`] over its RAW text (ADR-0008): the adapter adds the
+// `+`/`-`/context marker and the color. This is an Extension display choice (the
+// Extension decides WHAT to show; the adapter decides HOW).
+fn diff_line(line: &Line) -> DiffLine {
+    let side = match line.tag {
+        Tag::Context => DiffSide::Context,
+        Tag::Added => DiffSide::Added,
+        Tag::Removed => DiffSide::Removed,
+    };
+    DiffLine::new(side, line.text.clone())
 }
 
 #[cfg(test)]
@@ -135,55 +149,89 @@ mod tests {
         );
     }
 
-    // ---- lines/2 ----
+    // ---- lang/1 ----
 
     #[test]
-    fn existing_file_shows_hunk_headers() {
-        let hunks = hunks::compute("a\nb\nc", "a\nB\nc");
+    fn lang_is_the_file_extension() {
+        assert_eq!(lang("src/main.rs").as_deref(), Some("rs"));
+        assert_eq!(lang("app/foo.js").as_deref(), Some("js"));
+        assert_eq!(lang("data.json").as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn lang_is_none_without_an_extension() {
+        assert_eq!(lang("Makefile"), None);
+        assert_eq!(lang(""), None);
+    }
+
+    // ---- hunks/2 ----
+
+    #[test]
+    fn existing_file_carries_a_hunk_header_and_raw_marker_free_lines() {
+        let computed = hunks::compute("a\nb\nc", "a\nB\nc");
         let diff = Diff {
             path: String::new(),
-            hunks,
+            hunks: computed,
             added: 1,
             removed: 1,
             created: false,
         };
-        let lines = lines(&diff, DISPLAY_LINES);
-        assert!(lines.contains(&StyledLine::new(LineStyle::Muted, "@@ -1,3 +1,3 @@")));
+        let (hunks, elided) = hunks(&diff, DISPLAY_LINES);
+        assert_eq!(elided, 0);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header.as_deref(), Some("@@ -1,3 +1,3 @@"));
+        // The lines are RAW code with no +/-/context marker - the adapter adds it.
+        assert!(
+            hunks[0]
+                .lines
+                .contains(&DiffLine::new(DiffSide::Context, "a"))
+        );
+        assert!(
+            hunks[0]
+                .lines
+                .contains(&DiffLine::new(DiffSide::Removed, "b"))
+        );
+        assert!(
+            hunks[0]
+                .lines
+                .contains(&DiffLine::new(DiffSide::Added, "B"))
+        );
     }
 
     #[test]
-    fn created_file_skips_hunk_headers() {
-        let hunks = hunks::all_added("a\n");
+    fn created_file_skips_the_hunk_header() {
+        let computed = hunks::all_added("a\n");
         let diff = Diff {
             path: String::new(),
-            hunks,
+            hunks: computed,
             added: 1,
             removed: 0,
             created: true,
         };
-        let lines = lines(&diff, DISPLAY_LINES);
-        assert_eq!(lines, vec![StyledLine::new(LineStyle::Added, "+ a")]);
+        let (hunks, elided) = hunks(&diff, DISPLAY_LINES);
+        assert_eq!(elided, 0);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header, None);
+        assert_eq!(hunks[0].lines, vec![DiffLine::new(DiffSide::Added, "a")]);
     }
 
     #[test]
-    fn long_diffs_cap_with_a_muted_tail() {
+    fn long_diffs_cap_and_report_the_elided_count() {
         let content = (1..=100)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let hunks = hunks::all_added(&content);
+        let computed = hunks::all_added(&content);
         let diff = Diff {
             path: String::new(),
-            hunks,
+            hunks: computed,
             added: 100,
             removed: 0,
             created: true,
         };
-        let lines = lines(&diff, DISPLAY_LINES);
-        assert_eq!(lines.len(), 61);
-        assert_eq!(
-            lines.last(),
-            Some(&StyledLine::new(LineStyle::Muted, "… 40 more lines"))
-        );
+        let (hunks, elided) = hunks(&diff, DISPLAY_LINES);
+        let shown: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(shown, DISPLAY_LINES);
+        assert_eq!(elided, 40);
     }
 }

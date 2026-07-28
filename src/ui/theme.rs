@@ -254,6 +254,13 @@ theme_slots! {
     added,
     /// Diff removed lines in the conversation plane.
     removed,
+    /// The full-width background tint behind a diff's added lines (ADR-0008):
+    /// the semantic meaning as a GitHub-style band, over which the syntect
+    /// foreground layers. Subtle - it composites over the terminal ground.
+    added_bg,
+    /// The full-width background tint behind a diff's removed lines (ADR-0008),
+    /// the removed counterpart to `added_bg`.
+    removed_bg,
     /// Diff context (unchanged) lines.
     context,
     /// Dimmed secondary text: info lines, hints, quiet chrome.
@@ -752,6 +759,8 @@ mod tests {
         assert_eq!(theme.syntax, "base16-ocean.dark");
         assert_eq!(theme.added, Color::Green);
         assert_eq!(theme.removed, Color::Red);
+        assert_eq!(theme.added_bg, Color::Rgb(18, 41, 27));
+        assert_eq!(theme.removed_bg, Color::Rgb(51, 26, 29));
         assert_eq!(theme.context, Color::DarkGray);
         assert_eq!(theme.muted, Color::DarkGray);
         assert_eq!(theme.machinery, Color::DarkGray);

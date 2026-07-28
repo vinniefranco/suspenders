@@ -19,7 +19,7 @@ use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::response::Response;
-use crate::llm::{Llm, LlmRequest, StreamEvent};
+use crate::llm::{Llm, LlmRequest, StreamEvent, ToolCallStyle};
 use crate::run::deps::{CompactError, Emitter, RunDeps};
 
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
@@ -34,6 +34,9 @@ pub(crate) struct AgentDeps {
     /// The Session-resolved sampling temperature, applied to every request
     /// this shell builds (ADR-0037: temperature rides the request).
     temperature: Option<f64>,
+    /// The Session-resolved Tool Call style (qwen parity), applied to every
+    /// request this shell builds - it rides the request like temperature.
+    tool_call_style: ToolCallStyle,
     /// The accumulated Compaction state captured at Run start; `compact`
     /// closes over it and, on success, notifies the Agent to log + update state
     /// (baud's compact_fn, ADR-0012).
@@ -46,6 +49,7 @@ impl AgentDeps {
         llm: Arc<dyn Llm>,
         model: Model,
         temperature: Option<f64>,
+        tool_call_style: ToolCallStyle,
         compaction: Compaction,
     ) -> Self {
         AgentDeps {
@@ -53,13 +57,14 @@ impl AgentDeps {
             llm,
             model,
             temperature,
+            tool_call_style,
             compaction,
         }
     }
 
     /// The Model + Llm this Run captured at spawn, handed to
-    /// [`crate::run::run`] so it can build the Run's tooling (the `scout`
-    /// capture, the Result Cap) without reaching into this adapter.
+    /// [`crate::run::run`] so it can build the Run's tooling (the Result Cap)
+    /// without reaching into this adapter.
     pub(crate) fn capture(&self) -> crate::run::Capture {
         crate::run::Capture {
             model: self.model.clone(),
@@ -78,10 +83,12 @@ impl RunDeps for AgentDeps {
         req: LlmRequest,
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> impl Future<Output = Response> + Send {
-        // Attach the Session's temperature and call the injected boundary with
-        // the captured Model; each StreamEvent forwards to on_event (the Loop
-        // runs it into a message_update event).
-        let req = req.with_temperature(self.temperature);
+        // Attach the Session's temperature and Tool Call style, then call the
+        // injected boundary with the captured Model; each StreamEvent forwards
+        // to on_event (the Loop runs it into a message_update event).
+        let req = req
+            .with_temperature(self.temperature)
+            .with_tool_call_style(self.tool_call_style);
         let llm = Arc::clone(&self.llm);
         let model = self.model.clone();
         async move {

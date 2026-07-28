@@ -20,8 +20,6 @@
 
 use std::path::PathBuf;
 
-use crate::scout_port::ScoutFn;
-
 pub mod path;
 
 /// A tool's spec in Anthropic tool format: a name, a description, and a JSON
@@ -52,28 +50,12 @@ pub trait Tool: Send + Sync {
 }
 
 /// The ctx every Tool Call executes with: the Session's Project Root, the
-/// Result Cap, the command timeout, and the optional `scout` capture (read
-/// only by explore, which dispatches a Scout).
-#[derive(Clone)]
+/// Result Cap, and the command timeout.
+#[derive(Clone, Debug)]
 pub struct ToolCtx {
     pub root: PathBuf,
     pub result_cap: usize,
     pub command_timeout_ms: u64,
-    /// The `scout` capture: an effect wired to the Session that dispatches a
-    /// Scout. `None` on the extension-free path (tests, direct callers) - explore
-    /// then returns a graceful "no Scout wired" error.
-    pub scout: Option<ScoutFn>,
-}
-
-impl std::fmt::Debug for ToolCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolCtx")
-            .field("root", &self.root)
-            .field("result_cap", &self.result_cap)
-            .field("command_timeout_ms", &self.command_timeout_ms)
-            .field("scout", &self.scout.as_ref().map(|_| "<scout>"))
-            .finish()
-    }
 }
 
 /// Validates the model-supplied input against a tool's JSON Schema. Returns

@@ -1,30 +1,20 @@
 //! Run finish - how a Run ends when the model stops calling tools (carved
-//! from the Run Loop port of baud's `Baud.Turn.Loop`). Deliberately NOT named
-//! "settlement": Run Settlement (CONTEXT.md, [`super::settlement`]) is how an
-//! already-ended Run enters the Conversation; this module is the ending
-//! itself.
+//! from the Run Loop). Deliberately NOT named "settlement": Run Settlement
+//! (CONTEXT.md, [`super::settlement`]) is how an already-ended Run enters the
+//! Conversation; this module is the ending itself.
 //!
-//! [`finish`] handles a Pass without (executable) Tool Calls. Usually the Run
-//! ends there, but the finish-settlement arbiter ([`super::governor`],
-//! ADR-0026) may intervene instead: close the Run on the run-limit marker
-//! (ADR-0015's tool-insistence rule) or send the model back for one more Pass
-//! with a stand-alone Nudge - the strict Verify-failed > Verify > Empty
-//! precedence lives in [`governor::settle_finish`], not here. This module
-//! keeps the effects: appending blocks, announcing the Nudge, closing.
-//!
-//! The marker algebra: an empty close gets the empty-response marker (or the
-//! truncation marker on max_tokens), a parroted empty-response marker counts
-//! as empty, and the Run Limit / stopped / failed markers keep roles
-//! alternating when the Loop closes a Run itself. The LLM error algebra
-//! ([`fail`]): partial text survives, unanswered tool_use blocks are dropped,
-//! and the failed marker closes the Run.
+//! [`finish`] handles a Pass without (executable) Tool Calls: the model's
+//! reply concludes the Run. The marker algebra: an empty close gets the
+//! empty-response marker (or the truncation marker on max_tokens), and the Run
+//! Limit / stopped / failed markers keep roles alternating when the Loop closes
+//! a Run itself. The LLM error algebra ([`fail`]): partial text survives,
+//! unanswered tool_use blocks are dropped, and the failed marker closes the
+//! Run.
 
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
-use crate::event::{Event, VoicedTag};
 use crate::llm::response::{Response, StopReason};
 use crate::run::deps::RunDeps;
-use crate::run::governor::{self, FinishIntervention};
 use crate::run::loop_::{Flow, LoopState, Outcome, OutcomeStop};
 use crate::session::log;
 use crate::voice;
@@ -38,31 +28,6 @@ pub(super) fn close<D: RunDeps>(
     conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
     state.deps.checkpoint(&conversation);
     Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
-}
-
-// The close-and-open-a-Recovery-Run Intervention's close half: like
-// [`close`], but the outcome carries the Endgame Governor's directive out to
-// the Agent, which executes the opening (CONTEXT.md: Recovery Run). One
-// author for both recovery closes: `closing` is the run-limit marker at the
-// tool-answering cap and on the tool-insistent reply (roles keep
-// alternating; the insistent markup never enters), or the model's own
-// final-Pass reply on the text settle (ADR-0028 addendum). `provenance` is
-// the captured Model's when `closing` is that reply, `None` when it is the
-// Voice's marker (ADR-0037: Provenance marks what the model produced).
-pub(super) fn close_recover<D: RunDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    closing: Vec<ContentBlock>,
-    provenance: Option<crate::content::Provenance>,
-    stop_reason: log::StopReason,
-    recovery: governor::endgame::Recovery,
-) -> Outcome {
-    match provenance {
-        Some(p) => conversation.add_assistant_response(closing, p),
-        None => conversation.add_assistant_blocks(closing),
-    };
-    state.deps.checkpoint(&conversation);
-    Outcome::Recover(conversation, stop_reason, recovery)
 }
 
 pub(super) fn close_custom<D: RunDeps>(
@@ -98,15 +63,10 @@ pub(super) fn fail<D: RunDeps>(
     Outcome::Failed(reason, conversation)
 }
 
-// The model stopped without (executable) Tool Calls. The finish-settlement
-// arbiter (ADR-0026) decides how the finish settles; this site translates:
-// a Close appends the run-limit marker (the reply - ADR-0015's insistent
-// markup - never enters the Conversation), a CloseRecover appends the marker
-// or - `keep_reply`, the final-Pass text settle - the reply itself before
-// carrying the recovery directive out, a Standalone Nudge appends the reply
-// and then the user-role Nudge for one more Pass, and no Intervention
-// concludes the Run on the reply. Any tool_use block in this branch is
-// unanswered and is dropped.
+// The model stopped without (executable) Tool Calls: the reply concludes the
+// Run. The reply is stamped with the Run's captured Provenance (ADR-0037); an
+// empty reply gets the marker instead (`close_blocks`). Any tool_use block in
+// this branch is unanswered and is dropped.
 pub(super) fn finish<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
@@ -114,61 +74,9 @@ pub(super) fn finish<D: RunDeps>(
     stop_reason: StopReason,
 ) -> Flow {
     let closed = close_stop_reason(&stop_reason);
-
-    match governor::settle_finish(&state.ledger, &mut state.governors, &blocks, &closed) {
-        Some(FinishIntervention::Close(reason)) => Flow::Done(close(
-            state,
-            conversation,
-            voice::run_limit_marker(),
-            reason,
-        )),
-        Some(FinishIntervention::CloseRecover {
-            reason,
-            recovery,
-            keep_reply,
-        }) => {
-            let (closing, provenance) = if keep_reply {
-                (
-                    close_blocks(&blocks, &stop_reason),
-                    Some(state.deps.provenance()),
-                )
-            } else {
-                (vec![ContentBlock::text(voice::run_limit_marker())], None)
-            };
-            Flow::Done(close_recover(
-                state,
-                conversation,
-                closing,
-                provenance,
-                reason,
-                recovery,
-            ))
-        }
-        Some(FinishIntervention::Standalone { tag, text }) => {
-            let provenance = state.deps.provenance();
-            conversation.add_assistant_response(close_blocks(&blocks, &stop_reason), provenance);
-            nudge_finish(state, conversation, &text, tag)
-        }
-        None => {
-            let provenance = state.deps.provenance();
-            conversation.add_assistant_response(close_blocks(&blocks, &stop_reason), provenance);
-            Flow::Done(Outcome::Ok(conversation, outcome_stop_of(&closed)))
-        }
-    }
-}
-
-// Shared finish-Nudge mechanic: append the user-role Nudge, announce it, count
-// it as a normal Pass against the Run Limit, loop.
-fn nudge_finish<D: RunDeps>(
-    state: &mut LoopState<'_, D>,
-    mut conversation: Conversation,
-    nudge: &str,
-    tag: VoicedTag,
-) -> Flow {
-    conversation.add_user_text(nudge);
-    state.emitter.emit(Event::voiced(tag, nudge));
-    state.ledger.advance_pass();
-    Flow::Continue(conversation)
+    let provenance = state.deps.provenance();
+    conversation.add_assistant_response(close_blocks(&blocks, &stop_reason), provenance);
+    Flow::Done(Outcome::Ok(conversation, outcome_stop_of(&closed)))
 }
 
 fn close_blocks(blocks: &[ContentBlock], stop_reason: &StopReason) -> Vec<ContentBlock> {

@@ -181,7 +181,6 @@ mod tests {
             "read_file",
             "list_files",
             "grep",
-            "explore",
             "edit_file",
             "write_file",
         ] {

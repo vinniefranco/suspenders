@@ -15,8 +15,6 @@ pub mod middleware;
 pub mod plan;
 pub mod presenter;
 pub mod run;
-pub mod scout;
-pub mod scout_port;
 pub mod session;
 pub mod tool;
 pub mod tools;

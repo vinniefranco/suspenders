@@ -27,9 +27,10 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use super::text_tool_call::{ParsedCall, extract_tool_calls};
 use crate::content::{ContentBlock, Usage};
-use crate::llm::decode_tool_input;
 use crate::llm::response::{Response, StopReason};
+use crate::llm::{ToolCallStyle, decode_tool_input, malformed_input_marker};
 
 /// One parsed SSE frame handed to the fold. The transport runs each `data:`
 /// body into a [`SseEvent::Chunk`], the `[DONE]` terminator into
@@ -60,11 +61,27 @@ pub struct StreamState {
     finish_reason: Option<String>,
     usage: Usage,
     error: Option<String>,
+    /// How this fold resolves Tool Calls the model emitted as content text
+    /// (qwen parity). Set by the transport from the request; [`ToolCallStyle::Auto`]
+    /// by default (the fold's own `new`/`default` never sees the request).
+    style: ToolCallStyle,
 }
 
 impl StreamState {
     pub fn new() -> Self {
         StreamState::default()
+    }
+
+    /// The fold with an explicit Tool Call style (the transport's entry): the
+    /// request's `tool_call_style` decides whether [`finalize`] falls back to
+    /// parsing the content text when the structured channel is empty.
+    ///
+    /// [`finalize`]: StreamState::finalize
+    pub fn with_style(style: ToolCallStyle) -> Self {
+        StreamState {
+            style,
+            ..StreamState::default()
+        }
     }
 
     /// Folds one parsed SSE event. Once an error is recorded, subsequent
@@ -176,28 +193,77 @@ impl StreamState {
     /// dropped from content. Tool arguments are decoded here - a mangled
     /// accumulation becomes the shared malformed-input marker. A truncated or
     /// errored stream keeps its partial content (the error algebra).
+    ///
+    /// ## Text-emitted Tool Call fallback (qwen parity)
+    ///
+    /// When the structured `delta.tool_calls[]` channel came back EMPTY and the
+    /// style admits it ([`ToolCallStyle::Auto`]/[`ToolCallStyle::Text`], not
+    /// [`ToolCallStyle::Structured`]), the accumulated content text is parsed
+    /// for Hermes/Qwen-coder markup ([`extract_tool_calls`]). A hit replaces the
+    /// text block with the parsed preamble (only when non-empty) followed by one
+    /// `ToolUse` per recovered call, and forces `stop_reason` to `ToolUse` - a
+    /// text-emitted call means the model wants a tool even if `finish_reason`
+    /// was "stop". Structured Tool Calls ALWAYS win: this path runs only when
+    /// none arrived, and never touches the structured decode above.
     pub fn finalize(self) -> Response {
         let mut content = Vec::new();
-        if !self.text.is_empty() {
-            content.push(ContentBlock::text(self.text));
-        }
-        for call in self.tool_calls.into_values() {
-            content.push(ContentBlock::ToolUse {
-                id: call.id,
-                name: call.name,
-                input: decode_tool_input(&call.arguments),
-            });
+        let mut text_call_stop = None;
+
+        if self.tool_calls.is_empty()
+            && self.style != ToolCallStyle::Structured
+            && let Some(parse) = extract_tool_calls(&self.text)
+        {
+            if !parse.preamble.is_empty() {
+                content.push(ContentBlock::text(parse.preamble));
+            }
+            for (n, call) in parse.calls.into_iter().enumerate() {
+                content.push(text_call_block(n, call));
+            }
+            // A text-emitted call is a tool request regardless of finish_reason.
+            text_call_stop = Some(StopReason::ToolUse);
+        } else {
+            if !self.text.is_empty() {
+                content.push(ContentBlock::text(self.text));
+            }
+            for call in self.tool_calls.into_values() {
+                content.push(ContentBlock::ToolUse {
+                    id: call.id,
+                    name: call.name,
+                    input: decode_tool_input(&call.arguments),
+                });
+            }
         }
 
         match self.error {
             None => Response {
                 content,
-                stop_reason: stop_reason_of(self.finish_reason.as_deref()),
+                stop_reason: text_call_stop
+                    .unwrap_or_else(|| stop_reason_of(self.finish_reason.as_deref())),
                 usage: self.usage,
                 error: None,
             },
             Some(error) => Response::error_with(error, content, self.usage),
         }
+    }
+}
+
+/// One text-recovered Tool Call as a [`ContentBlock::ToolUse`]: the id is
+/// synthesized (`text-call-{n}` - the wire carried none) and the input routes
+/// through the shared malformed-marker discipline so a call whose parsed input
+/// is somehow not an object stays distinguishable, exactly as the structured
+/// decoder tags a mangled accumulation.
+fn text_call_block(n: usize, call: ParsedCall) -> ContentBlock {
+    let input = if call.input.is_object() {
+        call.input
+    } else {
+        // The parser always yields an object today; this keeps the malformed
+        // discipline intact if that ever changes, mirroring `decode_tool_input`.
+        malformed_input_marker(&call.input.to_string())
+    };
+    ContentBlock::ToolUse {
+        id: format!("text-call-{n}"),
+        name: call.name,
+        input,
     }
 }
 
@@ -543,6 +609,147 @@ mod tests {
             s.snapshot(),
             vec![ContentBlock::tool_use("c1", "read_file", Value::Null)]
         );
+    }
+
+    // --- text-emitted Tool Call fallback (qwen parity) ---
+
+    // Folds `events` under an explicit style, then finalizes.
+    fn fold_styled(style: ToolCallStyle, events: Vec<SseEvent>) -> Response {
+        let mut s = StreamState::with_style(style);
+        for e in &events {
+            s.handle_event(e);
+        }
+        s.finalize()
+    }
+
+    #[test]
+    fn text_markup_split_across_deltas_finalizes_to_a_tool_use() {
+        // Streaming chunks the markup, so it arrives in several content deltas;
+        // finish_reason is "stop", yet a text-emitted call must finalize as
+        // ToolUse. Auto (the default) recovers it.
+        let r = fold(vec![
+            delta(json!({ "content": "<tool_call>\n<function=run_command>\n" })),
+            delta(json!({ "content": "<parameter=command>\nmix test\n" })),
+            delta(json!({ "content": "</parameter>\n</function>\n</tool_call>" })),
+            finish("stop"),
+            SseEvent::Done,
+        ]);
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::tool_use(
+                "text-call-0",
+                "run_command",
+                json!({ "command": "mix test" })
+            )]
+        );
+        // The "stop" finish_reason is overridden - the model wants a tool.
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn text_markup_preamble_becomes_a_leading_text_block() {
+        let r = fold(vec![
+            delta(json!({ "content": "I need to run the tests:\n\n" })),
+            delta(json!({
+                "content": "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>"
+            })),
+            finish("stop"),
+        ]);
+        assert_eq!(
+            r.content,
+            vec![
+                ContentBlock::text("I need to run the tests:"),
+                ContentBlock::tool_use(
+                    "text-call-0",
+                    "run_command",
+                    json!({ "command": "mix test" })
+                ),
+            ]
+        );
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn a_structured_tool_call_wins_over_coincident_text_markup() {
+        // Both channels carry a call: the structured one must win, and the
+        // markup stays plain text (never re-parsed into a second ToolUse).
+        let r = fold(vec![
+            delta(json!({ "content": "<tool_call>\n<function=list_files>\n</function>\n</tool_call>" })),
+            tool_fragment(json!({
+                "index": 0, "id": "call_1", "type": "function",
+                "function": { "name": "read_file", "arguments": "{\"path\": \"x\"}" }
+            })),
+            finish("tool_calls"),
+        ]);
+        assert_eq!(
+            r.content,
+            vec![
+                ContentBlock::text(
+                    "<tool_call>\n<function=list_files>\n</function>\n</tool_call>"
+                ),
+                ContentBlock::tool_use("call_1", "read_file", json!({ "path": "x" })),
+            ]
+        );
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn structured_style_never_parses_text_markup() {
+        // The opt-out: the same markup stays plain text, stop_reason unchanged.
+        let r = fold_styled(
+            ToolCallStyle::Structured,
+            vec![
+                delta(json!({
+                    "content": "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>"
+                })),
+                finish("stop"),
+            ],
+        );
+        assert_eq!(r.content.len(), 1);
+        assert!(matches!(&r.content[0], ContentBlock::Text { .. }));
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn text_style_recovers_like_auto() {
+        // Text == Auto for now: it forces the same recovery Auto already does.
+        let r = fold_styled(
+            ToolCallStyle::Text,
+            vec![
+                delta(json!({
+                    "content": "<tool_call>\n<function=list_files>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+                })),
+                finish("stop"),
+            ],
+        );
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::tool_use(
+                "text-call-0",
+                "list_files",
+                json!({ "path": "." })
+            )]
+        );
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn plain_prose_that_only_mentions_markup_stays_text() {
+        // Line-anchor guard: the markup appears only inside a sentence, so the
+        // fallback declines and the answer stays plain text.
+        let r = fold(vec![
+            delta(json!({
+                "content": "Done. I could not run mix test - the <tool_call> was withdrawn."
+            })),
+            finish("stop"),
+        ]);
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::text(
+                "Done. I could not run mix test - the <tool_call> was withdrawn."
+            )]
+        );
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
     }
 
     // --- chunk shape leniency ---

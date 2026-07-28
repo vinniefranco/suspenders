@@ -12,9 +12,9 @@
 //! ## How the Token holds ctx (judgment call)
 //!
 //! baud's Token holds `ctx :: Baud.Tool.ctx()` (a shared, cheaply-copied map)
-//! directly. The Rust [`ToolCtx`] is `Clone` (its `scout` capture is an
-//! `Arc`-backed effect), so the Token owns a `ToolCtx` by value - the same
-//! ownership shape as baud, without threading a lifetime through the whole
+//! directly. The Rust [`ToolCtx`] is `Clone` and cheap, so the Token owns a
+//! `ToolCtx` by value - the same ownership shape as baud, without threading a
+//! lifetime through the whole
 //! Middleware trait. The pipeline reads `token.ctx` for `Tools::execute` and
 //! for the Result Cap; a Middleware may read it but never needs to mutate it.
 

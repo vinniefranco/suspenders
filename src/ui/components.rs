@@ -2,8 +2,8 @@
 //! (ADR-0008) to ratatui `Style`/`Color`, plus the render helpers the frontend
 //! draws with.
 //!
-//! This is the one place semantics become terminal colors: [`LineStyle`] →
-//! color for a Block's lines, [`PressureLevel`] → color/emphasis for the status
+//! This is the one place semantics become terminal colors: [`DiffSide`] →
+//! color for a diff's lines, [`PressureLevel`] → color/emphasis for the status
 //! bar. Extensions and the Screen core never touch ratatui; they speak the
 //! vocabulary and this module renders it. Everything here is pure presentation
 //! of [`TranscriptItem`]s - no state, no IO. Only this module and [`crate::ui`]
@@ -22,6 +22,7 @@ use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxSet;
 
 use thousands::Separable;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ui::composer::{self, ComposerLayout, OverlayStatus, OverlayView};
 use crate::ui::lull;
@@ -32,7 +33,7 @@ use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
 use crate::ui::viewport::Viewport;
 use crate::view_model::Tone;
-use crate::view_model::{LineStyle, StyledLine, TranscriptItem};
+use crate::view_model::{DiffHunk, DiffSide, TranscriptItem};
 use crate::view_model::{RowRole, SelectorRow};
 
 // ---------------------------------------------------------------------------
@@ -66,20 +67,27 @@ fn tui_color(color: theme::Color) -> Color {
     }
 }
 
-/// The ONE mapping from a semantic [`LineStyle`] to a ratatui [`Style`]
-/// (ADR-0008). Extensions produce styles; this runs them into the active
-/// Theme's colors.
-pub fn line_style(style: LineStyle, theme: &Theme) -> Style {
-    match style {
-        LineStyle::Added => Style::default().fg(tui_color(theme.added)),
-        LineStyle::Removed => Style::default().fg(tui_color(theme.removed)),
-        LineStyle::Context => Style::default().fg(tui_color(theme.context)),
-        LineStyle::Emphasis => Style::default().add_modifier(Modifier::BOLD),
-        LineStyle::Muted => Style::default()
-            .fg(tui_color(theme.muted))
-            .add_modifier(Modifier::ITALIC),
-        LineStyle::Default => Style::default(),
+/// The ONE mapping from a diff's [`DiffSide`] to its fallback foreground
+/// (ADR-0008): added reads green, removed red, context the muted context slot.
+/// This is the fg the marker glyph always wears (so add/remove reads without
+/// truecolor) and the code text falls back to when no syntect fragment colors
+/// it. The added/removed background TINT is a separate mapping ([`diff_tint`]).
+fn diff_side_fg(side: DiffSide, theme: &Theme) -> Color {
+    match side {
+        DiffSide::Added => tui_color(theme.added),
+        DiffSide::Removed => tui_color(theme.removed),
+        DiffSide::Context => tui_color(theme.context),
     }
+}
+
+/// The muted-italic style a diff's adapter CHROME wears (ADR-0008): the `@@ … @@`
+/// hunk header and the `… N more lines` elision tail - neither is a code line,
+/// so neither carries a marker, a tint, or syntect fg. One helper so both read
+/// the same.
+fn diff_chrome_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(tui_color(theme.muted))
+        .add_modifier(Modifier::ITALIC)
 }
 
 /// The ONE mapping from a semantic markdown [`MdStyle`] to a ratatui [`Style`]
@@ -989,7 +997,7 @@ fn expand_gutters(gutters: &[GutterKind], counts: &[usize]) -> Vec<RowGutter> {
 
 /// How many of a run's most recent low-signal actions (list/read-style tool
 /// one-liners) the collapsed view keeps as a rolling window; older ones are
-/// suppressed. Errors and code/diff Blocks are never windowed - they break out.
+/// suppressed. Errors and Diffs are never windowed - they break out.
 const MACHINERY_WINDOW: usize = 4;
 
 /// What the collapsed render does with one settled item ([`run_fold`]).
@@ -1012,11 +1020,11 @@ enum FoldAction {
 /// text rendered at the FIRST thought's slot, with the intervening thoughts
 /// dropped - and the low-signal machinery (paired/one-line tool results and
 /// calls) becomes a rolling window of the last `window` items, older ones
-/// dropped. Errors, code/diff [`Block`]s, assistant text, markers and prompts
-/// always Keep (they break out). `thinking_expanded` (Ctrl-T) disables the
-/// thought fold; `tools_expanded` (Ctrl-O) disables the machinery window.
+/// dropped. Errors, [`Diff`]s, assistant text, markers and prompts always Keep
+/// (they break out). `thinking_expanded` (Ctrl-T) disables the thought fold;
+/// `tools_expanded` (Ctrl-O) disables the machinery window.
 ///
-/// [`Block`]: TranscriptItem::Block
+/// [`Diff`]: TranscriptItem::Diff
 fn run_fold(
     items: &[TranscriptItem],
     thinking_expanded: bool,
@@ -1034,7 +1042,7 @@ fn run_fold(
             match &items[i] {
                 TranscriptItem::Thinking { .. } => thoughts.push(i),
                 // Low-signal machinery: a merged tool result or a bare call.
-                // Errors and Blocks are NOT here - they always break out.
+                // Errors and Diffs are NOT here - they always break out.
                 TranscriptItem::ToolResult {
                     is_error: false, ..
                 }
@@ -1629,13 +1637,14 @@ fn machinery_style(theme: &Theme) -> Style {
     Style::default().fg(tui_color(theme.machinery))
 }
 
-/// The lines one Transcript item renders as. `Block` is the semantic display
-/// vocabulary (ADR-0008): a titled block whose lines take their color from
-/// [`line_style`]. `thinking_expanded` (Ctrl-T, the core's
-/// `Transcript::thinking_expanded`) picks the collapsed one-liner or the full
-/// text for settled `Thinking` items; `tools_expanded` (Ctrl-O, the core's
-/// `Transcript::tools_expanded`) does the same for multi-line `Block` bodies -
-/// the same detail-on-demand rule applied to the machinery plane. `content_width`
+/// The lines one Transcript item renders as. `Diff` is the first-class rich item
+/// of the semantic display vocabulary (ADR-0008): a titled diff whose lines take
+/// a semantic tint from their [`DiffSide`]'s Theme slots and a syntect foreground.
+/// `thinking_expanded` (Ctrl-T, the core's `Transcript::thinking_expanded`)
+/// picks the collapsed one-liner or the full text for settled `Thinking` items;
+/// `tools_expanded` (Ctrl-O, the core's `Transcript::tools_expanded`) does the
+/// same for a multi-line `Diff` body - the same detail-on-demand rule applied to
+/// the machinery plane. `content_width`
 /// is the `content_area` width the lines draw in - the collapsed Thinking
 /// one-liner truncates to it so it stays one visual row (a long newline-free
 /// thought otherwise soft-wraps to many).
@@ -1647,14 +1656,14 @@ fn message_lines(
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     // Detail-on-demand collapse (Ctrl-O), keyed on the SEMANTIC fold predicate
-    // (Stage 2 review C2 / S1): any item with a `foldable_body` collapses to its
+    // (Stage 2 review C2 / S1): any item with a foldable body collapses to its
     // `fold_title` one-liner, so the fold rule is NOT gated inside a per-variant
-    // match arm - a future non-Block foldable item folds the same way. The
-    // affordance is a fixed `· ^O expand`, NOT a line count: a Block's title
+    // match arm - a future non-Diff foldable item folds the same way. The
+    // affordance is a fixed `· ^O expand`, NOT a line count: a Diff's title
     // already carries its `(+A −R)` magnitude, and the body is display-capped
-    // upstream, so a raw `lines.len()` would misreport what was elided.
+    // upstream, so a raw line count would misreport what was elided.
     if !tools_expanded
-        && item.foldable_body().is_some()
+        && item.has_foldable_body()
         && let Some(title) = item.fold_title()
     {
         return vec![Line::styled(
@@ -1734,21 +1743,19 @@ fn message_lines(
                     .add_modifier(Modifier::BOLD),
             )
         }
-        // A foldable Block reaches here only EXPANDED (Ctrl-O on) or when it has
-        // no foldable body (titleless / empty) - the collapse is handled once at
-        // the top of this fn. Expanded: the title line then the body rows, which
-        // keep their semantic diff colors (added/removed/context) indented under
-        // the gutter.
-        TranscriptItem::Block { title, lines } => {
-            let mut out = vec![Line::styled(format!("  ⋯ {title}"), machinery_style(theme))];
-            // Body rows keep their semantic diff colors (added/removed/context)
-            // but sit indented under the gutter.
-            out.extend(lines.iter().map(|line| {
-                let styled = block_line(line, theme);
-                let mut spans = vec![Span::raw("  ")];
-                spans.extend(styled.spans);
-                Line::from(spans)
-            }));
+        // A foldable Diff reaches here only EXPANDED (Ctrl-O on) or when it has
+        // no foldable body (empty) - the collapse is handled once at the top of
+        // this fn. Expanded: the title, then each hunk's header and its code
+        // lines as a full-width added/removed tint band with the syntect
+        // foreground layered over it (ADR-0008), indented under the gutter.
+        TranscriptItem::Diff {
+            title,
+            lang,
+            hunks,
+            elided,
+        } => {
+            let mut out = diff_lines(title, lang.as_deref(), hunks, content_width, theme);
+            out.extend(diff_elided_tail(*elided, content_width, theme));
             out
         }
         // The quiet plane: adapter Info news and the tinted harness marker
@@ -1976,19 +1983,312 @@ fn text_rows(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Normalizes a [`StyledLine`]'s text for display: an empty line expands to a
-/// single space so ratatui renders it as a visible blank row; tabs become two
-/// spaces (consistent with [`text_rows`]).
-fn normalize_block_text(line: &StyledLine) -> String {
-    if line.text.is_empty() {
-        " ".to_string()
-    } else {
-        line.text.replace('\t', "  ")
+/// Normalizes a diff line's raw code text for display: tabs become two spaces
+/// (consistent with [`text_rows`]); an empty line stays empty (the tint band
+/// fills it visibly, so no space-padding trick is needed as it was for a plain
+/// [`Line`]).
+fn normalize_diff_text(text: &str) -> String {
+    text.replace('\t', "  ")
+}
+
+// ---------------------------------------------------------------------------
+// Diff rendering (ADR-0008): the first-class `Diff` item's two color sources
+// stay split - the SEMANTIC tag (added/removed/context) becomes a full-width
+// background TINT from the Theme's slots, and the LEXICAL syntect foreground
+// layers over it. The `+`/`-`/context marker glyph is added here, never baked
+// into the core's text. The same syntect machinery highlights markdown fences.
+// ---------------------------------------------------------------------------
+
+/// The two-column indent a diff hangs under, matching the tool machinery plane:
+/// the tint band starts AFTER this gutter, so the run-lane spine and this indent
+/// stay untinted and the band reads as GitHub's content-area stripe.
+const DIFF_INDENT: usize = 2;
+
+/// The marker glyph a diff line's [`DiffSide`] draws (ADR-0008): the adapter
+/// adds it, so the change still reads on a non-truecolor terminal and when the
+/// tint is subtle. Two cells wide, so the code text aligns across the sides.
+fn diff_marker(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::Added => "+ ",
+        DiffSide::Removed => "- ",
+        DiffSide::Context => "  ",
     }
 }
 
-fn block_line(line: &StyledLine, theme: &Theme) -> Line<'static> {
-    Line::styled(normalize_block_text(line), line_style(line.style, theme))
+/// The background tint a diff line's [`DiffSide`] paints (ADR-0008): added and
+/// removed read their Theme `*_bg` slots; context is untinted. The tint is the
+/// SEMANTIC meaning; the syntect fg layers over it.
+fn diff_tint(side: DiffSide, theme: &Theme) -> Option<Color> {
+    match side {
+        DiffSide::Added => Some(tui_color(theme.added_bg)),
+        DiffSide::Removed => Some(tui_color(theme.removed_bg)),
+        DiffSide::Context => None,
+    }
+}
+
+/// Renders a first-class `Diff` item (ADR-0008) into ratatui lines: the title,
+/// then each hunk's optional `@@ … @@` header (muted italic, no marker or tint)
+/// and its tagged code lines as a full-width tint band with the marker glyph and
+/// the syntect foreground, then the muted `… N more lines` tail from
+/// [`diff_elided_tail`] (the caller appends it, so this stays integration-only).
+///
+/// Each produced [`Line`] is truncated to `content_width` so the viewport's
+/// `Wrap` never re-breaks it - `wrapped_count` then equals the drawn rows
+/// (measure==draw, ADR-0029). The tint is a FULL-WIDTH band: every code row is
+/// padded to `content_width` with a bg-filled span, so the stripe reaches the
+/// right edge like GitHub's.
+fn diff_lines(
+    title: &str,
+    lang: Option<&str>,
+    hunks: &[DiffHunk],
+    content_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let width = content_width as usize;
+    let mut out = vec![Line::styled(
+        truncate_cols(&format!("  ⋯ {title}"), width),
+        machinery_style(theme),
+    )];
+    for hunk in hunks {
+        out.extend(diff_hunk_lines(hunk, lang, width, theme));
+    }
+    out
+}
+
+/// One hunk's rows: its optional `@@ … @@` header (muted-italic chrome, no
+/// marker or tint) followed by its tinted, highlighted code lines
+/// ([`hunk_code_lines`]).
+fn diff_hunk_lines(
+    hunk: &DiffHunk,
+    lang: Option<&str>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = hunk
+        .header
+        .iter()
+        .map(|header| {
+            Line::styled(
+                truncate_cols(&format!("  {header}"), width),
+                diff_chrome_style(theme),
+            )
+        })
+        .collect();
+    out.extend(hunk_code_lines(hunk, lang, width, theme));
+    out
+}
+
+/// The muted `… N more lines` tail a display-capped diff ends with, or nothing
+/// when the cap elided nothing (`elided == 0`). Kept out of [`diff_lines`] so
+/// that function stays a pure sequence of extends (IOSP integration-only).
+fn diff_elided_tail(elided: usize, content_width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    if elided == 0 {
+        return Vec::new();
+    }
+    vec![Line::styled(
+        truncate_cols(&format!("  … {elided} more lines"), content_width as usize),
+        diff_chrome_style(theme),
+    )]
+}
+
+/// One hunk's code lines, syntect-highlighted two-pass so multi-line constructs
+/// (a block comment, a raw string) color coherently across ALL their lines
+/// (ADR-0008 recorded decision). The AFTER-image (context + added, in order) is
+/// highlighted as ONE slice so syntect parse state carries; the BEFORE-image
+/// (context + removed, in order) as another. A context line draws from the after
+/// pass and advances both cursors; an added line draws from after; a removed
+/// line from before - so a created file (one all-added hunk = the whole file)
+/// colors its `/** … */` JSDoc as a comment across every line, not just line 1.
+///
+/// KNOWN LIMITATION (inherent to any before/after two-pass scheme): a multi-line
+/// construct a single hunk STRADDLES via a removed opener and an added closer
+/// (e.g. `/*` removed, `*/` added) can't color coherently - the two lines live
+/// in different images. The common cases (whole created files, comments that
+/// survive an edit as context) are coherent; a straddling rewrite is not.
+fn hunk_code_lines(
+    hunk: &DiffHunk,
+    lang: Option<&str>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    // Normalize each line's text ONCE, in file order, and reuse it for both the
+    // image the highlighter sees and the row the renderer draws.
+    let texts: Vec<String> = hunk
+        .lines
+        .iter()
+        .map(|l| normalize_diff_text(&l.text))
+        .collect();
+
+    // The two images, in file order: added/context feed the after pass, and
+    // removed/context the before pass, so syntect parse state carries per side.
+    let image = |keep: fn(DiffSide) -> bool| -> Vec<&str> {
+        hunk.lines
+            .iter()
+            .zip(&texts)
+            .filter(|(l, _)| keep(l.side))
+            .map(|(_, t)| t.as_str())
+            .collect()
+    };
+    // Highlight each image as one slice (parse state carries) when a language
+    // resolves; `None` (unknown/absent language) falls back to no fg fragments.
+    let highlight =
+        |refs: Vec<&str>| lang.and_then(|lang| highlight_code(&refs, lang, &theme.syntax));
+    let after_fg = highlight(image(|s| matches!(s, DiffSide::Added | DiffSide::Context)));
+    let before_fg = highlight(image(|s| {
+        matches!(s, DiffSide::Removed | DiffSide::Context)
+    }));
+
+    let mut out = Vec::with_capacity(hunk.lines.len());
+    let mut after_i = 0;
+    let mut before_i = 0;
+    for (line, text) in hunk.lines.iter().zip(&texts) {
+        // Each line draws its fragments from the image it belongs to; a context
+        // line draws from the after pass and advances BOTH cursors so the two
+        // passes stay aligned to file order. Exhaustive over the three sides.
+        let fragments = match line.side {
+            DiffSide::Removed => {
+                let fg = before_fg.as_ref().and_then(|f| f.get(before_i)).cloned();
+                before_i += 1;
+                fg
+            }
+            DiffSide::Added => {
+                let fg = after_fg.as_ref().and_then(|f| f.get(after_i)).cloned();
+                after_i += 1;
+                fg
+            }
+            DiffSide::Context => {
+                let fg = after_fg.as_ref().and_then(|f| f.get(after_i)).cloned();
+                after_i += 1;
+                before_i += 1;
+                fg
+            }
+        };
+        out.push(diff_code_row(line.side, text, fragments, width, theme));
+    }
+    out
+}
+
+/// One diff code row as a full-width tint band: the untinted [`DIFF_INDENT`]
+/// gutter, then the marker glyph (semantic fg - added green, removed red, so the
+/// change reads without truecolor) and the code (syntect fg when highlighted,
+/// else the semantic fg), all over the side's background tint, padded to `width`
+/// so the band reaches the right edge. Widths are DISPLAY COLUMNS (a wide CJK or
+/// emoji glyph counts 2), so the row occupies exactly `width` columns and the
+/// viewport's `Wrap` never re-breaks it - measure==draw, and the tint band never
+/// shatters across rows (ADR-0029).
+fn diff_code_row(
+    side: DiffSide,
+    text: &str,
+    fragments: Option<Vec<CodeFragment>>,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let tint = diff_tint(side, theme);
+    let semantic = Style::default().fg(diff_side_fg(side, theme));
+    let band = |mut s: Style| {
+        if let Some(bg) = tint {
+            s = s.bg(bg);
+        }
+        s
+    };
+
+    let indent = DIFF_INDENT.min(width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // The indent/spine gutter stays untinted so the band starts at the marker.
+    spans.push(Span::raw(" ".repeat(indent)));
+    let mut used = indent;
+
+    // The marker glyph carries the SEMANTIC fg over the tint.
+    used = push_cols(&mut spans, diff_marker(side), band(semantic), used, width);
+
+    // The code: syntect fg fragments over the tint, or the semantic fg when no
+    // language highlighted this line.
+    match fragments {
+        Some(frags) if !frags.is_empty() => {
+            for ((r, g, b), frag) in frags {
+                used = push_cols(
+                    &mut spans,
+                    &frag,
+                    band(Style::default().fg(Color::Rgb(r, g, b))),
+                    used,
+                    width,
+                );
+            }
+        }
+        _ => {
+            used = push_cols(&mut spans, text, band(semantic), used, width);
+        }
+    }
+
+    // Pad the band to the right edge so the tint reads full-width.
+    if let Some(bg) = tint
+        && used < width
+    {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(bg),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Truncates `text` to at most `width` DISPLAY COLUMNS (a wide glyph counts 2),
+/// replacing the trimmed tail with a single `…`. The diff path's chrome uses
+/// this (not the char-based [`truncate_visual`]) so a CJK/emoji title or header
+/// still occupies `<= width` columns and the viewport never re-wraps it
+/// (measure==draw, ADR-0029).
+fn truncate_cols(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    // Leave one column for the ellipsis; stop before a wide glyph would straddle.
+    let (mut out, _) = clip_to_cols(text, width.saturating_sub(1));
+    out.push('…');
+    out
+}
+
+/// The longest char-boundary prefix of `text` that fits in `max` DISPLAY COLUMNS,
+/// with its column width. A wide glyph that would straddle the cap is dropped
+/// (never half-drawn), so the returned width is always `<= max`. The one place
+/// the diff path's column clipping lives ([`truncate_cols`] and [`push_cols`]).
+fn clip_to_cols(text: &str, max: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut cols = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if cols + w > max {
+            break;
+        }
+        out.push(ch);
+        cols += w;
+    }
+    (out, cols)
+}
+
+/// Pushes `text` styled onto `spans`, truncated so the row stays within `width`
+/// DISPLAY COLUMNS. Returns the new used-column count. A wide glyph that would
+/// straddle the cap is dropped (never half-drawn), so `used <= width` always and
+/// the produced [`Line`] occupies `<= width` columns - what keeps every diff row
+/// from soft-wrapping (measure==draw, ADR-0029).
+fn push_cols(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    style: Style,
+    used: usize,
+    width: usize,
+) -> usize {
+    if used >= width {
+        return used;
+    }
+    let room = width - used;
+    if text.width() <= room {
+        let w = text.width();
+        spans.push(Span::styled(text.to_string(), style));
+        return used + w;
+    }
+    let (clipped, cols) = clip_to_cols(text, room);
+    spans.push(Span::styled(clipped, style));
+    used + cols
 }
 
 /// The running-spinner animation frames (braille), advanced by the adapter's
@@ -2713,6 +3013,23 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::ui::transcript::Transcript;
+    use crate::view_model::DiffLine;
+
+    // A first-class `Diff` item (ADR-0008) with one all-added hunk of raw
+    // (marker-free) code lines - the shape the Diff extension's Presenter emits.
+    // `lang` is `None` so tests exercise the no-highlight fallback unless they
+    // pass a real language explicitly.
+    fn diff_item(title: &str, lines: Vec<DiffLine>) -> TranscriptItem {
+        TranscriptItem::Diff {
+            title: title.to_string(),
+            lang: None,
+            hunks: vec![DiffHunk {
+                header: None,
+                lines,
+            }],
+            elided: 0,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // The semantic MdStyle → Style mapping (ADR-0008): one assertion per
@@ -2902,31 +3219,22 @@ mod tests {
     }
 
     #[test]
-    fn dark_line_styles_pin_the_legacy_palette() {
+    fn dark_diff_side_fg_pins_the_palette() {
         let t = theme::dark();
+        assert_eq!(diff_side_fg(DiffSide::Added, t), Color::Green);
+        assert_eq!(diff_side_fg(DiffSide::Removed, t), Color::Red);
+        assert_eq!(diff_side_fg(DiffSide::Context, t), Color::DarkGray);
+    }
+
+    #[test]
+    fn diff_chrome_reads_muted_italic() {
+        // The `@@` header and `… N more lines` tail wear one shared chrome style.
         assert_eq!(
-            line_style(LineStyle::Added, t),
-            Style::default().fg(Color::Green)
-        );
-        assert_eq!(
-            line_style(LineStyle::Removed, t),
-            Style::default().fg(Color::Red)
-        );
-        assert_eq!(
-            line_style(LineStyle::Context, t),
-            Style::default().fg(Color::DarkGray)
-        );
-        assert_eq!(
-            line_style(LineStyle::Emphasis, t),
-            Style::default().add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(
-            line_style(LineStyle::Muted, t),
+            diff_chrome_style(theme::dark()),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC)
         );
-        assert_eq!(line_style(LineStyle::Default, t), Style::default());
     }
 
     #[test]
@@ -3001,12 +3309,12 @@ mod tests {
     fn a_non_default_theme_recolors_the_mappings() {
         let t = themed("[colors]\nadded = \"#123456\"\nheading = \"magenta\"\n");
         assert_eq!(
-            line_style(LineStyle::Added, &t).fg,
-            Some(Color::Rgb(0x12, 0x34, 0x56))
+            diff_side_fg(DiffSide::Added, &t),
+            Color::Rgb(0x12, 0x34, 0x56)
         );
         assert_eq!(md_style(MdStyle::Heading, &t).fg, Some(Color::Magenta));
         // Unstated slots still read the dark floor.
-        assert_eq!(line_style(LineStyle::Removed, &t).fg, Some(Color::Red));
+        assert_eq!(diff_side_fg(DiffSide::Removed, &t), Color::Red);
     }
 
     // -----------------------------------------------------------------------
@@ -3893,18 +4201,18 @@ mod tests {
 
     #[test]
     fn cache_sync_rebuilds_when_the_tools_toggle_flips() {
-        // The Ctrl-O twin of the thinking-toggle test: a multi-line Block folds
+        // The Ctrl-O twin of the thinking-toggle test: a multi-line Diff folds
         // to a single title line when collapsed and to the full body when
         // expanded, and flipping the toggle clears the cache so the change
         // takes effect. The lane is dense now - no per-item blank separator.
         let mut t = fresh_transcript();
-        t.push(TranscriptItem::Block {
-            title: "edit_file src/foo.rs".to_string(),
-            lines: vec![
-                StyledLine::new(LineStyle::Added, "+ added line"),
-                StyledLine::new(LineStyle::Removed, "- removed line"),
+        t.push(diff_item(
+            "edit_file src/foo.rs",
+            vec![
+                DiffLine::new(DiffSide::Added, "added line"),
+                DiffLine::new(DiffSide::Removed, "removed line"),
             ],
-        });
+        ));
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
         // Collapsed one-liner, dense (no per-item blank separator).
@@ -4092,13 +4400,10 @@ mod tests {
     }
 
     #[test]
-    fn foldable_body_is_some_only_for_a_non_empty_block() {
-        // A non-empty Block folds under Ctrl-O.
-        let block = TranscriptItem::Block {
-            title: "edit_file x".to_string(),
-            lines: vec![StyledLine::new(LineStyle::Added, "+ a")],
-        };
-        assert!(block.foldable_body().is_some());
+    fn has_foldable_body_is_true_only_for_a_non_empty_diff() {
+        // A non-empty Diff folds under Ctrl-O.
+        let diff = diff_item("edit_file x", vec![DiffLine::new(DiffSide::Added, "a")]);
+        assert!(diff.has_foldable_body());
 
         // A one-line merged ToolResult has no body to fold.
         let result = TranscriptItem::ToolResult {
@@ -4107,38 +4412,357 @@ mod tests {
             is_error: false,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        assert!(result.foldable_body().is_none());
+        assert!(!result.has_foldable_body());
 
-        // An empty Block has nothing to fold either.
-        let empty = TranscriptItem::Block {
-            title: "titled but empty".to_string(),
-            lines: vec![],
-        };
-        assert!(empty.foldable_body().is_none());
+        // A Diff with no hunk lines has nothing to fold either.
+        let empty = diff_item("titled but empty", vec![]);
+        assert!(!empty.has_foldable_body());
     }
 
     #[test]
-    fn ctrl_o_still_folds_a_diff_block_after_the_merge() {
-        // A merge produces a lone diff Block (the call line removed). Ctrl-O
-        // must still collapse it to its one-line title - the semantic fold
-        // predicate keys on the Block's foldable body, unaffected by the merge.
-        let block = TranscriptItem::Block {
-            title: "edit_file src/foo.rs (+1 -1)".to_string(),
-            lines: vec![
-                StyledLine::new(LineStyle::Added, "+ new"),
-                StyledLine::new(LineStyle::Removed, "- old"),
+    fn ctrl_o_still_folds_a_diff_after_the_merge() {
+        // A merge produces a lone Diff (the call line removed). Ctrl-O must still
+        // collapse it to its one-line title - the semantic fold predicate keys
+        // on the Diff's foldable body, unaffected by the merge.
+        let diff = diff_item(
+            "edit_file src/foo.rs (+1 -1)",
+            vec![
+                DiffLine::new(DiffSide::Added, "new"),
+                DiffLine::new(DiffSide::Removed, "old"),
             ],
-        };
+        );
         // Collapsed (tools_expanded = false): one title line with the affordance.
-        let collapsed = message_lines(&block, false, false, 80, theme::dark());
+        let collapsed = message_lines(&diff, false, false, 80, theme::dark());
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]),
             "  ⋯ edit_file src/foo.rs (+1 -1) · ^O expand"
         );
         // Expanded: title + both body rows.
-        let expanded = message_lines(&block, false, true, 80, theme::dark());
+        let expanded = message_lines(&diff, false, true, 80, theme::dark());
         assert_eq!(expanded.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // diff rendering (ADR-0008): the marker glyph, the full-width tint band,
+    // and the two-pass hunk-coherent syntect highlighting.
+    // -----------------------------------------------------------------------
+
+    // A one-hunk Diff item: the shared builder every diff-render test routes
+    // through, so the `TranscriptItem::Diff { … }` literal lives in one place.
+    fn diff_of(lang: Option<&str>, header: Option<&str>, lines: Vec<DiffLine>) -> TranscriptItem {
+        TranscriptItem::Diff {
+            title: "edit_file foo".to_string(),
+            lang: lang.map(str::to_string),
+            hunks: vec![DiffHunk {
+                header: header.map(str::to_string),
+                lines,
+            }],
+            elided: 0,
+        }
+    }
+
+    // A created-file Diff (one all-added hunk, `header: None`) of `content` in
+    // `lang`, expanded so `message_lines` renders every code row.
+    fn created_diff_rows(lang: &str, content: &[&str], width: u16) -> Vec<Line<'static>> {
+        let lines = content
+            .iter()
+            .map(|t| DiffLine::new(DiffSide::Added, *t))
+            .collect();
+        let item = diff_of(Some(lang), None, lines);
+        message_lines(&item, false, true, width, theme::dark())
+    }
+
+    // The distinct syntect foregrounds of a diff code row: the fgs AFTER the
+    // marker glyph, dropping the trailing full-width pad (bg only, no fg). Used
+    // to compare the color a line's code was highlighted with.
+    fn code_fgs(row: &Line<'static>) -> Vec<Color> {
+        row.spans
+            .iter()
+            .skip(2) // the untinted indent + the marker glyph
+            .filter_map(|s| s.style.fg)
+            .collect()
+    }
+
+    #[test]
+    fn a_created_file_block_comment_colors_coherently_across_every_line() {
+        // The ADR-0008 HARD requirement: a created file is one all-added hunk =
+        // the whole file, highlighted as ONE slice so syntect parse state
+        // carries. A multi-line `/** … */` JSDoc block MUST color as a comment
+        // across ALL its lines - per-line-independent highlighting (which would
+        // color only line 1 as a comment and lines 2-3 as plain text) is WRONG.
+        let rows = created_diff_rows(
+            "js",
+            &[
+                "/**",
+                " * a doc comment",
+                " * spanning lines",
+                " */",
+                "const x = 1;",
+            ],
+            80,
+        );
+        // rows[0] is the title; the 4 comment lines are rows[1..=4].
+        let comment_fg = code_fgs(&rows[1]);
+        assert!(
+            comment_fg.iter().all(|c| matches!(c, Color::Rgb(..))),
+            "the comment's first line is syntect-colored: {comment_fg:?}"
+        );
+        let first = comment_fg[0];
+        for row in &rows[1..=4] {
+            for fg in code_fgs(row) {
+                assert_eq!(
+                    fg,
+                    first,
+                    "every line of the block comment shares the comment color \
+                     (parse state carried across the hunk): {:?}",
+                    line_text(row)
+                );
+            }
+        }
+        // The trailing code line, by contrast, is NOT the comment color - proof
+        // the comment actually closed and highlighting resumed.
+        let code_fg = code_fgs(&rows[5]);
+        assert!(
+            code_fg.iter().any(|c| *c != first),
+            "the `const x = 1;` line is not the comment color: {code_fg:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_line_highlights_from_the_before_image() {
+        // The removed side of a hunk highlights as its own slice (the before
+        // image): a removed comment line still colors as a comment, from the
+        // before-image pass, not the after-image one.
+        let item = diff_of(
+            Some("js"),
+            Some("@@ -1,2 +1,1 @@"),
+            vec![
+                DiffLine::new(DiffSide::Removed, "// gone"),
+                DiffLine::new(DiffSide::Added, "kept();"),
+            ],
+        );
+        let rows = message_lines(&item, false, true, 80, theme::dark());
+        // rows: title, header, removed, added.
+        let removed = &rows[2];
+        assert_eq!(removed.spans[1].content.as_ref(), "- ");
+        // The removed comment carried a syntect fg (before-image highlighted).
+        assert!(
+            code_fgs(removed)
+                .iter()
+                .all(|c| matches!(c, Color::Rgb(..))),
+            "the removed comment is syntect-colored: {:?}",
+            line_text(removed)
+        );
+    }
+
+    #[test]
+    fn an_added_line_reads_as_a_full_width_tint_band() {
+        // The tint is GitHub-style: a full-width band. The row's LAST span pads
+        // to the content width and carries the added_bg, and the marker glyph +
+        // code carry that same bg over their fg.
+        let rows = created_diff_rows("rs", &["let x = 1;"], 40);
+        let row = &rows[1];
+        let added_bg = Some(tui_color(theme::dark().added_bg));
+        // The marker glyph carries the tint and the semantic (green) fg.
+        assert_eq!(row.spans[1].content.as_ref(), "+ ");
+        assert_eq!(row.spans[1].style.bg, added_bg);
+        assert_eq!(row.spans[1].style.fg, Some(tui_color(theme::dark().added)));
+        // Every span past the untinted indent carries the tint (band-wide).
+        for span in row.spans.iter().skip(1) {
+            assert_eq!(span.style.bg, added_bg, "band span keeps the tint");
+        }
+        // The row fills the width exactly, in DISPLAY COLUMNS (indent + marker +
+        // code + pad).
+        assert_eq!(row_display_width(row), 40, "the band reaches the edge");
+        // The last span is the pad (bg only, no fg).
+        let pad = row.spans.last().unwrap();
+        assert_eq!(pad.style.bg, added_bg);
+        assert_eq!(pad.style.fg, None);
+    }
+
+    #[test]
+    fn a_context_line_is_untinted() {
+        let item = diff_of(
+            Some("rs"),
+            None,
+            vec![DiffLine::new(DiffSide::Context, "let x = 1;")],
+        );
+        let rows = message_lines(&item, false, true, 40, theme::dark());
+        let ctx = &rows[1];
+        // The context marker is two blanks and NO span carries a background.
+        assert_eq!(ctx.spans[1].content.as_ref(), "  ");
+        for span in &ctx.spans {
+            assert_eq!(span.style.bg, None, "context is untinted");
+        }
+    }
+
+    #[test]
+    fn an_unknown_language_falls_back_to_the_semantic_foreground() {
+        // No language resolves for a `.txt` extension (lang: None in practice);
+        // the code still renders, tinted, with the semantic fg (no syntect).
+        let item = diff_of(
+            None,
+            None,
+            vec![DiffLine::new(DiffSide::Added, "just text")],
+        );
+        let rows = message_lines(&item, false, true, 40, theme::dark());
+        let row = &rows[1];
+        // The code span carries the semantic added fg (green), not a syntect Rgb.
+        let code = &row.spans[2];
+        assert_eq!(code.content.as_ref(), "just text");
+        assert_eq!(code.style.fg, Some(tui_color(theme::dark().added)));
+    }
+
+    #[test]
+    fn the_elided_tail_renders_as_a_muted_count() {
+        let mut item = diff_of(None, None, vec![DiffLine::new(DiffSide::Added, "a")]);
+        if let TranscriptItem::Diff { elided, .. } = &mut item {
+            *elided = 40;
+        }
+        let rows = message_lines(&item, false, true, 40, theme::dark());
+        let tail = rows.last().unwrap();
+        assert_eq!(line_text(tail).trim_end(), "  … 40 more lines");
+        assert_eq!(tail.style, diff_chrome_style(theme::dark()));
+    }
+
+    #[test]
+    fn an_interleaved_hunk_aligns_each_line_to_its_own_image() {
+        // The cursor-alignment path: a hunk that interleaves context, removed,
+        // and added lines must draw each line from the RIGHT image (added/context
+        // from the after pass, removed/context from the before) with no desync.
+        // The `x` identifier appears on every line, so a coherent highlight gives
+        // every row the SAME fg for that token; a desynced cursor would mis-color.
+        let item = diff_of(
+            Some("rs"),
+            Some("@@ -1,4 +1,4 @@"),
+            vec![
+                DiffLine::new(DiffSide::Context, "let x = 0;"),
+                DiffLine::new(DiffSide::Removed, "let x = 1;"),
+                DiffLine::new(DiffSide::Removed, "let x = 2;"),
+                DiffLine::new(DiffSide::Added, "let x = 3;"),
+                DiffLine::new(DiffSide::Context, "let x = 4;"),
+                DiffLine::new(DiffSide::Added, "let x = 5;"),
+            ],
+        );
+        let rows = message_lines(&item, false, true, 80, theme::dark());
+        // rows: title, header, then the 6 code rows in file order.
+        let code = &rows[2..];
+        assert_eq!(code.len(), 6);
+        // The `let` keyword is fragment 0 of every code row; its fg is the syntect
+        // keyword color, identical on every line iff the two passes stayed aligned.
+        let keyword_fg = |row: &Line<'static>| code_fgs(row).first().copied();
+        let first = keyword_fg(&code[0]).expect("the first row is highlighted");
+        assert!(
+            matches!(first, Color::Rgb(..)),
+            "syntect colored it: {first:?}"
+        );
+        for row in code {
+            assert_eq!(
+                keyword_fg(row),
+                Some(first),
+                "every interleaved line's keyword shares one color: {:?}",
+                line_text(row)
+            );
+        }
+        // And each line wears the tint of ITS side (added/removed/context).
+        let added_bg = Some(tui_color(theme::dark().added_bg));
+        let removed_bg = Some(tui_color(theme::dark().removed_bg));
+        assert_eq!(code[0].spans[1].content.as_ref(), "  "); // context marker
+        assert_eq!(code[0].spans.last().unwrap().style.bg, None);
+        assert_eq!(code[1].spans[1].content.as_ref(), "- "); // removed marker
+        assert_eq!(code[1].spans.last().unwrap().style.bg, removed_bg);
+        assert_eq!(code[3].spans[1].content.as_ref(), "+ "); // added marker
+        assert_eq!(code[3].spans.last().unwrap().style.bg, added_bg);
+    }
+
+    #[test]
+    fn an_all_removed_hunk_renders_from_the_before_image() {
+        // A pure deletion: every line is Removed, so the after image is empty and
+        // the whole hunk highlights from the before image. Each row wears the
+        // removed marker, the removed tint, and a syntect fg.
+        let item = diff_of(
+            Some("rs"),
+            Some("@@ -1,2 +0,0 @@"),
+            vec![
+                DiffLine::new(DiffSide::Removed, "fn gone() {}"),
+                DiffLine::new(DiffSide::Removed, "fn also() {}"),
+            ],
+        );
+        let rows = message_lines(&item, false, true, 80, theme::dark());
+        let removed_bg = Some(tui_color(theme::dark().removed_bg));
+        for row in &rows[2..] {
+            assert_eq!(row.spans[1].content.as_ref(), "- ");
+            assert_eq!(row.spans.last().unwrap().style.bg, removed_bg);
+            assert!(
+                code_fgs(row).iter().all(|c| matches!(c, Color::Rgb(..))),
+                "the removed code is syntect-colored: {:?}",
+                line_text(row)
+            );
+        }
+    }
+
+    #[test]
+    fn a_tab_in_a_diff_line_expands_through_the_full_row() {
+        // The tab→two-spaces normalization survives the whole render path, not
+        // just the unit: a `\t`-indented code line draws with the tab expanded.
+        let rows = created_diff_rows("rs", &["\tlet x = 1;"], 80);
+        let row = &rows[1];
+        // indent (2) + marker (2) then the code, tab expanded to two spaces.
+        let text = line_text(row);
+        assert!(
+            text.starts_with("  +   let x = 1;"),
+            "tab expanded in the rendered row: {text:?}"
+        );
+        assert!(!text.contains('\t'), "no raw tab survives: {text:?}");
+    }
+
+    #[test]
+    fn an_over_wide_code_row_is_clipped_to_the_width() {
+        // The clip branch of `push_cols`: a code line wider than the content area
+        // is truncated so the row occupies exactly `width` columns (and thus never
+        // soft-wraps). Width 20, a 40-char line.
+        let long = "x".repeat(40);
+        let rows = created_diff_rows("rs", &[&long], 20);
+        let row = &rows[1];
+        assert_eq!(
+            row_display_width(row),
+            20,
+            "the row is clipped to the width"
+        );
+        // One visual row: the viewport's own wrap math agrees (measure==draw).
+        assert_eq!(wrapped_count(vec![row.clone()], 20), 1);
+    }
+
+    #[test]
+    fn a_wide_cjk_diff_row_stays_one_visual_row() {
+        // The MAJOR width-correctness fix (review #2): widths are DISPLAY COLUMNS,
+        // not char counts. A CJK line char-padded to `width` would render WIDER
+        // than `width` columns and the viewport `Wrap` would re-break it, shatter-
+        // ing the tint band. Assert via the SAME `wrapped_count` the viewport uses
+        // that a wide-glyph row occupies exactly one visual row at several widths.
+        for width in [12u16, 20, 41] {
+            // Each CJK ideograph is two columns; mix in ASCII and an emoji.
+            let rows = created_diff_rows("txt", &["語 = 実装 ✨ done"], width);
+            let row = &rows[1];
+            assert!(
+                row_display_width(row) <= width as usize,
+                "row is within {width} columns: got {} for {:?}",
+                row_display_width(row),
+                line_text(row)
+            );
+            assert_eq!(
+                wrapped_count(vec![row.clone()], width),
+                1,
+                "the wide-glyph row stays ONE visual row at width {width}: {:?}",
+                line_text(row)
+            );
+        }
+    }
+
+    // The rendered display width of a diff row (sum of its spans' column widths).
+    fn row_display_width(row: &Line<'static>) -> usize {
+        row.spans.iter().map(|s| s.content.width()).sum()
     }
 
     // The Stage 2 review's deferred scroll test: an unpinned viewport stores an
@@ -4159,12 +4783,12 @@ mod tests {
         for i in 0..16 {
             t.info(format!("prose line {i}"));
         }
-        t.push(TranscriptItem::Block {
-            title: "edit_file big.rs".to_string(),
-            lines: (0..30)
-                .map(|i| StyledLine::new(LineStyle::Added, format!("+ line {i}")))
+        t.push(diff_item(
+            "edit_file big.rs",
+            (0..30)
+                .map(|i| DiffLine::new(DiffSide::Added, format!("line {i}")))
                 .collect(),
-        });
+        ));
 
         let width = 80u16;
         let height = 10usize;
@@ -4256,7 +4880,7 @@ mod tests {
     use crate::event::Event;
     use crate::llm::Delta;
     use crate::llm::response::StopReason;
-    use crate::ui::screen::ScreenOpts;
+    use crate::ui::screen::{Key, ScreenOpts};
 
     /// Draws one frame with `draw` on a fresh `width`×`height` test terminal
     /// and returns the terminal for buffer inspection.
@@ -4579,6 +5203,46 @@ mod tests {
         eprintln!("{out}");
     }
 
+    // The non-interactive smoke for the `diff-demo` binary: the seeded
+    // `Screen::demo_diffs()` renders through the real viewport path (the same
+    // `render_viewport` a live frame uses) without panicking, in BOTH fold
+    // states - collapsed (each diff a fold-title one-liner, the app's default)
+    // and expanded (Ctrl-O / the binary's `o` key: the code rows and the elided
+    // tail). The binary only adds the terminal lifecycle on top of this render.
+    #[test]
+    fn the_diff_demo_screen_renders_its_diffs_without_panicking() {
+        // Collapsed (default): the lane opens and each diff shows its fold title.
+        let collapsed = buffer_text(&draw_viewport(100, 70, &Screen::demo_diffs()));
+        assert!(
+            collapsed.contains("clean up the tokenizer"),
+            "the request:\n{collapsed}"
+        );
+        for title in [
+            "edit_file src/lexer.rs",
+            "src/greet.js",
+            "package.json",
+            "src/generated.js",
+        ] {
+            assert!(collapsed.contains(title), "the {title} title:\n{collapsed}");
+        }
+
+        // Expanded (Ctrl-O): the code rows and the capped diff's elision tail.
+        let (expanded_screen, _) = Screen::demo_diffs().handle_key(Key::ToggleTools);
+        let expanded = buffer_text(&draw_viewport(100, 70, &expanded_screen));
+        assert!(
+            expanded.contains("split_whitespace"),
+            "the rust hunk body:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("Greets a user by name"),
+            "the jsdoc body:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("37 more lines"),
+            "the elided tail:\n{expanded}"
+        );
+    }
+
     #[test]
     fn the_demo_render_matches_the_confirmed_collapsed_run_shape() {
         // The demo is the living spec (ADR-0040): pin the load-bearing rows of
@@ -4839,8 +5503,8 @@ mod tests {
     }
 
     #[test]
-    fn run_fold_keeps_errors_assistant_markers_and_blocks() {
-        // Errors, assistant text, markers and Blocks always Keep - they break
+    fn run_fold_keeps_errors_assistant_markers_and_diffs() {
+        // Errors, assistant text, markers and Diffs always Keep - they break
         // out of the fold regardless of the window.
         let items = vec![
             TranscriptItem::User { text: "go".into() },
@@ -4852,10 +5516,7 @@ mod tests {
                 text: "» nudge".into(),
                 tone: Tone::Aid,
             },
-            TranscriptItem::Block {
-                title: "diff".into(),
-                lines: vec![],
-            },
+            diff_item("diff", vec![]),
         ];
         let fold = run_fold(&items, false, false, 0);
         for (i, action) in fold.iter().enumerate().skip(1) {
@@ -4958,16 +5619,19 @@ mod tests {
         // Task 1 acceptance: a long marker soft-wraps and its continuation must
         // sit at column 2 (block indent), not fall back to column 0. Render the
         // real path and inspect the marker's second visual row.
-        let long = "[reading file after file fills your context - dispatch \
-                    explore with one focused question instead; a Scout searches \
-                    and reports back]";
+        let long: Vec<String> = "reading file after file fills your context dispatch \
+                    a focused search instead and let a helper report back with just \
+                    the answer you actually need to keep moving"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("go", Ok(()));
-        let (screen, _) = screen.apply_event(Event::ExploreNudge { text: long.into() });
+        let (screen, _) = screen.apply_event(Event::tools_narrowed(long));
         let terminal = draw_viewport(60, 20, &screen);
-        // The marker's FIRST row carries `»`; its continuation is the next row.
+        // The marker's FIRST row carries `⊘`; its continuation is the next row.
         let marker_y = (0..20)
-            .find(|&y| row_text(&terminal, y).contains('»'))
+            .find(|&y| row_text(&terminal, y).contains('⊘'))
             .expect("the marker row");
         let cont = row_text(&terminal, marker_y + 1);
         assert!(cont.contains("instead"), "the continuation row: {cont:?}");
@@ -5196,23 +5860,25 @@ mod tests {
     }
 
     /// Vinnie's `evaluate this project` shape (~60 cols): a User prompt, a long
-    /// settled thought that would wrap, a real Aid nudge marker, and a tool
+    /// settled thought that would wrap, a wrapping in-lane marker, and a tool
     /// call. Returns the rendered terminal.
     fn evaluate_project_screen(width: u16, height: u16) -> Terminal<TestBackend> {
-        // The exact ExploreNudge wording from voice.rs, so it matches Vinnie's
-        // `» [reading file after file...]` line.
-        let nudge = "[reading file after file fills your context - dispatch \
-                     explore with one focused question instead; a Scout searches \
-                     and reports back]";
+        // A long tools-narrowed marker (`⊘ tools narrowed to ...`) that soft-
+        // wraps at 60 cols, standing in for the wrapping in-lane marker this
+        // shape exercises.
+        let tools: Vec<String> = "read_file list_files grep run_command edit_file \
+                     write_file plan and every other tool name that could plausibly \
+                     appear so the marker wraps across several visual rows here"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
         let thinking = "I should read the manifest and the entry point and the tests \
                         and then form a plan about what to evaluate first here";
         let screen = screen_with_thinking("evaluate this project", thinking);
         // Settle the thought (empty final content → thinking materializes).
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-        // An Aid nudge marker (the `» [...]` line); the screen prepends `» `.
-        let (screen, _) = screen.apply_event(Event::ExploreNudge {
-            text: nudge.to_string(),
-        });
+        // A wrapping in-lane Constrain marker (the `⊘ ...` line).
+        let (screen, _) = screen.apply_event(Event::tools_narrowed(tools));
         let (screen, _) = screen.apply_event(Event::tool_call(
             "id1",
             "read_file",
@@ -5296,13 +5962,13 @@ mod tests {
         for y in 0..24 {
             let row = row_text(&terminal, y);
             let first = row.chars().next();
-            // Rows carrying agent content (the thought, the `»` marker, the `⋯`
+            // Rows carrying agent content (the thought, the `⊘` marker, the `⋯`
             // machinery) are all in-lane and must start with the spine.
             let is_agent_content = row.contains("thought:")
-                || row.contains('»')
+                || row.contains('⊘')
                 || row.contains('⋯')
-                || row.contains("explore with")
-                || row.contains("searches and report");
+                || row.contains("tools narrowed")
+                || row.contains("every other tool");
             if is_agent_content {
                 assert_eq!(first, Some('│'), "row {y} lost its spine: {row:?}");
             }
@@ -5393,36 +6059,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // normalize_block_text: the two normalization rules (empty -> space, tab
-    // -> two spaces) are the only logic in `block_line`; tested here so that
-    // render tests pin the VISIBLE output and these tests pin the TEXT rule.
+    // normalize_diff_text: tab -> two spaces, the only text rule a diff code
+    // line needs (the tint band fills empty lines, so no empty -> space trick);
+    // render tests pin the VISIBLE output, these pin the TEXT rule.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn normalize_block_text_expands_empty_to_a_space() {
-        let line = StyledLine {
-            text: String::new(),
-            style: LineStyle::Default,
-        };
-        assert_eq!(normalize_block_text(&line), " ");
+    fn normalize_diff_text_replaces_tabs_with_two_spaces() {
+        assert_eq!(normalize_diff_text("a\tb"), "a  b");
     }
 
     #[test]
-    fn normalize_block_text_replaces_tabs_with_two_spaces() {
-        let line = StyledLine {
-            text: "a\tb".to_string(),
-            style: LineStyle::Default,
-        };
-        assert_eq!(normalize_block_text(&line), "a  b");
-    }
-
-    #[test]
-    fn normalize_block_text_leaves_ordinary_text_unchanged() {
-        let line = StyledLine {
-            text: "hello world".to_string(),
-            style: LineStyle::Default,
-        };
-        assert_eq!(normalize_block_text(&line), "hello world");
+    fn normalize_diff_text_leaves_ordinary_text_unchanged() {
+        assert_eq!(normalize_diff_text("hello world"), "hello world");
     }
 
     // -----------------------------------------------------------------------

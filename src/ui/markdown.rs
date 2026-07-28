@@ -4,7 +4,7 @@
 //! [`MdLine`]s of [`MdSpan`]s carrying SEMANTIC styles ([`MdStyle`]), never
 //! colors - the one markdown-style → ratatui mapping lives in
 //! [`crate::ui::components`] (`md_style`), the same move as ADR-0008's
-//! `LineStyle`. Pure data in/out like [`crate::ui::transcript`]: no ratatui,
+//! diff-side → color mapping. Pure data in/out like [`crate::ui::transcript`]: no ratatui,
 //! no state, no IO, and [`to_lines`] never panics - any input, including
 //! partial mid-stream markdown, produces reasonable lines.
 

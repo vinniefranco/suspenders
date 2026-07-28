@@ -57,7 +57,7 @@ collapsed) a lane folds to a tidy, scannable shape via a render-time
   `Drop`, replaced by a single `⋯ N earlier actions · ^O expand` count
   (`Elided(n)`) at the first windowed-out slot - a fold never *silently* hides
   work. Ctrl-O (`tools_expanded`) disables the window and shows every action.
-- **Errors, code/diff `Block`s, markers, assistant text and prompts always
+- **Errors, `Diff` items, markers, assistant text and prompts always
   `Keep` - they break out** of both folds and are always shown. An error tool
   result is the one machinery item that stays foreground (red+bold, `⚙`, always
   a `✗`); code and diffs would be mangled by windowing.
@@ -139,7 +139,11 @@ the brain, not the bar). This
 redesign also carries one adjacent pure-core change that is NOT adapter-local: the
 diff Presenter drops its line-number gutter (`extensions/diff/display.rs`), a change to
 what the Presenter chooses to show (ADR-0008 leaves that to the Presenter) with its own
-tests. Cross-reference ADR-0029: the lane, tail, and the `run_fold` collapse all
+tests. (The diff's flat semantic-color rendering that this ADR assumed - the `+`/`-`
+marker and a single semantic color carrying the whole line - was later superseded: the
+diff became a first-class `Diff` item whose lines carry a `DiffSide`, rendered with an
+added/removed background tint plus syntect foreground highlighting, per the revised
+ADR-0008. The gutter stays dropped; the flat single-color-per-line rendering does not.) Cross-reference ADR-0029: the lane, tail, and the `run_fold` collapse all
 land in `components.rs`, which 0029 twice refused to split past semantic lines -
 the added code is not a signal to extract a `TranscriptItem`-to-line builder.
 

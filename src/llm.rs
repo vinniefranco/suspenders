@@ -40,6 +40,7 @@ pub mod transform;
 pub mod adapter_test_support;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::content::{ContentBlock, Message};
@@ -47,6 +48,54 @@ use crate::tool::ToolSpec;
 use model::{Api, Model};
 use provider::Provider;
 use response::Response;
+
+/// How a stream adapter resolves Tool Calls a model emits (qwen parity with
+/// `QWEN_CODE_TOOL_CALL_STYLE`). Only the OpenAI-completions adapter reads it -
+/// the Anthropic dialect has no text-markup fallback to gate.
+///
+/// `rename_all = "lowercase"` makes the serde forms the exact lowercase strings
+/// the config env seam parses (`"auto"` / `"structured"` / `"text"`), so the
+/// `FileConfig` serialization and [`ToolCallStyle::parse`]/[`as_str`] agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallStyle {
+    /// Structured-first with a text-markup fallback: parse the content channel
+    /// for Hermes/Qwen-coder markup ONLY when the structured `tool_calls[]`
+    /// channel came back empty. The default - it recovers small-model calls
+    /// without ever overriding a structured one.
+    #[default]
+    Auto,
+    /// Never parse the text channel: the pre-fallback behavior, an escape hatch
+    /// for a host whose prose trips the text parser as a false positive.
+    Structured,
+    /// Force the text-parse attempt. Structured Tool Calls still always win, so
+    /// this only differs from [`Auto`](ToolCallStyle::Auto) once the attempt is
+    /// gated on a model id (future work); for now `Text` == `Auto`.
+    Text,
+}
+
+impl ToolCallStyle {
+    /// The lowercase wire token, paired with [`parse`](ToolCallStyle::parse):
+    /// `as_str` and `parse` are exact inverses over the wire tokens.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolCallStyle::Auto => "auto",
+            ToolCallStyle::Structured => "structured",
+            ToolCallStyle::Text => "text",
+        }
+    }
+
+    /// Parses a wire token; `None` on an unknown one (the config env seam turns
+    /// that into a malformed-value error naming the accepted set).
+    pub fn parse(s: &str) -> Option<ToolCallStyle> {
+        match s {
+            "auto" => Some(ToolCallStyle::Auto),
+            "structured" => Some(ToolCallStyle::Structured),
+            "text" => Some(ToolCallStyle::Text),
+            _ => None,
+        }
+    }
+}
 
 /// A typed request as the caller assembles it. The adapter selected by the
 /// captured Model's Api renders it to that protocol's wire payload.
@@ -59,9 +108,19 @@ pub struct LlmRequest {
     /// defaults. Resolved once by the Session (ADR-0037: temperature belongs
     /// to the request options, not a Connection).
     pub temperature: Option<f64>,
+    /// Nucleus-sampling cutoff; `None` leaves it to the server. Emitted only by
+    /// the OpenAI-completions wire builder (Qwen3-Coder tuning), omitted when
+    /// unset - the same omit-when-None discipline as `temperature`.
+    pub top_p: Option<f64>,
+    /// Top-k sampling cutoff; `None` leaves it to the server. Like `top_p`,
+    /// only the OpenAI-completions wire builder emits it, and only when set.
+    pub top_k: Option<u64>,
     /// The break-glass no-think rescue flag (DESIGN.md: Empty-response Nudge)
     /// and the Scout default (ADR-0014).
     pub no_think: bool,
+    /// How the stream adapter resolves Tool Calls (qwen parity). Only the
+    /// OpenAI-completions adapter reads it; [`ToolCallStyle::Auto`] by default.
+    pub tool_call_style: ToolCallStyle,
 }
 
 impl LlmRequest {
@@ -71,7 +130,10 @@ impl LlmRequest {
             messages,
             tools,
             temperature: None,
+            top_p: None,
+            top_k: None,
             no_think: false,
+            tool_call_style: ToolCallStyle::Auto,
         }
     }
 
@@ -82,6 +144,21 @@ impl LlmRequest {
 
     pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
         self.temperature = temperature;
+        self
+    }
+
+    pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    pub fn with_top_k(mut self, top_k: Option<u64>) -> Self {
+        self.top_k = top_k;
+        self
+    }
+
+    pub fn with_tool_call_style(mut self, style: ToolCallStyle) -> Self {
+        self.tool_call_style = style;
         self
     }
 }

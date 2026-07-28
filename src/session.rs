@@ -2,7 +2,7 @@
 //! once at launch: the Project Root, the Provider set, the launch Model, the
 //! sampling temperature, the budget-cap knob, the Eviction slack, the Dead
 //! Mass fraction, the Compaction Keep, the Run Limit, the Anchor cadence and
-//! stale-plan threshold, the Scout Pass cap, the no-think knobs, the command
+//! stale-plan threshold, the no-think knob, the command
 //! timeout, the Extension list, and the LLM module. The Context Budget and the
 //! Result Cap are NOT fixed facts: they derive from the Model each Run
 //! captures (ADR-0037).
@@ -39,88 +39,9 @@ use std::collections::BTreeMap;
 use crate::conversation;
 use crate::llm::model::{Api, Model};
 use crate::llm::provider::Provider;
-use crate::llm::{catalog, model};
+use crate::llm::{ToolCallStyle, catalog, model};
 use crate::tool::ToolCtx;
 use serde::{Deserialize, Serialize};
-
-/// The shape of a Recovery Run (CONTEXT.md: Recovery Run, Continuation,
-/// Handoff): [`RecoveryShape::Handoff`] retires the Conversation and seeds a
-/// fresh one from the compaction machinery; [`RecoveryShape::Continuation`]
-/// keeps it and appends the recovery prompt. A Setpoint value the Endgame
-/// Governor owns; defined here beside the Session facts that resolve it (the
-/// same direction as [`log::StopReason`], which the Endgame also reads).
-///
-/// `rename_all = "lowercase"` makes the serde forms exactly the lowercase
-/// strings the env seam already parses (`"handoff"` / `"continuation"`), so the
-/// [`FileConfig`] serialization and [`RecoveryShape::parse`]/[`as_str`] agree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RecoveryShape {
-    Handoff,
-    Continuation,
-}
-
-impl RecoveryShape {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RecoveryShape::Handoff => "handoff",
-            RecoveryShape::Continuation => "continuation",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<RecoveryShape> {
-        match s {
-            "handoff" => Some(RecoveryShape::Handoff),
-            "continuation" => Some(RecoveryShape::Continuation),
-            _ => None,
-        }
-    }
-}
-
-/// Why a Recovery Run reopens (ADR-0043): the three evidences of "unfinished"
-/// the one recovery judgment recognises. The first two are broken-state (the
-/// original ADR-0028 trigger, split by the `verification_failing` bool the
-/// Voice was already parameterized with); the third is the Open Plan - a green
-/// Run whose Plan still shows unchecked `[ ]` steps. The Voice's recovery
-/// prompt and the Session Log entry carry it, so an Open-Plan continuation
-/// logs and greps distinctly while remaining one mechanism. A recovery-domain
-/// sibling of [`RecoveryShape`]; the Endgame Governor produces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReopenReason {
-    /// Successful writes with no verification since (ADR-0028).
-    UnverifiedWrites,
-    /// A command string whose most recent run this Run failed, with a write
-    /// this Run (ADR-0028 addendum 2026-07-14).
-    DanglingFailure,
-    /// The Run settled green but its Plan still has unchecked steps and it
-    /// checked off at least one step this Run (ADR-0043).
-    OpenPlan,
-}
-
-impl ReopenReason {
-    /// The lowercase wire token for the Session Log's `recovery` entry
-    /// (ADR-0043), so an Open-Plan reopen greps distinctly. Paired with
-    /// [`ReopenReason::parse`] the way [`RecoveryShape`] pairs `as_str`/`parse`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReopenReason::UnverifiedWrites => "unverified_writes",
-            ReopenReason::DanglingFailure => "dangling_failure",
-            ReopenReason::OpenPlan => "open_plan",
-        }
-    }
-
-    /// Parses a wire token back to a reason. `None` on an unknown token; the
-    /// log fold degrades a missing/foreign reason to `UnverifiedWrites` (a
-    /// broken-state recovery), never to a torn line.
-    pub fn parse(s: &str) -> Option<ReopenReason> {
-        match s {
-            "unverified_writes" => Some(ReopenReason::UnverifiedWrites),
-            "dangling_failure" => Some(ReopenReason::DanglingFailure),
-            "open_plan" => Some(ReopenReason::OpenPlan),
-            _ => None,
-        }
-    }
-}
 
 /// The Session's fixed facts.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,38 +60,23 @@ pub struct Session {
     /// from the Model each Run captures.
     pub context_budget: Option<u64>,
     pub eviction_slack: f64,
-    /// The Eviction mechanic's Dead Mass Setpoint: the fraction of the
-    /// Context Budget that elidable dead content may occupy before a wave
-    /// fires without budget pressure.
-    pub dead_mass_fraction: f64,
     pub compaction_keep: f64,
     pub run_limit: u64,
+    /// The loop-detector's stall Setpoint (the passive circuit breaker): how
+    /// many Passes in a row the model may emit the IDENTICAL Tool Call batch
+    /// before the Run is terminated. A small number (default
+    /// [`DEFAULT_LOOP_STALL_LIMIT`]); `1` would trip on the first repeat.
+    pub loop_stall_limit: u64,
     pub anchor_interval: u64,
     /// The anchor Governor's stale-plan Setpoint: the Passes a Plan may sit
     /// unchanged - while writes land - before each Anchor carries the
     /// stale-plan line.
     pub plan_stale_after: u64,
-    /// The Endgame Governor's broken-state recovery Setpoint: at most this
-    /// many broken-state Recovery Runs may serve one user request (feeds
-    /// `repair_limit`). `0` disables the broken-state arms.
-    pub recovery_limit: u64,
-    /// The Endgame Governor's Open-Plan Setpoint (ADR-0043): at most this many
-    /// Open-Plan continuations may serve one user request. `0` disables the
-    /// Open-Plan arm. Larger than `recovery_limit` by default (3 vs 1):
-    /// self-continuing a green build is a different risk profile than one-shot
-    /// break-fixing.
-    pub advance_limit: u64,
-    /// The Endgame Governor's recovery-shape Setpoint: which arm a broken-state
-    /// Recovery Run takes (CONTEXT.md: Handoff is the default shape; an
-    /// Open-Plan continuation is always Continuation-shaped, ADR-0043).
-    pub recovery_shape: RecoveryShape,
     /// The malformed-tool-call re-draw Setpoint (ADR-0030): at most this many
     /// in-band re-draws may follow a retryable generation error within one
     /// Run. `0` disables the mechanic entirely (the loud failure runs
     /// immediately, as before).
     pub malformed_retry_budget: u64,
-    pub scout_pass_limit: u64,
-    pub scout_no_think: bool,
     pub no_think_rescue: bool,
     pub command_timeout_ms: u64,
     pub session_dir: String,
@@ -189,6 +95,11 @@ pub struct Session {
     /// to the server's own defaults. Resolved once here, applied by the
     /// request-building callers (ADR-0037: temperature belongs to the request).
     pub temperature: Option<f64>,
+    /// How every request resolves Tool Calls the model emits (qwen parity):
+    /// [`ToolCallStyle::Auto`] recovers a text-emitted call from the content
+    /// channel when the structured one is empty; `Structured` opts out. Resolved
+    /// once here, applied by the request-building callers.
+    pub tool_call_style: ToolCallStyle,
     /// The output cap for Models the Catalog does not know (the config knob):
     /// the synthesis fallback when a scoped id resolves at `/model` time.
     pub max_tokens: u64,
@@ -218,23 +129,21 @@ pub struct SessionConfig {
     pub theme: String,
     pub max_tokens: u64,
     pub temperature: Option<f64>,
+    /// The Tool Call resolution style every request carries (qwen parity):
+    /// [`ToolCallStyle::Auto`] by default. Env/file-settable like the scalars.
+    pub tool_call_style: ToolCallStyle,
     /// The optional global budget cap and catalog-less window figure
     /// (ADR-0037); `None` leaves every Model's own window uncapped.
     pub context_budget: Option<u64>,
     pub eviction_slack: f64,
-    pub dead_mass_fraction: f64,
     pub compaction_keep: f64,
     pub llm_module: String,
     pub command_timeout_ms: u64,
     pub run_limit: u64,
+    pub loop_stall_limit: u64,
     pub anchor_interval: u64,
     pub plan_stale_after: u64,
-    pub recovery_limit: u64,
-    pub advance_limit: u64,
-    pub recovery_shape: RecoveryShape,
     pub malformed_retry_budget: u64,
-    pub scout_pass_limit: u64,
-    pub scout_no_think: bool,
     pub no_think_rescue: bool,
     pub extensions: Vec<String>,
     pub session_dir: String,
@@ -256,18 +165,22 @@ const DEFAULT_TEMPERATURE: f64 = 0.7;
 /// The default Eviction reserve as a fraction of the Context Budget.
 const DEFAULT_EVICTION_SLACK: f64 = 0.2;
 
-/// The default Dead Mass Setpoint: the fraction of the budget that elidable
-/// dead content may occupy before a wave fires without budget pressure.
-const DEFAULT_DEAD_MASS_FRACTION: f64 = 0.15;
-
 /// The default Compaction Keep fraction.
 const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
 
 /// The default command timeout in milliseconds (2 minutes).
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 
-/// The default Run Limit (maximum Passes per user request).
-const DEFAULT_RUN_LIMIT: u64 = 32;
+/// The default Run Limit (maximum Passes / turns per user request). Sized for a
+/// real multi-step task under the Governor-free ReAct loop: qwen-code completed
+/// a task in ~41 turns and its own session-turn ceiling is ~100, so 100 leaves
+/// a legitimate task uncut while still bounding a runaway. A config knob - the
+/// loop-detector (`loop_stall_limit`) catches a stuck model well before this.
+const DEFAULT_RUN_LIMIT: u64 = 100;
+
+/// The default loop-detector stall limit: how many Passes in a row the model
+/// may emit the IDENTICAL Tool Call batch before the Run is terminated.
+const DEFAULT_LOOP_STALL_LIMIT: u64 = 5;
 
 /// The default Anchor cadence: an Anchor fires every this many Passes.
 const DEFAULT_ANCHOR_INTERVAL: u64 = 5;
@@ -278,9 +191,6 @@ const DEFAULT_PLAN_STALE_AFTER: u64 = 8;
 
 /// The default malformed-tool-call re-draw budget per Run.
 const DEFAULT_MALFORMED_RETRY_BUDGET: u64 = 3;
-
-/// The default Scout Pass cap.
-const DEFAULT_SCOUT_PASS_LIMIT: u64 = 8;
 
 /// The valid temperature range upper bound (inclusive).
 const TEMPERATURE_MAX: f64 = 2.0;
@@ -311,23 +221,21 @@ impl SessionConfig {
             theme: "dark".into(),
             max_tokens: DEFAULT_MAX_TOKENS,
             temperature: Some(DEFAULT_TEMPERATURE),
+            // Auto by default: a text-emitted Tool Call is recovered, nothing
+            // changes for a host whose structured channel already works.
+            tool_call_style: ToolCallStyle::Auto,
             // No global cap by default: every Model's own window is its
             // budget, so a wide-window Catalog model works out of the box.
             context_budget: None,
             eviction_slack: DEFAULT_EVICTION_SLACK,
-            dead_mass_fraction: DEFAULT_DEAD_MASS_FRACTION,
             compaction_keep: DEFAULT_COMPACTION_KEEP,
             llm_module: "Suspenders.LLM".into(),
             command_timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
             run_limit: DEFAULT_RUN_LIMIT,
+            loop_stall_limit: DEFAULT_LOOP_STALL_LIMIT,
             anchor_interval: DEFAULT_ANCHOR_INTERVAL,
             plan_stale_after: DEFAULT_PLAN_STALE_AFTER,
-            recovery_limit: 1,
-            advance_limit: 3,
-            recovery_shape: RecoveryShape::Handoff,
             malformed_retry_budget: DEFAULT_MALFORMED_RETRY_BUDGET,
-            scout_pass_limit: DEFAULT_SCOUT_PASS_LIMIT,
-            scout_no_think: true,
             no_think_rescue: true,
             extensions: vec!["diff".into(), "run_command".into(), "condense".into()],
             session_dir: default_session_dir(),
@@ -430,19 +338,16 @@ impl SessionConfig {
             theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
             temperature: base.temperature,
+            tool_call_style: Some(base.tool_call_style),
             // Absent from the template on purpose (ADR-0037): the base config
             // carries no global cap, and baking one in would pin wide-window
             // Catalog models under it.
             context_budget: base.context_budget,
             eviction_slack: Some(base.eviction_slack),
-            dead_mass_fraction: Some(base.dead_mass_fraction),
             compaction_keep: Some(base.compaction_keep),
+            loop_stall_limit: Some(base.loop_stall_limit),
             plan_stale_after: Some(base.plan_stale_after),
-            recovery_limit: Some(base.recovery_limit),
-            advance_limit: Some(base.advance_limit),
-            recovery_shape: Some(base.recovery_shape),
             malformed_retry_budget: Some(base.malformed_retry_budget),
-            scout_no_think: Some(base.scout_no_think),
             no_think_rescue: Some(base.no_think_rescue),
         };
 
@@ -567,7 +472,7 @@ pub struct ProviderConfig {
 /// plus the file-only `providers` table (ADR-0037 narrowed the lockstep rule
 /// to the scalars). Every field `Option<T>` so an absent key is an empty
 /// overlay. The deliberately excluded fields (`session_dir`, `llm_module`,
-/// `turn_limit`, `anchor_interval`, `scout_pass_limit`, `extensions`) are simply
+/// `turn_limit`, `anchor_interval`, `extensions`) are simply
 /// absent, so `deny_unknown_fields` rejects them for free - as it now rejects
 /// the retired flat `base_url` and `token` keys.
 ///
@@ -591,25 +496,19 @@ pub(crate) struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_style: Option<ToolCallStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     context_budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     eviction_slack: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dead_mass_fraction: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     compaction_keep: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loop_stall_limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_stale_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    recovery_limit: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    advance_limit: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recovery_shape: Option<RecoveryShape>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     malformed_retry_budget: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scout_no_think: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     no_think_rescue: Option<bool>,
 }
@@ -635,19 +534,16 @@ impl FileConfig {
         overlay(&self.theme, &mut cfg.theme);
         overlay(&self.max_tokens, &mut cfg.max_tokens);
         overlay_opt(&self.temperature, &mut cfg.temperature);
+        overlay(&self.tool_call_style, &mut cfg.tool_call_style);
         overlay_opt(&self.context_budget, &mut cfg.context_budget);
         overlay(&self.eviction_slack, &mut cfg.eviction_slack);
-        overlay(&self.dead_mass_fraction, &mut cfg.dead_mass_fraction);
         overlay(&self.compaction_keep, &mut cfg.compaction_keep);
+        overlay(&self.loop_stall_limit, &mut cfg.loop_stall_limit);
         overlay(&self.plan_stale_after, &mut cfg.plan_stale_after);
-        overlay(&self.recovery_limit, &mut cfg.recovery_limit);
-        overlay(&self.advance_limit, &mut cfg.advance_limit);
-        overlay(&self.recovery_shape, &mut cfg.recovery_shape);
         overlay(
             &self.malformed_retry_budget,
             &mut cfg.malformed_retry_budget,
         );
-        overlay(&self.scout_no_think, &mut cfg.scout_no_think);
         overlay(&self.no_think_rescue, &mut cfg.no_think_rescue);
     }
 }
@@ -709,6 +605,10 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         Ok(())
     }),
     // Float in [0.0, 2.0].
+    ("SUSPENDERS_TOOL_CALL_STYLE", |cfg, v| {
+        cfg.tool_call_style = parse_tool_call_style(v)?;
+        Ok(())
+    }),
     ("SUSPENDERS_TEMPERATURE", |cfg, v| {
         cfg.temperature = Some(parse_temperature(v)?);
         Ok(())
@@ -719,31 +619,18 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         Ok(())
     }),
     // Fraction in (0.0, 1.0).
-    ("SUSPENDERS_DEAD_MASS_FRACTION", |cfg, v| {
-        cfg.dead_mass_fraction = parse_dead_mass_fraction(v)?;
-        Ok(())
-    }),
-    // Fraction in (0.0, 1.0).
     ("SUSPENDERS_COMPACTION_KEEP", |cfg, v| {
         cfg.compaction_keep = parse_compaction_keep(v)?;
+        Ok(())
+    }),
+    // Positive integer: at least one repeat before the loop-detector fires.
+    ("SUSPENDERS_LOOP_STALL_LIMIT", |cfg, v| {
+        cfg.loop_stall_limit = parse_loop_stall_limit(v)?;
         Ok(())
     }),
     // Positive integer.
     ("SUSPENDERS_PLAN_STALE_AFTER", |cfg, v| {
         cfg.plan_stale_after = parse_plan_stale_after(v)?;
-        Ok(())
-    }),
-    // Non-negative integer; 0 disables the Recovery Run mechanic.
-    ("SUSPENDERS_RECOVERY_LIMIT", |cfg, v| {
-        cfg.recovery_limit = parse_int(v, "SUSPENDERS_RECOVERY_LIMIT")?;
-        Ok(())
-    }),
-    // "handoff" | "continuation". Note: the env parser trims whitespace
-    // (via `parse_recovery_shape`), but the JSON path does not - serde
-    // matches the string exactly. Accepted, not fixed: a stray space in
-    // a hand-typed env var is likelier than in an editor-formatted file.
-    ("SUSPENDERS_RECOVERY_SHAPE", |cfg, v| {
-        cfg.recovery_shape = parse_recovery_shape(v)?;
         Ok(())
     }),
     // Non-negative integer; 0 disables the malformed-retry re-draw.
@@ -752,10 +639,6 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         Ok(())
     }),
     // Booleans.
-    ("SUSPENDERS_SCOUT_NO_THINK", |cfg, v| {
-        cfg.scout_no_think = parse_bool(v, "SUSPENDERS_SCOUT_NO_THINK")?;
-        Ok(())
-    }),
     ("SUSPENDERS_NO_THINK_RESCUE", |cfg, v| {
         cfg.no_think_rescue = parse_bool(v, "SUSPENDERS_NO_THINK_RESCUE")?;
         Ok(())
@@ -795,15 +678,6 @@ fn parse_eviction_slack(raw: &str) -> Result<f64, SessionError> {
     }
 }
 
-fn parse_dead_mass_fraction(raw: &str) -> Result<f64, SessionError> {
-    match raw.trim().parse::<f64>() {
-        Ok(v) if v > FRACTION_LOWER_BOUND && v < FRACTION_UPPER_BOUND => Ok(v),
-        _ => Err(SessionError(format!(
-            "SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0), got: {raw:?}"
-        ))),
-    }
-}
-
 fn parse_plan_stale_after(raw: &str) -> Result<u64, SessionError> {
     match raw.trim().parse::<u64>() {
         Ok(n) if n > 0 => Ok(n),
@@ -813,10 +687,19 @@ fn parse_plan_stale_after(raw: &str) -> Result<u64, SessionError> {
     }
 }
 
-fn parse_recovery_shape(raw: &str) -> Result<RecoveryShape, SessionError> {
-    RecoveryShape::parse(raw.trim()).ok_or_else(|| {
+fn parse_loop_stall_limit(raw: &str) -> Result<u64, SessionError> {
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(SessionError(format!(
+            "SUSPENDERS_LOOP_STALL_LIMIT must be a positive integer, got: {raw:?}"
+        ))),
+    }
+}
+
+fn parse_tool_call_style(raw: &str) -> Result<ToolCallStyle, SessionError> {
+    ToolCallStyle::parse(raw.trim()).ok_or_else(|| {
         SessionError(format!(
-            "SUSPENDERS_RECOVERY_SHAPE must be \"handoff\" or \"continuation\", got: {raw:?}"
+            "SUSPENDERS_TOOL_CALL_STYLE must be \"auto\", \"structured\", or \"text\", got: {raw:?}"
         ))
     })
 }
@@ -849,17 +732,12 @@ pub struct SessionOpts {
     pub extensions: Option<Vec<String>>,
     pub context_budget: Option<u64>,
     pub eviction_slack: Option<f64>,
-    pub dead_mass_fraction: Option<f64>,
     pub compaction_keep: Option<f64>,
     pub run_limit: Option<u64>,
+    pub loop_stall_limit: Option<u64>,
     pub anchor_interval: Option<u64>,
     pub plan_stale_after: Option<u64>,
-    pub recovery_limit: Option<u64>,
-    pub advance_limit: Option<u64>,
-    pub recovery_shape: Option<RecoveryShape>,
     pub malformed_retry_budget: Option<u64>,
-    pub scout_pass_limit: Option<u64>,
-    pub scout_no_think: Option<bool>,
     pub no_think_rescue: Option<bool>,
     pub command_timeout_ms: Option<u64>,
     pub session_dir: Option<String>,
@@ -867,6 +745,7 @@ pub struct SessionOpts {
     /// the Provider set still resolves from config).
     pub model: Option<Model>,
     pub temperature: Option<Option<f64>>,
+    pub tool_call_style: Option<ToolCallStyle>,
 }
 
 impl Session {
@@ -906,19 +785,14 @@ impl Session {
             extensions: opts.extensions.unwrap_or_else(|| config.extensions.clone()),
             context_budget,
             eviction_slack: opts.eviction_slack.unwrap_or(config.eviction_slack),
-            dead_mass_fraction: opts.dead_mass_fraction.unwrap_or(config.dead_mass_fraction),
             compaction_keep: opts.compaction_keep.unwrap_or(config.compaction_keep),
             run_limit: opts.run_limit.unwrap_or(config.run_limit),
+            loop_stall_limit: opts.loop_stall_limit.unwrap_or(config.loop_stall_limit),
             anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
             plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
-            recovery_limit: opts.recovery_limit.unwrap_or(config.recovery_limit),
-            advance_limit: opts.advance_limit.unwrap_or(config.advance_limit),
-            recovery_shape: opts.recovery_shape.unwrap_or(config.recovery_shape),
             malformed_retry_budget: opts
                 .malformed_retry_budget
                 .unwrap_or(config.malformed_retry_budget),
-            scout_pass_limit: opts.scout_pass_limit.unwrap_or(config.scout_pass_limit),
-            scout_no_think: opts.scout_no_think.unwrap_or(config.scout_no_think),
             no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
             command_timeout_ms: opts.command_timeout_ms.unwrap_or(config.command_timeout_ms),
             session_dir: opts
@@ -928,6 +802,7 @@ impl Session {
             model: launch_model,
             theme: config.theme.clone(),
             temperature: opts.temperature.unwrap_or(config.temperature),
+            tool_call_style: opts.tool_call_style.unwrap_or(config.tool_call_style),
             max_tokens: config.max_tokens,
         };
 
@@ -998,8 +873,7 @@ impl Session {
 
     /// The ctx every Tool Call executes with: the Project Root, the Result
     /// Cap derived from `model` - the one the Run captured (ADR-0037) - and
-    /// the command timeout. (The `scout` capture is added later without
-    /// changing tool signatures.)
+    /// the command timeout.
     pub fn tool_ctx(&self, model: &Model) -> ToolCtx {
         ToolCtx {
             root: std::path::PathBuf::from(&self.root),
@@ -1008,7 +882,6 @@ impl Session {
                 model.max_tokens,
             ),
             command_timeout_ms: self.command_timeout_ms,
-            scout: None,
         }
     }
 }
@@ -1122,13 +995,12 @@ fn validate_scalars(s: &Session) -> Result<(), SessionError> {
     }
     pos_int(s.model.max_tokens, "model :max_tokens")?;
     pos_int(s.run_limit, ":turn_limit")?;
+    pos_int(s.loop_stall_limit, ":loop_stall_limit")?;
     pos_int(s.anchor_interval, ":anchor_interval")?;
     pos_int(s.plan_stale_after, ":plan_stale_after")?;
-    pos_int(s.scout_pass_limit, ":scout_pass_limit")?;
     pos_int(s.command_timeout_ms, ":command_timeout_ms")?;
 
     fraction_left_closed(s.eviction_slack, ":eviction_slack")?;
-    fraction_open(s.dead_mass_fraction, ":dead_mass_fraction")?;
     fraction_open(s.compaction_keep, ":compaction_keep")?;
     temperature(s.temperature)?;
     Ok(())
@@ -1364,50 +1236,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_mass_fraction_defaults_to_015_and_opts_override() {
-        let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.dead_mass_fraction, 0.15);
-
-        let session = Session::build(
-            SessionOpts {
-                dead_mass_fraction: Some(0.3),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap();
-        assert_eq!(session.dead_mass_fraction, 0.3);
-    }
-
-    #[test]
-    fn dead_mass_fraction_must_be_strictly_inside_open_interval() {
-        let with_fraction = |f: f64| {
-            Session::build(
-                SessionOpts {
-                    dead_mass_fraction: Some(f),
-                    model: Some(test_model()),
-                    ..opts()
-                },
-                &cfg(),
-            )
-        };
-        assert!(
-            with_fraction(0.0)
-                .unwrap_err()
-                .0
-                .contains(":dead_mass_fraction")
-        );
-        assert!(
-            with_fraction(1.0)
-                .unwrap_err()
-                .0
-                .contains(":dead_mass_fraction")
-        );
-        assert_eq!(with_fraction(0.15).unwrap().dead_mass_fraction, 0.15);
-    }
-
-    #[test]
     fn plan_stale_after_defaults_to_8_and_opts_override() {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.plan_stale_after, 8);
@@ -1436,6 +1264,67 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains(":plan_stale_after"));
+    }
+
+    // ---- loop_stall_limit (the loop-detector knob) ----
+
+    #[test]
+    fn run_limit_defaults_generous_and_loop_stall_limit_defaults_small() {
+        // The turn cap is sized for a real multi-step task under the ReAct loop
+        // (qwen's ~100 session-turn ceiling); the loop-detector catches a stuck
+        // model far sooner.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.run_limit, 100);
+        assert_eq!(session.loop_stall_limit, 5);
+    }
+
+    #[test]
+    fn loop_stall_limit_opts_override_and_must_be_positive() {
+        let session = Session::build(
+            SessionOpts {
+                loop_stall_limit: Some(3),
+                model: Some(test_model()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        assert_eq!(session.loop_stall_limit, 3);
+
+        let err = Session::build(
+            SessionOpts {
+                loop_stall_limit: Some(0),
+                model: Some(test_model()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap_err();
+        assert!(err.0.contains(":loop_stall_limit"));
+    }
+
+    #[test]
+    fn env_loop_stall_limit_positive_integer() {
+        assert_eq!(parse_loop_stall_limit("4").unwrap(), 4);
+        assert_eq!(parse_loop_stall_limit(" 5 ").unwrap(), 5);
+        assert!(
+            parse_loop_stall_limit("0")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_LOOP_STALL_LIMIT must be a positive integer")
+        );
+        assert!(parse_loop_stall_limit("nope").is_err());
+    }
+
+    #[test]
+    fn file_loop_stall_limit_overlays_onto_base() {
+        let mut cfg = SessionConfig::test_defaults();
+        FileConfig::parse(r#"{"loop_stall_limit": 7}"#)
+            .unwrap()
+            .apply(&mut cfg);
+        assert_eq!(cfg.loop_stall_limit, 7);
+        let session = Session::build(opts(), &cfg).unwrap();
+        assert_eq!(session.loop_stall_limit, 7);
     }
 
     // ---- the per-Model budget derivation (ADR-0037) ----
@@ -1645,67 +1534,37 @@ mod tests {
         assert_eq!(session.compaction_keep, 0.5);
     }
 
-    // ---- recovery_limit / recovery_shape ----
-
     #[test]
-    fn recovery_limit_defaults_to_1_and_opts_override_including_the_off_value() {
+    fn tool_call_style_defaults_to_auto_and_opts_override() {
         let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.recovery_limit, 1);
-
-        let with_limit = |n| {
-            build_session(|o| SessionOpts {
-                recovery_limit: Some(n),
-                ..o
-            })
-        };
-        assert_eq!(with_limit(3).recovery_limit, 3);
-        // 0 is valid: it disables the Recovery Run mechanic entirely.
-        assert_eq!(with_limit(0).recovery_limit, 0);
-    }
-
-    #[test]
-    fn advance_limit_defaults_to_3_and_opts_override_including_the_off_value() {
-        // The Open-Plan budget (ADR-0043): larger than recovery_limit by
-        // default, its own knob, 0-disablable.
-        let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.advance_limit, 3);
-
-        let with_advance = |n| {
-            build_session(|o| SessionOpts {
-                advance_limit: Some(n),
-                ..o
-            })
-        };
-        assert_eq!(with_advance(5).advance_limit, 5);
-        assert_eq!(with_advance(0).advance_limit, 0);
-    }
-
-    #[test]
-    fn recovery_shape_defaults_to_handoff_and_opts_override() {
-        let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.recovery_shape, RecoveryShape::Handoff);
+        assert_eq!(session.tool_call_style, ToolCallStyle::Auto);
 
         let session = Session::build(
             SessionOpts {
-                recovery_shape: Some(RecoveryShape::Continuation),
+                tool_call_style: Some(ToolCallStyle::Structured),
                 model: Some(test_model()),
                 ..opts()
             },
             &cfg(),
         )
         .unwrap();
-        assert_eq!(session.recovery_shape, RecoveryShape::Continuation);
+        assert_eq!(session.tool_call_style, ToolCallStyle::Structured);
     }
 
     #[test]
-    fn env_recovery_limit_is_a_non_negative_integer() {
-        assert_eq!(parse_int("0", "SUSPENDERS_RECOVERY_LIMIT").unwrap(), 0);
-        assert_eq!(parse_int("2", "SUSPENDERS_RECOVERY_LIMIT").unwrap(), 2);
-        assert!(
-            parse_int("-1", "SUSPENDERS_RECOVERY_LIMIT")
-                .unwrap_err()
-                .0
-                .contains("SUSPENDERS_RECOVERY_LIMIT must be an integer")
+    fn env_tool_call_style_names_the_three_arms_only() {
+        assert_eq!(
+            parse_tool_call_style("auto").unwrap(),
+            ToolCallStyle::Auto
+        );
+        assert_eq!(
+            parse_tool_call_style(" structured ").unwrap(),
+            ToolCallStyle::Structured
+        );
+        assert_eq!(parse_tool_call_style("text").unwrap(), ToolCallStyle::Text);
+        assert_eq!(
+            parse_tool_call_style("nope").unwrap_err().0,
+            "SUSPENDERS_TOOL_CALL_STYLE must be \"auto\", \"structured\", or \"text\", got: \"nope\""
         );
     }
 
@@ -1743,78 +1602,6 @@ mod tests {
                 .0
                 .contains("SUSPENDERS_MALFORMED_RETRY_BUDGET must be an integer")
         );
-    }
-
-    #[test]
-    fn env_recovery_shape_names_the_two_arms_only() {
-        assert_eq!(
-            parse_recovery_shape("handoff").unwrap(),
-            RecoveryShape::Handoff
-        );
-        assert_eq!(
-            parse_recovery_shape(" continuation ").unwrap(),
-            RecoveryShape::Continuation
-        );
-        assert_eq!(
-            parse_recovery_shape("retry").unwrap_err().0,
-            "SUSPENDERS_RECOVERY_SHAPE must be \"handoff\" or \"continuation\", got: \"retry\""
-        );
-    }
-
-    // ---- scout_pass_limit ----
-
-    #[test]
-    fn scout_pass_limit_defaults_to_8() {
-        assert_eq!(Session::build(opts(), &cfg()).unwrap().scout_pass_limit, 8);
-    }
-
-    #[test]
-    fn scout_pass_limit_opts_override_and_must_be_positive() {
-        let session = Session::build(
-            SessionOpts {
-                scout_pass_limit: Some(3),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap();
-        assert_eq!(session.scout_pass_limit, 3);
-
-        assert!(
-            Session::build(
-                SessionOpts {
-                    scout_pass_limit: Some(0),
-                    model: Some(test_model()),
-                    ..opts()
-                },
-                &cfg()
-            )
-            .unwrap_err()
-            .0
-            .contains(":scout_pass_limit")
-        );
-    }
-
-    // ---- scout_no_think ----
-
-    #[test]
-    fn scout_no_think_defaults_to_true() {
-        assert!(Session::build(opts(), &cfg()).unwrap().scout_no_think);
-    }
-
-    #[test]
-    fn scout_no_think_opts_override() {
-        let session = Session::build(
-            SessionOpts {
-                scout_no_think: Some(false),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap();
-        assert!(!session.scout_no_think);
     }
 
     // ---- no_think_rescue ----
@@ -1897,23 +1684,6 @@ mod tests {
     }
 
     #[test]
-    fn env_dead_mass_fraction_open_interval() {
-        assert_eq!(parse_dead_mass_fraction("0.15").unwrap(), 0.15);
-        assert!(
-            parse_dead_mass_fraction("0.0")
-                .unwrap_err()
-                .0
-                .contains("SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0)")
-        );
-        assert!(
-            parse_dead_mass_fraction("1.0")
-                .unwrap_err()
-                .0
-                .contains("(0.0, 1.0)")
-        );
-    }
-
-    #[test]
     fn env_plan_stale_after_positive_integer() {
         assert_eq!(parse_plan_stale_after("12").unwrap(), 12);
         assert_eq!(parse_plan_stale_after(" 8 ").unwrap(), 8);
@@ -1945,13 +1715,13 @@ mod tests {
 
     #[test]
     fn env_bool_true_false_only() {
-        assert!(parse_bool("true", "SUSPENDERS_SCOUT_NO_THINK").unwrap());
-        assert!(!parse_bool("false", "SUSPENDERS_SCOUT_NO_THINK").unwrap());
+        assert!(parse_bool("true", "SUSPENDERS_NO_THINK_RESCUE").unwrap());
+        assert!(!parse_bool("false", "SUSPENDERS_NO_THINK_RESCUE").unwrap());
         assert_eq!(
-            parse_bool("yes", "SUSPENDERS_SCOUT_NO_THINK")
+            parse_bool("yes", "SUSPENDERS_NO_THINK_RESCUE")
                 .unwrap_err()
                 .0,
-            "SUSPENDERS_SCOUT_NO_THINK must be \"true\" or \"false\", got: \"yes\""
+            "SUSPENDERS_NO_THINK_RESCUE must be \"true\" or \"false\", got: \"yes\""
         );
     }
 
@@ -2003,7 +1773,7 @@ mod tests {
         assert_eq!(fc.max_tokens, Some(4096));
         // Absent keys stay None.
         assert_eq!(fc.providers, None);
-        assert_eq!(fc.recovery_shape, None);
+        assert_eq!(fc.temperature, None);
     }
 
     #[test]
@@ -2071,26 +1841,17 @@ mod tests {
     }
 
     #[test]
-    fn file_config_recovery_shape_round_trips_the_lowercase_strings() {
-        let fc = FileConfig::parse(r#"{"recovery_shape": "continuation"}"#).unwrap();
-        assert_eq!(fc.recovery_shape, Some(RecoveryShape::Continuation));
-        // And the enum serializes to exactly those strings.
-        let json = serde_json::to_string(&RecoveryShape::Handoff).unwrap();
-        assert_eq!(json, "\"handoff\"");
-    }
-
-    #[test]
     fn file_config_apply_overlays_only_present_fields() {
         let mut cfg = SessionConfig::test_defaults();
         let before_budget = cfg.context_budget;
         let fc = FileConfig {
             model: Some("overlaid/model".into()),
-            recovery_shape: Some(RecoveryShape::Continuation),
+            plan_stale_after: Some(11),
             ..Default::default()
         };
         fc.apply(&mut cfg);
         assert_eq!(cfg.model, "overlaid/model");
-        assert_eq!(cfg.recovery_shape, RecoveryShape::Continuation);
+        assert_eq!(cfg.plan_stale_after, 11);
         // Absent fields untouched.
         assert_eq!(cfg.context_budget, before_budget);
     }
@@ -2129,8 +1890,8 @@ mod tests {
             Some(SessionConfig::base().model.as_str())
         );
         assert_eq!(
-            fc.recovery_shape,
-            Some(SessionConfig::base().recovery_shape)
+            fc.plan_stale_after,
+            Some(SessionConfig::base().plan_stale_after)
         );
         // The providers table rides the template, tokenless.
         let providers = fc.providers.clone().unwrap();
@@ -2209,17 +1970,15 @@ mod tests {
         assert!(fc.theme.is_some());
         assert!(fc.max_tokens.is_some());
         assert!(fc.temperature.is_some());
+        assert!(fc.tool_call_style.is_some());
         // The one deliberate absence besides token (ADR-0037): the base config
         // carries no global budget cap, so the template writes none.
         assert!(fc.context_budget.is_none());
         assert!(fc.eviction_slack.is_some());
-        assert!(fc.dead_mass_fraction.is_some());
         assert!(fc.compaction_keep.is_some());
+        assert!(fc.loop_stall_limit.is_some());
         assert!(fc.plan_stale_after.is_some());
-        assert!(fc.recovery_limit.is_some());
-        assert!(fc.recovery_shape.is_some());
         assert!(fc.malformed_retry_budget.is_some());
-        assert!(fc.scout_no_think.is_some());
         assert!(fc.no_think_rescue.is_some());
 
         let _ = std::fs::remove_file(&path);
@@ -2296,11 +2055,9 @@ mod tests {
         set_env("SUSPENDERS_MAX_TOKENS", "2048");
         set_env("SUSPENDERS_TEMPERATURE", "1.5");
         set_env("SUSPENDERS_EVICTION_SLACK", "0.25");
-        set_env("SUSPENDERS_DEAD_MASS_FRACTION", "0.3");
         set_env("SUSPENDERS_COMPACTION_KEEP", "0.4");
         set_env("SUSPENDERS_PLAN_STALE_AFTER", "6");
-        // The two 0-disables knobs prove non-negative (not positive) parsing.
-        set_env("SUSPENDERS_RECOVERY_LIMIT", "0");
+        // The 0-disables knob proves non-negative (not positive) parsing.
         set_env("SUSPENDERS_MALFORMED_RETRY_BUDGET", "0");
 
         let mut cfg = SessionConfig::test_defaults();
@@ -2310,28 +2067,42 @@ mod tests {
         assert_eq!(cfg.max_tokens, 2048);
         assert_eq!(cfg.temperature, Some(1.5));
         assert_eq!(cfg.eviction_slack, 0.25);
-        assert_eq!(cfg.dead_mass_fraction, 0.3);
         assert_eq!(cfg.compaction_keep, 0.4);
         assert_eq!(cfg.plan_stale_after, 6);
-        assert_eq!(cfg.recovery_limit, 0);
         assert_eq!(cfg.malformed_retry_budget, 0);
     }
 
     #[test]
-    fn apply_env_overlays_the_shape_and_bool_vars_onto_their_fields() {
+    fn apply_env_overlays_the_bool_vars_onto_their_fields() {
         clear_suspenders_env();
-        // The shape parser trims a hand-typed stray space (documented quirk).
-        set_env("SUSPENDERS_RECOVERY_SHAPE", " continuation ");
-        set_env("SUSPENDERS_SCOUT_NO_THINK", "false");
         set_env("SUSPENDERS_NO_THINK_RESCUE", "false");
 
-        // test_defaults has Handoff/true/true, so each landing is visible.
+        // test_defaults has true, so the landing is visible.
         let mut cfg = SessionConfig::test_defaults();
         SessionConfig::apply_env(&mut cfg).unwrap();
 
-        assert_eq!(cfg.recovery_shape, RecoveryShape::Continuation);
-        assert!(!cfg.scout_no_think);
         assert!(!cfg.no_think_rescue);
+    }
+
+    #[test]
+    fn apply_env_overlays_the_tool_call_style_onto_its_field() {
+        clear_suspenders_env();
+        // test_defaults has Auto, so landing Structured is visible.
+        set_env("SUSPENDERS_TOOL_CALL_STYLE", "structured");
+        let mut cfg = SessionConfig::test_defaults();
+        SessionConfig::apply_env(&mut cfg).unwrap();
+        assert_eq!(cfg.tool_call_style, ToolCallStyle::Structured);
+    }
+
+    #[test]
+    fn apply_env_rejects_an_unrecognized_tool_call_style() {
+        clear_suspenders_env();
+        set_env("SUSPENDERS_TOOL_CALL_STYLE", "nope");
+        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
+        assert_eq!(
+            err.0,
+            "SUSPENDERS_TOOL_CALL_STYLE must be \"auto\", \"structured\", or \"text\", got: \"nope\""
+        );
     }
 
     #[test]
@@ -2388,16 +2159,7 @@ mod tests {
             "SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0), got: \"1.0\""
         );
 
-        // dead_mass_fraction and compaction_keep are open (0.0, 1.0): the
-        // endpoints fall outside.
-        clear_suspenders_env();
-        set_env("SUSPENDERS_DEAD_MASS_FRACTION", "0.0");
-        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
-        assert_eq!(
-            err.0,
-            "SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0), got: \"0.0\""
-        );
-
+        // compaction_keep is open (0.0, 1.0): the endpoints fall outside.
         clear_suspenders_env();
         set_env("SUSPENDERS_COMPACTION_KEEP", "1.0");
         let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
@@ -2408,22 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_env_rejects_an_unrecognized_recovery_shape() {
-        clear_suspenders_env();
-        set_env("SUSPENDERS_RECOVERY_SHAPE", "retry");
-        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
-        assert_eq!(
-            err.0,
-            "SUSPENDERS_RECOVERY_SHAPE must be \"handoff\" or \"continuation\", got: \"retry\""
-        );
-    }
-
-    #[test]
     fn apply_env_rejects_a_non_boolean_flag() {
-        assert_eq!(
-            env_error("SUSPENDERS_SCOUT_NO_THINK", "yes"),
-            "SUSPENDERS_SCOUT_NO_THINK must be \"true\" or \"false\", got: \"yes\""
-        );
         assert_eq!(
             env_error("SUSPENDERS_NO_THINK_RESCUE", "1"),
             "SUSPENDERS_NO_THINK_RESCUE must be \"true\" or \"false\", got: \"1\""
@@ -2433,10 +2180,10 @@ mod tests {
     #[test]
     fn apply_env_reports_the_first_malformed_value_in_table_order() {
         // Two malformed values: the error names the one whose row comes first
-        // (CONTEXT_BUDGET precedes SCOUT_NO_THINK in ENV_OVERRIDES).
+        // (CONTEXT_BUDGET precedes NO_THINK_RESCUE in ENV_OVERRIDES).
         clear_suspenders_env();
         set_env("SUSPENDERS_CONTEXT_BUDGET", "nope");
-        set_env("SUSPENDERS_SCOUT_NO_THINK", "yes");
+        set_env("SUSPENDERS_NO_THINK_RESCUE", "yes");
         let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert!(err.0.contains("SUSPENDERS_CONTEXT_BUDGET"));
     }

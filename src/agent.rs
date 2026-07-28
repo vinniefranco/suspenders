@@ -38,18 +38,17 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::approvals::{ApprovalId, Approvals, Decide, Decision, Request};
-use crate::compaction::{Compaction, SeedCall};
+use crate::compaction::Compaction;
 use crate::content::{ContentBlock, Provenance};
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
-use crate::run::governor::endgame::Recovery;
 use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
-use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
-use crate::session::{RecoveryShape, ReopenReason, Session};
+use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
+use crate::session::Session;
 use crate::{tools, voice};
 
 mod deps;
@@ -193,23 +192,6 @@ pub enum RunMsg {
         skip_count: u64,
         tokens_before: u64,
     },
-    /// A Handoff finished seeding inside the Recovery Run task (CONTEXT.md:
-    /// Handoff): the fresh Conversation replaces the retired one, the
-    /// compaction state updates, and the `handoff` + `recovery` entries are
-    /// logged so Resume rebuilds the same seed.
-    HandoffSeeded {
-        conversation: Conversation,
-        new_state: Compaction,
-        narrative: Option<String>,
-        verification: Option<String>,
-        prompt: String,
-        /// Why the Recovery Run reopened (ADR-0043), so the logged `recovery`
-        /// entry carries the reason and Resume restores the right budget. A
-        /// Handoff is always a broken-state recovery (the Open-Plan arm is
-        /// Continuation-shaped), but the reason still distinguishes unverified
-        /// writes from a Dangling Failure.
-        reason: ReopenReason,
-    },
 }
 
 /// A public API Command (baud's `handle_call`s). Queries carry a `oneshot` reply
@@ -277,21 +259,9 @@ impl AgentHandle {
 
         // Resume BEFORE opening the new log (baud, ADR-0010): root mismatch fails
         // loudly; other drift yields to the new Session and is reported. One fold
-        // yields the messages, the Transcript-facing `ResumeInfo`, AND the two
-        // governance facts below - no re-reading the log for the Plan or the
-        // recovery count.
-        let (resumed_messages, resume_info, governance) = maybe_resume(resume, &session)?;
-
-        // The Plan is held outside the Conversation; a Resume restores the last
-        // logged Plan (folded above) so the model keeps its goal across a restart.
-        // A Resume also restores the recoveries the logged request consumed, so a
-        // resumed Session cannot re-trigger them unboundedly. Both were computed
-        // in the single fold, sharing its torn-line tolerance.
-        let ResumedGovernance {
-            plan,
-            recoveries_used,
-            advances_used,
-        } = governance;
+        // yields the messages, the Transcript-facing `ResumeInfo`, AND the last
+        // logged Plan - no re-reading the log for the Plan.
+        let (resumed_messages, resume_info, plan) = maybe_resume(resume, &session)?;
 
         // The tool specs ride with every request but live outside the messages;
         // the estimate has to count them or Eviction fires late (baud's
@@ -317,7 +287,6 @@ impl AgentHandle {
             ConversationOpts::new(session.context_budget_for(&model), model.max_tokens)
                 .overhead_chars(overhead)
                 .eviction_slack(session.eviction_slack)
-                .dead_mass_fraction(session.dead_mass_fraction)
                 .compaction_keep(session.compaction_keep),
         );
         // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.
@@ -338,8 +307,8 @@ impl AgentHandle {
         let (events, _rx0) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Session cost metering (ADR-0037): every model call this Session
-        // makes - Run Passes, Scouts, Compaction, Handoff seeds - flows
-        // through this one Arc, so a single decorator prices them all against
+        // makes - Run Passes, Scouts, Compaction - flows through this one
+        // Arc, so a single decorator prices them all against
         // each call's captured Model. The running total rides the Agent's own
         // mpsc like every Run event, so Event order stays the single owner's;
         // it is display-side only and never enters the Session Log.
@@ -367,8 +336,6 @@ impl AgentHandle {
             approval_replies: HashMap::new(),
             steering: Vec::new(),
             compaction: Compaction::new(),
-            recoveries_used,
-            advances_used,
             self_tx: tx.clone(),
         };
 
@@ -537,18 +504,6 @@ struct AgentState {
     approval_replies: HashMap<String, oneshot::Sender<bool>>,
     steering: Vec<String>,
     compaction: Compaction,
-    // Recovery Runs consumed serving the CURRENT user request (CONTEXT.md:
-    // Recovery Run - the Setpoint bounds recoveries per user request, not
-    // per Run). Cross-Run state lives with the Agent: reset when a genuine
-    // user prompt starts a new request (`Command::Submit`), NOT by Rollover
-    // or a Recovery Run; a Resume restores it from the folded log.
-    recoveries_used: u64,
-    // Open-Plan continuations consumed serving the CURRENT user request
-    // (ADR-0043): the sibling of `recoveries_used` for the Open-Plan arm, with
-    // its own `advance_limit` budget. Same lifecycle - reset only on a genuine
-    // `Command::Submit`, never by Rollover or a Recovery Run, and restored
-    // symmetrically on Resume.
-    advances_used: u64,
     // A clone of the mpsc sender, handed to the Run's AgentDeps so the Run
     // talks back over the same channel, and used to post the Run's outcome.
     self_tx: mpsc::UnboundedSender<Msg>,
@@ -571,12 +526,6 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             if state.task.is_some() {
                 let _ = reply.send(Err(Busy));
             } else {
-                // A genuine user prompt starts a new request: BOTH recovery
-                // budgets reset (ADR-0043). Rollover starts its Run via
-                // `start_run` directly and keeps the counts - its Steering
-                // missed a Run of the SAME request.
-                state.recoveries_used = 0;
-                state.advances_used = 0;
                 start_run(state, prompt);
                 let _ = reply.send(Ok(()));
             }
@@ -673,41 +622,6 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             );
             broadcast(state, Event::compaction_progress("done"));
             state.compaction = new_state;
-        }
-        RunMsg::HandoffSeeded {
-            conversation,
-            new_state,
-            narrative,
-            verification,
-            prompt,
-            reason,
-        } => {
-            // The seed and its prompt enter the log the way Compaction does:
-            // the narrative alone plus the mechanical facts as their own
-            // fields, so the fold recomposes a byte-identical seed message,
-            // then the `recovery` entry merges the prompt onto it.
-            log_entry(
-                state,
-                LogEntry::Handoff {
-                    summary: narrative,
-                    file_ops: new_state.file_ops.clone(),
-                    original_task: new_state.original_task.clone(),
-                    verification,
-                },
-            );
-            log_entry(
-                state,
-                LogEntry::Recovery {
-                    shape: RecoveryShape::Handoff,
-                    reason,
-                    text: prompt,
-                },
-            );
-            state.compaction = new_state;
-            // The fresh Conversation is the new base: a cancel before any
-            // checkpoint must settle on the seeded state the log now holds,
-            // not on the retired one.
-            state.conversation = conversation;
         }
     }
 }
@@ -832,19 +746,6 @@ fn log_event(state: &mut AgentState, event: &Event) {
         Event::SteeringDelivered { text } => {
             log_entry(state, LogEntry::Steering(text.clone()));
         }
-        Event::VerifyNudge { text }
-        | Event::VerifyFailedNudge { text }
-        | Event::EmptyResponseNudge { text }
-        | Event::ExploreNudge { text } => {
-            log_entry(state, LogEntry::Nudge(text.clone()));
-        }
-        // Anchors and Endgame prompts are Conversation events the model read:
-        // they persist like Nudges, tagged, so Resume rebuilds the same bytes
-        // (CONTEXT.md: every rider is logged to the Session Log).
-        Event::Anchor { text } => log_rider(state, RiderTag::Anchor, text),
-        Event::WrapUpWarning { text } => log_rider(state, RiderTag::WrapUpWarning, text),
-        Event::VerificationPass { text } => log_rider(state, RiderTag::VerificationPass, text),
-        Event::FinalPass { text } => log_rider(state, RiderTag::FinalPass, text),
         // A malformed-tool-call re-draw (ADR-0030): silent to the Conversation
         // but durable in the log, so a resumed Session can be audited for it.
         Event::Retry {
@@ -865,17 +766,7 @@ fn log_event(state: &mut AgentState, event: &Event) {
     }
 }
 
-fn log_rider(state: &mut AgentState, tag: RiderTag, text: &str) {
-    log_entry(
-        state,
-        LogEntry::Rider {
-            tag,
-            text: text.to_string(),
-        },
-    );
-}
-
-// ---- Run start (submit + Rollover + Recovery) ------------------------------
+// ---- Run start (submit + Rollover) -----------------------------------------
 
 // One Run start for submit and Rollover alike (baud's start_run).
 fn start_run(state: &mut AgentState, prompt: String) {
@@ -898,6 +789,7 @@ fn spawn_run(state: &mut AgentState) {
         Arc::clone(&state.llm),
         state.model.clone(),
         state.session.temperature,
+        state.session.tool_call_style,
         state.compaction.clone(),
     );
     let conversation = state.conversation.clone();
@@ -934,8 +826,6 @@ fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {
     RunOpts {
         plan: state.plan.clone(),
         original_task,
-        recoveries_used: state.recoveries_used,
-        advances_used: state.advances_used,
     }
 }
 
@@ -972,118 +862,6 @@ fn watch_run(state: &mut AgentState, run: tokio::task::JoinHandle<LoopOutcome>) 
     broadcast(state, Event::run_started(reference));
 }
 
-// ---- Recovery Run (CONTEXT.md: Recovery Run) -------------------------------
-
-// Executes the Endgame Governor's close-and-open-a-Recovery-Run Intervention:
-// the Governor judged (trigger + both Setpoints); the Agent - owner of the
-// Conversation and the Run lifecycle - opens the next Run. The prompt is the
-// Voice's: the only Run whose prompt Suspenders authors.
-fn start_recovery(state: &mut AgentState, recovery: Recovery) {
-    // Each arm spends its OWN budget (ADR-0043): an Open-Plan continuation
-    // burns `advances_used` against `advance_limit`; a broken-state recovery
-    // burns `recoveries_used` against `repair_limit`.
-    if recovery.reason == ReopenReason::OpenPlan {
-        state.advances_used += 1;
-    } else {
-        state.recoveries_used += 1;
-    }
-    let prompt = voice::recovery_prompt(recovery.reason).to_string();
-    broadcast(
-        state,
-        Event::recovery_run(recovery.shape, recovery.reason, prompt.clone()),
-    );
-
-    match recovery.shape {
-        // Continuation keeps the Conversation: the recovery prompt is the
-        // next Run's prompt, mechanically like Rollover's auto-submit but
-        // logged as the Voice's, not the user's. Both the Open-Plan arm and a
-        // Continuation-shaped broken-state recovery pass here.
-        RecoveryShape::Continuation => {
-            log_entry(
-                state,
-                LogEntry::Recovery {
-                    shape: RecoveryShape::Continuation,
-                    reason: recovery.reason,
-                    text: prompt.clone(),
-                },
-            );
-            state.conversation.merge_user_text(prompt);
-            spawn_run(state);
-        }
-        RecoveryShape::Handoff => {
-            spawn_handoff_run(state, prompt, recovery.reason, recovery.failing_command)
-        }
-    }
-}
-
-// The Handoff arm: the Recovery Run task first seeds the fresh Conversation
-// (the compaction machinery's LLM narrative + mechanical facts + the
-// verification verbatim + the prompt - a long LLM call, so it runs in the Run
-// task, never on the Agent actor, per ADR-0012), posts the seed back
-// (`HandoffSeeded` logs it and retires the old Conversation), then runs the
-// Run over the seeded Conversation. The Plan is harness-owned and rides
-// RunOpts verbatim - it survives the retirement untouched. `failing_command`
-// (the Dangling Failure the recovery names, `None` on an unverified-writes
-// recovery) tells the seed which command's result to carry verbatim.
-fn spawn_handoff_run(
-    state: &mut AgentState,
-    prompt: String,
-    reason: ReopenReason,
-    failing_command: Option<String>,
-) {
-    reset_run_state(state);
-    let dying = state.conversation.clone();
-    let compaction = state.compaction.clone();
-    let llm = Arc::clone(&state.llm);
-    // A snapshot of the Agent's mutable Model (the Active Model), as
-    // `spawn_run` does - the seed narrative and the Recovery Run both run on
-    // the model current at spawn (ADR-0033).
-    let model = state.model.clone();
-    let temperature = state.session.temperature;
-    let session = state.session.clone();
-    let opts = run_opts(state, None);
-    let tx = state.self_tx.clone();
-
-    let run = tokio::spawn(async move {
-        let seeded = compaction
-            .seed_handoff(
-                &dying,
-                &prompt,
-                failing_command.as_deref(),
-                &SeedCall {
-                    llm: llm.as_ref(),
-                    model: &model,
-                    temperature,
-                },
-            )
-            .await;
-        let _ = tx.send(Msg::Run(RunMsg::HandoffSeeded {
-            conversation: seeded.conversation.clone(),
-            new_state: seeded.state.clone(),
-            narrative: seeded.narrative,
-            verification: seeded.verification,
-            prompt,
-            reason,
-        }));
-        // Built here, not before the spawn: the Run's deps must carry the
-        // SEEDED compaction state so a later compaction telescopes from it.
-        let deps = AgentDeps::new(
-            tx.clone(),
-            Arc::clone(&llm),
-            model.clone(),
-            temperature,
-            seeded.state.clone(),
-        );
-        let opts = RunOpts {
-            original_task: seeded.state.original_task.clone(),
-            ..opts
-        };
-        let capture = deps.capture();
-        crate::run::run(seeded.conversation, session, capture, deps, opts).await
-    });
-    watch_run(state, run);
-}
-
 fn mint_run_ref() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1103,15 +881,6 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     if state.task.is_none() {
         return;
     }
-
-    // The Endgame Governor's recovery directive, held aside: the Run settles
-    // exactly like an Ok limit close first, then the Agent executes the
-    // opening. A cancel that raced the close wins - cancel means stop
-    // everything, recovery included.
-    let recovery = match (&outcome, state.cancel_flag) {
-        (LoopOrDown::Loop(LoopOutcome::Recover(_, _, recovery)), false) => Some(recovery.clone()),
-        _ => None,
-    };
 
     // The cancel flag rides the Settlement (note_cancelled was called on
     // `cancel`); the outcome only needs mapping into the settlement vocabulary.
@@ -1139,16 +908,11 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     );
     broadcast(state, settle_event_to_event(&resolution.event));
 
-    // Rollover outranks recovery: rolled-over Steering is the user's voice
-    // continuing the same request, which is itself the bounded continuation
-    // the recovery would have bought - and the recovery budget stays unspent.
+    // Rolled-over Steering is the user's voice continuing the same request:
+    // start a fresh Run over it.
     match resolution.rollover {
         Rollover::Submit(prompt) => start_run(state, prompt),
-        Rollover::None => {
-            if let Some(recovery) = recovery {
-                start_recovery(state, recovery);
-            }
-        }
+        Rollover::None => {}
     }
 }
 
@@ -1159,9 +923,6 @@ fn to_settlement_outcome(outcome: LoopOrDown) -> Outcome {
         LoopOrDown::Loop(LoopOutcome::Ok(conv, stop)) => {
             Outcome::Ok(conv, outcome_stop_to_log(stop))
         }
-        // A recovery close settles exactly like an Ok limit close (the marker
-        // is already appended); the directive was held aside by `settle`.
-        LoopOrDown::Loop(LoopOutcome::Recover(conv, reason, _)) => Outcome::Ok(conv, reason),
         // The Loop already closed the Conversation with the failure marker and
         // kept the errored response's partial text (the LLM error algebra).
         LoopOrDown::Loop(LoopOutcome::Failed(reason, conv)) => {
@@ -1220,31 +981,17 @@ fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
 
 // ---- Resume ----------------------------------------------------------------
 
-/// The governance facts a Resume restores alongside the Conversation: the last
-/// logged Plan (held outside the Conversation) and the two per-request recovery
-/// counts the logged request consumed - broken-state recoveries and Open-Plan
-/// continuations (ADR-0043). Computed in the single fold, so they never belong
-/// on the Transcript-facing [`ResumeInfo`] - the Agent threads them privately.
-#[derive(Default)]
-struct ResumedGovernance {
-    plan: Option<String>,
-    recoveries_used: u64,
-    advances_used: u64,
-}
+/// What a Resume yields: the folded Conversation messages, the Transcript-facing
+/// [`ResumeInfo`], and the last logged Plan (held outside the Conversation).
+type Resumed = (Vec<crate::content::Message>, Option<ResumeInfo>, Option<String>);
 
-fn maybe_resume(
-    resume: Option<Resume>,
-    session: &Session,
-) -> Result<
-    (
-        Vec<crate::content::Message>,
-        Option<ResumeInfo>,
-        ResumedGovernance,
-    ),
-    StartError,
-> {
+/// The governance fact a Resume restores alongside the Conversation: the last
+/// logged Plan (held outside the Conversation), computed in the single fold, so
+/// it never belongs on the Transcript-facing [`ResumeInfo`] - the Agent threads
+/// it privately.
+fn maybe_resume(resume: Option<Resume>, session: &Session) -> Result<Resumed, StartError> {
     let path = match resume {
-        None => return Ok((Vec::new(), None, ResumedGovernance::default())),
+        None => return Ok((Vec::new(), None, None)),
         Some(Resume::Path(p)) => p,
         Some(Resume::Latest) => log::latest(&session.session_dir).ok_or_else(|| {
             StartError::ResumeFailed(format!("no Session Log found in {}", session.session_dir))
@@ -1258,11 +1005,7 @@ fn maybe_resume(
                 path,
                 drift: r.drift,
             }),
-            ResumedGovernance {
-                plan: r.plan,
-                recoveries_used: r.recoveries,
-                advances_used: r.advances,
-            },
+            r.plan,
         )),
         Err(ResumeError::RootMismatch) => Err(StartError::ResumeRootMismatch(path)),
         Err(e) => Err(StartError::ResumeFailed(format!(

@@ -96,9 +96,7 @@ impl Response {
 /// `Failed to generate a valid tool call`, which `llm/stream.rs` wraps as
 /// `api_stream_error: ...`. Everything else is `false`, fail-loud by default:
 /// `Context size has been exceeded` (the KV-pool 500) and transport errors
-/// are pointless or a budget problem to retry, not a generation one. Mirrors
-/// the string-matching style of
-/// [`failure_category::classify`](crate::run::governor::ledger::failure_category::classify).
+/// are pointless or a budget problem to retry, not a generation one.
 pub fn is_retryable_error(error: &str) -> bool {
     error.contains("Failed to generate a valid tool call")
 }

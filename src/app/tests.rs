@@ -8,10 +8,10 @@
 // ===========================================================================
 use super::*;
 use crate::content::{ContentBlock, Usage};
-use crate::conversation::WaveStats;
+use crate::event::WaveStats;
 use crate::llm::response::{Response, StopReason};
-use crate::session::{RecoveryShape, SessionConfig};
-use crate::test_support::{Entry, FakeLlm, Release};
+use crate::session::SessionConfig;
+use crate::test_support::{Entry, FakeLlm};
 use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -274,25 +274,6 @@ fn session_in(dir: &TempDir) -> Session {
     .expect("session builds")
 }
 
-// Every Run caps on Pass 2 (one working Pass, then a refused tool-insistent
-// final Pass), so unfinished work opens a Continuation Recovery Run - the
-// same shape agent/tests.rs uses to reach the recovery seam.
-fn recovery_session(dir: &TempDir) -> Session {
-    let root = dir.path().to_string_lossy().into_owned();
-    let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
-    Session::build(
-        SessionOpts {
-            root: Some(root),
-            session_dir: Some(session_dir),
-            run_limit: Some(2),
-            recovery_shape: Some(RecoveryShape::Continuation),
-            ..Default::default()
-        },
-        &SessionConfig::test_defaults(),
-    )
-    .expect("session builds")
-}
-
 fn start(session: Session, fake: FakeLlm) -> AgentHandle {
     AgentHandle::start(
         StartOpts::new(session, Arc::new(fake)).with_system_prompt("You are a test agent."),
@@ -304,15 +285,6 @@ fn text_end(text: &str) -> Response {
     Response {
         content: vec![ContentBlock::text(text)],
         stop_reason: StopReason::EndTurn,
-        usage: Usage::default(),
-        error: None,
-    }
-}
-
-fn tool_use_reply(id: &str, name: &str, input: serde_json::Value) -> Response {
-    Response {
-        content: vec![ContentBlock::tool_use(id, name, input)],
-        stop_reason: StopReason::ToolUse,
         usage: Usage::default(),
         error: None,
     }
@@ -380,75 +352,5 @@ async fn a_busy_submit_prints_the_skip_line_and_continues() {
             "\n== submit (root=r): second".to_string(),
             "!! agent busy; skipping".to_string(),
         ]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_recovery_run_is_drained_until_it_settles() {
-    let dir = TempDir::new().unwrap();
-    // The Recovery Run parks on a Barrier: a scripted instant reply can
-    // settle the recovery BEFORE drive's status query under load, skipping
-    // the drain branch - parked, the Agent is Running until we release.
-    let (barrier, mut in_flight) = Entry::barrier();
-    let script = vec![
-        // Run 1 Pass 1: the write lands.
-        Entry::just(tool_use_reply(
-            "w1",
-            "write_file",
-            json!({ "path": "a.txt", "content": "x" }),
-        )),
-        // Run 1 Pass 2: a tool-insistent final Pass is refused at dispatch,
-        // capping the Run unverified - the Endgame opens a Recovery Run.
-        Entry::just(tool_use_reply("x1", "list_files", json!({ "path": "." }))),
-        barrier,
-    ];
-    let agent = start(recovery_session(&dir), FakeLlm::script(script));
-
-    // The release must ALSO wait for drive to take the Running branch: freed
-    // on park alone, the recovery can settle before drive even processes the
-    // first run_finished, and the status query would see Idle. The out sink
-    // signals when the drain line prints; only then does the parked Run get
-    // its conclusion.
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let parked = in_flight.recv().await.expect("recovery parks in complete");
-        drained_rx.await.expect("drive prints the drain line");
-        parked
-            .release
-            .send(Release {
-                deltas: vec![],
-                response: text_end("recovered and done"),
-            })
-            .ok();
-    });
-
-    let mut drained_tx = Some(drained_tx);
-    let mut lines: Vec<String> = Vec::new();
-    drive(&agent, "r", vec!["write the file".into()], &mut |l| {
-        if l == "   .. recovery turn running; draining until it settles"
-            && let Some(tx) = drained_tx.take()
-        {
-            tx.send(()).ok();
-        }
-        lines.push(l)
-    })
-    .await
-    .expect("drive drains the recovery turn");
-
-    // The first settlement found the Agent Running again (the recovery
-    // starts before the status query is answered), so the loop kept
-    // draining until the recovery's own settlement.
-    assert!(
-        lines
-            .iter()
-            .any(|l| l == "   .. recovery turn running; draining until it settles"),
-        "lines: {lines:#?}"
-    );
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.starts_with("\n== turn_finished"))
-            .count(),
-        2
     );
 }

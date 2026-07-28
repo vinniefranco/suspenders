@@ -358,7 +358,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::tool::ToolCtx;
-    use crate::view_model::{LineStyle, StyledLine, TranscriptItem};
+    use crate::view_model::{DiffHunk, DiffLine, DiffSide, TranscriptItem};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -368,7 +368,6 @@ mod tests {
             root: "/nowhere".into(),
             result_cap: 10_000,
             command_timeout_ms: 120_000,
-            scout: None,
         }
     }
 
@@ -455,7 +454,7 @@ mod tests {
     }
 
     // Attaches an artifact in post_run; in present, replaces a tool_result with
-    // a block when the `mark: seen` artifact is present (baud's
+    // a diff when the `mark: seen` artifact is present (baud's
     // ArtifactPresenter). It composes both roles.
     struct ArtifactPresenter;
     impl Middleware for ArtifactPresenter {
@@ -472,9 +471,14 @@ mod tests {
         ) -> TranscriptItem {
             match (&item, artifacts.get("mark")) {
                 (TranscriptItem::ToolResult { name, .. }, Some(mark)) if mark == &json!("seen") => {
-                    TranscriptItem::Block {
+                    TranscriptItem::Diff {
                         title: format!("presented {name}"),
-                        lines: vec![StyledLine::new(LineStyle::Added, "+ line")],
+                        lang: None,
+                        hunks: vec![DiffHunk {
+                            header: None,
+                            lines: vec![DiffLine::new(DiffSide::Added, "line")],
+                        }],
+                        elided: 0,
                     }
                 }
                 _ => item,
@@ -767,9 +771,14 @@ mod tests {
         assert!(failures.is_empty());
         assert_eq!(
             presented,
-            TranscriptItem::Block {
+            TranscriptItem::Diff {
                 title: "presented edit_file".to_string(),
-                lines: vec![StyledLine::new(LineStyle::Added, "+ line")],
+                lang: None,
+                hunks: vec![DiffHunk {
+                    header: None,
+                    lines: vec![DiffLine::new(DiffSide::Added, "line")],
+                }],
+                elided: 0,
             }
         );
     }

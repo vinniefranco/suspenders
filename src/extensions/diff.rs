@@ -6,8 +6,8 @@
 //! Artifact. write_file only creates (it refuses to overwrite), so it needs no
 //! snapshot: `post_run` on a successful write attaches an all-added created-file
 //! diff from the written content alone. [`present`](Diff::present) replaces the
-//! one-line Tool Result summary with a line-numbered diff block (the semantic
-//! display vocabulary, ADR-0008).
+//! one-line Tool Result summary with a first-class [`TranscriptItem::Diff`] (the
+//! semantic display vocabulary, ADR-0008).
 //!
 //! The model-facing content is left alone with one exception: when edit_file's
 //! fuzzy re-indentation path landed something other than a naive exact
@@ -20,7 +20,7 @@
 //!
 //! This Extension composes both roles (ADR-0042): a Middleware
 //! (`pre_run` snapshots, `post_run` computes hunks and attaches the Artifact)
-//! and a Presenter (`present` replaces the summary with a diff Block).
+//! and a Presenter (`present` replaces the summary with a [`TranscriptItem::Diff`]).
 
 pub mod display;
 pub mod hunks;
@@ -121,7 +121,7 @@ impl Presenter for Diff {
         _opts: &Value,
     ) -> TranscriptItem {
         // Replace a successful edit_file/write_file Tool Result summary with a
-        // line-numbered diff block; everything else passes through.
+        // first-class Diff item; everything else passes through.
         if let TranscriptItem::ToolResult {
             name,
             is_error: false,
@@ -130,9 +130,12 @@ impl Presenter for Diff {
             && TOOLS.contains(&name.as_str())
             && let Some(diff) = read_diff_artifact(artifacts)
         {
-            return TranscriptItem::Block {
+            let (hunks, elided) = display::hunks(&diff, display::DISPLAY_LINES);
+            return TranscriptItem::Diff {
                 title: display::title(name, &diff),
-                lines: display::lines(&diff, display::DISPLAY_LINES),
+                lang: display::lang(&diff.path),
+                hunks,
+                elided,
             };
         }
         item
@@ -249,7 +252,7 @@ mod tests {
     use super::*;
     use crate::extensions::{self, Registered};
     use crate::tool::ToolCtx;
-    use crate::view_model::{LineStyle, StyledLine};
+    use crate::view_model::{DiffLine, DiffSide};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -258,7 +261,6 @@ mod tests {
             root: root.to_path_buf(),
             result_cap: 10_000,
             command_timeout_ms: 120_000,
-            scout: None,
         }
     }
 
@@ -493,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn present_replaces_a_successful_tool_result_with_a_diff_block() {
+    fn present_replaces_a_successful_tool_result_with_a_diff_item() {
         let item = TranscriptItem::ToolResult {
             name: "edit_file".to_string(),
             summary: "edited lib/x.ex".to_string(),
@@ -503,17 +505,27 @@ mod tests {
 
         let presented = Diff.present(item, &diff_artifact(|_| {}), &json!({}));
 
-        let TranscriptItem::Block { title, lines } = presented else {
-            panic!("expected a block");
+        let TranscriptItem::Diff {
+            title,
+            lang,
+            hunks,
+            elided,
+        } = presented
+        else {
+            panic!("expected a diff");
         };
         assert_eq!(title, "edit_file lib/x.ex (+1 -1)");
-        // Minimal diff (ADR-0040 Decision D): the `@@ … @@` hunk header is kept,
-        // the line-number gutter is dropped - the +/-/context markers and their
-        // semantic colors carry the change.
-        assert!(lines.contains(&StyledLine::new(LineStyle::Muted, "@@ -1,3 +1,3 @@")));
-        assert!(lines.contains(&StyledLine::new(LineStyle::Removed, "- b")));
-        assert!(lines.contains(&StyledLine::new(LineStyle::Added, "+ B")));
-        assert!(lines.contains(&StyledLine::new(LineStyle::Context, "  a")));
+        // "lib/x.ex" resolves its language from the extension.
+        assert_eq!(lang.as_deref(), Some("ex"));
+        assert_eq!(elided, 0);
+        assert_eq!(hunks.len(), 1);
+        // The `@@ … @@` hunk header is kept as structure; the lines are RAW code
+        // with no +/-/context marker (the adapter adds it).
+        assert_eq!(hunks[0].header.as_deref(), Some("@@ -1,3 +1,3 @@"));
+        let lines = &hunks[0].lines;
+        assert!(lines.contains(&DiffLine::new(DiffSide::Removed, "b")));
+        assert!(lines.contains(&DiffLine::new(DiffSide::Added, "B")));
+        assert!(lines.contains(&DiffLine::new(DiffSide::Context, "a")));
     }
 
     #[test]
@@ -533,15 +545,17 @@ mod tests {
 
         let presented = Diff.present(item, &artifacts, &json!({}));
 
-        let TranscriptItem::Block { title, lines } = presented else {
-            panic!("expected a block");
+        let TranscriptItem::Diff { title, hunks, .. } = presented else {
+            panic!("expected a diff");
         };
         assert_eq!(title, "write_file lib/x.ex (new file, +1)");
-        assert_eq!(lines, vec![StyledLine::new(LineStyle::Added, "+ a")]);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header, None);
+        assert_eq!(hunks[0].lines, vec![DiffLine::new(DiffSide::Added, "a")]);
     }
 
     #[test]
-    fn present_long_diffs_cap_with_a_muted_tail() {
+    fn present_long_diffs_cap_and_report_the_elided_count() {
         let content = (1..=100)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
@@ -561,14 +575,12 @@ mod tests {
 
         let presented = Diff.present(item, &artifacts, &json!({}));
 
-        let TranscriptItem::Block { lines, .. } = presented else {
-            panic!("expected a block");
+        let TranscriptItem::Diff { hunks, elided, .. } = presented else {
+            panic!("expected a diff");
         };
-        assert_eq!(lines.len(), 61);
-        assert_eq!(
-            lines.last(),
-            Some(&StyledLine::new(LineStyle::Muted, "… 40 more lines"))
-        );
+        let shown: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(shown, display::DISPLAY_LINES);
+        assert_eq!(elided, 40);
     }
 
     #[test]
