@@ -47,46 +47,8 @@ use serde_json::Value;
 use crate::content::ContentBlock;
 use crate::event::Stage;
 use crate::extensions::{self, Registered};
-use crate::view_model::{StyledLine, Tone, TranscriptItem};
+use crate::view_model::{Tone, TranscriptItem};
 use streaming::Streaming;
-
-impl TranscriptItem {
-    /// The body this item collapses to under the global tools toggle (Ctrl-O),
-    /// or `None` if the item has nothing to fold and always renders in full.
-    ///
-    /// This is the SEMANTIC collapse predicate (Stage 2 review C2): the view's
-    /// fold keys on `foldable_body().is_some()`, not on a structural
-    /// `matches!(item, Block)`, so the merge is free to choose an item's shape
-    /// without re-implementing the fold rule. Today only a [`Block`] with a
-    /// non-empty body folds; a merged one-line `ToolResult` has no body, so it
-    /// never collapses. Stays pure - returns the pure-core [`StyledLine`] slice,
-    /// never a ratatui type (ADR-0019).
-    ///
-    /// [`Block`]: TranscriptItem::Block
-    pub fn foldable_body(&self) -> Option<&[StyledLine]> {
-        match self {
-            TranscriptItem::Block { lines, .. } if !lines.is_empty() => Some(lines),
-            _ => None,
-        }
-    }
-
-    /// The title an item collapses TO under the global tools toggle (Ctrl-O):
-    /// the one-liner the view shows in place of the folded [`foldable_body`].
-    /// Kept beside `foldable_body` so the collapse rule - predicate AND title -
-    /// lives entirely in the pure core (Stage 2 review C2 / S1): the view
-    /// composes the collapsed line from this accessor without matching on
-    /// `Block`, so a future non-Block foldable item collapses the same way.
-    /// Today only a [`Block`] has a fold title.
-    ///
-    /// [`foldable_body`]: TranscriptItem::foldable_body
-    /// [`Block`]: TranscriptItem::Block
-    pub fn fold_title(&self) -> Option<&str> {
-        match self {
-            TranscriptItem::Block { title, .. } => Some(title),
-            _ => None,
-        }
-    }
-}
 
 /// The settled item a successor replaces - the ONE way anything leaves the
 /// history. Both structural edits route through [`Transcript::supersede`], so
@@ -486,7 +448,7 @@ fn truncate(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::presenter::Presenter;
-    use crate::view_model::LineStyle;
+    use crate::view_model::{LineStyle, StyledLine};
     use serde_json::json;
 
     // --- helpers ------------------------------------------------------------
