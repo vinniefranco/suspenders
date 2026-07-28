@@ -41,7 +41,7 @@ pub trait Llm: Send + Sync {
 }
 ```
 
-Callers (Turn, Scout, Compaction) speak only typed domain structs. Each Api
+Callers (Run, Scout, Compaction) speak only typed domain structs. Each Api
 adapter owns end to end: native request building, transport and headers,
 its SSE dialect's decoding (a pure fold, as before), stop-reason mapping,
 usage extraction, and error capture. The production implementation of `Llm`
@@ -122,9 +122,9 @@ reasoning) outright - there is nothing to strip.
 
 ## The budget follows the captured Model
 
-Supersedes ADR-0033's "only the model identifier changes." Each Turn
+Supersedes ADR-0033's "only the model identifier changes." Each Run
 captures the whole Model, not just its id, and the derived figures
-recompute from that capture at Turn start:
+recompute from that capture at Run start:
 
 - context window → Context Budget (config `context_budget` remains as the
   window for catalog-less Models and as an optional global cap),
@@ -132,7 +132,7 @@ recompute from that capture at Turn start:
 - Context Budget → the Result Cap.
 
 A switch to a smaller window lands as ordinary budget pressure on the next
-Turn - Eviction and Compaction already know what to do. An in-flight Turn
+Run - Eviction and Compaction already know what to do. An in-flight Run
 finishes on the Model it captured; nothing swaps mid-flight. Scout and
 Compaction run on the same captured figures.
 
@@ -140,20 +140,20 @@ The precedence (implemented in Stage E): a Model's window is the Catalog's
 figure for a known built-in model, else its Provider's config
 `context_window` (the per-provider entry beats the global figure for that
 Provider's models), else the config `context_budget` figure, else the
-64K default. The effective Context Budget for a Turn is then
+64K default. The effective Context Budget for a Run is then
 `min(context_budget, window)` when the config key is set, and the window
 alone when it is not - the key is a cap and a fallback, never the budget
 itself. The budget invariant is per-Model: the effective budget must leave
 room past that Model's own output cap, checked at launch for the launch
 Model and at a `/model` swap for the picked Model, so a pick that cannot
-fit is rejected with the reason instead of exploding on a later Turn.
+fit is rejected with the reason instead of exploding on a later Run.
 
 ## Considered and rejected
 
 - **Keeping `build_request` outside the trait with a protocol switch** -
   rejected: every caller learns there are N wire formats; the interface
   grows where it should deepen.
-- **A trait per Api instead of a dispatcher** - rejected: Turn, Scout, and
+- **A trait per Api instead of a dispatcher** - rejected: Run, Scout, and
   Compaction want one injected boundary (ADR-0020); which adapter speaks is
   the dispatcher's fact, routed on `model.api`.
 - **Gitignored generated Catalog data (pi's way)** - rejected: puts the
@@ -172,7 +172,7 @@ fit is rejected with the reason instead of exploding on a later Turn.
   algebra are reaffirmed.
 - ADR-0033 amended: the single-connection premise that rejected a model
   registry is reversed; the Active Model becomes a scoped
-  `provider/model-id`; per-Turn capture widens from the id to the Model.
+  `provider/model-id`; per-Run capture widens from the id to the Model.
 - ADR-0031 amended: `model` becomes scoped; a `providers` table joins the
   schema and is file-only (structure the env cannot express).
 - CONTEXT.md gains Provider, Api, Model, Catalog, and Provenance; the

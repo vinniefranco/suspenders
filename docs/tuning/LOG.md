@@ -7,7 +7,7 @@ fixture, the observed failure, the tweak, the N=5 confirmation, the verdict.
 The loop:
 - **Drive** - fixture in `/tmp` as a git repo; run headless.
 - **Vet** - stdout + Session Log + `git diff` + frontier-grade judgment;
-  "did it finish / burn turns / was the code good."
+  "did it finish / burn runs / was the code good."
 - **Tune** - whatever surface the vet points at: Setpoints, Voice, Anchor
   structure, Tool shape, Governor behavior.
 - **Repeat** - N=5 before a tweak is credited; `git reset --hard && git
@@ -19,7 +19,7 @@ exists to stop phantom-chasing.
 
 ## Surfaces (in priority order, not a menu)
 
-1. **Setpoints** - cadences and thresholds (turn_limit, anchor_interval,
+1. **Setpoints** - cadences and thresholds (run_limit, anchor_interval,
    nudge-from-passes, explore-every, stuck recency, eviction_slack,
    compaction_keep, no_think_rescue).
 2. **Voice** - the wording of every Suspenders-voiced string (system prompt,
@@ -90,7 +90,7 @@ a 1-in-5 hard failure and a 1-in-5 near-miss.
 **Next (cycle 002):** the rework bleed. Watching the logs, the model is
 inefficient in its debug loop - it re-reads whole files repeatedly and
 rewrites the entire `parse` function on each edit instead of surgical edits,
-despite a system-prompt rule already saying "keep edits minimal." The turn
+despite a system-prompt rule already saying "keep edits minimal." The run
 budget bleeds on rework. Cheapest lever: Voice - strengthen the edit-minimal
 rule into something a 9B actually obeys.
 
@@ -117,7 +117,7 @@ concrete surgical-edits wording:
 > Keep edits surgical. Give edit_file the smallest old_str/new_str that
 > captures the change - just the few lines you are changing, plus enough
 > context to be unique. Never paste a whole function back to alter a few
-> lines; that wastes turns and risks dropping working code. When a fix needs
+> lines; that wastes runs and risks dropping working code. When a fix needs
 > several tries, re-read only the region you changed, not the whole file.
 
 **N=5:**
@@ -138,11 +138,11 @@ concrete surgical-edits wording:
 
 ---
 
-## 003 - Setpoint: turn_limit 25 → 32 (with Verify-tweak from 001)
+## 003 - Setpoint: run_limit 25 → 32 (with Verify-tweak from 001)
 
 **Fixture:** Same as 001.
 
-**Tweak (surface: Setpoints):** Bumped `turn_limit` from 25 to 32 in
+**Tweak (surface: Setpoints):** Bumped `run_limit` from 25 to 32 in
 `session.rs` to give the model more runway when doing the right thing
 (writing tests, iterating to correct). Kept the 001 Verify-tweak in Voice.
 
@@ -161,10 +161,10 @@ concrete surgical-edits wording:
 and mostly converges within the extra runway. The 1 incomplete run is still
 a regression (the model didn't converge even with 32 passes), but it's less
 severe than the 001 hard-fail. The stochasticity of a 9B means 5/5 may not
-be achievable on this fixture; the next lever would be turn_limit → 40 or
+be achievable on this fixture; the next lever would be run_limit → 40 or
 the "done" bar lowered (e.g., all tests green = done even if no new tests).
 
-**Current best config:** Voice Verify-step from 001 + turn_limit=32.
+**Current best config:** Voice Verify-step from 001 + run_limit=32.
 
 ---
 
@@ -179,7 +179,7 @@ passing tests that don't catch the bug.
 exposes it, fix it, and verify all tests pass. This tests the "find bug without
 guidance" capability plus the Verify-tweak's encouragement to write tests.
 
-**Config:** Cycle-003 config (Verify-tweak + turn_limit=32).
+**Config:** Cycle-003 config (Verify-tweak + run_limit=32).
 
 **N=5:**
 
@@ -207,7 +207,7 @@ excellent for testing this capability.
   The Verify-tweak is the foundation; the prompt is the immediate trigger.
 
 **Status:** This fixture confirms the current config (Verify-tweak +
-turn_limit=32) is working well for the "write tests for new behavior" aspect.
+run_limit=32) is working well for the "write tests for new behavior" aspect.
 
 ---
 
@@ -224,7 +224,7 @@ turn_limit=32) is working well for the "write tests for new behavior" aspect.
   already-cents subtotal (100x); symptom given, root cause two modules away.
   Tests cross-module bug fixing.
 
-**Config:** cycle-003 (Verify-tweak + turn_limit=32). No tweak this cycle -
+**Config:** cycle-003 (Verify-tweak + run_limit=32). No tweak this cycle -
 this entry is the baseline for the new capability classes.
 
 **N=5 per fixture:**
@@ -250,7 +250,7 @@ high-variance, and the worst outcomes end broken at the cap.
   of cargo output ≈ 40% (rest: warnings/Compiling boilerplate, repeated
   verbatim across ~8 runs).
 - Stale plan: plan tool called once (pass 5), never updated; all 6 anchors
-  re-injected the same outdated "Next step" for the rest of the turn.
+  re-injected the same outdated "Next step" for the rest of the run.
 - The failure Governor fired 5x ("step back: Nx command exited with error")
   and the model thrashed anyway - the wording names the category but gives
   no strategy; the final third was 5 edits to the same function with the
@@ -268,7 +268,7 @@ matters.
 
 ### Parked insight - tool_use inputs are invisible to Eviction
 
-Eviction hollows out Tool Results, but on edit-heavy turns the assistant's
+Eviction hollows out Tool Results, but on edit-heavy runs the assistant's
 own edit_file inputs are the largest context consumer and never age out.
 Candidate mechanics: elide superseded edit inputs the way stale anchors are
 elided. Needs a design decision (rewriting assistant history is a bigger
@@ -341,14 +341,14 @@ full cargo output. Frontier-grade judgment applies to the vet half too.
 | c006 (+pipefail) | 3/5 | 2x compile error at cap; 12/16 plateau |
 
 12 of 15 runs ended AT the 32-pass cap: for hard implementation tasks the
-Turn budget, not ability, is the binding constraint. The near-misses
-(15/16, 12/16) are one honest debugging turn away from green.
+Run budget, not ability, is the binding constraint. The near-misses
+(15/16, 12/16) are one honest debugging run away from green.
 
 ---
 
-## 007 - Two-turn recovery experiment: INVALID (server shut down mid-batch)
+## 007 - Two-run recovery experiment: INVALID (server shut down mid-batch)
 
-Protocol: same session, turn 1 = the f5 task, turn 2 = "continue until every
+Protocol: same session, run 1 = the f5 task, run 2 = "continue until every
 test passes" - designed to measure what an auto-continuation/Handoff
 mechanic would buy, given that 12/15 f5 runs died at the 32-pass cap.
 The model server was turned off during run 1; all c007-* run dirs in
@@ -393,7 +393,7 @@ cargo test + clippy:
 
 1. **Rider persistence (#5)** - Entry::Rider logged at injection;
    Resume replays anchors/endgame prompts through the same merge seam
-   the live turn uses. Commit 71a5289.
+   the live run uses. Commit 71a5289.
 2. **Dead-mass eviction (#1+#2, unified)** - second wave trigger
    (`dead_mass_fraction`, default 0.15) + Supersession classifiers
    (landed write inputs husked; repeated identical run_command/
@@ -403,20 +403,20 @@ cargo test + clippy:
    Governor appends the conditional line when plan exists, passes >
    `plan_stale_after` (default 8), writes since update > 0.
    Commit dc4eb46.
-4. **Recovery Turn (#3, both arms)** - eighth Intervention: cap close
-   with unverified/failing work opens a Voice-prompted Recovery Turn,
+4. **Recovery Run (#3, both arms)** - eighth Intervention: cap close
+   with unverified/failing work opens a Voice-prompted Recovery Run,
    bounded by `recovery_limit` (default 1). Shapes: Handoff (default,
    compaction-seeded fresh Conversation + final verification verbatim)
    and Continuation. ADR-0028. Commit faf7cb3.
 
-Glossary grew: Dead Mass, Supersession, Recovery Turn, Continuation,
+Glossary grew: Dead Mass, Supersession, Recovery Run, Continuation,
 Handoff; Setpoints may now be mechanic-owned; Eviction redefined for
 quality-triggered waves. End state: 960 tests green, clippy clean.
 
 **None of these is credited yet.** Every change above is design-
 validated only (cycle-006 evidence motivated it; no N=5 has confirmed
 it). Next session: rebuild the fixtures (f5-v2 - treat old scorecards
-as approximate), re-baseline single-turn at the new config, then run
+as approximate), re-baseline single-run at the new config, then run
 the c007 protocol as a three-way arm comparison - recovery off vs
 Continuation vs Handoff (`SUSPENDERS_RECOVERY_LIMIT=0` /
 `SUSPENDERS_RECOVERY_SHAPE`) - and vet dead-mass wave behavior in the
@@ -424,7 +424,7 @@ session logs (waves fired? husks imitated? cache churn acceptable?).
 
 ---
 
-## 008 - Recovery Turn arm comparison: trigger almost never fired (two holes found and fixed)
+## 008 - Recovery Run arm comparison: trigger almost never fired (two holes found and fixed)
 
 **Fixtures rebuilt after the reboot** (specs from LOG.md/PROPOSALS.md):
 f4-analysis (tasktrack, 8 tests green), f5-hard-algo v2 (globber, 16
@@ -439,7 +439,7 @@ off (`SUSPENDERS_RECOVERY_LIMIT=0`), Continuation, Handoff. Arms ran
 concurrently against the one model server from separate fixture copies
 and separate `XDG_DATA_HOME`s; two runs died to server-side 500
 "Context size has been exceeded" under concurrent KV load (off-run4 at
-pass 4, cont-run3's recovery turn) - contention artifacts, not harness
+pass 4, cont-run3's recovery run) - contention artifacts, not harness
 failures; casualties re-run serially.
 
 **Scorecard (green suites):**
@@ -448,9 +448,9 @@ failures; casualties re-run serially.
 |-----|-------|----------------|------------------------|
 | off | 0/5 | - | 14/16, 7/16, 15/16, (500 casualty), 13/16 |
 | continuation | 0/5 | 1/5 | 15/16, 2/14, 10/16 (T2 died to 500), 5/11, 12/16 |
-| handoff | 2/5 | 4/5 | run1 16/16 in 18p single-turn; **run2 capped red → Handoff turn → 16/16 in 14p**; 14/16; 12/16 |
+| handoff | 2/5 | 4/5 | run1 16/16 in 18p single-run; **run2 capped red → Handoff run → 16/16 in 14p**; 14/16; 12/16 |
 
-**The vet's real finding - the Recovery Turn's trigger almost never
+**The vet's real finding - the Recovery Run's trigger almost never
 fires.** All 13 completed T1s ended at the 32-pass cap with a red
 suite; recovery fired in only 5. Two holes, both confirmed in code:
 
@@ -463,7 +463,7 @@ suite; recovery fired in only 5. Two holes, both confirmed in code:
    tools. The off/cont vs hand firing asymmetry (1/5 vs 4/5) was
    coin-flip tool-insistence, not design.
 2. **Filtered-rerun laundering.** `command_failing()` is
-   last-command-only; models end capped turns with
+   last-command-only; models end capped runs with
    `cargo test one_test_name` (exit 0) after a red full-suite run, so
    the ledger reads green (cont-run1: last command
    `cargo test character_class_range -- --nocapture` after a 15/16
@@ -474,14 +474,14 @@ suite; recovery fired in only 5. Two holes, both confirmed in code:
 text-settle path (the reply enters the Conversation - Handoff seeding
 keeps the model's own wrap-up); the judgment's failing arm is now
 **Dangling Failure** - any command string whose most recent run this
-Turn failed - so a filtered green rerun no longer clears a red suite.
+Run failed - so a filtered green rerun no longer clears a red suite.
 ADR-0028 addendum + CONTEXT.md glossary. 975 tests, clippy clean.
 Also landed: Eviction waves now emit `## EVICTION wave:` to headless
 stdout - request-time waves were invisible to the vet (found while
 building vet.sh; nothing in stdout or the Session Log showed them).
 
 **Evidence the mechanic works when it fires:** hand-run2 converted a
-capped 32-pass red T1 into 16/16 green in a 14-pass Handoff turn.
+capped 32-pass red T1 into 16/16 green in a 14-pass Handoff run.
 That is the conversion PROPOSALS.md #3 predicted.
 
 **Not credited:** c008 is an invalid arm comparison (the arms differed
@@ -491,7 +491,7 @@ unchanged by the fix) with the 500-casualty run re-run.
 
 ---
 
-## 009 - Recovery Turn arm comparison at the fixed trigger: CREDITED, Handoff confirmed as default
+## 009 - Recovery Run arm comparison at the fixed trigger: CREDITED, Handoff confirmed as default
 
 **Fixture:** f5-hard-algo v2. **Config:** commit 5a9d6a3 (fixed
 trigger + Dangling Failure). Arms as in 008; off baseline carried
@@ -503,14 +503,14 @@ off stays 0/5).
 | arm | green | trigger | detail |
 |-----|-------|---------|--------|
 | off (c008+redo) | 0/5 | - | 14/16, 7/16, 15/16, 13/16, 13/16 - every run capped red |
-| continuation | 3/5 | 4/4 capped-red T1s | conversions: 20p, 18p; non-conversions: T2 capped at 14/16, 15/16; plus one clean single-turn 16/16 in 31p (recovery rightly not consulted) |
+| continuation | 3/5 | 4/4 capped-red T1s | conversions: 20p, 18p; non-conversions: T2 capped at 14/16, 15/16; plus one clean single-run 16/16 in 31p (recovery rightly not consulted) |
 | handoff | 4/5 | 5/5 capped-red T1s | conversions: 15p, **8p**, 28p, **5p**; one T2 capped at 15/16 |
 
 **Verdict: CREDITED.** Two separable claims, both proven:
 1. **The trigger fix (008) cleared its failure mode 9/9** - every
-   capped-red T1 across both arms opened a Recovery Turn (c008: 5/13).
-2. **The Recovery Turn converts, and Handoff is the right default
-   shape.** f5-v2 goes 0/5 → 4/5 with a single Handoff turn. Handoff
+   capped-red T1 across both arms opened a Recovery Run (c008: 5/13).
+2. **The Recovery Run converts, and Handoff is the right default
+   shape.** f5-v2 goes 0/5 → 4/5 with a single Handoff run. Handoff
    conversions are also cheap - two finished in ≤8 passes, where
    Continuation needed 18–20 and failed twice by plateauing in its own
    bloated context. Fresh-context restart with the compaction skeleton
@@ -573,7 +573,7 @@ runs - find what actually executes before editing again."
 plateau at 15/16. Two server-500 casualties (concurrent batches)
 re-run serially per protocol; **all batches run serially from now
 on** - even two concurrent runs can trip the server's KV pool late
-in deep turns.
+in deep runs.
 
 **Verdict: kept, not credited as an improvement.** Green rate matches
 c009-hand (4/5); N=5 cannot resolve a delta. But the prescription
@@ -584,7 +584,7 @@ truth about how this model fails. Harmless, plausibly right, kept.
 **Capability scorecard at commit 5a9d6a3 + this tweak:** f4 analysis
 5/5 (line-number fabrication parked), f6 multi-file bug fix 5/5,
 f5 hard implementation 8/10 across c009-hand+c010 with the Recovery
-trigger 14/14 on capped-red turns.
+trigger 14/14 on capped-red runs.
 
 ---
 
@@ -634,7 +634,7 @@ transport error as the model server degraded), run5 invalid (server
 gone - the host stopped resolving mid-batch, cycle-007 style).
 
 **Verdict: f5's 8/10 does not transfer to f7 - this is the new open
-front.** The Recovery Turn fired every time (3/3 valid capped-red
+front.** The Recovery Run fired every time (3/3 valid capped-red
 T1s) but conversions that took 5–28 passes on f5 plateau far from
 green here (7–9 of 18). The gap between "memorized recursion shape"
 (f5's `*` backtracking passed everywhere) and "novel stateful spec"
@@ -674,9 +674,9 @@ clause so it cannot be over-read as a scope cap (cycle-002 lesson).
 |-----|-----------|---------|
 | 1 | T1 capped → Handoff T2 → **18/18 in 21p** | **GREEN - first f7 green ever** |
 | 2 | T1 died pass 9: `api_stream_error: Failed to generate a valid tool call` | invalid (server-side casualty) |
-| 3 | both turns capped, 7/18 | fail |
-| 4 | both turns capped, decode hangs (t02 60s+) | fail (hang again) |
-| 5 | both turns capped, compile error (`is_some_and` on `char`) | fail |
+| 3 | both runs capped, 7/18 | fail |
+| 4 | both runs capped, decode hangs (t02 60s+) | fail (hang again) |
+| 5 | both runs capped, compile error (`is_some_and` on `char`) | fail |
 
 **Verdict: kept, not credited.** 1/4 valid green vs c012's 0/3 - one
 run cannot separate the rule from a lucky draw, and first-test timing
@@ -684,12 +684,12 @@ did not move (batch 5–8 both cycles). f7 stays the open front. The
 rule stays: harmless by the evidence, and it encodes the audited
 failure honestly.
 
-### Parked insight - malformed tool calls kill the whole Turn
+### Parked insight - malformed tool calls kill the whole Run
 
 c013-run2: one "Failed to generate a valid tool call" api_stream_error
-at pass 9 ended the run - no retry, no recovery (a TURN ERROR is not a
+at pass 9 ended the run - no retry, no recovery (a RUN ERROR is not a
 settle, so the Endgame never judges it). A single bad generation
-should cost one Pass, not the Turn. Promote to a cycle if it recurs.
+should cost one Pass, not the Run. Promote to a cycle if it recurs.
 
 ### Parked insight - hang end states are a class now
 
@@ -735,14 +735,14 @@ approximate."
 
 ---
 
-## 014 - Recovery Turn false-fired on read-only work at the cap (found live)
+## 014 - Recovery Run false-fired on read-only work at the cap (found live)
 
 **Source:** a live user session, `20260714-174034` - not a fixture
 cycle. "evaluate this repo. Be thorough", qwen3.5-9b, defaults (budget
-64k, turn_limit 32).
+64k, run_limit 32).
 
-**Observed failure:** the Turn capped at its Turn Limit having already
-delivered a complete evaluation, then opened a **Handoff Recovery Turn
+**Observed failure:** the Run capped at its Run Limit having already
+delivered a complete evaluation, then opened a **Handoff Recovery Run
 that restarted the whole evaluation** from a fresh Conversation - the
 `restart` Handoff must never cause (CONTEXT.md). The recovery prompt
 said "the last verification failing - fix the failure," yet nothing had
@@ -758,7 +758,7 @@ been written and the last test run was green.
   positive**.
 - The Endgame recovery judgment fired on `dangling_failure ||
   unverified_writes`, so a Dangling Failure alone - with zero writes -
-  opened a Recovery Turn. But recovery's evidence base (c005–006,
+  opened a Recovery Run. But recovery's evidence base (c005–006,
   c008–009) is unverified writes and mid-fix near-misses; a failing
   command during read-only exploration is not unfinished implementation.
 - The Handoff seed carried the *last* run_command result (the green
@@ -767,7 +767,7 @@ been written and the last test run was green.
 
 **Tweaks (commit a54cff8):**
 1. *Governor behavior.* The dangling-failure arm now also requires that a
-   write landed this Turn - a new monotonic Ledger fact `wrote_this_turn`
+   write landed this Run - a new monotonic Ledger fact `wrote_this_run`
    (distinct from `unverified_writes`, which clears on the next
    run_command). `unverified_writes` stays a standalone arm; the c008
    laundering protection is untouched (that case always writes).
@@ -799,7 +799,7 @@ with the full endgame schedule and closed plain.
 | f4 analysis | 5/5 ANALYSIS.md | 5/5 | 0/5 | 0 (read-only) |
 | f6 multifile bug | 5/5 | 5/5 | 0/5 | 0 |
 | f5 hard-algo | 3/5 (run1 no-compile, run4 2 failing) | ~4/5 (8/10) | 4/5 | 4× (all wrote) |
-| f7 hard-algo-2 | 0/4 (run5 aborted; run1–2 turn-error, run3–4 capped) | 1/4 | 2/4 (run4 ×14) | 2× (both wrote) |
+| f7 hard-algo-2 | 0/4 (run5 aborted; run1–2 run-error, run3–4 capped) | 1/4 | 2/4 (run4 ×14) | 2× (both wrote) |
 
 Two findings. **(a) No regression** - green rates sit within stochastic
 N=5 noise of baseline; the rule and its token bump hurt nothing.
@@ -819,17 +819,17 @@ false recovery observed.
 
 **Caveat, not reproduced live:** nondeterminism meant no single post-fix
 run hit the exact original triple - cap **and** Dangling Failure **and**
-zero writes - in one Turn (run 1 had the failure but finished a pass
+zero writes - in one Run (run 1 had the failure but finished a pass
 short of the cap; runs 2–3 capped but ran no failing command). That path
 is covered deterministically by the unit test; the live runs corroborate.
 
 ### Parked insight - the `| head` footgun is general
 
-The false 101 is not specific to this task: any Turn where the model
+The false 101 is not specific to this task: any Run where the model
 pipes a producer through an early-closing consumer under pipefail
 manufactures a failure the exit code cannot disown (101 vs 101). The
 trigger gate neutralizes it for read-only work, but an *implementation*
-Turn that writes and then pipes `cargo test | head` would still
+Run that writes and then pipes `cargo test | head` would still
 false-recover. If the c014 Voice steer proves unreliable at N=5, the
 next lever is mechanical, not prose - e.g. run_command detecting a
 consumer-closed pipe, or the drive/vet scripts flagging it. Promote to a
@@ -837,19 +837,19 @@ cycle if it recurs on the scorecard.
 
 ---
 
-## 015 - A malformed tool call kills the whole Turn (no retry, no recovery) - BUILT, VALIDATION PENDING
+## 015 - A malformed tool call kills the whole Run (no retry, no recovery) - BUILT, VALIDATION PENDING
 
 **Status: BUILT (ADR-0030, commit 1359056), NOT YET CREDITED.** Design
 look done; fix implemented and unit-proven; the credit run - drive f7
-(where it recurs) at N≥3 and confirm the turn-error deaths clear without
+(where it recurs) at N≥3 and confirm the run-error deaths clear without
 a visible retry loop - is still outstanding. Promoted from the c013
-parked insight ("malformed tool calls kill the whole Turn") because it
+parked insight ("malformed tool calls kill the whole Run") because it
 recurred on the c014 scorecard (f7-run1/run2, 2/4).
 
 **Fix (ADR-0030):** a `StopReason::Error` classified retryable (the
 malformed-tool-call class ONLY - transport errors and context-exceeded
 still fail loud) re-issues the same request from the same Conversation,
-bounded by a per-Turn `malformed_retry_budget` Setpoint (default 3; 0
+bounded by a per-Run `malformed_retry_budget` Setpoint (default 3; 0
 disables). New `Flow::Retry` variant: the Pass is not advanced and
 nothing enters the Conversation (silent to the model), but every re-draw
 writes a durable `retry` Session Log entry + Transcript info line, and
@@ -863,14 +863,14 @@ never to the operator.
 
 **Original problem (retained):**
 
-**Observed failure:** a single bad generation ends the entire Turn. The
+**Observed failure:** a single bad generation ends the entire Run. The
 model emits `api_stream_error: Failed to generate a valid tool call`
 (llm/stream.rs sets `error`, response carries `StopReason::Error`), and
-the Turn loop maps that at `loop_.rs:303` to
+the Run loop maps that at `loop_.rs:303` to
 `Flow::Done(finish::fail(...))` - a terminal `failed` settle
-(finish.rs:185). Because it is a failure, not a Turn-Limit close, the
+(finish.rs:185). Because it is a failure, not a Run-Limit close, the
 Endgame never judges it: no Verification Pass, no final Pass, no Recovery
-Turn. One transient malformed generation discards the whole Turn's work.
+Run. One transient malformed generation discards the whole Run's work.
 
 **Evidence (3 observations):**
 - c013-run2: died at pass 9, mid-run.
@@ -879,15 +879,15 @@ Turn. One transient malformed generation discards the whole Turn's work.
   this bug, not capability.
 
 **Why it matters:** variance, not capability - the same framing that
-justified the Recovery Turn (ADR-0028). A malformed generation is a
+justified the Recovery Run (ADR-0028). A malformed generation is a
 transient; the Conversation so far is intact and one clean re-request
 would likely continue.
 
 **Candidate levers (pick after a design look):**
 1. *Bounded per-Pass retry.* Treat this stream-error class like a
    truncated tool call (ADR-0009 neighborhood): re-request the Pass once
-   or twice rather than failing the Turn. Needs a Setpoint bounding
-   retries per Turn, and a retry that still fails falls through to the
+   or twice rather than failing the Run. Needs a Setpoint bounding
+   retries per Run, and a retry that still fails falls through to the
    current `finish::fail` path - no infinite loop on a persistently
    malforming model.
 2. *Classify the error.* Distinguish transient generation errors
@@ -895,9 +895,9 @@ would likely continue.
    only the transient class retries. A hard 500/connection error must
    still fail loud.
 3. Rejected shape - route the error through the settle path so Recovery
-   can act: recovery is cap-shaped (it needs a Turn-Limit close and the
-   Ledger's unfinished-work facts), and a mid-Turn error is neither. A
-   per-Pass retry fits the failure mode; a Recovery Turn does not.
+   can act: recovery is cap-shaped (it needs a Run-Limit close and the
+   Ledger's unfinished-work facts), and a mid-Run error is neither. A
+   per-Pass retry fits the failure mode; a Recovery Run does not.
 
 **Open questions for the design look:** does `StopReason::Error` already
 carry enough to tell the malformed-tool-call class from a transport

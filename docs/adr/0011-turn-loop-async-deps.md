@@ -1,16 +1,16 @@
-# The Turn loop is a pure async function over a Deps trait
+# The Run loop is a pure async function over a Deps trait
 
 > Amended by ADR-0025: event emission moved from an `emit` trait method to the
-> detachable `Emitter` handle obtained via `TurnDeps::emitter`, so the
+> detachable `Emitter` handle obtained via `RunDeps::emitter`, so the
 > streaming sink can emit while `complete` holds `&mut D`.
 
-The Turn loop is `async fn run<D: TurnDeps>(conv, session, deps: &mut D) -> Outcome`, generic over a `TurnDeps` trait whose methods **are** every effect the loop needs: `complete` (a model request), `emit` (an event), `drain_steering`, `request_approval`, `checkpoint`, `set_plan`, and an optional `after_pass` control hook returning continue, stop, or inject.
+The Run loop is `async fn run<D: RunDeps>(conv, session, deps: &mut D) -> Outcome`, generic over a `RunDeps` trait whose methods **are** every effect the loop needs: `complete` (a model request), `emit` (an event), `drain_steering`, `request_approval`, `checkpoint`, `set_plan`, and an optional `after_pass` control hook returning continue, stop, or inject.
 
 The real implementation wires these methods to the Agent's channels and the Session. Tests supply a `FakeDeps` that records calls and returns canned values. Static dispatch via generic monomorphization means no `dyn` and no async-trait crate on the 2024 edition.
 
 The loop owns zero I/O and zero process concerns. All policy and effects arrive through the trait, so it is unit-tested with a fake and no tokio runtime scaffolding.
 
-Boundary with Plugins: `TurnDeps` methods are infrastructure - control-bearing and fail-**loud** (a panicking Dep fails the Turn honestly). Plugins remain the fail-open, tool-scoped extension unit (ADR-0007).
+Boundary with Extensions: `RunDeps` methods are infrastructure - control-bearing and fail-**loud** (a panicking Dep fails the Run honestly). Extensions remain the fail-open, tool-scoped extension unit (ADR-0007).
 
 Considered and rejected:
 

@@ -23,11 +23,11 @@
 //!     an Endgame prompt (wrap-up warning, Verification Pass prompt, final-Pass
 //!     prompt), logged as injected. The fold closes the open batch (every
 //!     result of the Pass precedes its riders) and re-injects the text through
-//!     the same merge seam the live Turn used
+//!     the same merge seam the live Run used
 //!   * `plan` - the model's Plan; held OUTSIDE the Conversation, so the fold
-//!     never turns it into a message; [`plan`] reads the last one back
+//!     never runs it into a message; [`plan`] reads the last one back
 //!   * `message` - a verbatim Conversation message; seeds a fresh log on Resume
-//!   * `settled{outcome, stop_reason, reason}` - Turn Settlement; `reason` is
+//!   * `settled{outcome, stop_reason, reason}` - Run Settlement; `reason` is
 //!     forensic only (the fold ignores it)
 //!   * `compacted{summary, skip_count, tokens_before, file_ops, original_task}` -
 //!     Compaction: old messages replaced by a summary. On Resume the fold
@@ -36,7 +36,7 @@
 //!
 //! The fold ([`resume`]) mirrors the Loop's close rules by construction:
 //! answered tool_use blocks are kept (ADR-0009), unanswered ones dropped
-//! (ADR-0004), and a log that ends mid-Turn settles as failed. A torn last
+//! (ADR-0004), and a log that ends mid-Run settles as failed. A torn last
 //! line is dropped: the expected crash mode of an append-only file.
 
 use std::fmt;
@@ -50,29 +50,29 @@ use crate::session::{RecoveryShape, Session};
 use crate::voice::{self, FileOps};
 
 // ------------------------------------------------------------------
-// Terminal stop reason + settled outcome (shared with Turn Settlement).
+// Terminal stop reason + settled outcome (shared with Run Settlement).
 // These types were introduced by the Settlement phase and are BUILT ON
 // here, not redefined.
 // ------------------------------------------------------------------
 
-/// A Turn's terminal stop reason as it enters the Session Log and the
+/// A Run's terminal stop reason as it enters the Session Log and the
 /// settlement event. Spans the LLM-reported reasons that ride through a
-/// completed Turn (`end_turn`, `max_tokens`, ...) and the Turn-Limit reasons
+/// completed Run (`end_turn`, `max_tokens`, ...) and the Run-Limit reasons
 /// the Endgame mints (`turn_limit`, `turn_limit_stuck`). `Error`/`Unknown` are
-/// the synthetic reasons Settlement writes for failed/cancelled Turns.
+/// the synthetic reasons Settlement writes for failed/cancelled Runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
     StopSequence,
-    /// The Turn ran out of Passes productively (baud `:turn_limit`).
-    TurnLimit,
-    /// The Turn ran out of Passes while stuck in a failure loop.
-    TurnLimitStuck,
-    /// A failed Turn's synthetic reason (baud `:error`).
+    /// The Run ran out of Passes productively (baud `:turn_limit`).
+    RunLimit,
+    /// The Run ran out of Passes while stuck in a failure loop.
+    RunLimitStuck,
+    /// A failed Run's synthetic reason (baud `:error`).
     Error,
-    /// A cancelled Turn's synthetic reason (baud `:unknown`).
+    /// A cancelled Run's synthetic reason (baud `:unknown`).
     Unknown,
 }
 
@@ -83,8 +83,8 @@ impl StopReason {
             StopReason::ToolUse => "tool_use",
             StopReason::MaxTokens => "max_tokens",
             StopReason::StopSequence => "stop_sequence",
-            StopReason::TurnLimit => "turn_limit",
-            StopReason::TurnLimitStuck => "turn_limit_stuck",
+            StopReason::RunLimit => "turn_limit",
+            StopReason::RunLimitStuck => "turn_limit_stuck",
             StopReason::Error => "error",
             StopReason::Unknown => "unknown",
         }
@@ -98,8 +98,8 @@ impl StopReason {
             "tool_use" => StopReason::ToolUse,
             "max_tokens" => StopReason::MaxTokens,
             "stop_sequence" => StopReason::StopSequence,
-            "turn_limit" => StopReason::TurnLimit,
-            "turn_limit_stuck" => StopReason::TurnLimitStuck,
+            "turn_limit" => StopReason::RunLimit,
+            "turn_limit_stuck" => StopReason::RunLimitStuck,
             "error" => StopReason::Error,
             _ => StopReason::Unknown,
         }
@@ -112,7 +112,7 @@ impl fmt::Display for StopReason {
     }
 }
 
-/// How a settled Turn resolved (baud's `:completed | :failed | :cancelled`).
+/// How a settled Run resolved (baud's `:completed | :failed | :cancelled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Settled {
     Completed,
@@ -139,9 +139,9 @@ impl Settled {
     }
 }
 
-/// The `{settled, outcome, stop_reason, reason}` value a Turn Settlement
+/// The `{settled, outcome, stop_reason, reason}` value a Run Settlement
 /// produces. `reason` is the failure term formatted to a string; `None` for
-/// completed/cancelled Turns and for failures with no reason. Forensic only.
+/// completed/cancelled Runs and for failures with no reason. Forensic only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettledEntry {
     pub outcome: Settled,
@@ -239,8 +239,8 @@ pub enum Entry {
         original_task: Option<String>,
         verification: Option<String>,
     },
-    /// The Voice-authored prompt that opened a Recovery Turn (CONTEXT.md:
-    /// Recovery Turn) - a Turn-starting prompt like `user_text`, but
+    /// The Voice-authored prompt that opened a Recovery Run (CONTEXT.md:
+    /// Recovery Run) - a Run-starting prompt like `user_text`, but
     /// distinguishable as Suspenders' voice; `shape` is forensic. The fold
     /// merges it through the same seam the live path used, and
     /// [`recoveries_used`] counts these to restore the per-request bound.
@@ -630,7 +630,8 @@ struct Header {
     root: String,
     model: String,
     context_budget: u64,
-    turn_limit: u64,
+    #[serde(rename = "turn_limit")]
+    run_limit: u64,
 }
 
 fn header(session: &Session) -> Header {
@@ -643,7 +644,7 @@ fn header(session: &Session) -> Header {
         // longer a fixed fact, so the header records the launch figure and
         // drift is judged against the resuming Session's launch figure.
         context_budget: session.context_budget_for(&session.model),
-        turn_limit: session.turn_limit,
+        run_limit: session.run_limit,
     }
 }
 
@@ -790,7 +791,7 @@ pub fn plan(path: &str) -> Option<String> {
     last
 }
 
-/// Recovery Turns the logged Session consumed serving its CURRENT user
+/// Recovery Runs the logged Session consumed serving its CURRENT user
 /// request: `recovery` entries since the last `user_text` (a genuine or
 /// rolled-over prompt resets the count exactly as the live Agent's does on a
 /// submit). Restores the per-request bound on Resume so a resumed Session
@@ -921,11 +922,11 @@ fn drift(header: &serde_json::Value, session: &Session) -> Vec<Drift> {
     }
 
     let logged_limit = header.get("turn_limit").and_then(|v| v.as_u64());
-    if logged_limit != Some(session.turn_limit) {
+    if logged_limit != Some(session.run_limit) {
         out.push(Drift {
             key: "turn_limit",
             logged: opt_num(logged_limit),
-            current: session.turn_limit.to_string(),
+            current: session.run_limit.to_string(),
         });
     }
 
@@ -966,7 +967,7 @@ fn fold(entries: &[Entry]) -> Vec<Message> {
     }
 
     // A log whose last entry is a settlement (or a Resume seed, written only at
-    // open) is complete; anything else died mid-Turn and settles as failed.
+    // open) is complete; anything else died mid-Run and settles as failed.
     match entries.last() {
         Some(Entry::Settled { .. }) | Some(Entry::Message(_)) => messages,
         _ => {
@@ -974,7 +975,7 @@ fn fold(entries: &[Entry]) -> Vec<Message> {
                 Vec::new()
             } else {
                 flush(&mut messages, batch);
-                close_with(&mut messages, voice::turn_failed_marker());
+                close_with(&mut messages, voice::run_failed_marker());
                 messages
             }
         }
@@ -1073,7 +1074,7 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
         // The recovery prompt entered the Conversation on the same seam a
         // rider crosses: merged into a trailing user message (the Handoff's
         // seed) or standing as a fresh one (a Continuation, after the
-        // turn-limit marker).
+        // run-limit marker).
         Entry::Recovery { text, .. } => {
             flush(messages, batch.take());
             conversation::merge_user_text(messages, text.clone());
@@ -1186,24 +1187,24 @@ fn flush_batch(messages: &mut Vec<Message>, batch: Batch, stop: StopReason) {
     }
 }
 
-// A settled Turn that ended on a user-role message (Turn Limit, stop hook)
+// A settled Run that ended on a user-role message (Run Limit, stop hook)
 // closed with a marker live; restore it so roles keep alternating.
 fn close_settled(messages: &mut Vec<Message>, outcome: Settled, stop_reason: StopReason) {
     match outcome {
         Settled::Completed => {
             if matches!(messages.last(), Some(m) if m.role == Role::User) {
-                let marker = if stop_reason == StopReason::TurnLimit
-                    || stop_reason == StopReason::TurnLimitStuck
+                let marker = if stop_reason == StopReason::RunLimit
+                    || stop_reason == StopReason::RunLimitStuck
                 {
-                    voice::turn_limit_marker()
+                    voice::run_limit_marker()
                 } else {
-                    voice::turn_stopped_marker()
+                    voice::run_stopped_marker()
                 };
                 messages.push(Message::assistant(vec![text_block(marker)]));
             }
         }
-        Settled::Failed => close_with(messages, voice::turn_failed_marker()),
-        Settled::Cancelled => close_with(messages, voice::turn_cancelled_marker()),
+        Settled::Failed => close_with(messages, voice::run_failed_marker()),
+        Settled::Cancelled => close_with(messages, voice::run_cancelled_marker()),
     }
 }
 
@@ -1247,7 +1248,7 @@ mod tests {
     fn session_with(
         dir: &std::path::Path,
         context_budget: Option<u64>,
-        turn_limit: Option<u64>,
+        run_limit: Option<u64>,
     ) -> Session {
         let root = dir.to_string_lossy().into_owned();
         let session_dir = dir.join("sessions").to_string_lossy().into_owned();
@@ -1256,7 +1257,7 @@ mod tests {
                 root: Some(root),
                 session_dir: Some(session_dir),
                 context_budget,
-                turn_limit,
+                run_limit,
                 ..Default::default()
             },
             &SessionConfig::test_defaults(),
@@ -1283,7 +1284,7 @@ mod tests {
     // ---- round trip ----
 
     #[test]
-    fn a_settled_turn_folds_back_into_the_exact_conversation_shape() {
+    fn a_settled_run_folds_back_into_the_exact_conversation_shape() {
         let tmp = TempDir::new().unwrap();
         let session = session_in(tmp.path());
         let mut log = Log::open(&session).unwrap();
@@ -1482,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn a_log_ending_mid_turn_settles_as_failed_dangling_tool_use_dropped_marker_appended() {
+    fn a_log_ending_mid_run_settles_as_failed_dangling_tool_use_dropped_marker_appended() {
         let tmp = TempDir::new().unwrap();
         let session = session_in(tmp.path());
         let mut log = Log::open(&session).unwrap();
@@ -1506,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_limit_settlement_restores_the_closing_marker() {
+    fn a_run_limit_settlement_restores_the_closing_marker() {
         let tmp = TempDir::new().unwrap();
         let session = session_in(tmp.path());
         let mut log = Log::open(&session).unwrap();
@@ -1520,7 +1521,7 @@ mod tests {
         log.append(Entry::ToolResult(tool_result("t1", "hits")));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
-            stop_reason: StopReason::TurnLimit,
+            stop_reason: StopReason::RunLimit,
             reason: None,
         });
 
@@ -1788,7 +1789,7 @@ mod tests {
 
         // No open batch: each rider merges into the trailing user message -
         // the same role-alternation rule the live seam applies. The log ends
-        // mid-Turn, so the fold settles it as failed.
+        // mid-Run, so the fold settles it as failed.
         let (messages, _) = resume(&log.path, &session).unwrap();
         assert_eq!(
             messages,
@@ -1868,7 +1869,7 @@ mod tests {
         let changed = session_with(
             tmp.path(),
             Some(logged_budget / 2),
-            Some(session.turn_limit + 5),
+            Some(session.run_limit + 5),
         );
 
         let (_messages, drift) = resume(&log.path, &changed).unwrap();
@@ -1880,8 +1881,8 @@ mod tests {
         }));
         assert!(drift.contains(&Drift {
             key: "turn_limit",
-            logged: session.turn_limit.to_string(),
-            current: changed.turn_limit.to_string(),
+            logged: session.run_limit.to_string(),
+            current: changed.run_limit.to_string(),
         }));
     }
 
@@ -2033,7 +2034,7 @@ mod tests {
         use crate::llm::response::{Response, StopReason as LlmStop};
         use crate::test_support::{Entry as ScriptEntry, FakeLlm};
 
-        // Arrange: a Conversation of several Turns (user text + assistant text),
+        // Arrange: a Conversation of several Runs (user text + assistant text),
         // fat enough that the Compaction Keep leaves a real head to summarize.
         // The same ops feed the Session Log so the log mirrors the live events.
         let tmp = TempDir::new().unwrap();
@@ -2049,7 +2050,7 @@ mod tests {
             log.append(Entry::UserText(body.clone()));
             log.append(Entry::assistant_blocks(vec![text(&body)]));
         }
-        // The Turn that triggers Compaction settles first, like the real path.
+        // The Run that triggers Compaction settles first, like the real path.
         log.append(Entry::Settled {
             outcome: Settled::Completed,
             stop_reason: StopReason::EndTurn,
@@ -2076,7 +2077,7 @@ mod tests {
         // Act (log): append the `Compacted` entry through the production path -
         // `session_log_entry` then the exact usize/Option conversion agent.rs
         // performs - followed by the surviving tail as it would have been logged
-        // by the Turns that ran after the Compaction.
+        // by the Runs that ran after the Compaction.
         let skip = Compaction::skip_count(&before, &compacted);
         let entry = new_state.session_log_entry(skip, 0);
         log.append(Entry::Compacted {
@@ -2087,7 +2088,7 @@ mod tests {
             original_task: entry.original_task,
         });
         // The live-compacted tail (everything after the summary message) is
-        // what later Turns appended; replay each surviving message as its entry.
+        // what later Runs appended; replay each surviving message as its entry.
         for msg in &compacted.messages[1..] {
             match msg.role {
                 Role::User => {
@@ -2116,7 +2117,7 @@ mod tests {
         assert_eq!(folded, compacted.messages);
     }
 
-    // ---- Recovery Turn entries (Continuation + Handoff) ----
+    // ---- Recovery Run entries (Continuation + Handoff) ----
 
     #[test]
     fn a_continuation_recovery_prompt_folds_as_a_fresh_user_message_after_the_marker() {
@@ -2133,7 +2134,7 @@ mod tests {
         log.append(Entry::ToolResult(tool_result("t1", "edited")));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
-            stop_reason: StopReason::TurnLimit,
+            stop_reason: StopReason::RunLimit,
             reason: None,
         });
         log.append(Entry::Recovery {
@@ -2172,7 +2173,7 @@ mod tests {
         log.append(Entry::assistant_blocks(vec![text("failing attempt")]));
         log.append(Entry::Settled {
             outcome: Settled::Completed,
-            stop_reason: StopReason::TurnLimit,
+            stop_reason: StopReason::RunLimit,
             reason: None,
         });
         log.append(Entry::Handoff {
@@ -2351,7 +2352,7 @@ mod tests {
 
         log.append(Entry::UserText("go".into()));
         // A retryable draw failed and was re-drawn silently; the re-issued
-        // request succeeded and the Turn completed.
+        // request succeeded and the Run completed.
         log.append(Entry::Retry {
             error: "api_stream_error: Failed to generate a valid tool call".into(),
             attempt: 1,

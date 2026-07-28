@@ -57,7 +57,7 @@ pub struct ToolCtx {
     pub result_cap: usize,
     pub command_timeout_ms: u64,
     /// The `scout` capture: an effect wired to the Session that dispatches a
-    /// Scout. `None` on the plugin-free path (tests, direct callers) - explore
+    /// Scout. `None` on the extension-free path (tests, direct callers) - explore
     /// then returns a graceful "no Scout wired" error.
     pub scout: Option<ScoutFn>,
 }

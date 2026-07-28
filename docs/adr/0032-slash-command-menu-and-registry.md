@@ -32,11 +32,11 @@ single-select overlay - so trailing text after a committed command name filters
 that command's list continuously (`/model qw` filters models to "qw").
 
 **Always available, whatever the Agent is doing.** A leading `/` opens the menu
-whether idle or running - a running Turn never suppresses it, and a leading `/`
+whether idle or running - a running Run never suppresses it, and a leading `/`
 is therefore never Steering text sent to the model. A command's *effect* may
-still land at a Turn boundary (a `/model` change applies to the next Turn), but
+still land at a Run boundary (a `/model` change applies to the next Run), but
 the menu itself does not gate on Agent state. Unknown `/foo` resolves to a
-Transcript info line, never a Turn.
+Transcript info line, never a Run.
 
 ## Considered options
 
@@ -52,8 +52,8 @@ Transcript info line, never a Turn.
 - **A per-command bespoke UI** - rejected: `/model` and `/theme` are both
   "filter a list, pick one." One generic selector means the second command is a
   descriptor plus an Effect arm, not a new widget.
-- **Leading `/` as Steering while a Turn runs** - rejected as surprising: typing
-  `/model` mid-Turn would steer the model with the literal text.
+- **Leading `/` as Steering while a Run runs** - rejected as surprising: typing
+  `/model` mid-Run would steer the model with the literal text.
 
 ## Consequences
 

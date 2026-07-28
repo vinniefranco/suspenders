@@ -39,7 +39,7 @@ seam are two serializations of one schema - `base_url`, `token`, `model`,
 `recovery_limit`, `recovery_shape`, `malformed_retry_budget`,
 `scout_no_think`, `no_think_rescue`. Fields the env never exposed
 (`session_dir`, `llm_module`, `turn_limit`, `anchor_interval`,
-`scout_pass_limit`, `plugins`) stay out of both; closing that gap means
+`scout_pass_limit`, the extensions list) stay out of both; closing that gap means
 adding to both seams, not letting the file diverge.
 
 **A `FileConfig` DTO carries the schema** - every field `Option<T>`,
@@ -138,7 +138,7 @@ Providers (ADR-0037) change the schema without keeping compatibility:
   remain in both seams, and `SUSPENDERS_MODEL` carries the scoped id.
 - `context_budget` remains, reinterpreted (ADR-0037): the window for
   Models the Catalog does not know, and an optional global cap - no longer
-  the budget itself, which derives from the captured Model per Turn.
+  the budget itself, which derives from the captured Model per Run.
 
 Loud failure, `deny_unknown_fields`, no-auto-create, and the `/model`
 sparse-write exception (which still never writes any `token`) all stand.

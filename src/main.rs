@@ -19,7 +19,7 @@ struct Cli {
     /// Overwrite an existing file when writing the config template
     #[arg(long)]
     force: bool,
-    /// Prompt(s) to submit (headless runs them as sequential Turns)
+    /// Prompt(s) to submit (headless runs them as sequential Runs)
     prompts: Vec<String>,
 }
 

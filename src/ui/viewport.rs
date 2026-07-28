@@ -17,7 +17,7 @@
 //!   user is reading.
 //! * **Only user actions re-pin**: a downward scroll that reaches/passes the
 //!   tail, or an explicit [`Viewport::pin_bottom`] (prompt submit). Agent
-//!   events - turn end, streaming - never call in here.
+//!   events - run end, streaming - never call in here.
 //! * **Clamped both ends**: the top offset stays in
 //!   `[0, total_lines - height]`; when the content fits the viewport,
 //!   scrolling is a no-op and the view starts at the top (offset 0).

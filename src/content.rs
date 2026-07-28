@@ -64,7 +64,7 @@ impl ContentBlock {
     }
 
     /// Is this block a Tool Call (`tool_use`)? A property of the content
-    /// itself - shared by the Turn loop's dispatch, the Scout's, and the
+    /// itself - shared by the Run loop's dispatch, the Scout's, and the
     /// empty Governor's reply predicate.
     pub fn is_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ToolUse { .. })

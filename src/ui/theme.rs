@@ -251,11 +251,16 @@ theme_slots! {
     /// Extended-thinking lines (Ctrl-T's plane).
     thinking,
     /// The live `✦ Thinking` header over the streaming reasoning tail
-    /// (ADR-0040): the animated brain, where motion sits during a Turn.
+    /// (ADR-0040): the animated brain, where motion sits during a Run.
     thinking_header,
+    /// The lull "waiting" animation + its elapsed timer (the spellcast scenes):
+    /// quiet chrome under the running lane, so it reads muted by default. Named
+    /// for the lull it fills - a quiet stretch WITHIN a running Run, distinct
+    /// from the Agent being Idle (the `segment_idle_*` slots).
+    lull,
     /// The `>` gutter marking the user's own prompts.
     prompt_gutter,
-    /// The dim `│` turn-lane spine the agent's whole Turn hangs off (ADR-0040):
+    /// The dim `│` run-lane spine the agent's whole Run hangs off (ADR-0040):
     /// background chrome, so it recedes like the machinery plane.
     lane_spine,
     /// The Housekeeping marker plane (ADR-0040): Eviction, Compaction,
@@ -265,7 +270,7 @@ theme_slots! {
     /// plan/anchor refresh, Recovery. Warm amber, kept clear of error-red.
     marker_aid,
     /// The Constrain marker plane (ADR-0040): a Governor limiting the model -
-    /// tool-narrowing, the Endgame's turn-close. Cool blue, clear of green.
+    /// tool-narrowing, the Endgame's run-close. Cool blue, clear of green.
     marker_constrain,
     /// Assistant markdown headings.
     heading,

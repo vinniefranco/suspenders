@@ -6,7 +6,7 @@ spare: ~66k chars of `edit_file` old_str/new_str bodies - dead the
 moment each edit landed, the file on disk being the truth - outweighed
 every Tool Result combined, and four near-identical failure dumps of
 the same verification command sat unevicted, in a window that peaked at
-38k of 64k. The run ended 12/16 at the Turn Limit. Context quality, not
+38k of 64k. The run ended 12/16 at the Run Limit. Context quality, not
 overflow - and pressure-gated eviction is dead code against it.
 
 ## Decision
@@ -22,7 +22,7 @@ CONTEXT.md as **Dead Mass** and **Supersession**:
   judgment: a *successful* write's `tool_use` input body is superseded
   by the file on disk (husked to valid JSON keeping the path); older
   results of an identical `(name, input)` `run_command`/`read_file`
-  call in the same Turn are superseded by the newest, which survives
+  call in the same Run are superseded by the newest, which survives
   verbatim. A failed edit's input stays until a later successful write
   to the same file supersedes the attempt chain.
 - The recency guard extends symmetrically: the paired `tool_use` blocks

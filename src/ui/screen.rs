@@ -20,7 +20,7 @@
 //!   greeting, stop reasons, cancellation notes, and wave lines are authored
 //!   HERE and recorded through the store.
 //! * Enter submits when idle and STEERS when running (the Composer never
-//!   locks). The submit/steer race at the Turn boundary is retried the other
+//!   locks). The submit/steer race at the Run boundary is retried the other
 //!   way via [`Screen::submitted`] and [`Screen::steered`] - the retry lives
 //!   here because it touches only Agent status, and the draft must survive it.
 //! * The Composer is its own module (ADR-0034): [`crate::ui::composer`] owns
@@ -35,8 +35,8 @@
 
 use crate::conversation::{WaveStats, compaction_target, dead_mass_pct};
 use crate::event::Event;
+use crate::extensions::Registered;
 use crate::llm::response::StopReason;
-use crate::plugins::Registered;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
 use crate::ui::transcript::{Tone, Transcript, TranscriptItem};
 
@@ -158,7 +158,7 @@ pub enum Decision {
 
 /// How far one scroll Effect moves: the wheel steps by [`ScrollStep::Line`]s,
 /// the page keys by whole viewport [`ScrollStep::Page`]s. The core only names
-/// the granularity - the adapter's `ui::viewport` knows the geometry and turns
+/// the granularity - the adapter's `ui::viewport` knows the geometry and runs
 /// it into an actual line count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollStep {
@@ -206,8 +206,8 @@ pub enum Effect {
 /// The pure Screen state (ADR-0034; the renamed fold root of baud's
 /// `%Baud.UI.Transcript{}`).
 ///
-/// The Transcript store's plugins are not `Clone`/`PartialEq`, so the core is
-/// not `Clone`; the fold takes and returns an owned `Screen` by value,
+/// The Transcript store's extensions are not `Clone`/`PartialEq`, so the core
+/// is not `Clone`; the fold takes and returns an owned `Screen` by value,
 /// mirroring the Elixir struct-threading style.
 pub struct Screen {
     /// The Transcript (ADR-0034): the display-side history, the streaming
@@ -257,7 +257,7 @@ pub struct Screen {
 pub struct ScreenOpts {
     pub context_budget: Option<u64>,
     pub eviction_slack: f64,
-    pub plugins: Vec<Registered>,
+    pub extensions: Vec<Registered>,
     pub history: Vec<String>,
     /// Launch-time info lines the adapter authors (context-file skips today):
     /// news from before the event loop existed, recorded right after the
@@ -270,7 +270,7 @@ impl Screen {
     pub fn new(opts: ScreenOpts) -> Self {
         // The greeting is this fold's Voice: the store opens empty and
         // records what its owner authors.
-        let mut transcript = Transcript::new(opts.plugins);
+        let mut transcript = Transcript::new(opts.extensions);
         transcript.info(GREETING);
         for notice in opts.notices {
             transcript.info(notice);
@@ -292,7 +292,7 @@ impl Screen {
     }
 
     /// A representative populated Screen for eyeballing the render (the `--demo`
-    /// harness and the render tests): one user request whose turn interleaves
+    /// harness and the render tests): one user request whose run interleaves
     /// several Thinking passes, tool machinery, harness markers, and an answer
     /// with a code fence - the exact shape that exposed the fold / spine / blank
     /// -line bugs. No IO, no events; the transcript is authored directly.
@@ -391,7 +391,7 @@ impl Screen {
         // The flat family dispatch: each arm names one event family and hands
         // the whole event to that family's fold below.
         match event {
-            event @ (Event::TurnStarted(..)
+            event @ (Event::RunStarted(..)
             | Event::MessageStart { .. }
             | Event::MessageUpdate { .. }
             | Event::MessageEnd { .. }) => self.apply_streaming(event),
@@ -403,7 +403,7 @@ impl Screen {
 
             event @ (Event::ToolCall { .. }
             | Event::ToolResult { .. }
-            | Event::PluginError { .. }) => self.apply_tooling(event),
+            | Event::ExtensionError { .. }) => self.apply_tooling(event),
 
             event @ (Event::ApprovalRequest { .. }
             | Event::ApprovalResolved { .. }
@@ -421,14 +421,14 @@ impl Screen {
             | Event::WrapUpWarning { .. }
             | Event::VerificationPass { .. }
             | Event::FinalPass { .. }
-            | Event::RecoveryTurn { .. }
+            | Event::RecoveryRun { .. }
             | Event::Anchor { .. }
             | Event::ToolsNarrowed { .. }
             | Event::Retry { .. }) => self.apply_voice(event),
 
-            event @ (Event::TurnFinished { .. }
-            | Event::TurnCancelled
-            | Event::TurnError { .. }) => self.apply_settlement(event),
+            event @ (Event::RunFinished { .. }
+            | Event::RunCancelled
+            | Event::RunError { .. }) => self.apply_settlement(event),
 
             // The selector fills are the Composer's own (ADR-0034): they are
             // consumed by `self.composer.apply_event` at the top of this fold
@@ -447,11 +447,11 @@ impl Screen {
     // family membership, so each method's trailing `_` arm restates the
     // dispatch's own ignore rule - it is never a reachable behavior of its own.
 
-    // Streaming / message events: the Turn opening and the three-phase
+    // Streaming / message events: the Run opening and the three-phase
     // assistant stream, each delegating one store verb.
     fn apply_streaming(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
-            Event::TurnStarted(_reference) => {
+            Event::RunStarted(_reference) => {
                 self.status = Status::Running;
                 self.transcript.discard_streaming();
                 (self, vec![Effect::PinBottom])
@@ -481,7 +481,7 @@ impl Screen {
     fn apply_pressure(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
             // Live context-pressure indication: refresh the status bar's token
-            // estimate, budget, and LIVE Dead Mass share mid-Turn and name the
+            // estimate, budget, and LIVE Dead Mass share mid-Run and name the
             // semantic pressure level (ADR-0008). NEVER a Transcript item. The
             // Dead Mass here is the current figure, refreshed every pass - the
             // bar tracks it, not a wave's cleared snapshot.
@@ -534,7 +534,7 @@ impl Screen {
     }
 
     // Tool machinery: calls, results (paired by id in the store), and the
-    // Plugin failure report.
+    // Extension failure report.
     fn apply_tooling(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
             Event::ToolCall { id, name, input } => {
@@ -554,14 +554,14 @@ impl Screen {
                 (self, vec![])
             }
 
-            // A Plugin crashed and was skipped (fail-open, ADR-0007) - the
+            // An Extension crashed and was skipped (fail-open, ADR-0007) - the
             // same report line the store's own Presentment failures use.
-            Event::PluginError {
-                plugin,
+            Event::ExtensionError {
+                extension,
                 stage,
                 message,
             } => {
-                self.transcript.plugin_failure(&plugin, stage, &message);
+                self.transcript.extension_failure(&extension, stage, &message);
                 (self, vec![])
             }
 
@@ -621,7 +621,7 @@ impl Screen {
 
     // Voiced / operator-news lines: everything whose display is one authored
     // info line - the Session Log failure, the Nudges and Endgame riders, the
-    // Recovery Turn prompt, and the bounded re-draw marks.
+    // Recovery Run prompt, and the bounded re-draw marks.
     fn apply_voice(mut self, event: Event) -> (Self, Vec<Effect>) {
         // The rider's marker-plane tone (ADR-0040) is decided at the firing
         // site ([`VoicedTag::tone`]) and recovered here BEFORE the match moves
@@ -649,7 +649,7 @@ impl Screen {
             | Event::VerificationPass { text }
             | Event::FinalPass { text } => {
                 // Every variant in this arm is a voiced rider, so
-                // `voiced_tone` returned `Some` above; asserting it here turns a
+                // `voiced_tone` returned `Some` above; asserting it here runs a
                 // future drift (a rider added to this arm but not to
                 // `voiced_tone`) into a test failure instead of a silently
                 // mistinted (Plain) marker (LOW-1).
@@ -658,10 +658,10 @@ impl Screen {
                 (self, vec![])
             }
 
-            // A Recovery Turn opened: its Voice prompt entered the
+            // A Recovery Run opened: its Voice prompt entered the
             // Conversation, so the Transcript shows it like every Nudge - a
             // Governor aiding the model, so an Aid-toned marker.
-            Event::RecoveryTurn { text, .. } => {
+            Event::RecoveryRun { text, .. } => {
                 self.transcript
                     .marker(marker_line(Tone::Aid, &text), Tone::Aid);
                 self.status = Status::Running;
@@ -704,14 +704,14 @@ impl Screen {
         }
     }
 
-    // Settlement: how a Turn ends - finished, cancelled, or errored.
+    // Settlement: how a Run ends - finished, cancelled, or errored.
     fn apply_settlement(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
-            // A finished Turn: salvage anything still streaming and note an
+            // A finished Run: salvage anything still streaming and note an
             // abnormal stop reason - the note is this fold's Voice, the
             // flush-before-note ordering the store's `close` - then record
             // the closing estimate and budget.
-            Event::TurnFinished {
+            Event::RunFinished {
                 stop_reason,
                 token_estimate,
                 context_budget,
@@ -723,9 +723,9 @@ impl Screen {
                 (self, vec![])
             }
 
-            Event::TurnCancelled => self.close_abnormally("turn cancelled".to_string()),
+            Event::RunCancelled => self.close_abnormally("turn cancelled".to_string()),
 
-            Event::TurnError { reason } => self.close_abnormally(format!("turn error: {reason}")),
+            Event::RunError { reason } => self.close_abnormally(format!("turn error: {reason}")),
 
             _ => (self, vec![]),
         }
@@ -791,7 +791,7 @@ impl Screen {
         };
 
         match key {
-            // Escape means Cancellation while a Turn runs; the Composer has
+            // Escape means Cancellation while a Run runs; the Composer has
             // already refused it (no overlay was open to close).
             Key::Escape if self.status == Status::Running => {
                 (self, vec![Effect::Agent(AgentCommand::Cancel)])
@@ -830,7 +830,7 @@ impl Screen {
     /// the PinBottom that belongs beside it) and hands the Composer its
     /// success - [`Composer::submitted_ok`] records the prompt into the ring,
     /// clears the draft, and mints the on-disk `HistoryAppend`. `Err(Busy)`
-    /// means the submit raced a starting Turn - retry as Steering. The retry
+    /// means the submit raced a starting Run - retry as Steering. The retry
     /// lives HERE (ADR-0034): it touches only Agent status, and the draft
     /// must survive it (the Composer is not told, so nothing clears).
     pub fn submitted(
@@ -855,7 +855,7 @@ impl Screen {
 
     /// Records how the `Steer` effect went: `Ok` clears the Composer's draft
     /// (the pending line arrives via `steering_queued`); `Err(Idle)` means
-    /// the Turn ended between keypress and call - retry as a submit. Same
+    /// the Run ended between keypress and call - retry as a submit. Same
     /// retry rule as [`Screen::submitted`]: only status flips, the draft
     /// survives.
     pub fn steered(
@@ -884,7 +884,7 @@ impl Screen {
 
     /// Resets to a truthful state after the Agent crashed and was restarted:
     /// its subscriber map and Conversation are gone, so the Screen must not
-    /// claim a Turn is still running or an Approval is still pending.
+    /// claim a Run is still running or an Approval is still pending.
     pub fn agent_down(self) -> (Self, Vec<Effect>) {
         self.close_abnormally("agent restarted; session history was reset".to_string())
     }
@@ -900,6 +900,15 @@ impl Screen {
     /// [`revision`]: Transcript::revision
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// Whether live model output is currently streaming - reasoning under the
+    /// `✦ Thinking` tail or assistant answer text. The adapter resets the lull
+    /// clock while this holds, and the render gate shows the idle animation only
+    /// while it does NOT - one predicate, so the two can never disagree.
+    pub fn has_live_stream(&self) -> bool {
+        !self.transcript().streaming_thinking().is_empty()
+            || !self.transcript().streaming_text().is_empty()
     }
 
     /// The Composer, read-only - the render adapter's window (ADR-0034). It
@@ -934,12 +943,12 @@ impl Screen {
     }
 }
 
-/// The submit raced a starting Turn (baud's `{:error, :busy}`). Marker so
+/// The submit raced a starting Run (baud's `{:error, :busy}`). Marker so
 /// [`Screen::submitted`]'s signature reads like baud's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy;
 
-/// The Turn ended between keypress and steer (baud's `{:error, :idle}`).
+/// The Run ended between keypress and steer (baud's `{:error, :idle}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Idle;
 
@@ -1026,7 +1035,7 @@ fn tools_narrowed_line(tools: &[String]) -> String {
 // The marker-plane glyph the Screen's display Voice prefixes to a toned line
 // (ADR-0040), chosen by TONE so the adapter tints by tone alone and never
 // reads the text. Aid riders (Nudges, Recovery) wear `»`/`↺`-family warmth via
-// `»`; the Endgame's turn-closing Constrain riders wear `▪`. Housekeeping and
+// `»`; the Endgame's run-closing Constrain riders wear `▪`. Housekeeping and
 // Steering author their own glyphs at their own sites (`✂`/`⟨⟩`, `↳`).
 fn marker_glyph(tone: Tone) -> &'static str {
     match tone {
@@ -1183,10 +1192,55 @@ mod tests {
         );
     }
 
+    // --- has_live_stream (the render gate's one predicate) ------------------
+
+    // The lull/tail gate: a fresh Screen streams nothing, a reasoning delta
+    // trips the `streaming_thinking` operand, and an answer-text delta trips the
+    // `streaming_text` operand - both `||` arms covered.
+    #[test]
+    fn has_live_stream_tracks_reasoning_and_answer_streams() {
+        // Fresh: nothing on the wire.
+        assert!(!fresh().has_live_stream(), "a fresh Screen streams nothing");
+
+        // A reasoning delta => the thinking arm holds.
+        let thinking_stream = fold(
+            fresh(),
+            vec![
+                Event::run_started("r1"),
+                Event::message_start(1),
+                Event::message_update(
+                    crate::llm::Delta::Thinking("half a thought".into()),
+                    vec![thinking_block("half a thought")],
+                ),
+            ],
+        );
+        assert!(
+            thinking_stream.has_live_stream(),
+            "a streaming reasoning delta is a live stream"
+        );
+
+        // An answer-text delta => the text arm holds.
+        let text_stream = fold(
+            fresh(),
+            vec![
+                Event::run_started("r1"),
+                Event::message_start(1),
+                Event::message_update(
+                    crate::llm::Delta::Text("half an ans".into()),
+                    vec![text_block("half an ans")],
+                ),
+            ],
+        );
+        assert!(
+            text_stream.has_live_stream(),
+            "a streaming answer delta is a live stream"
+        );
+    }
+
     // --- streaming (the arms; the materialize rules live with the store) ----
 
     #[test]
-    fn turn_started_marks_running_clears_snapshot_and_pins() {
+    fn run_started_marks_running_clears_snapshot_and_pins() {
         let t = fold(
             fresh(),
             vec![
@@ -1197,7 +1251,7 @@ mod tests {
                 ),
             ],
         );
-        let (t, effects) = t.apply_event(Event::turn_started("r1"));
+        let (t, effects) = t.apply_event(Event::run_started("r1"));
         assert_eq!(t.status, Status::Running);
         assert!(
             t.transcript().streaming_text().is_empty()
@@ -1206,23 +1260,23 @@ mod tests {
         assert_eq!(effects, vec![Effect::PinBottom]);
     }
 
-    // --- turn_finished -----------------------------------------------------
+    // --- run_finished -----------------------------------------------------
 
     #[test]
-    fn turn_finished_flushes_snapshot_goes_idle_records_estimate_and_budget() {
+    fn run_finished_flushes_snapshot_goes_idle_records_estimate_and_budget() {
         let t = fold(
             fresh_opts(ScreenOpts {
                 context_budget: Some(100),
                 ..Default::default()
             }),
             vec![
-                Event::turn_started("r1"),
+                Event::run_started("r1"),
                 Event::message_start(1),
                 Event::message_update(
                     crate::llm::Delta::Text("Done.".into()),
                     vec![text_block("Done.")],
                 ),
-                Event::TurnFinished {
+                Event::RunFinished {
                     stop_reason: StopReason::EndTurn,
                     token_estimate: 42,
                     context_budget: 32_000,
@@ -1236,17 +1290,17 @@ mod tests {
     }
 
     // baud keeps the previous budget when the event lacks one. In the Rust
-    // Event, TurnFinished always carries a budget; the Agent forwards the live
+    // Event, RunFinished always carries a budget; the Agent forwards the live
     // budget it holds. We reproduce baud's assertion by emitting the same
     // budget the Screen was opened with (the Agent's live value).
     #[test]
-    fn turn_finished_keeps_previous_budget_when_event_carries_it() {
+    fn run_finished_keeps_previous_budget_when_event_carries_it() {
         let t = fold(
             fresh_opts(ScreenOpts {
                 context_budget: Some(100),
                 ..Default::default()
             }),
-            vec![Event::TurnFinished {
+            vec![Event::RunFinished {
                 stop_reason: StopReason::EndTurn,
                 token_estimate: 0,
                 context_budget: 100,
@@ -1259,7 +1313,7 @@ mod tests {
     fn normal_stop_reason_adds_no_info_abnormal_one_does() {
         let normal = fold(
             fresh(),
-            vec![Event::TurnFinished {
+            vec![Event::RunFinished {
                 stop_reason: StopReason::EndTurn,
                 token_estimate: 0,
                 context_budget: 0,
@@ -1269,7 +1323,7 @@ mod tests {
 
         let abnormal = fold(
             fresh(),
-            vec![Event::TurnFinished {
+            vec![Event::RunFinished {
                 stop_reason: StopReason::MaxTokens,
                 token_estimate: 0,
                 context_budget: 0,
@@ -1459,9 +1513,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_turn_shows_its_prompt_as_an_aid_marker_and_marks_running() {
+    fn recovery_run_shows_its_prompt_as_an_aid_marker_and_marks_running() {
         let prompt = crate::voice::recovery_prompt(true);
-        let (t, effects) = fresh().apply_event(Event::recovery_turn(
+        let (t, effects) = fresh().apply_event(Event::recovery_run(
             crate::session::RecoveryShape::Handoff,
             prompt,
         ));
@@ -1521,7 +1575,7 @@ mod tests {
             crate::event::VoicedTag::WrapUpWarning,
             warning.clone(),
         ));
-        // The Endgame turn-close schedule limits the model: a Constrain marker.
+        // The Endgame run-close schedule limits the model: a Constrain marker.
         assert_eq!(
             items(&t),
             vec![marker(&format!("▪ {warning}"), Tone::Constrain)]
@@ -1801,7 +1855,7 @@ mod tests {
 
     #[test]
     fn successful_steer_clears_composer() {
-        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let (t, _) = fresh().apply_event(Event::run_started("r1"));
         let t = press(t, typed("check the README"));
         let (t, effects) = t.steered("check the README", Ok(()));
         assert_eq!(t.composer().view().draft, "");
@@ -1810,7 +1864,7 @@ mod tests {
 
     #[test]
     fn steer_that_lost_race_retries_as_submit_and_the_draft_survives() {
-        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let (t, _) = fresh().apply_event(Event::run_started("r1"));
         let t = press(t, typed("check the README"));
         let (t, effects) = t.steered("check the README", Err(Idle));
         assert_eq!(t.status, Status::Idle);
@@ -1836,11 +1890,11 @@ mod tests {
     }
 
     #[test]
-    fn plugin_error_events_become_info_lines() {
+    fn extension_error_events_become_info_lines() {
         let t = fold(
             fresh(),
-            vec![Event::plugin_error(
-                "Baud.Plugins.Diff",
+            vec![Event::extension_error(
+                "diff",
                 Stage::PreRun,
                 "boom",
             )],
@@ -1849,7 +1903,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         match &items[0] {
             TranscriptItem::Info { text } => {
-                assert!(text.contains("Baud.Plugins.Diff"));
+                assert!(text.contains("diff"));
                 assert!(text.contains("pre_run"));
                 assert!(text.contains("boom"));
             }
@@ -1948,10 +2002,10 @@ mod tests {
     }
 
     // Escape with an open overlay closes the overlay - it must NOT cancel the
-    // running Turn (Escape is only Cancellation when the Composer refuses it).
+    // running Run (Escape is only Cancellation when the Composer refuses it).
     #[test]
-    fn escape_with_an_open_overlay_closes_it_instead_of_cancelling_the_turn() {
-        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+    fn escape_with_an_open_overlay_closes_it_instead_of_cancelling_the_run() {
+        let (t, _) = fresh().apply_event(Event::run_started("r1"));
         let t = press(t, vec![Key::Char('/')]);
         assert!(
             t.composer().view().overlay.is_some(),
@@ -1995,7 +2049,7 @@ mod tests {
 
     #[test]
     fn escape_while_running_no_modal_cancels() {
-        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let (t, _) = fresh().apply_event(Event::run_started("r1"));
         let (_t, effects) = t.handle_key(Key::Escape);
         assert_eq!(effects, vec![Effect::Agent(AgentCommand::Cancel)]);
     }
@@ -2007,17 +2061,17 @@ mod tests {
     }
 
     #[test]
-    fn turn_cancelled_flushes_snapshot_goes_idle_notes_cancellation() {
+    fn run_cancelled_flushes_snapshot_goes_idle_notes_cancellation() {
         let t = fold(
             fresh(),
             vec![
-                Event::turn_started("r1"),
+                Event::run_started("r1"),
                 Event::message_start(1),
                 Event::message_update(
                     crate::llm::Delta::Thinking("half a thought".into()),
                     vec![thinking_block("half a thought")],
                 ),
-                Event::TurnCancelled,
+                Event::RunCancelled,
             ],
         );
         assert_eq!(t.status, Status::Idle);
@@ -2028,18 +2082,18 @@ mod tests {
     }
 
     #[test]
-    fn turn_cancelled_clears_pending_approval_and_refocuses() {
-        let t = fold(fresh(), vec![Event::turn_started("r1")]);
+    fn run_cancelled_clears_pending_approval_and_refocuses() {
+        let t = fold(fresh(), vec![Event::run_started("r1")]);
         let t = with_pending_approval(t, &approval());
-        let (t, effects) = t.apply_event(Event::TurnCancelled);
+        let (t, effects) = t.apply_event(Event::RunCancelled);
         assert_eq!(t.pending_approval, None);
         assert_eq!(effects, vec![Effect::FocusComposer]);
     }
 
     #[test]
-    fn turn_error_notes_reason_and_goes_idle() {
-        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
-        let (t, _) = t.apply_event(Event::TurnError {
+    fn run_error_notes_reason_and_goes_idle() {
+        let (t, _) = fresh().apply_event(Event::run_started("r1"));
+        let (t, _) = t.apply_event(Event::RunError {
             reason: ":boom".into(),
         });
         assert_eq!(t.status, Status::Idle);
@@ -2053,7 +2107,7 @@ mod tests {
         let t = fold(
             fresh(),
             vec![
-                Event::turn_started("r1"),
+                Event::run_started("r1"),
                 Event::message_start(1),
                 Event::message_update(
                     crate::llm::Delta::Text("half an ans".into()),
@@ -2121,7 +2175,7 @@ mod tests {
 
     #[test]
     fn wheel_keys_scroll_while_running() {
-        let (t, _) = fresh().apply_event(Event::turn_started("r1"));
+        let (t, _) = fresh().apply_event(Event::run_started("r1"));
         let (t, effects) = t.handle_key(Key::WheelUp);
         assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Line)]);
         let (_t, effects) = t.handle_key(Key::WheelDown);

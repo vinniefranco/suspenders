@@ -17,6 +17,7 @@ pub mod components;
 pub mod composer;
 pub mod draft;
 pub mod history;
+pub mod lull;
 pub mod markdown;
 pub mod model_command;
 pub mod picker;
@@ -49,8 +50,11 @@ use screen::{
 use theme::ActiveTheme;
 use viewport::{Viewport, WHEEL_LINES};
 
-/// How often the status-bar spinner advances while a Turn is running (~10 fps).
-const TICK_MS: u64 = 100;
+/// How often the status-bar spinner advances while a Run is running (~10 fps).
+/// `pub(crate)` so `components::live_lull_lines` can run the lull's tick count
+/// into elapsed seconds at the same cadence the adapter ticks (ADR-0029: one
+/// place ticks become real time).
+pub(crate) const TICK_MS: u64 = 100;
 
 /// The last draw's measured viewport geometry: `(total wrapped lines,
 /// viewport height)`. Scroll effects execute BETWEEN draws, and the adapter
@@ -238,7 +242,7 @@ async fn run_loop(
     let mut screen = Some(Screen::new(ScreenOpts {
         context_budget: Some(session.context_budget_for(&session.model)),
         eviction_slack: session.eviction_slack,
-        plugins: crate::plugins::configured(&session.plugins),
+        extensions: crate::extensions::configured(&session.extensions),
         history,
         notices: launch_notices,
     }));
@@ -267,7 +271,7 @@ async fn run_loop(
     // counter (only meaningful while running).
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut spinner: u64 = 0;
+    let mut anim = components::Anim::default();
 
     // Initial paint; `geometry` tracks the last draw's measure for the scroll
     // effects (see [`Geometry`]).
@@ -275,7 +279,7 @@ async fn run_loop(
         terminal,
         screen.as_ref().unwrap(),
         &conn,
-        spinner,
+        anim,
         &mut cache,
         &state,
     )?;
@@ -283,11 +287,28 @@ async fn run_loop(
     loop {
         tokio::select! {
             // Animation tick: advance the spinner and repaint, but ONLY while a
-            // Turn is running - an idle UI does no work between events.
+            // Run is running - an idle UI does no work between events.
             _ = ticker.tick() => {
-                if screen.as_ref().unwrap().status == Status::Running {
-                    spinner = spinner.wrapping_add(1);
-                    geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &conn, spinner, &mut cache, &state)?;
+                let s = screen.as_ref().unwrap();
+                if s.status == Status::Running {
+                    anim.spinner = anim.spinner.wrapping_add(1);
+                    if s.has_live_stream() {
+                        // Output is streaming: no lull, reset the quiet clock.
+                        anim.quiet_ticks = 0;
+                    } else {
+                        // A quiet tick. The 0 -> 1 edge begins a new lull, so
+                        // bump the sequence that seeds the scene pick.
+                        if anim.quiet_ticks == 0 {
+                            anim.lull_seq = anim.lull_seq.wrapping_add(1);
+                        }
+                        anim.quiet_ticks = anim.quiet_ticks.saturating_add(1);
+                    }
+                    geometry = draw_previewed(terminal, s, &conn, anim, &mut cache, &state)?;
+                } else {
+                    // Idle between Runs: keep the lull clock at zero so the
+                    // next Run's first quiet stretch is a fresh lull (fresh
+                    // scene, full settle).
+                    anim.quiet_ticks = 0;
                 }
                 continue;
             }
@@ -369,7 +390,7 @@ async fn run_loop(
                         let core = screen.take().unwrap();
                         let (core, effects) = core.agent_down();
                         screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
-                        let geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &conn, spinner, &mut cache, &state)?;
+                        let geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &conn, anim, &mut cache, &state)?;
                         // Nothing more will arrive; wait only on input now. The
                         // frozen frames draw in the ACTIVE Theme - any open
                         // /theme preview ends with the Agent.
@@ -399,7 +420,7 @@ async fn run_loop(
             terminal,
             screen.as_ref().unwrap(),
             &conn,
-            spinner,
+            anim,
             &mut cache,
             &state,
         )?;
@@ -436,7 +457,15 @@ where
                     Key::PageDown => viewport.page_down(total_lines, height),
                     _ => {}
                 }
-                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache, &theme)?;
+                geometry = draw(
+                    terminal,
+                    &screen,
+                    &viewport,
+                    &conn,
+                    components::Anim::default(),
+                    &mut cache,
+                    &theme,
+                )?;
             }
             // The wheel still scrolls after the Agent is gone; other mouse
             // kinds are ignored.
@@ -446,7 +475,15 @@ where
                     Some(Key::WheelDown) => viewport.scroll_down(WHEEL_LINES, total_lines, height),
                     _ => continue,
                 }
-                geometry = draw(terminal, &screen, &viewport, &conn, 0, &mut cache, &theme)?;
+                geometry = draw(
+                    terminal,
+                    &screen,
+                    &viewport,
+                    &conn,
+                    components::Anim::default(),
+                    &mut cache,
+                    &theme,
+                )?;
             }
             Some(_) => {}
             None => return Ok(()),
@@ -733,21 +770,13 @@ fn draw_previewed<B: Backend>(
     terminal: &mut Terminal<B>,
     screen: &Screen,
     conn: &components::ConnectionFacts,
-    spinner: u64,
+    anim: components::Anim,
     cache: &mut components::RenderCache,
     state: &AdapterState,
 ) -> anyhow::Result<Geometry> {
     let preview = theme_command::preview_name(screen.composer().selector_highlight());
     let theme = state.themes.render_theme(preview);
-    draw(
-        terminal,
-        screen,
-        &state.viewport,
-        conn,
-        spinner,
-        cache,
-        theme,
-    )
+    draw(terminal, screen, &state.viewport, conn, anim, cache, theme)
 }
 
 /// Draws one frame and returns the measured viewport [`Geometry`]: the render
@@ -761,13 +790,13 @@ fn draw<B: Backend>(
     screen: &Screen,
     viewport: &Viewport,
     conn: &components::ConnectionFacts,
-    spinner: u64,
+    anim: components::Anim,
     cache: &mut components::RenderCache,
     theme: &theme::Theme,
 ) -> anyhow::Result<Geometry> {
     let mut geometry: Geometry = (0, 0);
     terminal.draw(|frame| {
-        geometry = components::render(frame, screen, conn.view(), spinner, viewport, cache, theme);
+        geometry = components::render(frame, screen, conn.view(), anim, viewport, cache, theme);
     })?;
     Ok(geometry)
 }
@@ -1191,7 +1220,7 @@ mod tests {
             &screen,
             &viewport,
             &conn,
-            0,
+            components::Anim::default(),
             &mut cache,
             theme::dark(),
         )?;
@@ -1457,7 +1486,7 @@ mod tests {
         let (entry, mut inflight) = Entry::barrier();
         let agent = start_agent(&dir, FakeLlm::script(vec![entry]));
 
-        // Park a Turn mid-`complete`, so the Agent answers Busy.
+        // Park a Run mid-`complete`, so the Agent answers Busy.
         agent.submit("first").await.unwrap();
         let parked = tokio::time::timeout(Duration::from_secs(1), inflight.recv())
             .await
@@ -1479,7 +1508,7 @@ mod tests {
         // retry flipped it to a truthful Running status.
         assert_eq!(screen.status, Status::Running);
         assert!(!has_user_line(&screen, "second"));
-        drop(parked); // release the barrier so the Turn can end
+        drop(parked); // release the barrier so the Run can end
     }
 
     #[tokio::test(flavor = "multi_thread")]

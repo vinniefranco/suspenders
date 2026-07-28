@@ -10,14 +10,15 @@ pub mod context_files;
 pub mod conversation;
 pub mod event;
 pub mod llm;
+pub mod extensions;
+pub mod middleware;
 pub mod plan;
-pub mod plugin;
-pub mod plugins;
+pub mod presenter;
 pub mod scout;
 pub mod session;
 pub mod tool;
 pub mod tools;
-pub mod turn;
+pub mod run;
 pub mod ui;
 pub mod voice;
 

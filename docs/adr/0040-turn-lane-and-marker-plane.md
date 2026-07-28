@@ -1,10 +1,10 @@
-# A turn is a visual object: the agent lane and the tinted marker plane
+# A run is a visual object: the agent lane and the tinted marker plane
 
 ADR-0008 made the Transcript a flat list of semantically-styled items and kept
 all terminal markup in the adapter; ADR-0034 split the store but kept the flat
 shape; ADR-0029 kept the render pipeline whole in the adapter. That flat list,
 drawn with per-item glyphs and the two-planes coloring, reads as a stream of
-disconnected events: a turn never becomes one object, live reasoning shows only
+disconnected events: a run never becomes one object, live reasoning shows only
 as a `~N tokens` counter, and every harness event (eviction, compaction,
 Governor Interventions, Steering) draws as an identical `Info` line. This ADR
 records the display principles that fix that, and the single schema change they
@@ -12,7 +12,7 @@ require.
 
 ## Decision
 
-**Live reasoning is content, not a metric.** A running Turn streams the tail of
+**Live reasoning is content, not a metric.** A running Run streams the tail of
 its Thinking (the last few reasoning lines) under an animated `✦ Thinking`
 header, and the running-spinner animation moves from the status bar to that
 header - motion sits where the content and the user's cursor are. The status-bar
@@ -24,12 +24,12 @@ renders it instead of counting it.
 produces in service of one request - Thinking, tool machinery, the answer - hangs
 off one dim vertical spine; the user's prompts break to the margin. A *lane-opener*
 is a `User` item; every item until the next `User` hangs off that lane. This is
-deliberately scoped to the user request, not the Turn: a Recovery Turn (ADR-0028)
-is a harness-opened Turn whose prompt is Voiced, not a `User` item, so its work
-correctly shares the originating request's lane, with the `↺ recovery turn`
+deliberately scoped to the user request, not the Run: a Recovery Run (ADR-0028)
+is a harness-opened Run whose prompt is Voiced, not a `User` item, so its work
+correctly shares the originating request's lane, with the `↺ recovery run`
 marker as the in-lane seam. The region before the first `User` item (the greeting,
 launch notices) is spineless by definition. The lane is computed by the adapter
-from the existing item sequence, so NO turn structure is stored and no revision
+from the existing item sequence, so NO run structure is stored and no revision
 contract changes; the store stays the flat append-only list ADR-0034 defined.
 
 Because the viewport is bottom-anchored and lives or dies on measure==draw
@@ -43,13 +43,13 @@ assembly pass, never inside `message_lines` and never in the RenderCache key.
 confirmed hands-on against a live demo buffer, `Screen::demo()` / the
 `dump_demo_render` test - the living spec). By default (thinking and tools
 collapsed) a lane folds to a tidy, scannable shape via a render-time
-`turn_fold` pass over the item sequence (`FoldAction { Keep, Drop, Header, Elided }`):
+`run_fold` pass over the item sequence (`FoldAction { Keep, Drop, Header, Elided }`):
 
 - **The reasoning folds to ONE header: the LAST thought's text at the FIRST
   thought's slot.** The intervening thoughts `Drop`. This departs from the
   mockups' Decision C ("grouped, thinking-first, thinking stays in one place"):
   hands-on, the *latest* thought is the one worth surfacing (it reflects where
-  the agent's reasoning landed), and a single header at the top of the turn reads
+  the agent's reasoning landed), and a single header at the top of the run reads
   far denser than a preserved thinking block. Ctrl-T (`thinking_expanded`)
   disables the fold and shows every thought.
 - **Low-signal machinery is a rolling window of the last `MACHINERY_WINDOW`
@@ -70,14 +70,14 @@ columns (a block indent, so a wrapped continuation stays at column 2, not the
 margin - ratatui's `Wrap` has no hanging indent, so the machinery/marker arms
 pre-word-wrap to `content_width - 2` and prefix every visual row). The lane is
 DENSE: there is NO per-item blank separator row (an earlier design appended one),
-so the `│` spine is continuous down the whole turn - the two-planes coloring, not
-whitespace, separates a turn's parts.
+so the `│` spine is continuous down the whole run - the two-planes coloring, not
+whitespace, separates a run's parts.
 
 **Harness events form one tinted marker plane, tone stamped at the firing site.**
 Every Suspenders-authored marker carries a semantic tone: Housekeeping (eviction,
 compaction, result-cap cuts), Aid (a Governor that helps the model - nudge,
 plan/anchor refresh, recovery), Constrain (a Governor that limits it -
-tool-narrowing, turn-close), or Steering (the user's own voice). Aid-vs-Constrain
+tool-narrowing, run-close), or Steering (the user's own voice). Aid-vs-Constrain
 is a Governor's *intent* - a domain judgment - so per ADR-0026 ("opinions live in
 exactly one Governor") the tone is stamped where the Intervention is voiced and
 carried on the Event, the same shape as an Artifact or Provenance: display-only
@@ -96,20 +96,20 @@ is added at ADR-0008's deliberate vocabulary chokepoint. The Transcript is
 display-only and is never persisted (the Session Log records the Conversation,
 not the Transcript), so there is no decode path to protect and `Tone` needs no
 serde - the `#[default] Plain` variant exists only for an unclassified `push`. A new `Marker` keeps `Info` for its
-non-marker uses (greeting, notices, the recursion-bound plugin-failure line) and
+non-marker uses (greeting, notices, the recursion-bound extension-failure line) and
 keeps Steering's removal-by-equality working once its anchor re-points to `Marker`.
 
 ## Considered and rejected
 
-- **Speaker headers ("you" / model name per turn).** Explicit grouping, but
+- **Speaker headers ("you" / model name per run).** Explicit grouping, but
   spends rows on labels and reads as a chat app, not a dense TUI.
-- **Storing turn boundaries in the Transcript.** Unnecessary: a boundary is
+- **Storing run boundaries in the Transcript.** Unnecessary: a boundary is
   derivable from `User`-item position, so grouping stays render-time and
   reversible, honoring ADR-0029's whole-pipeline-in-the-adapter boundary. (The
-  next engineer will see a Recovery Turn share a lane and be tempted to "fix" it
+  next engineer will see a Recovery Run share a lane and be tempted to "fix" it
   with a stored boundary - it is not a bug; the lane is a user request.)
 - **`tone` on the `Info` item.** Rejected: `Info` carries non-marker uses (the
-  greeting, launch notices, the plugin-failure line that bypasses Presentment as
+  greeting, launch notices, the extension-failure line that bypasses Presentment as
   the recursion bound), and the Steering pending marker is keyed by `Info`-text
   equality. A `tone` on `Info` forces a `Plain` sentinel onto all of them and
   makes the steering-removal breakage invisible to the compiler. A `Marker`
@@ -132,14 +132,14 @@ and the live tail are adapter-local and cheap to reverse. The tone is the only
 cross-layer change (Event → Screen → store → property test) and is the part to
 weigh: every future marker-bearing event must stamp a tone. Because the running
 spinner moves to the `✦ Thinking` header, the status-bar mode dot is a static
-running/idle color, not a pulse - motion lives at the brain by design, so a turn
+running/idle color, not a pulse - motion lives at the brain by design, so a run
 running while the user has scrolled away from the tail shows the running-color
 dot without motion. That trade is deliberate (the user asked for the animation at
 the brain, not the bar). This
 redesign also carries one adjacent pure-core change that is NOT adapter-local: the
-diff Plugin drops its line-number gutter (`plugins/diff/display.rs`), a change to
-what the Plugin chooses to show (ADR-0008 leaves that to the Plugin) with its own
-tests. Cross-reference ADR-0029: the lane, tail, and the `turn_fold` collapse all
+diff Presenter drops its line-number gutter (`extensions/diff/display.rs`), a change to
+what the Presenter chooses to show (ADR-0008 leaves that to the Presenter) with its own
+tests. Cross-reference ADR-0029: the lane, tail, and the `run_fold` collapse all
 land in `components.rs`, which 0029 twice refused to split past semantic lines -
 the added code is not a signal to extract a `TranscriptItem`-to-line builder.
 

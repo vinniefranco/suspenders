@@ -1,7 +1,7 @@
 //! Session cost metering (ADR-0037): a decorator over the [`Llm`] boundary
 //! that prices every Response against the captured Model it answered for.
 //!
-//! Every model call a Session makes - main Turn Passes, Scouts, Compaction
+//! Every model call a Session makes - main Run Passes, Scouts, Compaction
 //! summaries, Handoff seeds - flows through the one injected `Arc<dyn Llm>`,
 //! so wrapping that value at Agent start meters them all in one place. The
 //! math is the existing [`Model::cost`] fold; this module only accumulates.

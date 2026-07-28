@@ -18,7 +18,7 @@
 //! Running it twice changes nothing.
 
 mod supersession;
-mod turn_boundary;
+mod run_boundary;
 
 use crate::content::{ContentBlock, Message, Provenance, Role, Usage};
 use crate::voice::{self, FileOps};
@@ -392,17 +392,17 @@ impl Conversation {
     /// Prepares compaction: which messages to summarize and where the cutoff
     /// to kept messages falls. Walks backwards from the newest message,
     /// accumulating the char estimate; stops at the Compaction Keep, then
-    /// adjusts the cutoff backward to the nearest turn-start user message.
+    /// adjusts the cutoff backward to the nearest run-start user message.
     pub fn prepare_compaction(&self) -> Option<(Vec<Message>, usize, FileOps)> {
         let keep_recent = self.compaction_keep_amount();
 
-        // Indexes of turn-start user messages (turn_boundary owns the rule).
-        let turn_start_indexes: Vec<usize> =
-            turn_boundary::turn_start_indices(&self.messages).collect();
+        // Indexes of run-start user messages (run_boundary owns the rule).
+        let run_start_indexes: Vec<usize> =
+            run_boundary::run_start_indices(&self.messages).collect();
 
-        // Nearest turn-start at or before the computed cutoff.
+        // Nearest run-start at or before the computed cutoff.
         let cutoff = keep_cutoff(&self.messages, keep_recent).and_then(|computed_cutoff| {
-            turn_start_indexes
+            run_start_indexes
                 .iter()
                 .filter(|&&i| i <= computed_cutoff)
                 .max()
@@ -638,7 +638,7 @@ pub fn extract_file_ops(messages: &[Message]) -> FileOps {
 
 /// The newest run_command Tool Result in `messages`, verbatim - the Handoff's
 /// final-verification fact (CONTEXT.md: Handoff; the simplest correct rule:
-/// the last run_command Tool Result of the Turn is the single highest-value
+/// the last run_command Tool Result of the Run is the single highest-value
 /// artifact for a debugging continuation). `None` when no run_command ever
 /// produced a result.
 pub fn last_command_result(messages: &[Message]) -> Option<&str> {
@@ -1449,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compaction_finds_cutoff_across_turns() {
+    fn prepare_compaction_finds_cutoff_across_runs() {
         let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0).eviction_slack(0.0));
         for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
             conv.add_user_text(u.repeat(100));
@@ -1496,7 +1496,7 @@ mod tests {
         // executed keep is ~3.5x smaller than configured. Keep amount =
         // 0.05 * 10_000 = 500. The newest message alone is 600 chars
         // (~172 tokens): a char walk crosses on it, snapping the cutoff to
-        // the last turn start (index 6); a token walk would need three
+        // the last run start (index 6); a token walk would need three
         // messages and snap to index 4.
         let mut conv = Conversation::new(
             "sys",
@@ -1534,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compaction_cutoff_lands_on_turn_start_user_message() {
+    fn prepare_compaction_cutoff_lands_on_run_start_user_message() {
         let mut conv = Conversation::new("sys", ConversationOpts::new(1, 0));
         for (u, a) in [
             ("turn 1", "a"),

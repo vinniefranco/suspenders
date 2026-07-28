@@ -1,12 +1,12 @@
 //! UI Transcript - the display-side history of a Session (CONTEXT.md), as a
 //! store (ADR-0034): the settled items, the revision counter the render cache
 //! keys on, the in-flight [`Streaming`] snapshot (a private child module), and
-//! Presentment (the Plugin list lives here, so `present` runs on every append
+//! Presentment (the Extension list lives here, so `present` runs on every append
 //! by construction). The [`crate::ui::screen`] fold delegates one verb per
 //! event arm; no caller can reach the items Vec directly.
 //!
 //! Pure like the rest of the core (ADR-0001/0019): no terminal, no async, no
-//! IO, no ratatui types. Not `Clone`/`PartialEq` - plugins aren't.
+//! IO, no ratatui types. Not `Clone`/`PartialEq` - extensions aren't.
 //!
 //! ## The invariants, held at this seam
 //!
@@ -19,10 +19,10 @@
 //! * **Pairing is by `id`**, never by position - parallel Tool Calls
 //!   interleave.
 //! * **Presentment runs before every append**, and a paired result's
-//!   `key_arg` is stamped BEFORE Presentment (a plugin may swap the item for
+//!   `key_arg` is stamped BEFORE Presentment (a extension may swap the item for
 //!   a Block; stamping after would stamp a dropped item).
-//! * **Fail-open lines bypass Presentment** (the recursion bound): a plugin
-//!   cannot re-present its own failure report, so a plugin that panics on
+//! * **Fail-open lines bypass Presentment** (the recursion bound): a extension
+//!   cannot re-present its own failure report, so a extension that panics on
 //!   every item still terminates in one item plus one raw info line.
 //! * The pending-Steering marker is authored HERE, by both
 //!   [`Transcript::steering_queued`] and [`Transcript::steering_delivered`],
@@ -36,7 +36,7 @@
 //! Voice strings stay with the Screen (the greeting, stop reasons, wave
 //! lines, nudges - recorded through [`Transcript::info`]); the store authors
 //! only the two lines its own invariants require verbatim: the pending
-//! Steering marker and the plugin-failure line.
+//! Steering marker and the extension-failure line.
 
 mod streaming;
 
@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use crate::content::ContentBlock;
 use crate::event::Stage;
-use crate::plugins::{self, Registered};
+use crate::extensions::{self, Registered};
 use streaming::Streaming;
 
 /// The semantic style of one display line inside a [`TranscriptItem::Block`]
@@ -83,12 +83,12 @@ pub enum Tone {
     /// Result-Cap cuts. Not a Governor's judgment - neutral gray.
     Housekeeping,
     /// A Governor helping the model along: a Nudge, a plan/anchor refresh, a
-    /// Recovery Turn. Warm amber (chosen away from error-red).
+    /// Recovery Run. Warm amber (chosen away from error-red).
     Aid,
-    /// A Governor limiting the model: tool-narrowing, the Endgame's turn-close
+    /// A Governor limiting the model: tool-narrowing, the Endgame's run-close
     /// schedule. Cool blue (chosen away from success-green).
     Constrain,
-    /// The user's own voice reaching a running Turn (the pending-Steering
+    /// The user's own voice reaching a running Run (the pending-Steering
     /// marker): the prompt color, never the harness plane.
     Steering,
     /// A marker with no assigned tone - the default a plain `push`ed marker or
@@ -128,13 +128,13 @@ impl StyledLine {
 ///   interprets it.
 /// * `ToolResult { name, summary, is_error, key_arg }` -
 ///   `{:tool_result, name, summary, is_error, key_arg}`, the default one-line
-///   summary a plugin's `present` may replace; `key_arg` is the salient input
+///   summary a extension's `present` may replace; `key_arg` is the salient input
 ///   arg (path/command/pattern) carried over from the paired call so the merged
 ///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
 /// * `Block { title, lines }` - `{:block, title, lines}`: a titled block of
 ///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
-///   plane (the greeting, launch notices, the plugin-failure line).
+///   plane (the greeting, launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
 ///   plane (ADR-0040): eviction, compaction, Governor Interventions, Steering.
 ///   The [`Tone`] tints it in the adapter; the store only carries the fact.
@@ -241,7 +241,7 @@ enum Anchor<'a> {
 /// [`Streaming`] snapshot, and Presentment - see the module doc for the
 /// invariants this seam holds.
 ///
-/// `plugins` are not `Clone`/`PartialEq`, so neither is the store (nor the
+/// `extensions` are not `Clone`/`PartialEq`, so neither is the store (nor the
 /// Screen that owns it).
 pub struct Transcript {
     /// The settled items. Private: every write routes through the append
@@ -254,19 +254,19 @@ pub struct Transcript {
     /// The in-flight streaming snapshot and its materialize rules (the private
     /// `streaming` child module owns the end/flush asymmetry).
     streaming: Streaming,
-    /// The configured Plugins whose pure `present` runs on every append.
-    plugins: Vec<Registered>,
+    /// The configured Extensions whose pure `present` runs on every append.
+    extensions: Vec<Registered>,
 }
 
 impl Transcript {
     /// An empty Transcript. The caller authors any opening line (the greeting
     /// is the Screen's Voice, recorded through [`Transcript::info`]).
-    pub fn new(plugins: Vec<Registered>) -> Self {
+    pub fn new(extensions: Vec<Registered>) -> Self {
         Transcript {
             items: Vec::new(),
             revision: 0,
             streaming: Streaming::idle(),
-            plugins,
+            extensions,
         }
     }
 
@@ -293,13 +293,13 @@ impl Transcript {
         }
     }
 
-    /// Turn-boundary reset: discard the snapshot without settling it. The
+    /// Run-boundary reset: discard the snapshot without settling it. The
     /// settled items are untouched.
     pub fn discard_streaming(&mut self) {
         self.streaming.clear();
     }
 
-    /// Close out a Turn: settle whatever the live snapshot holds (both
+    /// Close out a Run: settle whatever the live snapshot holds (both
     /// Thinking and text - a cancel/crash mid-stream has no final content),
     /// THEN record `note` as an info line if there is one. The order is the
     /// point - the closing note always lands after the salvaged content. The
@@ -415,13 +415,13 @@ impl Transcript {
         });
     }
 
-    /// Records the fail-open Plugin report line (ADR-0007) - ONE format
+    /// Records the fail-open Extension report line (ADR-0007) - ONE format
     /// whether the failure came from this store's own Presentment fold or from
-    /// the `plugin_error` event the Turn reports. Bypasses Presentment like
+    /// the `extension_error` event the Run reports. Bypasses Presentment like
     /// every fail-open line (the recursion bound - see the module doc).
-    pub fn plugin_failure(&mut self, plugin: &str, stage: Stage, message: &str) {
+    pub fn extension_failure(&mut self, extension: &str, stage: Stage, message: &str) {
         self.items.push(TranscriptItem::Info {
-            text: plugin_failure_line(plugin, stage, message),
+            text: extension_failure_line(extension, stage, message),
         });
     }
 
@@ -454,15 +454,15 @@ impl Transcript {
     // ---- Internals ----------------------------------------------------------
 
     // Presentment (CONTEXT.md), then push - the one append funnel. A crashing
-    // plugin is skipped fail-open (ADR-0007): the item from before it ran
+    // Presenter is skipped fail-open (ADR-0007): the item from before it ran
     // survives, and its failure report lands as a RAW info line - never
-    // re-presented, so a plugin that panics on every item cannot recurse on
+    // re-presented, so an Extension that panics on every item cannot recurse on
     // its own report.
     fn append(&mut self, item: TranscriptItem, artifacts: &HashMap<String, Value>) {
-        let (item, failures) = plugins::present(&self.plugins, item, artifacts);
+        let (item, failures) = extensions::present(&self.extensions, item, artifacts);
         self.items.push(item);
         for failure in failures {
-            self.plugin_failure(&failure.plugin, failure.stage, &failure.message);
+            self.extension_failure(&failure.extension, failure.stage, &failure.message);
         }
     }
 
@@ -510,10 +510,10 @@ fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
 }
 
-// The fail-open Plugin report (ADR-0007) - sourced once, so the store's own
-// Presentment failures and the Turn's `plugin_error` events read identically.
-fn plugin_failure_line(plugin: &str, stage: Stage, message: &str) -> String {
-    format!("plugin {plugin} failed in {}: {message}", stage.as_str())
+// The fail-open Extension report (ADR-0007) - sourced once, so the store's own
+// Presentment failures and the Run's `extension_error` events read identically.
+fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> String {
+    format!("plugin {extension} failed in {}: {message}", stage.as_str())
 }
 
 // The single salient input arg for a merged one-liner, picked by tool: the
@@ -606,7 +606,7 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::Plugin;
+    use crate::presenter::Presenter;
     use serde_json::json;
 
     // --- helpers ------------------------------------------------------------
@@ -980,7 +980,7 @@ mod tests {
     // --- presentment -----------------------------------------------------------
 
     struct BlockPresenter;
-    impl Plugin for BlockPresenter {
+    impl Presenter for BlockPresenter {
         fn present(
             &self,
             item: TranscriptItem,
@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     struct PresentCrasher;
-    impl Plugin for PresentCrasher {
+    impl Presenter for PresentCrasher {
         fn present(
             &self,
             _item: TranscriptItem,
@@ -1013,8 +1013,8 @@ mod tests {
         }
     }
 
-    fn reg(name: &str, plugin: Box<dyn Plugin>) -> Registered {
-        Registered::new(name, plugin, Value::Null)
+    fn reg(name: &str, presenter: Box<dyn Presenter>) -> Registered {
+        Registered::new(name, Value::Null).with_presenter(presenter)
     }
 
     fn diff_artifacts() -> HashMap<String, Value> {
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_replaces_tool_result_summary_using_artifacts() {
+    fn extension_replaces_tool_result_summary_using_artifacts() {
         let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
         t.tool_result(
             "t1",
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     // The recursion bound: the fail-open report line is pushed RAW, never
-    // re-presented - a plugin that panics on EVERY item (this one) would
+    // re-presented - a extension that panics on EVERY item (this one) would
     // otherwise crash on its own failure report, report that, crash on the
     // report of the report, and never terminate.
     #[test]
@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     // The diff-Block redundancy case: because the paired call is removed, the
-    // Diff plugin's Block (whose title summarizes the call) stands alone.
+    // Diff extension's Block (whose title summarizes the call) stands alone.
     #[test]
     fn a_diff_block_stands_alone_after_the_paired_call_is_removed() {
         let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
@@ -1176,8 +1176,8 @@ mod tests {
                 Box::new(|t| t.tool_result("t1", "grep".into(), "hit", false, &HashMap::new())),
             ),
             (
-                "plugin_failure",
-                Box::new(|t| t.plugin_failure("P", Stage::Present, "boom")),
+                "extension_failure",
+                Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
             ),
             ("message_start (again)", Box::new(|t| t.message_start())),
             (

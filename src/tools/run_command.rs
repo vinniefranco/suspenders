@@ -150,7 +150,7 @@ fn report(output: &str, exit_code: i32) -> String {
 /// Recovers the exit code [`report`] owns from a run_command result, or `None`
 /// when the tail is absent (a timeout, or content produced elsewhere). The
 /// inverse of [`report`]: the `[exit code: N]` tail is the single-sourced
-/// contract between here and the run_command plugin's `present`, so the badge is
+/// contract between here and the run_command extension's `present`, so the badge is
 /// a semantic fact, not a fragile fold-time parse. Searched from the END so
 /// command output that happens to contain the phrase cannot spoof it.
 pub fn parse_exit_code(content: &str) -> Option<i32> {

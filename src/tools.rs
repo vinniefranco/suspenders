@@ -1,9 +1,9 @@
 //! Registry of Suspenders tools.
 //!
 //! Registry order is prompt order: the order the model sees the tool specs.
-//! [`execute`] turns every outcome into a `{content, is_error}` Tool Result, so
-//! a tool can never crash the Turn. [`run`] adds Shaping on top - the
-//! plugin-free dispatch path.
+//! [`execute`] runs every outcome into a `{content, is_error}` Tool Result, so
+//! a tool can never crash the Run. [`run`] adds Shaping on top - the
+//! extension-free dispatch path.
 
 pub mod edit_file;
 pub mod explore;
@@ -74,12 +74,12 @@ pub fn verification_specs() -> Vec<ToolSpec> {
         .collect()
 }
 
-/// Runs a batch of read-only Tool Calls plugin-free and collects their Tool
+/// Runs a batch of read-only Tool Calls extension-free and collects their Tool
 /// Result blocks, in emission order.
 ///
 /// This is the read-only collect-results core the Scout's Pass loop repeats:
 /// for every `tool_use` block, run the tool through [`run`] (Shaped, no
-/// Plugins) and wrap its outcome in a `tool_result` block. Non-`tool_use`
+/// Extensions) and wrap its outcome in a `tool_result` block. Non-`tool_use`
 /// blocks are ignored. A malformed-input sentinel (the LLM layer's tag for
 /// input JSON that never parsed) is blanked to an empty object so the tool's
 /// own validation rejects it rather than acting on undecoded JSON.
@@ -90,11 +90,11 @@ pub fn verification_specs() -> Vec<ToolSpec> {
 /// with the Voice's refusal and never runs. Small local models hallucinate
 /// Tool Calls the request never offered; the refusal is the mechanic.
 ///
-/// The Turn's batch (`turn::batch`) deliberately does NOT share this: it
-/// interleaves the Governor answering arbiter, the Plugin lifecycle, the
+/// The Run's batch (`run::batch`) deliberately does NOT share this: it
+/// interleaves the Governor answering arbiter, the Extension lifecycle, the
 /// Approval gate, Ledger recording, and per-result checkpointing around each
 /// call - none of which a read-only Scout has. The shared unit is only this
-/// plugin-free core.
+/// extension-free core.
 pub async fn run_read_only(blocks: &[ContentBlock], ctx: &ToolCtx) -> Vec<ContentBlock> {
     // The subset names, resolved once per batch: the dispatch check and the
     // refusal wording read the same derivation.
@@ -139,7 +139,7 @@ fn sanitize_input(input: &Value) -> Value {
 }
 
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
-/// result to the Result Cap: the plugin-free dispatch path.
+/// result to the Result Cap: the extension-free dispatch path.
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     let mut result = execute(name, input, ctx).await;
     result.content = shaping::shape(name, input, &result.content, ctx.result_cap);
@@ -300,7 +300,7 @@ mod tests {
 
     // ---- run_read_only ----
 
-    // The read-only batch core runs every tool_use block plugin-free and Shaped,
+    // The read-only batch core runs every tool_use block extension-free and Shaped,
     // collecting one tool_result block per call in emission order; non-tool_use
     // blocks are ignored.
     #[tokio::test]

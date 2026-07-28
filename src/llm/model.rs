@@ -27,9 +27,9 @@ pub enum Api {
 
 /// The facts of one model at one Provider (CONTEXT.md: Model). Read from the
 /// Catalog for built-in Providers; synthesized from config for custom ones.
-/// Each Turn captures a Model when it begins (ADR-0033 amendment), and the
+/// Each Run captures a Model when it begins (ADR-0033 amendment), and the
 /// Context Budget, the Eviction reserve, and the Result Cap derive from that
-/// capture at Turn start (ADR-0037).
+/// capture at Run start (ADR-0037).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     /// The Provider's identifier (the scope of the scoped id).

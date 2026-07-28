@@ -3,7 +3,7 @@
 //!
 //! Owns the one pending Approval (the open modal) and the Session's Standing
 //! Approvals. Returns verdicts; the Agent hosts this struct and translates the
-//! verdicts into the actual `send` to the Turn task and the broadcast to
+//! verdicts into the actual `send` to the Run task and the broadcast to
 //! subscribers - this module knows nothing about task handles or events.
 //!
 //! Standing Approval matching is string equality only - no prefix, glob, or
@@ -32,7 +32,7 @@ const GATED: &[(&str, &str)] = &[("run_command", "command"), ("web_fetch", "url"
 /// Standing Approval matches); `None` means no gate. Because the same lookup
 /// answers both facts, "does this gate" and "what text" can never disagree.
 ///
-/// The text is read from the plugin-adjusted input the caller hands over.
+/// The text is read from the extension-adjusted input the caller hands over.
 pub fn gate_text(name: &str, input: &Value) -> Option<String> {
     let (_, field) = GATED.iter().find(|(tool, _)| *tool == name)?;
     Some(
@@ -45,7 +45,7 @@ pub fn gate_text(name: &str, input: &Value) -> Option<String> {
 }
 
 /// A unique identifier for an Approval request, standing in for baud's
-/// `make_ref()`. In the wired Agent the id is minted by the Turn Loop and
+/// `make_ref()`. In the wired Agent the id is minted by the Run Loop and
 /// carried as the opaque string the `request_approval` Dep hands over (baud's
 /// `make_ref()` reference); the Agent's Approvals fold keys on that same string
 /// so a decision matches the pending modal. [`ApprovalId::new`] mints a fresh,
@@ -68,7 +68,7 @@ impl ApprovalId {
         ))
     }
 
-    /// Wraps the opaque reference the Turn Loop minted (`request_approval`'s
+    /// Wraps the opaque reference the Run Loop minted (`request_approval`'s
     /// `id` argument) so the Agent's fold keys on the same string the Loop and
     /// the UI both hold.
     pub fn from_ref(id: impl Into<String>) -> Self {
@@ -100,7 +100,7 @@ pub struct Pending {
 /// The verdict of folding in an Approval request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// A Standing Approval covers the exact command string: answer the Turn
+    /// A Standing Approval covers the exact command string: answer the Run
     /// approved immediately, no modal (the caller emits `approval_auto`).
     Auto(Approvals),
     /// No cover: the request becomes the pending Approval (the caller
@@ -112,10 +112,10 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decide {
     /// The id matches the pending Approval: relay `approved` to the waiting
-    /// Turn. `ApproveAlways` records the pending command as Standing first.
+    /// Run. `ApproveAlways` records the pending command as Standing first.
     Forward(bool, Approvals),
     /// Stale or duplicate id, or nothing pending: drop it, so late decisions
-    /// never pile up in the Turn task's mailbox.
+    /// never pile up in the Run task's mailbox.
     Ignore(Approvals),
 }
 
@@ -132,7 +132,7 @@ impl Approvals {
         Approvals::default()
     }
 
-    /// Folds in an Approval request from the Turn.
+    /// Folds in an Approval request from the Run.
     pub fn request(mut self, id: ApprovalId, command: impl Into<String>) -> Request {
         let command = command.into();
         if self.standing.contains(&command) {
@@ -158,7 +158,7 @@ impl Approvals {
         }
     }
 
-    /// Clears the pending Approval (the Turn it belonged to is gone: settled or
+    /// Clears the pending Approval (the Run it belonged to is gone: settled or
     /// freshly started). Standing Approvals survive - they are Session-scoped.
     pub fn reset(mut self) -> Self {
         self.pending = None;
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn standing_approvals_survive_they_are_session_scoped_not_turn_scoped() {
+    fn standing_approvals_survive_they_are_session_scoped_not_run_scoped() {
         let approvals = granted("mix test").reset();
 
         assert!(matches!(

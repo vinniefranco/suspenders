@@ -19,7 +19,7 @@ the results tail, narrow the offered Tools, silence Thinking, close on a
 marker. Every Intervention belongs to exactly one of three moments of a
 Pass - request shaping, Tool Call answering, finish settlement - and one
 arbiter owns an explicit precedence order per moment. Facts live in a
-**Turn Ledger** written once by the loop; each Governor keeps only its
+**Run Ledger** written once by the loop; each Governor keeps only its
 private trigger state and its **Setpoints** (declared with defaults,
 resolved by the Session at launch, exposed to user config only when a
 real model has demanded a different value). Compaction and Eviction are
@@ -28,7 +28,7 @@ tuned.
 
 ## Considered options
 
-- **Open registry (Plugin-shaped)**: a trait plus a list, new heuristic =
+- **Open registry (Extension-shaped)**: a trait plus a list, new heuristic =
   new impl, zero loop changes. Rejected because the interactions BETWEEN
   heuristics are the domain, not incidental wiring: Verify-failed >
   Verify > Empty is strict precedence, the Verification Pass prompt
@@ -40,12 +40,12 @@ tuned.
   set delivers that (one module, one Voice string, one precedence line)
   while keeping precedence a single readable function - the artifact a
   tuning session diffs.
-- **Heuristics as Plugins**: rejected on a boundary now in CONTEXT.md - a
-  Plugin acts on one Tool Call in isolation, fail-open, no Turn history;
-  a Governor judges the Turn's trajectory and needs the Ledger. The
-  litmus test is Turn history: the duplicate check cannot be a Plugin
-  ("still-fresh from the previous Pass" is a fact about the Turn), the
-  Diff plugin cannot be a Governor. Approval is neither - the user's
+- **Heuristics as Middleware**: rejected on a boundary now in CONTEXT.md - a
+  Middleware acts on one Tool Call in isolation, fail-open, no Run history;
+  a Governor judges the Run's trajectory and needs the Ledger. The
+  litmus test is Run history: the duplicate check cannot be a Middleware
+  ("still-fresh from the previous Pass" is a fact about the Run), the
+  Diff Presenter cannot be a Governor. Approval is neither - the user's
   judgment, not a tuned learning.
 - **Status quo**: well-named files, but the five-file wiring cost per
   learning is the shotgun surgery this exists to remove.
@@ -57,14 +57,14 @@ tuned.
   Conversation is a visible design decision, per the same
   mechanics-over-prose stance as ADR-0015/0016 - do not "fix" this by
   generalizing the enum away.
-- Governors are first-party only. Open extension stays with Plugins
+- Governors are first-party only. Open extension stays with Extensions
   (ADR-0007), which keep their fail-open contract; Governors have no
   failure mode - they are pure judgment over Ledger facts, and are part
-  of the Turn's correctness.
+  of the Run's correctness.
 - At the Tool Call moment the ordering is fixed: Governors judge what the
-  model sent and what the model will read; Plugins shape what actually
+  model sent and what the model will read; Middleware shapes what actually
   runs in between (consistent with the existing rule that duplicates key
-  on what the model sent while Approval shows the plugin-adjusted
+  on what the model sent while Approval shows the Middleware-adjusted
   command).
 - Cross-cutting reads become principled: Endgame reading verification
   state and Settlement reading stuckness are Ledger reads; no Governor

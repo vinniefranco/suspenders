@@ -7,7 +7,7 @@
 //!   may need to see what it tried against the error - until a later
 //!   successful write to the same file supersedes the attempt chain.
 //! * A run_command or read_file Tool Call identical to a LATER call in the
-//!   same Turn - full `(name, input)` equality, the same identity the
+//!   same Run - full `(name, input)` equality, the same identity the
 //!   duplicate Governor uses - leaves its older result dead. The newest
 //!   result always survives verbatim.
 //!
@@ -21,11 +21,11 @@ use serde_json::Value;
 use crate::content::{ContentBlock, Message, Role};
 use crate::voice;
 
-use super::turn_boundary;
+use super::run_boundary;
 
 // The write Tools whose landed input the file on disk supersedes. Mirrors the
 // duplicate Governor's list; kept local so the Conversation core carries no
-// turn dependency.
+// run dependency.
 const WRITE_TOOLS: &[&str] = &["edit_file", "write_file"];
 
 /// The tool kind of a superseded Tool Result - the classification supersession
@@ -60,7 +60,7 @@ pub(super) enum Dead {
         block_index: usize,
         path: Option<String>,
     },
-    /// A Tool Result superseded by a later identical call in the same Turn.
+    /// A Tool Result superseded by a later identical call in the same Run.
     Result {
         msg_index: usize,
         block_index: usize,
@@ -109,11 +109,11 @@ pub(super) fn dead_chars(messages: &[Message], dead: &[Dead]) -> u64 {
 }
 
 // One Tool Call joined to its landed Tool Result, positioned for oldest-first
-// ordering and Turn scoping.
+// ordering and Run scoping.
 struct Call<'a> {
     msg_index: usize,
     block_index: usize,
-    turn: usize,
+    run: usize,
     id: &'a str,
     name: &'a str,
     input: &'a Value,
@@ -135,20 +135,20 @@ impl Call<'_> {
 
 fn collect_calls(messages: &[Message]) -> Vec<Call<'_>> {
     let mut calls: Vec<Call<'_>> = Vec::new();
-    // Turn ordinal, incremented at each Turn boundary (turn_boundary owns the
-    // rule Compaction's cutoff also reads). Same-Turn supersession compares
-    // this ordinal; only calls sharing a Turn can supersede one another.
-    let mut turn = 0usize;
+    // Run ordinal, incremented at each Run boundary (run_boundary owns the
+    // rule Compaction's cutoff also reads). Same-Run supersession compares
+    // this ordinal; only calls sharing a Run can supersede one another.
+    let mut run = 0usize;
     for (msg_index, message) in messages.iter().enumerate() {
-        if turn_boundary::is_turn_start(message) {
-            turn += 1;
+        if run_boundary::is_run_start(message) {
+            run += 1;
         }
         for (block_index, block) in message.content.iter().enumerate() {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 calls.push(Call {
                     msg_index,
                     block_index,
-                    turn,
+                    run,
                     id,
                     name,
                     input,
@@ -277,7 +277,7 @@ fn superseded_results(calls: &[Call<'_>], guard: &RecencyGuard) -> Vec<Dead> {
             }
             let superseded = calls.iter().any(|later| {
                 later.position() > call.position()
-                    && later.turn == call.turn
+                    && later.run == call.run
                     && later.name == call.name
                     && later.input == call.input
                     && later.result.is_some()
@@ -520,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn an_identical_call_in_a_different_turn_does_not_supersede() {
+    fn an_identical_call_in_a_different_run_does_not_supersede() {
         let cmd = json!({"command": "cargo test"});
         let mut messages = vec![Message::user(vec![ContentBlock::text("turn one")])];
         let [a, b] = exchange(
@@ -529,7 +529,7 @@ mod tests {
         );
         messages.push(a);
         messages.push(b);
-        // A new Turn: a user message opening with text.
+        // A new Run: a user message opening with text.
         messages.push(Message::user(vec![ContentBlock::text("turn two")]));
         let [a, b] = exchange(
             tool_use("t2", "run_command", cmd.clone()),

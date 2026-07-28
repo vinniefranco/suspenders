@@ -5,14 +5,14 @@ Compaction): uniform behavior over server-dependent toggles. Live driving
 on 2026-07-10 (Qwen3.5-9B, llama.cpp b9870) broke that uniformity for the
 Scout: every explore dispatch in a real Session died in ~4s with
 "[scout returned no findings]", and the resulting consecutive-failure
-streak ended the Turn as turn-limit-stuck with no evaluation delivered.
+streak ended the Run as run-limit-stuck with no evaluation delivered.
 
 A direct A/B probe (same tasks, same server) was decisive:
 
 - **Thinking on, 5/5 fatal** (3 live dispatches + 2 probe trials): the
   known Qwen3.5 quirk - the model fails to exit thinking into prose after
   Tool Results - kills the Scout at Pass 2. Its final text is empty, so
-  the report is empty. The main Turn loop survives this quirk via the
+  the report is empty. The main Run loop survives this quirk via the
   Empty-response Nudge and the no-think rescue; the Scout loop has
   neither.
 - **Thinking off**: accurate, well-structured reports (7 fast Passes,

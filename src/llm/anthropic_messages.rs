@@ -144,7 +144,7 @@ pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, Stri
     models_from_body(&body)
 }
 
-/// Turns a raw `event:`/`data:` frame into a parsed [`SseEvent`]. A data body
+/// Runs a raw `event:`/`data:` frame into a parsed [`SseEvent`]. A data body
 /// that isn't valid JSON becomes a [`SseEvent::ParseError`] (the error
 /// algebra: an SSE parse failure is data, not an exception).
 fn parse_frame(name: &str, data: &str) -> SseEvent {

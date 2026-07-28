@@ -98,7 +98,7 @@ impl Response {
 /// `Context size has been exceeded` (the KV-pool 500) and transport errors
 /// are pointless or a budget problem to retry, not a generation one. Mirrors
 /// the string-matching style of
-/// [`failure_category::classify`](crate::turn::governor::ledger::failure_category::classify).
+/// [`failure_category::classify`](crate::run::governor::ledger::failure_category::classify).
 pub fn is_retryable_error(error: &str) -> bool {
     error.contains("Failed to generate a valid tool call")
 }

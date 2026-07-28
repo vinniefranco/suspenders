@@ -157,7 +157,7 @@ fn authorized(builder: reqwest::RequestBuilder, provider: &Provider) -> reqwest:
     }
 }
 
-/// Turns one `data:` frame body into a parsed [`SseEvent`]. `[DONE]` is the
+/// Runs one `data:` frame body into a parsed [`SseEvent`]. `[DONE]` is the
 /// dialect's terminator; any other body must be a JSON chunk, and one that
 /// isn't valid JSON becomes a [`SseEvent::ParseError`] (the error algebra: an
 /// SSE parse failure is data, not an exception).

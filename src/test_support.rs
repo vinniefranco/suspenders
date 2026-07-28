@@ -16,7 +16,7 @@ use crate::llm::model::{Api, Model};
 use crate::llm::provider::Provider;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{Delta, Llm, LlmRequest, OnEvent, StreamEvent};
-use crate::turn::deps::{AfterPass, CompactError, Emitter, TurnDeps};
+use crate::run::deps::{AfterPass, CompactError, Emitter, RunDeps};
 
 /// A callback that inspects the outgoing typed request (and the Model it is
 /// bound for) and produces a [`Response`]. The extension point for
@@ -69,7 +69,7 @@ pub enum Entry {
     },
     /// The tokio analog of baud's blocking script closure: on `complete`, sends
     /// an [`InFlight`] (the request + a release oneshot) to `signal` so the test
-    /// observes the Turn parked mid-call, then awaits the [`Release`]. The test
+    /// observes the Run parked mid-call, then awaits the [`Release`]. The test
     /// answers to unpark it (busy / steer-while-running / streaming handshakes),
     /// or never answers so `JoinHandle::abort()` cancels the call at this await
     /// (the cancellation tests).
@@ -214,7 +214,7 @@ impl Llm for FakeLlm {
                     return Response::error("fake_llm: barrier signal receiver dropped");
                 }
                 // Park until the test releases us - or forever, so an abort()
-                // cancels the Turn task exactly at this await.
+                // cancels the Run task exactly at this await.
                 match release_rx.await {
                     Ok(Release { deltas, response }) => {
                         Self::fire_deltas(&deltas, on_event);
@@ -242,7 +242,7 @@ impl Llm for FakeLlm {
 }
 
 // ---------------------------------------------------------------------------
-// FakeDeps - the Turn loop's dependency bundle for tests (baud's loop_test fake
+// FakeDeps - the Run loop's dependency bundle for tests (baud's loop_test fake
 // Deps). Records emitted events, checkpoints, set_plan calls, and each built
 // request into shared handles the test inspects; scripts `complete` through an
 // owned [`FakeLlm`]; answers Approvals from a canned per-call queue OR an
@@ -265,7 +265,7 @@ pub struct ApprovalAsk {
     pub command: String,
 }
 
-/// The Turn loop test double. All recording handles are `Arc<Mutex<..>>` so a
+/// The Run loop test double. All recording handles are `Arc<Mutex<..>>` so a
 /// test can clone a handle before the run consumes `&mut deps` and inspect it
 /// after (or concurrently, from a spawned answerer).
 pub struct FakeDeps {
@@ -377,7 +377,7 @@ impl FakeDeps {
     }
 }
 
-impl TurnDeps for FakeDeps {
+impl RunDeps for FakeDeps {
     async fn complete(
         &mut self,
         req: LlmRequest,
