@@ -45,11 +45,11 @@ use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
-use crate::run::governor::endgame::{Recovery, ReopenReason};
+use crate::run::governor::endgame::Recovery;
 use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
-use crate::session::{RecoveryShape, Session};
+use crate::session::{RecoveryShape, ReopenReason, Session};
 use crate::{tools, voice};
 
 mod deps;

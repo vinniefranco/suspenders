@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentBlock, Message, Provenance, Role};
 use crate::conversation;
-use crate::run::governor::endgame::ReopenReason;
+use crate::session::ReopenReason;
 use crate::session::{RecoveryShape, Session};
 use crate::voice::{self, FileOps};
 

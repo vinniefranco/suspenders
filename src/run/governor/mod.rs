@@ -828,7 +828,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    reason: endgame::ReopenReason::UnverifiedWrites,
+                    reason: crate::session::ReopenReason::UnverifiedWrites,
                     failing_command: None,
                 },
                 keep_reply: false,
@@ -844,7 +844,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    reason: endgame::ReopenReason::DanglingFailure,
+                    reason: crate::session::ReopenReason::DanglingFailure,
                     failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: false,
@@ -899,7 +899,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    reason: endgame::ReopenReason::DanglingFailure,
+                    reason: crate::session::ReopenReason::DanglingFailure,
                     failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: false,
@@ -1139,7 +1139,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    reason: endgame::ReopenReason::DanglingFailure,
+                    reason: crate::session::ReopenReason::DanglingFailure,
                     failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: true,
@@ -1160,7 +1160,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    reason: endgame::ReopenReason::UnverifiedWrites,
+                    reason: crate::session::ReopenReason::UnverifiedWrites,
                     failing_command: None,
                 },
                 keep_reply: true,

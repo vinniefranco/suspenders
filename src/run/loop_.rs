@@ -2259,7 +2259,7 @@ mod tests {
         assert_eq!(reason, log::StopReason::RunLimit);
         assert_eq!(
             recovery.reason,
-            governor::endgame::ReopenReason::UnverifiedWrites
+            crate::session::ReopenReason::UnverifiedWrites
         );
     }
 
@@ -2560,7 +2560,7 @@ mod tests {
             recovery,
             Recovery {
                 shape: RecoveryShape::Handoff,
-                reason: governor::endgame::ReopenReason::UnverifiedWrites,
+                reason: crate::session::ReopenReason::UnverifiedWrites,
                 failing_command: None,
             }
         );
@@ -2605,7 +2605,7 @@ mod tests {
         let (_conv, _reason, recovery) = recover(&outcome);
         assert_eq!(
             recovery.reason,
-            governor::endgame::ReopenReason::DanglingFailure
+            crate::session::ReopenReason::DanglingFailure
         );
         assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
@@ -2672,7 +2672,7 @@ mod tests {
         let (_conv, _reason, recovery) = recover(&outcome);
         assert_eq!(
             recovery.reason,
-            governor::endgame::ReopenReason::DanglingFailure
+            crate::session::ReopenReason::DanglingFailure
         );
         assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
@@ -2781,7 +2781,7 @@ mod tests {
         assert_eq!(reason, log::StopReason::RunLimit);
         assert_eq!(
             recovery.reason,
-            governor::endgame::ReopenReason::DanglingFailure
+            crate::session::ReopenReason::DanglingFailure
         );
         let lm = last_message(conv);
         assert!(
@@ -2833,7 +2833,7 @@ mod tests {
         let (_conv, _reason, recovery) = recover(&outcome);
         assert_eq!(
             recovery.reason,
-            governor::endgame::ReopenReason::DanglingFailure
+            crate::session::ReopenReason::DanglingFailure
         );
     }
 

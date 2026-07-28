@@ -27,8 +27,7 @@ use crate::content::ContentBlock;
 use crate::conversation::WaveStats;
 use crate::llm::Delta;
 use crate::llm::response::StopReason;
-use crate::run::governor::endgame::ReopenReason;
-use crate::session::RecoveryShape;
+use crate::session::{RecoveryShape, ReopenReason};
 use crate::view_model::{SelectorRow, Tone};
 
 /// The `extension_error` stage: which point in the extension's lifecycle crashed

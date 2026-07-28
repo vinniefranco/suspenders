@@ -918,17 +918,14 @@ async fn a_capped_unfinished_run_opens_a_continuation_recovery_run() {
             text,
         } => {
             assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
-            assert_eq!(
-                *reason,
-                crate::run::governor::endgame::ReopenReason::UnverifiedWrites
-            );
+            assert_eq!(*reason, crate::session::ReopenReason::UnverifiedWrites);
             text.clone()
         }
         _ => unreachable!(),
     };
     assert_eq!(
         prompt,
-        voice::recovery_prompt(crate::run::governor::endgame::ReopenReason::UnverifiedWrites)
+        voice::recovery_prompt(crate::session::ReopenReason::UnverifiedWrites)
     );
     recv_match(&mut rx, is_run_started).await;
     recv_match(&mut rx, is_run_finished).await;
@@ -1065,8 +1062,8 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
         &recovery,
         Event::RecoveryRun { shape, reason, text }
             if *shape == crate::session::RecoveryShape::Handoff
-                && *reason == crate::run::governor::endgame::ReopenReason::DanglingFailure
-                && text == voice::recovery_prompt(crate::run::governor::endgame::ReopenReason::DanglingFailure)
+                && *reason == crate::session::ReopenReason::DanglingFailure
+                && text == voice::recovery_prompt(crate::session::ReopenReason::DanglingFailure)
     ));
     recv_match(&mut rx, is_run_started).await;
     recv_match(&mut rx, is_run_finished).await;
@@ -1082,7 +1079,7 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     assert!(seed.contains("narrative-of-dying-turn"));
     assert!(seed.contains(&verification));
     assert!(seed.contains(voice::recovery_prompt(
-        crate::run::governor::endgame::ReopenReason::DanglingFailure
+        crate::session::ReopenReason::DanglingFailure
     )));
     assert_eq!(
         conv.messages[1],
@@ -1134,7 +1131,7 @@ async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
     assert!(seed.contains(voice::handoff_no_narrative()));
     assert!(seed.contains("write the file")); // task verbatim
     assert!(seed.contains(voice::recovery_prompt(
-        crate::run::governor::endgame::ReopenReason::UnverifiedWrites
+        crate::session::ReopenReason::UnverifiedWrites
     )));
 }
 
@@ -1210,13 +1207,10 @@ async fn a_green_run_with_an_advanced_open_plan_opens_a_continuation() {
             // Continuation despite the Handoff Setpoint, and the Open Plan
             // reason carries the plan-continuation prompt.
             assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
-            assert_eq!(
-                *reason,
-                crate::run::governor::endgame::ReopenReason::OpenPlan
-            );
+            assert_eq!(*reason, crate::session::ReopenReason::OpenPlan);
             assert_eq!(
                 text,
-                voice::recovery_prompt(crate::run::governor::endgame::ReopenReason::OpenPlan)
+                voice::recovery_prompt(crate::session::ReopenReason::OpenPlan)
             );
         }
         _ => unreachable!(),

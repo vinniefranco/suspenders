@@ -57,54 +57,10 @@ use crate::content::ContentBlock;
 use crate::plan::PlanProgress;
 use crate::run::governor::failure;
 use crate::run::governor::ledger::Ledger;
-use crate::session::RecoveryShape;
 use crate::session::log::StopReason;
+use crate::session::{RecoveryShape, ReopenReason};
 use crate::tool::ToolSpec;
 use crate::voice;
-
-/// Why a Recovery Run reopens (ADR-0043): the three evidences of "unfinished"
-/// the one recovery judgment recognises. The first two are broken-state (the
-/// original ADR-0028 trigger, split by the `verification_failing` bool the
-/// Voice was already parameterized with); the third is the Open Plan - a green
-/// Run whose Plan still shows unchecked `[ ]` steps. The Voice's recovery
-/// prompt and the Session Log entry carry it, so an Open-Plan continuation
-/// logs and greps distinctly while remaining one mechanism.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReopenReason {
-    /// Successful writes with no verification since (ADR-0028).
-    UnverifiedWrites,
-    /// A command string whose most recent run this Run failed, with a write
-    /// this Run (ADR-0028 addendum 2026-07-14).
-    DanglingFailure,
-    /// The Run settled green but its Plan still has unchecked steps and it
-    /// checked off at least one step this Run (ADR-0043).
-    OpenPlan,
-}
-
-impl ReopenReason {
-    /// The lowercase wire token for the Session Log's `recovery` entry
-    /// (ADR-0043), so an Open-Plan reopen greps distinctly. Paired with
-    /// [`ReopenReason::parse`] the way [`RecoveryShape`] pairs `as_str`/`parse`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReopenReason::UnverifiedWrites => "unverified_writes",
-            ReopenReason::DanglingFailure => "dangling_failure",
-            ReopenReason::OpenPlan => "open_plan",
-        }
-    }
-
-    /// Parses a wire token back to a reason. `None` on an unknown token; the
-    /// log fold degrades a missing/foreign reason to `UnverifiedWrites` (a
-    /// broken-state recovery), never to a torn line.
-    pub fn parse(s: &str) -> Option<ReopenReason> {
-        match s {
-            "unverified_writes" => Some(ReopenReason::UnverifiedWrites),
-            "dangling_failure" => Some(ReopenReason::DanglingFailure),
-            "open_plan" => Some(ReopenReason::OpenPlan),
-            _ => None,
-        }
-    }
-}
 
 /// The Endgame Governor's recovery Setpoints (CONTEXT.md: Setpoint -
 /// resolved by the Session once at launch and fed to the Governor that owns

@@ -178,8 +178,8 @@ pub fn run_limit_marker() -> &'static str {
 /// reopened (ADR-0043): a Dangling Failure, unverified writes, or an Open Plan
 /// (a green Run whose Plan still has open steps). Deliberately short and
 /// mechanical - a 9B over-reads long imperatives (LOG.md cycle 002).
-pub fn recovery_prompt(reason: crate::run::governor::endgame::ReopenReason) -> &'static str {
-    use crate::run::governor::endgame::ReopenReason;
+pub fn recovery_prompt(reason: crate::session::ReopenReason) -> &'static str {
+    use crate::session::ReopenReason;
     match reason {
         ReopenReason::DanglingFailure => {
             "[the previous turn hit its pass limit with the last verification failing - continue the task: fix the failure with minimal changes and re-run the verification until it passes]"
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn recovery_prompt_names_the_triggering_fact() {
-        use crate::run::governor::endgame::ReopenReason;
+        use crate::session::ReopenReason;
 
         let failing = recovery_prompt(ReopenReason::DanglingFailure);
         assert!(failing.contains("verification failing"));
