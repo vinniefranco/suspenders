@@ -6,7 +6,7 @@
 //! * [`run_tui`] - the interactive ratatui frontend (ADR-0001), owning the
 //!   terminal for the session.
 //! * [`run_headless`] - the stdout event-subscriber runner (ADR-0019): submit
-//!   each prompt as a sequential Turn in ONE session, stream every event to
+//!   each prompt as a sequential Run in ONE session, stream every event to
 //!   stdout, auto-approve run_command Approvals, and report the token estimate
 //!   and message count on settlement.
 
@@ -116,11 +116,11 @@ fn resolve_resume(resume: Option<String>, outcome: Option<PickerOutcome>) -> Res
 }
 
 /// The stdout event-subscriber runner (ports `scripts/drive.exs`, ADR-0019).
-/// Starts the Agent, subscribes, and submits each prompt as a sequential Turn
+/// Starts the Agent, subscribes, and submits each prompt as a sequential Run
 /// in the SAME session; every event streams to stdout, run_command Approvals are
 /// auto-approved (a diagnostic harness, not a session for untrusted work), and
 /// each settle prints the token estimate and message count. An empty `prompts`
-/// defaults to a single "evaluate this project" Turn (drive.exs's default).
+/// defaults to a single "evaluate this project" Run (drive.exs's default).
 pub async fn run_headless(
     root: Option<PathBuf>,
     resume: Option<String>,
@@ -147,9 +147,9 @@ fn headless_context(root: &str) -> String {
     context.system_prompt
 }
 
-/// The per-prompt drive loop: submit each prompt as a sequential Turn and
+/// The per-prompt drive loop: submit each prompt as a sequential Run and
 /// drain events until it settles. An empty `prompts` defaults to a single
-/// "evaluate this project" Turn (drive.exs's default). Every printed line
+/// "evaluate this project" Run (drive.exs's default). Every printed line
 /// goes through `out` - `run_headless` passes `println!`, tests capture the
 /// lines - so the loop runs against an Agent over any Llm double.
 async fn drive(
@@ -168,15 +168,15 @@ async fn drive(
     for prompt in prompts {
         let started = std::time::Instant::now();
         out(format!("\n== submit (root={root_label}): {prompt}"));
-        // A Turn boundary race with a still-running previous Turn is not
-        // possible here: we drive Turns strictly sequentially, awaiting each
+        // A Run boundary race with a still-running previous Run is not
+        // possible here: we drive Runs strictly sequentially, awaiting each
         // one's settlement before submitting the next.
         if let Err(_busy) = agent.submit(prompt).await {
             out("!! agent busy; skipping".to_string());
             continue;
         }
 
-        // Drain events until this Turn settles - including any Recovery Turn
+        // Drain events until this Run settles - including any Recovery Run
         // the settlement opens (the Agent starts it before answering the
         // status query, so Running here means recovery is underway; ADR-0019:
         // headless drives the same Agent seam, recovery included).
@@ -252,7 +252,7 @@ fn parse_resume(resume: &str) -> crate::agent::Resume {
 fn is_settled(event: &Event) -> bool {
     matches!(
         event,
-        Event::TurnFinished { .. } | Event::TurnError { .. } | Event::TurnCancelled
+        Event::RunFinished { .. } | Event::RunError { .. } | Event::RunCancelled
     )
 }
 
@@ -349,7 +349,7 @@ fn event_lines(event: &Event, elapsed_secs: f64) -> Vec<String> {
         Event::ApprovalRequest { command, .. } => {
             vec![format!("   ?? approval for: {command} -- auto-approving")]
         }
-        Event::TurnFinished {
+        Event::RunFinished {
             stop_reason,
             token_estimate,
             context_budget,
@@ -358,8 +358,8 @@ fn event_lines(event: &Event, elapsed_secs: f64) -> Vec<String> {
                 "\n== turn_finished (t={t}s): stop_reason={stop_reason} token_estimate={token_estimate} context_budget={context_budget}"
             )]
         }
-        Event::TurnError { reason } => vec![format!("\n== TURN ERROR (t={t}s): {reason}")],
-        Event::TurnCancelled => vec![format!("\n== turn_cancelled (t={t}s)")],
+        Event::RunError { reason } => vec![format!("\n== TURN ERROR (t={t}s): {reason}")],
+        Event::RunCancelled => vec![format!("\n== turn_cancelled (t={t}s)")],
         other => vec![format!(
             "   .. {} (t={t}s)",
             trunc(&format!("{other:?}"), 200)

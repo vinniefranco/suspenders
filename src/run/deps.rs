@@ -1,18 +1,18 @@
-//! Turn Deps - the static-dispatch dependency bundle for a Turn (ADR-0011).
+//! Run Deps - the static-dispatch dependency bundle for a Run (ADR-0011).
 //!
-//! Every effect the Turn loop performs, as trait methods (baud's `Baud.Turn.Deps`
-//! function captures). The shell builds a `TurnDeps` wiring these to Agent
+//! Every effect the Run loop performs, as trait methods (baud's `Baud.Turn.Deps`
+//! function captures). The shell builds a `RunDeps` wiring these to Agent
 //! messages; tests build one whose methods record into fields the test inspects.
 //! The loop itself spawns nothing and holds no pids.
 //!
 //! These are infrastructure, NOT Plugins: control-bearing and NOT fail-open
-//! (ADR-0011). A `TurnDeps` method that panics or returns an error fails the
-//! Turn honestly. Plugins remain the fail-open, tool-scoped unit of extension
+//! (ADR-0011). A `RunDeps` method that panics or returns an error fails the
+//! Run honestly. Plugins remain the fail-open, tool-scoped unit of extension
 //! (ADR-0007) - that isolation lives in `crate::plugins`, not here.
 //!
 //! ## Static dispatch, no `async_trait`
 //!
-//! The Loop is `async fn run<D: TurnDeps>(...)`; `TurnDeps` is monomorphised per
+//! The Loop is `async fn run<D: RunDeps>(...)`; `RunDeps` is monomorphised per
 //! caller. The methods that do IO (`complete`, `request_approval`,
 //! `drain_steering`, `compact`) return concrete futures via
 //! `impl Future` in return position (edition 2024 RPITIT), so no boxing and no
@@ -20,7 +20,7 @@
 //! synchronous - the Loop never awaits them.
 //!
 //! Event emission is NOT a trait method: it is the owned [`Emitter`] handle
-//! [`TurnDeps::emitter`] hands out (ADR-0025), so the streaming sink can emit
+//! [`RunDeps::emitter`] hands out (ADR-0025), so the streaming sink can emit
 //! while `complete` exclusively borrows the deps.
 
 use std::future::Future;
@@ -31,8 +31,8 @@ use crate::event::Event;
 use crate::llm::response::Response;
 use crate::llm::{LlmRequest, StreamEvent};
 
-/// The detached emission handle (ADR-0025): an owned sink for turn [`Event`]s,
-/// obtained once from [`TurnDeps::emitter`] and carried by the Loop alongside
+/// The detached emission handle (ADR-0025): an owned sink for run [`Event`]s,
+/// obtained once from [`RunDeps::emitter`] and carried by the Loop alongside
 /// the deps. Because it is a separate owned value - not a method on the deps -
 /// the streaming sink inside `complete_and_emit` can emit MessageUpdates LIVE
 /// while `complete` holds the exclusive `&mut D` borrow.
@@ -47,7 +47,7 @@ impl Emitter {
         Emitter(Box::new(f))
     }
 
-    /// Emits one turn Event (fire-and-forget).
+    /// Emits one run Event (fire-and-forget).
     pub fn emit(&mut self, event: Event) {
         (self.0)(event)
     }
@@ -59,7 +59,7 @@ impl Emitter {
 pub enum AfterPass {
     /// Keep looping.
     Continue,
-    /// Close the Turn with the stopped marker and this stop reason (an arbitrary
+    /// Close the Run with the stopped marker and this stop reason (an arbitrary
     /// atom in baud - carried here as a string, e.g. `"budget_hook"`).
     Stop(String),
     /// Merge this text into the trailing tool-results user message and loop.
@@ -72,16 +72,16 @@ pub enum AfterPass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactError(pub String);
 
-/// Every effect the Turn loop performs (ADR-0011). Static-dispatch: the Loop is
-/// generic over `D: TurnDeps` and monomorphises per caller. Methods that do IO
+/// Every effect the Run loop performs (ADR-0011). Static-dispatch: the Loop is
+/// generic over `D: RunDeps` and monomorphises per caller. Methods that do IO
 /// are async (return a `Future`); `checkpoint`/`set_plan` are fire-and-forget
 /// and synchronous. Event emission goes through the [`Emitter`] handle that
-/// [`TurnDeps::emitter`] hands out (ADR-0025).
+/// [`RunDeps::emitter`] hands out (ADR-0025).
 ///
 /// `complete` receives the fully-built [`LlmRequest`] (system, messages, tools,
 /// no_think) - the shell renders it to wire JSON and calls the LLM boundary,
 /// forwarding each streaming `StreamEvent` to `on_event`.
-pub trait TurnDeps: Send {
+pub trait RunDeps: Send {
     /// Calls the model with the built request, forwarding every streaming delta
     /// snapshot to `on_event`, and yields the [`Response`] (the error algebra
     /// means this never "fails" - a failure is a `Response` with an `Error`
@@ -92,10 +92,10 @@ pub trait TurnDeps: Send {
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> impl Future<Output = Response> + Send;
 
-    /// The Provenance of the Model this Turn captured at spawn (ADR-0037,
+    /// The Provenance of the Model this Run captured at spawn (ADR-0037,
     /// CONTEXT.md: Provenance): stamped on every assistant message a Response
     /// contributes to the Conversation. A fact of the capture, so it never
-    /// changes mid-Turn.
+    /// changes mid-Run.
     fn provenance(&self) -> Provenance;
 
     /// Hands out the owned emission handle (ADR-0025). Emission alone is a

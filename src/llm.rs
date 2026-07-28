@@ -1,6 +1,6 @@
 //! The LLM client boundary (ADR-0002, ADR-0037).
 //!
-//! Callers - the Turn, the Scout, and Compaction - speak only the typed shapes
+//! Callers - the Run, the Scout, and Compaction - speak only the typed shapes
 //! here: an [`LlmRequest`] plus the captured [`Model`]. Wire building, headers,
 //! SSE decoding, stop-reason mapping, and usage extraction all live behind the
 //! [`Llm`] trait, one adapter module per [`Api`]:
@@ -23,7 +23,7 @@
 //! a non-2xx status, an SSE parse failure, mid-stream death, an unknown
 //! Provider, and an Api with no adapter ALL yield a [`Response`] with
 //! `stop_reason: Error`, `error` set, and whatever partial content had
-//! streamed. Failure is data the Turn loop reads.
+//! streamed. Failure is data the Run loop reads.
 
 pub mod anthropic_messages;
 pub mod catalog;
@@ -111,7 +111,7 @@ const MALFORMED_INPUT_SENTINEL: &str = "__suspenders_malformed_input__";
 ///
 /// This is how the stream-decoding fact that a tool_use's input was mangled
 /// crosses the LLM boundary as a domain signal. The sentinel string that
-/// carries it stays private to this module - domain code (the Turn batch, the
+/// carries it stays private to this module - domain code (the Run batch, the
 /// tool registry) gates on this accessor without knowing the representation.
 ///
 /// ADR-0002: malformation is DATA folded into the content path, so it rides in
@@ -205,7 +205,7 @@ pub trait Llm: Send + Sync {
     ///
     /// Unlike [`complete`], this RETURNS a `Result` rather than folding failure
     /// into a Response (ADR-0002 amendment, ADR-0033): it is a discrete,
-    /// user-triggered query, not the streaming Turn loop, so a plain `Err` the
+    /// user-triggered query, not the streaming Run loop, so a plain `Err` the
     /// caller surfaces as an info line is simpler than the never-Err error
     /// algebra. Connection refused, a non-2xx status, an unparseable body,
     /// and a request over [`DISCOVERY_TIMEOUT`] are all `Err`; a well-formed
@@ -221,14 +221,14 @@ pub trait Llm: Send + Sync {
 /// dropping SYNs with no RST - must degrade into its group's unreachable
 /// note within seconds, not sit on the OS TCP timeout's minutes. A live
 /// `GET /models` answers well inside this. [`Llm::complete`] deliberately
-/// carries no such cap: a Turn streams for minutes by design.
+/// carries no such cap: a Run streams for minutes by design.
 const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One Provider's offering for the `/model` selector (ADR-0037): the Provider
 /// id, its PICKABLE bare model ids, and its [`Availability`]. The UI scopes
 /// the ids (`provider/model-id`) when it builds rows, keeping the wire's bare
 /// ids at the boundary. A configured Provider that lists nothing pickable
-/// does not vanish: `availability` states why, as a fact the UI turns into
+/// does not vanish: `availability` states why, as a fact the UI runs into
 /// display strings, not a pre-rendered reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderModels {
@@ -369,7 +369,7 @@ impl Llm for Dispatcher {
     ) -> Response {
         // An unknown Provider is data, not a panic (the error algebra): the
         // Session validates the set at launch, so this arm marks a harness bug
-        // loudly without killing the Turn.
+        // loudly without killing the Run.
         let Some(provider) = provider::find(&self.providers, &model.provider) else {
             return Response::error(format!("unknown_provider: {}", model.provider));
         };

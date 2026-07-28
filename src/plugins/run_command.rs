@@ -3,7 +3,7 @@
 //! [`post_run`](RunCommand::post_run) reads the exit code out of a run_command
 //! result - the `[exit code: N]` tail [`crate::tools::run_command::report`]
 //! owns - and attaches it (plus a timeout marker) as Artifacts. It never
-//! mutates model-facing content. [`present`](RunCommand::present) turns those
+//! mutates model-facing content. [`present`](RunCommand::present) runs those
 //! Artifacts into a one-liner badge on the Tool Result summary: `✓ exit 0`,
 //! `✗ exit N`, or `✗ timed out`.
 //!

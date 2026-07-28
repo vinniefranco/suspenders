@@ -78,14 +78,14 @@ pub fn is_write_input_husk(input: &serde_json::Value) -> bool {
 }
 
 /// Marker replacing a run_command Tool Result superseded by an identical later
-/// run in the same Turn (CONTEXT.md: Supersession - the newest result always
+/// run in the same Run (CONTEXT.md: Supersession - the newest result always
 /// survives verbatim).
 pub fn superseded_command_marker() -> &'static str {
     "[superseded by a newer run of this command below]"
 }
 
 /// Marker replacing a read_file Tool Result superseded by an identical later
-/// read in the same Turn.
+/// read in the same Run.
 pub fn superseded_read_marker() -> &'static str {
     "[superseded by a newer read of this file below]"
 }
@@ -168,12 +168,12 @@ pub fn duplicate_call_nudge() -> &'static str {
     "[identical Tool Call repeated - its result is already above; act on it instead of re-running]"
 }
 
-/// Assistant marker closing a Turn that hit its Turn Limit.
-pub fn turn_limit_marker() -> &'static str {
+/// Assistant marker closing a Run that hit its Run Limit.
+pub fn run_limit_marker() -> &'static str {
     "[turn limit reached - reply to continue]"
 }
 
-/// The Recovery Turn's prompt (CONTEXT.md: Recovery Turn - the only Turn
+/// The Recovery Run's prompt (CONTEXT.md: Recovery Run - the only Run
 /// whose prompt Suspenders authors). Parameterized on the Ledger fact that
 /// triggered it: the last verification failing, or writes left unverified.
 /// Deliberately short and mechanical - a 9B over-reads long imperatives
@@ -200,7 +200,7 @@ pub fn handoff_no_narrative() -> &'static str {
     "- no narrative (the summarization call failed)"
 }
 
-/// One-shot warning riding the tool-results user message when the Turn Limit
+/// One-shot warning riding the tool-results user message when the Run Limit
 /// is `passes_left` Passes away.
 pub fn wrap_up_warning(passes_left: u64) -> String {
     format!(
@@ -214,7 +214,7 @@ pub fn verification_pass_prompt() -> &'static str {
     "[only 2 passes left and your changes are unverified - the next pass offers run_command ONLY: run your verification now]"
 }
 
-/// User message riding the tool-results message before the Turn's final Pass
+/// User message riding the tool-results message before the Run's final Pass
 /// (ADR-0015).
 pub fn final_pass_prompt() -> &'static str {
     "[last pass - tools are withdrawn; state what you accomplished, what remains undone, and whether your changes are verified]"
@@ -242,8 +242,8 @@ pub fn tool_error_marker() -> &'static str {
     "[tool error]"
 }
 
-/// Assistant marker closing a Turn an after-Pass hook stopped.
-pub fn turn_stopped_marker() -> &'static str {
+/// Assistant marker closing a Run an after-Pass hook stopped.
+pub fn run_stopped_marker() -> &'static str {
     "[turn stopped - reply to continue]"
 }
 
@@ -269,7 +269,7 @@ pub fn verify_failed_nudge() -> &'static str {
 }
 
 /// Empty-response Nudge: sent when a Pass's response carried zero content
-/// blocks. Fires at most once per Turn.
+/// blocks. Fires at most once per Run.
 pub fn empty_response_nudge() -> &'static str {
     "[your reply was empty - continue with your next step, or state plainly what is blocking you]"
 }
@@ -280,13 +280,13 @@ pub fn explore_nudge() -> &'static str {
     "[reading file after file fills your context - dispatch explore with one focused question instead; a Scout searches and reports back]"
 }
 
-/// Assistant marker closing a cancelled Turn (keeps roles alternating).
-pub fn turn_cancelled_marker() -> &'static str {
+/// Assistant marker closing a cancelled Run (keeps roles alternating).
+pub fn run_cancelled_marker() -> &'static str {
     "[turn cancelled by user]"
 }
 
-/// Assistant marker closing a failed or crashed Turn.
-pub fn turn_failed_marker() -> &'static str {
+/// Assistant marker closing a failed or crashed Run.
+pub fn run_failed_marker() -> &'static str {
     "[turn failed]"
 }
 
@@ -627,7 +627,7 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Run commands whole"));
         assert!(prompt.contains("never pipe their output through head, tail, or wc"));
-        // Both reasons: the harness truncates, and pipefail turns an
+        // Both reasons: the harness truncates, and pipefail runs an
         // early-closing consumer into a spurious failure.
         assert!(prompt.contains("truncates long output while keeping the exit code"));
         assert!(prompt.contains("pipefail"));

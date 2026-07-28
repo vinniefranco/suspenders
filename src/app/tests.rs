@@ -162,8 +162,8 @@ fn approval_request_prints_the_command_being_auto_approved() {
 }
 
 #[test]
-fn turn_finished_prints_the_stop_reason_and_the_estimates() {
-    let event = Event::TurnFinished {
+fn run_finished_prints_the_stop_reason_and_the_estimates() {
+    let event = Event::RunFinished {
         stop_reason: StopReason::EndTurn,
         token_estimate: 123,
         context_budget: 456,
@@ -178,8 +178,8 @@ fn turn_finished_prints_the_stop_reason_and_the_estimates() {
 }
 
 #[test]
-fn turn_error_prints_the_reason() {
-    let event = Event::TurnError {
+fn run_error_prints_the_reason() {
+    let event = Event::RunError {
         reason: "boom".into(),
     };
     assert_eq!(
@@ -189,9 +189,9 @@ fn turn_error_prints_the_reason() {
 }
 
 #[test]
-fn turn_cancelled_prints_the_marker() {
+fn run_cancelled_prints_the_marker() {
     assert_eq!(
-        event_lines(&Event::TurnCancelled, 0.0),
+        event_lines(&Event::RunCancelled, 0.0),
         vec!["\n== turn_cancelled (t=0.0s)".to_string()]
     );
 }
@@ -200,10 +200,10 @@ fn turn_cancelled_prints_the_marker() {
 fn an_unhandled_event_prints_its_truncated_debug_form() {
     // The catch-all keeps a new event visible in the stream (never silent)
     // without the formatter having to know it.
-    let event = Event::TurnStarted("t1".into());
+    let event = Event::RunStarted("t1".into());
     assert_eq!(
         event_lines(&event, 0.0),
-        vec!["   .. TurnStarted(\"t1\") (t=0.0s)".to_string()]
+        vec!["   .. RunStarted(\"t1\") (t=0.0s)".to_string()]
     );
 }
 
@@ -274,8 +274,8 @@ fn session_in(dir: &TempDir) -> Session {
     .expect("session builds")
 }
 
-// Every Turn caps on Pass 2 (one working Pass, then a refused tool-insistent
-// final Pass), so unfinished work opens a Continuation Recovery Turn - the
+// Every Run caps on Pass 2 (one working Pass, then a refused tool-insistent
+// final Pass), so unfinished work opens a Continuation Recovery Run - the
 // same shape agent/tests.rs uses to reach the recovery seam.
 fn recovery_session(dir: &TempDir) -> Session {
     let root = dir.path().to_string_lossy().into_owned();
@@ -284,7 +284,7 @@ fn recovery_session(dir: &TempDir) -> Session {
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(2),
+            run_limit: Some(2),
             recovery_shape: Some(RecoveryShape::Continuation),
             ..Default::default()
         },
@@ -319,7 +319,7 @@ fn tool_use_reply(id: &str, name: &str, input: serde_json::Value) -> Response {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_scripted_turn_settles_and_the_drive_loop_terminates() {
+async fn a_scripted_run_settles_and_the_drive_loop_terminates() {
     let dir = TempDir::new().unwrap();
     let fake = FakeLlm::script(vec![Entry::just(text_end("done"))]);
     let agent = start(session_in(&dir), fake);
@@ -343,7 +343,7 @@ async fn a_scripted_turn_settles_and_the_drive_loop_terminates() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn empty_prompts_drive_the_default_evaluate_turn() {
+async fn empty_prompts_drive_the_default_evaluate_run() {
     let dir = TempDir::new().unwrap();
     let fake = FakeLlm::script(vec![Entry::just(text_end("done"))]);
     let agent = start(session_in(&dir), fake);
@@ -353,7 +353,7 @@ async fn empty_prompts_drive_the_default_evaluate_turn() {
         .await
         .expect("drive settles");
 
-    // drive.exs's default: no prompts means one "evaluate this project" Turn.
+    // drive.exs's default: no prompts means one "evaluate this project" Run.
     assert_eq!(lines[0], "\n== submit (root=r): evaluate this project");
 }
 
@@ -363,8 +363,8 @@ async fn a_busy_submit_prints_the_skip_line_and_continues() {
     let (barrier, mut in_flight) = Entry::barrier();
     let agent = start(session_in(&dir), FakeLlm::script(vec![barrier]));
 
-    // Park a Turn mid-complete so the Agent is genuinely busy; the InFlight
-    // must stay alive through the drive call or the parked Turn errors out
+    // Park a Run mid-complete so the Agent is genuinely busy; the InFlight
+    // must stay alive through the drive call or the parked Run errors out
     // (and the Agent goes Idle) before drive submits.
     agent.submit("park here").await.unwrap();
     let _parked = in_flight.recv().await.expect("turn parks in complete");
@@ -384,21 +384,21 @@ async fn a_busy_submit_prints_the_skip_line_and_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_recovery_turn_is_drained_until_it_settles() {
+async fn a_recovery_run_is_drained_until_it_settles() {
     let dir = TempDir::new().unwrap();
-    // The Recovery Turn parks on a Barrier: a scripted instant reply can
+    // The Recovery Run parks on a Barrier: a scripted instant reply can
     // settle the recovery BEFORE drive's status query under load, skipping
     // the drain branch - parked, the Agent is Running until we release.
     let (barrier, mut in_flight) = Entry::barrier();
     let script = vec![
-        // Turn 1 Pass 1: the write lands.
+        // Run 1 Pass 1: the write lands.
         Entry::just(tool_use_reply(
             "w1",
             "write_file",
             json!({ "path": "a.txt", "content": "x" }),
         )),
-        // Turn 1 Pass 2: a tool-insistent final Pass is refused at dispatch,
-        // capping the Turn unverified - the Endgame opens a Recovery Turn.
+        // Run 1 Pass 2: a tool-insistent final Pass is refused at dispatch,
+        // capping the Run unverified - the Endgame opens a Recovery Run.
         Entry::just(tool_use_reply("x1", "list_files", json!({ "path": "." }))),
         barrier,
     ];
@@ -406,8 +406,8 @@ async fn a_recovery_turn_is_drained_until_it_settles() {
 
     // The release must ALSO wait for drive to take the Running branch: freed
     // on park alone, the recovery can settle before drive even processes the
-    // first turn_finished, and the status query would see Idle. The out sink
-    // signals when the drain line prints; only then does the parked Turn get
+    // first run_finished, and the status query would see Idle. The out sink
+    // signals when the drain line prints; only then does the parked Run get
     // its conclusion.
     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {

@@ -66,7 +66,7 @@ fn tui_color(color: theme::Color) -> Color {
 }
 
 /// The ONE mapping from a semantic [`LineStyle`] to a ratatui [`Style`]
-/// (ADR-0008). Plugins produce styles; this turns them into the active
+/// (ADR-0008). Plugins produce styles; this runs them into the active
 /// Theme's colors.
 pub fn line_style(style: LineStyle, theme: &Theme) -> Style {
     match style {
@@ -207,14 +207,14 @@ impl ConnectionFacts {
 }
 
 /// The frame-animation clocks the adapter advances each ~100ms tick while a
-/// Turn runs. One value object so the render path takes a single animation
+/// Run runs. One value object so the render path takes a single animation
 /// argument and new clocks are a field, not another parameter.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Anim {
     /// The braille `✦ Thinking` spinner frame (advances every running tick).
     pub spinner: u64,
     /// Ticks of unbroken quiet in the CURRENT lull (reset when output streams,
-    /// or when the Turn ends). Drives the lull animation + its elapsed timer.
+    /// or when the Run ends). Drives the lull animation + its elapsed timer.
     pub quiet_ticks: u64,
     /// Which lull this is, session-wide (bumped when a new lull begins). Seeds
     /// the per-lull scene pick, so a fresh wait usually brings a fresh scene.
@@ -453,7 +453,7 @@ pub fn render_viewport(
         width: area.width.saturating_sub(1),
         ..area
     };
-    // The leftmost LANE_GUTTER columns are ALWAYS reserved for the turn-lane
+    // The leftmost LANE_GUTTER columns are ALWAYS reserved for the run-lane
     // spine / user caret (ADR-0040), occupied or not - the same unconditional
     // reservation as the scrollbar column, and for the same reason: content
     // wraps in the narrower `content_area`, so the wrap width never depends on
@@ -491,15 +491,15 @@ pub fn render_viewport(
     // below. The lane is DERIVED here at render time (ADR-0040), never stored and
     // never in the RenderCache key: `lane_gutters` walks the settled items in
     // order, and both live entries (the reasoning tail, the streaming answer)
-    // hang off the running Turn's lane, so they take the spine. The lane is dense
+    // hang off the running Run's lane, so they take the spine. The lane is dense
     // - no per-item blank separator - so the spine stays continuous.
     let items = t.transcript().items();
     let lane = lane_gutters(items);
-    // A collapsed turn reads tidy: the LAST thought becomes a header, and beneath
+    // A collapsed run reads tidy: the LAST thought becomes a header, and beneath
     // it only the last few actions show as a rolling window - older low-signal
     // machinery (list/read) is suppressed, while code/diff Blocks and errors
     // always break out. Ctrl-T reveals every thought; Ctrl-O every action.
-    let fold = turn_fold(
+    let fold = run_fold(
         items,
         t.thinking_expanded,
         t.tools_expanded,
@@ -528,7 +528,7 @@ pub fn render_viewport(
         gutters.push(GutterKind::Spine);
     }
     // The lull "waiting" row is the third live entry, mutually exclusive with
-    // the two above BY CONSTRUCTION: it draws only when the Turn runs and
+    // the two above BY CONSTRUCTION: it draws only when the Run runs and
     // NEITHER a reasoning tail nor a streaming answer is on screen. Declared
     // in this scope so the `&lull_lines` reference `item_lines` holds outlives
     // the draw, exactly like `thinking_lines`. `push_live_entry` folds the
@@ -587,7 +587,7 @@ pub fn render_viewport(
     (total_lines, height)
 }
 
-/// The rolling reasoning tail shown while a Turn streams: an animated
+/// The rolling reasoning tail shown while a Run streams: an animated
 /// `✦ Thinking ⠋` header (the braille [`SPINNER`] advanced by the adapter's
 /// tick - motion lives HERE at the brain, not the status bar, ADR-0040), then
 /// the last [`THINKING_TAIL_ROWS`] VISUAL rows of the reasoning, indented two
@@ -633,7 +633,7 @@ fn live_thinking_lines(
     out
 }
 
-/// The lull "waiting" row shown while a Turn runs but nothing streams: an
+/// The lull "waiting" row shown while a Run runs but nothing streams: an
 /// elapsed timer (left, fixed-width so the animation column never jitters) then
 /// the current [`lull`] scene frame, indented two columns under the running
 /// lane like the reasoning tail. Empty until the lull passes the settle window
@@ -664,7 +664,7 @@ fn push_live_entry<'a>(
     gutters.push(GutterKind::Spine);
 }
 
-/// Whether the lull "waiting" row should draw this frame: the Turn is Running
+/// Whether the lull "waiting" row should draw this frame: the Run is Running
 /// and NEITHER live entry (the reasoning tail, the streaming answer) is on
 /// screen. The one gate, matching [`Screen::has_live_stream`] by construction
 /// (`thinking_empty == streaming_thinking().is_empty()` and `tail_present ==
@@ -779,7 +779,7 @@ fn indented_lines(
         .collect()
 }
 
-/// The reserved left-gutter width (columns): the turn-lane spine / user caret
+/// The reserved left-gutter width (columns): the run-lane spine / user caret
 /// plane (ADR-0040). Two columns - a glyph and a trailing space - so content
 /// sits one clear column off the spine. Carved unconditionally off the text
 /// area so the content wrap width never depends on lane membership.
@@ -795,15 +795,15 @@ enum GutterKind {
     /// A `User` prompt: the `› ` caret breaks to the margin on the item's first
     /// visual row, blank on any wrapped continuation.
     User,
-    /// Everything the agent emits inside a Turn: the dim `│ ` spine on every
-    /// visual row, so the whole turn reads as one object.
+    /// Everything the agent emits inside a Run: the dim `│ ` spine on every
+    /// visual row, so the whole run reads as one object.
     Spine,
 }
 
 /// Derives the per-item lane gutter for the settled items, in order (ADR-0040):
 /// a `User` item opens a lane and every item after it hangs off that lane until
 /// the next `User`; the region before the first `User` is spineless. The lane is
-/// the user REQUEST, not the Turn - a Recovery Turn injects no `User` item, so
+/// the user REQUEST, not the Run - a Recovery Run injects no `User` item, so
 /// its work correctly stays on the prior request's spine. Pure over the item
 /// sequence, so it is asserted without a frame; the two live entries (reasoning
 /// tail, streaming answer) are appended as `Spine` by the caller.
@@ -868,12 +868,12 @@ fn expand_gutters(gutters: &[GutterKind], counts: &[usize]) -> Vec<RowGutter> {
     rows
 }
 
-/// How many of a turn's most recent low-signal actions (list/read-style tool
+/// How many of a run's most recent low-signal actions (list/read-style tool
 /// one-liners) the collapsed view keeps as a rolling window; older ones are
 /// suppressed. Errors and code/diff Blocks are never windowed - they break out.
 const MACHINERY_WINDOW: usize = 4;
 
-/// What the collapsed render does with one settled item ([`turn_fold`]).
+/// What the collapsed render does with one settled item ([`run_fold`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FoldAction {
     /// Render the item from its cached lines.
@@ -888,7 +888,7 @@ enum FoldAction {
     Elided(usize),
 }
 
-/// Folds a collapsed turn to a tidy shape (ADR-0040): per lane (a `User`-opened
+/// Folds a collapsed run to a tidy shape (ADR-0040): per lane (a `User`-opened
 /// request), the reasoning collapses to a single header - the LAST thought's
 /// text rendered at the FIRST thought's slot, with the intervening thoughts
 /// dropped - and the low-signal machinery (paired/one-line tool results and
@@ -898,7 +898,7 @@ enum FoldAction {
 /// thought fold; `tools_expanded` (Ctrl-O) disables the machinery window.
 ///
 /// [`Block`]: TranscriptItem::Block
-fn turn_fold(
+fn run_fold(
     items: &[TranscriptItem],
     thinking_expanded: bool,
     tools_expanded: bool,
@@ -978,7 +978,7 @@ fn fold_synthetic_lines(
         .collect()
 }
 
-/// Applies the collapsed-turn [`turn_fold`] to the cached settled items,
+/// Applies the collapsed-run [`run_fold`] to the cached settled items,
 /// producing the parallel `(lines, wrapped-count, gutter-kind)` the viewport's
 /// window math and gutter mapping consume. A `Keep` contributes the item's
 /// cached lines and count; a `Header`/`Elided` its synthetic line (re-measured
@@ -1248,7 +1248,7 @@ mod render_cache {
                 // No per-item blank separator: the lane stays DENSE with one
                 // continuous spine (a blank row breaks the spine into segments
                 // and burns vertical real estate - the two-planes coloring, not
-                // whitespace, separates the turn's parts).
+                // whitespace, separates the run's parts).
                 let wrapped = wrapped_count(lines.clone(), width);
                 self.items.push(CachedItem { lines, wrapped });
             }
@@ -1528,7 +1528,7 @@ fn message_lines(
         // prepends a gutter of its own. Multi-line input renders as many rows.
         TranscriptItem::User { text } => text_rows(text).into_iter().map(Line::from).collect(),
         // Assistant text is markdown: the pure ui::markdown fold produces
-        // semantic lines and [`md_style`] turns them into colors here.
+        // semantic lines and [`md_style`] runs them into colors here.
         // Width-wrapping is left to the viewport Paragraph's Wrap.
         TranscriptItem::Assistant { text } => markdown_lines(text, theme),
         // Settled Thinking: collapsed is the one-line form; expanded (Ctrl-T)
@@ -1622,7 +1622,7 @@ fn message_lines(
                 .collect()
         }
         // A harness Marker (governing/housekeeping) indents two columns under the
-        // thought header, like the tool work - it is part of the turn's body, not
+        // thought header, like the tool work - it is part of the run's body, not
         // a foreground line. Wrapped continuations stay at column 2 too
         // ([`indented_lines`]). Tinted by TONE alone (the glyph/wording are
         // authored upstream, never sniffed here).
@@ -1843,7 +1843,7 @@ fn block_line(line: &StyledLine, theme: &Theme) -> Line<'static> {
 }
 
 /// The running-spinner animation frames (braille), advanced by the adapter's
-/// animation tick while a Turn is running.
+/// animation tick while a Run is running.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// How many source rows of the live reasoning the rolling tail shows under the
@@ -1865,9 +1865,9 @@ const SEP_LEFT: &str = "\u{e0b2}"; //
 /// a drawing concern the painter injects, not part of what the bar *means*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeState {
-    /// The Agent is idle - no Turn running.
+    /// The Agent is idle - no Run running.
     Idle,
-    /// The Agent is running a Turn.
+    /// The Agent is running a Run.
     Running,
 }
 
@@ -2246,7 +2246,7 @@ impl StatusSegment {
 ///
 /// A thin painter over the pure [`status_bar`] assembly: the semantics (which
 /// segments, in what order, at what [`PressureLevel`]) are decided there; this
-/// turns each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
+/// runs each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
 /// and [`segment_style`].
 pub fn render_status_bar(
     frame: &mut Frame,
@@ -2636,15 +2636,15 @@ mod tests {
     // The lull "waiting" row: the render gate and the row builder.
     // -----------------------------------------------------------------------
 
-    // The gate draws the lull ONLY when the Turn is Running and NEITHER live
+    // The gate draws the lull ONLY when the Run is Running and NEITHER live
     // entry is on screen. Each of the three clauses must be able to veto it.
     #[test]
     fn lull_visible_only_when_running_and_no_live_entry() {
         // Running, no thinking tail, no streaming answer => the lull shows.
         assert!(lull_visible(Status::Running, true, false));
-        // A running Turn but the reasoning tail is on screen => no lull.
+        // A running Run but the reasoning tail is on screen => no lull.
         assert!(!lull_visible(Status::Running, false, false));
-        // A running Turn but the streaming answer is on screen => no lull.
+        // A running Run but the streaming answer is on screen => no lull.
         assert!(!lull_visible(Status::Running, true, true));
         // Not running (idle) => no lull, even with both live entries clear.
         assert!(!lull_visible(Status::Idle, true, false));
@@ -4389,9 +4389,9 @@ mod tests {
     }
 
     #[test]
-    fn the_demo_render_matches_the_confirmed_collapsed_turn_shape() {
+    fn the_demo_render_matches_the_confirmed_collapsed_run_shape() {
         // The demo is the living spec (ADR-0040): pin the load-bearing rows of
-        // the confirmed collapsed-turn shape so a regression trips here, not only
+        // the confirmed collapsed-run shape so a regression trips here, not only
         // in a manual dump. Rows are `(gutter, content)` where gutter is the
         // leftmost LANE_GUTTER columns.
         let terminal = draw_frame(100, 70, |f| {
@@ -4457,7 +4457,7 @@ mod tests {
     #[test]
     fn the_collapsed_lane_spine_is_dense_and_continuous() {
         // The lane has NO per-item blank separator: every content row of the
-        // turn (from the first assistant line through the last) carries the `│`
+        // run (from the first assistant line through the last) carries the `│`
         // spine, with no bare gap rows breaking it into segments.
         let terminal = draw_frame(100, 70, |f| {
             render_viewport(
@@ -4470,7 +4470,7 @@ mod tests {
                 theme::dark(),
             );
         });
-        // Rows 3..=24 are the agent's turn (assistant, folded thought, machinery,
+        // Rows 3..=24 are the agent's run (assistant, folded thought, machinery,
         // markers, error, closing assistant + code). Every one starts with the
         // spine - no blank separator rows interleave the machinery.
         for y in 3..=14u16 {
@@ -4513,13 +4513,13 @@ mod tests {
         }
     }
 
-    // The lull row draws through the full render path: a Running Turn with
+    // The lull row draws through the full render path: a Running Run with
     // nothing streaming, quiet past the settle window, paints the timer into the
     // buffer as a third live entry under the running lane.
     #[test]
     fn the_viewport_draws_the_lull_row_when_running_and_quiet() {
         let (screen, _) = screen_with_notices(vec!["a launch notice".to_string()])
-            .apply_event(Event::turn_started("r1"));
+            .apply_event(Event::run_started("r1"));
         assert!(
             !screen.has_live_stream(),
             "the Turn runs but nothing streams"
@@ -4583,7 +4583,7 @@ mod tests {
         // Before the first User the region is spineless (Blank); a User opens a
         // lane (User caret) and every item until the next User hangs off it
         // (Spine). A second User opens a fresh lane. The lane is the request,
-        // not the Turn - agent items with no intervening User stay on the spine.
+        // not the Run - agent items with no intervening User stay on the spine.
         let items = vec![
             TranscriptItem::Info {
                 text: "greeting".into(),
@@ -4615,7 +4615,7 @@ mod tests {
         );
     }
 
-    // ---- turn_fold: the rolling-window collapsed turn (ADR-0040) -----------
+    // ---- run_fold: the rolling-window collapsed run (ADR-0040) -----------
 
     fn thought(t: &str) -> TranscriptItem {
         TranscriptItem::Thinking { text: t.into() }
@@ -4638,7 +4638,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_fold_headers_the_last_thought_at_the_first_thoughts_slot() {
+    fn run_fold_headers_the_last_thought_at_the_first_thoughts_slot() {
         // Collapsed default: the LAST thought's text renders as a header at the
         // FIRST thought's slot; the intervening thoughts drop.
         let items = vec![
@@ -4647,7 +4647,7 @@ mod tests {
             thought("middle"),
             thought("LAST"),
         ];
-        let fold = turn_fold(&items, false, false, MACHINERY_WINDOW);
+        let fold = run_fold(&items, false, false, MACHINERY_WINDOW);
         // index 3 is the last thought; the header lands at index 1 (first slot).
         assert_eq!(fold[1], FoldAction::Header(3));
         assert_eq!(fold[2], FoldAction::Drop);
@@ -4655,14 +4655,14 @@ mod tests {
     }
 
     #[test]
-    fn turn_fold_windows_machinery_and_elides_the_rest_with_a_count() {
+    fn run_fold_windows_machinery_and_elides_the_rest_with_a_count() {
         // With window=2 and 5 machinery items, the last 2 Keep; the earlier 3
         // collapse to an `Elided(3)` count at the first windowed-out slot.
         let mut items = vec![TranscriptItem::User { text: "go".into() }];
         for i in 0..5 {
             items.push(tool(&format!("t{i}")));
         }
-        let fold = turn_fold(&items, false, false, 2);
+        let fold = run_fold(&items, false, false, 2);
         assert_eq!(fold[1], FoldAction::Elided(3)); // first windowed-out slot
         assert_eq!(fold[2], FoldAction::Drop);
         assert_eq!(fold[3], FoldAction::Drop);
@@ -4671,7 +4671,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_fold_keeps_errors_assistant_markers_and_blocks() {
+    fn run_fold_keeps_errors_assistant_markers_and_blocks() {
         // Errors, assistant text, markers and Blocks always Keep - they break
         // out of the fold regardless of the window.
         let items = vec![
@@ -4689,7 +4689,7 @@ mod tests {
                 lines: vec![],
             },
         ];
-        let fold = turn_fold(&items, false, false, 0);
+        let fold = run_fold(&items, false, false, 0);
         for (i, action) in fold.iter().enumerate().skip(1) {
             assert_eq!(*action, FoldAction::Keep, "item {i} must break out");
         }
@@ -4703,7 +4703,7 @@ mod tests {
             thought("last"),
         ];
         // thinking_expanded = true: every thought Keeps, no header.
-        let fold = turn_fold(&items, true, false, MACHINERY_WINDOW);
+        let fold = run_fold(&items, true, false, MACHINERY_WINDOW);
         assert_eq!(fold[1], FoldAction::Keep);
         assert_eq!(fold[2], FoldAction::Keep);
     }
@@ -4715,14 +4715,14 @@ mod tests {
             items.push(tool(&format!("t{i}")));
         }
         // tools_expanded = true: every action Keeps, no Elided count.
-        let fold = turn_fold(&items, false, true, 2);
+        let fold = run_fold(&items, false, true, 2);
         for (i, action) in fold.iter().enumerate().skip(1) {
             assert_eq!(*action, FoldAction::Keep, "action {i} must show");
         }
     }
 
     #[test]
-    fn turn_fold_folds_each_lane_independently() {
+    fn run_fold_folds_each_lane_independently() {
         // Two User-opened lanes: the second lane's thoughts fold on their own,
         // not merged with the first lane's.
         let items = vec![
@@ -4733,7 +4733,7 @@ mod tests {
             thought("b1"),
             thought("b2"),
         ];
-        let fold = turn_fold(&items, false, false, MACHINERY_WINDOW);
+        let fold = run_fold(&items, false, false, MACHINERY_WINDOW);
         assert_eq!(fold[1], FoldAction::Header(2)); // lane one: last is a2 (idx 2)
         assert_eq!(fold[4], FoldAction::Header(5)); // lane two: last is b2 (idx 5)
     }
@@ -4929,9 +4929,9 @@ mod tests {
     }
 
     #[test]
-    fn a_user_prompt_breaks_to_the_caret_and_the_agent_turn_hangs_off_the_spine() {
+    fn a_user_prompt_breaks_to_the_caret_and_the_agent_run_hangs_off_the_spine() {
         // The greeting (pre-lane) is spineless; a User prompt shows the `›`
-        // caret at the margin; the agent's answer in that turn shows the `│`
+        // caret at the margin; the agent's answer in that run shows the `│`
         // spine. Column 0 carries the gutter glyph.
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("do the thing", Ok(()));

@@ -259,7 +259,7 @@ mod tests {
         vec![Registered::new("Diff", Box::new(Diff), json!({}))]
     }
 
-    // The lifecycle exactly as the Turn runs it: pre_run, then execution with
+    // The lifecycle exactly as the Run runs it: pre_run, then execution with
     // post_run and Shaping inside Plugins::execute.
     async fn run(name: &str, input: Value, ctx: &ToolCtx) -> plugins::PipelineResult {
         let regs = plugins();

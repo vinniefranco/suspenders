@@ -1,10 +1,10 @@
 //! The Session's fixed facts (CONTEXT.md: Session), resolved and validated
 //! once at launch: the Project Root, the Provider set, the launch Model, the
 //! sampling temperature, the budget-cap knob, the Eviction slack, the Dead
-//! Mass fraction, the Compaction Keep, the Turn Limit, the Anchor cadence and
+//! Mass fraction, the Compaction Keep, the Run Limit, the Anchor cadence and
 //! stale-plan threshold, the Scout Pass cap, the no-think knobs, the command
 //! timeout, the Plugin list, and the LLM module. The Context Budget and the
-//! Result Cap are NOT fixed facts: they derive from the Model each Turn
+//! Result Cap are NOT fixed facts: they derive from the Model each Run
 //! captures (ADR-0037).
 //!
 //! This is the composition seam for configuration. [`Session::new`] resolves
@@ -16,7 +16,7 @@
 //! live in one place:
 //!
 //! * the Context Budget, the Eviction reserve, and the Result Cap are NOT
-//!   fixed facts (ADR-0037): they derive from the Model each Turn captures,
+//!   fixed facts (ADR-0037): they derive from the Model each Run captures,
 //!   through [`Session::context_budget_for`] and [`Session::tool_ctx`]
 //! * a Model's output cap must leave room in its effective budget - checked
 //!   here at launch for the launch Model and by the Agent at a `/model` swap
@@ -43,7 +43,7 @@ use crate::llm::{catalog, model};
 use crate::tool::ToolCtx;
 use serde::{Deserialize, Serialize};
 
-/// The shape of a Recovery Turn (CONTEXT.md: Recovery Turn, Continuation,
+/// The shape of a Recovery Run (CONTEXT.md: Recovery Run, Continuation,
 /// Handoff): [`RecoveryShape::Handoff`] retires the Conversation and seeds a
 /// fresh one from the compaction machinery; [`RecoveryShape::Continuation`]
 /// keeps it and appends the recovery prompt. A Setpoint value the Endgame
@@ -91,7 +91,7 @@ pub struct Session {
     /// amendment): an optional global cap on every Model's effective budget,
     /// and the window figure for Models the Catalog does not know. The budget
     /// itself is NOT a fixed fact - [`Session::context_budget_for`] derives it
-    /// from the Model each Turn captures.
+    /// from the Model each Run captures.
     pub context_budget: Option<u64>,
     pub eviction_slack: f64,
     /// The Eviction mechanic's Dead Mass Setpoint: the fraction of the
@@ -99,21 +99,21 @@ pub struct Session {
     /// fires without budget pressure.
     pub dead_mass_fraction: f64,
     pub compaction_keep: f64,
-    pub turn_limit: u64,
+    pub run_limit: u64,
     pub anchor_interval: u64,
     /// The anchor Governor's stale-plan Setpoint: the Passes a Plan may sit
     /// unchanged - while writes land - before each Anchor carries the
     /// stale-plan line.
     pub plan_stale_after: u64,
     /// The Endgame Governor's recovery Setpoint: at most this many Recovery
-    /// Turns may serve one user request. `0` disables the mechanic entirely.
+    /// Runs may serve one user request. `0` disables the mechanic entirely.
     pub recovery_limit: u64,
     /// The Endgame Governor's recovery-shape Setpoint: which arm a Recovery
-    /// Turn takes (CONTEXT.md: Handoff is the default shape).
+    /// Run takes (CONTEXT.md: Handoff is the default shape).
     pub recovery_shape: RecoveryShape,
     /// The malformed-tool-call re-draw Setpoint (ADR-0030): at most this many
     /// in-band re-draws may follow a retryable generation error within one
-    /// Turn. `0` disables the mechanic entirely (the loud failure runs
+    /// Run. `0` disables the mechanic entirely (the loud failure runs
     /// immediately, as before).
     pub malformed_retry_budget: u64,
     pub scout_pass_limit: u64,
@@ -125,7 +125,7 @@ pub struct Session {
     /// built-ins from the generated Catalog with their environment credentials.
     pub providers: Vec<Provider>,
     /// The launch-resolved Model - the Active Model's seed (ADR-0033
-    /// amendment). The budget figures derive from whichever Model each Turn
+    /// amendment). The budget figures derive from whichever Model each Run
     /// captures, this one until a `/model` swap.
     pub model: Model,
     /// The configured Theme name (ADR-0038), carried unvalidated: the UI
@@ -180,7 +180,7 @@ pub struct SessionConfig {
     pub compaction_keep: f64,
     pub llm_module: String,
     pub command_timeout_ms: u64,
-    pub turn_limit: u64,
+    pub run_limit: u64,
     pub anchor_interval: u64,
     pub plan_stale_after: u64,
     pub recovery_limit: u64,
@@ -220,7 +220,7 @@ impl SessionConfig {
             compaction_keep: 0.5,
             llm_module: "Suspenders.LLM".into(),
             command_timeout_ms: 120_000,
-            turn_limit: 32,
+            run_limit: 32,
             anchor_interval: 5,
             plan_stale_after: 8,
             recovery_limit: 1,
@@ -629,7 +629,7 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         cfg.plan_stale_after = parse_plan_stale_after(v)?;
         Ok(())
     }),
-    // Non-negative integer; 0 disables the Recovery Turn mechanic.
+    // Non-negative integer; 0 disables the Recovery Run mechanic.
     ("SUSPENDERS_RECOVERY_LIMIT", |cfg, v| {
         cfg.recovery_limit = parse_int(v, "SUSPENDERS_RECOVERY_LIMIT")?;
         Ok(())
@@ -747,7 +747,7 @@ pub struct SessionOpts {
     pub eviction_slack: Option<f64>,
     pub dead_mass_fraction: Option<f64>,
     pub compaction_keep: Option<f64>,
-    pub turn_limit: Option<u64>,
+    pub run_limit: Option<u64>,
     pub anchor_interval: Option<u64>,
     pub plan_stale_after: Option<u64>,
     pub recovery_limit: Option<u64>,
@@ -803,7 +803,7 @@ impl Session {
             eviction_slack: opts.eviction_slack.unwrap_or(config.eviction_slack),
             dead_mass_fraction: opts.dead_mass_fraction.unwrap_or(config.dead_mass_fraction),
             compaction_keep: opts.compaction_keep.unwrap_or(config.compaction_keep),
-            turn_limit: opts.turn_limit.unwrap_or(config.turn_limit),
+            run_limit: opts.run_limit.unwrap_or(config.run_limit),
             anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
             plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
             recovery_limit: opts.recovery_limit.unwrap_or(config.recovery_limit),
@@ -844,7 +844,7 @@ impl Session {
 
     /// The effective Context Budget for `model` (ADR-0037): its own context
     /// window, capped by the config `context_budget` when set. Derived from
-    /// whichever Model the Turn captured, never a fixed Session fact.
+    /// whichever Model the Run captured, never a fixed Session fact.
     pub fn context_budget_for(&self, model: &Model) -> u64 {
         match self.context_budget {
             Some(cap) => cap.min(model.context_window),
@@ -857,7 +857,7 @@ impl Session {
     /// Compaction Keep must sit below the compaction trigger at those figures.
     /// Run at launch for the launch Model and by the Agent at a `/model` swap
     /// for the picked Model, so a pick that cannot fit is rejected with the
-    /// reason instead of exploding on a later Turn.
+    /// reason instead of exploding on a later Run.
     pub fn validate_model_budget(&self, model: &Model) -> Result<(), String> {
         let budget = self.context_budget_for(model);
         if model.max_tokens >= budget {
@@ -891,7 +891,7 @@ impl Session {
     }
 
     /// The ctx every Tool Call executes with: the Project Root, the Result
-    /// Cap derived from `model` - the one the Turn captured (ADR-0037) - and
+    /// Cap derived from `model` - the one the Run captured (ADR-0037) - and
     /// the command timeout. (The `scout` capture is added later without
     /// changing tool signatures.)
     pub fn tool_ctx(&self, model: &Model) -> ToolCtx {
@@ -1015,7 +1015,7 @@ fn validate_scalars(s: &Session) -> Result<(), SessionError> {
         pos_int(cap, ":context_budget")?;
     }
     pos_int(s.model.max_tokens, "model :max_tokens")?;
-    pos_int(s.turn_limit, ":turn_limit")?;
+    pos_int(s.run_limit, ":turn_limit")?;
     pos_int(s.anchor_interval, ":anchor_interval")?;
     pos_int(s.plan_stale_after, ":plan_stale_after")?;
     pos_int(s.scout_pass_limit, ":scout_pass_limit")?;
@@ -1216,7 +1216,7 @@ mod tests {
             context_budget: Some(5_000),
             eviction_slack: Some(0.1),
             compaction_keep: Some(0.4),
-            turn_limit: Some(3),
+            run_limit: Some(3),
             anchor_interval: Some(7),
             command_timeout_ms: Some(1_000),
             model: Some(test_model()),
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(session.context_budget, Some(5_000));
         assert_eq!(session.eviction_slack, 0.1);
         assert_eq!(session.compaction_keep, 0.4);
-        assert_eq!(session.turn_limit, 3);
+        assert_eq!(session.run_limit, 3);
         assert_eq!(session.anchor_interval, 7);
         assert_eq!(session.command_timeout_ms, 1_000);
         assert_eq!(session.model.max_tokens, 1_000);
@@ -1455,7 +1455,7 @@ mod tests {
 
         assert!(
             with(SessionOpts {
-                turn_limit: Some(0),
+                run_limit: Some(0),
                 model: Some(test_model()),
                 ..opts()
             })
@@ -1558,7 +1558,7 @@ mod tests {
             .unwrap()
         };
         assert_eq!(with_limit(3).recovery_limit, 3);
-        // 0 is valid: it disables the Recovery Turn mechanic entirely.
+        // 0 is valid: it disables the Recovery Run mechanic entirely.
         assert_eq!(with_limit(0).recovery_limit, 0);
     }
 

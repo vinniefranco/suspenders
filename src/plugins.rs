@@ -7,12 +7,12 @@
 //! Every stage call is wrapped: a panic skips that
 //! plugin's effect - the token passes through unchanged from before it ran -
 //! and comes back as a [`Failure`] for the caller to report. Fail-open with
-//! visibility (ADR-0007 / ADR-0018): the model never sees it, the Turn never
+//! visibility (ADR-0007 / ADR-0018): the model never sees it, the Run never
 //! fails. In Rust the isolation is `std::panic::catch_unwind` around each
 //! synchronous stage call (`AssertUnwindSafe`, since the token/plugin are not
 //! `UnwindSafe`); the panic message is recovered from the panic payload.
 //!
-//! [`execute`] is the Turn's dispatch seam: [`crate::tools::execute`] (raw,
+//! [`execute`] is the Run's dispatch seam: [`crate::tools::execute`] (raw,
 //! unshaped), then the `post_run` fold, then Shaping - so plugins transform
 //! the model-facing content BEFORE the Result Cap, and whatever they append is
 //! capped like any other content. Artifacts bypass Shaping entirely; they
@@ -179,7 +179,7 @@ pub fn present(
 
 /// One entry in the configured Plugin list: a plugin name and its registration
 /// options. The Session carries plugins as these lightweight specs (a name plus
-/// opts) and resolves them into live [`Registered`] instances at Turn/UI start.
+/// opts) and resolves them into live [`Registered`] instances at Run/UI start.
 /// This is the analogue of the config `:plugins` entries - a bare `Module` or a
 /// `{Module, opts}` tuple.
 #[derive(Debug, Clone, PartialEq)]
@@ -233,7 +233,7 @@ pub fn normalize(entry: impl Into<PluginSpec>) -> PluginSpec {
 /// production registry: the shipped config resolves
 /// `["diff", "run_command", "condense"]` into the Diff plugin, the run_command
 /// exit-badge plugin, and the condense noise-collapse plugin, so the live app
-/// runs the Turn/Presentment pipeline with all three.
+/// runs the Run/Presentment pipeline with all three.
 pub fn configured(names: &[String]) -> Vec<Registered> {
     names
         .iter()

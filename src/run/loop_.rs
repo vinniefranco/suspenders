@@ -1,4 +1,4 @@
-//! Turn Loop - the inner tool-call loop of a Turn (baud's `Baud.Turn.Loop`).
+//! Run Loop - the inner tool-call loop of a Run (baud's `Baud.Turn.Loop`).
 //! (Module name is `loop_` because `loop` is a keyword - ADR-0022.)
 //!
 //! One Pass (CONTEXT.md) = one model response plus the Tool Calls it carries.
@@ -6,22 +6,22 @@
 //! `MessageUpdate` (delta + accumulated snapshot), `MessageEnd` - on every path,
 //! including errored responses, then acts on the stop reason. See the Elixir
 //! moduledoc (`baud/lib/baud/turn/loop.ex`) for the full narrative; this port
-//! preserves its behaviour exactly, with the Turn Ledger and the Governors'
+//! preserves its behaviour exactly, with the Run Ledger and the Governors'
 //! trigger state threaded as plain values instead of baud's functional
 //! re-binding.
 //!
 //! This module keeps the loop skeleton: the Pass cycle (request, stream,
-//! dispatch), proactive Compaction at Turn start, and the riders on a
+//! dispatch), proactive Compaction at Run start, and the riders on a
 //! tool-answering Pass (Steering, Explore Nudge, Anchor, Endgame tail rider,
-//! Turn Limit, after-Pass hook). Executing a Pass's Tool Call batch lives in
-//! [`super::batch`]; how a Turn ends when the model stops calling tools lives
+//! Run Limit, after-Pass hook). Executing a Pass's Tool Call batch lives in
+//! [`super::batch`]; how a Run ends when the model stops calling tools lives
 //! in [`super::finish`]. Every heuristic decision - which Tools ride, what
-//! rides the results tail, when the Turn Limit closes - comes from the
+//! rides the results tail, when the Run Limit closes - comes from the
 //! arbiter in [`super::governor`] (ADR-0026); this module only translates the
 //! returned Interventions into effects.
 //!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
-//! [`TurnDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
+//! [`RunDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
 //! over a `plugins` list and a `ToolCtx` the caller supplies - the Rust Session
 //! carries plugin *names*, not `Registered` values, so these ride as explicit
 //! `run` arguments (the shell builds them from the Session).
@@ -39,26 +39,26 @@ use crate::plugins::Registered;
 use crate::session::Session;
 use crate::session::log;
 use crate::tool::ToolCtx;
-use crate::turn::deps::{AfterPass, Emitter, TurnDeps};
-use crate::turn::governor::ledger::Ledger;
-use crate::turn::governor::{
+use crate::run::deps::{AfterPass, Emitter, RunDeps};
+use crate::run::governor::ledger::Ledger;
+use crate::run::governor::{
     self, AnswerIntervention, FinishIntervention, Governors, RequestIntervention, Rider,
 };
-use crate::turn::offer::Offer;
-use crate::turn::{batch, finish};
+use crate::run::offer::Offer;
+use crate::run::{batch, finish};
 use crate::voice;
 
-/// The Turn loop's outcome (baud's `outcome`).
+/// The Run loop's outcome (baud's `outcome`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    /// The Turn completed; carries the final Conversation and terminal stop
+    /// The Run completed; carries the final Conversation and terminal stop
     /// reason.
     Ok(Conversation, OutcomeStop),
-    /// The Turn closed at its Turn Limit with demonstrably unfinished work and
-    /// the Endgame Governor issued the close-and-open-a-Recovery-Turn
-    /// Intervention (CONTEXT.md: Recovery Turn). The Conversation is closed on
-    /// the turn-limit marker exactly like an `Ok` limit close; the directive
-    /// rides out so the Agent - which owns the Turn lifecycle - executes the
+    /// The Run closed at its Run Limit with demonstrably unfinished work and
+    /// the Endgame Governor issued the close-and-open-a-Recovery-Run
+    /// Intervention (CONTEXT.md: Recovery Run). The Conversation is closed on
+    /// the run-limit marker exactly like an `Ok` limit close; the directive
+    /// rides out so the Agent - which owns the Run lifecycle - executes the
     /// opening.
     Recover(Conversation, log::StopReason, governor::endgame::Recovery),
     /// The response errored; carries the LLM error reason and the Conversation
@@ -88,8 +88,8 @@ impl OutcomeStop {
 
 /// Options for [`run`] (baud's `opts`): the restored Plan content, the
 /// durable original task copy from the Compaction state, and the Recovery
-/// Turns already consumed serving the current user request (an Agent-owned
-/// cross-Turn fact the Ledger starts with).
+/// Runs already consumed serving the current user request (an Agent-owned
+/// cross-Run fact the Ledger starts with).
 #[derive(Debug, Clone, Default)]
 pub struct RunOpts {
     pub plan: Option<String>,
@@ -99,13 +99,13 @@ pub struct RunOpts {
 
 // The loop state that spans Passes: the effect bundle, the owned emission
 // handle (obtained once from `deps.emitter()`, ADR-0025), the Plan/Anchor
-// state, the Turn Ledger (the Turn's facts, written here and in `batch` at
+// state, the Run Ledger (the Run's facts, written here and in `batch` at
 // the firing sites - ADR-0026), and the Governors' trigger state + resolved
 // Setpoints. The Session's fixed facts the loop needs are resolved into the
-// Ledger and the Governors once at Turn start, so no Session reference rides.
+// Ledger and the Governors once at Run start, so no Session reference rides.
 // The Conversation stays a separate value the loop folds. Fields are
 // `pub(super)` so `batch` and `finish` work on the state directly.
-pub(super) struct LoopState<'a, D: TurnDeps> {
+pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) deps: &'a mut D,
     pub(super) emitter: Emitter,
     pub(super) plugins: &'a [Registered],
@@ -118,18 +118,18 @@ pub(super) struct LoopState<'a, D: TurnDeps> {
     // Tool Call the Offer does not name (ADR-0035).
     pub(super) offer: Offer,
     // The malformed-tool-call re-draw Setpoint (ADR-0030), resolved once from
-    // the Session at Turn start: how many in-band re-draws a retryable
-    // generation error may trigger this Turn (0 disables it). A Session fact,
+    // the Session at Run start: how many in-band re-draws a retryable
+    // generation error may trigger this Run (0 disables it). A Session fact,
     // not a Ledger field - the Ledger holds only how many retries were USED.
     pub(super) malformed_retry_budget: u64,
 }
 
-/// Runs the loop until the model stops asking for tools, the Turn Limit is hit,
+/// Runs the loop until the model stops asking for tools, the Run Limit is hit,
 /// or the response errors (baud's `Baud.Turn.Loop.run/4`).
 ///
 /// `plugins` and `tool_ctx` supply the Plugin pipeline and Tool execution
 /// context (Session-derived; the Rust Session carries plugin names only).
-pub async fn run<D: TurnDeps>(
+pub async fn run<D: RunDeps>(
     mut conversation: Conversation,
     session: &Session,
     plugins: &[Registered],
@@ -148,7 +148,7 @@ pub async fn run<D: TurnDeps>(
         emitter,
         plugins,
         tool_ctx,
-        ledger: Ledger::new(session.turn_limit),
+        ledger: Ledger::new(session.run_limit),
         offer: Offer::default(),
         governors: Governors::new(
             session.anchor_interval,
@@ -163,13 +163,13 @@ pub async fn run<D: TurnDeps>(
         malformed_retry_budget: session.malformed_retry_budget,
     };
 
-    // Recovery Turns already consumed serving this user request: an Agent-
-    // owned cross-Turn fact the Ledger starts with, read by the Endgame
+    // Recovery Runs already consumed serving this user request: an Agent-
+    // owned cross-Run fact the Ledger starts with, read by the Endgame
     // Governor's recovery judgment.
     state.ledger.note_recoveries_used(opts.recoveries_used);
 
-    // A Plan carried in from a previous Turn is a fact the Ledger starts
-    // with: its recency clock runs from Turn start (a Plan set THIS Turn
+    // A Plan carried in from a previous Run is a fact the Ledger starts
+    // with: its recency clock runs from Run start (a Plan set THIS Run
     // starts its clock at `batch`'s firing site instead).
     if state.plan.content.is_some() {
         state.ledger.note_plan_carried();
@@ -180,9 +180,9 @@ pub async fn run<D: TurnDeps>(
 }
 
 // Proactive Compaction (ADR-0012): when the Conversation already exceeds the
-// compaction target at Turn start, compact before the first Pass. A failed
+// compaction target at Run start, compact before the first Pass. A failed
 // Compaction falls through to the reactive path at the budget cliff.
-async fn maybe_compact_proactive<D: TurnDeps>(
+async fn maybe_compact_proactive<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Conversation {
@@ -199,7 +199,7 @@ async fn maybe_compact_proactive<D: TurnDeps>(
     }
 }
 
-async fn run_loop<D: TurnDeps>(
+async fn run_loop<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
 ) -> Outcome {
@@ -243,7 +243,7 @@ async fn run_loop<D: TurnDeps>(
 // beside the deps (ADR-0025): destructuring `state` borrows the disjoint
 // `deps` and `emitter` fields, so the sink emits live while the model call
 // holds the deps.
-async fn complete_and_emit<D: TurnDeps>(
+async fn complete_and_emit<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     request: LlmRequest,
 ) -> Response {
@@ -257,7 +257,7 @@ async fn complete_and_emit<D: TurnDeps>(
 // Returns `Ok((request, conversation))` (Compaction may have rewritten the
 // Conversation and set the post-Compaction Anchor flag) or `Err(())` for
 // context-budget exhaustion.
-async fn build_request<D: TurnDeps>(
+async fn build_request<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Result<(LlmRequest, Conversation), ()> {
@@ -312,7 +312,7 @@ async fn build_request<D: TurnDeps>(
 }
 
 // The result of a stop-reason dispatch: either the loop continues with an
-// updated Conversation, or the Turn is done.
+// updated Conversation, or the Run is done.
 pub(super) enum Flow {
     Continue(Conversation),
     Done(Outcome),
@@ -324,7 +324,7 @@ pub(super) enum Flow {
     Retry(Conversation),
 }
 
-async fn dispatch<D: TurnDeps>(
+async fn dispatch<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
@@ -359,14 +359,14 @@ async fn dispatch<D: TurnDeps>(
 
 // ADR-0030: a StopReason::Error whose error string classifies as retryable -
 // the malformed-tool-call class only - re-draws the generation in-band while
-// the per-Turn budget holds, instead of failing the whole Turn. The re-draw
+// the per-Run budget holds, instead of failing the whole Run. The re-draw
 // is a mechanical response to a wire event (it lives here, not in a Governor,
 // and carries no trajectory judgment): increment the Ledger, emit the visible
 // info event (the Agent folds it to a durable `retry` Session Log entry, never
 // into the Conversation), and re-request the SAME, unmutated Conversation. On
 // a non-retryable error, or once the budget is spent (default 3, 0 disables),
 // the existing loud `finish::fail` runs - preserved exactly, only deferred.
-fn error_flow<D: TurnDeps>(
+fn error_flow<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
@@ -385,7 +385,7 @@ fn error_flow<D: TurnDeps>(
 }
 
 // The model asked for tools and gets them, in the order it emitted them.
-async fn continue_tools<D: TurnDeps>(
+async fn continue_tools<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
@@ -399,7 +399,7 @@ async fn continue_tools<D: TurnDeps>(
 // arguments may be valid-but-incomplete JSON, so NOTHING executes; every call
 // is answered with the re-issue error and the model retries in-band. The calls
 // never enter the duplicate memory.
-async fn truncated_batch<D: TurnDeps>(
+async fn truncated_batch<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
@@ -433,8 +433,8 @@ async fn truncated_batch<D: TurnDeps>(
 
 // Shared tail of every tool-answering Pass: drain Steering, append the batch
 // (assistant blocks intact, results + Steering as ONE user message),
-// checkpoint, then Turn Limit -> after-Pass hook -> loop.
-async fn next_pass<D: TurnDeps>(
+// checkpoint, then Run Limit -> after-Pass hook -> loop.
+async fn next_pass<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     response: Response,
@@ -474,7 +474,7 @@ async fn next_pass<D: TurnDeps>(
     state.deps.checkpoint(&conversation);
 
     // The finish-settlement moment, consulted after a tool-answering Pass: at
-    // the Turn Limit the arbiter closes the Turn on the marker (stop calling
+    // the Run Limit the arbiter closes the Run on the marker (stop calling
     // the model; the marker keeps roles alternating) - carrying the Endgame
     // Governor's recovery directive out when the work is unfinished.
     match governor::settle_capped(&state.ledger, &state.governors) {
@@ -482,7 +482,7 @@ async fn next_pass<D: TurnDeps>(
             return Flow::Done(finish::close(
                 state,
                 conversation,
-                voice::turn_limit_marker(),
+                voice::run_limit_marker(),
                 reason,
             ));
         }
@@ -494,7 +494,7 @@ async fn next_pass<D: TurnDeps>(
             return Flow::Done(finish::close_recover(
                 state,
                 conversation,
-                vec![ContentBlock::text(voice::turn_limit_marker())],
+                vec![ContentBlock::text(voice::run_limit_marker())],
                 None,
                 reason,
                 recovery,
@@ -514,7 +514,7 @@ async fn next_pass<D: TurnDeps>(
         AfterPass::Stop(reason) => Flow::Done(finish::close_custom(
             state,
             conversation,
-            voice::turn_stopped_marker(),
+            voice::run_stopped_marker(),
             reason,
         )),
         AfterPass::Inject(text) => {
@@ -530,7 +530,7 @@ async fn next_pass<D: TurnDeps>(
 // tool-results user message; the Anchor injects the Plan's current anchor
 // block on the same seam. The per-call Interventions never issue from the
 // tail consultation (they are translated in `super::batch`).
-fn apply_tail<D: TurnDeps>(
+fn apply_tail<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: &mut Conversation,
     intervention: AnswerIntervention,
@@ -574,7 +574,7 @@ fn pass_calls(blocks: &[ContentBlock]) -> Vec<(String, Value)> {
 }
 
 // Live context-pressure indication, once the Pass's usage is noted.
-fn emit_context_pressure<D: TurnDeps>(state: &mut LoopState<'_, D>, conversation: &Conversation) {
+fn emit_context_pressure<D: RunDeps>(state: &mut LoopState<'_, D>, conversation: &Conversation) {
     state.emitter.emit(Event::context_pressure(
         conversation.token_estimate(),
         conversation.context_budget,
@@ -602,14 +602,14 @@ mod tests {
     use crate::test_support::Entry;
     use crate::test_support::FakeDeps;
     use crate::tool::ToolCtx;
-    use crate::turn::deps::CompactError;
-    use crate::turn::fixtures::*;
+    use crate::run::deps::CompactError;
+    use crate::run::fixtures::*;
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     // The harness fixtures (session builders, Response builders, `run_with`,
-    // event inspectors) live in `crate::turn::fixtures`, one set for the split
+    // event inspectors) live in `crate::run::fixtures`, one set for the split
     // Loop's tests (these integration tests cover `batch` and `finish` too).
 
     // ---- tool loop --------------------------------------------------------
@@ -710,7 +710,7 @@ mod tests {
 
         let checkpoints = deps.checkpoints.lock().unwrap();
         // Exactly one checkpoint for the two-tool batch (plus the finish
-        // checkpoint on end-of-Turn) - never one per tool.
+        // checkpoint on end-of-Run) - never one per tool.
         assert_eq!(checkpoints.len(), 2, "one per batch, not one per tool");
 
         // The batch checkpoint carries both answered Tool Calls paired with
@@ -761,7 +761,7 @@ mod tests {
         let (conv, _) = ok(&outcome);
 
         // Both the tool-answering Pass and the finish reply are stamped with
-        // the Turn's captured Model; user messages carry no Provenance.
+        // the Run's captured Model; user messages carry no Provenance.
         let expected = Some(session.model.provenance());
         let assistants: Vec<_> = conv
             .messages
@@ -994,7 +994,7 @@ mod tests {
     // ---- after-Pass hook --------------------------------------------------
 
     #[tokio::test]
-    async fn after_pass_stop_closes_the_turn_with_the_stopped_marker() {
+    async fn after_pass_stop_closes_the_run_with_the_stopped_marker() {
         let root = root();
         let session = session(root.path());
         let deps = deps_for(
@@ -1093,10 +1093,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retryable_error_re_draws_in_band_and_the_turn_completes() {
+    async fn a_retryable_error_re_draws_in_band_and_the_run_completes() {
         let root = root();
         let session = session(root.path());
-        // A retryable draw fails, then the re-draw succeeds - the Turn
+        // A retryable draw fails, then the re-draw succeeds - the Run
         // continues and completes rather than failing.
         let deps = deps_for(
             &session,
@@ -1108,7 +1108,7 @@ mod tests {
         assert_eq!(*stop, OutcomeStop::end_turn());
 
         // The Conversation ends on the re-drawn reply; the failed draw left
-        // nothing behind (no [turn failed] marker).
+        // nothing behind (no [run failed] marker).
         let lm = last_message(conv);
         assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "the good answer"));
         assert!(!conv.messages.iter().any(|m| {
@@ -1417,10 +1417,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_nudge_skipped_when_turn_limit_reached() {
+    async fn verify_nudge_skipped_when_run_limit_reached() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -1522,7 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_with_no_run_command_never_fires_verify_failed() {
+    async fn run_with_no_run_command_never_fires_verify_failed() {
         let root = root();
         let session = session(root.path());
         let deps = deps_for(
@@ -1670,10 +1670,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_failed_skipped_when_turn_limit_reached() {
+    async fn verify_failed_skipped_when_run_limit_reached() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -1896,10 +1896,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_nudge_skipped_when_turn_limit_reached() {
+    async fn empty_nudge_skipped_when_run_limit_reached() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2041,7 +2041,7 @@ mod tests {
     async fn wrap_up_warning_rides_tool_results_when_two_passes_remain() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(4);
+        opts.run_limit = Some(4);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2101,7 +2101,7 @@ mod tests {
     async fn unverified_writes_verification_prompt_replaces_warning_and_narrows_tools() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(4);
+        opts.run_limit = Some(4);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2154,7 +2154,7 @@ mod tests {
     async fn verification_pass_narrowing_emits_tools_narrowed_to_run_command() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(4);
+        opts.run_limit = Some(4);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2201,7 +2201,7 @@ mod tests {
         let root = root();
         write(&root, "secret.txt", "SECRET-CONTENT");
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(4);
+        opts.run_limit = Some(4);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2232,21 +2232,21 @@ mod tests {
             matches!(result, Event::ToolResult { content, is_error: true, .. }
                 if *content == voice::tool_not_offered("read_file"))
         );
-        // The refused read never verified the write, so the capped Turn
+        // The refused read never verified the write, so the capped Run
         // recovers (the refusal and the recovery judgment compose).
         let (_conv, reason, recovery) = recover(&outcome);
-        assert_eq!(reason, log::StopReason::TurnLimit);
+        assert_eq!(reason, log::StopReason::RunLimit);
         assert!(!recovery.verification_failing);
     }
 
     // The final Pass offers NO Tools (ADR-0015/0035); a tool-insistent reply's
-    // calls are refused at dispatch - never executed - and the Turn closes
-    // on the turn-limit marker (CONTEXT.md: Endgame).
+    // calls are refused at dispatch - never executed - and the Run closes
+    // on the run-limit marker (CONTEXT.md: Endgame).
     #[tokio::test]
     async fn final_pass_tool_insistence_is_refused_and_closes_on_the_marker() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2263,7 +2263,7 @@ mod tests {
         let (outcome, deps) = run_with(&session, "small task", deps).await;
         assert!(matches!(
             outcome,
-            Outcome::Ok(_, OutcomeStop::Reason(log::StopReason::TurnLimit))
+            Outcome::Ok(_, OutcomeStop::Reason(log::StopReason::RunLimit))
         ));
         assert!(!root.path().join("evil.txt").exists());
         let evs = events(&deps);
@@ -2280,7 +2280,7 @@ mod tests {
     async fn verified_writes_ordinary_warning_and_full_tool_list() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(4);
+        opts.run_limit = Some(4);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2317,10 +2317,10 @@ mod tests {
     // ---- final Pass -------------------------------------------------------
 
     #[tokio::test]
-    async fn final_request_no_tools_and_prompt_conclusion_ends_turn() {
+    async fn final_request_no_tools_and_prompt_conclusion_ends_run() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2357,12 +2357,12 @@ mod tests {
 
     // The final Pass withdraws every Tool (empty narrowing): ToolsNarrowed
     // carries an empty name list, so the Transcript reads "tools withdrawn"
-    // (ADR-0040). The last narrowing of the Turn is the empty one.
+    // (ADR-0040). The last narrowing of the Run is the empty one.
     #[tokio::test]
     async fn final_pass_narrowing_emits_tools_narrowed_empty() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2395,7 +2395,7 @@ mod tests {
     async fn final_pass_tool_markup_as_text_closes_on_marker() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let markup = "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>";
         let deps = deps_for(
@@ -2408,10 +2408,10 @@ mod tests {
         );
         let (outcome, _deps) = run_with(&session, "big task", deps).await;
         let (conv, stop) = ok(&outcome);
-        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
         let lm = last_message(conv);
         assert!(
-            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
         );
         assert!(!conv.messages.iter().any(|m| {
             m.content
@@ -2424,7 +2424,7 @@ mod tests {
     async fn final_pass_conclusion_mentioning_markup_still_ends_end_turn() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2445,7 +2445,7 @@ mod tests {
     async fn prose_preamble_does_not_launder_final_pass_markup() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let text = "I need to update the DESIGN.md file to reflect the new behavior:\n\n<tool_call>\n<function=edit_file>\n<parameter=path>\ndocs/DESIGN.md\n</parameter>\n</function>\n</tool_call>";
         let deps = deps_for(
@@ -2458,10 +2458,10 @@ mod tests {
         );
         let (outcome, _deps) = run_with(&session, "big task", deps).await;
         let (conv, stop) = ok(&outcome);
-        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
         let lm = last_message(conv);
         assert!(
-            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
         );
     }
 
@@ -2469,7 +2469,7 @@ mod tests {
     async fn model_answers_final_pass_with_tools_still_closes_on_marker() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2481,17 +2481,17 @@ mod tests {
         );
         let (outcome, _deps) = run_with(&session, "big task", deps).await;
         let (conv, stop) = ok(&outcome);
-        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
         let lm = last_message(conv);
         assert!(
-            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
         );
     }
 
-    // ---- Recovery Turn (the close-and-recover Intervention) ----------------
+    // ---- Recovery Run (the close-and-recover Intervention) ----------------
 
     use crate::session::RecoveryShape;
-    use crate::turn::governor::endgame::Recovery;
+    use crate::run::governor::endgame::Recovery;
 
     fn recover(outcome: &Outcome) -> (&Conversation, log::StopReason, Recovery) {
         match outcome {
@@ -2502,8 +2502,8 @@ mod tests {
 
     // A tool-insistent reply on the final Pass (ADR-0035): the call is
     // refused at dispatch, never executed, and the refusal is what closes the
-    // Turn at its cap. Used to drive capped-Turn tests: the work lands on an
-    // offered Pass, then the insistent reply carries the Turn to the limit.
+    // Run at its cap. Used to drive capped-Run tests: the work lands on an
+    // offered Pass, then the insistent reply carries the Run to the limit.
     // (agent/tests.rs keeps its own copy - the two test modules own separate
     // Response builders by house pattern.)
     fn insistent_reply(id: &str) -> Response {
@@ -2514,7 +2514,7 @@ mod tests {
     async fn a_cap_with_unverified_writes_carries_the_recovery_directive_out() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2531,7 +2531,7 @@ mod tests {
         let (outcome, _deps) = run_with(&session, "write it", deps).await;
         let (conv, reason, recovery) = recover(&outcome);
 
-        assert_eq!(reason, log::StopReason::TurnLimit);
+        assert_eq!(reason, log::StopReason::RunLimit);
         assert_eq!(
             recovery,
             Recovery {
@@ -2540,10 +2540,10 @@ mod tests {
                 failing_command: None,
             }
         );
-        // The Conversation closed on the turn-limit marker like any limit close.
+        // The Conversation closed on the run-limit marker like any limit close.
         let lm = last_message(conv);
         assert!(
-            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::turn_limit_marker())
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
         );
     }
 
@@ -2554,7 +2554,7 @@ mod tests {
         // 2026-07-14). The recovery names the failing command.
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2587,7 +2587,7 @@ mod tests {
     async fn the_shape_setpoint_rides_the_directive() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         opts.recovery_shape = Some(RecoveryShape::Continuation);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
@@ -2615,7 +2615,7 @@ mod tests {
         // Handoff seed's verbatim-verification guarantee (ADR-0028) holds.
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2648,10 +2648,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_spent_recovery_budget_settles_a_plain_turn_limit() {
+    async fn a_spent_recovery_budget_settles_a_plain_run_limit() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let mut deps = deps_for(
             &session,
@@ -2683,14 +2683,14 @@ mod tests {
         .await;
 
         let (_conv, stop) = ok(&outcome);
-        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
     }
 
     #[tokio::test]
     async fn recovery_limit_zero_disables_the_mechanic() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         opts.recovery_limit = Some(0);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
@@ -2707,18 +2707,18 @@ mod tests {
 
         let (outcome, _deps) = run_with(&session, "write it", deps).await;
         let (_conv, stop) = ok(&outcome);
-        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
     }
 
     #[tokio::test]
     async fn a_final_pass_text_settle_with_a_dangling_failure_recovers_on_the_reply() {
-        // ADR-0015 withdrew the tools on the final Pass, so the capped Turn
+        // ADR-0015 withdrew the tools on the final Pass, so the capped Run
         // ends on a plain reply - the recovery judgment applies there too
         // (ADR-0028 addendum), and the reply (the model's genuine wrap-up),
-        // NOT the turn-limit marker, closes the Conversation.
+        // NOT the run-limit marker, closes the Conversation.
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2746,14 +2746,14 @@ mod tests {
         let (outcome, _deps) = run_with(&session, "run the tests", deps).await;
         let (conv, reason, recovery) = recover(&outcome);
 
-        assert_eq!(reason, log::StopReason::TurnLimit);
+        assert_eq!(reason, log::StopReason::RunLimit);
         assert!(recovery.verification_failing);
         let lm = last_message(conv);
         assert!(
             matches!(&lm.content[0], ContentBlock::Text { text } if text == "half done; the tests are still red")
         );
         assert!(!conv.messages.iter().any(|m| m.content.iter().any(
-            |b| matches!(b, ContentBlock::Text { text } if text == voice::turn_limit_marker())
+            |b| matches!(b, ContentBlock::Text { text } if text == voice::run_limit_marker())
         )));
     }
 
@@ -2764,7 +2764,7 @@ mod tests {
         // the text settle still recovers, naming the failure.
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(3);
+        opts.run_limit = Some(3);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2800,7 +2800,7 @@ mod tests {
     }
 
     // A clean cap (no writes, no failing command) settling Ok is covered by
-    // `turn_limit_stops_the_loop_after_n_passes` below.
+    // `run_limit_stops_the_loop_after_n_passes` below.
 
     // ---- loop guards ------------------------------------------------------
 
@@ -2932,10 +2932,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_limit_stops_the_loop_after_n_passes() {
+    async fn run_limit_stops_the_loop_after_n_passes() {
         let root = root();
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(2);
+        opts.run_limit = Some(2);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -2946,7 +2946,7 @@ mod tests {
         );
         let (outcome, _deps) = run_with(&session, "explore", deps).await;
         let (conv, stop) = ok(&outcome);
-        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::TurnLimit));
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
         let lm = last_message(conv);
         assert!(
             matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn limit reached - reply to continue]")
@@ -3513,7 +3513,7 @@ mod tests {
         write(&root, "a.txt", "");
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(5);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
         let deps = deps_for(&session, tool_each_pass(12));
         let (outcome, _deps) = run_with(&session, "the original task", deps).await;
@@ -3529,7 +3529,7 @@ mod tests {
         write(&root, "a.txt", "");
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(2);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -3557,7 +3557,7 @@ mod tests {
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(2);
         opts.plan_stale_after = Some(2);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
 
         // Pass 1 sets the Plan; Passes 2-8 keep writing without touching it -
@@ -3611,7 +3611,7 @@ mod tests {
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(2);
         opts.plan_stale_after = Some(2);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
 
         // Writes land every Pass, but the model refreshes its Plan on Pass 4
@@ -3652,16 +3652,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plan_carried_from_a_previous_turn_goes_stale_from_turn_start() {
+    async fn a_plan_carried_from_a_previous_run_goes_stale_from_run_start() {
         let root = root();
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(2);
         opts.plan_stale_after = Some(2);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
 
-        // The Plan rides in through RunOpts (a previous Turn set it) and this
-        // Turn only writes: the recency clock runs from Turn start.
+        // The Plan rides in through RunOpts (a previous Run set it) and this
+        // Run only writes: the recency clock runs from Run start.
         let mut deps = deps_for(
             &session,
             vec![
@@ -3709,8 +3709,8 @@ mod tests {
         .await;
         let (conv, _) = ok(&outcome);
 
-        // Anchors on Passes 2 and 4: 1 then 3 Passes since Turn start - the
-        // carried Plan crosses the threshold without ever being set this Turn.
+        // Anchors on Passes 2 and 4: 1 then 3 Passes since Run start - the
+        // carried Plan crosses the threshold without ever being set this Run.
         let anchors = anchors_in(conv);
         assert_eq!(anchors.len(), 2);
         assert!(!anchors[0].contains("has not changed"));
@@ -3723,7 +3723,7 @@ mod tests {
         write(&root, "a.txt", "");
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(999);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
 
         // Reactive compaction: a big conversation that only fits once the
@@ -3775,7 +3775,7 @@ mod tests {
         let root = root();
         let mut opts = SessionOpts::default();
         opts.anchor_interval = Some(999);
-        opts.turn_limit = Some(50);
+        opts.run_limit = Some(50);
         let session = session_with(root.path(), opts);
 
         let compacted = Arc::new(Mutex::new(false));
@@ -3848,7 +3848,7 @@ mod tests {
     // Scout is not yet ported, so we wire the ctx's `scout` capture to return a
     // canned ScoutOutcome - exercising the SAME loop behaviour (only the explore
     // Tool Call and its Tool Result enter the Conversation; a Scout failure
-    // becomes an ordinary is_error Tool Result, never failing the Turn).
+    // becomes an ordinary is_error Tool Result, never failing the Run).
 
     fn ctx_with_scout(session: &Session, outcome: crate::scout::ScoutOutcome) -> ToolCtx {
         use std::sync::Arc;
@@ -3940,7 +3940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scout_failure_becomes_error_result_never_failing_turn() {
+    async fn scout_failure_becomes_error_result_never_failing_run() {
         let root = root();
         let session = session(root.path());
         let deps = deps_for(
@@ -4045,7 +4045,7 @@ mod tests {
         write(&root, "b.txt", "b\n");
         write(&root, "c.txt", "c\n");
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(20);
+        opts.run_limit = Some(20);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -4087,7 +4087,7 @@ mod tests {
         write(&root, "b.txt", "b\n");
         write(&root, "c.txt", "c\n");
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(20);
+        opts.run_limit = Some(20);
         let session = session_with(root.path(), opts);
         let deps = deps_for(
             &session,
@@ -4131,7 +4131,7 @@ mod tests {
             std::fs::create_dir_all(root.path().join(format!("d{n}"))).unwrap();
         }
         let mut opts = SessionOpts::default();
-        opts.turn_limit = Some(20);
+        opts.run_limit = Some(20);
         let session = session_with(root.path(), opts);
         let mut entries: Vec<Entry> = (1..=6)
             .map(|n| {

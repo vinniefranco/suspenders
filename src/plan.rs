@@ -4,18 +4,18 @@
 //! harness outside the Conversation; the original task is the user's verbatim
 //! first prompt. The Anchor is an injected copy of both, placed near the
 //! Conversation's tail. This module owns the value and its composition; the
-//! Turn loop keeps the *when* (Anchor cadence, when to fire `set_plan`), the
+//! Run loop keeps the *when* (Anchor cadence, when to fire `set_plan`), the
 //! Agent keeps the storage, and `crate::voice` keeps the Anchor's framing.
 //!
 //! ## Where the original task comes from
 //!
-//! Captured once per Turn from the Conversation's first user text
+//! Captured once per Run from the Conversation's first user text
 //! ([`crate::conversation::Conversation::original_task`]) - unless the caller
 //! already holds a durable copy. After a Compaction the Conversation's head is
 //! the summary message, whose first block is also user text: a fresh capture
 //! there would anchor the summary blob, not the task. The durable copy lives in
 //! the Compaction state (captured at the first Compaction), and the Agent
-//! threads it into every later Turn, so the Anchor keeps carrying the verbatim
+//! threads it into every later Run, so the Anchor keeps carrying the verbatim
 //! task statement per CONTEXT.md.
 
 use crate::conversation::Conversation;
@@ -41,7 +41,7 @@ pub enum Update {
 }
 
 impl Plan {
-    /// Builds the Turn's Plan value: `content` restored from the previous Turn
+    /// Builds the Run's Plan value: `content` restored from the previous Run
     /// (the Agent holds it), `original_task` from a durable copy when one
     /// exists (the Compaction state after the first Compaction).
     pub fn new(content: Option<String>, original_task: Option<String>) -> Self {
@@ -52,7 +52,7 @@ impl Plan {
     }
 
     /// Captures the verbatim original task from the Conversation, once: a Plan
-    /// that already carries one is returned unchanged. Called at Turn start,
+    /// that already carries one is returned unchanged. Called at Run start,
     /// before any Compaction can summarize the head away.
     pub fn capture_task(mut self, conv: &Conversation) -> Self {
         if self.original_task.is_none() {

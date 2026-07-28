@@ -1,5 +1,5 @@
 //! The failure Governor: consecutive failures of one Tool draw the step-back
-//! annotation, and a recent threshold streak marks the Turn stuck
+//! annotation, and a recent threshold streak marks the Run stuck
 //! (CONTEXT.md: Governor, Setpoint, Nudge; ADR-0026).
 //!
 //! * **Trigger**: the Ledger's per-Tool consecutive-failure tallies and their
@@ -10,8 +10,8 @@
 //!   from the threshold failure of one Tool onward, the "step back" suffix
 //!   rides the real result, summarising the kinds of errors seen
 //!   ([`annotation`]). Its judgment also informs the close at the finish
-//!   settlement: the Endgame's turn-limit stop reason reads [`stuck`] to
-//!   distinguish a stuck Turn from a productive one.
+//!   settlement: the Endgame's run-limit stop reason reads [`stuck`] to
+//!   distinguish a stuck Run from a productive one.
 //! * **Setpoints**: [`Setpoints`] - the annotation threshold and the stuck
 //!   recency window. Neither is user-exposed: resolution at launch is the
 //!   [`Default`], because a Setpoint becomes user-configurable only when a
@@ -23,7 +23,7 @@
 //! the whole judgment - over one set of setpoints (ADR-0026). The wording
 //! lives in [`crate::voice`]; this module never authors nudge strings.
 
-use crate::turn::governor::ledger::Ledger;
+use crate::run::governor::ledger::Ledger;
 use crate::voice;
 
 /// The failure Governor's Setpoints (CONTEXT.md: Setpoint): thresholds tuned
@@ -31,9 +31,9 @@ use crate::voice;
 #[derive(Debug, Clone)]
 pub struct Setpoints {
     /// From this consecutive failure of one Tool onward, the step-back
-    /// annotation rides the result (and the streak can mark the Turn stuck).
+    /// annotation rides the result (and the streak can mark the Run stuck).
     pub nudge_from: u64,
-    /// A threshold streak marks the Turn stuck only while its last failure
+    /// A threshold streak marks the Run stuck only while its last failure
     /// landed within this many closed batches.
     pub stuck_recency: u64,
 }
@@ -47,11 +47,11 @@ impl Default for Setpoints {
     }
 }
 
-/// Is the Turn stuck in a failure loop? True when any Tool has reached the
+/// Is the Run stuck in a failure loop? True when any Tool has reached the
 /// consecutive-failure threshold AND that streak is recent - its last failure
 /// landed within the final `stuck_recency` batches. A streak only resets on
 /// that Tool's next success, so without the recency requirement a Tool the
-/// model abandoned early and routed around would still label the Turn stuck
+/// model abandoned early and routed around would still label the Run stuck
 /// at the limit. A pure read over the Ledger's facts against this Governor's
 /// setpoints (ADR-0026: one exported predicate, two readers).
 pub fn stuck(ledger: &Ledger) -> bool {
@@ -80,7 +80,7 @@ pub fn annotation(ledger: &Ledger, name: &str, content: &str) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
+    use crate::run::governor::ledger::{CallOutcome, ToolResult};
     use serde_json::json;
 
     fn ok() -> ToolResult<'static> {

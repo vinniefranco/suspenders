@@ -1,4 +1,4 @@
-//! Tool Call batch - executing one Pass's Tool Calls (carved from the Turn
+//! Tool Call batch - executing one Pass's Tool Calls (carved from the Run
 //! Loop port of baud's `Baud.Turn.Loop`; "batch" is the domain word: Steering
 //! is delivered after a Tool Call batch completes, and ADR-0009's truncated
 //! response means none of its batch executes).
@@ -19,7 +19,7 @@
 //! only the answered Tool Calls, so the checkpoint never persists an unanswered
 //! tool_use block.
 //!
-//! The loop skeleton lives in [`super::loop_`]; how a Turn ends when the model
+//! The loop skeleton lives in [`super::loop_`]; how a Run ends when the model
 //! stops calling tools lives in [`super::finish`].
 
 use std::collections::HashMap;
@@ -34,16 +34,16 @@ use crate::llm::malformed_tool_input;
 use crate::plan::Update;
 use crate::plugin::Token;
 use crate::plugins;
-use crate::turn::deps::TurnDeps;
-use crate::turn::governor::ledger::{CallOutcome, ToolResult};
-use crate::turn::governor::{self, AnswerIntervention};
-use crate::turn::loop_::LoopState;
+use crate::run::deps::RunDeps;
+use crate::run::governor::ledger::{CallOutcome, ToolResult};
+use crate::run::governor::{self, AnswerIntervention};
+use crate::run::loop_::LoopState;
 use crate::voice;
 
 // Run tool calls in emission order; results keep that order. Checkpoint ONCE
 // after the batch, carrying every answered Tool Call. After the batch the
 // duplicate memory advances and the Ledger's failure-recency clock ticks.
-pub(super) async fn execute_tools<D: TurnDeps>(
+pub(super) async fn execute_tools<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     blocks: &[ContentBlock],
@@ -59,7 +59,7 @@ pub(super) async fn execute_tools<D: TurnDeps>(
     // completed work through the log - not this checkpoint. The in-memory
     // checkpoint is only the settlement fallback, so one over the finished
     // batch is enough (and must not be dropped: it holds in-flight settlement
-    // state should the Turn end here).
+    // state should the Run end here).
     let provenance = state.deps.provenance();
     let checkpoint = build_checkpoint(&conversation, blocks, &results, provenance);
     state.deps.checkpoint(&checkpoint);
@@ -70,8 +70,8 @@ pub(super) async fn execute_tools<D: TurnDeps>(
 
 // The end-of-batch checkpoint: only the answered Tool Calls, paired with their
 // results (never a bare, unanswered tool_use block). The kept blocks are the
-// model's, so the message carries the Turn's captured Provenance (ADR-0037) -
-// this checkpoint becomes the settled Conversation if the Turn ends here.
+// model's, so the message carries the Run's captured Provenance (ADR-0037) -
+// this checkpoint becomes the settled Conversation if the Run ends here.
 fn build_checkpoint(
     conversation: &Conversation,
     blocks: &[ContentBlock],
@@ -102,7 +102,7 @@ fn build_checkpoint(
     conv
 }
 
-async fn execute_tool<D: TurnDeps>(
+async fn execute_tool<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     block: &ContentBlock,
 ) -> ContentBlock {
@@ -155,10 +155,10 @@ async fn execute_tool<D: TurnDeps>(
 }
 
 // A successful plan Tool Call updates the Plan value and stores its content
-// through the set_plan Dep; the Loop's copy keeps this Turn's Anchors current,
+// through the set_plan Dep; the Loop's copy keeps this Run's Anchors current,
 // and the Ledger's plan-recency fact resets at the same firing site (written
 // once as it happens - ADR-0026).
-fn maybe_store_plan<D: TurnDeps>(
+fn maybe_store_plan<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
@@ -271,7 +271,7 @@ impl Answer {
 // arbiter judges what the model SENT (a replaced Tool Result skips execution),
 // then pre_run, Approval on the plugin-adjusted command, and execution with
 // post_run and Shaping.
-async fn run_block<D: TurnDeps>(state: &mut LoopState<'_, D>, name: &str, input: &Value) -> Answer {
+async fn run_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str, input: &Value) -> Answer {
     if let Some(raw) = malformed_tool_input(input) {
         return Answer::malformed(raw);
     }
@@ -299,7 +299,7 @@ async fn run_block<D: TurnDeps>(state: &mut LoopState<'_, D>, name: &str, input:
     run_lifecycle(state, name, input).await
 }
 
-async fn run_lifecycle<D: TurnDeps>(
+async fn run_lifecycle<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
@@ -329,13 +329,13 @@ async fn run_lifecycle<D: TurnDeps>(
     }
 }
 
-async fn execute_token<D: TurnDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
+async fn execute_token<D: RunDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
     let (result, failures) = plugins::execute(state.plugins, token).await;
     emit_plugin_errors(state, &failures);
     Answer::ran(result)
 }
 
-fn emit_plugin_errors<D: TurnDeps>(state: &mut LoopState<'_, D>, failures: &[plugins::Failure]) {
+fn emit_plugin_errors<D: RunDeps>(state: &mut LoopState<'_, D>, failures: &[plugins::Failure]) {
     for failure in failures {
         state.emitter.emit(Event::plugin_error(
             failure.plugin.clone(),

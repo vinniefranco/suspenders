@@ -1,5 +1,5 @@
 //! The lull "waiting" scenes: the whimsical single-row ASCII that plays under
-//! the running Turn's lane during a LULL - the Agent is Running but nothing is
+//! the running Run's lane during a LULL - the Agent is Running but nothing is
 //! streaming (waiting on the first token, or a tool executing). Distinct from
 //! the `✦ Thinking` tail, which shows when reasoning IS streaming; this fills
 //! the silence, with a live elapsed timer on its left.
@@ -52,7 +52,7 @@ pub fn frame(quiet_ticks: u64, lull_seq: u64) -> Option<&'static str> {
 }
 
 /// A compact elapsed label for the lull timer: `"7s"` under a minute, `"2m 03s"`
-/// under an hour, `"1h 04m"` beyond. Pure string formatting - the caller turns
+/// under an hour, `"1h 04m"` beyond. Pure string formatting - the caller runs
 /// `quiet_ticks` into seconds (it owns the tick cadence) and pads this to a
 /// fixed field so the animation column never jitters.
 pub fn format_elapsed(secs: u64) -> String {

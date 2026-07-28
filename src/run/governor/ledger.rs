@@ -1,5 +1,5 @@
-//! Turn Ledger - the record of facts about the running Turn (CONTEXT.md:
-//! Turn Ledger; ADR-0026). Facts are written once as each thing happens: the
+//! Run Ledger - the record of facts about the running Run (CONTEXT.md:
+//! Run Ledger; ADR-0026). Facts are written once as each thing happens: the
 //! Tool Calls the Pass carried, per-Tool consecutive-failure tallies (with
 //! error categories and a recency stamp for the last failure), writes and
 //! whether a verification has run since, the run_command outcomes (the most
@@ -7,14 +7,14 @@
 //! the Plan's recency (Passes and
 //! successful writes since it last changed - absent while no Plan exists),
 //! and the Pass position (current Pass,
-//! Turn Limit). The Ledger holds facts, never opinions or setpoints -
+//! Run Limit). The Ledger holds facts, never opinions or setpoints -
 //! Governors read it and judge; no Governor reads another Governor's state.
 //!
-//! Only the loop writes here, at the firing sites: `crate::turn::batch`
+//! Only the loop writes here, at the firing sites: `crate::run::batch`
 //! records each Tool Call's Answer ([`Ledger::record`]) and closes the
-//! batch, [`crate::turn::loop_`] records Pass advancement, Compaction, the
+//! batch, [`crate::run::loop_`] records Pass advancement, Compaction, the
 //! Pass's carried calls, and the truncated batch's close (ADR-0009), and
-//! `crate::turn::finish` advances the Pass a finish Nudge grants.
+//! `crate::run::finish` advances the Pass a finish Nudge grants.
 //! Governors and the arbiter ([`super`]) READ the
 //! Ledger; their thresholds (setpoints) and trigger state stay their own -
 //! e.g. the annotation threshold that judges a failure tally lives with the
@@ -33,7 +33,7 @@ use crate::voice::FailureCategory;
 /// unverified-writes fact and invalidate results from before them).
 pub(super) const WRITE_TOOLS: &[&str] = &["edit_file", "write_file"];
 
-/// The outcome of one executed Tool Call, as the Turn loop observes it.
+/// The outcome of one executed Tool Call, as the Run loop observes it.
 pub struct ToolResult<'a> {
     pub content: &'a str,
     pub is_error: bool,
@@ -41,7 +41,7 @@ pub struct ToolResult<'a> {
 
 /// The batch's typed fact of whether an answered Tool Call ran (CONTEXT.md:
 /// Answer): the batch states the fact, the Ledger owns what each fact moves
-/// (the Turn Ledger holds facts, never opinions).
+/// (the Run Ledger holds facts, never opinions).
 #[derive(Debug, Clone, Copy)]
 pub enum CallOutcome {
     /// The call ran.
@@ -76,10 +76,10 @@ impl FailureStreak {
     }
 }
 
-// Plan recency: the Pass the Plan last changed on (the Turn's start Pass when
-// the Plan was carried in from a previous Turn), and the successful writes
-// since. Absent while no Plan exists - a Turn with no Plan has nothing to go
-// stale, so the recency facts read as `None` rather than counting from Turn
+// Plan recency: the Pass the Plan last changed on (the Run's start Pass when
+// the Plan was carried in from a previous Run), and the successful writes
+// since. Absent while no Plan exists - a Run with no Plan has nothing to go
+// stale, so the recency facts read as `None` rather than counting from Run
 // start.
 #[derive(Debug, Clone)]
 struct PlanRecency {
@@ -87,15 +87,15 @@ struct PlanRecency {
     writes_since: u64,
 }
 
-/// The Turn Ledger. A plain value the loop owns beside the Governors' trigger
+/// The Run Ledger. A plain value the loop owns beside the Governors' trigger
 /// state: methods either write a fact once at its firing site (`&mut self`,
 /// loop-only) or read one (`&self`, Governors and the arbiter).
 #[derive(Debug, Clone)]
 pub struct Ledger {
-    // Pass position: the current Pass (1-based) and the Turn Limit (a Session
-    // fact fixed at Turn start; Passes remaining is the difference).
+    // Pass position: the current Pass (1-based) and the Run Limit (a Session
+    // fact fixed at Run start; Passes remaining is the difference).
     pass: u64,
-    turn_limit: u64,
+    run_limit: u64,
     // A Compaction has happened since the last results tail (the Anchor is
     // refreshed immediately after every Compaction - CONTEXT.md).
     compacted_since_tail: bool,
@@ -112,43 +112,43 @@ pub struct Ledger {
     // Writes and whether a verification has run since: true from a successful
     // write until the next run_command.
     unverified_writes: bool,
-    // A successful write landed this Turn. Monotonic - set once and NEVER
+    // A successful write landed this Run. Monotonic - set once and NEVER
     // cleared, unlike `unverified_writes` (which a run_command clears): it
     // records that implementation happened at all, the evidence the
-    // dangling-failure recovery arm requires so a read-only Turn that merely
-    // ran a failing command opens no Recovery Turn (ADR-0028 addendum
+    // dangling-failure recovery arm requires so a read-only Run that merely
+    // ran a failing command opens no Recovery Run (ADR-0028 addendum
     // 2026-07-14).
-    wrote_this_turn: bool,
-    // The most recent run_command that actually RAN this Turn failed.
+    wrote_this_run: bool,
+    // The most recent run_command that actually RAN this Run failed.
     command_failing: bool,
     // The most recent outcome per distinct run_command command string that
-    // actually RAN this Turn: `true` records a failure not yet followed by a
+    // actually RAN this Run: `true` records a failure not yet followed by a
     // rerun of the SAME string.
     command_outcomes: Vec<(String, bool)>,
-    // Recovery Turns already consumed serving the current user request - a
-    // fact the Agent owns across Turns and stamps once at Turn start (the
+    // Recovery Runs already consumed serving the current user request - a
+    // fact the Agent owns across Runs and stamps once at Run start (the
     // Agent resets it when a genuine user prompt starts a new request).
     recoveries_used: u64,
-    // Malformed-tool-call re-draws consumed this Turn (ADR-0030): the loop
+    // Malformed-tool-call re-draws consumed this Run (ADR-0030): the loop
     // increments this at the retry firing site, and the re-draw decision
     // reads it against the `malformed_retry_budget` Setpoint. Transient - a
-    // resumed Turn settles as failed regardless, so it is never restored.
+    // resumed Run settles as failed regardless, so it is never restored.
     retries_used: u64,
     // Plan recency (see [`PlanRecency`]): `None` until a Plan exists.
     plan: Option<PlanRecency>,
 }
 
 impl Ledger {
-    pub fn new(turn_limit: u64) -> Self {
+    pub fn new(run_limit: u64) -> Self {
         Ledger {
             pass: 1,
-            turn_limit,
+            run_limit,
             compacted_since_tail: false,
             batches: 0,
             pass_calls: Vec::new(),
             failures: Vec::new(),
             unverified_writes: false,
-            wrote_this_turn: false,
+            wrote_this_run: false,
             command_failing: false,
             command_outcomes: Vec::new(),
             recoveries_used: 0,
@@ -159,13 +159,13 @@ impl Ledger {
 
     // ---- writes: the loop's firing sites ---------------------------------
 
-    /// The Turn moved to its next Pass (a tool-answering Pass looping, or a
+    /// The Run moved to its next Pass (a tool-answering Pass looping, or a
     /// finish Nudge granting one more).
     pub fn advance_pass(&mut self) {
         self.pass += 1;
     }
 
-    /// A Compaction rewrote the Conversation (proactively at Turn start, or
+    /// A Compaction rewrote the Conversation (proactively at Run start, or
     /// recovering at the budget cliff).
     pub fn note_compacted(&mut self) {
         self.compacted_since_tail = true;
@@ -225,21 +225,21 @@ impl Ledger {
         self.batches += 1;
     }
 
-    /// The Turn began with a Plan carried in from a previous Turn: the
-    /// recency clock starts at Turn start - nothing changed the Plan THIS
-    /// Turn yet, but a Plan exists to go stale.
+    /// The Run began with a Plan carried in from a previous Run: the
+    /// recency clock starts at Run start - nothing changed the Plan THIS
+    /// Run yet, but a Plan exists to go stale.
     pub fn note_plan_carried(&mut self) {
         self.note_plan_updated();
     }
 
-    /// Stamped once at Turn start: the Recovery Turns already consumed
-    /// serving the current user request (an Agent-owned cross-Turn count).
+    /// Stamped once at Run start: the Recovery Runs already consumed
+    /// serving the current user request (an Agent-owned cross-Run count).
     pub fn note_recoveries_used(&mut self, n: u64) {
         self.recoveries_used = n;
     }
 
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): one
-    /// more of the per-Turn retry budget is spent.
+    /// more of the per-Run retry budget is spent.
     pub fn note_retry(&mut self) {
         self.retries_used += 1;
     }
@@ -260,9 +260,9 @@ impl Ledger {
         self.pass
     }
 
-    /// The Turn Limit, in Passes (CONTEXT.md).
-    pub fn turn_limit(&self) -> u64 {
-        self.turn_limit
+    /// The Run Limit, in Passes (CONTEXT.md).
+    pub fn run_limit(&self) -> u64 {
+        self.run_limit
     }
 
     /// Has a Compaction happened since the last results tail?
@@ -280,21 +280,21 @@ impl Ledger {
         self.unverified_writes
     }
 
-    /// Did any successful write land this Turn? Monotonic - once true it
+    /// Did any successful write land this Run? Monotonic - once true it
     /// stays true, even after a later run_command clears `unverified_writes`.
     /// The evidence the dangling-failure recovery arm requires: a failing
     /// command during pure exploration is not unfinished implementation
     /// (ADR-0028 addendum 2026-07-14).
-    pub fn wrote_this_turn(&self) -> bool {
-        self.wrote_this_turn
+    pub fn wrote_this_run(&self) -> bool {
+        self.wrote_this_run
     }
 
-    /// Did the most recent run_command this Turn fail?
+    /// Did the most recent run_command this Run fail?
     pub fn command_failing(&self) -> bool {
         self.command_failing
     }
 
-    /// Is there a command string whose most recent run this Turn failed? A
+    /// Is there a command string whose most recent run this Run failed? A
     /// passing run clears only its own command string.
     pub fn dangling_failure(&self) -> bool {
         self.command_outcomes.iter().any(|(_, failing)| *failing)
@@ -314,20 +314,20 @@ impl Ledger {
             .map(|(command, _)| command.as_str())
     }
 
-    /// Recovery Turns already consumed serving the current user request.
+    /// Recovery Runs already consumed serving the current user request.
     pub fn recoveries_used(&self) -> u64 {
         self.recoveries_used
     }
 
-    /// Malformed-tool-call re-draws already spent this Turn (ADR-0030), read
+    /// Malformed-tool-call re-draws already spent this Run (ADR-0030), read
     /// against the `malformed_retry_budget` Setpoint by the loop's re-draw
     /// decision.
     pub fn retries_used(&self) -> u64 {
         self.retries_used
     }
 
-    /// Passes since the Plan last changed (since Turn start for a Plan
-    /// carried in from a previous Turn). `None` while no Plan exists - a
+    /// Passes since the Plan last changed (since Run start for a Plan
+    /// carried in from a previous Run). `None` while no Plan exists - a
     /// missing Plan cannot be stale.
     pub fn passes_since_plan_update(&self) -> Option<u64> {
         self.plan.as_ref().map(|p| self.pass - p.updated_at_pass)
@@ -379,20 +379,20 @@ impl Ledger {
     }
 
     // A run_command verifies (approved, denied, or failed alike); a successful
-    // write leaves the Turn unverified until the next one.
+    // write leaves the Run unverified until the next one.
     fn record_write(&mut self, name: &str, is_error: bool) {
         if name == "run_command" {
             self.unverified_writes = false;
         } else if WRITE_TOOLS.contains(&name) && !is_error {
             self.unverified_writes = true;
-            self.wrote_this_turn = true;
+            self.wrote_this_run = true;
             if let Some(plan) = &mut self.plan {
                 plan.writes_since += 1;
             }
         }
     }
 
-    // The most recent run_command this Turn: a failing one sets the fact, a
+    // The most recent run_command this Run: a failing one sets the fact, a
     // passing one clears it. The per-command-string record moves the same
     // way, keyed by the call's command string - a passing run clears only
     // its own entry. Calls that never ran never reach here: [`Ledger::record`]
@@ -439,10 +439,10 @@ mod tests {
     // ----- pass position -----
 
     #[test]
-    fn a_turn_starts_on_pass_one_and_advances() {
+    fn a_run_starts_on_pass_one_and_advances() {
         let mut ledger = Ledger::new(25);
         assert_eq!(ledger.pass(), 1);
-        assert_eq!(ledger.turn_limit(), 25);
+        assert_eq!(ledger.run_limit(), 25);
 
         ledger.advance_pass();
         assert_eq!(ledger.pass(), 2);
@@ -547,15 +547,15 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_write_marks_the_turn_and_the_mark_survives_a_run_command() {
+    fn a_successful_write_marks_the_run_and_the_mark_survives_a_run_command() {
         let mut ledger = Ledger::new(25);
-        assert!(!ledger.wrote_this_turn());
+        assert!(!ledger.wrote_this_run());
 
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
-        assert!(ledger.wrote_this_turn());
+        assert!(ledger.wrote_this_run());
 
         // Monotonic: the run_command clears unverified_writes but never the
-        // wrote-this-turn mark.
+        // wrote-this-run mark.
         ledger.record(
             "run_command",
             &json!({"command": "cargo test"}),
@@ -563,18 +563,18 @@ mod tests {
             CallOutcome::Ran,
         );
         assert!(!ledger.unverified_writes());
-        assert!(ledger.wrote_this_turn());
+        assert!(ledger.wrote_this_run());
     }
 
     #[test]
-    fn a_failed_write_does_not_mark_the_turn() {
+    fn a_failed_write_does_not_mark_the_run() {
         let mut ledger = Ledger::new(25);
         ledger.record("write_file", &json!({}), &err(), CallOutcome::Ran);
-        assert!(!ledger.wrote_this_turn());
+        assert!(!ledger.wrote_this_run());
     }
 
     #[test]
-    fn a_read_only_turn_never_marks_the_turn() {
+    fn a_read_only_run_never_marks_the_run() {
         let mut ledger = Ledger::new(25);
         ledger.record("read_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger.record("grep", &json!({}), &ok(), CallOutcome::Ran);
@@ -584,7 +584,7 @@ mod tests {
             &err(),
             CallOutcome::Ran,
         );
-        assert!(!ledger.wrote_this_turn());
+        assert!(!ledger.wrote_this_run());
     }
 
     // ----- the most recent run_command -----
@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_without_commands_dangles_nothing() {
+    fn a_run_without_commands_dangles_nothing() {
         let mut ledger = Ledger::new(25);
         assert!(!ledger.dangling_failure());
 
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn a_carried_plan_counts_passes_since_turn_start() {
+    fn a_carried_plan_counts_passes_since_run_start() {
         let mut ledger = Ledger::new(25);
         ledger.note_plan_carried();
         assert_eq!(ledger.passes_since_plan_update(), Some(0));

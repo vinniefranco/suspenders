@@ -50,8 +50,8 @@ use screen::{
 use theme::ActiveTheme;
 use viewport::{Viewport, WHEEL_LINES};
 
-/// How often the status-bar spinner advances while a Turn is running (~10 fps).
-/// `pub(crate)` so `components::live_lull_lines` can turn the lull's tick count
+/// How often the status-bar spinner advances while a Run is running (~10 fps).
+/// `pub(crate)` so `components::live_lull_lines` can run the lull's tick count
 /// into elapsed seconds at the same cadence the adapter ticks (ADR-0029: one
 /// place ticks become real time).
 pub(crate) const TICK_MS: u64 = 100;
@@ -287,7 +287,7 @@ async fn run_loop(
     loop {
         tokio::select! {
             // Animation tick: advance the spinner and repaint, but ONLY while a
-            // Turn is running - an idle UI does no work between events.
+            // Run is running - an idle UI does no work between events.
             _ = ticker.tick() => {
                 let s = screen.as_ref().unwrap();
                 if s.status == Status::Running {
@@ -305,8 +305,8 @@ async fn run_loop(
                     }
                     geometry = draw_previewed(terminal, s, &conn, anim, &mut cache, &state)?;
                 } else {
-                    // Idle between Turns: keep the lull clock at zero so the
-                    // next Turn's first quiet stretch is a fresh lull (fresh
+                    // Idle between Runs: keep the lull clock at zero so the
+                    // next Run's first quiet stretch is a fresh lull (fresh
                     // scene, full settle).
                     anim.quiet_ticks = 0;
                 }
@@ -1486,7 +1486,7 @@ mod tests {
         let (entry, mut inflight) = Entry::barrier();
         let agent = start_agent(&dir, FakeLlm::script(vec![entry]));
 
-        // Park a Turn mid-`complete`, so the Agent answers Busy.
+        // Park a Run mid-`complete`, so the Agent answers Busy.
         agent.submit("first").await.unwrap();
         let parked = tokio::time::timeout(Duration::from_secs(1), inflight.recv())
             .await
@@ -1508,7 +1508,7 @@ mod tests {
         // retry flipped it to a truthful Running status.
         assert_eq!(screen.status, Status::Running);
         assert!(!has_user_line(&screen, "second"));
-        drop(parked); // release the barrier so the Turn can end
+        drop(parked); // release the barrier so the Run can end
     }
 
     #[tokio::test(flavor = "multi_thread")]

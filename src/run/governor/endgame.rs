@@ -1,71 +1,71 @@
-//! The Endgame Governor: the mechanical schedule by which a Turn ends at its
-//! Turn Limit (CONTEXT.md: Endgame, Governor; ADR-0015, ADR-0016, ADR-0026).
+//! The Endgame Governor: the mechanical schedule by which a Run ends at its
+//! Run Limit (CONTEXT.md: Endgame, Governor; ADR-0015, ADR-0016, ADR-0026).
 //!
-//! * **Trigger**: the Pass position against the Turn Limit - Passes remaining -
+//! * **Trigger**: the Pass position against the Run Limit - Passes remaining -
 //!   plus the Ledger's unverified-writes fact (a principled cross-read:
 //!   verification state is a Ledger fact, never a sibling Governor's state).
 //! * **Interventions**: uniquely, this Governor speaks at all three moments of
 //!   a Pass - it narrows the offered Tools at the request-shaping moment
 //!   ([`narrowed_tools`]), rides the results tail at the answering moment
-//!   ([`tail_rider`]), and closes the Turn on the turn-limit marker at the
+//!   ([`tail_rider`]), and closes the Run on the run-limit marker at the
 //!   finish settlement ([`final_pass`], [`tool_insistent_text`],
 //!   [`limit_stop_reason`]).
 //! * **Setpoints**: the recovery pair ([`RecoverySetpoints`]) - `recovery_limit`
-//!   (at most N Recovery Turns per user request, `0` disables the mechanic) and
+//!   (at most N Recovery Runs per user request, `0` disables the mechanic) and
 //!   `recovery_shape` (Handoff or Continuation). The schedule itself carries
 //!   none: its offsets (2, 1, 0 Passes remaining) ARE the mechanics, and the
-//!   Turn Limit is a Session fact read from the Ledger's Pass position.
+//!   Run Limit is a Session fact read from the Ledger's Pass position.
 //!
-//! The Recovery Turn (CONTEXT.md): when this Governor closes a Turn at its
-//! Turn Limit and the Ledger says the work is demonstrably unfinished
+//! The Recovery Run (CONTEXT.md): when this Governor closes a Run at its
+//! Run Limit and the Ledger says the work is demonstrably unfinished
 //! (unverified writes, or a Dangling Failure - a command string whose most
-//! recent run this Turn failed), it issues the
-//! close-and-open-a-Recovery-Turn Intervention instead of the plain close
+//! recent run this Run failed), it issues the
+//! close-and-open-a-Recovery-Run Intervention instead of the plain close
 //! ([`recovery`]) - evidence: 12 of 15 hard f5 runs died AT the cap, several
-//! one honest debugging turn from green (LOG.md cycles 005-006). The Agent
+//! one honest debugging run from green (LOG.md cycles 005-006). The Agent
 //! executes the Intervention; this Governor only judges.
 //!
 //! The endgame is mechanical because small models comply with mechanics, not
 //! requests (the lesson learned at every scale: the Explore Nudge's
 //! classifier, the Scout's forced report Pass, the tool-less final Pass). Its
-//! schedule, counted in Passes remaining before the Turn Limit:
+//! schedule, counted in Passes remaining before the Run Limit:
 //!
 //!   * **2 remaining** - the tail rider warns: the one-shot wrap-up warning,
 //!     or the Verification Pass prompt in its place when writes are unverified
 //!     (the prompt subsumes the warning: verify now, the final Pass concludes).
 //!   * **1 remaining** - the Verification Pass (ADR-0016) when writes are
-//!     unverified: the request offers run_command ONLY, so a capped Turn cannot
+//!     unverified: the request offers run_command ONLY, so a capped Run cannot
 //!     end unverified for lack of opportunity. The tail rider is the final-Pass
 //!     prompt either way: tools are about to be withdrawn.
 //!   * **0 remaining (the final Pass)** - no tools offered (ADR-0015): the only
 //!     move left is the conclusion. A reply that still insists on tools - as
 //!     real tool_use blocks or as serialized markup in plain text - closes on
-//!     the turn-limit marker instead of passing as a conclusion.
+//!     the run-limit marker instead of passing as a conclusion.
 //!
-//! Every query is a pure function over the Pass position and the Turn
+//! Every query is a pure function over the Pass position and the Run
 //! Ledger's facts (ADR-0026: Governors read the Ledger and judge); the
 //! arbiter in [`super`] owns when to ask, the firing sites in
-//! `crate::turn::loop_` apply the answers, and `crate::voice` owns the
+//! `crate::run::loop_` apply the answers, and `crate::voice` owns the
 //! wording the answers carry.
 
 use crate::content::ContentBlock;
 use crate::session::RecoveryShape;
 use crate::session::log::StopReason;
 use crate::tool::ToolSpec;
-use crate::turn::governor::failure;
-use crate::turn::governor::ledger::Ledger;
+use crate::run::governor::failure;
+use crate::run::governor::ledger::Ledger;
 use crate::voice;
 
 /// The Endgame Governor's recovery Setpoints (CONTEXT.md: Setpoint -
 /// resolved by the Session once at launch and fed to the Governor that owns
-/// them). Defaults mirror the shipped config: one Recovery Turn per user
+/// them). Defaults mirror the shipped config: one Recovery Run per user
 /// request, Handoff-shaped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoverySetpoints {
-    /// At most this many Recovery Turns per user request; `0` disables the
+    /// At most this many Recovery Runs per user request; `0` disables the
     /// mechanic entirely.
     pub limit: u64,
-    /// Which arm a Recovery Turn takes.
+    /// Which arm a Recovery Run takes.
     pub shape: RecoveryShape,
 }
 
@@ -79,15 +79,15 @@ impl Default for RecoverySetpoints {
 }
 
 /// The close-and-recover directive: the payload of
-/// [`super::FinishIntervention::CloseRecover`], carried out of the Turn to the
-/// Agent (which executes the Intervention - opening the next Turn, or seeding
+/// [`super::FinishIntervention::CloseRecover`], carried out of the Run to the
+/// Agent (which executes the Intervention - opening the next Run, or seeding
 /// the fresh Conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovery {
     /// The arm to take, from the shape Setpoint.
     pub shape: RecoveryShape,
     /// Why the work is unfinished: `true` when a verification is failing (a
-    /// Dangling Failure - a command string whose most recent run this Turn
+    /// Dangling Failure - a command string whose most recent run this Run
     /// failed), `false` when writes went unverified - the fact the Voice's
     /// recovery prompt is parameterized with.
     pub verification_failing: bool,
@@ -100,19 +100,19 @@ pub struct Recovery {
 }
 
 /// The recovery judgment, consulted only when this Governor is already
-/// closing the Turn at its Turn Limit: `Some` when the Ledger says the work
+/// closing the Run at its Run Limit: `Some` when the Ledger says the work
 /// is demonstrably unfinished (unverified writes, or a Dangling Failure) and
 /// the request's recovery budget is not spent. The failing arm is
 /// dangling-failure-based, not last-command-only - a red full-suite run
 /// followed by a green filtered rerun (observed live) must not read as
 /// green. The dangling-failure arm additionally requires that a write landed
-/// this Turn: a failing command during pure exploration is not unfinished
-/// implementation, so a read-only Turn draws no recovery (ADR-0028 addendum
-/// 2026-07-14). A capped Turn that settled green gets no recovery; `limit` 0
+/// this Run: a failing command during pure exploration is not unfinished
+/// implementation, so a read-only Run draws no recovery (ADR-0028 addendum
+/// 2026-07-14). A capped Run that settled green gets no recovery; `limit` 0
 /// disables the mechanic.
 pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recovery> {
     let unfinished =
-        ledger.unverified_writes() || (ledger.dangling_failure() && ledger.wrote_this_turn());
+        ledger.unverified_writes() || (ledger.dangling_failure() && ledger.wrote_this_run());
     if unfinished && ledger.recoveries_used() < setpoints.limit {
         Some(Recovery {
             shape: setpoints.shape,
@@ -144,10 +144,10 @@ pub enum TailRider {
 /// previous Pass's tail) and this request - no tool runs in between. A path
 /// that never carried the prompt (a verify-nudged finish) still narrows here;
 /// the nudge's own wording is the prompt in that path.
-pub fn narrowed_tools(pass: u64, turn_limit: u64, ledger: &Ledger) -> Option<Vec<ToolSpec>> {
-    if final_pass(pass, turn_limit) {
+pub fn narrowed_tools(pass: u64, run_limit: u64, ledger: &Ledger) -> Option<Vec<ToolSpec>> {
+    if final_pass(pass, run_limit) {
         Some(Vec::new())
-    } else if verification_pass(pass, turn_limit, ledger) {
+    } else if verification_pass(pass, run_limit, ledger) {
         Some(crate::tools::verification_specs())
     } else {
         None
@@ -162,8 +162,8 @@ pub fn narrowed_tools(pass: u64, turn_limit: u64, ledger: &Ledger) -> Option<Vec
 /// `turn_limit` with no answer delivered; the warning alone is ignored
 /// (observed live 2/2), so the final-Pass prompt precedes the mechanical
 /// ending.
-pub fn tail_rider(pass: u64, turn_limit: u64, ledger: &Ledger) -> TailRider {
-    let remaining = turn_limit.saturating_sub(pass);
+pub fn tail_rider(pass: u64, run_limit: u64, ledger: &Ledger) -> TailRider {
+    let remaining = run_limit.saturating_sub(pass);
     if remaining == 2 && ledger.unverified_writes() {
         TailRider::VerificationPass(voice::verification_pass_prompt().to_string())
     } else if remaining == 2 {
@@ -175,28 +175,28 @@ pub fn tail_rider(pass: u64, turn_limit: u64, ledger: &Ledger) -> TailRider {
     }
 }
 
-/// Is this the Turn's last permitted Pass (or past it)?
-pub fn final_pass(pass: u64, turn_limit: u64) -> bool {
-    pass >= turn_limit
+/// Is this the Run's last permitted Pass (or past it)?
+pub fn final_pass(pass: u64, run_limit: u64) -> bool {
+    pass >= run_limit
 }
 
-/// May a finish Nudge send the model back for one more Pass? False at the Turn
+/// May a finish Nudge send the model back for one more Pass? False at the Run
 /// Limit - the limit bounds every Nudge (CONTEXT.md).
-pub fn can_loop(pass: u64, turn_limit: u64) -> bool {
-    pass < turn_limit
+pub fn can_loop(pass: u64, run_limit: u64) -> bool {
+    pass < run_limit
 }
 
-/// The stop reason for a Turn closing at its limit: `TurnLimitStuck` when the
-/// Turn has been stuck in a recent failure loop ([`failure::stuck`] - the
+/// The stop reason for a Run closing at its limit: `RunLimitStuck` when the
+/// Run has been stuck in a recent failure loop ([`failure::stuck`] - the
 /// failure Governor's one exported predicate over the Ledger's failure
-/// tallies; one set of setpoints, two readers - ADR-0026), `TurnLimit`
-/// otherwise - so Settlement and the UI can distinguish "ran out of turns
-/// productively" from "ran out of turns while stuck."
+/// tallies; one set of setpoints, two readers - ADR-0026), `RunLimit`
+/// otherwise - so Settlement and the UI can distinguish "ran out of runs
+/// productively" from "ran out of runs while stuck."
 pub fn limit_stop_reason(ledger: &Ledger) -> StopReason {
     if failure::stuck(ledger) {
-        StopReason::TurnLimitStuck
+        StopReason::RunLimitStuck
     } else {
-        StopReason::TurnLimit
+        StopReason::RunLimit
     }
 }
 
@@ -206,8 +206,8 @@ pub fn limit_stop_reason(ledger: &Ledger) -> StopReason {
 /// once after a one-sentence preamble. Detection is line-anchored: a line that
 /// IS markup means the model is still trying to work; the markup string
 /// appearing inline in prose is still a conclusion. A final-Pass reply carrying
-/// such a line closes on the turn-limit marker path, and the markup never
-/// enters the Conversation (kept, it would prime later Turns to emit more).
+/// such a line closes on the run-limit marker path, and the markup never
+/// enters the Conversation (kept, it would prime later Runs to emit more).
 pub fn tool_insistent_text(blocks: &[ContentBlock]) -> bool {
     blocks
         .iter()
@@ -224,18 +224,18 @@ pub fn tool_insistent_text(blocks: &[ContentBlock]) -> bool {
 
 // The Verification Pass (ADR-0016): exactly one Pass before the limit, with
 // successful writes and no run_command since.
-fn verification_pass(pass: u64, turn_limit: u64, ledger: &Ledger) -> bool {
-    pass == turn_limit - 1 && ledger.unverified_writes()
+fn verification_pass(pass: u64, run_limit: u64, ledger: &Ledger) -> bool {
+    pass == run_limit - 1 && ledger.unverified_writes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::ContentBlock;
-    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
+    use crate::run::governor::ledger::{CallOutcome, ToolResult};
     use serde_json::json;
 
-    // One successful edit_file leaves the Turn with unverified writes.
+    // One successful edit_file leaves the Run with unverified writes.
     fn unverified() -> Ledger {
         let mut ledger = Ledger::new(25);
         ledger.record(
@@ -331,8 +331,8 @@ mod tests {
     // ---- limit_stop_reason/1 ----
 
     #[test]
-    fn distinguishes_a_stuck_turn_from_a_productive_one() {
-        assert_eq!(limit_stop_reason(&Ledger::new(25)), StopReason::TurnLimit);
+    fn distinguishes_a_stuck_run_from_a_productive_one() {
+        assert_eq!(limit_stop_reason(&Ledger::new(25)), StopReason::RunLimit);
 
         let mut stuck = Ledger::new(25);
         for _ in 0..3 {
@@ -347,7 +347,7 @@ mod tests {
             );
         }
 
-        assert_eq!(limit_stop_reason(&stuck), StopReason::TurnLimitStuck);
+        assert_eq!(limit_stop_reason(&stuck), StopReason::RunLimitStuck);
     }
 
     // ---- recovery/2 ----
@@ -449,7 +449,7 @@ mod tests {
             CallOutcome::Ran,
         );
         assert!(ledger.dangling_failure());
-        assert!(!ledger.wrote_this_turn());
+        assert!(!ledger.wrote_this_run());
         assert_eq!(recovery(&RecoverySetpoints::default(), &ledger), None);
     }
 

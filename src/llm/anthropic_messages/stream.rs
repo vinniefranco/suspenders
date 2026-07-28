@@ -29,7 +29,7 @@ use crate::content::{ContentBlock, Usage};
 use crate::llm::decode_tool_input;
 use crate::llm::response::{Response, StopReason};
 
-/// One parsed SSE frame handed to the fold. The transport turns each
+/// One parsed SSE frame handed to the fold. The transport runs each
 /// `event:`/`data:` frame into a [`SseEvent::Event`]; a framing/JSON failure
 /// becomes [`SseEvent::ParseError`] (baud's `{:error, reason}`).
 #[derive(Debug, Clone, PartialEq)]

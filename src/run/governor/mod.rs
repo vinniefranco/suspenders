@@ -5,8 +5,8 @@
 //! keep the model on course; it acts only through an **Intervention**, one of
 //! the eight closed actions: replace a Tool Result, annotate one, stand alone
 //! as a user message, ride the results tail, narrow the offered Tools, silence
-//! Thinking for a Pass, close the Turn on a marker, or close the Turn and open
-//! a Recovery Turn. The set is deliberately closed: a new Governor is routine,
+//! Thinking for a Pass, close the Run on a marker, or close the Run and open
+//! a Recovery Run. The set is deliberately closed: a new Governor is routine,
 //! a new KIND of Intervention is a visible design decision (ADR-0026 - do not
 //! generalize these enums away; the eighth variant, the Endgame Governor's
 //! close-and-recover, deliberately touched the firing sites).
@@ -24,11 +24,11 @@
 //!     executes (what the model will READ), and [`answer_tail`] once per batch
 //!     for the results tail - the same user message, so still this moment;
 //!   * **settling a finish** - [`FinishIntervention`]. One moment, two
-//!     consultation points, because a Turn finishes two ways:
-//!     [`settle_capped`] after a tool-answering Pass at the Turn Limit, and
+//!     consultation points, because a Run finishes two ways:
+//!     [`settle_capped`] after a tool-answering Pass at the Run Limit, and
 //!     [`settle_finish`] when the model stops calling tools.
 //!
-//! Facts live in the Turn [`Ledger`](ledger) ("The Ledger holds facts, never
+//! Facts live in the Run [`Ledger`](ledger) ("The Ledger holds facts, never
 //! opinions or setpoints" - CONTEXT.md), written once by the loop at the
 //! firing sites and READ here. Each Governor lives in its own child module
 //! (ADR-0022: modules mirror the domain tree) - [`duplicate`], [`failure`],
@@ -59,8 +59,8 @@ use crate::event::VoicedTag;
 use crate::llm::response::StopReason;
 use crate::session::log;
 use crate::tool::ToolSpec;
-use crate::turn::governor::endgame::TailRider;
-use crate::turn::governor::ledger::{Ledger, ToolResult};
+use crate::run::governor::endgame::TailRider;
+use crate::run::governor::ledger::{Ledger, ToolResult};
 use crate::voice;
 
 /// Interventions at the request-shaping moment.
@@ -111,11 +111,11 @@ pub enum AnswerIntervention {
 }
 
 /// The Governors' private trigger state and resolved Setpoints, threaded
-/// through the Turn loop as one value beside the [`Ledger`] - one field per
+/// through the Run loop as one value beside the [`Ledger`] - one field per
 /// Governor that carries state or a Session-fed Setpoint ([`failure`] and
 /// [`endgame`] carry neither: they are pure reads over the Ledger), each
 /// field's internals opaque outside its own module, so no Governor reads a
-/// sibling's state (CONTEXT.md: Turn Ledger). The arbiter's entry points
+/// sibling's state (CONTEXT.md: Run Ledger). The arbiter's entry points
 /// below consult the fields; the loop's firing sites feed the Pass-cycle
 /// bookkeeping through the methods here.
 #[derive(Debug, Clone)]
@@ -129,7 +129,7 @@ pub struct Governors {
 }
 
 impl Governors {
-    /// Resolves the Governors for one Turn: the unexposed Setpoints are their
+    /// Resolves the Governors for one Run: the unexposed Setpoints are their
     /// defaults, and the Session's resolved knobs feed the Governors that
     /// carry them (`anchor_interval` and `plan_stale_after` feed the anchor
     /// Governor, `no_think_rescue` the empty Governor, and
@@ -174,10 +174,10 @@ impl Governors {
 /// Interventions at the finish-settlement moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishIntervention {
-    /// Close the Turn on the turn-limit marker with this stop reason.
+    /// Close the Run on the run-limit marker with this stop reason.
     Close(log::StopReason),
-    /// Close the Turn AND open a Recovery Turn (CONTEXT.md: the eighth
-    /// Intervention): issued by the Endgame Governor when a Turn caps with
+    /// Close the Run AND open a Recovery Run (CONTEXT.md: the eighth
+    /// Intervention): issued by the Endgame Governor when a Run caps with
     /// demonstrably unfinished work and the request's recovery budget is not
     /// spent. The Agent executes the opening.
     CloseRecover {
@@ -188,7 +188,7 @@ pub enum FinishIntervention {
         /// model's genuine wrap-up (the tools were withdrawn, ADR-0015), so
         /// Handoff compaction-seeding and Continuation both read it. False
         /// at the tool-answering cap and on the tool-insistent close, where
-        /// the turn-limit marker stands in for the reply.
+        /// the run-limit marker stands in for the reply.
         keep_reply: bool,
     },
     /// Stand alone as a user message - a finish Nudge; the model gets one
@@ -207,14 +207,14 @@ pub enum FinishIntervention {
 ///
 /// Borrows the empty Governor's rescue state mutably: consulting this moment
 /// consumes the one-Pass rescue arm, so the Pass after a rescued one reverts
-/// - unless the rescue has gone sticky (second empty of the Turn).
+/// - unless the rescue has gone sticky (second empty of the Run).
 pub fn shape_request(ledger: &Ledger, governors: &mut Governors) -> Vec<RequestIntervention> {
     let mut interventions = Vec::new();
 
     // The Endgame Governor's narrowing (ADR-0015/0016), answered directly:
     // outside the schedule it is `None` and no Intervention issues - the
     // firing site's full registry rides.
-    if let Some(tools) = endgame::narrowed_tools(ledger.pass(), ledger.turn_limit(), ledger) {
+    if let Some(tools) = endgame::narrowed_tools(ledger.pass(), ledger.run_limit(), ledger) {
         interventions.push(RequestIntervention::NarrowTools(tools));
     }
 
@@ -301,22 +301,22 @@ pub fn answer_tail(ledger: &Ledger, governors: &mut Governors) -> Vec<AnswerInte
 }
 
 /// The finish-settlement moment, consulted after a tool-answering Pass: at
-/// the Turn Limit the Turn closes on the marker even though the model is
-/// still asking for Tools (CONTEXT.md: a Turn ends at its Turn Limit). The
+/// the Run Limit the Run closes on the marker even though the model is
+/// still asking for Tools (CONTEXT.md: a Run ends at its Run Limit). The
 /// close is plain, or - when the Ledger says the work is demonstrably
 /// unfinished and the endgame Governor's recovery budget allows - the
-/// close-and-open-a-Recovery-Turn Intervention; the stop reason distinguishes
-/// a stuck Turn from a productive one either way.
+/// close-and-open-a-Recovery-Run Intervention; the stop reason distinguishes
+/// a stuck Run from a productive one either way.
 pub fn settle_capped(ledger: &Ledger, governors: &Governors) -> Option<FinishIntervention> {
-    if endgame::final_pass(ledger.pass(), ledger.turn_limit()) {
+    if endgame::final_pass(ledger.pass(), ledger.run_limit()) {
         Some(limit_close(ledger, governors))
     } else {
         None
     }
 }
 
-// The Endgame Governor's close at the Turn Limit: plain, or with a Recovery
-// Turn when its recovery judgment fires. One author for both settle paths.
+// The Endgame Governor's close at the Run Limit: plain, or with a Recovery
+// Run when its recovery judgment fires. One author for both settle paths.
 fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
     let reason = endgame::limit_stop_reason(ledger);
     match endgame::recovery(&governors.endgame, ledger) {
@@ -335,26 +335,26 @@ fn limit_close(ledger: &Ledger, governors: &Governors) -> FinishIntervention {
 /// precedence:
 ///
 ///   1. the final-Pass tool-insistence Close (ADR-0015): a reply that still
-///      insists on tools as serialized markup closes on the turn-limit marker -
+///      insists on tools as serialized markup closes on the run-limit marker -
 ///      it outranks every Nudge because no Pass is left to grant; it is a
-///      Turn-Limit close, so the endgame Governor's recovery judgment applies
+///      Run-Limit close, so the endgame Governor's recovery judgment applies
 ///      exactly as at [`settle_capped`];
 ///   2. the final-Pass text-settle recovery (ADR-0028 addendum): ADR-0015
-///      withdraws every tool on the final Pass, so a capped Turn nearly
+///      withdraws every tool on the final Pass, so a capped Run nearly
 ///      always ends here - a plain reply, end_turn - and the recovery
 ///      judgment applies exactly as at the marker closes. When it fires, the
 ///      reply (the model's genuine wrap-up) enters the Conversation before
 ///      the close (`keep_reply`); when it does not (a green settle, or the
-///      budget spent), the Turn concludes on the reply as before;
-///   3. the Verify-failed Nudge - the last run_command this Turn failed;
+///      budget spent), the Run concludes on the reply as before;
+///   3. the Verify-failed Nudge - the last run_command this Run failed;
 ///   4. the Verify Nudge - files changed but nothing was verified;
 ///   5. the Empty-response Nudge - no content, or a parroted empty marker.
 ///      The strict Verify-failed > Verify > Empty order, each gated on
-///      end_turn, room under the Turn Limit ([`endgame::can_loop`] - the
+///      end_turn, room under the Run Limit ([`endgame::can_loop`] - the
 ///      limit bounds every Nudge), and its own re-arm bookkeeping;
-///   6. nothing - the Turn concludes on the model's reply.
+///   6. nothing - the Run concludes on the model's reply.
 ///
-/// A firing Nudge updates its trigger bookkeeping here (the once-per-Turn
+/// A firing Nudge updates its trigger bookkeeping here (the once-per-Run
 /// caps, the no-think rescue arm, and the duplicate Governor's memory clear -
 /// the finishing response's dropped tool_use blocks never produced results):
 /// that is decision state, not effect. The firing site keeps the effects.
@@ -364,7 +364,7 @@ pub fn settle_finish(
     blocks: &[ContentBlock],
     stop_reason: &StopReason,
 ) -> Option<FinishIntervention> {
-    if endgame::final_pass(ledger.pass(), ledger.turn_limit())
+    if endgame::final_pass(ledger.pass(), ledger.run_limit())
         && endgame::tool_insistent_text(blocks)
     {
         return Some(limit_close(ledger, governors));
@@ -373,7 +373,7 @@ pub fn settle_finish(
     let end_turn = *stop_reason == StopReason::EndTurn;
 
     if end_turn
-        && endgame::final_pass(ledger.pass(), ledger.turn_limit())
+        && endgame::final_pass(ledger.pass(), ledger.run_limit())
         && let Some(recovery) = endgame::recovery(&governors.endgame, ledger)
     {
         return Some(FinishIntervention::CloseRecover {
@@ -383,7 +383,7 @@ pub fn settle_finish(
         });
     }
 
-    if !end_turn || !endgame::can_loop(ledger.pass(), ledger.turn_limit()) {
+    if !end_turn || !endgame::can_loop(ledger.pass(), ledger.run_limit()) {
         return None;
     }
 
@@ -424,7 +424,7 @@ pub fn settle_finish(
 // finishing response's dropped tool_use blocks never produced results - so the
 // duplicate Governor's freshness memory clears here, once, for all three kinds
 // (Verify-failed, Verify, Empty alike). Each branch above owns only its own
-// trigger bookkeeping (the once-per-Turn cap, the no-think rescue arm); the
+// trigger bookkeeping (the once-per-Run cap, the no-think rescue arm); the
 // cross-Governor clear lives only here, so the rule has a single visible site.
 fn finish_nudge(governors: &mut Governors, tag: VoicedTag, text: &str) -> FinishIntervention {
     governors.duplicate.note_finish_nudged();
@@ -437,7 +437,7 @@ fn finish_nudge(governors: &mut Governors, tag: VoicedTag, text: &str) -> Finish
 // The Endgame's tail rider for this Pass position, paired with the Transcript
 // tag announcing it.
 fn endgame_rider(ledger: &Ledger) -> Option<(VoicedTag, String)> {
-    match endgame::tail_rider(ledger.pass(), ledger.turn_limit(), ledger) {
+    match endgame::tail_rider(ledger.pass(), ledger.run_limit(), ledger) {
         TailRider::VerificationPass(t) => Some((VoicedTag::VerificationPass, t)),
         TailRider::WrapUpWarning(t) => Some((VoicedTag::WrapUpWarning, t)),
         TailRider::FinalPass(t) => Some((VoicedTag::FinalPass, t)),
@@ -448,7 +448,7 @@ fn endgame_rider(ledger: &Ledger) -> Option<(VoicedTag, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::governor::ledger::CallOutcome;
+    use crate::run::governor::ledger::CallOutcome;
     use serde_json::json;
 
     fn ok() -> ToolResult<'static> {
@@ -466,17 +466,17 @@ mod tests {
     }
 
     // A Ledger at a Pass position.
-    fn ledger_at(pass: u64, turn_limit: u64) -> Ledger {
-        let mut ledger = Ledger::new(turn_limit);
+    fn ledger_at(pass: u64, run_limit: u64) -> Ledger {
+        let mut ledger = Ledger::new(run_limit);
         for _ in 1..pass {
             ledger.advance_pass();
         }
         ledger
     }
 
-    // One successful edit_file leaves the Turn with unverified writes.
-    fn unverified_at(pass: u64, turn_limit: u64) -> Ledger {
-        let mut ledger = ledger_at(pass, turn_limit);
+    // One successful edit_file leaves the Run with unverified writes.
+    fn unverified_at(pass: u64, run_limit: u64) -> Ledger {
+        let mut ledger = ledger_at(pass, run_limit);
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger
     }
@@ -484,8 +484,8 @@ mod tests {
     // The model wrote, then its verification dangles red: a successful write
     // followed by a failing run_command. The write is the evidence the
     // dangling-failure recovery arm requires (ADR-0028 addendum 2026-07-14).
-    fn command_failing_at(pass: u64, turn_limit: u64) -> Ledger {
-        let mut ledger = ledger_at(pass, turn_limit);
+    fn command_failing_at(pass: u64, run_limit: u64) -> Ledger {
+        let mut ledger = ledger_at(pass, run_limit);
         ledger.record(
             "edit_file",
             &json!({"path": "a.ex"}),
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn no_plan_never_draws_the_stale_line() {
-        // Deep in the Turn with writes but no Plan ever set: the Anchor rides
+        // Deep in the Run with writes but no Plan ever set: the Anchor rides
         // bare (its no-plan fallback already asks for a Plan).
         let mut ledger = ledger_at(1, 50);
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
@@ -785,10 +785,10 @@ mod tests {
         );
     }
 
-    // ---- settle_capped: the Turn Limit after a tool-answering Pass ----------
+    // ---- settle_capped: the Run Limit after a tool-answering Pass ----------
 
     #[test]
-    fn below_the_limit_the_turn_runs_on() {
+    fn below_the_limit_the_run_runs_on() {
         assert_eq!(
             settle_capped(&ledger_at(24, 25), &Governors::new(5, 8, true)),
             None
@@ -801,22 +801,22 @@ mod tests {
     }
 
     #[test]
-    fn at_the_limit_a_clean_turn_closes_on_the_marker_no_recovery() {
+    fn at_the_limit_a_clean_run_closes_on_the_marker_no_recovery() {
         assert_eq!(
             settle_capped(&ledger_at(25, 25), &Governors::new(5, 8, true)),
-            Some(FinishIntervention::Close(log::StopReason::TurnLimit))
+            Some(FinishIntervention::Close(log::StopReason::RunLimit))
         );
     }
 
     #[test]
-    fn a_stuck_turn_closes_with_the_stuck_reason() {
+    fn a_stuck_run_closes_with_the_stuck_reason() {
         let mut stuck = ledger_at(25, 25);
         for _ in 0..3 {
             stuck.record("grep", &json!({}), &err(), CallOutcome::Ran);
         }
         assert_eq!(
             settle_capped(&stuck, &Governors::new(5, 8, true)),
-            Some(FinishIntervention::Close(log::StopReason::TurnLimitStuck))
+            Some(FinishIntervention::Close(log::StopReason::RunLimitStuck))
         );
     }
 
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(
             settle_capped(&unverified_at(25, 25), &Governors::new(5, 8, true)),
             Some(FinishIntervention::CloseRecover {
-                reason: log::StopReason::TurnLimit,
+                reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: false,
@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(
             settle_capped(&command_failing_at(25, 25), &Governors::new(5, 8, true)),
             Some(FinishIntervention::CloseRecover {
-                reason: log::StopReason::TurnLimit,
+                reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
@@ -858,7 +858,7 @@ mod tests {
         ledger.note_recoveries_used(1);
         assert_eq!(
             settle_capped(&ledger, &Governors::new(5, 8, true)),
-            Some(FinishIntervention::Close(log::StopReason::TurnLimit))
+            Some(FinishIntervention::Close(log::StopReason::RunLimit))
         );
     }
 
@@ -870,7 +870,7 @@ mod tests {
         });
         assert_eq!(
             settle_capped(&unverified_at(25, 25), &governors),
-            Some(FinishIntervention::Close(log::StopReason::TurnLimit))
+            Some(FinishIntervention::Close(log::StopReason::RunLimit))
         );
     }
 
@@ -884,7 +884,7 @@ mod tests {
     fn the_tool_insistence_close_outranks_every_nudge() {
         // Verify-failed is armed, but on the final Pass a tool-insistent
         // reply closes: no Pass is left to grant the Nudge. It is a
-        // Turn-Limit close with a failing verification, so the endgame
+        // Run-Limit close with a failing verification, so the endgame
         // Governor's recovery rides it.
         let ledger = command_failing_at(3, 3);
         assert_eq!(
@@ -895,7 +895,7 @@ mod tests {
                 &StopReason::EndTurn
             ),
             Some(FinishIntervention::CloseRecover {
-                reason: log::StopReason::TurnLimit,
+                reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
@@ -915,7 +915,7 @@ mod tests {
                 &text("<tool_call>x</tool_call>"),
                 &StopReason::EndTurn
             ),
-            Some(FinishIntervention::Close(log::StopReason::TurnLimit))
+            Some(FinishIntervention::Close(log::StopReason::RunLimit))
         );
     }
 
@@ -943,7 +943,7 @@ mod tests {
                 text: voice::verify_nudge().to_string(),
             })
         );
-        // Both spoken, the reply has content: the Turn concludes.
+        // Both spoken, the reply has content: the Run concludes.
         ledger.advance_pass();
         assert_eq!(
             settle_finish(&ledger, &mut governors, &text("done"), &StopReason::EndTurn),
@@ -1103,9 +1103,9 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_limit_bounds_every_nudge() {
+    fn the_run_limit_bounds_every_nudge() {
         // At the limit no Pass is left to grant, so an armed gate stays quiet
-        // and the Turn concludes on the model's reply (the recovery budget is
+        // and the Run concludes on the model's reply (the recovery budget is
         // spent here, so the text-settle recovery stays out of the way).
         let mut ledger = command_failing_at(2, 2);
         ledger.note_recoveries_used(1);
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn a_final_pass_text_settle_with_a_dangling_failure_closes_and_recovers() {
-        // ADR-0015 withdrew the tools, so the capped Turn ends on a plain
+        // ADR-0015 withdrew the tools, so the capped Run ends on a plain
         // reply - the recovery judgment applies, and the reply (not the
         // marker) enters the Conversation.
         assert_eq!(
@@ -1135,7 +1135,7 @@ mod tests {
                 &StopReason::EndTurn
             ),
             Some(FinishIntervention::CloseRecover {
-                reason: log::StopReason::TurnLimit,
+                reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: true,
@@ -1156,7 +1156,7 @@ mod tests {
                 &StopReason::EndTurn
             ),
             Some(FinishIntervention::CloseRecover {
-                reason: log::StopReason::TurnLimit,
+                reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
                     verification_failing: false,

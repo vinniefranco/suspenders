@@ -3,7 +3,7 @@
 //! inspectors. Today `loop_`'s test module is the only consumer - `batch` and
 //! `finish` are covered through the loop's integration tests - but any test
 //! module they grow draws on this one fixture set instead of drifting copies.
-//! `#[cfg(test)]`-gated in `turn.rs`; never compiled into non-test builds.
+//! `#[cfg(test)]`-gated in `run.rs`; never compiled into non-test builds.
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -16,7 +16,7 @@ use crate::plugins::Registered;
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::test_support::{Entry, FakeDeps, FakeLlm};
 use crate::tool::ToolCtx;
-use crate::turn::loop_::{Outcome, OutcomeStop, RunOpts, run};
+use crate::run::loop_::{Outcome, OutcomeStop, RunOpts, run};
 
 pub(super) fn session_with(root: &std::path::Path, opts: SessionOpts) -> Session {
     let mut opts = opts;

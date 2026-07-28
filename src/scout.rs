@@ -4,12 +4,12 @@
 //! read-only Tool subset (read_file, list_files, grep), and returns a
 //! structured findings report.
 //!
-//! ## An effect, not part of the Turn loop
+//! ## An effect, not part of the Run loop
 //!
 //! Like [`crate::compaction`], the Scout calls the [`Llm`] boundary directly -
-//! it is an effect that lives outside the Turn loop (ADR-0011, ADR-0013). The
+//! it is an effect that lives outside the Run loop (ADR-0011, ADR-0013). The
 //! explore Tool reaches it through the `scout` capture on the Tool ctx, which
-//! wires the Session's llm and the Turn's captured Model. The Turn loop never
+//! wires the Session's llm and the Run's captured Model. The Run loop never
 //! sees the Scout's Conversation; only the explore Tool Call and its Tool
 //! Result flow through the normal path.
 //!
@@ -33,9 +33,9 @@
 //! thinking is not load-bearing for search quality and is fatal on Qwen3.5.
 //! Sessions default this on via `scout_no_think`.
 //!
-//! ## Never crashes the Turn
+//! ## Never crashes the Run
 //!
-//! [`Scout::run`] NEVER panics out to the dispatching Turn. An LLM error, empty
+//! [`Scout::run`] NEVER panics out to the dispatching Run. An LLM error, empty
 //! findings, or hitting the hard Pass cap all return a [`ScoutOutcome`] error
 //! variant carrying whatever partial findings exist.
 
@@ -190,7 +190,7 @@ impl Scout {
 
             let req = match conversation.for_request() {
                 // A disposable Scout that outgrows its own budget stops with
-                // what it has rather than failing the dispatching Turn.
+                // what it has rather than failing the dispatching Run.
                 Err(_) => {
                     return ScoutOutcome::PassCap {
                         limit: state.pass_limit,

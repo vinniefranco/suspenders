@@ -19,13 +19,13 @@
 //!   fires), and `plan_stale_after`, the Passes a Plan may go unchanged
 //!   while writes land before each Anchor carries the stale-plan line.
 //!   User-exposed: the Session's resolved `anchor_interval` and
-//!   `plan_stale_after` knobs feed them at Turn start, and the defaults
+//!   `plan_stale_after` knobs feed them at Run start, and the defaults
 //!   match the Session's.
 
-use crate::turn::governor::ledger::Ledger;
+use crate::run::governor::ledger::Ledger;
 
 /// The anchor Governor's Setpoints (CONTEXT.md: Setpoint). Fed by the
-/// Session's resolved `anchor_interval` and `plan_stale_after` knobs at Turn
+/// Session's resolved `anchor_interval` and `plan_stale_after` knobs at Run
 /// start.
 #[derive(Debug, Clone)]
 pub struct Setpoints {
@@ -130,7 +130,7 @@ mod tests {
 
     // ---- stale_plan ----
 
-    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
+    use crate::run::governor::ledger::{CallOutcome, ToolResult};
 
     fn ok_write() -> ToolResult<'static> {
         ToolResult {

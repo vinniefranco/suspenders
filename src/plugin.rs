@@ -29,7 +29,7 @@
 //!
 //! Failure isolation is fail-open (ADR-0007): a crashing stage is skipped and
 //! reported as an info line in the Transcript; the model never sees it and the
-//! Turn never fails because of it. That isolation lives in the pipeline
+//! Run never fails because of it. That isolation lives in the pipeline
 //! (`catch_unwind`), not here.
 
 pub mod token;

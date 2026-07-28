@@ -1,5 +1,5 @@
 //! Classifies a failed Tool Result's content into a category, recorded on the
-//! Turn [`Ledger`](super::Ledger) as each failure happens (baud:
+//! Run [`Ledger`](super::Ledger) as each failure happens (baud:
 //! `Baud.Turn.Nudges.FailureCategory`).
 //!
 //! Placement judgment (ADR-0026 Step 3): the category is a FACT about the

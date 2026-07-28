@@ -1,12 +1,12 @@
-//! Turn finish - how a Turn ends when the model stops calling tools (carved
-//! from the Turn Loop port of baud's `Baud.Turn.Loop`). Deliberately NOT named
-//! "settlement": Turn Settlement (CONTEXT.md, [`super::settlement`]) is how an
-//! already-ended Turn enters the Conversation; this module is the ending
+//! Run finish - how a Run ends when the model stops calling tools (carved
+//! from the Run Loop port of baud's `Baud.Turn.Loop`). Deliberately NOT named
+//! "settlement": Run Settlement (CONTEXT.md, [`super::settlement`]) is how an
+//! already-ended Run enters the Conversation; this module is the ending
 //! itself.
 //!
-//! [`finish`] handles a Pass without (executable) Tool Calls. Usually the Turn
+//! [`finish`] handles a Pass without (executable) Tool Calls. Usually the Run
 //! ends there, but the finish-settlement arbiter ([`super::governor`],
-//! ADR-0026) may intervene instead: close the Turn on the turn-limit marker
+//! ADR-0026) may intervene instead: close the Run on the run-limit marker
 //! (ADR-0015's tool-insistence rule) or send the model back for one more Pass
 //! with a stand-alone Nudge - the strict Verify-failed > Verify > Empty
 //! precedence lives in [`governor::settle_finish`], not here. This module
@@ -14,22 +14,22 @@
 //!
 //! The marker algebra: an empty close gets the empty-response marker (or the
 //! truncation marker on max_tokens), a parroted empty-response marker counts
-//! as empty, and the Turn Limit / stopped / failed markers keep roles
-//! alternating when the Loop closes a Turn itself. The LLM error algebra
+//! as empty, and the Run Limit / stopped / failed markers keep roles
+//! alternating when the Loop closes a Run itself. The LLM error algebra
 //! ([`fail`]): partial text survives, unanswered tool_use blocks are dropped,
-//! and the failed marker closes the Turn.
+//! and the failed marker closes the Run.
 
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::{Event, VoicedTag};
 use crate::llm::response::{Response, StopReason};
 use crate::session::log;
-use crate::turn::deps::TurnDeps;
-use crate::turn::governor::{self, FinishIntervention};
-use crate::turn::loop_::{Flow, LoopState, Outcome, OutcomeStop};
+use crate::run::deps::RunDeps;
+use crate::run::governor::{self, FinishIntervention};
+use crate::run::loop_::{Flow, LoopState, Outcome, OutcomeStop};
 use crate::voice;
 
-pub(super) fn close<D: TurnDeps>(
+pub(super) fn close<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     marker: &str,
@@ -40,16 +40,16 @@ pub(super) fn close<D: TurnDeps>(
     Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
 }
 
-// The close-and-open-a-Recovery-Turn Intervention's close half: like
+// The close-and-open-a-Recovery-Run Intervention's close half: like
 // [`close`], but the outcome carries the Endgame Governor's directive out to
-// the Agent, which executes the opening (CONTEXT.md: Recovery Turn). One
-// author for both recovery closes: `closing` is the turn-limit marker at the
+// the Agent, which executes the opening (CONTEXT.md: Recovery Run). One
+// author for both recovery closes: `closing` is the run-limit marker at the
 // tool-answering cap and on the tool-insistent reply (roles keep
 // alternating; the insistent markup never enters), or the model's own
 // final-Pass reply on the text settle (ADR-0028 addendum). `provenance` is
 // the captured Model's when `closing` is that reply, `None` when it is the
 // Voice's marker (ADR-0037: Provenance marks what the model produced).
-pub(super) fn close_recover<D: TurnDeps>(
+pub(super) fn close_recover<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     closing: Vec<ContentBlock>,
@@ -65,7 +65,7 @@ pub(super) fn close_recover<D: TurnDeps>(
     Outcome::Recover(conversation, stop_reason, recovery)
 }
 
-pub(super) fn close_custom<D: TurnDeps>(
+pub(super) fn close_custom<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     marker: &str,
@@ -77,8 +77,8 @@ pub(super) fn close_custom<D: TurnDeps>(
 }
 
 // The LLM error algebra: text survives; unanswered tool_use blocks are dropped;
-// the failed marker closes the Turn so roles keep alternating.
-pub(super) fn fail<D: TurnDeps>(
+// the failed marker closes the Run so roles keep alternating.
+pub(super) fn fail<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     response: Response,
@@ -89,7 +89,7 @@ pub(super) fn fail<D: TurnDeps>(
         .filter(|b| !b.is_tool_use())
         .cloned()
         .collect();
-    blocks.push(ContentBlock::text(voice::turn_failed_marker()));
+    blocks.push(ContentBlock::text(voice::run_failed_marker()));
     // The partial text is the model's, so the message carries its Provenance
     // (the appended marker rides the same message, as the fold's does).
     conversation.add_assistant_response(blocks, state.deps.provenance());
@@ -100,14 +100,14 @@ pub(super) fn fail<D: TurnDeps>(
 
 // The model stopped without (executable) Tool Calls. The finish-settlement
 // arbiter (ADR-0026) decides how the finish settles; this site translates:
-// a Close appends the turn-limit marker (the reply - ADR-0015's insistent
+// a Close appends the run-limit marker (the reply - ADR-0015's insistent
 // markup - never enters the Conversation), a CloseRecover appends the marker
 // or - `keep_reply`, the final-Pass text settle - the reply itself before
 // carrying the recovery directive out, a Standalone Nudge appends the reply
 // and then the user-role Nudge for one more Pass, and no Intervention
-// concludes the Turn on the reply. Any tool_use block in this branch is
+// concludes the Run on the reply. Any tool_use block in this branch is
 // unanswered and is dropped.
-pub(super) fn finish<D: TurnDeps>(
+pub(super) fn finish<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     blocks: Vec<ContentBlock>,
@@ -119,7 +119,7 @@ pub(super) fn finish<D: TurnDeps>(
         Some(FinishIntervention::Close(reason)) => Flow::Done(close(
             state,
             conversation,
-            voice::turn_limit_marker(),
+            voice::run_limit_marker(),
             reason,
         )),
         Some(FinishIntervention::CloseRecover {
@@ -133,7 +133,7 @@ pub(super) fn finish<D: TurnDeps>(
                     Some(state.deps.provenance()),
                 )
             } else {
-                (vec![ContentBlock::text(voice::turn_limit_marker())], None)
+                (vec![ContentBlock::text(voice::run_limit_marker())], None)
             };
             Flow::Done(close_recover(
                 state,
@@ -158,8 +158,8 @@ pub(super) fn finish<D: TurnDeps>(
 }
 
 // Shared finish-Nudge mechanic: append the user-role Nudge, announce it, count
-// it as a normal Pass against the Turn Limit, loop.
-fn nudge_finish<D: TurnDeps>(
+// it as a normal Pass against the Run Limit, loop.
+fn nudge_finish<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     nudge: &str,
@@ -188,7 +188,7 @@ fn close_blocks(blocks: &[ContentBlock], stop_reason: &StopReason) -> Vec<Conten
     }
 }
 
-// A phantom :tool_use stop ends the Turn like a normal completion.
+// A phantom :tool_use stop ends the Run like a normal completion.
 fn close_stop_reason(stop_reason: &StopReason) -> StopReason {
     match stop_reason {
         StopReason::ToolUse => StopReason::EndTurn,

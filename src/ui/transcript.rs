@@ -83,12 +83,12 @@ pub enum Tone {
     /// Result-Cap cuts. Not a Governor's judgment - neutral gray.
     Housekeeping,
     /// A Governor helping the model along: a Nudge, a plan/anchor refresh, a
-    /// Recovery Turn. Warm amber (chosen away from error-red).
+    /// Recovery Run. Warm amber (chosen away from error-red).
     Aid,
-    /// A Governor limiting the model: tool-narrowing, the Endgame's turn-close
+    /// A Governor limiting the model: tool-narrowing, the Endgame's run-close
     /// schedule. Cool blue (chosen away from success-green).
     Constrain,
-    /// The user's own voice reaching a running Turn (the pending-Steering
+    /// The user's own voice reaching a running Run (the pending-Steering
     /// marker): the prompt color, never the harness plane.
     Steering,
     /// A marker with no assigned tone - the default a plain `push`ed marker or
@@ -293,13 +293,13 @@ impl Transcript {
         }
     }
 
-    /// Turn-boundary reset: discard the snapshot without settling it. The
+    /// Run-boundary reset: discard the snapshot without settling it. The
     /// settled items are untouched.
     pub fn discard_streaming(&mut self) {
         self.streaming.clear();
     }
 
-    /// Close out a Turn: settle whatever the live snapshot holds (both
+    /// Close out a Run: settle whatever the live snapshot holds (both
     /// Thinking and text - a cancel/crash mid-stream has no final content),
     /// THEN record `note` as an info line if there is one. The order is the
     /// point - the closing note always lands after the salvaged content. The
@@ -417,7 +417,7 @@ impl Transcript {
 
     /// Records the fail-open Plugin report line (ADR-0007) - ONE format
     /// whether the failure came from this store's own Presentment fold or from
-    /// the `plugin_error` event the Turn reports. Bypasses Presentment like
+    /// the `plugin_error` event the Run reports. Bypasses Presentment like
     /// every fail-open line (the recursion bound - see the module doc).
     pub fn plugin_failure(&mut self, plugin: &str, stage: Stage, message: &str) {
         self.items.push(TranscriptItem::Info {
@@ -511,7 +511,7 @@ fn pending_steering_line(text: &str) -> String {
 }
 
 // The fail-open Plugin report (ADR-0007) - sourced once, so the store's own
-// Presentment failures and the Turn's `plugin_error` events read identically.
+// Presentment failures and the Run's `plugin_error` events read identically.
 fn plugin_failure_line(plugin: &str, stage: Stage, message: &str) -> String {
     format!("plugin {plugin} failed in {}: {message}", stage.as_str())
 }

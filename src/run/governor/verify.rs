@@ -1,10 +1,10 @@
-//! The verify Governor: a Turn should not conclude with unverified writes,
+//! The verify Governor: a Run should not conclude with unverified writes,
 //! nor while the last command it ran is failing (CONTEXT.md: Governor, Nudge;
 //! ADR-0026). Two gates, one Governor: the Verify-failed Nudge (the model
 //! finishing while its last run_command failed) and the Verify Nudge (changes
 //! left unverified) share the trigger discipline and the re-arm rule.
 //!
-//! * **Trigger**: private once-per-Turn caps (`verify_nudged`,
+//! * **Trigger**: private once-per-Run caps (`verify_nudged`,
 //!   `verify_failed_nudged`), re-armed by progress - a Pass that made at
 //!   least one Tool Call ([`Verify::note_progress`]). The unverified-writes
 //!   and command-failing facts themselves are the Ledger's; this Governor
@@ -13,7 +13,7 @@
 //!   settlement - the model gets one more Pass to act on it. The strict
 //!   Verify-failed > Verify precedence is the arbiter's
 //!   ([`super::settle_finish`]), not this module's.
-//! * **Setpoints**: none - the once-per-Turn-until-progress cap is the
+//! * **Setpoints**: none - the once-per-Run-until-progress cap is the
 //!   trigger's mechanics, not a tuned value; no threshold here has ever
 //!   demanded tuning.
 //!
@@ -22,7 +22,7 @@
 
 use serde_json::Value;
 
-use crate::turn::governor::ledger::Ledger;
+use crate::run::governor::ledger::Ledger;
 
 /// The verify Governor's private trigger state, a plain value the loop
 /// threads (methods mutate `&mut self` or read, no processes).
@@ -37,26 +37,26 @@ impl Verify {
         Verify::default()
     }
 
-    /// Does end-of-turn owe the Verify Nudge? The unverified writes are the
-    /// Ledger's fact; the once-per-Turn cap is this Governor's trigger state.
+    /// Does end-of-run owe the Verify Nudge? The unverified writes are the
+    /// Ledger's fact; the once-per-Run cap is this Governor's trigger state.
     pub fn verify_nudge(&self, ledger: &Ledger) -> bool {
         ledger.unverified_writes() && !self.verify_nudged
     }
 
-    /// Does end-of-turn owe the Verify-failed Nudge? True when the most recent
-    /// run_command this Turn failed (the Ledger's fact) and this Nudge has not
+    /// Does end-of-run owe the Verify-failed Nudge? True when the most recent
+    /// run_command this Run failed (the Ledger's fact) and this Nudge has not
     /// fired yet.
     pub fn verify_failed_nudge(&self, ledger: &Ledger) -> bool {
         ledger.command_failing() && !self.verify_failed_nudged
     }
 
-    /// The Verify Nudge fired; fires at most once per Turn UNTIL progress
+    /// The Verify Nudge fired; fires at most once per Run UNTIL progress
     /// re-arms it.
     pub fn note_verify_nudged(&mut self) {
         self.verify_nudged = true;
     }
 
-    /// The Verify-failed Nudge fired; fires at most once per Turn UNTIL
+    /// The Verify-failed Nudge fired; fires at most once per Run UNTIL
     /// progress re-arms it.
     pub fn note_verify_failed_nudged(&mut self) {
         self.verify_failed_nudged = true;
@@ -78,7 +78,7 @@ impl Verify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::governor::ledger::{CallOutcome, ToolResult};
+    use crate::run::governor::ledger::{CallOutcome, ToolResult};
     use serde_json::json;
 
     fn ok() -> ToolResult<'static> {
@@ -97,7 +97,7 @@ mod tests {
 
     // ----- verify nudge -----
 
-    // One successful edit_file leaves the Turn with unverified writes.
+    // One successful edit_file leaves the Run with unverified writes.
     fn unverified() -> Ledger {
         let mut ledger = Ledger::new(25);
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_fires_at_most_once_per_turn() {
+    fn verify_fires_at_most_once_per_run() {
         let mut ledger = unverified();
         let mut verify = Verify::new();
         verify.note_verify_nudged();
@@ -126,7 +126,7 @@ mod tests {
 
     // ----- verify-failed nudge -----
 
-    // The most recent run_command this Turn failed.
+    // The most recent run_command this Run failed.
     fn command_failing() -> Ledger {
         let mut ledger = Ledger::new(25);
         ledger.record("run_command", &json!({}), &err(), CallOutcome::Ran);

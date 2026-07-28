@@ -1,32 +1,32 @@
-//! Agent - the actor driving Turns for a Session (baud's `Baud.Agent`, ADR-0017).
+//! Agent - the actor driving Runs for a Session (baud's `Baud.Agent`, ADR-0017).
 //!
 //! A `tokio::spawn`ed task SOLELY owns the mutable state: the `Session`, the one
 //! `Conversation`, the `Approvals` fold, the Steering queue, the latest
 //! per-Tool-Result checkpoint, the Plan, the Session Log handle, and the
 //! `broadcast` Sender to subscribers. The UI, the headless driver, and tests
-//! talk ONLY to the Agent - never to a Turn - by sending [`Command`]s over an
+//! talk ONLY to the Agent - never to a Run - by sending [`Command`]s over an
 //! `mpsc` channel and reading [`Event`]s off a `broadcast` channel. Single
 //! ownership serializes the state without shared locks and fixes one
 //! deterministic Event order (ADR-0017).
 //!
-//! Each Turn runs as a child task via `tokio::spawn`; the Agent holds its
+//! Each Run runs as a child task via `tokio::spawn`; the Agent holds its
 //! [`JoinHandle`]. Cancellation is `JoinHandle::abort()`, which only cancels at
 //! an `.await`; partial work survives because the Agent already holds the latest
 //! checkpoint (delivered through the Deps `checkpoint` effect, ADR-0011). The
 //! `JoinError`/[`Outcome`] the awaited handle yields distinguishes the three
-//! Turn outcomes: completed (`Ok`), cancelled (abort + the cancel flag), and
-//! panicked (`Err`, so Turn Settlement records failed).
+//! Run outcomes: completed (`Ok`), cancelled (abort + the cancel flag), and
+//! panicked (`Err`, so Run Settlement records failed).
 //!
-//! ## How the Turn talks back
+//! ## How the Run talks back
 //!
-//! The Turn's [`crate::turn::AgentDeps`] sends [`TurnMsg`]s over the SAME `mpsc`
+//! The Run's [`crate::run::AgentDeps`] sends [`RunMsg`]s over the SAME `mpsc`
 //! the public Commands use, so the single owner serializes them and Event order
 //! is the owner's order. Fire-and-forget effects (`emit`, `checkpoint`,
 //! `set_plan`, `compacted`) are plain sends; `drain_steering` and
 //! `request_approval` carry a `oneshot` reply - the Agent owns the Steering
-//! queue (a dead Turn cannot hand back its mailbox) and consults the Standing
+//! queue (a dead Run cannot hand back its mailbox) and consults the Standing
 //! Approvals when relaying (an auto-approve emits `approval_auto` and answers
-//! the reply immediately; the Turn cannot tell the difference).
+//! the reply immediately; the Run cannot tell the difference).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,10 +43,10 @@ use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
 use crate::session::{RecoveryShape, Session};
-use crate::turn::AgentDeps;
-use crate::turn::governor::endgame::Recovery;
-use crate::turn::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
-use crate::turn::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
+use crate::run::AgentDeps;
+use crate::run::governor::endgame::Recovery;
+use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
+use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
 use crate::{tools, voice};
 
 #[cfg(test)]
@@ -65,11 +65,11 @@ pub enum Status {
     Running,
 }
 
-/// Returned by [`AgentHandle::submit`] when a Turn is already running.
+/// Returned by [`AgentHandle::submit`] when a Run is already running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy;
 
-/// Returned by [`AgentHandle::steer`] when no Turn is running (the caller should
+/// Returned by [`AgentHandle::steer`] when no Run is running (the caller should
 /// [`AgentHandle::submit`] instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Idle;
@@ -156,17 +156,17 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {}
 
 // ---------------------------------------------------------------------------
-// The message protocol: public Commands + the Turn's talk-back, one mpsc.
+// The message protocol: public Commands + the Run's talk-back, one mpsc.
 // ---------------------------------------------------------------------------
 
-/// A message the Turn task sends back to the Agent (baud's `{:turn_event, ...}`,
+/// A message the Run task sends back to the Agent (baud's `{:turn_event, ...}`,
 /// `{:turn_checkpoint, ...}`, `{:turn_plan, ...}`, `{:compacted, ...}`, and the
 /// `:drain_steering`/approval reply calls). Routed through the same mpsc as
 /// [`Command`] so Event order is the single owner's order.
-pub enum TurnMsg {
-    /// A turn Event: logged (at the contract points) then broadcast.
+pub enum RunMsg {
+    /// A run Event: logged (at the contract points) then broadcast.
     Emit(Event),
-    /// Partial-Turn snapshot, after every Tool Result; the latest wins.
+    /// Partial-Run snapshot, after every Tool Result; the latest wins.
     Checkpoint(Conversation),
     /// A successful plan Tool Call: hold it outside the Conversation and log it.
     SetPlan(String),
@@ -179,14 +179,14 @@ pub enum TurnMsg {
         command: String,
         reply: oneshot::Sender<bool>,
     },
-    /// A completed Compaction from the Turn task: log the `{:compacted, ...}`
+    /// A completed Compaction from the Run task: log the `{:compacted, ...}`
     /// entry and update the accumulated state (ADR-0012).
     Compacted {
         new_state: Compaction,
         skip_count: u64,
         tokens_before: u64,
     },
-    /// A Handoff finished seeding inside the Recovery Turn task (CONTEXT.md:
+    /// A Handoff finished seeding inside the Recovery Run task (CONTEXT.md:
     /// Handoff): the fresh Conversation replaces the retired one, the
     /// compaction state updates, and the `handoff` + `recovery` entries are
     /// logged so Resume rebuilds the same seed.
@@ -207,10 +207,10 @@ pub enum Command {
     /// Swap the Active Model to a scoped `provider/model-id` (ADR-0033
     /// amendment): resolved against the Session's fixed Provider set, so an
     /// unknown Provider is an `Err` the caller surfaces. Takes effect on the
-    /// next Turn - an in-flight Turn is unaffected. No-op semantics
+    /// next Run - an in-flight Run is unaffected. No-op semantics
     /// (re-selecting the current model) are the caller's job, not here.
     SetModel(String, oneshot::Sender<Result<(), String>>),
-    /// The Active Model identifier the next Turn will call (ADR-0033), so a
+    /// The Active Model identifier the next Run will call (ADR-0033), so a
     /// caller can mark "(current)".
     ActiveModel(oneshot::Sender<String>),
     /// List every Provider's models for the `/model` selector (ADR-0033,
@@ -230,15 +230,15 @@ pub enum Command {
     ResumeInfoQuery(oneshot::Sender<Option<ResumeInfo>>),
 }
 
-/// Both flavors ride the one mpsc (public so the Turn shell can post `Turn`
-/// messages back to the Agent; only `Turn` is constructed outside this module).
+/// Both flavors ride the one mpsc (public so the Run shell can post `Run`
+/// messages back to the Agent; only `Run` is constructed outside this module).
 pub enum Msg {
     Command(Command),
-    Turn(TurnMsg),
-    /// The awaited Turn task yielded (baud's `{ref, outcome}` / `{:DOWN, ...}`).
+    Run(RunMsg),
+    /// The awaited Run task yielded (baud's `{ref, outcome}` / `{:DOWN, ...}`).
     Settle(LoopOutcome),
-    /// The Turn task panicked or was aborted (baud's `:DOWN` with no reply).
-    TurnDown(Reason),
+    /// The Run task panicked or was aborted (baud's `:DOWN` with no reply).
+    RunDown(Reason),
 }
 
 /// The handle callers hold (baud's `GenServer.server()`): an mpsc sender for
@@ -290,14 +290,14 @@ impl AgentHandle {
 
         // The Active Model lives here as mutable Agent state (ADR-0033,
         // CONTEXT.md: Active Model), seeded from the Session's launch-resolved
-        // Model. Each Turn is spawned with a snapshot of THIS Model, so a
-        // `SetModel` between Turns lands on the next Turn and an in-flight
-        // Turn finishes on the Model it captured.
+        // Model. Each Run is spawned with a snapshot of THIS Model, so a
+        // `SetModel` between Runs lands on the next Run and an in-flight
+        // Run finishes on the Model it captured.
         let model = session.model.clone();
 
         // The budget figures derive from the launch Model here and are
-        // re-derived from the captured Model at every Turn start (ADR-0037,
-        // `reset_turn_state`).
+        // re-derived from the captured Model at every Run start (ADR-0037,
+        // `reset_run_state`).
         let mut conversation = Conversation::new(
             system_prompt,
             ConversationOpts::new(session.context_budget_for(&model), model.max_tokens)
@@ -324,21 +324,21 @@ impl AgentHandle {
         let (events, _rx0) = broadcast::channel(1024);
 
         // Session cost metering (ADR-0037): every model call this Session
-        // makes - Turn Passes, Scouts, Compaction, Handoff seeds - flows
+        // makes - Run Passes, Scouts, Compaction, Handoff seeds - flows
         // through this one Arc, so a single decorator prices them all against
         // each call's captured Model. The running total rides the Agent's own
-        // mpsc like every Turn event, so Event order stays the single owner's;
+        // mpsc like every Run event, so Event order stays the single owner's;
         // it is display-side only and never enters the Session Log.
         let llm: Arc<dyn Llm> = {
             let tx = tx.clone();
             Arc::new(crate::llm::metered::Metered::new(llm, move |total| {
-                let _ = tx.send(Msg::Turn(TurnMsg::Emit(Event::session_cost(total))));
+                let _ = tx.send(Msg::Run(RunMsg::Emit(Event::session_cost(total))));
             }))
         };
 
         let state = AgentState {
             session,
-            turn_provenance: model.provenance(),
+            run_provenance: model.provenance(),
             model,
             llm,
             conversation,
@@ -369,8 +369,8 @@ impl AgentHandle {
         self.events.subscribe()
     }
 
-    /// Submits a user prompt, starting a Turn (baud's `submit/2`). `Err(Busy)`
-    /// while a Turn runs.
+    /// Submits a user prompt, starting a Run (baud's `submit/2`). `Err(Busy)`
+    /// while a Run runs.
     pub async fn submit(&self, prompt: impl Into<String>) -> Result<(), Busy> {
         let (reply, rx) = oneshot::channel();
         if self
@@ -383,8 +383,8 @@ impl AgentHandle {
         rx.await.unwrap_or(Err(Busy))
     }
 
-    /// Queues Steering for the running Turn (baud's `steer/2`). `Err(Idle)` when
-    /// no Turn is running.
+    /// Queues Steering for the running Run (baud's `steer/2`). `Err(Idle)` when
+    /// no Run is running.
     pub async fn steer(&self, text: impl Into<String>) -> Result<(), Idle> {
         let (reply, rx) = oneshot::channel();
         if self
@@ -398,7 +398,7 @@ impl AgentHandle {
     }
 
     /// Swaps the Active Model to a scoped `provider/model-id` (ADR-0033
-    /// amendment). Takes effect on the next Turn; an in-flight Turn finishes
+    /// amendment). Takes effect on the next Run; an in-flight Run finishes
     /// on the Model it captured. An unresolvable id is an `Err` naming the
     /// reason; a dead Agent answers `Err` too, matching `list_models`.
     pub async fn set_model(&self, model: String) -> Result<(), String> {
@@ -407,7 +407,7 @@ impl AgentHandle {
             .unwrap_or_else(|| Err("agent unavailable".to_string()))
     }
 
-    /// The Active Model identifier the next Turn will call (ADR-0033), for a
+    /// The Active Model identifier the next Run will call (ADR-0033), for a
     /// caller marking "(current)".
     pub async fn active_model(&self) -> String {
         self.query(Command::ActiveModel).await.expect("agent alive")
@@ -439,7 +439,7 @@ impl AgentHandle {
         let _ = rx.await;
     }
 
-    /// Cancels the running Turn (baud's `cancel/1`). No-op when idle.
+    /// Cancels the running Run (baud's `cancel/1`). No-op when idle.
     pub async fn cancel(&self) {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Msg::Command(Command::Cancel(reply)));
@@ -492,44 +492,44 @@ struct AgentState {
     session: Session,
     // The Active Model as mutable Agent state (ADR-0033 amendment, CONTEXT.md:
     // Active Model): an owned Model seeded from `session.model` at launch and
-    // read - not `session.model` - when spawning a Turn. `Command::SetModel`
+    // read - not `session.model` - when spawning a Run. `Command::SetModel`
     // swaps the whole Model (resolved against the Session's fixed Provider
     // set, budget-checked); the budget figures re-derive from this capture at
-    // every Turn start (ADR-0037, `reset_turn_state`).
+    // every Run start (ADR-0037, `reset_run_state`).
     model: Model,
-    // The Provenance of the Model the RUNNING Turn captured at spawn
+    // The Provenance of the Model the RUNNING Run captured at spawn
     // (ADR-0037): stamps assistant events in the Session Log. Snapshotted in
-    // `reset_turn_state`, NOT read from `model` at log time - a mid-flight
-    // `SetModel` swaps `model` while the in-flight Turn keeps its capture.
-    turn_provenance: Provenance,
+    // `reset_run_state`, NOT read from `model` at log time - a mid-flight
+    // `SetModel` swaps `model` while the in-flight Run keeps its capture.
+    run_provenance: Provenance,
     llm: Arc<dyn Llm>,
     conversation: Conversation,
     log: Option<Log>,
     resume_info: Option<ResumeInfo>,
     plan: Option<String>,
     events: broadcast::Sender<Event>,
-    // The running Turn: the AbortHandle for `cancel` (the real JoinHandle lives
+    // The running Run: the AbortHandle for `cancel` (the real JoinHandle lives
     // in the spawned watcher that awaits it and posts the outcome back).
     task: Option<tokio::task::AbortHandle>,
-    // The user cancelled the running Turn; a following abort settles as
-    // cancelled (Turn Settlement needs both the flag and the abort).
+    // The user cancelled the running Run; a following abort settles as
+    // cancelled (Run Settlement needs both the flag and the abort).
     cancel_flag: bool,
     settlement: Settlement,
     approvals: Approvals,
-    // The per-Turn Approval reply channels, keyed by the Loop's ref string: the
-    // Turn parks awaiting this oneshot; `approve` (or a Standing Approval hit)
+    // The per-Run Approval reply channels, keyed by the Loop's ref string: the
+    // Run parks awaiting this oneshot; `approve` (or a Standing Approval hit)
     // answers it.
     approval_replies: HashMap<String, oneshot::Sender<bool>>,
     steering: Vec<String>,
     compaction: Compaction,
-    // Recovery Turns consumed serving the CURRENT user request (CONTEXT.md:
-    // Recovery Turn - the Setpoint bounds recoveries per user request, not
-    // per Turn). Cross-Turn state lives with the Agent: reset when a genuine
+    // Recovery Runs consumed serving the CURRENT user request (CONTEXT.md:
+    // Recovery Run - the Setpoint bounds recoveries per user request, not
+    // per Run). Cross-Run state lives with the Agent: reset when a genuine
     // user prompt starts a new request (`Command::Submit`), NOT by Rollover
-    // or a Recovery Turn; a Resume restores it from the folded log.
+    // or a Recovery Run; a Resume restores it from the folded log.
     recoveries_used: u64,
-    // A clone of the mpsc sender, handed to the Turn's AgentDeps so the Turn
-    // talks back over the same channel, and used to post the Turn's outcome.
+    // A clone of the mpsc sender, handed to the Run's AgentDeps so the Run
+    // talks back over the same channel, and used to post the Run's outcome.
     self_tx: mpsc::UnboundedSender<Msg>,
 }
 
@@ -537,9 +537,9 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Command(cmd) => handle_command(&mut state, cmd),
-            Msg::Turn(turn) => handle_turn(&mut state, turn),
+            Msg::Run(run) => handle_run(&mut state, run),
             Msg::Settle(outcome) => settle(&mut state, LoopOrDown::Loop(outcome)),
-            Msg::TurnDown(reason) => settle(&mut state, LoopOrDown::Down(reason)),
+            Msg::RunDown(reason) => settle(&mut state, LoopOrDown::Down(reason)),
         }
     }
 }
@@ -551,11 +551,11 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
                 let _ = reply.send(Err(Busy));
             } else {
                 // A genuine user prompt starts a new request: the recovery
-                // budget resets. Rollover starts its Turn via `start_turn`
-                // directly and keeps the count - its Steering missed a Turn
+                // budget resets. Rollover starts its Run via `start_run`
+                // directly and keeps the count - its Steering missed a Run
                 // of the SAME request.
                 state.recoveries_used = 0;
-                start_turn(state, prompt);
+                start_run(state, prompt);
                 let _ = reply.send(Ok(()));
             }
         }
@@ -609,31 +609,31 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
     }
 }
 
-fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
-    match turn {
-        TurnMsg::Emit(event) => {
+fn handle_run(state: &mut AgentState, run: RunMsg) {
+    match run {
+        RunMsg::Emit(event) => {
             log_event(state, &event);
             broadcast(state, event);
         }
-        TurnMsg::Checkpoint(conversation) => {
-            // Only meaningful while a Turn is running.
+        RunMsg::Checkpoint(conversation) => {
+            // Only meaningful while a Run is running.
             if state.task.is_some() {
                 state.settlement =
                     std::mem::take(&mut state.settlement).note_checkpoint(conversation);
             }
         }
-        TurnMsg::SetPlan(plan) => {
+        RunMsg::SetPlan(plan) => {
             log_entry(state, LogEntry::Plan(plan.clone()));
             state.plan = Some(plan);
         }
-        TurnMsg::DrainSteering(reply) => {
+        RunMsg::DrainSteering(reply) => {
             let drained = std::mem::take(&mut state.steering);
             let _ = reply.send(drained);
         }
-        TurnMsg::RequestApproval { id, command, reply } => {
+        RunMsg::RequestApproval { id, command, reply } => {
             request_approval(state, id, command, reply);
         }
-        TurnMsg::Compacted {
+        RunMsg::Compacted {
             new_state,
             skip_count,
             tokens_before,
@@ -652,7 +652,7 @@ fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
             broadcast(state, Event::compaction_progress("done"));
             state.compaction = new_state;
         }
-        TurnMsg::HandoffSeeded {
+        RunMsg::HandoffSeeded {
             conversation,
             new_state,
             narrative,
@@ -693,7 +693,7 @@ fn handle_turn(state: &mut AgentState, turn: TurnMsg) {
 // known built-in models, config synthesis otherwise), and the per-Model
 // budget invariants are re-checked (ADR-0037) so a pick that cannot fit is
 // rejected here with the reason, never accepted and exploded later. The next
-// spawned Turn snapshots it; an in-flight Turn is unaffected. A rejected pick
+// spawned Run snapshots it; an in-flight Run is unaffected. A rejected pick
 // leaves the Active Model as-is and the Err rides back to the caller.
 fn swap_active_model(state: &mut AgentState, scoped: &str) -> Result<(), String> {
     let model = state.session.resolve_model(scoped)?;
@@ -715,8 +715,8 @@ fn spawn_list_models(state: &AgentState, reply: oneshot::Sender<Vec<ProviderMode
     });
 }
 
-// A Standing Approval covering the exact string answers the Turn immediately -
-// no modal, an `approval_auto` event; the Turn cannot tell the difference.
+// A Standing Approval covering the exact string answers the Run immediately -
+// no modal, an `approval_auto` event; the Run cannot tell the difference.
 // Otherwise the request becomes pending and its reply channel is held until the
 // user's `approve` arrives (baud's approval_request handler).
 fn request_approval(
@@ -740,11 +740,11 @@ fn request_approval(
     }
 }
 
-// Only forward the Approval the Turn is actually waiting on; the fold ignores
+// Only forward the Approval the Run is actually waiting on; the fold ignores
 // duplicate or stale approve calls (baud's approve handler).
 fn approve(state: &mut AgentState, id: String, decision: Decision) {
     if state.task.is_none() {
-        return; // No Turn: drop it.
+        return; // No Run: drop it.
     }
     let approval_id = ApprovalId::from_ref(id.clone());
     match std::mem::take(&mut state.approvals).decide(approval_id, decision) {
@@ -768,7 +768,7 @@ fn broadcast(state: &AgentState, event: Event) {
 
 // ---- Session Log append points (baud's log_event / log_entry) --------------
 
-// Append fail-open: an IO failure kills the log, never the Turn. The Transcript
+// Append fail-open: an IO failure kills the log, never the Run. The Transcript
 // hears about it once (baud's log_entry rescue).
 fn log_entry(state: &mut AgentState, entry: LogEntry) {
     if let Some(log) = &mut state.log {
@@ -781,7 +781,7 @@ fn log_entry(state: &mut AgentState, entry: LogEntry) {
 fn log_event(state: &mut AgentState, event: &Event) {
     match event {
         Event::MessageEnd { content, .. } => {
-            let provenance = Some(state.turn_provenance.clone());
+            let provenance = Some(state.run_provenance.clone());
             log_entry(
                 state,
                 LogEntry::AssistantBlocks {
@@ -851,23 +851,23 @@ fn log_rider(state: &mut AgentState, tag: RiderTag, text: &str) {
     );
 }
 
-// ---- Turn start (submit + Rollover + Recovery) ------------------------------
+// ---- Run start (submit + Rollover + Recovery) ------------------------------
 
-// One Turn start for submit and Rollover alike (baud's start_turn).
-fn start_turn(state: &mut AgentState, prompt: String) {
+// One Run start for submit and Rollover alike (baud's start_run).
+fn start_run(state: &mut AgentState, prompt: String) {
     log_entry(state, LogEntry::UserText(prompt.clone()));
     state.conversation.add_user_text(prompt);
-    spawn_turn(state);
+    spawn_run(state);
 }
 
-// Spawns a Turn over the Agent's CURRENT Conversation (the prompt - user or
+// Spawns a Run over the Agent's CURRENT Conversation (the prompt - user or
 // Voice - is already appended and logged by the caller).
-fn spawn_turn(state: &mut AgentState) {
-    reset_turn_state(state);
+fn spawn_run(state: &mut AgentState) {
+    reset_run_state(state);
     // The AgentDeps wires each effect to the Agent's mpsc + the Session's Llm.
-    // The Turn captures a SNAPSHOT of the Agent's mutable Model (the Active
-    // Model), not `session.model`: a `SetModel` between Turns lands on this
-    // next Turn, and an in-flight Turn keeps the Model it already captured
+    // The Run captures a SNAPSHOT of the Agent's mutable Model (the Active
+    // Model), not `session.model`: a `SetModel` between Runs lands on this
+    // next Run, and an in-flight Run keeps the Model it already captured
     // (ADR-0017's read-only guest; ADR-0033).
     let deps = AgentDeps::new(
         state.self_tx.clone(),
@@ -880,26 +880,26 @@ fn spawn_turn(state: &mut AgentState) {
     let session = state.session.clone();
     let opts = run_opts(state, state.compaction.original_task.clone());
 
-    let turn =
-        tokio::spawn(async move { crate::turn::run(conversation, session, deps, opts).await });
-    watch_turn(state, turn);
+    let run =
+        tokio::spawn(async move { crate::run::run(conversation, session, deps, opts).await });
+    watch_run(state, run);
 }
 
-// Resets the per-Turn state before a Turn task spawns. The Provenance
-// snapshot here matches the Model the spawned Turn captures (both read
-// `state.model` at spawn), so logged assistant events carry the Turn's
+// Resets the per-Run state before a Run task spawns. The Provenance
+// snapshot here matches the Model the spawned Run captures (both read
+// `state.model` at spawn), so logged assistant events carry the Run's
 // capture even across a mid-flight SetModel.
-fn reset_turn_state(state: &mut AgentState) {
+fn reset_run_state(state: &mut AgentState) {
     state.settlement = Settlement::new();
     state.approvals = std::mem::take(&mut state.approvals).reset();
     state.approval_replies.clear();
     state.cancel_flag = false;
-    state.turn_provenance = state.model.provenance();
-    // The captured Model's budget figures land at Turn start (ADR-0037): the
+    state.run_provenance = state.model.provenance();
+    // The captured Model's budget figures land at Run start (ADR-0037): the
     // Context Budget from its window (config may cap it), the Eviction reserve
-    // from its output cap. The Turn task clones this Conversation, so an
-    // in-flight Turn keeps the figures it captured, and a switch to a smaller
-    // window lands here as ordinary pressure on the next Turn.
+    // from its output cap. The Run task clones this Conversation, so an
+    // in-flight Run keeps the figures it captured, and a switch to a smaller
+    // window lands here as ordinary pressure on the next Run.
     state.conversation.context_budget = state.session.context_budget_for(&state.model);
     state.conversation.max_tokens_reserve = state.model.max_tokens;
 }
@@ -912,53 +912,53 @@ fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {
     }
 }
 
-// The Turn task's watcher. The Agent holds only the AbortHandle (for
+// The Run task's watcher. The Agent holds only the AbortHandle (for
 // `cancel`); the spawned watcher OWNS the JoinHandle, awaits it, and posts the
 // outcome back through the mpsc (baud's `{ref, outcome}` / `:DOWN`). This lets
 // the Agent both abort (cancel) and observe the outcome without co-owning one
 // handle.
-fn watch_turn(state: &mut AgentState, turn: tokio::task::JoinHandle<LoopOutcome>) {
-    let reference = mint_turn_ref();
-    let abort = turn.abort_handle();
+fn watch_run(state: &mut AgentState, run: tokio::task::JoinHandle<LoopOutcome>) {
+    let reference = mint_run_ref();
+    let abort = run.abort_handle();
     let out_tx = state.self_tx.clone();
 
     tokio::spawn(async move {
-        match turn.await {
+        match run.await {
             Ok(outcome) => {
                 let _ = out_tx.send(Msg::Settle(outcome));
             }
             Err(join_err) => {
                 let reason = if join_err.is_cancelled() {
-                    // abort() - Turn Settlement pairs this with the cancel flag.
+                    // abort() - Run Settlement pairs this with the cancel flag.
                     Reason::atom("shutdown")
                 } else {
-                    // A panic; close with the failure marker (baud's turn_error
+                    // A panic; close with the failure marker (baud's run_error
                     // + "[turn failed]").
                     Reason::tuple("turn_panic")
                 };
-                let _ = out_tx.send(Msg::TurnDown(reason));
+                let _ = out_tx.send(Msg::RunDown(reason));
             }
         }
     });
 
     state.task = Some(abort);
-    broadcast(state, Event::turn_started(reference));
+    broadcast(state, Event::run_started(reference));
 }
 
-// ---- Recovery Turn (CONTEXT.md: Recovery Turn) -------------------------------
+// ---- Recovery Run (CONTEXT.md: Recovery Run) -------------------------------
 
-// Executes the Endgame Governor's close-and-open-a-Recovery-Turn Intervention:
+// Executes the Endgame Governor's close-and-open-a-Recovery-Run Intervention:
 // the Governor judged (trigger + both Setpoints); the Agent - owner of the
-// Conversation and the Turn lifecycle - opens the next Turn. The prompt is the
-// Voice's: the only Turn whose prompt Suspenders authors.
+// Conversation and the Run lifecycle - opens the next Run. The prompt is the
+// Voice's: the only Run whose prompt Suspenders authors.
 fn start_recovery(state: &mut AgentState, recovery: Recovery) {
     state.recoveries_used += 1;
     let prompt = voice::recovery_prompt(recovery.verification_failing).to_string();
-    broadcast(state, Event::recovery_turn(recovery.shape, prompt.clone()));
+    broadcast(state, Event::recovery_run(recovery.shape, prompt.clone()));
 
     match recovery.shape {
         // Continuation keeps the Conversation: the recovery prompt is the
-        // next Turn's prompt, mechanically like Rollover's auto-submit but
+        // next Run's prompt, mechanically like Rollover's auto-submit but
         // logged as the Voice's, not the user's.
         RecoveryShape::Continuation => {
             log_entry(
@@ -969,28 +969,28 @@ fn start_recovery(state: &mut AgentState, recovery: Recovery) {
                 },
             );
             state.conversation.merge_user_text(prompt);
-            spawn_turn(state);
+            spawn_run(state);
         }
-        RecoveryShape::Handoff => spawn_handoff_turn(state, prompt, recovery.failing_command),
+        RecoveryShape::Handoff => spawn_handoff_run(state, prompt, recovery.failing_command),
     }
 }
 
-// The Handoff arm: the Recovery Turn task first seeds the fresh Conversation
+// The Handoff arm: the Recovery Run task first seeds the fresh Conversation
 // (the compaction machinery's LLM narrative + mechanical facts + the
-// verification verbatim + the prompt - a long LLM call, so it runs in the Turn
+// verification verbatim + the prompt - a long LLM call, so it runs in the Run
 // task, never on the Agent actor, per ADR-0012), posts the seed back
 // (`HandoffSeeded` logs it and retires the old Conversation), then runs the
-// Turn over the seeded Conversation. The Plan is harness-owned and rides
+// Run over the seeded Conversation. The Plan is harness-owned and rides
 // RunOpts verbatim - it survives the retirement untouched. `failing_command`
 // (the Dangling Failure the recovery names, `None` on an unverified-writes
 // recovery) tells the seed which command's result to carry verbatim.
-fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: Option<String>) {
-    reset_turn_state(state);
+fn spawn_handoff_run(state: &mut AgentState, prompt: String, failing_command: Option<String>) {
+    reset_run_state(state);
     let dying = state.conversation.clone();
     let compaction = state.compaction.clone();
     let llm = Arc::clone(&state.llm);
     // A snapshot of the Agent's mutable Model (the Active Model), as
-    // `spawn_turn` does - the seed narrative and the Recovery Turn both run on
+    // `spawn_run` does - the seed narrative and the Recovery Run both run on
     // the model current at spawn (ADR-0033).
     let model = state.model.clone();
     let temperature = state.session.temperature;
@@ -998,7 +998,7 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
     let opts = run_opts(state, None);
     let tx = state.self_tx.clone();
 
-    let turn = tokio::spawn(async move {
+    let run = tokio::spawn(async move {
         let seeded = compaction
             .seed_handoff(
                 &dying,
@@ -1009,14 +1009,14 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
                 temperature,
             )
             .await;
-        let _ = tx.send(Msg::Turn(TurnMsg::HandoffSeeded {
+        let _ = tx.send(Msg::Run(RunMsg::HandoffSeeded {
             conversation: seeded.conversation.clone(),
             new_state: seeded.state.clone(),
             narrative: seeded.narrative,
             verification: seeded.verification,
             prompt,
         }));
-        // Built here, not before the spawn: the Turn's deps must carry the
+        // Built here, not before the spawn: the Run's deps must carry the
         // SEEDED compaction state so a later compaction telescopes from it.
         let deps = AgentDeps::new(
             tx.clone(),
@@ -1029,12 +1029,12 @@ fn spawn_handoff_turn(state: &mut AgentState, prompt: String, failing_command: O
             original_task: seeded.state.original_task.clone(),
             ..opts
         };
-        crate::turn::run(seeded.conversation, session, deps, opts).await
+        crate::run::run(seeded.conversation, session, deps, opts).await
     });
-    watch_turn(state, turn);
+    watch_run(state, run);
 }
 
-fn mint_turn_ref() -> String {
+fn mint_run_ref() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     format!("turn-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -1048,13 +1048,13 @@ enum LoopOrDown {
 }
 
 fn settle(state: &mut AgentState, outcome: LoopOrDown) {
-    // If there is no running Turn, this is a stale outcome (e.g. the watcher for
-    // an already-settled Turn); ignore it.
+    // If there is no running Run, this is a stale outcome (e.g. the watcher for
+    // an already-settled Run); ignore it.
     if state.task.is_none() {
         return;
     }
 
-    // The Endgame Governor's recovery directive, held aside: the Turn settles
+    // The Endgame Governor's recovery directive, held aside: the Run settles
     // exactly like an Ok limit close first, then the Agent executes the
     // opening. A cancel that raced the close wins - cancel means stop
     // everything, recovery included.
@@ -1093,7 +1093,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     // continuing the same request, which is itself the bounded continuation
     // the recovery would have bought - and the recovery budget stays unspent.
     match resolution.rollover {
-        Rollover::Submit(prompt) => start_turn(state, prompt),
+        Rollover::Submit(prompt) => start_run(state, prompt),
         Rollover::None => {
             if let Some(recovery) = recovery {
                 start_recovery(state, recovery);
@@ -1139,19 +1139,19 @@ fn outcome_stop_to_log(stop: OutcomeStop) -> StopReason {
 // the Rust port has two typed enums that carry the same facts).
 fn settle_event_to_event(event: &SettleEvent) -> Event {
     match event {
-        SettleEvent::TurnFinished {
+        SettleEvent::RunFinished {
             stop_reason,
             token_estimate,
             context_budget,
-        } => Event::TurnFinished {
+        } => Event::RunFinished {
             stop_reason: log_stop_to_resp(*stop_reason),
             token_estimate: *token_estimate,
             context_budget: *context_budget,
         },
-        SettleEvent::TurnError(reason) => Event::TurnError {
+        SettleEvent::RunError(reason) => Event::RunError {
             reason: reason.inspect(),
         },
-        SettleEvent::TurnCancelled => Event::TurnCancelled,
+        SettleEvent::RunCancelled => Event::RunCancelled,
     }
 }
 
@@ -1161,8 +1161,8 @@ fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
         StopReason::ToolUse => RespStopReason::ToolUse,
         StopReason::MaxTokens => RespStopReason::MaxTokens,
         StopReason::StopSequence => RespStopReason::StopSequence,
-        StopReason::TurnLimit
-        | StopReason::TurnLimitStuck
+        StopReason::RunLimit
+        | StopReason::RunLimitStuck
         | StopReason::Error
         | StopReason::Unknown => RespStopReason::Unknown,
     }

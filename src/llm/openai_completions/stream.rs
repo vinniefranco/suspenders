@@ -31,7 +31,7 @@ use crate::content::{ContentBlock, Usage};
 use crate::llm::decode_tool_input;
 use crate::llm::response::{Response, StopReason};
 
-/// One parsed SSE frame handed to the fold. The transport turns each `data:`
+/// One parsed SSE frame handed to the fold. The transport runs each `data:`
 /// body into a [`SseEvent::Chunk`], the `[DONE]` terminator into
 /// [`SseEvent::Done`], and a framing/JSON failure into
 /// [`SseEvent::ParseError`].

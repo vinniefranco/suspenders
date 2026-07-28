@@ -1,29 +1,29 @@
-//! Turn Settlement (CONTEXT.md): how an ended Turn enters the Conversation, as
+//! Run Settlement (CONTEXT.md): how an ended Run enters the Conversation, as
 //! one pure fold.
 //!
-//! `crate::agent` accumulates the facts here while the Turn task runs - the
+//! `crate::agent` accumulates the facts here while the Run task runs - the
 //! latest checkpoint, the reported stop reason, whether the user cancelled -
 //! and calls [`settle`] exactly once when the task ends. The fold returns the
 //! complete resolution: the settled Conversation, the settlement event to
 //! broadcast, the Session Log entry, and the Rollover decision over the queued
 //! Steering. The Agent only interprets - it updates its state, logs,
-//! broadcasts, and maybe starts the next Turn (the same pure-core/process-shell
-//! split ADR-0011 gave the Turn loop).
+//! broadcasts, and maybe starts the next Run (the same pure-core/process-shell
+//! split ADR-0011 gave the Run loop).
 //!
-//! Every Turn settles exactly one way: completed, failed, or cancelled; a crash
+//! Every Run settles exactly one way: completed, failed, or cancelled; a crash
 //! settles as a failure, and so does a `Shutdown` nobody asked for.
 //! Cancellation needs both the flag and reason `Shutdown`, so a crash that
 //! races a cancel still settles as a failure.
 //!
-//! A Turn that did not complete settles on its latest checkpoint (the pre-Turn
-//! Conversation when none arrived): the killed Turn's Tool Calls already
+//! A Run that did not complete settles on its latest checkpoint (the pre-Run
+//! Conversation when none arrived): the killed Run's Tool Calls already
 //! mutated the disk, so dropping them from the Conversation would leave the
 //! model amnesiac about its own edits. The settled Conversation closes with an
 //! assistant marker so roles keep alternating - strict chat templates on small
 //! local models choke on two user messages in a row.
 //!
-//! Rollover (CONTEXT.md): Steering the Turn ended before delivering
-//! auto-submits as the next Turn's prompt (queued texts joined) when the Turn
+//! Rollover (CONTEXT.md): Steering the Run ended before delivering
+//! auto-submits as the next Run's prompt (queued texts joined) when the Run
 //! settled completed or failed; Cancellation discards it - cancel means stop
 //! everything (the text stays in the UI's input history).
 
@@ -32,9 +32,9 @@ use crate::conversation::Conversation;
 use crate::session::log::{Settled, SettledEntry, StopReason};
 use crate::voice;
 
-/// A Turn failure/exit reason, an arbitrary term at baud's boundary: it rides
+/// A Run failure/exit reason, an arbitrary term at baud's boundary: it rides
 /// the settlement event verbatim, and is debug-formatted (baud's `inspect/1`)
-/// into the Session Log entry. Only the shapes the Turn produces are modelled;
+/// into the Session Log entry. Only the shapes the Run produces are modelled;
 /// [`Reason::inspect`] reproduces baud's inspect rendering for the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
@@ -66,7 +66,7 @@ impl Reason {
     }
 }
 
-/// How the Turn task ended, as seen from the Agent's mailbox (baud's
+/// How the Run task ended, as seen from the Agent's mailbox (baud's
 /// `outcome`): the async reply - [`Outcome::Ok`], [`Outcome::Failed`] (the Loop
 /// already closed the Conversation with the failure marker), or
 /// [`Outcome::Error`] (no Conversation came back, e.g. budget exhaustion) - or
@@ -82,17 +82,17 @@ pub enum Outcome {
 /// The settlement event to broadcast (baud's `event`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    TurnFinished {
+    RunFinished {
         stop_reason: StopReason,
         token_estimate: u64,
         context_budget: u64,
     },
-    TurnError(Reason),
-    TurnCancelled,
+    RunError(Reason),
+    RunCancelled,
 }
 
 /// The Rollover decision over the queued Steering (CONTEXT.md): `Submit` the
-/// joined queue as the next Turn's prompt, or `None` (empty queue, or a
+/// joined queue as the next Run's prompt, or `None` (empty queue, or a
 /// cancellation discarding it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rollover {
@@ -100,7 +100,7 @@ pub enum Rollover {
     None,
 }
 
-/// The complete resolution of one ended Turn: the settled Conversation, the
+/// The complete resolution of one ended Run: the settled Conversation, the
 /// settlement event, the `{:settled, ...}` Session Log entry, and the Rollover
 /// decision.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,7 +124,7 @@ impl Settlement {
         Settlement::default()
     }
 
-    /// Partial-Turn snapshot, sent after every Tool Result; the latest one wins.
+    /// Partial-Run snapshot, sent after every Tool Result; the latest one wins.
     pub fn note_checkpoint(mut self, conversation: Conversation) -> Self {
         self.checkpoint = Some(conversation);
         self
@@ -137,8 +137,8 @@ impl Settlement {
     }
 
     /// Folds the outcome, the accumulated facts, and the queued Steering into
-    /// the Turn's complete [`Resolution`]. `base` is the Conversation from
-    /// before the Turn, the fallback when no checkpoint arrived.
+    /// the Run's complete [`Resolution`]. `base` is the Conversation from
+    /// before the Run, the fallback when no checkpoint arrived.
     pub fn settle(&self, outcome: Outcome, base: &Conversation, steering: &[String]) -> Resolution {
         let (conversation, event) = self.resolve(outcome, base);
         let log_entry = log_entry(&event);
@@ -158,7 +158,7 @@ impl Settlement {
                 let context_budget = conversation.context_budget;
                 (
                     conversation,
-                    Event::TurnFinished {
+                    Event::RunFinished {
                         stop_reason,
                         token_estimate,
                         context_budget,
@@ -168,49 +168,49 @@ impl Settlement {
             // The Loop already closed this Conversation with the failure marker
             // and kept the errored response's partial text (the LLM error
             // algebra).
-            Outcome::Failed(reason, conversation) => (conversation, Event::TurnError(reason)),
-            Outcome::Error(reason) => (failed(self.latest(base)), Event::TurnError(reason)),
+            Outcome::Failed(reason, conversation) => (conversation, Event::RunError(reason)),
+            Outcome::Error(reason) => (failed(self.latest(base)), Event::RunError(reason)),
             // Cancellation needs both the flag and reason Shutdown.
             Outcome::Down(reason) if self.cancelled && reason == Reason::atom("shutdown") => {
                 let mut conversation = self.latest(base);
                 conversation
-                    .add_assistant_blocks(vec![ContentBlock::text(voice::turn_cancelled_marker())]);
-                (conversation, Event::TurnCancelled)
+                    .add_assistant_blocks(vec![ContentBlock::text(voice::run_cancelled_marker())]);
+                (conversation, Event::RunCancelled)
             }
-            Outcome::Down(reason) => (failed(self.latest(base)), Event::TurnError(reason)),
+            Outcome::Down(reason) => (failed(self.latest(base)), Event::RunError(reason)),
         }
     }
 
-    // The checkpoint holds the partial Turn (per Tool Result); before the first
-    // one, the pre-Turn snapshot is all there is.
+    // The checkpoint holds the partial Run (per Tool Result); before the first
+    // one, the pre-Run snapshot is all there is.
     fn latest(&self, base: &Conversation) -> Conversation {
         self.checkpoint.clone().unwrap_or_else(|| base.clone())
     }
 }
 
-// Close a failed Turn with an assistant marker so roles keep alternating.
+// Close a failed Run with an assistant marker so roles keep alternating.
 fn failed(mut conversation: Conversation) -> Conversation {
-    conversation.add_assistant_blocks(vec![ContentBlock::text(voice::turn_failed_marker())]);
+    conversation.add_assistant_blocks(vec![ContentBlock::text(voice::run_failed_marker())]);
     conversation
 }
 
 fn log_entry(event: &Event) -> SettledEntry {
     match event {
-        Event::TurnFinished { stop_reason, .. } => {
+        Event::RunFinished { stop_reason, .. } => {
             SettledEntry::new(Settled::Completed, *stop_reason, None)
         }
-        Event::TurnError(reason) => {
+        Event::RunError(reason) => {
             SettledEntry::new(Settled::Failed, StopReason::Error, Some(reason.inspect()))
         }
-        Event::TurnCancelled => SettledEntry::new(Settled::Cancelled, StopReason::Unknown, None),
+        Event::RunCancelled => SettledEntry::new(Settled::Cancelled, StopReason::Unknown, None),
     }
 }
 
 // Rollover (CONTEXT.md): Cancellation discards the queue; any other settlement
-// auto-submits it, joined, as the next Turn's prompt.
+// auto-submits it, joined, as the next Run's prompt.
 fn rollover(event: &Event, steering: &[String]) -> Rollover {
     match event {
-        Event::TurnCancelled => Rollover::None,
+        Event::RunCancelled => Rollover::None,
         _ if steering.is_empty() => Rollover::None,
         _ => Rollover::Submit(steering.join("\n")),
     }
@@ -223,14 +223,14 @@ mod tests {
     use crate::conversation::{Conversation, ConversationOpts};
     use serde_json::json;
 
-    // The pre-Turn Conversation: system prompt plus the submitted user prompt.
+    // The pre-Run Conversation: system prompt plus the submitted user prompt.
     fn base() -> Conversation {
         let mut conv = Conversation::new("system", ConversationOpts::new(10_000, 0));
         conv.add_user_text("do the thing");
         conv
     }
 
-    // A partial-Turn checkpoint: one answered Tool Call on top of a conversation.
+    // A partial-Run checkpoint: one answered Tool Call on top of a conversation.
     fn checkpoint(mut conversation: Conversation) -> Conversation {
         conversation.add_assistant_blocks(vec![ContentBlock::tool_use(
             "t1",
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(resolution.conversation, final_conv);
         assert_eq!(
             resolution.event,
-            Event::TurnFinished {
+            Event::RunFinished {
                 stop_reason: StopReason::EndTurn,
                 token_estimate: final_conv.token_estimate(),
                 context_budget: final_conv.context_budget,
@@ -289,7 +289,7 @@ mod tests {
         final_conv.add_assistant_blocks(vec![ContentBlock::text("done")]);
 
         let resolution = Settlement::new().settle(
-            Outcome::Ok(final_conv.clone(), StopReason::TurnLimit),
+            Outcome::Ok(final_conv.clone(), StopReason::RunLimit),
             &base(),
             &[],
         );
@@ -297,8 +297,8 @@ mod tests {
         assert_eq!(resolution.conversation, final_conv);
         assert!(matches!(
             resolution.event,
-            Event::TurnFinished {
-                stop_reason: StopReason::TurnLimit,
+            Event::RunFinished {
+                stop_reason: StopReason::RunLimit,
                 ..
             }
         ));
@@ -317,7 +317,7 @@ mod tests {
         );
 
         assert_eq!(resolution.conversation, final_conv);
-        assert!(matches!(resolution.event, Event::TurnFinished { .. }));
+        assert!(matches!(resolution.event, Event::RunFinished { .. }));
     }
 
     // ---- failed with a conversation (Failed(reason, conv)) ----
@@ -328,7 +328,7 @@ mod tests {
         let mut closed = base();
         closed.add_assistant_blocks(vec![
             ContentBlock::text("partial thought"),
-            ContentBlock::text(voice::turn_failed_marker()),
+            ContentBlock::text(voice::run_failed_marker()),
         ]);
 
         let settlement = Settlement::new().note_checkpoint(checkpoint(base()));
@@ -340,26 +340,26 @@ mod tests {
         );
 
         assert_eq!(resolution.conversation, closed);
-        assert_eq!(resolution.event, Event::TurnError(Reason::atom("boom")));
+        assert_eq!(resolution.event, Event::RunError(Reason::atom("boom")));
     }
 
     // ---- failed ----
 
     #[test]
-    fn in_turn_error_with_no_checkpoint_closes_the_pre_turn_conversation() {
+    fn in_run_error_with_no_checkpoint_closes_the_pre_run_conversation() {
         let resolution =
             Settlement::new().settle(Outcome::Error(Reason::atom("timeout")), &base(), &[]);
 
-        assert_eq!(resolution.event, Event::TurnError(Reason::atom("timeout")));
+        assert_eq!(resolution.event, Event::RunError(Reason::atom("timeout")));
         assert_closed_with(
             &resolution.conversation,
             &base(),
-            voice::turn_failed_marker(),
+            voice::run_failed_marker(),
         );
     }
 
     #[test]
-    fn in_turn_error_with_a_checkpoint_the_partial_turn_survives() {
+    fn in_run_error_with_a_checkpoint_the_partial_run_survives() {
         let partial = checkpoint(base());
         let settlement = Settlement::new().note_checkpoint(partial.clone());
 
@@ -371,12 +371,12 @@ mod tests {
 
         assert_eq!(
             resolution.event,
-            Event::TurnError(Reason::atom("context_budget_exhausted"))
+            Event::RunError(Reason::atom("context_budget_exhausted"))
         );
         assert_closed_with(
             &resolution.conversation,
             &partial,
-            voice::turn_failed_marker(),
+            voice::run_failed_marker(),
         );
     }
 
@@ -394,7 +394,7 @@ mod tests {
         assert_closed_with(
             &resolution.conversation,
             &second,
-            voice::turn_failed_marker(),
+            voice::run_failed_marker(),
         );
     }
 
@@ -407,12 +407,12 @@ mod tests {
 
         assert_eq!(
             resolution.event,
-            Event::TurnError(Reason::tuple("{:badarg, []}"))
+            Event::RunError(Reason::tuple("{:badarg, []}"))
         );
         assert_closed_with(
             &resolution.conversation,
             &checkpoint(base()),
-            voice::turn_failed_marker(),
+            voice::run_failed_marker(),
         );
     }
 
@@ -421,11 +421,11 @@ mod tests {
         let resolution =
             Settlement::new().settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
-        assert_eq!(resolution.event, Event::TurnError(Reason::atom("shutdown")));
+        assert_eq!(resolution.event, Event::RunError(Reason::atom("shutdown")));
         assert_closed_with(
             &resolution.conversation,
             &base(),
-            voice::turn_failed_marker(),
+            voice::run_failed_marker(),
         );
     }
 
@@ -435,11 +435,11 @@ mod tests {
 
         let resolution = settlement.settle(Outcome::Down(Reason::atom("killed")), &base(), &[]);
 
-        assert_eq!(resolution.event, Event::TurnError(Reason::atom("killed")));
+        assert_eq!(resolution.event, Event::RunError(Reason::atom("killed")));
         assert_closed_with(
             &resolution.conversation,
             &base(),
-            voice::turn_failed_marker(),
+            voice::run_failed_marker(),
         );
     }
 
@@ -451,11 +451,11 @@ mod tests {
         final_conv.add_assistant_blocks(vec![ContentBlock::text("done")]);
 
         let resolution =
-            Settlement::new().settle(Outcome::Ok(final_conv, StopReason::TurnLimit), &base(), &[]);
+            Settlement::new().settle(Outcome::Ok(final_conv, StopReason::RunLimit), &base(), &[]);
 
         assert_eq!(
             resolution.log_entry,
-            SettledEntry::new(Settled::Completed, StopReason::TurnLimit, None)
+            SettledEntry::new(Settled::Completed, StopReason::RunLimit, None)
         );
     }
 
@@ -489,7 +489,7 @@ mod tests {
     // ---- Rollover (CONTEXT.md) ----
 
     #[test]
-    fn queued_steering_auto_submits_joined_after_a_completed_turn() {
+    fn queued_steering_auto_submits_joined_after_a_completed_run() {
         let mut final_conv = base();
         final_conv.add_assistant_blocks(vec![ContentBlock::text("done")]);
 
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_steering_rolls_over_after_a_failed_turn_too() {
+    fn queued_steering_rolls_over_after_a_failed_run_too() {
         let resolution = Settlement::new().settle(
             Outcome::Error(Reason::atom("timeout")),
             &base(),
@@ -555,25 +555,25 @@ mod tests {
 
         let resolution = settlement.settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
-        assert_eq!(resolution.event, Event::TurnCancelled);
+        assert_eq!(resolution.event, Event::RunCancelled);
         assert_closed_with(
             &resolution.conversation,
             &partial,
-            voice::turn_cancelled_marker(),
+            voice::run_cancelled_marker(),
         );
     }
 
     #[test]
-    fn with_no_checkpoint_the_pre_turn_conversation_is_the_base() {
+    fn with_no_checkpoint_the_pre_run_conversation_is_the_base() {
         let settlement = Settlement::new().note_cancelled();
 
         let resolution = settlement.settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
-        assert_eq!(resolution.event, Event::TurnCancelled);
+        assert_eq!(resolution.event, Event::RunCancelled);
         assert_closed_with(
             &resolution.conversation,
             &base(),
-            voice::turn_cancelled_marker(),
+            voice::run_cancelled_marker(),
         );
     }
 }

@@ -3,7 +3,7 @@
 //! ## What compaction is
 //!
 //! When the Conversation's token estimate approaches the Context Budget, old
-//! Turns are summarized by the LLM and replaced with a structured markdown
+//! Runs are summarized by the LLM and replaced with a structured markdown
 //! summary. Unlike Eviction (which mechanically hollows out Tool Results),
 //! compaction is semantic - it extracts what was accomplished, what decisions
 //! were made, and what files were touched.
@@ -11,7 +11,7 @@
 //! ## An effect, not part of the pure loop
 //!
 //! [`Compaction::run`] calls the [`Llm`] boundary directly - it is an effect,
-//! invoked via the Turn's `compact` Dep in production (ADR-0012), NOT inside
+//! invoked via the Run's `compact` Dep in production (ADR-0012), NOT inside
 //! the pure loop. It uses the Conversation's PURE helpers
 //! ([`Conversation::prepare_compaction`], [`Conversation::apply_compaction`],
 //! [`crate::conversation::extract_file_ops`]).
@@ -70,7 +70,7 @@ impl Compaction {
 
     /// Checks whether the Conversation's token estimate exceeds the Compaction
     /// Target (the same low-water mark Eviction settles to), meaning Proactive
-    /// Compaction should fire before the Turn's first Pass. The single
+    /// Compaction should fire before the Run's first Pass. The single
     /// definition of the trigger (baud's `Baud.Compaction.proactive?/1`):
     /// callers consult this rather than restating the comparison.
     pub fn proactive(conv: &Conversation) -> bool {
@@ -125,7 +125,7 @@ impl Compaction {
         Ok((compacted, new_state))
     }
 
-    /// Seeds a Handoff (CONTEXT.md: Handoff - the Recovery Turn shape that
+    /// Seeds a Handoff (CONTEXT.md: Handoff - the Recovery Run shape that
     /// retires the Conversation): the model narrative over the WHOLE dying
     /// Conversation, the mechanical facts appended outside the LLM exactly as
     /// Compaction does, the verification result verbatim, and `prompt` merged
@@ -240,7 +240,7 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
         Ok(extract_summary(&response.content))
     }
 
-    /// Convenience wrapper for use as a Turn `compact` Dep capture: runs and
+    /// Convenience wrapper for use as a Run `compact` Dep capture: runs and
     /// drops the new state - the caller fires the state update separately.
     /// Returns `Ok(conversation)` or `Err(reason)`.
     pub async fn recovery_capture(
@@ -288,7 +288,7 @@ impl Default for Compaction {
 
 /// A seeded Handoff (CONTEXT.md: Handoff): the fresh Conversation (seed
 /// message + recovery prompt, everything else retired), the updated
-/// compaction state the recovery Turn carries forward, and the two facts the
+/// compaction state the recovery Run carries forward, and the two facts the
 /// Session Log entry needs beyond the state - the narrative actually used
 /// (`None` when degraded) and the final verification result verbatim.
 #[derive(Debug, Clone, PartialEq)]
@@ -371,13 +371,13 @@ mod tests {
         ConversationOpts::new(2000, 500).eviction_slack(0.0)
     }
 
-    fn conversation_with_turns(count: u64) -> Conversation {
+    fn conversation_with_runs(count: u64) -> Conversation {
         let mut conv = Conversation::new("You are Baud.", opts());
-        add_turns(&mut conv, count);
+        add_runs(&mut conv, count);
         conv
     }
 
-    fn add_turns(conv: &mut Conversation, n: u64) {
+    fn add_runs(conv: &mut Conversation, n: u64) {
         for i in (1..=n).rev() {
             let content = format!("{}: turn {i}", "line ".repeat(50));
             conv.add_user_text(content.clone());
@@ -448,8 +448,8 @@ mod tests {
         // The trigger is strict: AT the Compaction Target the Conversation
         // still fits, so nothing fires. The estimate rides the usage floor
         // (`token_estimate` is the char estimate floored by the usage's
-        // context floor), the binding term at Turn start when the previous
-        // Turn's usage is on record.
+        // context floor), the binding term at Run start when the previous
+        // Run's usage is on record.
         let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).eviction_slack(0.0));
         conv.add_user_text("short");
         assert_eq!(conv.compaction_target(), 800);
@@ -485,7 +485,7 @@ mod tests {
         let fake = FakeLlm::script(vec![Entry::just(ok_response(
             "## Goal\nTest compaction\n## Progress\n### Done\n- completed",
         ))]);
-        let conv = conversation_with_turns(5);
+        let conv = conversation_with_runs(5);
         let (compacted, new_state) = Compaction::new()
             .run(&conv, &fake, &test_model(), None)
             .await
@@ -516,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn returns_error_when_llm_fails() {
         let fake = FakeLlm::script(vec![Entry::error("server_busy")]);
-        let conv = conversation_with_turns(5);
+        let conv = conversation_with_runs(5);
         let result = Compaction::new()
             .run(&conv, &fake, &test_model(), None)
             .await;
@@ -561,7 +561,7 @@ mod tests {
 
         let mut conv = Conversation::new("You are Baud.", opts());
         conv.add_user_text(task);
-        add_turns(&mut conv, 5);
+        add_runs(&mut conv, 5);
 
         let (_compacted, new_state) = Compaction::new()
             .run(&conv, &fake, &test_model(), None)
@@ -579,7 +579,7 @@ mod tests {
 
         let mut conv = Conversation::new("You are Baud.", opts());
         conv.add_user_text(task);
-        add_turns(&mut conv, 5);
+        add_runs(&mut conv, 5);
 
         let (compacted, _new_state) = Compaction::new()
             .run(&conv, &fake, &test_model(), None)
@@ -624,7 +624,7 @@ mod tests {
 
         let mut conv = Conversation::new("You are Baud.", opts());
         conv.add_user_text(task);
-        add_turns(&mut conv, 5);
+        add_runs(&mut conv, 5);
 
         let (mut compacted1, state1) = Compaction::new()
             .run(&conv, &fake, &test_model(), None)
@@ -635,7 +635,7 @@ mod tests {
         // Grow the conversation again and compact a second time. The summary
         // message the first compaction produced no longer starts with the
         // original user text, so only the carried state can preserve it.
-        add_turns(&mut compacted1, 5);
+        add_runs(&mut compacted1, 5);
         let (compacted2, state2) = state1
             .run(&compacted1, &fake, &test_model(), None)
             .await
@@ -804,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_capture_returns_ok_conversation_on_success() {
         let fake = FakeLlm::script(vec![Entry::just(ok_response("summary data"))]);
-        let conv = conversation_with_turns(5);
+        let conv = conversation_with_runs(5);
 
         let compacted = Compaction::new()
             .recovery_capture(&conv, &fake, &test_model(), None)
@@ -816,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_capture_returns_error_on_llm_failure() {
         let fake = FakeLlm::script(vec![Entry::error("timeout")]);
-        let conv = conversation_with_turns(5);
+        let conv = conversation_with_runs(5);
         let result = Compaction::new()
             .recovery_capture(&conv, &fake, &test_model(), None)
             .await;
@@ -857,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn counts_the_messages_a_compaction_folded_into_the_single_summary() {
         let fake = FakeLlm::script(vec![Entry::just(ok_response("narr"))]);
-        let conv = conversation_with_turns(5);
+        let conv = conversation_with_runs(5);
         let (compacted, _state) = Compaction::new()
             .run(&conv, &fake, &test_model(), None)
             .await

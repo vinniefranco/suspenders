@@ -5,7 +5,7 @@
 //! The Scout is reached through the `scout` capture on the ctx (an effect
 //! wired to the Session), so this Tool stays a plain [`Tool`].
 //!
-//! ## Never crashes the Turn
+//! ## Never crashes the Run
 //!
 //! Every Scout failure mode - an LLM error, empty findings, or hitting the
 //! Scout's hard Pass cap - comes back as an ordinary Tool Result. Failures are

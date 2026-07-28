@@ -16,7 +16,7 @@
 //!
 //! A slash draft is `/name[ rest]`: the FIRST space separates the command token
 //! (`name`) from an optional remainder (`rest`). [`parse`] splits it; [`lookup`]
-//! resolves a name to a descriptor; [`rows`] turns the (optionally
+//! resolves a name to a descriptor; [`rows`] runs the (optionally
 //! token-filtered) registry into [`SelectorRow`]s so the menu renders through
 //! the generic selector.
 

@@ -13,7 +13,7 @@
 //! caller's own arms (scroll, display toggles, Escape-as-Cancellation).
 //! Contextual ownership therefore lives in ONE place: the wheel navigates an
 //! open overlay here but scrolls the viewport there; Escape closes an open
-//! overlay here but cancels the Turn there. [`Composer::apply_event`] is the
+//! overlay here but cancels the Run there. [`Composer::apply_event`] is the
 //! same shape over events - the overlay-filling deliveries are consumed
 //! (stale ones absorbed), everything else refused untouched - so a future
 //! overlay fed by a new event slots in without a new arm in the fold root.
@@ -240,7 +240,7 @@ impl Composer {
     ///   no-op), and Up/Down (edge-triggered history recall from the draft's
     ///   first/last line, cursor movement everywhere else).
     /// * Consumed ONLY while an overlay is open: Escape (closes it, emptying
-    ///   the Composer - there is no Turn to cancel, the overlay is a Composer
+    ///   the Composer - there is no Run to cancel, the overlay is a Composer
     ///   state) and the wheel (navigates its rows). Refused otherwise, so
     ///   Escape-as-Cancellation and wheel-scroll stay the caller's.
     /// * ALWAYS refused: PageUp/PageDown, the display toggles,
@@ -349,7 +349,7 @@ impl Composer {
                 }
             }
             Key::Escape => {
-                // Close the overlay and empty the Composer (no Turn to
+                // Close the overlay and empty the Composer (no Run to
                 // cancel - the overlay is a Composer state).
                 self.close_selector();
                 consumed(vec![])
@@ -389,7 +389,7 @@ impl Composer {
             }
             // Commit the highlighted command. An empty filtered menu
             // means the typed token matches no command: surface an
-            // unknown-command notice, start no Turn, clear the draft.
+            // unknown-command notice, start no Run, clear the draft.
             Key::Enter => self.commit_command(rows.into_iter().nth(self.slash_cursor)),
             // Typing a space after a command token also commits it
             // (the palette convention): the space is the menu→command
@@ -401,7 +401,7 @@ impl Composer {
                 self.commit_command(rows.into_iter().nth(self.slash_cursor))
             }
             // Escape closes the menu by clearing the draft - there is
-            // no Turn to cancel: the menu is a Composer state, so
+            // no Run to cancel: the menu is a Composer state, so
             // leaving it empties the Composer.
             Key::Escape => {
                 self.clear();
@@ -1563,7 +1563,7 @@ mod tests {
         // The event first-refusal contract: everything that is not an
         // overlay fill comes back exactly as offered.
         let mut c = fresh();
-        let event = Event::turn_started("r1");
+        let event = Event::run_started("r1");
         match c.apply_event(event.clone()) {
             EventOutcome::Refused(back) => assert_eq!(back, event),
             other => panic!("expected a refusal, got {other:?}"),

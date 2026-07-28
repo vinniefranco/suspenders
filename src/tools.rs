@@ -1,8 +1,8 @@
 //! Registry of Suspenders tools.
 //!
 //! Registry order is prompt order: the order the model sees the tool specs.
-//! [`execute`] turns every outcome into a `{content, is_error}` Tool Result, so
-//! a tool can never crash the Turn. [`run`] adds Shaping on top - the
+//! [`execute`] runs every outcome into a `{content, is_error}` Tool Result, so
+//! a tool can never crash the Run. [`run`] adds Shaping on top - the
 //! plugin-free dispatch path.
 
 pub mod edit_file;
@@ -90,7 +90,7 @@ pub fn verification_specs() -> Vec<ToolSpec> {
 /// with the Voice's refusal and never runs. Small local models hallucinate
 /// Tool Calls the request never offered; the refusal is the mechanic.
 ///
-/// The Turn's batch (`turn::batch`) deliberately does NOT share this: it
+/// The Run's batch (`run::batch`) deliberately does NOT share this: it
 /// interleaves the Governor answering arbiter, the Plugin lifecycle, the
 /// Approval gate, Ledger recording, and per-result checkpointing around each
 /// call - none of which a read-only Scout has. The shared unit is only this

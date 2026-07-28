@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn user_tail_text_follows_the_tool_messages() {
-        // The Turn's results tail (a Nudge riding the results) stays after
+        // The Run's results tail (a Nudge riding the results) stays after
         // the tool messages, as it does in the typed message.
         let mut out = Vec::new();
         wire_messages(

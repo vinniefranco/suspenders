@@ -4,16 +4,16 @@
 //! no-think rescue (CONTEXT.md: Governor, Nudge, Thinking; ADR-0026).
 //!
 //! * **Trigger**: [`is_empty_reply`], a pure predicate over the finishing
-//!   response's content blocks, gated by the private once-per-Turn cap
+//!   response's content blocks, gated by the private once-per-Run cap
 //!   (`nudged`, re-armed by progress - [`Empty::note_progress`]) and the
 //!   rescue's private state machine (`RescueState`: Off, Armed for one Pass,
-//!   or Sticky for the rest of the Turn) alongside the running `empty_count`.
+//!   or Sticky for the rest of the Run) alongside the running `empty_count`.
 //!   Progress never disarms the rescue.
 //! * **Interventions**: stands alone as a user message at the finish
 //!   settlement (the Empty-response Nudge - the model gets one more Pass),
 //!   and silences Thinking for a Pass at the request-shaping moment (the
 //!   rescue: after the Nudge fires, the very next model call carries
-//!   no_think, then reverts - unless the SECOND empty of the Turn has made
+//!   no_think, then reverts - unless the SECOND empty of the Run has made
 //!   the rescue sticky). Consulting the shaping moment consumes the one-Pass
 //!   arm ([`Empty::consume_rescue`]).
 //! * **Setpoints**: [`Setpoints`] - whether the rescue may arm at all. This
@@ -31,7 +31,7 @@ use crate::content::ContentBlock;
 use crate::voice;
 
 /// The empty Governor's Setpoints (CONTEXT.md: Setpoint). Fed by the
-/// Session's resolved `no_think_rescue` knob at Turn start.
+/// Session's resolved `no_think_rescue` knob at Run start.
 #[derive(Debug, Clone)]
 pub struct Setpoints {
     /// May the break-glass no-think rescue arm after an Empty-response Nudge?
@@ -47,7 +47,7 @@ impl Default for Setpoints {
 }
 
 /// The no-think rescue's state machine: disarmed, armed for exactly one
-/// Pass, or sticky for the rest of the Turn. Sticky never downgrades.
+/// Pass, or sticky for the rest of the Run. Sticky never downgrades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum RescueState {
     /// Not armed: the next model call keeps Thinking.
@@ -55,7 +55,7 @@ enum RescueState {
     Off,
     /// Armed for one Pass: consumed by the next request-shaping moment.
     Armed,
-    /// Armed for the rest of the Turn: consuming leaves it armed.
+    /// Armed for the rest of the Run: consuming leaves it armed.
     Sticky,
 }
 
@@ -78,15 +78,15 @@ impl Empty {
         }
     }
 
-    /// Does end-of-turn owe the Empty-response Nudge?
+    /// Does end-of-run owe the Empty-response Nudge?
     pub fn due(&self) -> bool {
         !self.nudged
     }
 
-    /// The Empty-response Nudge fired: the once-per-Turn cap sets (UNTIL
+    /// The Empty-response Nudge fired: the once-per-Run cap sets (UNTIL
     /// progress re-arms it), the empty count advances, and - when the
     /// setpoint allows - the no-think rescue arms for the very next model
-    /// call, going STICKY on the second empty of the Turn. With the setpoint
+    /// call, going STICKY on the second empty of the Run. With the setpoint
     /// off nothing arms, and a Sticky rescue never downgrades.
     pub fn note_fired(&mut self) {
         self.empty_count += 1;

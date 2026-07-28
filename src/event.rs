@@ -1,5 +1,5 @@
-//! The event vocabulary between the Turn, the Agent, and the Transcript - one
-//! authoritative enumeration of every shape that flows as a turn/agent event
+//! The event vocabulary between the Run, the Agent, and the Transcript - one
+//! authoritative enumeration of every shape that flows as a run/agent event
 //! (baud's `{:turn_event, ...}` / `{:baud_event, ...}` payloads).
 //!
 //! baud keeps the wire shape as bare tuples; what `Baud.Event` adds is a
@@ -8,8 +8,8 @@
 //! across five files. This is the Rust port of that single author: a typed
 //! [`Event`] enum with the same variants and the same constructor helpers.
 //!
-//! Settlement events ([`Event::TurnFinished`], [`Event::TurnError`],
-//! [`Event::TurnCancelled`]) are constructed by the Turn's settlement as part
+//! Settlement events ([`Event::RunFinished`], [`Event::RunError`],
+//! [`Event::RunCancelled`]) are constructed by the Run's settlement as part
 //! of its resolution; their shapes are enumerated here with everything else.
 //!
 //! An event the Transcript does not know is still silently ignored by its
@@ -75,7 +75,7 @@ impl VoicedTag {
     /// The marker-plane [`Tone`] this rider carries (ADR-0040), stamped HERE at
     /// the firing-site authority so no downstream fold classifies by kind or
     /// text. A Governor's Nudge helps the model along ([`Tone::Aid`]); the
-    /// Endgame's turn-closing schedule limits it ([`Tone::Constrain`]).
+    /// Endgame's run-closing schedule limits it ([`Tone::Constrain`]).
     pub fn tone(self) -> Tone {
         match self {
             VoicedTag::VerifyNudge
@@ -89,17 +89,17 @@ impl VoicedTag {
     }
 }
 
-/// Every event shape the Turn and the Agent emit.
+/// Every event shape the Run and the Agent emit.
 ///
 /// The `artifacts` on [`Event::ToolResult`] is display-side Plugin data
 /// (CONTEXT.md: Artifact) - a `HashMap<String, Value>`, `{}` when no plugin
 /// attached any; it never enters the Conversation, is never shaped or evicted.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    // ---- Turn lifecycle ----
-    /// A Turn began; carries the Turn's reference. baud uses `reference()`;
+    // ---- Run lifecycle ----
+    /// A Run began; carries the Run's reference. baud uses `reference()`;
     /// the Rust port carries an opaque string id.
-    TurnStarted(String),
+    RunStarted(String),
     MessageStart {
         pass: u32,
     },
@@ -176,7 +176,7 @@ pub enum Event {
     },
     /// The Session's cumulative dollar cost after a priced Response (ADR-0037:
     /// pricing rides the Catalog Model; surfacing is display-side only).
-    /// Emitted by the metered boundary for every priced call - main Turn,
+    /// Emitted by the metered boundary for every priced call - main Run,
     /// Scout, and Compaction alike - and never for an unpriced (local/custom)
     /// Model, so a local-only Session sees none of these. Never logged: cost
     /// enters neither the Conversation nor the Session Log.
@@ -219,10 +219,10 @@ pub enum Event {
         text: String,
     },
 
-    /// A Recovery Turn opened (CONTEXT.md: Recovery Turn): carries the arm
+    /// A Recovery Run opened (CONTEXT.md: Recovery Run): carries the arm
     /// taken and the Voice-authored prompt that starts it - the prompt enters
     /// the Conversation, so the Transcript must show it.
-    RecoveryTurn {
+    RecoveryRun {
         shape: RecoveryShape,
         text: String,
     },
@@ -270,23 +270,23 @@ pub enum Event {
     },
 
     // ---- Settlement ----
-    TurnFinished {
+    RunFinished {
         stop_reason: StopReason,
         token_estimate: u64,
         context_budget: u64,
     },
-    TurnCancelled,
-    /// A Turn failed; carries the reason (baud's `term()`).
-    TurnError {
+    RunCancelled,
+    /// A Run failed; carries the reason (baud's `term()`).
+    RunError {
         reason: String,
     },
 }
 
 impl Event {
-    // ---- Turn lifecycle ----
+    // ---- Run lifecycle ----
 
-    pub fn turn_started(reference: impl Into<String>) -> Self {
-        Event::TurnStarted(reference.into())
+    pub fn run_started(reference: impl Into<String>) -> Self {
+        Event::RunStarted(reference.into())
     }
 
     pub fn message_start(pass: u32) -> Self {
@@ -369,8 +369,8 @@ impl Event {
         Event::Anchor { text: text.into() }
     }
 
-    pub fn recovery_turn(shape: RecoveryShape, text: impl Into<String>) -> Self {
-        Event::RecoveryTurn {
+    pub fn recovery_run(shape: RecoveryShape, text: impl Into<String>) -> Self {
+        Event::RecoveryRun {
             shape,
             text: text.into(),
         }

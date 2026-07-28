@@ -6,7 +6,7 @@
 // for the dead-subscriber test → tokio's auto-cleaning broadcast (a dropped
 // Receiver is pruned on the next send), noted where it adapts baud's monitor.
 // The busy/steer/cancel handshakes use the FakeLlm `Barrier` entry: the test
-// observes the Turn parked mid-`complete`, then releases (or aborts) it.
+// observes the Run parked mid-`complete`, then releases (or aborts) it.
 // ===========================================================================
 use super::*;
 use crate::content::{ContentBlock, Message, Role, Usage};
@@ -47,7 +47,7 @@ fn start(session: Session, fake: FakeLlm) -> AgentHandle {
 
 // Starts an Agent over the DEFAULT (Voice) system prompt - the compaction
 // test needs the real prompt's bulk in the token estimate so the small
-// Turns cross the compaction target (baud's agent runs the default prompt +
+// Runs cross the compaction target (baud's agent runs the default prompt +
 // context files; the Rust test uses the Voice default alone).
 fn start_voiced(session: Session, fake: FakeLlm) -> AgentHandle {
     AgentHandle::start(StartOpts::new(session, Arc::new(fake))).expect("agent starts")
@@ -117,11 +117,11 @@ async fn refute_match(rx: &mut broadcast::Receiver<Event>, pred: impl Fn(&Event)
     }
 }
 
-fn is_turn_started(e: &Event) -> bool {
-    matches!(e, Event::TurnStarted(_))
+fn is_run_started(e: &Event) -> bool {
+    matches!(e, Event::RunStarted(_))
 }
-fn is_turn_finished(e: &Event) -> bool {
-    matches!(e, Event::TurnFinished { .. })
+fn is_run_finished(e: &Event) -> bool {
+    matches!(e, Event::RunFinished { .. })
 }
 
 // ---- subscribe + submit happy path -----------------------------------
@@ -145,8 +145,8 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
     assert_eq!(agent.status().await, Status::Idle);
     agent.submit("hi there").await.unwrap();
 
-    let started = recv_match(&mut rx, is_turn_started).await;
-    assert!(matches!(started, Event::TurnStarted(_)));
+    let started = recv_match(&mut rx, is_run_started).await;
+    assert!(matches!(started, Event::RunStarted(_)));
 
     recv_match(&mut rx, |e| matches!(e, Event::MessageStart { pass: 1 })).await;
     recv_match(&mut rx, |e| {
@@ -178,8 +178,8 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
     })
     .await;
 
-    let finished = recv_match(&mut rx, is_turn_finished).await;
-    if let Event::TurnFinished {
+    let finished = recv_match(&mut rx, is_run_finished).await;
+    if let Event::RunFinished {
         stop_reason,
         token_estimate,
         context_budget,
@@ -197,7 +197,7 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
         conv.messages,
         vec![
             Message::user(vec![ContentBlock::text("hi there")]),
-            // The reply enters stamped with the Turn's captured Model.
+            // The reply enters stamped with the Run's captured Model.
             Message::assistant_from(vec![ContentBlock::text("Hello")], provenance),
         ]
     );
@@ -255,14 +255,14 @@ async fn an_unpriced_model_broadcasts_no_session_cost() {
 
     agent.submit("hi").await.unwrap();
 
-    // Watch the whole Turn: a cost event anywhere in it fails (a metered
+    // Watch the whole Run: a cost event anywhere in it fails (a metered
     // zero is silence, not a $0.00), so the first match must be the finish.
     let ev = recv_match(&mut rx, |e| {
-        matches!(e, Event::SessionCost { .. }) || is_turn_finished(e)
+        matches!(e, Event::SessionCost { .. }) || is_run_finished(e)
     })
     .await;
     assert!(
-        is_turn_finished(&ev),
+        is_run_finished(&ev),
         "unpriced model emitted a cost event: {ev:?}"
     );
 }
@@ -270,7 +270,7 @@ async fn an_unpriced_model_broadcasts_no_session_cost() {
 // ---- busy rejection ---------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn submit_while_running_is_busy_idle_again_after_the_turn() {
+async fn submit_while_running_is_busy_idle_again_after_the_run() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let fake = FakeLlm::script(vec![barrier]);
@@ -279,7 +279,7 @@ async fn submit_while_running_is_busy_idle_again_after_the_turn() {
 
     agent.submit("first").await.unwrap();
 
-    // The Turn is parked mid-complete.
+    // The Run is parked mid-complete.
     let InFlight { release, .. } = inflight.recv().await.expect("in-flight signal");
     assert_eq!(agent.status().await, Status::Running);
     assert_eq!(agent.submit("second").await, Err(Busy));
@@ -291,7 +291,7 @@ async fn submit_while_running_is_busy_idle_again_after_the_turn() {
         })
         .ok();
 
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -337,7 +337,7 @@ async fn denied_run_command_is_never_executed_and_yields_the_denial_tool_result(
             if id == "tu_run" && content == "[command denied by user]")
     })
     .await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     assert!(!marker.exists(), "the command never ran");
 
@@ -391,7 +391,7 @@ async fn approved_run_command_executes_and_returns_its_output() {
     if let Event::ToolResult { content, .. } = result {
         assert!(content.contains("hi"));
     }
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 }
 
 // ---- standing approval ------------------------------------------------
@@ -452,7 +452,7 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
     if let Event::ToolResult { content, .. } = r2 {
         assert!(content.contains("hi"));
     }
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -508,7 +508,7 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
             if id == "r2" && content == "[command denied by user]")
     })
     .await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 }
 
 // ---- steering ---------------------------------------------------------
@@ -521,7 +521,7 @@ async fn steer_while_idle_is_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn steer_mid_turn_is_drained_after_the_tool_batch_and_delivered_unadorned() {
+async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let (second_tx, mut second_rx) = mpsc::unbounded_channel::<LlmRequest>();
@@ -569,11 +569,11 @@ async fn steer_mid_turn_is_drained_after_the_tool_batch_and_delivered_unadorned(
     ));
     assert_eq!(last.content[1], ContentBlock::text("also check the README"));
 
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rollover_steering_the_turn_never_drained_auto_submits_the_next_turn() {
+async fn rollover_steering_the_run_never_drained_auto_submits_the_next_run() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let (roll_tx, mut roll_rx) = mpsc::unbounded_channel::<LlmRequest>();
@@ -590,7 +590,7 @@ async fn rollover_steering_the_turn_never_drained_auto_submits_the_next_turn() {
     agent.submit("first thing").await.unwrap();
 
     let InFlight { release, .. } = inflight.recv().await.expect("first call parked");
-    // No tool batch ever runs, so this steering misses its Turn.
+    // No tool batch ever runs, so this steering misses its Run.
     agent.steer("and then this").await.unwrap();
     release
         .send(Release {
@@ -599,15 +599,15 @@ async fn rollover_steering_the_turn_never_drained_auto_submits_the_next_turn() {
         })
         .ok();
 
-    recv_match(&mut rx, is_turn_finished).await;
-    recv_match(&mut rx, is_turn_started).await;
+    recv_match(&mut rx, is_run_finished).await;
+    recv_match(&mut rx, is_run_started).await;
 
     let request = roll_rx.recv().await.expect("rollover request");
     let last = request.messages.last().unwrap();
     assert_eq!(last.role, Role::User);
     assert_eq!(last.content[0], ContentBlock::text("and then this"));
 
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -619,15 +619,15 @@ async fn cancellation_discards_queued_steering_no_rollover() {
     let mut rx = agent.subscribe();
 
     agent.submit("slow work").await.unwrap();
-    recv_match(&mut rx, is_turn_started).await;
+    recv_match(&mut rx, is_run_started).await;
 
-    // The Turn parks in complete forever (we never release it).
+    // The Run parks in complete forever (we never release it).
     let _inflight = inflight.recv().await.expect("parked");
     agent.steer("never mind this").await.unwrap();
     agent.cancel().await;
 
-    recv_match(&mut rx, |e| matches!(e, Event::TurnCancelled)).await;
-    refute_match(&mut rx, is_turn_started).await;
+    recv_match(&mut rx, |e| matches!(e, Event::RunCancelled)).await;
+    refute_match(&mut rx, is_run_started).await;
     assert_eq!(agent.status().await, Status::Idle);
 
     // The discarded text never entered the Conversation.
@@ -640,7 +640,7 @@ async fn cancellation_discards_queued_steering_no_rollover() {
 // ---- cancellation -----------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cancel_mid_turn_emits_turn_cancelled_and_records_the_cancellation() {
+async fn cancel_mid_run_emits_run_cancelled_and_records_the_cancellation() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let agent = start(session_in(&dir), FakeLlm::script(vec![barrier]));
@@ -650,7 +650,7 @@ async fn cancel_mid_turn_emits_turn_cancelled_and_records_the_cancellation() {
     let _inflight = inflight.recv().await.expect("parked in llm");
     agent.cancel().await;
 
-    recv_match(&mut rx, |e| matches!(e, Event::TurnCancelled)).await;
+    recv_match(&mut rx, |e| matches!(e, Event::RunCancelled)).await;
     assert_eq!(agent.status().await, Status::Idle);
 
     let conv = agent.conversation().await;
@@ -661,7 +661,7 @@ async fn cancel_mid_turn_emits_turn_cancelled_and_records_the_cancellation() {
     );
     assert_eq!(
         conv.messages[n - 1],
-        Message::assistant(vec![ContentBlock::text(voice::turn_cancelled_marker())])
+        Message::assistant(vec![ContentBlock::text(voice::run_cancelled_marker())])
     );
 }
 
@@ -674,7 +674,7 @@ async fn cancel_when_idle_is_a_no_op() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cancel_after_a_tool_ran_keeps_the_partial_turn() {
+async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
     let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let script = vec![
@@ -695,7 +695,7 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_turn() {
     let _inflight = inflight.recv().await.expect("second call parked");
     agent.cancel().await;
 
-    recv_match(&mut rx, |e| matches!(e, Event::TurnCancelled)).await;
+    recv_match(&mut rx, |e| matches!(e, Event::RunCancelled)).await;
 
     let conv = agent.conversation().await;
     let tail: Vec<_> = conv.messages.iter().rev().take(3).rev().cloned().collect();
@@ -705,14 +705,14 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_turn() {
         Message { role: Role::User, content, .. } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
     assert_eq!(
         tail[2],
-        Message::assistant(vec![ContentBlock::text(voice::turn_cancelled_marker())])
+        Message::assistant(vec![ContentBlock::text(voice::run_cancelled_marker())])
     );
 }
 
-// ---- turn error -------------------------------------------------------
+// ---- run error -------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn llm_error_emits_turn_error_keeps_user_message_and_closes_with_failure_marker() {
+async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_marker() {
     let dir = TempDir::new().unwrap();
     let session = session_in(&dir);
     let provenance = session.model.provenance();
@@ -723,7 +723,7 @@ async fn llm_error_emits_turn_error_keeps_user_message_and_closes_with_failure_m
 
     recv_match(
         &mut rx,
-        |e| matches!(e, Event::TurnError { reason } if reason == "boom"),
+        |e| matches!(e, Event::RunError { reason } if reason == "boom"),
     )
     .await;
     assert_eq!(agent.status().await, Status::Idle);
@@ -739,14 +739,14 @@ async fn llm_error_emits_turn_error_keeps_user_message_and_closes_with_failure_m
     assert_eq!(
         conv.messages[n - 1],
         Message::assistant_from(
-            vec![ContentBlock::text(voice::turn_failed_marker())],
+            vec![ContentBlock::text(voice::run_failed_marker())],
             provenance
         )
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_llm_error_after_a_tool_ran_keeps_the_partial_turn_under_the_failure_marker() {
+async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_marker() {
     let dir = TempDir::new().unwrap();
     let script = vec![
         Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
@@ -761,7 +761,7 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_turn_under_the_failure_
 
     recv_match(
         &mut rx,
-        |e| matches!(e, Event::TurnError { reason } if reason == "boom"),
+        |e| matches!(e, Event::RunError { reason } if reason == "boom"),
     )
     .await;
 
@@ -774,14 +774,14 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_turn_under_the_failure_
     assert_eq!(
         tail[2],
         Message::assistant_from(
-            vec![ContentBlock::text(voice::turn_failed_marker())],
+            vec![ContentBlock::text(voice::run_failed_marker())],
             provenance
         )
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error_reason() {
+async fn a_run_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error_reason() {
     let dir = TempDir::new().unwrap();
     let session = session_in(&dir);
     let session_dir = session.session_dir.clone();
@@ -796,7 +796,7 @@ async fn a_turn_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_erro
 
     recv_match(
         &mut rx,
-        |e| matches!(e, Event::TurnError { reason } if reason.contains("connection refused")),
+        |e| matches!(e, Event::RunError { reason } if reason.contains("connection refused")),
     )
     .await;
     assert_eq!(agent.status().await, Status::Idle);
@@ -835,7 +835,7 @@ async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
     let mut rx = first.subscribe();
 
     first.submit("look around").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     let live = first.conversation().await;
     drop(first);
@@ -854,9 +854,9 @@ async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
     assert_eq!(info.drift, vec![]);
 }
 
-// ---- Recovery Turns (Continuation + Handoff) ---------------------------
+// ---- Recovery Runs (Continuation + Handoff) ---------------------------
 
-// A Session whose every Turn caps on Pass 2 - one working Pass, then a
+// A Session whose every Run caps on Pass 2 - one working Pass, then a
 // tool-insistent final Pass (refused at dispatch, ADR-0035) - so any
 // unfinished work triggers the Endgame Governor's recovery judgment.
 fn recovery_session(dir: &TempDir, shape: crate::session::RecoveryShape) -> Session {
@@ -866,7 +866,7 @@ fn recovery_session(dir: &TempDir, shape: crate::session::RecoveryShape) -> Sess
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(2),
+            run_limit: Some(2),
             recovery_shape: Some(shape),
             ..Default::default()
         },
@@ -880,14 +880,14 @@ fn write_tool(id: &str, path: &str) -> Response {
 }
 
 // A tool-insistent reply on the final Pass: the call is refused at dispatch
-// (ADR-0035; ADR-0015 withdrew the Tools), and the refusal carries the Turn
-// to its cap. (turn/loop_.rs keeps its own copy - see its note.)
+// (ADR-0035; ADR-0015 withdrew the Tools), and the refusal carries the Run
+// to its cap. (run/loop_.rs keeps its own copy - see its note.)
 fn insistent_reply(id: &str) -> Response {
     tool_use_result(id, "list_files", json!({ "path": "." }))
 }
 
-fn is_recovery_turn(e: &Event) -> bool {
-    matches!(e, Event::RecoveryTurn { .. })
+fn is_recovery_run(e: &Event) -> bool {
+    matches!(e, Event::RecoveryRun { .. })
 }
 
 // All user-role text blocks of a conversation, flattened.
@@ -904,33 +904,33 @@ fn user_texts(conv: &Conversation) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_capped_unfinished_turn_opens_a_continuation_recovery_turn() {
+async fn a_capped_unfinished_run_opens_a_continuation_recovery_run() {
     let dir = TempDir::new().unwrap();
     let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
     let session_dir = session.session_dir.clone();
     let script = vec![
-        Entry::just(write_tool("w1", "a.txt")), // Turn 1 Pass 1: the write lands.
-        Entry::just(insistent_reply("x1")),     // Turn 1 Pass 2: refused, caps unverified.
-        Entry::just(text_end("recovered and done")), // The Recovery Turn.
+        Entry::just(write_tool("w1", "a.txt")), // Run 1 Pass 1: the write lands.
+        Entry::just(insistent_reply("x1")),     // Run 1 Pass 2: refused, caps unverified.
+        Entry::just(text_end("recovered and done")), // The Recovery Run.
     ];
     let agent = start(session, FakeLlm::script(script));
     let mut rx = agent.subscribe();
 
     agent.submit("write the file").await.unwrap();
 
-    // The capped Turn settles, then the harness opens the Recovery Turn.
-    recv_match(&mut rx, is_turn_finished).await;
-    let recovery = recv_match(&mut rx, is_recovery_turn).await;
+    // The capped Run settles, then the harness opens the Recovery Run.
+    recv_match(&mut rx, is_run_finished).await;
+    let recovery = recv_match(&mut rx, is_recovery_run).await;
     let prompt = match &recovery {
-        Event::RecoveryTurn { shape, text } => {
+        Event::RecoveryRun { shape, text } => {
             assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
             text.clone()
         }
         _ => unreachable!(),
     };
     assert_eq!(prompt, voice::recovery_prompt(false));
-    recv_match(&mut rx, is_turn_started).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_started).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 
     // The Conversation was KEPT: the original prompt and the Voice's
@@ -952,10 +952,10 @@ async fn a_capped_unfinished_turn_opens_a_continuation_recovery_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_turn_never_resets_it() {
+async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_run_never_resets_it() {
     let dir = TempDir::new().unwrap();
     let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
-    // Turn 1 caps unverified -> one recovery; the Recovery Turn ALSO caps
+    // Run 1 caps unverified -> one recovery; the Recovery Run ALSO caps
     // unverified, but the request's budget (limit 1) is spent.
     let script = vec![
         Entry::just(write_tool("w1", "a.txt")),
@@ -968,13 +968,13 @@ async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_turn_never_re
 
     agent.submit("write the files").await.unwrap();
 
-    recv_match(&mut rx, is_turn_finished).await;
-    recv_match(&mut rx, is_recovery_turn).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
+    recv_match(&mut rx, is_recovery_run).await;
+    recv_match(&mut rx, is_run_finished).await;
 
-    // No third Turn: the capped Recovery Turn settles and the Agent idles.
-    refute_match(&mut rx, is_recovery_turn).await;
-    refute_match(&mut rx, is_turn_started).await;
+    // No third Run: the capped Recovery Run settles and the Agent idles.
+    refute_match(&mut rx, is_recovery_run).await;
+    refute_match(&mut rx, is_run_started).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -997,15 +997,15 @@ async fn a_genuine_user_prompt_resets_the_recovery_count() {
     let mut rx = agent.subscribe();
 
     agent.submit("first request").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
-    recv_match(&mut rx, is_recovery_turn).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
+    recv_match(&mut rx, is_recovery_run).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 
     agent.submit("second request").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
-    recv_match(&mut rx, is_recovery_turn).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
+    recv_match(&mut rx, is_recovery_run).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -1015,7 +1015,7 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
     let session_dir = session.session_dir.clone();
     let script = vec![
-        // Turn 1's single Pass: set the Plan, write, and run a failing
+        // Run 1's single Pass: set the Plan, write, and run a failing
         // verification. The write is the evidence the dangling-failure
         // recovery arm now requires (ADR-0028 addendum 2026-07-14).
         Entry::just(Response {
@@ -1032,12 +1032,12 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
             usage: Usage::default(),
             error: None,
         }),
-        // Turn 1 Pass 2: a tool-insistent reply, refused, caps the Turn with
+        // Run 1 Pass 2: a tool-insistent reply, refused, caps the Run with
         // the write unverified and the verification dangling.
         Entry::just(insistent_reply("x1")),
         // The Handoff's summarize call.
         Entry::just(text_end("## Task\nnarrative-of-dying-turn")),
-        // The Recovery Turn over the seeded Conversation.
+        // The Recovery Run over the seeded Conversation.
         Entry::just(text_end("handoff recovered")),
     ];
     let agent = start(session.clone(), FakeLlm::script(script));
@@ -1064,16 +1064,16 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
         _ => unreachable!(),
     };
 
-    recv_match(&mut rx, is_turn_finished).await;
-    let recovery = recv_match(&mut rx, is_recovery_turn).await;
+    recv_match(&mut rx, is_run_finished).await;
+    let recovery = recv_match(&mut rx, is_recovery_run).await;
     assert!(matches!(
         &recovery,
-        Event::RecoveryTurn { shape, text }
+        Event::RecoveryRun { shape, text }
             if *shape == crate::session::RecoveryShape::Handoff
                 && text == voice::recovery_prompt(true)
     ));
-    recv_match(&mut rx, is_turn_started).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_started).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 
     // The Conversation was RETIRED: one seed message (task verbatim,
@@ -1117,8 +1117,8 @@ async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
     let dir = TempDir::new().unwrap();
     let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
     let script = vec![
-        Entry::just(write_tool("w1", "a.txt")), // Turn 1 Pass 1: the write lands.
-        Entry::just(insistent_reply("x1")),     // Turn 1 Pass 2: refused, caps unverified.
+        Entry::just(write_tool("w1", "a.txt")), // Run 1 Pass 1: the write lands.
+        Entry::just(insistent_reply("x1")),     // Run 1 Pass 2: refused, caps unverified.
         Entry::error("summarizer down"),        // The Handoff's LLM call fails.
         Entry::just(text_end("recovered anyway")),
     ];
@@ -1126,9 +1126,9 @@ async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
     let mut rx = agent.subscribe();
 
     agent.submit("write the file").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
-    recv_match(&mut rx, is_recovery_turn).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
+    recv_match(&mut rx, is_recovery_run).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     // The recovery still happened, on the mechanical skeleton alone.
     let conv = agent.conversation().await;
@@ -1140,7 +1140,7 @@ async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
+async fn recovery_limit_zero_leaves_a_capped_unfinished_run_alone() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_string_lossy().into_owned();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -1148,7 +1148,7 @@ async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(2),
+            run_limit: Some(2),
             recovery_limit: Some(0),
             ..Default::default()
         },
@@ -1165,15 +1165,15 @@ async fn recovery_limit_zero_leaves_a_capped_unfinished_turn_alone() {
     let mut rx = agent.subscribe();
 
     agent.submit("write the file").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
-    refute_match(&mut rx, is_recovery_turn).await;
-    refute_match(&mut rx, is_turn_started).await;
+    recv_match(&mut rx, is_run_finished).await;
+    refute_match(&mut rx, is_recovery_run).await;
+    refute_match(&mut rx, is_run_started).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
 // ---- riders in the Session Log (Anchors + Endgame prompts) ------------
 
-// Session facts tuned so riders fire: turn_limit 4 puts the wrap-up
+// Session facts tuned so riders fire: run_limit 4 puts the wrap-up
 // warning on Pass 2 and the final-Pass prompt on Pass 3; anchor_interval 2
 // places an Anchor on Pass 2.
 fn rider_session(dir: &TempDir) -> Session {
@@ -1183,7 +1183,7 @@ fn rider_session(dir: &TempDir) -> Session {
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(4),
+            run_limit: Some(4),
             anchor_interval: Some(2),
             ..Default::default()
         },
@@ -1192,7 +1192,7 @@ fn rider_session(dir: &TempDir) -> Session {
     .expect("session builds")
 }
 
-// [`rider_session`] with the Recovery Turn disabled: a Turn that caps
+// [`rider_session`] with the Recovery Run disabled: a Run that caps
 // with unverified writes now settles as a recovery close (ADR-0028
 // addendum), which has its own coverage - the test on this fixture
 // asserts rider logging and byte-for-byte Resume only.
@@ -1203,7 +1203,7 @@ fn rider_session_no_recovery(dir: &TempDir) -> Session {
         SessionOpts {
             root: Some(root),
             session_dir: Some(session_dir),
-            turn_limit: Some(4),
+            run_limit: Some(4),
             anchor_interval: Some(2),
             recovery_limit: Some(0),
             ..Default::default()
@@ -1257,7 +1257,7 @@ async fn riders_are_logged_in_linear_position_as_they_are_injected() {
     let mut rx = agent.subscribe();
 
     agent.submit("look around").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
     drop(agent);
 
     let path = log::latest(&session_dir).expect("a log file");
@@ -1288,7 +1288,7 @@ async fn riders_are_logged_in_linear_position_as_they_are_injected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_that_carried_riders_resumes_byte_for_byte() {
+async fn a_run_that_carried_riders_resumes_byte_for_byte() {
     let dir = TempDir::new().unwrap();
     let session = rider_session(&dir);
     let session_dir = session.session_dir.clone();
@@ -1296,7 +1296,7 @@ async fn a_turn_that_carried_riders_resumes_byte_for_byte() {
     let mut rx = agent.subscribe();
 
     agent.submit("look around").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     let live = agent.conversation().await;
     drop(agent);
@@ -1336,7 +1336,7 @@ async fn an_unverified_write_logs_the_verification_pass_prompt_and_resumes_byte_
     let mut rx = agent.subscribe();
 
     agent.submit("write it").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     let live = agent.conversation().await;
     drop(agent);
@@ -1369,7 +1369,7 @@ async fn an_unverified_write_logs_the_verification_pass_prompt_and_resumes_byte_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_plan_survives_a_turn_boundary_and_is_restored_on_resume() {
+async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     let dir = TempDir::new().unwrap();
     let session = session_in(&dir);
     let session_dir = session.session_dir.clone();
@@ -1385,7 +1385,7 @@ async fn the_plan_survives_a_turn_boundary_and_is_restored_on_resume() {
     let mut rx = first.subscribe();
 
     first.submit("do Y").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     assert_eq!(first.plan().await.as_deref(), Some("Goal: Y. 1. do [ ]"));
     drop(first);
@@ -1410,7 +1410,7 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             root: Some(dir.path().to_string_lossy().into_owned()),
             session_dir: Some(dir.path().join("sessions").to_string_lossy().into_owned()),
             model: Some(model),
-            // Tuned so THREE small Turns cross the Compaction Target and
+            // Tuned so THREE small Runs cross the Compaction Target and
             // two do not: the tool-spec overhead rides the estimate, so
             // this number tracks the registry (web_fetch, ADR-0024, moved
             // it from 4000; run_command's pipefail description moved it
@@ -1431,9 +1431,9 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
 
     // Adaptation of baud's mid-test `Baud.FakeLLM.script(...)` re-scripting:
     // the Rust FakeLlm is per-instance with a fixed queue (ADR-0020), so all
-    // entries ride ONE script up front - three small Turns to build history
+    // entries ride ONE script up front - three small Runs to build history
     // past the compaction target, then the proactive summarization call
-    // (popped FIRST on the next submit) and that Turn's own reply.
+    // (popped FIRST on the next submit) and that Run's own reply.
     let reply = "word ".repeat(250);
     let entries = vec![
         Entry::just(text_end(&format!("{reply} 1"))),
@@ -1446,11 +1446,11 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
     let mut rx = agent.subscribe();
     for n in 1..=3 {
         agent.submit(format!("step {n}")).await.unwrap();
-        recv_match(&mut rx, is_turn_finished).await;
+        recv_match(&mut rx, is_run_finished).await;
     }
     // The next submit trips proactive compaction before its own reply.
     agent.submit("keep going").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 
     // The proactive Compaction replaced old messages: the head is a summary.
     let live = agent.conversation().await;
@@ -1549,12 +1549,12 @@ async fn resume_from_a_different_project_root_fails_init_loudly() {
 // ---- subscriber pruning ----------------------------------------------
 
 // Adaptation of baud's "a dead subscriber is pruned and does not break later
-// turns": in tokio a dropped broadcast Receiver auto-cleans on the next
+// runs": in tokio a dropped broadcast Receiver auto-cleans on the next
 // send, so there is no monitor/DOWN to model. We DROP a Receiver (the tokio
-// analog of the subscriber process dying), then run a full Turn and assert a
+// analog of the subscriber process dying), then run a full Run and assert a
 // live subscriber still gets every event and the Agent stays healthy.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dropped_subscriber_is_pruned_and_does_not_break_later_turns() {
+async fn a_dropped_subscriber_is_pruned_and_does_not_break_later_runs() {
     let dir = TempDir::new().unwrap();
     let agent = start(
         session_in(&dir),
@@ -1570,7 +1570,7 @@ async fn a_dropped_subscriber_is_pruned_and_does_not_break_later_turns() {
 
     let mut rx = agent.subscribe();
     agent.submit("still alive?").await.unwrap();
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -1586,13 +1586,13 @@ async fn tool_use_during_streaming_steer_then_unblock_no_crash() {
 
     agent.submit("test streaming").await.unwrap();
 
-    // The first model call parks in-flight (mid-Turn). The first Pass's
-    // MessageStart has already gone out; steer NOW - the Turn is running but
+    // The first model call parks in-flight (mid-Run). The first Pass's
+    // MessageStart has already gone out; steer NOW - the Run is running but
     // has not reached its drain point - then release into a tool_use.
     // `steer().await` round-trips through the Agent, so the text is queued
     // before the tool batch runs and the drain delivers it (this removes
     // baud's implicit scheduler race while preserving the observable
-    // behavior: steering issued mid-Turn, delivered after the tool batch, no
+    // behavior: steering issued mid-Run, delivered after the tool batch, no
     // crash).
     let InFlight { release, .. } = inflight.recv().await.expect("blocked in llm");
     assert_eq!(agent.status().await, Status::Running);
@@ -1614,7 +1614,7 @@ async fn tool_use_during_streaming_steer_then_unblock_no_crash() {
     // runs and the drain delivers the queued Steering.
     recv_match(&mut rx, |e| matches!(e, Event::MessageUpdate { .. })).await;
     recv_match(&mut rx, |e| matches!(e, Event::SteeringDelivered { .. })).await;
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -1632,7 +1632,7 @@ async fn cancel_during_streaming_does_not_crash() {
     // The barrier drops its release when the test ends; the parked call is
     // aborted at the await.
 
-    recv_match(&mut rx, |e| matches!(e, Event::TurnCancelled)).await;
+    recv_match(&mut rx, |e| matches!(e, Event::RunCancelled)).await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
@@ -1667,8 +1667,8 @@ async fn set_model_rejects_an_unknown_provider_and_keeps_the_active_model() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_spawned_after_set_model_uses_the_new_model() {
-    // The next Turn captures the Agent's mutable Model, so the boundary call
+async fn a_run_spawned_after_set_model_uses_the_new_model() {
+    // The next Run captures the Agent's mutable Model, so the boundary call
     // carries the new one - not the Session's launch-time one (ADR-0033).
     let dir = TempDir::new().unwrap();
     let (model_tx, mut model_rx) = mpsc::unbounded_channel::<Model>();
@@ -1689,7 +1689,7 @@ async fn a_turn_spawned_after_set_model_uses_the_new_model() {
     assert_eq!(captured.scoped_id(), "local/picked-model");
     assert_eq!(captured.id, "picked-model");
 
-    recv_match(&mut rx, is_turn_finished).await;
+    recv_match(&mut rx, is_run_finished).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1755,10 +1755,10 @@ async fn set_model_rejects_a_pick_that_cannot_fit_and_keeps_the_active_model() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_budget_follows_the_captured_model_across_a_swap() {
-    // The budget derives from the Model each Turn captures (ADR-0037): the
-    // first Turn runs at the launch Model's window, and after a `/model` swap
-    // to a narrower Provider the NEXT Turn runs at the picked window - visible
-    // on TurnFinished, which carries the settling Conversation's budget.
+    // The budget derives from the Model each Run captures (ADR-0037): the
+    // first Run runs at the launch Model's window, and after a `/model` swap
+    // to a narrower Provider the NEXT Run runs at the picked window - visible
+    // on RunFinished, which carries the settling Conversation's budget.
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_string_lossy().into_owned();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -1792,16 +1792,16 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
     let mut rx = agent.subscribe();
 
     let finished_budget = |e: &Event| match e {
-        Event::TurnFinished { context_budget, .. } => Some(*context_budget),
+        Event::RunFinished { context_budget, .. } => Some(*context_budget),
         _ => None,
     };
 
     agent.submit("first").await.unwrap();
-    let ev = recv_match(&mut rx, is_turn_finished).await;
+    let ev = recv_match(&mut rx, is_run_finished).await;
     assert_eq!(finished_budget(&ev), Some(64_000), "the launch window");
 
     agent.set_model("tiny/m".into()).await.unwrap();
     agent.submit("second").await.unwrap();
-    let ev = recv_match(&mut rx, is_turn_finished).await;
+    let ev = recv_match(&mut rx, is_run_finished).await;
     assert_eq!(finished_budget(&ev), Some(4_000), "the captured window");
 }

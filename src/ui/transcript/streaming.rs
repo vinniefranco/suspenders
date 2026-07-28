@@ -1,5 +1,5 @@
 //! In-flight streaming state - the ONE owner of the assistant message being
-//! streamed (CONTEXT.md: the snapshot the Transcript shows mid-Turn, before it
+//! streamed (CONTEXT.md: the snapshot the Transcript shows mid-Run, before it
 //! settles into discrete items). A PRIVATE child of the Transcript store
 //! (ADR-0034): only the store's verbs reach it.
 //!
@@ -45,7 +45,7 @@ impl Streaming {
         self.0 = Some(content);
     }
 
-    /// Back to not streaming, discarding any snapshot (Turn boundary reset).
+    /// Back to not streaming, discarding any snapshot (Run boundary reset).
     pub fn clear(&mut self) {
         self.0 = None;
     }
