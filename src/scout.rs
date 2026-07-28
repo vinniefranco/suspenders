@@ -39,42 +39,16 @@
 //! findings, or hitting the hard Pass cap all return a [`ScoutOutcome`] error
 //! variant carrying whatever partial findings exist.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-
 use crate::content::ContentBlock;
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::llm::model::Model;
 use crate::llm::response::StopReason;
 use crate::llm::{Llm, LlmRequest};
+use crate::scout_port::ScoutOutcome;
 use crate::tool::ToolCtx;
 use crate::tools;
 use crate::tools::shaping;
 use crate::voice;
-
-/// The result of one Scout run.
-///
-/// A clean report is `Ok`. Every failure mode carries whatever partial
-/// findings text was gathered (possibly empty), which the explore Tool rides
-/// after a Voice-owned marker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScoutOutcome {
-    /// A clean findings report.
-    Ok(String),
-    /// The Scout's own model call failed; `partial` is what streamed before.
-    LlmError { partial: String },
-    /// The Scout stopped without reporting anything usable.
-    Empty { partial: String },
-    /// The Scout hit its hard Pass cap before reporting.
-    PassCap { limit: u64, partial: String },
-}
-
-/// The `scout` capture on the Tool ctx: an effect wired to the Session that
-/// dispatches a Scout for a `task` and yields its [`ScoutOutcome`]. Boxed and
-/// pinned so it is object-safe and `Send`, mirroring the async run path.
-pub type ScoutFn =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ScoutOutcome> + Send>> + Send + Sync>;
 
 // The disposable Scout Conversation is short by construction (a small Pass
 // cap), so it does not need the main Session's budget. A generous default

@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::middleware::{Middleware, Token};
 use crate::presenter::Presenter;
-use crate::tool::resolve_path;
+use crate::tool::path::resolve_path;
 use crate::view_model::TranscriptItem;
 use display::Diff as DiffArtifact;
 

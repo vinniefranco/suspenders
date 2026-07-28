@@ -617,13 +617,12 @@ mod tests {
     use crate::middleware::{Middleware, Token};
     use crate::run::deps::CompactError;
     use crate::run::fixtures::{
-        conversation, count_voiced, deps_for, empty, events, find_tool_result, just, last_message,
-        ok, root, run_with, session, session_with, text_end, text_result, tool_ctx,
-        tool_use_result, write,
+        FakeDeps, conversation, count_voiced, deps_for, empty, events, find_tool_result, just,
+        last_message, ok, root, run_with, session, session_with, session_with_limit, text_end,
+        text_result, tool_ctx, tool_use_result, write,
     };
     use crate::session::{Session, SessionOpts};
     use crate::test_support::Entry;
-    use crate::test_support::FakeDeps;
     use crate::tool::ToolCtx;
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
@@ -1440,9 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn verify_nudge_skipped_when_run_limit_reached() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -1693,9 +1690,7 @@ mod tests {
     #[tokio::test]
     async fn verify_failed_skipped_when_run_limit_reached() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -1919,9 +1914,7 @@ mod tests {
     #[tokio::test]
     async fn empty_nudge_skipped_when_run_limit_reached() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -2061,9 +2054,7 @@ mod tests {
     #[tokio::test]
     async fn wrap_up_warning_rides_tool_results_when_two_passes_remain() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(4);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 4);
         let deps = deps_for(
             &session,
             vec![
@@ -2121,9 +2112,7 @@ mod tests {
     #[tokio::test]
     async fn unverified_writes_verification_prompt_replaces_warning_and_narrows_tools() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(4);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 4);
         let deps = deps_for(
             &session,
             vec![
@@ -2174,9 +2163,7 @@ mod tests {
     #[tokio::test]
     async fn verification_pass_narrowing_emits_tools_narrowed_to_run_command() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(4);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 4);
         let deps = deps_for(
             &session,
             vec![
@@ -2221,9 +2208,7 @@ mod tests {
     async fn verification_pass_refuses_non_run_command_calls_without_executing() {
         let root = root();
         write(&root, "secret.txt", "SECRET-CONTENT");
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(4);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 4);
         let deps = deps_for(
             &session,
             vec![
@@ -2269,9 +2254,7 @@ mod tests {
     #[tokio::test]
     async fn final_pass_tool_insistence_is_refused_and_closes_on_the_marker() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -2303,9 +2286,7 @@ mod tests {
     #[tokio::test]
     async fn verified_writes_ordinary_warning_and_full_tool_list() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(4);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 4);
         let deps = deps_for(
             &session,
             vec![
@@ -2343,9 +2324,7 @@ mod tests {
     #[tokio::test]
     async fn final_request_no_tools_and_prompt_conclusion_ends_run() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let deps = deps_for(
             &session,
             vec![
@@ -2385,9 +2364,7 @@ mod tests {
     #[tokio::test]
     async fn final_pass_narrowing_emits_tools_narrowed_empty() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let deps = deps_for(
             &session,
             vec![
@@ -2418,9 +2395,7 @@ mod tests {
     #[tokio::test]
     async fn final_pass_tool_markup_as_text_closes_on_marker() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let markup = "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>";
         let deps = deps_for(
             &session,
@@ -2447,9 +2422,7 @@ mod tests {
     #[tokio::test]
     async fn final_pass_conclusion_mentioning_markup_still_ends_end_turn() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let deps = deps_for(
             &session,
             vec![
@@ -2468,9 +2441,7 @@ mod tests {
     #[tokio::test]
     async fn prose_preamble_does_not_launder_final_pass_markup() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let text = "I need to update the DESIGN.md file to reflect the new behavior:\n\n<tool_call>\n<function=edit_file>\n<parameter=path>\ndocs/DESIGN.md\n</parameter>\n</function>\n</tool_call>";
         let deps = deps_for(
             &session,
@@ -2492,9 +2463,7 @@ mod tests {
     #[tokio::test]
     async fn model_answers_final_pass_with_tools_still_closes_on_marker() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let deps = deps_for(
             &session,
             vec![
@@ -2537,9 +2506,7 @@ mod tests {
     #[tokio::test]
     async fn a_cap_with_unverified_writes_carries_the_recovery_directive_out() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -2577,9 +2544,7 @@ mod tests {
         // evidence the dangling-failure arm requires (ADR-0028 addendum
         // 2026-07-14). The recovery names the failing command.
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -2641,9 +2606,7 @@ mod tests {
         // never ran, so the recovery still names the GENUINE failure - the
         // Handoff seed's verbatim-verification guarantee (ADR-0028) holds.
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -2680,9 +2643,7 @@ mod tests {
     #[tokio::test]
     async fn a_spent_recovery_budget_settles_a_plain_run_limit() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let mut deps = deps_for(
             &session,
             vec![
@@ -2749,9 +2710,7 @@ mod tests {
         // (ADR-0028 addendum), and the reply (the model's genuine wrap-up),
         // NOT the run-limit marker, closes the Conversation.
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -2798,9 +2757,7 @@ mod tests {
         // final-Pass wrap-up. The first command string's failure dangles, so
         // the text settle still recovers, naming the failure.
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(3);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 3);
         let deps = deps_for(
             &session,
             vec![
@@ -2972,9 +2929,7 @@ mod tests {
     #[tokio::test]
     async fn run_limit_stops_the_loop_after_n_passes() {
         let root = root();
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(2);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 2);
         let deps = deps_for(
             &session,
             vec![
@@ -3795,7 +3750,6 @@ mod tests {
             out.messages = vec![conv.messages[0].clone()];
             Ok(out)
         });
-        let _ = deps.requests_handle();
 
         let mut conv =
             Conversation::new("sys", crate::conversation::ConversationOpts::new(1000, 100));
@@ -3906,7 +3860,7 @@ mod tests {
     // Tool Call and its Tool Result enter the Conversation; a Scout failure
     // becomes an ordinary is_error Tool Result, never failing the Run).
 
-    fn ctx_with_scout(session: &Session, outcome: crate::scout::ScoutOutcome) -> ToolCtx {
+    fn ctx_with_scout(session: &Session, outcome: crate::scout_port::ScoutOutcome) -> ToolCtx {
         use std::sync::Arc;
         let mut ctx = session.tool_ctx(&session.model);
         let out = outcome;
@@ -3955,7 +3909,10 @@ mod tests {
                 just(text_end("Done: Widget is in widget.ex.")),
             ],
         );
-        let ctx = ctx_with_scout(&session, crate::scout::ScoutOutcome::Ok(report.to_string()));
+        let ctx = ctx_with_scout(
+            &session,
+            crate::scout_port::ScoutOutcome::Ok(report.to_string()),
+        );
         let (outcome, deps) = run_with_ctx(&session, "find Widget", deps, ctx).await;
         let (conv, _) = ok(&outcome);
 
@@ -4021,7 +3978,7 @@ mod tests {
         );
         let ctx = ctx_with_scout(
             &session,
-            crate::scout::ScoutOutcome::LlmError {
+            crate::scout_port::ScoutOutcome::LlmError {
                 partial: String::new(),
             },
         );
@@ -4109,9 +4066,7 @@ mod tests {
         write(&root, "a.txt", "a\n");
         write(&root, "b.txt", "b\n");
         write(&root, "c.txt", "c\n");
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(20);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 20);
         let deps = deps_for(
             &session,
             vec![
@@ -4151,9 +4106,7 @@ mod tests {
         write(&root, "a.txt", "a\n");
         write(&root, "b.txt", "b\n");
         write(&root, "c.txt", "c\n");
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(20);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 20);
         let deps = deps_for(
             &session,
             vec![
@@ -4195,9 +4148,7 @@ mod tests {
         for n in 1..=6 {
             std::fs::create_dir_all(root.path().join(format!("d{n}"))).unwrap();
         }
-        let mut opts = SessionOpts::default();
-        opts.run_limit = Some(20);
-        let session = session_with(root.path(), opts);
+        let session = session_with_limit(root.path(), 20);
         let mut entries: Vec<Entry> = (1..=6)
             .map(|n| {
                 just(tool_use_result(

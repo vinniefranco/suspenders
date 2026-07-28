@@ -105,7 +105,7 @@ fn make_scout(
     model: Model,
     root: String,
     knobs: ScoutKnobs,
-) -> crate::scout::ScoutFn {
+) -> crate::scout_port::ScoutFn {
     Arc::new(move |task: String| {
         let llm = Arc::clone(&llm);
         let model = model.clone();

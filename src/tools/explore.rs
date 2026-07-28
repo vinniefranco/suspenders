@@ -12,7 +12,7 @@
 //! `is_error` and carry a Voice-owned marker plus whatever partial findings the
 //! Scout gathered; a clean report is an ok result.
 
-use crate::scout::ScoutOutcome;
+use crate::scout_port::ScoutOutcome;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use crate::voice;
 use serde_json::{Value, json};
@@ -86,7 +86,7 @@ fn with_partial(marker: &str, partial: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::ScoutFn;
+    use crate::scout_port::ScoutFn;
     use std::sync::Arc;
 
     // A ctx whose `scout` capture returns a canned outcome.

@@ -4,7 +4,8 @@
 //! stops a small model from destroying a file by rewriting it (each
 //! reproduction shorter than the last) instead of making a targeted edit.
 
-use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};
+use crate::tool::path::{FileError, file_error, with_path};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct WriteFile;

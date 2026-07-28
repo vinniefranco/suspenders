@@ -8,7 +8,8 @@
 //! meaning the literal characters; bouncing that back costs a full model
 //! response on a slow local server.
 
-use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, resolve_path, with_path};
+use crate::tool::path::{FileError, file_error, resolve_path, with_path};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::path::Path;

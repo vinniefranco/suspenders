@@ -17,7 +17,8 @@
 //! matches whole trimmed lines, so its span is always line-aligned and cannot
 //! split an identifier.
 
-use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, jaro_distance, with_path};
+use crate::tool::path::{FileError, file_error, jaro_distance, with_path};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct EditFile;

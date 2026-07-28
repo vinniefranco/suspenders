@@ -4,7 +4,8 @@
 //! continues a truncated read - `start_line` is windowing (WHICH part), the
 //! cap stays the size authority (HOW MUCH).
 
-use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};
+use crate::tool::path::{FileError, file_error, with_path};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct ReadFile;

@@ -2,7 +2,8 @@
 //! Sorted, directories first. Empty dir → `"[empty directory]"` (an
 //! empty-string result confuses small models).
 
-use crate::tool::{FileError, Tool, ToolCtx, ToolSpec, file_error, with_path};
+use crate::tool::path::{FileError, file_error, with_path};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct ListFiles;
