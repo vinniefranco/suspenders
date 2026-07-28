@@ -70,7 +70,6 @@ impl Token {
     /// Stores Middleware state under `key`, threading `pre_run` into `post_run`.
     /// Returns the token so it threads through a fold, mirroring baud's
     /// `Token.assign/3`.
-    // qual:api
     pub fn assign(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.assigns.insert(key.into(), value.into());
         self
@@ -86,6 +85,7 @@ impl Token {
     /// Denies the Tool Call. The reason is the Extension's own wording and
     /// becomes the `is_error` Tool Result content; the Tool never executes and
     /// the remaining `pre_run` stages are skipped.
+    // qual:api (Middleware contract, baud parity; no built-in Extension halts yet)
     pub fn halt(mut self, reason: impl Into<String>) -> Self {
         self.halted = true;
         self.halt_reason = Some(reason.into());

@@ -1,79 +1,54 @@
 {
   "version": 2,
-  "quality_score": 0.8518803721290616,
-  "iosp_score": 0.9957122439256789,
-  "violations": 9,
-  "total": 3185,
+  "quality_score": 0.9262947787592737,
+  "iosp_score": 0.9981264637002342,
+  "violations": 4,
+  "total": 3244,
   "complexity_warnings": 0,
-  "magic_number_warnings": 82,
+  "magic_number_warnings": 10,
   "nesting_depth_warnings": 0,
   "function_length_warnings": 0,
   "unsafe_warnings": 2,
-  "error_handling_warnings": 25,
-  "duplicate_groups": 45,
-  "dead_code_warnings": 16,
-  "dead_type_warnings": 1,
-  "fragment_groups": 182,
-  "boilerplate_warnings": 30,
+  "error_handling_warnings": 19,
+  "duplicate_groups": 34,
+  "dead_code_warnings": 2,
+  "dead_type_warnings": 0,
+  "fragment_groups": 90,
+  "boilerplate_warnings": 24,
   "srp_struct_warnings": 4,
   "srp_module_warnings": 17,
-  "wildcard_import_warnings": 1,
+  "wildcard_import_warnings": 0,
   "sdp_violations": 10,
   "coupling_warnings": 1,
   "coupling_cycles": 2,
   "tq_no_assertion_warnings": 0,
-  "tq_no_sut_warnings": 1,
-  "tq_untested_warnings": 8,
+  "tq_no_sut_warnings": 0,
+  "tq_untested_warnings": 7,
   "tq_uncovered_warnings": 0,
   "tq_untested_logic_warnings": 0,
   "structural_srp_warnings": 1,
   "structural_coupling_warnings": 2,
-  "total_findings": 455,
+  "total_findings": 240,
   "violation_details": [
     {
       "name": "render",
       "file": "src/ui/components.rs",
-      "line": 236
-    },
-    {
-      "name": "render_composer_popup",
-      "file": "src/ui/components.rs",
-      "line": 293
+      "line": 260
     },
     {
       "name": "render_viewport",
       "file": "src/ui/components.rs",
-      "line": 440
+      "line": 548
     },
     {
       "name": "paint_gutter",
       "file": "src/ui/components.rs",
-      "line": 1080
-    },
-    {
-      "name": "block_line",
-      "file": "src/ui/components.rs",
-      "line": 1836
-    },
-    {
-      "name": "render_picker",
-      "file": "src/ui/components.rs",
-      "line": 2442
+      "line": 1219
     },
     {
       "name": "main",
       "file": "src/main.rs",
       "line": 27
-    },
-    {
-      "name": "run_effects",
-      "file": "src/ui.rs",
-      "line": 584
-    },
-    {
-      "name": "run_effect",
-      "file": "src/ui.rs",
-      "line": 597
     }
   ]
 }
