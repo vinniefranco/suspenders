@@ -1,12 +1,11 @@
 //! The Presenter contract (CONTEXT.md): the display-path half of an Extension,
 //! the PURE Presentment stage inside the Transcript store. ADR-0007 records the
-//! original shape; ADR-0042 splits the old single Plugin trait into
+//! lifecycle; ADR-0042 split the former combined trait into
 //! [`crate::middleware::Middleware`] (execution) and Presenter (display).
 //! [`crate::extensions`] runs the pipeline.
 //!
-//! In baud the `present/3` callback is optional (`@optional_callbacks`); Rust
-//! has no optional trait methods, so `present` carries a **default = identity**
-//! body: an Extension that does not implement Presenter (registered with no
+//! `present` carries a **default = identity** body: an Extension that does not
+//! implement Presenter (registered with no
 //! Presenter role) is skipped entirely by the pipeline - observably identical
 //! to the old identity default that passed every item through.
 //!
@@ -31,19 +30,18 @@ use serde_json::Value;
 
 use crate::ui::transcript::TranscriptItem;
 
-/// The display-path contract a Suspenders Extension implements (the display
-/// half of baud's `Baud.Plugin` behaviour; ADR-0042). `present` defaults to
-/// identity, so a Presenter overrides it only when it means to reshape items.
+/// The display-path contract a Suspenders Extension implements (ADR-0042).
+/// `present` defaults to identity, so a Presenter overrides it only when it
+/// means to reshape items.
 ///
-/// `opts` is the extension's registration options (baud's `keyword()`),
-/// carried as a `serde_json::Value` - the open edge for per-extension config.
+/// `opts` is the extension's registration options, carried as a
+/// `serde_json::Value` - the open edge for per-extension config.
 pub trait Presenter: Send + Sync {
     /// The PURE Presentment stage: folds over EVERY [`TranscriptItem`] the
     /// Transcript store appends (ADR-0034) - not just Tool Calls/Results -
     /// reading the append's Artifacts (an empty map for every non-Tool-Result
     /// append), and returns the item to display. Match the kinds you mean to
     /// reshape; pass everything else through. Default: identity. No IO.
-    /// Mirrors baud's `present/3`.
     fn present(
         &self,
         item: TranscriptItem,

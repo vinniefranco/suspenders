@@ -1,14 +1,12 @@
 //! The Middleware contract (CONTEXT.md): the execution-path half of an
-//! Extension, wrapping the Tool Call lifecycle. ADR-0007 records the original
-//! shape; ADR-0042 splits the old single Plugin trait into Middleware
+//! Extension, wrapping the Tool Call lifecycle. ADR-0007 records the
+//! lifecycle; ADR-0042 split the former combined trait into Middleware
 //! (execution) and [`crate::presenter::Presenter`] (display).
 //! [`crate::extensions`] runs the pipeline.
 //!
-//! In baud all callbacks are optional (`@optional_callbacks`); an extension
-//! implements only the stages it cares about. Rust has no optional trait
-//! methods, so both stages carry a **default = identity** body: a Middleware
-//! that does not override a stage passes the token through unchanged, exactly
-//! like a baud plugin that does not export it.
+//! Both stages carry a **default = identity** body, so a Middleware overrides
+//! only the stages it cares about; one that does not override a stage passes
+//! the token through unchanged.
 //!
 //! * `pre_run` - before the Tool executes. May replace the token's input,
 //!   [`Token::halt`] the call, or capture state into `assigns`. Runs after the
@@ -28,13 +26,12 @@ use serde_json::Value;
 
 pub use token::{Token, TokenResult};
 
-/// The execution-path contract a Suspenders Extension implements (the
-/// execution half of baud's `Baud.Plugin` behaviour; ADR-0042). Both stages
-/// default to identity, so a Middleware overrides only the stages it cares
-/// about.
+/// The execution-path contract a Suspenders Extension implements (ADR-0042).
+/// Both stages default to identity, so a Middleware overrides only the stages
+/// it cares about.
 ///
-/// `opts` is the extension's registration options (baud's `keyword()`),
-/// carried as a `serde_json::Value` - the open edge for per-extension config.
+/// `opts` is the extension's registration options, carried as a
+/// `serde_json::Value` - the open edge for per-extension config.
 pub trait Middleware: Send + Sync {
     /// Runs before the Tool executes. Default: identity.
     fn pre_run(&self, token: Token, _opts: &Value) -> Token {

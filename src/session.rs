@@ -1212,7 +1212,7 @@ mod tests {
         let o = SessionOpts {
             root: Some("/tmp".into()),
             llm_module: Some("SomeLLM".into()),
-            extensions: Some(vec!["SomePlugin".into()]),
+            extensions: Some(vec!["some_extension".into()]),
             context_budget: Some(5_000),
             eviction_slack: Some(0.1),
             compaction_keep: Some(0.4),
@@ -1224,7 +1224,7 @@ mod tests {
         };
         let session = Session::build(o, &cfg()).unwrap();
         assert_eq!(session.llm_module, "SomeLLM");
-        assert_eq!(session.extensions, vec!["SomePlugin".to_string()]);
+        assert_eq!(session.extensions, vec!["some_extension".to_string()]);
         assert_eq!(session.context_budget, Some(5_000));
         assert_eq!(session.eviction_slack, 0.1);
         assert_eq!(session.compaction_keep, 0.4);

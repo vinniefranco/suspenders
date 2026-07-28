@@ -1894,7 +1894,7 @@ mod tests {
         let t = fold(
             fresh(),
             vec![Event::extension_error(
-                "Baud.Plugins.Diff",
+                "diff",
                 Stage::PreRun,
                 "boom",
             )],
@@ -1903,7 +1903,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         match &items[0] {
             TranscriptItem::Info { text } => {
-                assert!(text.contains("Baud.Plugins.Diff"));
+                assert!(text.contains("diff"));
                 assert!(text.contains("pre_run"));
                 assert!(text.contains("boom"));
             }

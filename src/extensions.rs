@@ -220,8 +220,8 @@ pub fn present(
 /// One entry in the configured Extension list: an extension name and its
 /// registration options. The Session carries extensions as these lightweight
 /// specs (a name plus opts) and resolves them into live [`Registered`]
-/// instances at Run/UI start. This is the analogue of the config `:plugins`
-/// entries - a bare `Module` or a `{Module, opts}` tuple.
+/// instances at Run/UI start. Each configured entry is a bare name or a name
+/// paired with opts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionSpec {
     pub name: String,
@@ -361,7 +361,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    // ---- The `@ctx` from plugins_test.exs: %{root: "/nowhere", result_cap: 10_000} ----
+    // ---- Test ctx: root "/nowhere", result_cap 10_000 ----
     fn ctx() -> ToolCtx {
         ToolCtx {
             root: "/nowhere".into(),
@@ -615,12 +615,10 @@ mod tests {
         );
     }
 
-    // baud's "a stage returning a non-token is a reported failure" case: in
-    // baud a plugin can return the wrong shape at runtime (dynamic dispatch on
-    // an untyped return). In Rust the trait method's return type is `Token`, so
-    // this failure mode is impossible - the compiler enforces the contract that
-    // baud's `token_stage` guards at runtime. SKIPPED as unrepresentable
-    // (type-system-enforced), not deferred; noted in the report.
+    // The "a stage returns the wrong shape at runtime" failure mode is
+    // unrepresentable here: a stage method's return type is `Token`, so the
+    // compiler enforces the contract statically. No test - the type system
+    // already guarantees it.
 
     #[test]
     fn pre_run_extensions_without_the_stage_are_skipped() {

@@ -436,7 +436,7 @@ impl Event {
     // ---- The rest ----
 
     /// Constructs an `extension_error` from a pipeline [`crate::extensions::Failure`]'s
-    /// parts, mirroring baud's `plugin_error/1` which takes the failure map.
+    /// parts: the extension name, the stage that crashed, and the message.
     pub fn extension_error(
         extension: impl Into<String>,
         stage: Stage,
