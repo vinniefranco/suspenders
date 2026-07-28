@@ -30,9 +30,9 @@ use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
-use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
 use crate::ui::viewport::Viewport;
 use crate::view_model::Tone;
+use crate::view_model::{LineStyle, StyledLine, TranscriptItem};
 use crate::view_model::{RowRole, SelectorRow};
 
 // ---------------------------------------------------------------------------

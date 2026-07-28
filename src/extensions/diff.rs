@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::middleware::{Middleware, Token};
 use crate::presenter::Presenter;
 use crate::tool::resolve_path;
-use crate::ui::transcript::TranscriptItem;
+use crate::view_model::TranscriptItem;
 use display::Diff as DiffArtifact;
 
 /// The Token keys the Diff extension reserves, declared in one place.
@@ -249,7 +249,7 @@ mod tests {
     use super::*;
     use crate::extensions::{self, Registered};
     use crate::tool::ToolCtx;
-    use crate::ui::transcript::{LineStyle, StyledLine};
+    use crate::view_model::{LineStyle, StyledLine};
     use serde_json::json;
     use tempfile::TempDir;
 

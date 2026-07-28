@@ -1361,7 +1361,7 @@ mod tests {
     use crate::llm::response::{Response, StopReason};
     use crate::session::{SessionConfig, SessionOpts};
     use crate::test_support::{Entry, FakeLlm};
-    use crate::ui::transcript::TranscriptItem;
+    use crate::view_model::TranscriptItem;
     use std::sync::Arc;
     use std::time::Duration;
 

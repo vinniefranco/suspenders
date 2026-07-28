@@ -47,112 +47,8 @@ use serde_json::Value;
 use crate::content::ContentBlock;
 use crate::event::Stage;
 use crate::extensions::{self, Registered};
-use crate::view_model::Tone;
+use crate::view_model::{StyledLine, Tone, TranscriptItem};
 use streaming::Streaming;
-
-/// The semantic style of one display line inside a [`TranscriptItem::Block`]
-/// (ADR-0008). Names WHAT the line is; the terminal color mapping is
-/// `ui/components`. Mirrors baud's `block_style :: :added | :removed | :context
-/// | :emphasis | :muted`, plus a plain [`LineStyle::Default`] for unstyled text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LineStyle {
-    /// An added line (a `+` line in a diff).
-    Added,
-    /// A removed line (a `-` line in a diff).
-    Removed,
-    /// A context line (unchanged, shown for orientation).
-    Context,
-    /// Emphasised text.
-    Emphasis,
-    /// De-emphasised / secondary text (diff headers, elision tails).
-    Muted,
-    /// Plain, unstyled text.
-    #[default]
-    Default,
-}
-
-/// One styled display line inside a [`TranscriptItem::Block`]: a semantic
-/// [`LineStyle`] plus its text. Mirrors baud's `{style, text}` line tuple.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StyledLine {
-    pub style: LineStyle,
-    pub text: String,
-}
-
-impl StyledLine {
-    /// A styled line from any style and text.
-    pub fn new(style: LineStyle, text: impl Into<String>) -> Self {
-        StyledLine {
-            style,
-            text: text.into(),
-        }
-    }
-}
-
-/// A Transcript Item (CONTEXT.md): one entry in the display history.
-///
-/// Mirrors baud's `item` sum type:
-///
-/// * `User { text }` - `{:user, text}`.
-/// * `Assistant { text }` - `{:assistant, text}`.
-/// * `Thinking { text }` - `{:thinking, text}`.
-/// * `ToolCall { id, name, summary }` - `{:tool_call, id, name, summary}`; `id`
-///   is a display-opaque correlation token (the `tool_use_id`) used ONLY to
-///   pair the call with its later `ToolResult` in the store - the display never
-///   interprets it.
-/// * `ToolResult { name, summary, is_error, key_arg }` -
-///   `{:tool_result, name, summary, is_error, key_arg}`, the default one-line
-///   summary a extension's `present` may replace; `key_arg` is the salient input
-///   arg (path/command/pattern) carried over from the paired call so the merged
-///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
-/// * `Block { title, lines }` - `{:block, title, lines}`: a titled block of
-///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
-/// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
-///   plane (the greeting, launch notices, the extension-failure line).
-/// * `Marker { text, tone }` - a harness-authored line in the tinted marker
-///   plane (ADR-0040): eviction, compaction, Governor Interventions, Steering.
-///   The [`Tone`] tints it in the adapter; the store only carries the fact.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptItem {
-    User {
-        text: String,
-    },
-    Assistant {
-        text: String,
-    },
-    Thinking {
-        text: String,
-    },
-    ToolCall {
-        /// A display-opaque correlation token (the `tool_use_id`): used ONLY to
-        /// pair this call with its later [`TranscriptItem::ToolResult`] in the
-        /// store. The view never interprets or renders it.
-        id: String,
-        name: String,
-        summary: String,
-    },
-    ToolResult {
-        name: String,
-        summary: String,
-        is_error: bool,
-        /// The salient input arg (path/command/pattern) carried from the paired
-        /// [`TranscriptItem::ToolCall`], so the merged line can read
-        /// `name  <key_arg> · <result>`. `None` for a result with no live call
-        /// (e.g. governor-injected) - the line falls back to `name → result`.
-        key_arg: Option<String>,
-    },
-    Block {
-        title: String,
-        lines: Vec<StyledLine>,
-    },
-    Info {
-        text: String,
-    },
-    Marker {
-        text: String,
-        tone: Tone,
-    },
-}
 
 impl TranscriptItem {
     /// The body this item collapses to under the global tools toggle (Ctrl-O),
@@ -590,6 +486,7 @@ fn truncate(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::presenter::Presenter;
+    use crate::view_model::LineStyle;
     use serde_json::json;
 
     // --- helpers ------------------------------------------------------------

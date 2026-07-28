@@ -31,7 +31,7 @@ use serde_json::Value;
 use crate::middleware::{Middleware, Token};
 use crate::presenter::Presenter;
 use crate::tools::run_command;
-use crate::ui::transcript::TranscriptItem;
+use crate::view_model::TranscriptItem;
 
 /// The Artifact keys this extension reserves, declared in one place (the diff
 /// extension's convention): a producer and consumer that disagree fail to compile.

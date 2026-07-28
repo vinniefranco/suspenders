@@ -23,7 +23,7 @@
 
 use crate::content::ContentBlock;
 
-use super::TranscriptItem;
+use crate::view_model::TranscriptItem;
 
 /// The latest streaming snapshot (`None` when not streaming). Owns the
 /// stateless-streaming rules: replace-wholesale, and the two materialize paths.

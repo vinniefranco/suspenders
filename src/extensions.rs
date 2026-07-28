@@ -43,7 +43,7 @@ use crate::middleware::token::TokenResult;
 use crate::middleware::{Middleware, Token};
 use crate::presenter::Presenter;
 use crate::tools::{self, shaping};
-use crate::ui::transcript::TranscriptItem;
+use crate::view_model::TranscriptItem;
 
 /// One registered Extension (ADR-0042): a name (used to attribute a
 /// [`Failure`]), its optional Middleware and Presenter roles, and its
@@ -358,7 +358,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::tool::ToolCtx;
-    use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
+    use crate::view_model::{LineStyle, StyledLine, TranscriptItem};
     use serde_json::json;
     use std::collections::HashMap;
 

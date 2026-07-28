@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::extensions::diff::hunks::{Hunk, Line, Tag};
-use crate::ui::transcript::{LineStyle, StyledLine};
+use crate::view_model::{LineStyle, StyledLine};
 
 /// The default display cap: hunks render at most this many lines before eliding
 /// with a muted tail (baud's `lines/2` default). Artifacts cost no Context

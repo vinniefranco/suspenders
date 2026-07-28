@@ -38,8 +38,9 @@ use crate::event::Event;
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
-use crate::ui::transcript::{Transcript, TranscriptItem};
+use crate::ui::transcript::Transcript;
 use crate::view_model::Tone;
+use crate::view_model::TranscriptItem;
 
 /// The greeting line a fresh Screen opens its Transcript with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
@@ -1068,8 +1069,8 @@ mod tests {
     use super::*;
     use crate::content::ContentBlock;
     use crate::event::Stage;
-    use crate::ui::transcript::TranscriptItem;
     use crate::view_model::Tone;
+    use crate::view_model::TranscriptItem;
     use std::collections::HashMap;
 
     // --- helpers mirroring transcript_test.exs -----------------------------

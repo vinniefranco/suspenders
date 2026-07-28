@@ -10,7 +10,7 @@
 //! to the old identity default that passed every item through.
 //!
 //! `present` - the PURE Presentment stage inside the Transcript store. Given a
-//! [`crate::ui::transcript::TranscriptItem`] and the append's Artifacts, it
+//! [`crate::view_model::TranscriptItem`] and the append's Artifacts, it
 //! returns the item to display - unchanged (default = identity) or replaced
 //! (e.g. a one-line Tool Result summary rewritten into a diff `Block`). No IO:
 //! it runs in the view and folds, in registration order, over EVERY item the
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::ui::transcript::TranscriptItem;
+use crate::view_model::TranscriptItem;
 
 /// The display-path contract a Suspenders Extension implements (ADR-0042).
 /// `present` defaults to identity, so a Presenter overrides it only when it
