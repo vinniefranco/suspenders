@@ -27,6 +27,7 @@ use crate::content::ContentBlock;
 use crate::conversation::WaveStats;
 use crate::llm::Delta;
 use crate::llm::response::StopReason;
+use crate::run::governor::endgame::ReopenReason;
 use crate::session::RecoveryShape;
 use crate::ui::selector::SelectorRow;
 use crate::ui::transcript::Tone;
@@ -220,10 +221,13 @@ pub enum Event {
     },
 
     /// A Recovery Run opened (CONTEXT.md: Recovery Run): carries the arm
-    /// taken and the Voice-authored prompt that starts it - the prompt enters
-    /// the Conversation, so the Transcript must show it.
+    /// taken, the reason it reopened (ADR-0043 - so an Open-Plan continuation
+    /// greps distinctly from a broken-state recovery), and the Voice-authored
+    /// prompt that starts it - the prompt enters the Conversation, so the
+    /// Transcript must show it.
     RecoveryRun {
         shape: RecoveryShape,
+        reason: ReopenReason,
         text: String,
     },
 
@@ -369,9 +373,14 @@ impl Event {
         Event::Anchor { text: text.into() }
     }
 
-    pub fn recovery_run(shape: RecoveryShape, text: impl Into<String>) -> Self {
+    pub fn recovery_run(
+        shape: RecoveryShape,
+        reason: ReopenReason,
+        text: impl Into<String>,
+    ) -> Self {
         Event::RecoveryRun {
             shape,
+            reason,
             text: text.into(),
         }
     }

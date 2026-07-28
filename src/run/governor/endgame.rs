@@ -10,19 +10,24 @@
 //!   ([`tail_rider`]), and closes the Run on the run-limit marker at the
 //!   finish settlement ([`final_pass`], [`tool_insistent_text`],
 //!   [`limit_stop_reason`]).
-//! * **Setpoints**: the recovery pair ([`RecoverySetpoints`]) - `recovery_limit`
-//!   (at most N Recovery Runs per user request, `0` disables the mechanic) and
-//!   `recovery_shape` (Handoff or Continuation). The schedule itself carries
-//!   none: its offsets (2, 1, 0 Passes remaining) ARE the mechanics, and the
-//!   Run Limit is a Session fact read from the Ledger's Pass position.
+//! * **Setpoints**: the recovery Setpoints ([`RecoverySetpoints`]) - two
+//!   budgets, `repair_limit` (broken-state Recovery Runs per user request) and
+//!   `advance_limit` (Open-Plan continuations per user request; ADR-0043),
+//!   each `0`-disablable, plus `recovery_shape` (the broken-state arm's shape).
+//!   The schedule itself carries none: its offsets (2, 1, 0 Passes remaining)
+//!   ARE the mechanics, and the Run Limit is a Session fact read from the
+//!   Ledger's Pass position.
 //!
 //! The Recovery Run (CONTEXT.md): when this Governor closes a Run at its
-//! Run Limit and the Ledger says the work is demonstrably unfinished
-//! (unverified writes, or a Dangling Failure - a command string whose most
-//! recent run this Run failed), it issues the
-//! close-and-open-a-Recovery-Run Intervention instead of the plain close
-//! ([`recovery`]) - evidence: 12 of 15 hard f5 runs died AT the cap, several
-//! one honest debugging run from green (LOG.md cycles 005-006). The Agent
+//! Run Limit and the Ledger says the work is demonstrably unfinished, it
+//! issues the close-and-open-a-Recovery-Run Intervention instead of the plain
+//! close ([`recovery`]). "Unfinished" is one of three evidences (ADR-0043):
+//! unverified writes, a Dangling Failure (a command string whose most recent
+//! run this Run failed) with a write this Run, or - green but not done - an
+//! Open Plan (a Plan still showing unchecked steps that advanced this Run).
+//! Evidence: 12 of 15 hard f5 runs died AT the cap, several one honest
+//! debugging run from green (LOG.md cycles 005-006); and a green-but-incomplete
+//! greenfield build made the user type "continue" (ADR-0043). The Agent
 //! executes the Intervention; this Governor only judges.
 //!
 //! The endgame is mechanical because small models comply with mechanics, not
@@ -49,6 +54,7 @@
 //! wording the answers carry.
 
 use crate::content::ContentBlock;
+use crate::plan::PlanProgress;
 use crate::session::RecoveryShape;
 use crate::session::log::StopReason;
 use crate::tool::ToolSpec;
@@ -56,23 +62,76 @@ use crate::run::governor::failure;
 use crate::run::governor::ledger::Ledger;
 use crate::voice;
 
+/// Why a Recovery Run reopens (ADR-0043): the three evidences of "unfinished"
+/// the one recovery judgment recognises. The first two are broken-state (the
+/// original ADR-0028 trigger, split by the `verification_failing` bool the
+/// Voice was already parameterized with); the third is the Open Plan - a green
+/// Run whose Plan still shows unchecked `[ ]` steps. The Voice's recovery
+/// prompt and the Session Log entry carry it, so an Open-Plan continuation
+/// logs and greps distinctly while remaining one mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenReason {
+    /// Successful writes with no verification since (ADR-0028).
+    UnverifiedWrites,
+    /// A command string whose most recent run this Run failed, with a write
+    /// this Run (ADR-0028 addendum 2026-07-14).
+    DanglingFailure,
+    /// The Run settled green but its Plan still has unchecked steps and it
+    /// checked off at least one step this Run (ADR-0043).
+    OpenPlan,
+}
+
+impl ReopenReason {
+    /// The lowercase wire token for the Session Log's `recovery` entry
+    /// (ADR-0043), so an Open-Plan reopen greps distinctly. Paired with
+    /// [`ReopenReason::parse`] the way [`RecoveryShape`] pairs `as_str`/`parse`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReopenReason::UnverifiedWrites => "unverified_writes",
+            ReopenReason::DanglingFailure => "dangling_failure",
+            ReopenReason::OpenPlan => "open_plan",
+        }
+    }
+
+    /// Parses a wire token back to a reason. `None` on an unknown token; the
+    /// log fold degrades a missing/foreign reason to `UnverifiedWrites` (a
+    /// broken-state recovery), never to a torn line.
+    pub fn parse(s: &str) -> Option<ReopenReason> {
+        match s {
+            "unverified_writes" => Some(ReopenReason::UnverifiedWrites),
+            "dangling_failure" => Some(ReopenReason::DanglingFailure),
+            "open_plan" => Some(ReopenReason::OpenPlan),
+            _ => None,
+        }
+    }
+}
+
 /// The Endgame Governor's recovery Setpoints (CONTEXT.md: Setpoint -
 /// resolved by the Session once at launch and fed to the Governor that owns
-/// them). Defaults mirror the shipped config: one Recovery Run per user
-/// request, Handoff-shaped.
+/// them). Two budgets (ADR-0043): `repair_limit` bounds broken-state
+/// recoveries, `advance_limit` bounds Open-Plan continuations - self-continuing
+/// a green build is a different risk profile than one-shot break-fixing.
+/// Defaults mirror the shipped config: one broken-state Recovery Run and three
+/// Open-Plan continuations per user request, Handoff-shaped (the broken-state
+/// shape; an Open Plan always reopens as a Continuation regardless, ADR-0043).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoverySetpoints {
-    /// At most this many Recovery Runs per user request; `0` disables the
-    /// mechanic entirely.
-    pub limit: u64,
-    /// Which arm a Recovery Run takes.
+    /// At most this many broken-state Recovery Runs per user request; `0`
+    /// disables the broken-state arms.
+    pub repair_limit: u64,
+    /// At most this many Open-Plan continuations per user request; `0`
+    /// disables the Open-Plan arm.
+    pub advance_limit: u64,
+    /// Which arm a broken-state Recovery Run takes (an Open-Plan continuation
+    /// is always Continuation-shaped, ADR-0043).
     pub shape: RecoveryShape,
 }
 
 impl Default for RecoverySetpoints {
     fn default() -> Self {
         RecoverySetpoints {
-            limit: 1,
+            repair_limit: 1,
+            advance_limit: 3,
             shape: RecoveryShape::Handoff,
         }
     }
@@ -84,40 +143,70 @@ impl Default for RecoverySetpoints {
 /// the fresh Conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovery {
-    /// The arm to take, from the shape Setpoint.
+    /// The arm to take: the configured shape for a broken state, always
+    /// Continuation for an Open Plan (ADR-0043 - a green, step-advancing Run
+    /// is productive, not degraded, so retiring its Conversation throws away
+    /// the working context the next steps need).
     pub shape: RecoveryShape,
-    /// Why the work is unfinished: `true` when a verification is failing (a
-    /// Dangling Failure - a command string whose most recent run this Run
-    /// failed), `false` when writes went unverified - the fact the Voice's
-    /// recovery prompt is parameterized with.
-    pub verification_failing: bool,
+    /// Why the work is unfinished (ADR-0043): the fact the Voice's recovery
+    /// prompt is parameterized with, and the Session Log entry carries, so an
+    /// Open-Plan continuation logs and greps distinctly.
+    pub reason: ReopenReason,
     /// The Dangling Failure's command string, so the Handoff seed can carry
     /// that command's OWN failing result verbatim - the command the recovery
     /// prompt names, never merely the last command run (ADR-0028 addendum
-    /// 2026-07-14). `None` on an unverified-writes-only recovery (nothing
-    /// dangles), which keeps the pre-existing last-command seed.
+    /// 2026-07-14). `None` on an unverified-writes or Open-Plan recovery
+    /// (nothing dangles), which keeps the pre-existing last-command seed.
     pub failing_command: Option<String>,
 }
 
 /// The recovery judgment, consulted only when this Governor is already
-/// closing the Run at its Run Limit: `Some` when the Ledger says the work
-/// is demonstrably unfinished (unverified writes, or a Dangling Failure) and
-/// the request's recovery budget is not spent. The failing arm is
-/// dangling-failure-based, not last-command-only - a red full-suite run
-/// followed by a green filtered rerun (observed live) must not read as
-/// green. The dangling-failure arm additionally requires that a write landed
-/// this Run: a failing command during pure exploration is not unfinished
-/// implementation, so a read-only Run draws no recovery (ADR-0028 addendum
-/// 2026-07-14). A capped Run that settled green gets no recovery; `limit` 0
-/// disables the mechanic.
+/// closing the Run at its Run Limit. `Some` when the Ledger says the work is
+/// demonstrably unfinished on one of three evidences (ADR-0028, ADR-0043),
+/// and that evidence's budget is not spent. Precedence is resolved INSIDE this
+/// one function - broken evidence always wins, green is an inviolable
+/// precondition for the Open Plan arm - so the arbiter gains no new
+/// cross-Governor ordering. The two arms are mutually exclusive.
+///
+/// * **Broken** (the ADR-0028 trigger): unverified writes, or a Dangling
+///   Failure with a write this Run. The failing arm is dangling-failure-based,
+///   not last-command-only - a red full-suite run followed by a green filtered
+///   rerun (observed live) must not read as green - and it requires a write
+///   this Run, so pure exploration draws no recovery (addendum 2026-07-14).
+///   Reopens with the configured `shape`, bounded by `repair_limit`.
+/// * **Open Plan** (ADR-0043): a green Run (no broken evidence) whose Plan is
+///   still [`PlanProgress::Incomplete`] and which checked off a step this Run
+///   (the made-progress guard). Reopens as a Continuation - a productive Run's
+///   context is worth keeping - bounded by the separate `advance_limit`. A
+///   Plan that is Complete, has no checkboxes, or showed no progress draws
+///   nothing.
+///
+/// A capped Run that settled green with a done (or checkbox-less) Plan gets no
+/// recovery; either budget at `0` disables its arm.
 pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recovery> {
-    let unfinished =
+    let broken =
         ledger.unverified_writes() || (ledger.dangling_failure() && ledger.wrote_this_run());
-    if unfinished && ledger.recoveries_used() < setpoints.limit {
+
+    if broken && ledger.recoveries_used() < setpoints.repair_limit {
+        let reason = if ledger.dangling_failure() {
+            ReopenReason::DanglingFailure
+        } else {
+            ReopenReason::UnverifiedWrites
+        };
         Some(Recovery {
             shape: setpoints.shape,
-            verification_failing: ledger.dangling_failure(),
+            reason,
             failing_command: ledger.dangling_command().map(str::to_string),
+        })
+    } else if !broken
+        && ledger.plan_open() == Some(PlanProgress::Incomplete)
+        && ledger.plan_advanced()
+        && ledger.advances_used() < setpoints.advance_limit
+    {
+        Some(Recovery {
+            shape: RecoveryShape::Continuation,
+            reason: ReopenReason::OpenPlan,
+            failing_command: None,
         })
     } else {
         None
@@ -378,13 +467,25 @@ mod tests {
         ledger
     }
 
+    // A green Run whose carried Plan is Incomplete and which checked off a
+    // step this Run: the Open Plan arm's happy path (ADR-0043).
+    fn open_plan_advanced() -> Ledger {
+        let mut ledger = Ledger::new(25);
+        // Carried Incomplete with one box checked; a step gets checked off
+        // this Run, so checked_now (2) rises over the baseline (1). No broken
+        // evidence: no unverified writes, no dangling command.
+        ledger.note_plan_carried(PlanProgress::Incomplete, 1);
+        ledger.note_plan_updated(PlanProgress::Incomplete, 2);
+        ledger
+    }
+
     #[test]
     fn unverified_writes_draw_a_recovery() {
         assert_eq!(
             recovery(&RecoverySetpoints::default(), &unverified()),
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
-                verification_failing: false,
+                reason: ReopenReason::UnverifiedWrites,
                 failing_command: None,
             })
         );
@@ -399,7 +500,7 @@ mod tests {
             recovery(&RecoverySetpoints::default(), &command_failing()),
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
-                verification_failing: true,
+                reason: ReopenReason::DanglingFailure,
                 failing_command: Some("cargo test".to_string()),
             })
         );
@@ -425,10 +526,112 @@ mod tests {
             recovery(&RecoverySetpoints::default(), &ledger),
             Some(Recovery {
                 shape: RecoveryShape::Handoff,
-                verification_failing: true,
+                reason: ReopenReason::DanglingFailure,
                 failing_command: Some("cargo test".to_string()),
             })
         );
+    }
+
+    // ---- recovery/2: the Open Plan arm (ADR-0043) ----
+
+    #[test]
+    fn an_advanced_open_plan_on_a_green_run_draws_a_continuation() {
+        // Green (no broken evidence), Incomplete Plan, a step checked off this
+        // Run, budget available: the Open Plan arm fires as a Continuation -
+        // NOT the configured Handoff shape.
+        assert_eq!(
+            recovery(&RecoverySetpoints::default(), &open_plan_advanced()),
+            Some(Recovery {
+                shape: RecoveryShape::Continuation,
+                reason: ReopenReason::OpenPlan,
+                failing_command: None,
+            })
+        );
+    }
+
+    #[test]
+    fn broken_evidence_outranks_an_open_plan() {
+        // The same advanced Incomplete Plan, but the Run ALSO left unverified
+        // writes: green is an inviolable precondition, so the broken arm wins
+        // and reopens with the configured (Handoff) shape.
+        let mut ledger = open_plan_advanced();
+        ledger.record(
+            "edit_file",
+            &json!({"path": "a.ex"}),
+            &ToolResult {
+                content: "edited",
+                is_error: false,
+            },
+            CallOutcome::Ran,
+        );
+        assert!(ledger.unverified_writes());
+        assert_eq!(
+            recovery(&RecoverySetpoints::default(), &ledger).map(|r| (r.shape, r.reason)),
+            Some((RecoveryShape::Handoff, ReopenReason::UnverifiedWrites))
+        );
+    }
+
+    #[test]
+    fn a_complete_plan_draws_no_open_plan_recovery() {
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried(PlanProgress::Incomplete, 1);
+        ledger.note_plan_updated(PlanProgress::Complete, 2);
+        assert_eq!(recovery(&RecoverySetpoints::default(), &ledger), None);
+    }
+
+    #[test]
+    fn a_checkboxless_plan_draws_no_open_plan_recovery() {
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried(PlanProgress::NoCheckboxes, 0);
+        ledger.note_plan_updated(PlanProgress::NoCheckboxes, 0);
+        assert_eq!(recovery(&RecoverySetpoints::default(), &ledger), None);
+    }
+
+    #[test]
+    fn an_incomplete_plan_that_did_not_advance_draws_no_recovery() {
+        // The made-progress guard: Incomplete, but no box checked off this Run
+        // (checked_now stays at the baseline). A continuation would just repeat
+        // the Run.
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried(PlanProgress::Incomplete, 1);
+        ledger.note_plan_updated(PlanProgress::Incomplete, 1);
+        assert!(!ledger.plan_advanced());
+        assert_eq!(recovery(&RecoverySetpoints::default(), &ledger), None);
+    }
+
+    #[test]
+    fn the_advance_limit_bounds_open_plan_continuations() {
+        let mut spent = open_plan_advanced();
+        spent.note_advances_used(3);
+        assert_eq!(recovery(&RecoverySetpoints::default(), &spent), None);
+
+        let mut room = open_plan_advanced();
+        room.note_advances_used(2);
+        assert!(recovery(&RecoverySetpoints::default(), &room).is_some());
+    }
+
+    #[test]
+    fn the_open_plan_arm_uses_its_own_budget_not_the_repair_budget() {
+        // A spent repair budget does not close the Open Plan arm: they are
+        // distinct counters.
+        let mut ledger = open_plan_advanced();
+        ledger.note_recoveries_used(1); // repair budget spent
+        assert!(recovery(&RecoverySetpoints::default(), &ledger).is_some());
+
+        // And a spent advance budget does not close the repair arm.
+        let mut broken = unverified();
+        broken.note_advances_used(3);
+        assert!(recovery(&RecoverySetpoints::default(), &broken).is_some());
+    }
+
+    #[test]
+    fn advance_limit_zero_disables_the_open_plan_arm() {
+        let setpoints = RecoverySetpoints {
+            repair_limit: 1,
+            advance_limit: 0,
+            shape: RecoveryShape::Handoff,
+        };
+        assert_eq!(recovery(&setpoints, &open_plan_advanced()), None);
     }
 
     #[test]
@@ -462,9 +665,10 @@ mod tests {
     }
 
     #[test]
-    fn the_shape_setpoint_picks_the_arm() {
+    fn the_shape_setpoint_picks_the_broken_state_arm() {
         let setpoints = RecoverySetpoints {
-            limit: 1,
+            repair_limit: 1,
+            advance_limit: 3,
             shape: RecoveryShape::Continuation,
         };
         assert_eq!(
@@ -474,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn the_limit_bounds_recoveries_per_user_request() {
+    fn the_repair_limit_bounds_broken_state_recoveries_per_user_request() {
         let mut spent = unverified();
         spent.note_recoveries_used(1);
         assert_eq!(recovery(&RecoverySetpoints::default(), &spent), None);
@@ -482,16 +686,18 @@ mod tests {
         let mut room = unverified();
         room.note_recoveries_used(1);
         let setpoints = RecoverySetpoints {
-            limit: 2,
+            repair_limit: 2,
+            advance_limit: 3,
             shape: RecoveryShape::Handoff,
         };
         assert!(recovery(&setpoints, &room).is_some());
     }
 
     #[test]
-    fn limit_zero_disables_the_mechanic() {
+    fn repair_limit_zero_disables_the_broken_state_arms() {
         let setpoints = RecoverySetpoints {
-            limit: 0,
+            repair_limit: 0,
+            advance_limit: 3,
             shape: RecoveryShape::Handoff,
         };
         assert_eq!(recovery(&setpoints, &unverified()), None);

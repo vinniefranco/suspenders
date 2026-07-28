@@ -714,7 +714,7 @@ mod tests {
         // freshly parameterized - never a one-shot.
         let mut governors = Governors::new(5, 8, true);
         let mut ledger = ledger_at(1, 50);
-        ledger.note_plan_updated();
+        ledger.note_plan_updated(crate::plan::PlanProgress::NoCheckboxes, 0);
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         for _ in 1..10 {
             ledger.advance_pass();
@@ -743,7 +743,7 @@ mod tests {
         // Same cadence hit, but the Plan is within its threshold - and a
         // stale Plan with zero writes since (pure reading) stays bare too.
         let mut fresh = ledger_at(1, 50);
-        fresh.note_plan_updated();
+        fresh.note_plan_updated(crate::plan::PlanProgress::NoCheckboxes, 0);
         fresh.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         for _ in 1..5 {
             fresh.advance_pass();
@@ -756,7 +756,7 @@ mod tests {
         );
 
         let mut reading = ledger_at(1, 50);
-        reading.note_plan_updated();
+        reading.note_plan_updated(crate::plan::PlanProgress::NoCheckboxes, 0);
         for _ in 1..10 {
             reading.advance_pass();
         }
@@ -828,7 +828,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    verification_failing: false,
+                    reason: endgame::ReopenReason::UnverifiedWrites,
                     failing_command: None,
                 },
                 keep_reply: false,
@@ -844,7 +844,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    verification_failing: true,
+                    reason: endgame::ReopenReason::DanglingFailure,
                     failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: false,
@@ -865,7 +865,8 @@ mod tests {
     #[test]
     fn recovery_limit_zero_disables_the_mechanic_at_the_arbiter() {
         let governors = Governors::new(5, 8, true).with_recovery(endgame::RecoverySetpoints {
-            limit: 0,
+            repair_limit: 0,
+            advance_limit: 0,
             shape: crate::session::RecoveryShape::Handoff,
         });
         assert_eq!(
@@ -898,7 +899,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    verification_failing: true,
+                    reason: endgame::ReopenReason::DanglingFailure,
                     failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: false,
@@ -1138,7 +1139,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    verification_failing: true,
+                    reason: endgame::ReopenReason::DanglingFailure,
                     failing_command: Some("cargo test".to_string()),
                 },
                 keep_reply: true,
@@ -1159,7 +1160,7 @@ mod tests {
                 reason: log::StopReason::RunLimit,
                 recovery: endgame::Recovery {
                     shape: crate::session::RecoveryShape::Handoff,
-                    verification_failing: false,
+                    reason: endgame::ReopenReason::UnverifiedWrites,
                     failing_command: None,
                 },
                 keep_reply: true,

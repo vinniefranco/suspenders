@@ -922,13 +922,20 @@ async fn a_capped_unfinished_run_opens_a_continuation_recovery_run() {
     recv_match(&mut rx, is_run_finished).await;
     let recovery = recv_match(&mut rx, is_recovery_run).await;
     let prompt = match &recovery {
-        Event::RecoveryRun { shape, text } => {
+        Event::RecoveryRun { shape, reason, text } => {
             assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
+            assert_eq!(
+                *reason,
+                crate::run::governor::endgame::ReopenReason::UnverifiedWrites
+            );
             text.clone()
         }
         _ => unreachable!(),
     };
-    assert_eq!(prompt, voice::recovery_prompt(false));
+    assert_eq!(
+        prompt,
+        voice::recovery_prompt(crate::run::governor::endgame::ReopenReason::UnverifiedWrites)
+    );
     recv_match(&mut rx, is_run_started).await;
     recv_match(&mut rx, is_run_finished).await;
     assert_eq!(agent.status().await, Status::Idle);
@@ -1068,9 +1075,10 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     let recovery = recv_match(&mut rx, is_recovery_run).await;
     assert!(matches!(
         &recovery,
-        Event::RecoveryRun { shape, text }
+        Event::RecoveryRun { shape, reason, text }
             if *shape == crate::session::RecoveryShape::Handoff
-                && text == voice::recovery_prompt(true)
+                && *reason == crate::run::governor::endgame::ReopenReason::DanglingFailure
+                && text == voice::recovery_prompt(crate::run::governor::endgame::ReopenReason::DanglingFailure)
     ));
     recv_match(&mut rx, is_run_started).await;
     recv_match(&mut rx, is_run_finished).await;
@@ -1085,7 +1093,9 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     assert!(seed.contains("fix the failing tests"));
     assert!(seed.contains("narrative-of-dying-turn"));
     assert!(seed.contains(&verification));
-    assert!(seed.contains(voice::recovery_prompt(true)));
+    assert!(seed.contains(voice::recovery_prompt(
+        crate::run::governor::endgame::ReopenReason::DanglingFailure
+    )));
     assert_eq!(
         conv.messages[1],
         Message::assistant_from(
@@ -1136,7 +1146,9 @@ async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
     let seed = user_texts(&conv).join("\n");
     assert!(seed.contains(voice::handoff_no_narrative()));
     assert!(seed.contains("write the file")); // task verbatim
-    assert!(seed.contains(voice::recovery_prompt(false)));
+    assert!(seed.contains(voice::recovery_prompt(
+        crate::run::governor::endgame::ReopenReason::UnverifiedWrites
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1169,6 +1181,101 @@ async fn recovery_limit_zero_leaves_a_capped_unfinished_run_alone() {
     refute_match(&mut rx, is_recovery_run).await;
     refute_match(&mut rx, is_run_started).await;
     assert_eq!(agent.status().await, Status::Idle);
+}
+
+// ---- the Open Plan arm (ADR-0043) --------------------------------------
+
+// A green Run that checked off a Plan step but left the Plan Incomplete: the
+// plan tool sets `[x] a / [ ] b` (green - no writes, no run_command), then the
+// final Pass settles green with the Plan still open. run_limit 2 caps it on the
+// final-Pass text settle, where the Open Plan arm fires as a Continuation.
+fn open_plan_script(prompt: &str) -> Vec<Entry> {
+    vec![
+        Entry::just(tool_use_result(
+            "p1",
+            "plan",
+            json!({ "plan": "Goal: build it.\n1. [x] a\n2. [ ] b" }),
+        )),
+        Entry::just(text_end("finished step a; step b remains")),
+        Entry::just(text_end(prompt)),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_green_run_with_an_advanced_open_plan_opens_a_continuation() {
+    let dir = TempDir::new().unwrap();
+    // Handoff-configured, to prove the Open Plan arm ignores the broken-state
+    // shape Setpoint and always continues (ADR-0043).
+    let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
+    let session_dir = session.session_dir.clone();
+    let agent = start(session, FakeLlm::script(open_plan_script("all steps done now")));
+    let mut rx = agent.subscribe();
+
+    agent.submit("build it").await.unwrap();
+
+    recv_match(&mut rx, is_run_finished).await;
+    let recovery = recv_match(&mut rx, is_recovery_run).await;
+    match &recovery {
+        Event::RecoveryRun { shape, reason, text } => {
+            // Continuation despite the Handoff Setpoint, and the Open Plan
+            // reason carries the plan-continuation prompt.
+            assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
+            assert_eq!(
+                *reason,
+                crate::run::governor::endgame::ReopenReason::OpenPlan
+            );
+            assert_eq!(
+                text,
+                voice::recovery_prompt(crate::run::governor::endgame::ReopenReason::OpenPlan)
+            );
+        }
+        _ => unreachable!(),
+    }
+    recv_match(&mut rx, is_run_started).await;
+    recv_match(&mut rx, is_run_finished).await;
+    assert_eq!(agent.status().await, Status::Idle);
+
+    // The log records the continuation against the ADVANCE budget, not the
+    // broken-state recovery budget (the two counters are separate).
+    let path = log::latest(&session_dir).expect("a log file");
+    assert_eq!(log::advances_used(&path), 1);
+    assert_eq!(log::recoveries_used(&path), 0);
+}
+
+// The advance budget survives Resume symmetrically to the recovery budget: the
+// spent-count is a durable Session Log fact the fold restores (the same fold
+// that restores `recoveries_used`), so a resumed Session cannot re-trigger
+// Open-Plan continuations unboundedly. One continuation is spent, then the
+// whole session round-trips: the log records the advance and the resumed
+// Conversation rebuilds byte-identically.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_plan_continuation_survives_resume() {
+    let dir = TempDir::new().unwrap();
+    let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
+    let session_dir = session.session_dir.clone();
+    let agent = start(session.clone(), FakeLlm::script(open_plan_script("all done")));
+    let mut rx = agent.subscribe();
+
+    agent.submit("build it").await.unwrap();
+    recv_match(&mut rx, is_run_finished).await;
+    recv_match(&mut rx, is_recovery_run).await;
+    recv_match(&mut rx, is_run_started).await;
+    recv_match(&mut rx, is_run_finished).await;
+
+    let live = agent.conversation().await;
+    drop(agent);
+
+    let path = log::latest(&session_dir).expect("a log file");
+    assert_eq!(log::advances_used(&path), 1);
+    assert_eq!(log::recoveries_used(&path), 0);
+
+    let resumed = AgentHandle::start(
+        StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+            .with_system_prompt("You are a test agent.")
+            .with_resume(Resume::Path(path)),
+    )
+    .expect("resumes");
+    assert_eq!(resumed.conversation().await.messages, live.messages);
 }
 
 // ---- riders in the Session Log (Anchors + Endgame prompts) ------------

@@ -69,15 +69,18 @@ jobs:
           path: target/tarpaulin
           if-no-files-found: error
 
-      # prebuilt binary, pinned (not in install-action's registry)
-      - name: Install cargo-crap
-        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/minikin/cargo-crap/releases/download/v0.3.1/cargo-crap-x86_64-unknown-linux-gnu.tar.gz | tar xz -C ~/.cargo/bin
+      # no prebuilt binaries published, so cargo-install the pinned version
+      # (the crate ships a Cargo.lock, so --locked stays reproducible)
+      - name: Install rustqual
+        run: cargo install rustqual --version 1.8.2 --locked
 
-      # regression-only complexity gate: fails when a function's CRAP score
-      # rises above the committed baseline (see .cargo-crap.toml); runs after
-      # the artifact upload so the coverage report survives a red gate
-      - name: CRAP regression
-        run: cargo crap --lcov target/tarpaulin/lcov.info --baseline .cargo-crap-baseline.json --fail-regression
+      # quality gate: fails if any of the seven dimensions regress against the
+      # committed baseline OR the aggregate quality score drops below the floor
+      # (see rustqual.toml). --no-fail suppresses rustqual's default
+      # findings-present exit so only regression + floor decide the gate; runs
+      # after the artifact upload so the coverage report survives a red gate
+      - name: rustqual quality gate
+        run: rustqual . --coverage target/tarpaulin/lcov.info --compare rustqual-baseline.json --fail-on-regression --min-quality-score 80 --no-fail
 
   # release binaries, built only when main advances (all deps are pure Rust
   # thanks to rustls + fancy-regex, so cross-arch darwin builds need no SDK fuss)

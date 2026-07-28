@@ -87,14 +87,16 @@ impl OutcomeStop {
 }
 
 /// Options for [`run`] (baud's `opts`): the restored Plan content, the
-/// durable original task copy from the Compaction state, and the Recovery
-/// Runs already consumed serving the current user request (an Agent-owned
-/// cross-Run fact the Ledger starts with).
+/// durable original task copy from the Compaction state, and the two per-request
+/// recovery counts already consumed serving the current user request
+/// (Agent-owned cross-Run facts the Ledger starts with, ADR-0043): broken-state
+/// recoveries and Open-Plan continuations.
 #[derive(Debug, Clone, Default)]
 pub struct RunOpts {
     pub plan: Option<String>,
     pub original_task: Option<String>,
     pub recoveries_used: u64,
+    pub advances_used: u64,
 }
 
 // The loop state that spans Passes: the effect bundle, the owned emission
@@ -156,23 +158,31 @@ pub async fn run<D: RunDeps>(
             session.no_think_rescue,
         )
         .with_recovery(governor::endgame::RecoverySetpoints {
-            limit: session.recovery_limit,
+            repair_limit: session.recovery_limit,
+            advance_limit: session.advance_limit,
             shape: session.recovery_shape,
         }),
         plan,
         malformed_retry_budget: session.malformed_retry_budget,
     };
 
-    // Recovery Runs already consumed serving this user request: an Agent-
-    // owned cross-Run fact the Ledger starts with, read by the Endgame
-    // Governor's recovery judgment.
+    // Recovery Runs and Open-Plan continuations already consumed serving this
+    // user request: Agent-owned cross-Run facts the Ledger starts with, read
+    // by the Endgame Governor's recovery judgment against its two budgets
+    // (ADR-0043).
     state.ledger.note_recoveries_used(opts.recoveries_used);
+    state.ledger.note_advances_used(opts.advances_used);
 
     // A Plan carried in from a previous Run is a fact the Ledger starts
     // with: its recency clock runs from Run start (a Plan set THIS Run
-    // starts its clock at `batch`'s firing site instead).
+    // starts its clock at `batch`'s firing site instead). Its checkbox facts
+    // (ADR-0043: the Open Plan) seed the made-progress baseline here - the
+    // Ledger stores what the caller computes off the Plan, never parsing
+    // markdown itself.
     if state.plan.content.is_some() {
-        state.ledger.note_plan_carried();
+        state
+            .ledger
+            .note_plan_carried(state.plan.progress(), state.plan.checked_steps());
     }
 
     conversation = maybe_compact_proactive(&mut state, conversation).await;
@@ -2236,7 +2246,7 @@ mod tests {
         // recovers (the refusal and the recovery judgment compose).
         let (_conv, reason, recovery) = recover(&outcome);
         assert_eq!(reason, log::StopReason::RunLimit);
-        assert!(!recovery.verification_failing);
+        assert_eq!(recovery.reason, governor::endgame::ReopenReason::UnverifiedWrites);
     }
 
     // The final Pass offers NO Tools (ADR-0015/0035); a tool-insistent reply's
@@ -2536,7 +2546,7 @@ mod tests {
             recovery,
             Recovery {
                 shape: RecoveryShape::Handoff,
-                verification_failing: false,
+                reason: governor::endgame::ReopenReason::UnverifiedWrites,
                 failing_command: None,
             }
         );
@@ -2579,7 +2589,7 @@ mod tests {
 
         let (outcome, _deps) = run_with(&session, "run it", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
-        assert!(recovery.verification_failing);
+        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
         assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
 
@@ -2643,7 +2653,7 @@ mod tests {
         .with_approvals(vec![true]);
         let (outcome, _deps) = run_with(&session, "run it", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
-        assert!(recovery.verification_failing);
+        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
         assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
 
@@ -2747,7 +2757,7 @@ mod tests {
         let (conv, reason, recovery) = recover(&outcome);
 
         assert_eq!(reason, log::StopReason::RunLimit);
-        assert!(recovery.verification_failing);
+        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
         let lm = last_message(conv);
         assert!(
             matches!(&lm.content[0], ContentBlock::Text { text } if text == "half done; the tests are still red")
@@ -2796,7 +2806,7 @@ mod tests {
 
         let (outcome, _deps) = run_with(&session, "run the tests", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
-        assert!(recovery.verification_failing);
+        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
     }
 
     // A clean cap (no writes, no failing command) settling Ok is covered by

@@ -174,15 +174,22 @@ pub fn run_limit_marker() -> &'static str {
 }
 
 /// The Recovery Run's prompt (CONTEXT.md: Recovery Run - the only Run
-/// whose prompt Suspenders authors). Parameterized on the Ledger fact that
-/// triggered it: the last verification failing, or writes left unverified.
-/// Deliberately short and mechanical - a 9B over-reads long imperatives
-/// (LOG.md cycle 002).
-pub fn recovery_prompt(verification_failing: bool) -> &'static str {
-    if verification_failing {
-        "[the previous turn hit its pass limit with the last verification failing - continue the task: fix the failure with minimal changes and re-run the verification until it passes]"
-    } else {
-        "[the previous turn hit its pass limit with unverified changes - continue the task: run the verification, fix failures with minimal changes, and finish only when it passes]"
+/// whose prompt Suspenders authors). Parameterized on the reason the Endgame
+/// reopened (ADR-0043): a Dangling Failure, unverified writes, or an Open Plan
+/// (a green Run whose Plan still has open steps). Deliberately short and
+/// mechanical - a 9B over-reads long imperatives (LOG.md cycle 002).
+pub fn recovery_prompt(reason: crate::run::governor::endgame::ReopenReason) -> &'static str {
+    use crate::run::governor::endgame::ReopenReason;
+    match reason {
+        ReopenReason::DanglingFailure => {
+            "[the previous turn hit its pass limit with the last verification failing - continue the task: fix the failure with minimal changes and re-run the verification until it passes]"
+        }
+        ReopenReason::UnverifiedWrites => {
+            "[the previous turn hit its pass limit with unverified changes - continue the task: run the verification, fix failures with minimal changes, and finish only when it passes]"
+        }
+        ReopenReason::OpenPlan => {
+            "[the previous turn finished a step with tests green but the plan still has open steps - continue the plan: pick up the next unchecked step and keep going until every step is done]"
+        }
     }
 }
 
@@ -762,18 +769,29 @@ mod tests {
 
     #[test]
     fn recovery_prompt_names_the_triggering_fact() {
-        let failing = recovery_prompt(true);
+        use crate::run::governor::endgame::ReopenReason;
+
+        let failing = recovery_prompt(ReopenReason::DanglingFailure);
         assert!(failing.contains("verification failing"));
 
-        let unverified = recovery_prompt(false);
+        let unverified = recovery_prompt(ReopenReason::UnverifiedWrites);
         assert!(unverified.contains("unverified changes"));
 
+        // The broken-state prompts share the fix-and-verify shape.
         for prompt in [failing, unverified] {
             assert!(prompt.starts_with('['));
             assert!(prompt.ends_with(']'));
             assert!(prompt.contains("continue the task"));
             assert!(prompt.contains("minimal changes"));
         }
+
+        // The Open Plan prompt steers to the next unchecked step, not a fix.
+        let open_plan = recovery_prompt(ReopenReason::OpenPlan);
+        assert!(open_plan.starts_with('['));
+        assert!(open_plan.ends_with(']'));
+        assert!(open_plan.contains("open steps"));
+        assert!(open_plan.contains("continue the plan"));
+        assert!(open_plan.contains("next unchecked step"));
     }
 
     #[test]
