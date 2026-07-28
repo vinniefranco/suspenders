@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "quality_score": 0.9275677587208564,
+  "quality_score": 0.9277619035590686,
   "iosp_score": 0.9981264637002342,
   "violations": 4,
   "total": 3245,
@@ -27,8 +27,8 @@
   "tq_uncovered_warnings": 0,
   "tq_untested_logic_warnings": 0,
   "structural_srp_warnings": 1,
-  "structural_coupling_warnings": 3,
-  "total_findings": 234,
+  "structural_coupling_warnings": 2,
+  "total_findings": 233,
   "violation_details": [
     {
       "name": "render",
