@@ -483,7 +483,12 @@ pub fn render_viewport(
     // it only the last few actions show as a rolling window - older low-signal
     // machinery (list/read) is suppressed, while code/diff Blocks and errors
     // always break out. Ctrl-T reveals every thought; Ctrl-O every action.
-    let fold = turn_fold(items, t.thinking_expanded, t.tools_expanded, MACHINERY_WINDOW);
+    let fold = turn_fold(
+        items,
+        t.thinking_expanded,
+        t.tools_expanded,
+        MACHINERY_WINDOW,
+    );
     // The fold's synthetic lines (a thought header carrying the LAST thought's
     // text at the FIRST thought's slot, or a `⋯ N earlier actions` count),
     // owned here so the assembly below can borrow them.
@@ -560,7 +565,12 @@ pub fn render_viewport(
 /// Uncached on purpose: the tail's window is non-monotonic (older lines scroll
 /// off as it grows), so the char-length key the settled streaming cache relies
 /// on would not hold. A handful of `Line`s per frame is cheap.
-fn live_thinking_lines(thinking: &str, spinner: u64, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn live_thinking_lines(
+    thinking: &str,
+    spinner: u64,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if thinking.is_empty() {
         return vec![];
     }
@@ -577,9 +587,10 @@ fn live_thinking_lines(thinking: &str, spinner: u64, width: u16, theme: &Theme) 
     let row_width = (width as usize).saturating_sub(2).max(1);
     let rows = text_rows(thinking);
     let tail = &rows[rows.len().saturating_sub(THINKING_TAIL_ROWS)..];
-    out.extend(tail.iter().map(|row| {
-        Line::styled(format!("  {}", truncate_visual(row, row_width)), row_style)
-    }));
+    out.extend(
+        tail.iter()
+            .map(|row| Line::styled(format!("  {}", truncate_visual(row, row_width)), row_style)),
+    );
     out
 }
 
@@ -625,7 +636,11 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
         }
         let wlen = word.chars().count();
         // +1 for the space that would join this word to the current line.
-        let needed = if line_len == 0 { wlen } else { line_len + 1 + wlen };
+        let needed = if line_len == 0 {
+            wlen
+        } else {
+            line_len + 1 + wlen
+        };
         if needed > width && line_len > 0 {
             out.push(std::mem::take(&mut line));
             line_len = 0;
@@ -648,7 +663,12 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// indent), and because each produced Line is `<= content_width` chars the
 /// viewport never re-wraps it - so `wrapped_count` equals the rendered rows
 /// (measure==draw, ADR-0029). Used by the indented machinery/marker arms.
-fn indented_lines(content: &str, indent: usize, content_width: u16, style: Style) -> Vec<Line<'static>> {
+fn indented_lines(
+    content: &str,
+    indent: usize,
+    content_width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
     let inner = (content_width as usize).saturating_sub(indent).max(1);
     let pad = " ".repeat(indent);
     wrap_words(content, inner)
@@ -794,12 +814,15 @@ fn turn_fold(
                 TranscriptItem::Thinking { .. } => thoughts.push(i),
                 // Low-signal machinery: a merged tool result or a bare call.
                 // Errors and Blocks are NOT here - they always break out.
-                TranscriptItem::ToolResult { is_error: false, .. }
+                TranscriptItem::ToolResult {
+                    is_error: false, ..
+                }
                 | TranscriptItem::ToolCall { .. } => machinery.push(i),
                 _ => {}
             }
         }
-        if !thinking_expanded && let (Some(&first), Some(&last)) = (thoughts.first(), thoughts.last())
+        if !thinking_expanded
+            && let (Some(&first), Some(&last)) = (thoughts.first(), thoughts.last())
         {
             fold[first] = FoldAction::Header(last);
             for &t in &thoughts {
@@ -894,7 +917,9 @@ fn assemble_settled<'a>(
 fn collapsed_thought_line(text: &str, width: u16, theme: &Theme) -> Line<'static> {
     const PREFIX: &str = "✦ thought: ";
     let style = thinking_style(theme);
-    let budget = (width as usize).saturating_sub(PREFIX.chars().count()).max(1);
+    let budget = (width as usize)
+        .saturating_sub(PREFIX.chars().count())
+        .max(1);
     Line::styled(
         format!("{PREFIX}{}", truncate_visual(first_line(text), budget)),
         style,
@@ -925,7 +950,11 @@ fn settled_thinking_lines(
     }
     let style = thinking_style(theme);
     let mut out = vec![Line::styled("✦ thought:", style)];
-    out.extend(text_rows(text).into_iter().map(|row| Line::styled(row, style)));
+    out.extend(
+        text_rows(text)
+            .into_iter()
+            .map(|row| Line::styled(row, style)),
+    );
     out
 }
 
@@ -1395,10 +1424,7 @@ fn message_lines(
         // gutter (ADR-0040 - the user's voice breaks the spine to the margin),
         // painted per-visual-row by `paint_gutter`, so `message_lines` no longer
         // prepends a gutter of its own. Multi-line input renders as many rows.
-        TranscriptItem::User { text } => text_rows(text)
-            .into_iter()
-            .map(Line::from)
-            .collect(),
+        TranscriptItem::User { text } => text_rows(text).into_iter().map(Line::from).collect(),
         // Assistant text is markdown: the pure ui::markdown fold produces
         // semantic lines and [`md_style`] turns them into colors here.
         // Width-wrapping is left to the viewport Paragraph's Wrap.
@@ -1653,10 +1679,7 @@ fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                     } else {
                         let mut spans = vec![inset()];
                         spans.extend(fragments.into_iter().map(|((r, g, b), text)| {
-                            Span::styled(
-                                text,
-                                Style::default().fg(Color::Rgb(r, g, b)).bg(code_bg),
-                            )
+                            Span::styled(text, Style::default().fg(Color::Rgb(r, g, b)).bg(code_bg))
                         }));
                         out.push(Line::from(spans));
                     }
@@ -3124,10 +3147,7 @@ mod tests {
 
     #[test]
     fn the_tools_marker_paints_from_its_state() {
-        assert_eq!(
-            StatusSegment::Tools { expanded: true }.paint(),
-            " ▾ tools "
-        );
+        assert_eq!(StatusSegment::Tools { expanded: true }.paint(), " ▾ tools ");
         assert_eq!(
             StatusSegment::Tools { expanded: false }.paint(),
             " ▸ tools "
@@ -3869,7 +3889,12 @@ mod tests {
         for width in [10u16, 24, 80] {
             let per_item: usize = items
                 .iter()
-                .map(|item| wrapped_count(message_lines(item, false, false, width, theme::dark()), width))
+                .map(|item| {
+                    wrapped_count(
+                        message_lines(item, false, false, width, theme::dark()),
+                        width,
+                    )
+                })
                 .sum();
             let whole: Vec<Line> = items
                 .iter()
@@ -4174,7 +4199,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(100, 70, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         let mut out = String::from("\n");
         for y in 0..70 {
@@ -4195,7 +4228,15 @@ mod tests {
         // in a manual dump. Rows are `(gutter, content)` where gutter is the
         // leftmost LANE_GUTTER columns.
         let terminal = draw_frame(100, 70, |f| {
-            render_viewport(f, f.area(), &Screen::demo(), &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &Screen::demo(),
+                &Viewport::new(),
+                &mut RenderCache::new(),
+                0,
+                theme::dark(),
+            );
         });
         let split = |y: u16| -> (String, String) {
             let row = row_text(&terminal, y);
@@ -4212,17 +4253,27 @@ mod tests {
         // flush under the spine.
         assert_eq!(
             split(5),
-            ("│ ".into(), "✦ thought: Let me check the build health and test coverage.".into())
+            (
+                "│ ".into(),
+                "✦ thought: Let me check the build health and test coverage.".into()
+            )
         );
         // The windowed-out machinery collapses to a `⋯ N earlier actions` count,
         // indented two columns.
-        assert_eq!(split(6), ("│ ".into(), "  ⋯ 6 earlier actions · ^O expand".into()));
+        assert_eq!(
+            split(6),
+            ("│ ".into(), "  ⋯ 6 earlier actions · ^O expand".into())
+        );
         // A governing marker indents two columns; its wrapped continuation stays
         // indented (task 1: the wrap-indent fix).
         assert_eq!(split(7).0, "│ ");
         assert!(split(7).1.starts_with("  » [reading file after file"));
         assert_eq!(split(8).0, "│ ");
-        assert!(split(8).1.starts_with("  instead;"), "wrapped marker stays indented: {:?}", split(8).1);
+        assert!(
+            split(8).1.starts_with("  instead;"),
+            "wrapped marker stays indented: {:?}",
+            split(8).1
+        );
         // The error tool result breaks out (always shown), indented two columns,
         // with the ⚙ gutter.
         assert_eq!(split(14).0, "│ ");
@@ -4242,7 +4293,15 @@ mod tests {
         // turn (from the first assistant line through the last) carries the `│`
         // spine, with no bare gap rows breaking it into segments.
         let terminal = draw_frame(100, 70, |f| {
-            render_viewport(f, f.area(), &Screen::demo(), &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &Screen::demo(),
+                &Viewport::new(),
+                &mut RenderCache::new(),
+                0,
+                theme::dark(),
+            );
         });
         // Rows 3..=24 are the agent's turn (assistant, folded thought, machinery,
         // markers, error, closing assistant + code). Every one starts with the
@@ -4263,7 +4322,15 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         let terminal = draw_frame(80, 20, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            geometry = render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         let text = buffer_text(&terminal);
         assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
@@ -4287,7 +4354,15 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         let terminal = draw_frame(40, 8, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            geometry = render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         let (total_lines, height) = geometry;
         assert!(total_lines > height, "the content overflows");
@@ -4312,12 +4387,22 @@ mod tests {
         // (Spine). A second User opens a fresh lane. The lane is the request,
         // not the Turn - agent items with no intervening User stay on the spine.
         let items = vec![
-            TranscriptItem::Info { text: "greeting".into() },
-            TranscriptItem::User { text: "first".into() },
+            TranscriptItem::Info {
+                text: "greeting".into(),
+            },
+            TranscriptItem::User {
+                text: "first".into(),
+            },
             TranscriptItem::Thinking { text: "hm".into() },
-            TranscriptItem::Assistant { text: "answer".into() },
-            TranscriptItem::User { text: "second".into() },
-            TranscriptItem::Assistant { text: "reply".into() },
+            TranscriptItem::Assistant {
+                text: "answer".into(),
+            },
+            TranscriptItem::User {
+                text: "second".into(),
+            },
+            TranscriptItem::Assistant {
+                text: "reply".into(),
+            },
         ];
         assert_eq!(
             lane_gutters(&items),
@@ -4394,9 +4479,17 @@ mod tests {
         let items = vec![
             TranscriptItem::User { text: "go".into() },
             tool_err(),
-            TranscriptItem::Assistant { text: "answer".into() },
-            TranscriptItem::Marker { text: "» nudge".into(), tone: Tone::Aid },
-            TranscriptItem::Block { title: "diff".into(), lines: vec![] },
+            TranscriptItem::Assistant {
+                text: "answer".into(),
+            },
+            TranscriptItem::Marker {
+                text: "» nudge".into(),
+                tone: Tone::Aid,
+            },
+            TranscriptItem::Block {
+                title: "diff".into(),
+                lines: vec![],
+            },
         ];
         let fold = turn_fold(&items, false, false, 0);
         for (i, action) in fold.iter().enumerate().skip(1) {
@@ -4481,7 +4574,11 @@ mod tests {
         let lines = indented_lines(content, 2, width, style);
         assert!(lines.len() > 1, "the long line wrapped");
         for line in &lines {
-            let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+            let text = line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>();
             assert!(text.starts_with("  "), "row not indented: {text:?}");
             assert!(
                 text.chars().count() <= width as usize,
@@ -4502,7 +4599,15 @@ mod tests {
         let (screen, _) = screen.submitted("go", Ok(()));
         let (screen, _) = screen.apply_event(Event::ExploreNudge { text: long.into() });
         let terminal = draw_frame(60, 20, |f| {
-            render_viewport(f, f.area(), &screen, &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &Viewport::new(),
+                &mut RenderCache::new(),
+                0,
+                theme::dark(),
+            );
         });
         // The marker's FIRST row carries `»`; its continuation is the next row.
         let marker_y = (0..20)
@@ -4535,16 +4640,28 @@ mod tests {
     fn collapsed_thought_line_truncates_to_one_visual_row() {
         let long = "z".repeat(400);
         let line = collapsed_thought_line(&long, 40, theme::dark());
-        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
         assert!(text.starts_with("✦ thought: "));
-        assert!(text.chars().count() <= 40, "one row: {}", text.chars().count());
+        assert!(
+            text.chars().count() <= 40,
+            "one row: {}",
+            text.chars().count()
+        );
         assert!(text.ends_with('…'), "truncated: {text:?}");
     }
 
     #[test]
     fn collapsed_thought_line_takes_the_first_source_line_only() {
         let line = collapsed_thought_line("one\ntwo\nthree", 60, theme::dark());
-        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
         assert_eq!(text, "✦ thought: one");
     }
 
@@ -4571,7 +4688,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(40, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
 
         // (1) The notice is drawn two columns in: the first row carrying the
@@ -4620,7 +4745,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(40, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         // Gather the first column of every row and the text, to find each line.
         let mut saw_caret_on_user = false;
@@ -4672,14 +4805,30 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         draw_frame(40, 10, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            geometry = render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         let (total, height) = geometry;
         assert!(total > height, "the answer overflows the viewport");
         viewport.scroll_up(4, total, height); // unpin, land 4 rows above the tail
 
         let terminal = draw_frame(40, 10, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         // Every visible answer row must still carry the spine in column 0 at
         // this nonzero scroll. A desync (the gutter sliced differently from the
@@ -4739,7 +4888,15 @@ mod tests {
             serde_json::json!({"path": "Cargo.toml"}),
         ));
         draw_frame(width, height, |f| {
-            render_viewport(f, f.area(), &screen, &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &Viewport::new(),
+                &mut RenderCache::new(),
+                0,
+                theme::dark(),
+            );
         })
     }
 
@@ -4758,17 +4915,35 @@ mod tests {
         ));
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
         let terminal = draw_frame(60, 20, |f| {
-            render_viewport(f, f.area(), &screen, &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &Viewport::new(),
+                &mut RenderCache::new(),
+                0,
+                theme::dark(),
+            );
         });
         // Exactly one row carries the collapsed thought, and it is truncated.
         let thought_rows: Vec<String> = (0..20)
             .map(|y| row_text(&terminal, y))
             .filter(|r| r.contains("thought:"))
             .collect();
-        assert_eq!(thought_rows.len(), 1, "the thought folds to one row: {thought_rows:?}");
-        assert!(thought_rows[0].contains('…'), "truncated: {:?}", thought_rows[0]);
+        assert_eq!(
+            thought_rows.len(),
+            1,
+            "the thought folds to one row: {thought_rows:?}"
+        );
+        assert!(
+            thought_rows[0].contains('…'),
+            "truncated: {:?}",
+            thought_rows[0]
+        );
         // The z's did not spill onto a second row.
-        let z_rows = (0..20).filter(|&y| row_text(&terminal, y).contains('z')).count();
+        let z_rows = (0..20)
+            .filter(|&y| row_text(&terminal, y).contains('z'))
+            .count();
         assert_eq!(z_rows, 1, "the long thought did not wrap to more rows");
     }
 
@@ -4777,7 +4952,9 @@ mod tests {
         // Symptom 3: settled thinking unifies on the `✦` family with the live
         // tail, and drops the width-2 `🧠` emoji.
         let collapsed = message_lines(
-            &TranscriptItem::Thinking { text: "a short thought".into() },
+            &TranscriptItem::Thinking {
+                text: "a short thought".into(),
+            },
             false,
             false,
             80,
@@ -4787,7 +4964,9 @@ mod tests {
         assert!(!line_text(&collapsed[0]).contains('🧠'));
 
         let expanded = message_lines(
-            &TranscriptItem::Thinking { text: "line one\nline two".into() },
+            &TranscriptItem::Thinking {
+                text: "line one\nline two".into(),
+            },
             true,
             false,
             80,
@@ -4838,7 +5017,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         let text = buffer_text(&terminal);
         // Live reasoning is content, not a metric (ADR-0040): the animated
@@ -4868,7 +5055,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         let text = buffer_text(&terminal);
         assert!(text.contains("row three") && text.contains("row five"));
@@ -4892,7 +5087,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(40, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         // Exactly one row carries the reasoning z's, and it ends in the `…`
         // truncation marker - the long line did not balloon into many rows.
@@ -4900,7 +5103,11 @@ mod tests {
             .map(|y| row_text(&terminal, y))
             .filter(|r| r.contains('z'))
             .collect();
-        assert_eq!(z_rows.len(), 1, "the long line stays one visual row: {z_rows:?}");
+        assert_eq!(
+            z_rows.len(),
+            1,
+            "the long line stays one visual row: {z_rows:?}"
+        );
         assert!(z_rows[0].contains('…'), "it is truncated: {:?}", z_rows[0]);
     }
 
@@ -4915,7 +5122,15 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+            render_viewport(
+                f,
+                f.area(),
+                &screen,
+                &viewport,
+                &mut cache,
+                0,
+                theme::dark(),
+            );
         });
         assert!(buffer_text(&terminal).contains("a streaming reply"));
     }

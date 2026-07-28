@@ -313,23 +313,58 @@ impl Screen {
         });
         t.push(thought("The user wants me to evaluate this project. Let me start by understanding what kind of project this is and its structure before forming an evaluation, then look at dependencies and code quality."));
         t.push(tool("list_files", ".", ".claude/ (+19 more lines)", false));
-        t.push(tool("explore", "What is the overall architecture and purpose of this projec…", "## Locations (+29 more lines)", false));
+        t.push(tool(
+            "explore",
+            "What is the overall architecture and purpose of this projec…",
+            "## Locations (+29 more lines)",
+            false,
+        ));
         t.push(thought("Let me gather more details about the project structure, dependencies, code quality, and documentation."));
-        t.push(tool("read_file", "README.md", "# Suspenders (+61 more lines)", false));
-        t.push(tool("read_file", "Cargo.toml", "[package] (+49 more lines)", false));
+        t.push(tool(
+            "read_file",
+            "README.md",
+            "# Suspenders (+61 more lines)",
+            false,
+        ));
+        t.push(tool(
+            "read_file",
+            "Cargo.toml",
+            "[package] (+49 more lines)",
+            false,
+        ));
         t.push(thought("Let me continue exploring the project structure to understand the codebase more thoroughly."));
         t.push(tool("list_files", "src", "agent/ (+32 more lines)", false));
         t.push(tool("list_files", "docs", "adr/ (+2 more lines)", false));
         t.marker("» [reading file after file fills your context - dispatch explore with one focused question instead; a Scout searches and reports back]", Tone::Aid);
         t.push(thought("Let me explore more of the project structure to understand the codebase depth, test coverage, and ADRs."));
-        t.push(tool("list_files", "docs/adr", "0001-ratatui-for-the-tui.md (+39 more lines)", false));
-        t.push(tool("list_files", "src/turn", "governor/ (+7 more lines)", false));
+        t.push(tool(
+            "list_files",
+            "docs/adr",
+            "0001-ratatui-for-the-tui.md (+39 more lines)",
+            false,
+        ));
+        t.push(tool(
+            "list_files",
+            "src/turn",
+            "governor/ (+7 more lines)",
+            false,
+        ));
         t.marker("⚑ plan refreshed", Tone::Aid);
         t.push(thought("Let me set up a plan for this evaluation, then continue gathering information to form a comprehensive assessment."));
-        t.push(tool("plan", "GOAL: Evaluate the Suspenders project - a Rust terminal cod…", "[plan recorded]", false));
+        t.push(tool(
+            "plan",
+            "GOAL: Evaluate the Suspenders project - a Rust terminal cod…",
+            "[plan recorded]",
+            false,
+        ));
         t.push(thought("Let me check the build health and test coverage."));
         t.push(tool("run_command", "cargo build 2>&1", "√ exit 0", false));
-        t.push(tool("run_command", "cargo test --lib -- --quiet 2>&1", "× [command denied by user]", true));
+        t.push(tool(
+            "run_command",
+            "cargo test --lib -- --quiet 2>&1",
+            "× [command denied by user]",
+            true,
+        ));
         t.push(TranscriptItem::Assistant {
             text: "The project is a well-structured Rust terminal agent. Here is the tokenizer entry point:\n\n```rust\nfn tokenize(src: &str) -> Vec<Token> {\n    let mut out = Vec::new();\n    out\n}\n```\n\nOverall the codebase is clean and well-tested.".into(),
         });
@@ -1473,7 +1508,10 @@ mod tests {
     fn tools_withdrawn_on_the_final_pass_shows_a_constrain_marker() {
         let (t, effects) = fresh().apply_event(Event::tools_narrowed(vec![]));
         assert_eq!(effects, vec![]);
-        assert_eq!(items(&t), vec![marker("⊘ tools withdrawn", Tone::Constrain)]);
+        assert_eq!(
+            items(&t),
+            vec![marker("⊘ tools withdrawn", Tone::Constrain)]
+        );
     }
 
     #[test]
@@ -1698,7 +1736,10 @@ mod tests {
         assert_eq!(effects, vec![]);
         assert_eq!(
             items(&t),
-            vec![marker("⟨ compaction: working → summary ⟩", Tone::Housekeeping)]
+            vec![marker(
+                "⟨ compaction: working → summary ⟩",
+                Tone::Housekeeping
+            )]
         );
     }
 
