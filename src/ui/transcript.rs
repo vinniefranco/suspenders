@@ -55,7 +55,7 @@ use streaming::Streaming;
 /// the revision rule (remove ⇒ bump) has exactly one body. Private on purpose:
 /// the public interface is the named verbs; promote only when a third
 /// pair-merge rule exists.
-enum Anchor<'a> {
+enum Locator<'a> {
     /// The pending [`TranscriptItem::ToolCall`] with this id, NEWEST match:
     /// parallel calls interleave, and the latest call with the id is the live
     /// one.
@@ -211,14 +211,14 @@ impl Transcript {
         artifacts: &HashMap<String, Value>,
     ) {
         let summary = summarize_result(content);
-        self.supersede(Anchor::ToolCall { id }, artifacts, |call| {
+        self.supersede(Locator::ToolCall { id }, artifacts, |call| {
             TranscriptItem::ToolResult {
                 name,
                 summary,
                 is_error,
                 key_arg: call.map(|item| match item {
                     TranscriptItem::ToolCall { summary, .. } => summary,
-                    other => unreachable!("Anchor::ToolCall matched {other:?}"),
+                    other => unreachable!("Locator::ToolCall matched {other:?}"),
                 }),
             }
         });
@@ -237,12 +237,12 @@ impl Transcript {
     /// edit - the revision bumps), then appends the User item. A delivery
     /// whose marker was never queued removes nothing and does not bump. The
     /// removal anchors on the [`TranscriptItem::Marker`] by text
-    /// ([`Anchor::Marker`]), matching what [`Transcript::steering_queued`]
+    /// ([`Locator::Marker`]), matching what [`Transcript::steering_queued`]
     /// appended.
     pub fn steering_delivered(&mut self, text: impl Into<String>) {
         let text = text.into();
         let marker = pending_steering_line(&text);
-        self.supersede(Anchor::Marker { text: &marker }, &HashMap::new(), |_| {
+        self.supersede(Locator::Marker { text: &marker }, &HashMap::new(), |_| {
             TranscriptItem::User { text }
         });
     }
@@ -304,11 +304,11 @@ impl Transcript {
     // RenderCache contract is held by construction, not by discipline.
     fn supersede(
         &mut self,
-        anchor: Anchor<'_>,
+        locator: Locator<'_>,
         artifacts: &HashMap<String, Value>,
         successor: impl FnOnce(Option<TranscriptItem>) -> TranscriptItem,
     ) {
-        let removed = self.locate(&anchor).map(|pos| {
+        let removed = self.locate(&locator).map(|pos| {
             let item = self.items.remove(pos);
             // A non-append edit: settled items shifted, so any cached
             // per-item render state upstream is stale.
@@ -318,12 +318,12 @@ impl Transcript {
         self.append(successor(removed), artifacts);
     }
 
-    fn locate(&self, anchor: &Anchor<'_>) -> Option<usize> {
-        match anchor {
-            Anchor::ToolCall { id } => self.items.iter().rposition(
+    fn locate(&self, locator: &Locator<'_>) -> Option<usize> {
+        match locator {
+            Locator::ToolCall { id } => self.items.iter().rposition(
                 |m| matches!(m, TranscriptItem::ToolCall { id: call_id, .. } if call_id == id),
             ),
-            Anchor::Marker { text } => self
+            Locator::Marker { text } => self
                 .items
                 .iter()
                 .position(|m| matches!(m, TranscriptItem::Marker { text: t, .. } if t == text)),

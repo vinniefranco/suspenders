@@ -34,11 +34,11 @@ pub struct ToolResult {
 // `run` stays object-safe (async-trait).
 fn tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(plan::Plan),
+        Box::new(plan::PlanTool),
         Box::new(read_file::ReadFile),
         Box::new(list_files::ListFiles),
         Box::new(grep::Grep),
-        Box::new(explore::Explore),
+        Box::new(explore::ExploreTool),
         Box::new(edit_file::EditFile),
         Box::new(write_file::WriteFile),
         Box::new(run_command::RunCommand),

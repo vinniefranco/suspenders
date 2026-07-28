@@ -11,10 +11,10 @@ use crate::tool::{Tool, ToolCtx, ToolSpec};
 use crate::voice;
 use serde_json::{Value, json};
 
-pub struct Plan;
+pub struct PlanTool;
 
 #[async_trait::async_trait]
-impl Tool for Plan {
+impl Tool for PlanTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "plan".into(),
@@ -58,12 +58,12 @@ mod tests {
     }
 
     async fn run(input: Value) -> Result<String, String> {
-        Plan.run(&input, &ctx()).await
+        PlanTool.run(&input, &ctx()).await
     }
 
     #[test]
     fn spec_is_a_flat_one_string_schema_requiring_plan() {
-        let spec = Plan.spec();
+        let spec = PlanTool.spec();
         assert_eq!(spec.name, "plan");
         let schema = &spec.input_schema;
         assert_eq!(schema["type"], "object");

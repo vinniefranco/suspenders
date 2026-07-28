@@ -53,7 +53,6 @@ pub struct Anchor {
     setpoints: Setpoints,
 }
 
-// qual:allow(coupling, oi) reason: "Anchor also names a private enum in ui::transcript; this impl sits with its own Governor type - OI is a name-collision false positive resolved by file-discovery order, which differs between local and CI"
 impl Anchor {
     pub fn new(setpoints: Setpoints) -> Self {
         Anchor { setpoints }

@@ -17,10 +17,10 @@ use crate::tool::{Tool, ToolCtx, ToolSpec};
 use crate::voice;
 use serde_json::{Value, json};
 
-pub struct Explore;
+pub struct ExploreTool;
 
 #[async_trait::async_trait]
-impl Tool for Explore {
+impl Tool for ExploreTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "explore".into(),
@@ -107,12 +107,12 @@ mod tests {
     }
 
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
-        Explore.run(&input, ctx).await
+        ExploreTool.run(&input, ctx).await
     }
 
     #[test]
     fn spec_is_named_explore_with_a_single_required_string_task() {
-        let spec = Explore.spec();
+        let spec = ExploreTool.spec();
         assert_eq!(spec.name, "explore");
         assert_eq!(spec.input_schema["required"], json!(["task"]));
         assert_eq!(spec.input_schema["properties"]["task"]["type"], "string");
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn spec_tells_the_model_to_delegate() {
-        let spec = Explore.spec();
+        let spec = ExploreTool.spec();
         let d = spec.description.to_lowercase();
         assert!(d.contains("where does") || d.contains("how does") || d.contains("delegate"));
     }
