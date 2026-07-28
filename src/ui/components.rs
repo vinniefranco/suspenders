@@ -30,7 +30,7 @@ use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::selector::{RowRole, SelectorRow};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
-use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
+use crate::ui::transcript::{LineStyle, StyledLine, Tone, TranscriptItem};
 use crate::ui::viewport::Viewport;
 
 // ---------------------------------------------------------------------------
@@ -251,10 +251,8 @@ pub fn render(
     // The viewport renders FIRST: the status bar's position segment reads the
     // measured geometry (and the Viewport's clamped top) from this frame, not
     // a stale one.
-    let geometry = render_viewport(frame, chunks[0], t, viewport, cache, theme);
-    render_status_bar(
-        frame, chunks[1], t, conn, spinner, viewport, geometry, theme,
-    );
+    let geometry = render_viewport(frame, chunks[0], t, viewport, cache, spinner, theme);
+    render_status_bar(frame, chunks[1], t, conn, viewport, geometry, theme);
     render_composer(frame, chunks[2], t, &layout, theme);
 
     // The Composer overlay (ADR-0032/0033) floats just above the status bar +
@@ -429,6 +427,7 @@ pub fn render_viewport(
     t: &Screen,
     viewport: &Viewport,
     cache: &mut RenderCache,
+    spinner: u64,
     theme: &Theme,
 ) -> (usize, usize) {
     // The rightmost column is ALWAYS the scrollbar gutter, occupied or not:
@@ -438,66 +437,98 @@ pub fn render_viewport(
         width: area.width.saturating_sub(1),
         ..area
     };
+    // The leftmost LANE_GUTTER columns are ALWAYS reserved for the turn-lane
+    // spine / user caret (ADR-0040), occupied or not - the same unconditional
+    // reservation as the scrollbar column, and for the same reason: content
+    // wraps in the narrower `content_area`, so the wrap width never depends on
+    // whether a given row carries a spine. Everything below (`cache.sync`, the
+    // live tail's `wrapped_count`) MUST measure at `content_area.width` so
+    // measuring and drawing agree exactly (ADR-0029, the load-bearing gutter
+    // invariant).
+    let content_area = Rect {
+        x: text_area.x + LANE_GUTTER,
+        width: text_area.width.saturating_sub(LANE_GUTTER),
+        ..text_area
+    };
     cache.sync(
         t.transcript(),
         Toggles {
             thinking_expanded: t.thinking_expanded,
             tools_expanded: t.tools_expanded,
         },
-        text_area.width,
+        content_area.width,
         theme,
     );
 
     // The live streaming snapshot renders below the settled items: the
-    // one-line thinking indicator (rebuilt each frame - one Line is cheap)
-    // and the streaming markdown (cached - see [`RenderCache::sync`]).
+    // animated `✦ Thinking` header + a rolling reasoning tail (rebuilt each
+    // frame - the tail's window is non-monotonic so it is NOT cached; a few
+    // lines are cheap) and the streaming markdown (cached - see
+    // [`RenderCache::sync`]). `streaming_thinking()` stays whole in the store;
+    // the last-N windowing is a display policy, so it lives here (ADR-0029).
     let thinking = t.transcript().streaming_thinking();
-    let thinking_lines: Vec<Line<'static>> = if thinking.is_empty() {
-        vec![]
-    } else {
-        vec![Line::styled(
-            format!(
-                "🧠 thinking… (~{} tokens)",
-                crate::conversation::tokens_for_chars(thinking.chars().count() as u64)
-            ),
-            Style::default()
-                .fg(tui_color(theme.thinking))
-                .add_modifier(Modifier::ITALIC),
-        )]
-    };
+    let thinking_lines = live_thinking_lines(&thinking, spinner, content_area.width, theme);
 
-    // One (lines, wrapped-count) entry per window "item": every settled
-    // message, then the streaming tail - a single indexing shared by the
-    // window selection and the slice assembly below.
-    let mut item_lines: Vec<&[Line<'static>]> = Vec::new();
-    let mut counts: Vec<usize> = Vec::new();
-    for (lines, wrapped) in cache.settled() {
-        item_lines.push(lines);
-        counts.push(wrapped);
-    }
+    // One (lines, wrapped-count, gutter-kind) entry per window "item": every
+    // KEPT settled message, then the live tail - a single indexing shared by the
+    // window selection, the slice assembly, and the per-visual-row gutter mapping
+    // below. The lane is DERIVED here at render time (ADR-0040), never stored and
+    // never in the RenderCache key: `lane_gutters` walks the settled items in
+    // order, and both live entries (the reasoning tail, the streaming answer)
+    // hang off the running Turn's lane, so they take the spine. The lane is dense
+    // - no per-item blank separator - so the spine stays continuous.
+    let items = t.transcript().items();
+    let lane = lane_gutters(items);
+    // A collapsed turn reads tidy: the LAST thought becomes a header, and beneath
+    // it only the last few actions show as a rolling window - older low-signal
+    // machinery (list/read) is suppressed, while code/diff Blocks and errors
+    // always break out. Ctrl-T reveals every thought; Ctrl-O every action.
+    let fold = turn_fold(items, t.thinking_expanded, t.tools_expanded, MACHINERY_WINDOW);
+    // The fold's synthetic lines (a thought header carrying the LAST thought's
+    // text at the FIRST thought's slot, or a `⋯ N earlier actions` count),
+    // owned here so the assembly below can borrow them.
+    let synthetic = fold_synthetic_lines(&fold, items, content_area.width, theme);
+    // Apply the fold: kept items contribute their cached lines, Header/Elided
+    // their synthetic line, Drops nothing - the per-item branch structure lives
+    // in `assemble_settled` so it stays off `render_viewport`'s complexity.
+    let (mut item_lines, mut counts, mut gutters) =
+        assemble_settled(cache, &fold, &synthetic, &lane, content_area.width);
     if !thinking_lines.is_empty() {
-        counts.push(wrapped_count(thinking_lines.clone(), text_area.width));
+        counts.push(wrapped_count(thinking_lines.clone(), content_area.width));
         item_lines.push(&thinking_lines);
+        gutters.push(GutterKind::Spine);
     }
     if let Some((lines, wrapped)) = cache.streaming_tail() {
         counts.push(wrapped);
         item_lines.push(lines);
+        gutters.push(GutterKind::Spine);
     }
+
+    // The ONE per-visual-row mapping both the content and the gutter consume:
+    // expanding the per-item kinds over each item's wrapped rows yields a flat
+    // `RowGutter` per content row, in the same order the Paragraph lays rows
+    // out. Slicing it by the absolute `top` offset is exactly the content's
+    // `scroll`, so the gutter and the content can never desync (M3).
+    let row_gutters = expand_gutters(&gutters, &counts);
 
     let total_lines: usize = counts.iter().sum();
     let height = area.height as usize;
     let top = viewport.top_offset(total_lines, height);
     let (range, offset) = visible_window(&counts, top, height);
-    let visible: Vec<Line> = item_lines[range]
+    let visible: Vec<Line> = item_lines[range.clone()]
         .iter()
         .flat_map(|lines| lines.iter().cloned())
         .collect();
     let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
     // The pure window math speaks usize; saturate only here, at the ratatui
     // boundary. The relative offset is bounded by ONE item's wrapped rows
-    // (the item straddling the window top), never the session's.
+    // (the item straddling the window top), never the session's. Content draws
+    // into `content_area` (the gutter carved off the left); the gutter glyphs
+    // are painted into the reserved columns per VISUAL row, so soft-wrapped
+    // continuations keep their spine.
     let scroll = u16::try_from(offset).unwrap_or(u16::MAX);
-    frame.render_widget(paragraph.scroll((scroll, 0)), text_area);
+    frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
+    paint_gutter(frame, text_area, &row_gutters, top, height, theme);
 
     if total_lines > height {
         let mut state = ScrollbarState::new(total_lines)
@@ -510,6 +541,444 @@ pub fn render_viewport(
         );
     }
     (total_lines, height)
+}
+
+/// The rolling reasoning tail shown while a Turn streams: an animated
+/// `✦ Thinking ⠋` header (the braille [`SPINNER`] advanced by the adapter's
+/// tick - motion lives HERE at the brain, not the status bar, ADR-0040), then
+/// the last [`THINKING_TAIL_ROWS`] VISUAL rows of the reasoning, indented two
+/// columns under the header as a sub-block. Empty when nothing is streaming.
+///
+/// Bounded by VISUAL rows, not source rows: one long unwrapped reasoning line
+/// soft-wraps to many rows, which would let the "short tail" (Decision A) grow
+/// to fill the viewport. Each source row is truncated (with an `…` marker) to
+/// the content width so it occupies exactly one visual row and the tail is a
+/// hard `THINKING_TAIL_ROWS` cap - truncation, not re-wrapping, so this never
+/// drifts from what the Paragraph paints (ADR-0029). `width` is the
+/// `content_area` width the tail draws in.
+///
+/// Uncached on purpose: the tail's window is non-monotonic (older lines scroll
+/// off as it grows), so the char-length key the settled streaming cache relies
+/// on would not hold. A handful of `Line`s per frame is cheap.
+fn live_thinking_lines(thinking: &str, spinner: u64, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    if thinking.is_empty() {
+        return vec![];
+    }
+    let header_style = Style::default()
+        .fg(tui_color(theme.thinking_header))
+        .add_modifier(Modifier::ITALIC);
+    let row_style = Style::default()
+        .fg(tui_color(theme.thinking))
+        .add_modifier(Modifier::ITALIC);
+    let frame = SPINNER[(spinner as usize) % SPINNER.len()];
+    let mut out = vec![Line::styled(format!("✦ Thinking {frame}"), header_style)];
+    // The tail rows indent two columns, so their text budget is the content
+    // width less that indent (never below 1).
+    let row_width = (width as usize).saturating_sub(2).max(1);
+    let rows = text_rows(thinking);
+    let tail = &rows[rows.len().saturating_sub(THINKING_TAIL_ROWS)..];
+    out.extend(tail.iter().map(|row| {
+        Line::styled(format!("  {}", truncate_visual(row, row_width)), row_style)
+    }));
+    out
+}
+
+/// Truncates `text` to at most `width` display columns, replacing the trimmed
+/// tail with a single `…` so an over-long reasoning line stays one visual row.
+/// Char-based (like the rest of this module) - a truncated row is always `<=
+/// width` chars, so the viewport's `Wrap` never breaks it onto a second row.
+fn truncate_visual(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Greedy word-wrap of `text` into segments each at most `width` chars, char
+/// based (consistent with `truncate_visual`; no `unicode-width`, so the caller's
+/// glyphs must be width-1 - the machinery/marker text is). Words are broken on
+/// ASCII spaces; a single word longer than `width` is HARD-SPLIT across rows so
+/// no segment ever exceeds `width` (the invariant `indented_lines` relies on to
+/// keep measure==draw). A `width` of 0 is treated as 1. An empty input yields
+/// one empty segment so a blank line survives as a blank row.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut line_len = 0usize;
+    for word in text.split(' ') {
+        let mut word = word;
+        // Hard-split a word wider than the whole line before it ever tries to
+        // sit on one: peel `width`-char chunks until the remainder fits.
+        while word.chars().count() > width {
+            if line_len > 0 {
+                out.push(std::mem::take(&mut line));
+                line_len = 0;
+            }
+            let head: String = word.chars().take(width).collect();
+            let consumed = head.len();
+            out.push(head);
+            word = &word[consumed..];
+        }
+        let wlen = word.chars().count();
+        // +1 for the space that would join this word to the current line.
+        let needed = if line_len == 0 { wlen } else { line_len + 1 + wlen };
+        if needed > width && line_len > 0 {
+            out.push(std::mem::take(&mut line));
+            line_len = 0;
+        }
+        if line_len > 0 {
+            line.push(' ');
+            line_len += 1;
+        }
+        line.push_str(word);
+        line_len += wlen;
+    }
+    out.push(line);
+    out
+}
+
+/// Renders `content` as styled lines that hang at `indent` columns: the content
+/// is word-wrapped to `content_width - indent` and EVERY resulting visual row
+/// (the first and every continuation) is prefixed with `indent` spaces. This
+/// gives a block indent that ratatui's own `Wrap` cannot (it has no hanging
+/// indent), and because each produced Line is `<= content_width` chars the
+/// viewport never re-wraps it - so `wrapped_count` equals the rendered rows
+/// (measure==draw, ADR-0029). Used by the indented machinery/marker arms.
+fn indented_lines(content: &str, indent: usize, content_width: u16, style: Style) -> Vec<Line<'static>> {
+    let inner = (content_width as usize).saturating_sub(indent).max(1);
+    let pad = " ".repeat(indent);
+    wrap_words(content, inner)
+        .into_iter()
+        .map(|seg| Line::styled(format!("{pad}{seg}"), style))
+        .collect()
+}
+
+/// The reserved left-gutter width (columns): the turn-lane spine / user caret
+/// plane (ADR-0040). Two columns - a glyph and a trailing space - so content
+/// sits one clear column off the spine. Carved unconditionally off the text
+/// area so the content wrap width never depends on lane membership.
+const LANE_GUTTER: u16 = 2;
+
+/// What the reserved left gutter draws beside one transcript item's rows
+/// (ADR-0040). Derived at render time from the item sequence, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GutterKind {
+    /// Before the first `User` item - the opening greeting/notices sit at the
+    /// margin with no spine.
+    Blank,
+    /// A `User` prompt: the `› ` caret breaks to the margin on the item's first
+    /// visual row, blank on any wrapped continuation.
+    User,
+    /// Everything the agent emits inside a Turn: the dim `│ ` spine on every
+    /// visual row, so the whole turn reads as one object.
+    Spine,
+}
+
+/// Derives the per-item lane gutter for the settled items, in order (ADR-0040):
+/// a `User` item opens a lane and every item after it hangs off that lane until
+/// the next `User`; the region before the first `User` is spineless. The lane is
+/// the user REQUEST, not the Turn - a Recovery Turn injects no `User` item, so
+/// its work correctly stays on the prior request's spine. Pure over the item
+/// sequence, so it is asserted without a frame; the two live entries (reasoning
+/// tail, streaming answer) are appended as `Spine` by the caller.
+fn lane_gutters(items: &[TranscriptItem]) -> Vec<GutterKind> {
+    let mut in_lane = false;
+    items
+        .iter()
+        .map(|item| match item {
+            TranscriptItem::User { .. } => {
+                in_lane = true;
+                GutterKind::User
+            }
+            _ if in_lane => GutterKind::Spine,
+            _ => GutterKind::Blank,
+        })
+        .collect()
+}
+
+/// What one VISUAL content row draws in the reserved gutter (ADR-0040): the
+/// user's `› ` caret, the dim `│ ` lane spine, or nothing. This is the flat
+/// per-row mapping [`expand_gutters`] produces and both the content and the
+/// gutter index by, so they can never desync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowGutter {
+    /// A `User` prompt's first visual row - the caret at the margin.
+    Caret,
+    /// An in-lane row - the dim spine.
+    Spine,
+    /// A user continuation, a pre-lane row, or an item's trailing separator row.
+    Blank,
+}
+
+impl RowGutter {
+    /// The glyph this row paints into the [`LANE_GUTTER`] columns.
+    fn glyph(self) -> &'static str {
+        match self {
+            RowGutter::Caret => "› ",
+            RowGutter::Spine => "│ ",
+            RowGutter::Blank => "  ",
+        }
+    }
+}
+
+/// Expands the per-item lane `gutters` over each item's `counts` wrapped rows
+/// into one [`RowGutter`] per VISUAL content row, in Paragraph layout order -
+/// the single mapping the content and the gutter share (M3). A `User` item's
+/// caret shows only on its first row; a `Spine` item spines every row (the lane
+/// is dense - no per-item blank separator - so the spine stays continuous).
+fn expand_gutters(gutters: &[GutterKind], counts: &[usize]) -> Vec<RowGutter> {
+    let mut rows = Vec::with_capacity(counts.iter().sum());
+    for (i, &n) in counts.iter().enumerate() {
+        for row in 0..n {
+            let cell = match gutters[i] {
+                GutterKind::User if row == 0 => RowGutter::Caret,
+                GutterKind::User => RowGutter::Blank,
+                GutterKind::Spine => RowGutter::Spine,
+                GutterKind::Blank => RowGutter::Blank,
+            };
+            rows.push(cell);
+        }
+    }
+    rows
+}
+
+/// How many of a turn's most recent low-signal actions (list/read-style tool
+/// one-liners) the collapsed view keeps as a rolling window; older ones are
+/// suppressed. Errors and code/diff Blocks are never windowed - they break out.
+const MACHINERY_WINDOW: usize = 4;
+
+/// What the collapsed render does with one settled item ([`turn_fold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldAction {
+    /// Render the item from its cached lines.
+    Keep,
+    /// Suppress it (a non-last thought, or an action older than the window).
+    Drop,
+    /// Render a synthetic one-line thought header here (the FIRST thought's slot)
+    /// carrying the text of the lane's LAST thought (the index).
+    Header(usize),
+    /// Render a `⋯ N earlier actions` count here (the FIRST windowed-out action's
+    /// slot), so a fold never silently hides work; the rest of the run `Drop`s.
+    Elided(usize),
+}
+
+/// Folds a collapsed turn to a tidy shape (ADR-0040): per lane (a `User`-opened
+/// request), the reasoning collapses to a single header - the LAST thought's
+/// text rendered at the FIRST thought's slot, with the intervening thoughts
+/// dropped - and the low-signal machinery (paired/one-line tool results and
+/// calls) becomes a rolling window of the last `window` items, older ones
+/// dropped. Errors, code/diff [`Block`]s, assistant text, markers and prompts
+/// always Keep (they break out). `thinking_expanded` (Ctrl-T) disables the
+/// thought fold; `tools_expanded` (Ctrl-O) disables the machinery window.
+///
+/// [`Block`]: TranscriptItem::Block
+fn turn_fold(
+    items: &[TranscriptItem],
+    thinking_expanded: bool,
+    tools_expanded: bool,
+    window: usize,
+) -> Vec<FoldAction> {
+    let mut fold = vec![FoldAction::Keep; items.len()];
+    // Lanes are delimited by `User` items; the region before the first is its
+    // own (greeting) lane. Fold each independently.
+    let mut start = 0;
+    let fold_lane = |fold: &mut Vec<FoldAction>, range: std::ops::Range<usize>| {
+        let mut thoughts = Vec::new();
+        let mut machinery = Vec::new();
+        for i in range {
+            match &items[i] {
+                TranscriptItem::Thinking { .. } => thoughts.push(i),
+                // Low-signal machinery: a merged tool result or a bare call.
+                // Errors and Blocks are NOT here - they always break out.
+                TranscriptItem::ToolResult { is_error: false, .. }
+                | TranscriptItem::ToolCall { .. } => machinery.push(i),
+                _ => {}
+            }
+        }
+        if !thinking_expanded && let (Some(&first), Some(&last)) = (thoughts.first(), thoughts.last())
+        {
+            fold[first] = FoldAction::Header(last);
+            for &t in &thoughts {
+                if t != first {
+                    fold[t] = FoldAction::Drop;
+                }
+            }
+        }
+        if !tools_expanded && machinery.len() > window {
+            let dropped = &machinery[..machinery.len() - window];
+            // A count marker at the first windowed-out slot, the rest suppressed.
+            fold[dropped[0]] = FoldAction::Elided(dropped.len());
+            for &m in &dropped[1..] {
+                fold[m] = FoldAction::Drop;
+            }
+        }
+    };
+    for (i, item) in items.iter().enumerate() {
+        if matches!(item, TranscriptItem::User { .. }) && i > start {
+            fold_lane(&mut fold, start..i);
+            start = i;
+        }
+    }
+    fold_lane(&mut fold, start..items.len());
+    fold
+}
+
+/// The synthetic line each [`FoldAction`] contributes, indexed to match the
+/// items: `Header(last)` builds the collapsed thought header from the LAST
+/// thought's text at the FIRST thought's slot; `Elided(n)` builds the
+/// `⋯ N earlier actions` count; every other action contributes `None` (its own
+/// cached lines are used). Split out of `render_viewport` so the fold's branch
+/// structure does not inflate that function's complexity.
+fn fold_synthetic_lines(
+    fold: &[FoldAction],
+    items: &[TranscriptItem],
+    width: u16,
+    theme: &Theme,
+) -> Vec<Option<Vec<Line<'static>>>> {
+    fold.iter()
+        .map(|f| match f {
+            FoldAction::Header(last) => match &items[*last] {
+                TranscriptItem::Thinking { text } => {
+                    Some(vec![collapsed_thought_line(text, width, theme)])
+                }
+                _ => None,
+            },
+            FoldAction::Elided(n) => Some(vec![elided_actions_line(*n, theme)]),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Applies the collapsed-turn [`turn_fold`] to the cached settled items,
+/// producing the parallel `(lines, wrapped-count, gutter-kind)` the viewport's
+/// window math and gutter mapping consume. A `Keep` contributes the item's
+/// cached lines and count; a `Header`/`Elided` its synthetic line (re-measured
+/// at `width`); a `Drop` nothing. Borrows the cached and synthetic lines, so the
+/// returned slices live as long as both. Split out of `render_viewport` to keep
+/// the fold's branch structure off that function's complexity.
+fn assemble_settled<'a>(
+    cache: &'a RenderCache,
+    fold: &[FoldAction],
+    synthetic: &'a [Option<Vec<Line<'static>>>],
+    lane: &[GutterKind],
+    width: u16,
+) -> (Vec<&'a [Line<'static>]>, Vec<usize>, Vec<GutterKind>) {
+    let mut item_lines: Vec<&[Line<'static>]> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    let mut gutters: Vec<GutterKind> = Vec::new();
+    for (i, (cached, wrapped)) in cache.settled().enumerate() {
+        match fold[i] {
+            FoldAction::Drop => continue,
+            FoldAction::Keep => {
+                item_lines.push(cached);
+                counts.push(wrapped);
+            }
+            FoldAction::Header(_) | FoldAction::Elided(_) => {
+                let syn = synthetic[i].as_deref().unwrap_or(cached);
+                counts.push(wrapped_count(syn.to_vec(), width));
+                item_lines.push(syn);
+            }
+        }
+        gutters.push(lane[i]);
+    }
+    (item_lines, counts, gutters)
+}
+
+/// The collapsed one-line thought (the fold header and the settled collapsed
+/// form): `✦ thought: …` truncated to a single VISUAL row at the content
+/// `width` so a long paragraph never wraps to fill the viewport.
+fn collapsed_thought_line(text: &str, width: u16, theme: &Theme) -> Line<'static> {
+    const PREFIX: &str = "✦ thought: ";
+    let style = thinking_style(theme);
+    let budget = (width as usize).saturating_sub(PREFIX.chars().count()).max(1);
+    Line::styled(
+        format!("{PREFIX}{}", truncate_visual(first_line(text), budget)),
+        style,
+    )
+}
+
+/// The dim italic style settled Thinking (and its live tail) draws in.
+fn thinking_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(tui_color(theme.thinking))
+        .add_modifier(Modifier::ITALIC)
+}
+
+/// A settled Thinking item's lines: collapsed (default) is the one-line
+/// [`collapsed_thought_line`]; expanded (Ctrl-T) is the `✦ thought:` header then
+/// the full text, all dim italic. Split out of `message_lines` so its toggle
+/// branch does not inflate that fold's complexity (the `✦` family unifies with
+/// the live tail's header; `✦` is width-1, unlike the width-2 `🧠` that shifted
+/// the spine in real terminals).
+fn settled_thinking_lines(
+    text: &str,
+    thinking_expanded: bool,
+    content_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if !thinking_expanded {
+        return vec![collapsed_thought_line(text, content_width, theme)];
+    }
+    let style = thinking_style(theme);
+    let mut out = vec![Line::styled("✦ thought:", style)];
+    out.extend(text_rows(text).into_iter().map(|row| Line::styled(row, style)));
+    out
+}
+
+/// The `⋯ N earlier actions` count that stands in for a run of windowed-out
+/// low-signal machinery, indented under the thought header like the tool work,
+/// so a fold never silently hides what the agent did (Ctrl-O reveals it all).
+fn elided_actions_line(n: usize, theme: &Theme) -> Line<'static> {
+    Line::styled(
+        format!("  ⋯ {n} earlier actions · ^O expand"),
+        machinery_style(theme),
+    )
+}
+
+/// Paints the reserved left gutter per VISUAL row over the visible window: the
+/// user caret in the prompt color, the lane spine in the dim `lane_spine` slot.
+/// Consumes the flat [`RowGutter`] mapping the content shares, sliced by the
+/// absolute `top` offset - the SAME slice the content Paragraph scrolls to - so
+/// a gutter glyph lands on exactly the row its item occupies at any scroll
+/// position, soft-wrapped continuations included (M3). Draws nothing outside the
+/// item rows (a short transcript leaves the lower gutter clear).
+fn paint_gutter(
+    frame: &mut Frame,
+    text_area: Rect,
+    row_gutters: &[RowGutter],
+    top: usize,
+    height: usize,
+    theme: &Theme,
+) {
+    let caret = Style::default()
+        .fg(tui_color(theme.prompt_gutter))
+        .add_modifier(Modifier::BOLD);
+    let spine = Style::default().fg(tui_color(theme.lane_spine));
+
+    for (screen_row, cell) in row_gutters.iter().skip(top).take(height).enumerate() {
+        if *cell == RowGutter::Blank {
+            continue; // nothing to paint - the reserved columns stay clear.
+        }
+        let style = if *cell == RowGutter::Caret {
+            caret
+        } else {
+            spine
+        };
+        let y = text_area.y + screen_row as u16;
+        frame.render_widget(
+            Paragraph::new(Line::styled(cell.glyph(), style)),
+            Rect {
+                x: text_area.x,
+                y,
+                width: LANE_GUTTER,
+                height: 1,
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -638,18 +1107,17 @@ mod render_cache {
                 self.revision = t.revision();
             }
             for item in &t.items()[self.items.len()..] {
-                let mut lines = message_lines(
+                let lines = message_lines(
                     item,
                     toggles.thinking_expanded,
                     toggles.tools_expanded,
+                    width,
                     theme,
                 );
-                // One trailing blank row per settled item so turns read as
-                // distinct paragraphs rather than one wall. Building it into
-                // the cached lines keeps measurement (`wrapped`) and rendering
-                // exactly consistent - the viewport window math depends on
-                // that agreement.
-                lines.push(Line::default());
+                // No per-item blank separator: the lane stays DENSE with one
+                // continuous spine (a blank row breaks the spine into segments
+                // and burns vertical real estate - the two-planes coloring, not
+                // whitespace, separates the turn's parts).
                 let wrapped = wrapped_count(lines.clone(), width);
                 self.items.push(CachedItem { lines, wrapped });
             }
@@ -757,11 +1225,12 @@ mod render_cache {
             // The delivered steering removes its pending marker - a structural
             // edit that bumps the store's revision - so the cache rebuilds
             // from scratch: the sentinel is gone and the promoted user line is
-            // seen.
+            // seen. The `› ` caret now lives in the reserved lane gutter
+            // (ADR-0040), so the cached User line is the bare prompt text.
             t.steering_delivered("check");
             cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 1);
-            assert_eq!(line_text(&cache.items[0].lines[0]), "› check");
+            assert_eq!(line_text(&cache.items[0].lines[0]), "check");
         }
 
         #[test]
@@ -892,11 +1361,15 @@ fn machinery_style(theme: &Theme) -> Style {
 /// `Transcript::thinking_expanded`) picks the collapsed one-liner or the full
 /// text for settled `Thinking` items; `tools_expanded` (Ctrl-O, the core's
 /// `Transcript::tools_expanded`) does the same for multi-line `Block` bodies -
-/// the same detail-on-demand rule applied to the machinery plane.
+/// the same detail-on-demand rule applied to the machinery plane. `content_width`
+/// is the `content_area` width the lines draw in - the collapsed Thinking
+/// one-liner truncates to it so it stays one visual row (a long newline-free
+/// thought otherwise soft-wraps to many).
 fn message_lines(
     item: &TranscriptItem,
     thinking_expanded: bool,
     tools_expanded: bool,
+    content_width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     // Detail-on-demand collapse (Ctrl-O), keyed on the SEMANTIC fold predicate
@@ -917,56 +1390,36 @@ fn message_lines(
     }
 
     match item {
-        // User prompts: the "› " gutter on the first row, continuation rows
-        // aligned under it. Multi-line input renders as multiple rows.
-        TranscriptItem::User { text } => {
-            let gutter = Style::default()
-                .fg(tui_color(theme.prompt_gutter))
-                .add_modifier(Modifier::BOLD);
-            text_rows(text)
-                .into_iter()
-                .enumerate()
-                .map(|(i, row)| {
-                    let prefix = if i == 0 { "› " } else { "  " };
-                    Line::from(vec![Span::styled(prefix, gutter), Span::raw(row)])
-                })
-                .collect()
-        }
+        // User prompts: bare rows at the content margin. The `› ` caret (first
+        // visual row) and continuation blanks now live in the RESERVED lane
+        // gutter (ADR-0040 - the user's voice breaks the spine to the margin),
+        // painted per-visual-row by `paint_gutter`, so `message_lines` no longer
+        // prepends a gutter of its own. Multi-line input renders as many rows.
+        TranscriptItem::User { text } => text_rows(text)
+            .into_iter()
+            .map(Line::from)
+            .collect(),
         // Assistant text is markdown: the pure ui::markdown fold produces
         // semantic lines and [`md_style`] turns them into colors here.
         // Width-wrapping is left to the viewport Paragraph's Wrap.
         TranscriptItem::Assistant { text } => markdown_lines(text, theme),
         // Settled Thinking: collapsed is the one-line form; expanded (Ctrl-T)
-        // is a header row then the full text, all in the same dim italic. The
-        // in-flight "🧠 thinking… (N chars)" streaming indicator is rendered by
-        // the viewport and is unaffected by the toggle.
+        // is a header row then the full text. Delegated so the toggle branch
+        // does not add to this fold's complexity.
         TranscriptItem::Thinking { text } => {
-            let style = Style::default()
-                .fg(tui_color(theme.thinking))
-                .add_modifier(Modifier::ITALIC);
-            if thinking_expanded {
-                let mut out = vec![Line::styled("🧠 thought:", style)];
-                out.extend(
-                    text_rows(text)
-                        .into_iter()
-                        .map(|row| Line::styled(row, style)),
-                );
-                out
-            } else {
-                vec![Line::styled(
-                    format!("🧠 thought: {}", first_line(text)),
-                    style,
-                )]
-            }
+            settled_thinking_lines(text, thinking_expanded, content_width, theme)
         }
         // Tool-call machinery recedes into a dim, indented background gutter so
         // the conversation (assistant prose, user text) owns the foreground:
         // DarkGray (not italic - italic stays reserved for Thinking/Info), a
-        // two-space indent, and a quiet "⋯" glyph in place of the loud "⚙".
-        TranscriptItem::ToolCall { name, summary, .. } => vec![Line::styled(
-            format!("  ⋯ {}", join_summary(name, summary)),
+        // two-space block indent (wrapped continuations stay at column 2 -
+        // [`indented_lines`]), and a quiet "⋯" glyph in place of the loud "⚙".
+        TranscriptItem::ToolCall { name, summary, .. } => indented_lines(
+            &format!("⋯ {}", join_summary(name, summary)),
+            2,
+            content_width,
             machinery_style(theme),
-        )],
+        ),
         // A merged one-liner (Stage 3): a paired call+result reads
         // `⋯ name  <key_arg> · <result>`; an unpaired result (no live call, so
         // no arg) keeps the older `⋯ name → result` shape.
@@ -975,10 +1428,12 @@ fn message_lines(
             summary,
             is_error: false,
             key_arg,
-        } => vec![Line::styled(
-            format!("  ⋯ {}", join_merged(name, key_arg.as_deref(), summary)),
+        } => indented_lines(
+            &format!("⋯ {}", join_merged(name, key_arg.as_deref(), summary)),
+            2,
+            content_width,
             machinery_style(theme),
-        )],
+        ),
         // Errors are the exception that belongs in the foreground: they keep
         // red + bold and the ⚙ gutter, share the two-space indent, and ALWAYS
         // carry a `✗` failed-marker so they can't be missed (the two-planes
@@ -999,15 +1454,14 @@ fn message_lines(
             } else {
                 "✗ "
             };
-            vec![Line::styled(
-                format!(
-                    "  ⚙ {} {glyph}{summary}",
-                    join_arg(name, key_arg.as_deref())
-                ),
+            indented_lines(
+                &format!("⚙ {} {glyph}{summary}", join_arg(name, key_arg.as_deref())),
+                2,
+                content_width,
                 Style::default()
                     .fg(tui_color(theme.error))
                     .add_modifier(Modifier::BOLD),
-            )]
+            )
         }
         // A foldable Block reaches here only EXPANDED (Ctrl-O on) or when it has
         // no foldable body (titleless / empty) - the collapse is handled once at
@@ -1026,16 +1480,59 @@ fn message_lines(
             }));
             out
         }
+        // The quiet plane: adapter Info news and the tinted harness marker
+        // plane (ADR-0040) share one shape - italic text rows. Info wears the
+        // muted color; a Marker tints by TONE alone (never by text, the glyph
+        // and wording were authored upstream). One arm, so the fold rule for
+        // "a plain italic line" lives in one place.
+        // Adapter Info news sits flush at the margin (the greeting, notices).
         TranscriptItem::Info { text } => {
-            let style = Style::default()
-                .fg(tui_color(theme.muted))
-                .add_modifier(Modifier::ITALIC);
+            let style = marker_style(item, theme).add_modifier(Modifier::ITALIC);
             text_rows(text)
                 .into_iter()
                 .map(|row| Line::styled(row, style))
                 .collect()
         }
+        // A harness Marker (governing/housekeeping) indents two columns under the
+        // thought header, like the tool work - it is part of the turn's body, not
+        // a foreground line. Wrapped continuations stay at column 2 too
+        // ([`indented_lines`]). Tinted by TONE alone (the glyph/wording are
+        // authored upstream, never sniffed here).
+        TranscriptItem::Marker { text, .. } => {
+            let style = marker_style(item, theme).add_modifier(Modifier::ITALIC);
+            text_rows(text)
+                .into_iter()
+                .flat_map(|row| indented_lines(&row, 2, content_width, style))
+                .collect()
+        }
     }
+}
+
+/// The color an Info or Marker line draws in (ADR-0040): a Marker reads its
+/// [`Tone`]'s own Theme slot (Steering the prompt gutter, Plain the muted
+/// fallback); an Info line is always muted. Tone alone decides the tint, never
+/// the text.
+fn marker_style(item: &TranscriptItem, theme: &Theme) -> Style {
+    let color = match item {
+        TranscriptItem::Marker {
+            tone: Tone::Housekeeping,
+            ..
+        } => theme.marker_housekeeping,
+        TranscriptItem::Marker {
+            tone: Tone::Aid, ..
+        } => theme.marker_aid,
+        TranscriptItem::Marker {
+            tone: Tone::Constrain,
+            ..
+        } => theme.marker_constrain,
+        TranscriptItem::Marker {
+            tone: Tone::Steering,
+            ..
+        } => theme.prompt_gutter,
+        // A Plain marker and an Info line both read muted.
+        _ => theme.muted,
+    };
+    Style::default().fg(tui_color(color))
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,20 +1595,31 @@ fn highlight_code(
     Some(out)
 }
 
+/// The inset prefix a bare code block indents under (ADR-0040 Decision E): two
+/// columns, wearing the code background so the block reads as one solid inset
+/// surface rather than a boxed one.
+const CODE_INSET: &str = "  ";
+
 /// Renders assistant markdown into ratatui lines: one `Line` per [`MdLine`],
 /// each span styled by the single [`md_style`] mapping; an empty MdLine (block
 /// separation) becomes a blank row. Consecutive code lines sharing a non-empty
-/// `code_lang` are highlighted as one block via [`highlight_code`] - syntect
-/// fg over OUR code background; blocks with no/unknown language fall back to
-/// the plain CodeBlock style.
+/// `code_lang` render as one bare, inset code block (a blank row above/below,
+/// each row inset under [`CODE_INSET`], no box or gutter): [`highlight_code`]
+/// gives syntect fg over OUR code background; blocks with no/unknown language
+/// fall back to the plain CodeBlock style, still inset.
 fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let md_lines = markdown::to_lines(text);
     let mut out = Vec::with_capacity(md_lines.len());
     let mut i = 0;
     while i < md_lines.len() {
+        // Prose (`code_lang == None`) takes the per-line plain path; ANY fenced
+        // code - including a bare ``` fence (`Some("")`, which local models emit
+        // constantly) - enters the inset code-block branch below. An empty lang
+        // simply won't resolve a syntax, so it falls to the plain-but-inset
+        // fallback inside the branch, framed like every other code block.
         let lang = match md_lines[i].code_lang.as_deref() {
-            Some(lang) if !lang.is_empty() => lang.to_string(),
-            _ => {
+            Some(lang) => lang.to_string(),
+            None => {
                 out.push(plain_md_line(&md_lines[i], theme));
                 i += 1;
                 continue;
@@ -1124,36 +1632,48 @@ fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         let block = &md_lines[i..end];
         let texts: Vec<String> = block.iter().map(md_line_text).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        // Bare, inset code block (ADR-0040 Decision E): a blank row above and
+        // below frames the block, and each code row insets under
+        // [`CODE_INSET`]; no box, no line-number gutter - the syntect fg over
+        // our code bg carries it. The inset prefix wears the code bg so the
+        // block reads as one solid surface.
+        let code_bg = tui_color(theme.code_block_bg);
+        let inset = || Span::styled(CODE_INSET, Style::default().bg(code_bg));
+        out.push(Line::default());
         match highlight_code(&refs, &lang, &theme.syntax) {
             Some(highlighted) => {
                 for (fragments, text) in highlighted.into_iter().zip(&texts) {
                     if fragments.is_empty() {
                         // Blank (or all-whitespace) code line: keep the same
-                        // bg treatment the plain path gives it.
-                        out.push(Line::from(Span::styled(
-                            text.clone(),
-                            md_style(MdStyle::CodeBlock, theme),
-                        )));
+                        // bg treatment the plain path gives it, still inset.
+                        out.push(Line::from(vec![
+                            inset(),
+                            Span::styled(text.clone(), md_style(MdStyle::CodeBlock, theme)),
+                        ]));
                     } else {
-                        out.push(Line::from(
-                            fragments
-                                .into_iter()
-                                .map(|((r, g, b), text)| {
-                                    Span::styled(
-                                        text,
-                                        Style::default()
-                                            .fg(Color::Rgb(r, g, b))
-                                            .bg(tui_color(theme.code_block_bg)),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        ));
+                        let mut spans = vec![inset()];
+                        spans.extend(fragments.into_iter().map(|((r, g, b), text)| {
+                            Span::styled(
+                                text,
+                                Style::default().fg(Color::Rgb(r, g, b)).bg(code_bg),
+                            )
+                        }));
+                        out.push(Line::from(spans));
                     }
                 }
             }
-            // Unknown language: the existing plain CodeBlock rendering.
-            None => out.extend(block.iter().map(|line| plain_md_line(line, theme))),
+            // Unknown language: the plain CodeBlock rendering, still inset.
+            None => out.extend(block.iter().map(|line| {
+                let mut spans = vec![inset()];
+                spans.extend(
+                    line.spans
+                        .iter()
+                        .map(|span| Span::styled(span.text.clone(), md_style(span.style, theme))),
+                );
+                Line::from(spans)
+            })),
         }
+        out.push(Line::default());
         i = end;
     }
     out
@@ -1200,6 +1720,10 @@ fn block_line(line: &StyledLine, theme: &Theme) -> Line<'static> {
 /// The running-spinner animation frames (braille), advanced by the adapter's
 /// animation tick while a Turn is running.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How many source rows of the live reasoning the rolling tail shows under the
+/// `✦ Thinking` header (ADR-0040 Decision A: the short tail). Tunable.
+const THINKING_TAIL_ROWS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // The powerline status bar.
@@ -1313,14 +1837,14 @@ impl StatusSegment {
     /// The columns this segment occupies once painted, ratatui-free. Kept in
     /// lockstep with [`StatusSegment::paint`] so the pure fit policy
     /// ([`StatusBar::fit`]) measures exactly what the painter will draw. The
-    /// spinner glyph and `▾`/`▸` marker are each one column, so the width does
-    /// not depend on the frame the painter later chooses. Exhaustive so a new
+    /// mode dot and `▾`/`▸` marker are each one column, so the width does not
+    /// depend on the mode the painter later chooses. Exhaustive so a new
     /// segment kind is a compile error here as well as in the painter.
     fn cells(&self) -> usize {
         match self {
-            // " X RUNNING " / " IDLE " - the running spinner glyph is one col.
-            StatusSegment::Mode(ModeState::Running) => " X RUNNING ".chars().count(),
-            StatusSegment::Mode(ModeState::Idle) => " IDLE ".chars().count(),
+            // " ● " / " ○ " - the mode dot is one col in either state, so both
+            // modes are three columns (matches paint() exactly).
+            StatusSegment::Mode(_) => " ● ".chars().count(),
             StatusSegment::Connection { base_url } => {
                 format!(" suspenders · {base_url} ").chars().count()
             }
@@ -1559,18 +2083,15 @@ pub enum SegmentKind {
 
 impl StatusSegment {
     /// Paints this segment into its display text (padding included). The ONLY
-    /// place the drawing details live: the spinner glyph (chosen from the
-    /// adapter's animation `spinner` tick), the `▾`/`▸` Thinking marker, the
-    /// `~N tokens` label, and the block padding. Semantics-in,
-    /// terminal-text-out - the seam ADR-0019 wants.
-    fn paint(&self, spinner: u64) -> String {
+    /// place the drawing details live: the mode dot, the `▾`/`▸` Thinking
+    /// marker, the `~N tokens` label, and the block padding. Semantics-in,
+    /// terminal-text-out - the seam ADR-0019 wants. No spinner: the running
+    /// animation moved to the `✦ Thinking` brain header (ADR-0040); the mode
+    /// block is now a static dot (`●` running, pulsing color; `○` idle).
+    fn paint(&self) -> String {
         match self {
-            // While running, the animated braille spinner lives inside the
-            // mode block; the frame counter comes from the adapter's tick.
-            StatusSegment::Mode(ModeState::Running) => {
-                format!(" {} RUNNING ", SPINNER[(spinner as usize) % SPINNER.len()])
-            }
-            StatusSegment::Mode(ModeState::Idle) => " IDLE ".to_string(),
+            StatusSegment::Mode(ModeState::Running) => " ● ".to_string(),
+            StatusSegment::Mode(ModeState::Idle) => " ○ ".to_string(),
             StatusSegment::Connection { base_url } => format!(" suspenders · {base_url} "),
             StatusSegment::Model { model } => format!(" model · {model} "),
             StatusSegment::Thinking { expanded } => {
@@ -1602,13 +2123,11 @@ impl StatusSegment {
 /// segments, in what order, at what [`PressureLevel`]) are decided there; this
 /// turns each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
 /// and [`segment_style`].
-#[allow(clippy::too_many_arguments)] // one painter input per bar fact, like status_bar above
 pub fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
     t: &Screen,
     conn: ConnectionView,
-    spinner: u64,
     viewport: &Viewport,
     geometry: (usize, usize),
     theme: &Theme,
@@ -1641,10 +2160,7 @@ pub fn render_status_bar(
     let mut spans: Vec<Span> = Vec::new();
     for (i, segment) in bar.left.iter().enumerate() {
         let kind = segment.kind();
-        spans.push(Span::styled(
-            segment.paint(spinner),
-            segment_style(kind, theme),
-        ));
+        spans.push(Span::styled(segment.paint(), segment_style(kind, theme)));
         // The separator wears THIS segment's bg over the NEXT one's (the base
         // bg after the last segment) - that is what draws the triangle.
         let next_bg = bar
@@ -1666,10 +2182,7 @@ pub fn render_status_bar(
             SEP_LEFT,
             Style::default().fg(segment_bg(kind, theme)).bg(prev_bg),
         ));
-        spans.push(Span::styled(
-            segment.paint(spinner),
-            segment_style(kind, theme),
-        ));
+        spans.push(Span::styled(segment.paint(), segment_style(kind, theme)));
         prev_bg = segment_bg(kind, theme);
     }
 
@@ -2160,49 +2673,76 @@ mod tests {
         assert_eq!(bold.style, md_style(MdStyle::Bold, theme::dark()));
     }
 
+    /// A bare code block insets each row under [`CODE_INSET`] and frames the
+    /// block with a blank row above and below (ADR-0040 Decision E). This finds
+    /// the row whose code text (after the inset) matches `code`, and returns its
+    /// spans WITHOUT the leading inset span - what the assertions below care
+    /// about.
+    fn code_row<'a>(lines: &'a [Line<'static>], code: &str) -> &'a [Span<'static>] {
+        let line = lines
+            .iter()
+            .find(|l| line_text(l) == format!("{CODE_INSET}{code}"))
+            .unwrap_or_else(|| panic!("the code row for {code:?}"));
+        // The first span is always the inset (code bg, no fg); the code follows.
+        assert_eq!(line.spans[0].content.as_ref(), CODE_INSET);
+        assert_eq!(
+            line.spans[0].style.bg,
+            Some(tui_color(theme::dark().code_block_bg))
+        );
+        &line.spans[1..]
+    }
+
     #[test]
     fn a_known_language_fence_is_highlighted_over_the_code_background() {
         let lines = markdown_lines("```rust\nlet x = 1;\n```", theme::dark());
-        let code = lines
-            .iter()
-            .find(|l| line_text(l) == "let x = 1;")
-            .expect("the code line, text verbatim");
+        let code = code_row(&lines, "let x = 1;");
         // Syntect fragments the line; every fragment keeps OUR code bg under
         // its own syntect fg.
-        assert!(code.spans.len() > 1, "syntect splits the line");
-        for span in &code.spans {
+        assert!(code.len() > 1, "syntect splits the line");
+        for span in code {
             assert_eq!(span.style.bg, Some(tui_color(theme::dark().code_block_bg)));
             assert!(matches!(span.style.fg, Some(Color::Rgb(..))));
         }
     }
 
     #[test]
-    fn an_unknown_language_fence_falls_back_to_the_plain_code_block_style() {
-        let lines = markdown_lines("```notareallanguage\nsome code\n```", theme::dark());
-        let code = lines
+    fn a_bare_code_block_is_framed_by_a_blank_row_above_and_below() {
+        // The block is inset and bounded by one blank row on each side; no box,
+        // no gutter (Decision E).
+        let lines = markdown_lines("before\n\n```rust\nlet x = 1;\n```\n\nafter", theme::dark());
+        let code_idx = lines
             .iter()
-            .find(|l| line_text(l) == "some code")
-            .expect("the code line");
-        assert_eq!(code.spans.len(), 1);
-        assert_eq!(
-            code.spans[0].style,
-            md_style(MdStyle::CodeBlock, theme::dark())
-        );
+            .position(|l| line_text(l) == format!("{CODE_INSET}let x = 1;"))
+            .expect("the inset code row");
+        assert_eq!(line_text(&lines[code_idx - 1]), "", "blank row above");
+        assert_eq!(line_text(&lines[code_idx + 1]), "", "blank row below");
     }
 
     #[test]
-    fn a_bare_fence_with_no_language_renders_the_plain_code_block_style() {
-        // A bare ``` fence carries `Some("")` - an empty lang must route to
-        // the plain path, never to syntect.
-        let lines = markdown_lines("```\nunlabeled code\n```", theme::dark());
-        let code = lines
+    fn an_unknown_language_fence_falls_back_to_the_plain_code_block_style() {
+        let lines = markdown_lines("```notareallanguage\nsome code\n```", theme::dark());
+        let code = code_row(&lines, "some code");
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].style, md_style(MdStyle::CodeBlock, theme::dark()));
+    }
+
+    #[test]
+    fn a_bare_fence_with_no_language_gets_the_inset_framed_block() {
+        // A bare ``` fence carries `Some("")` - the common case local models
+        // emit. It skips syntect (empty lang resolves no syntax) but still gets
+        // the SAME inset + blank-framed code block as a labeled fence (M1): the
+        // plain CodeBlock style, inset under CODE_INSET, framed above and below.
+        let lines = markdown_lines("before\n\n```\nunlabeled code\n```\n\nafter", theme::dark());
+        let code = code_row(&lines, "unlabeled code");
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].style, md_style(MdStyle::CodeBlock, theme::dark()));
+        // Framed: a blank row above and below the inset code row.
+        let idx = lines
             .iter()
-            .find(|l| line_text(l) == "unlabeled code")
-            .expect("the code line");
-        assert_eq!(
-            code.spans[0].style,
-            md_style(MdStyle::CodeBlock, theme::dark())
-        );
+            .position(|l| line_text(l) == format!("{CODE_INSET}unlabeled code"))
+            .expect("the inset code row");
+        assert_eq!(line_text(&lines[idx - 1]), "", "blank row above");
+        assert_eq!(line_text(&lines[idx + 1]), "", "blank row below");
     }
 
     #[test]
@@ -2210,14 +2750,15 @@ mod tests {
         let lines = markdown_lines("```rust\nlet a = 1;\n\nlet b = 2;\n```", theme::dark());
         let a_idx = lines
             .iter()
-            .position(|l| line_text(l) == "let a = 1;")
+            .position(|l| line_text(l) == format!("{CODE_INSET}let a = 1;"))
             .expect("the first code line");
-        // The blank row between the statements yields no syntect fragments,
-        // so it takes the plain CodeBlock treatment - same bg, no hole.
+        // The blank row between the statements yields no syntect fragments, so
+        // it takes the plain CodeBlock treatment - same bg, no hole - and it is
+        // still inset (the inset span, then the empty code span).
         let blank = &lines[a_idx + 1];
-        assert_eq!(line_text(blank), "");
+        assert_eq!(line_text(blank), CODE_INSET);
         assert_eq!(
-            blank.spans[0].style,
+            blank.spans[1].style,
             md_style(MdStyle::CodeBlock, theme::dark())
         );
     }
@@ -2494,9 +3035,10 @@ mod tests {
             ]
         );
 
-        // At 40 cost drops next; tokens survive it (they carry the pressure
-        // level the operator steers by).
-        let bar = bar_at(40);
+        // At 30 cost drops next; tokens survive it (they carry the pressure
+        // level the operator steers by). The threshold sits lower than it once
+        // did because the mode block is now a 3-col dot, not a spelled word.
+        let bar = bar_at(30);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
             kinds(&bar.right),
@@ -2546,11 +3088,11 @@ mod tests {
     #[test]
     fn the_thinking_marker_paints_from_its_state() {
         assert_eq!(
-            StatusSegment::Thinking { expanded: true }.paint(0),
+            StatusSegment::Thinking { expanded: true }.paint(),
             " ▾ thinking "
         );
         assert_eq!(
-            StatusSegment::Thinking { expanded: false }.paint(0),
+            StatusSegment::Thinking { expanded: false }.paint(),
             " ▸ thinking "
         );
     }
@@ -2583,11 +3125,11 @@ mod tests {
     #[test]
     fn the_tools_marker_paints_from_its_state() {
         assert_eq!(
-            StatusSegment::Tools { expanded: true }.paint(0),
+            StatusSegment::Tools { expanded: true }.paint(),
             " ▾ tools "
         );
         assert_eq!(
-            StatusSegment::Tools { expanded: false }.paint(0),
+            StatusSegment::Tools { expanded: false }.paint(),
             " ▸ tools "
         );
     }
@@ -2666,7 +3208,7 @@ mod tests {
                 label: "$0.42".into()
             }
         );
-        assert_eq!(cost.paint(0), " $0.42 ");
+        assert_eq!(cost.paint(), " $0.42 ");
         assert_eq!(cost.cells(), " $0.42 ".chars().count());
     }
 
@@ -2763,15 +3305,20 @@ mod tests {
     }
 
     #[test]
-    fn the_running_mode_segment_paints_the_spinner_frame() {
-        let running = StatusSegment::Mode(ModeState::Running);
-        assert_eq!(running.paint(0), format!(" {} RUNNING ", SPINNER[0]));
-        assert_eq!(running.paint(1), format!(" {} RUNNING ", SPINNER[1]));
-        // The counter wraps around the frame set.
-        assert_eq!(
-            running.paint(SPINNER.len() as u64),
-            format!(" {} RUNNING ", SPINNER[0])
-        );
+    fn the_mode_segment_paints_a_static_dot_no_spinner() {
+        // The running animation moved to the `✦ Thinking` brain header
+        // (ADR-0040); the mode block is now a static dot, and cells() agrees
+        // with paint() in both modes (the drift invariant).
+        for mode in [ModeState::Running, ModeState::Idle] {
+            let seg = StatusSegment::Mode(mode);
+            assert_eq!(
+                seg.cells(),
+                seg.paint().chars().count(),
+                "{seg:?} cells() disagrees with painted width"
+            );
+        }
+        assert_eq!(StatusSegment::Mode(ModeState::Running).paint(), " ● ");
+        assert_eq!(StatusSegment::Mode(ModeState::Idle).paint(), " ○ ");
     }
 
     #[test]
@@ -2782,7 +3329,7 @@ mod tests {
                 level: PressureLevel::Ok,
                 dead_mass_pct: None,
             }
-            .paint(0),
+            .paint(),
             " ~1,200 tokens "
         );
     }
@@ -2797,21 +3344,21 @@ mod tests {
             level: PressureLevel::Ok,
             dead_mass_pct: Some(12),
         };
-        assert_eq!(with_dead.paint(0), " ~1,200 tokens · 12% dead ");
+        assert_eq!(with_dead.paint(), " ~1,200 tokens · 12% dead ");
 
         let zero = StatusSegment::Tokens {
             estimate: 1200,
             level: PressureLevel::Ok,
             dead_mass_pct: Some(0),
         };
-        assert_eq!(zero.paint(0), " ~1,200 tokens · 0% dead ");
+        assert_eq!(zero.paint(), " ~1,200 tokens · 0% dead ");
 
         let without = StatusSegment::Tokens {
             estimate: 1200,
             level: PressureLevel::Ok,
             dead_mass_pct: None,
         };
-        assert_eq!(without.paint(0), " ~1,200 tokens ");
+        assert_eq!(without.paint(), " ~1,200 tokens ");
     }
 
     #[test]
@@ -2826,7 +3373,7 @@ mod tests {
             };
             assert_eq!(
                 seg.cells(),
-                seg.paint(0).chars().count(),
+                seg.paint().chars().count(),
                 "{seg:?} cells() disagrees with painted width"
             );
         }
@@ -2841,7 +3388,7 @@ mod tests {
         for segment in bar.left.iter().chain(&bar.right) {
             assert_eq!(
                 segment.cells(),
-                segment.paint(0).chars().count(),
+                segment.paint().chars().count(),
                 "{segment:?} cells() disagrees with painted width"
             );
         }
@@ -2938,14 +3485,15 @@ mod tests {
     #[test]
     fn cache_sync_builds_one_entry_per_settled_item_with_its_wrapped_count() {
         let mut t = fresh_transcript();
-        // At width 10 the word-wrapper puts the unbreakable 16-char word
-        // below the "› " gutter row and splits it: 3 rows.
+        // The `› ` caret now lives in the reserved lane gutter (ADR-0040), so
+        // the cached User line is the bare 16-char word. At width 10 it wraps
+        // to 2 rows (10 + 6).
         t.user("0123456789012345");
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 10, theme::dark());
         assert_eq!(cache.settled().count(), 1);
-        // 3 wrapped rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.settled().next().unwrap().1, 4);
+        // 2 wrapped rows, dense (no per-item blank separator).
+        assert_eq!(cache.settled().next().unwrap().1, 2);
     }
 
     #[test]
@@ -2954,9 +3502,9 @@ mod tests {
         t.user("0123456789012345");
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // 1 content row + 1 trailing inter-turn blank separator.
+        // 1 content row, dense (no per-item blank separator).
         let wide = cache.settled().next().unwrap().1;
-        assert_eq!(wide, 2);
+        assert_eq!(wide, 1);
         cache.sync(&t, Toggles::default(), 10, theme::dark()); // resize: every wrapped count is stale
         assert!(cache.settled().next().unwrap().1 > wide);
     }
@@ -2969,8 +3517,8 @@ mod tests {
         });
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // Collapsed one-liner + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.settled().next().unwrap().0.len(), 2);
+        // Collapsed one-liner, dense (no per-item blank separator).
+        assert_eq!(cache.settled().next().unwrap().0.len(), 1);
         cache.sync(
             &t,
             Toggles {
@@ -2980,8 +3528,8 @@ mod tests {
             80,
             theme::dark(),
         );
-        // Header + both rows + 1 trailing inter-turn blank separator.
-        assert_eq!(cache.settled().next().unwrap().0.len(), 4);
+        // Header + both rows, dense (no per-item blank separator).
+        assert_eq!(cache.settled().next().unwrap().0.len(), 3);
     }
 
     #[test]
@@ -2989,7 +3537,7 @@ mod tests {
         // The Ctrl-O twin of the thinking-toggle test: a multi-line Block folds
         // to a single title line when collapsed and to the full body when
         // expanded, and flipping the toggle clears the cache so the change
-        // takes effect. (+1 everywhere for Stage 1's trailing blank separator.)
+        // takes effect. The lane is dense now - no per-item blank separator.
         let mut t = fresh_transcript();
         t.push(TranscriptItem::Block {
             title: "edit_file src/foo.rs".to_string(),
@@ -3000,9 +3548,9 @@ mod tests {
         });
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // Collapsed one-liner + 1 trailing inter-turn blank separator.
+        // Collapsed one-liner, dense (no per-item blank separator).
         let collapsed = cache.settled().next().unwrap().0;
-        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]),
             "  ⋯ edit_file src/foo.rs · ^O expand"
@@ -3016,9 +3564,9 @@ mod tests {
             80,
             theme::dark(),
         );
-        // Title row + both body rows + 1 trailing inter-turn blank separator.
+        // Title row + both body rows, dense (no per-item blank separator).
         let expanded = cache.settled().next().unwrap().0;
-        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded.len(), 3);
         assert_eq!(line_text(&expanded[0]), "  ⋯ edit_file src/foo.rs");
     }
 
@@ -3083,7 +3631,7 @@ mod tests {
             is_error: false,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false, theme::dark());
+        let lines = message_lines(&item, false, false, 80, theme::dark());
         assert_eq!(lines.len(), 1);
         assert_eq!(
             line_text(&lines[0]),
@@ -3100,7 +3648,7 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let lines = message_lines(&item, false, false, theme::dark());
+        let lines = message_lines(&item, false, false, 80, theme::dark());
         assert_eq!(line_text(&lines[0]), "  ⋯ run_command → injected");
     }
 
@@ -3114,7 +3662,7 @@ mod tests {
             is_error: true,
             key_arg: Some("cargo test".to_string()),
         };
-        let lines = message_lines(&item, false, false, theme::dark());
+        let lines = message_lines(&item, false, false, 80, theme::dark());
         assert_eq!(line_text(&lines[0]), "  ⚙ run_command  cargo test ✗ exit 1");
     }
 
@@ -3129,7 +3677,7 @@ mod tests {
             is_error: true,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false, theme::dark());
+        let lines = message_lines(&item, false, false, 80, theme::dark());
         assert_eq!(
             line_text(&lines[0]),
             "  ⚙ edit_file  src/foo.rs ✗ old_str not found"
@@ -3147,8 +3695,40 @@ mod tests {
                 is_error: true,
                 key_arg: None,
             };
-            let lines = message_lines(&item, false, false, theme::dark());
+            let lines = message_lines(&item, false, false, 80, theme::dark());
             assert_eq!(line_text(&lines[0]), format!("  ⚙ run_command {badge}"));
+        }
+    }
+
+    // The tinted marker plane (ADR-0040): each Tone renders in its OWN Theme
+    // slot, tinted by tone alone - identical text under two tones tints
+    // differently, proving the adapter never sniffs the line.
+    #[test]
+    fn a_marker_tints_by_its_tone_slot_not_its_text() {
+        let theme = theme::dark();
+        for (tone, expected) in [
+            (Tone::Housekeeping, theme.marker_housekeeping),
+            (Tone::Aid, theme.marker_aid),
+            (Tone::Constrain, theme.marker_constrain),
+            (Tone::Steering, theme.prompt_gutter),
+            (Tone::Plain, theme.muted),
+        ] {
+            let item = TranscriptItem::Marker {
+                // Same text for every tone: the tint cannot be coming from it.
+                text: "harness marker".to_string(),
+                tone,
+            };
+            let lines = message_lines(&item, false, false, 80, theme);
+            assert_eq!(lines.len(), 1);
+            // A Marker indents two columns under the thought header (ADR-0040);
+            // the whole styled line (indent + text) carries the tone color.
+            // `Line::styled` puts the style on the Line, which the spans inherit.
+            assert_eq!(line_text(&lines[0]), "  harness marker", "{tone:?}");
+            assert_eq!(lines[0].style.fg, Some(tui_color(expected)), "{tone:?}");
+            assert!(
+                lines[0].style.add_modifier.contains(Modifier::ITALIC),
+                "{tone:?} marker should read as the quiet plane (italic)"
+            );
         }
     }
 
@@ -3191,14 +3771,14 @@ mod tests {
             ],
         };
         // Collapsed (tools_expanded = false): one title line with the affordance.
-        let collapsed = message_lines(&block, false, false, theme::dark());
+        let collapsed = message_lines(&block, false, false, 80, theme::dark());
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]),
             "  ⋯ edit_file src/foo.rs (+1 -1) · ^O expand"
         );
         // Expanded: title + both body rows.
-        let expanded = message_lines(&block, false, true, theme::dark());
+        let expanded = message_lines(&block, false, true, 80, theme::dark());
         assert_eq!(expanded.len(), 3);
     }
 
@@ -3211,9 +3791,13 @@ mod tests {
         use crate::ui::viewport::Viewport;
 
         let mut t = fresh_transcript();
-        // Some prose above the fold, then a tall foldable block so expand/collapse
-        // changes the total wrapped-line count.
-        for i in 0..8 {
+        // Enough prose above the fold that the COLLAPSED content already
+        // overflows the viewport (the lane is dense now - no per-item blank
+        // separators - so more rows are needed to overflow), then a tall
+        // foldable block so expand/collapse changes the total wrapped-line count.
+        // Overflow-while-collapsed is what makes `scroll_up` truly unpin, which
+        // is the precondition for the stationary-across-expand invariant.
+        for i in 0..16 {
             t.info(format!("prose line {i}"));
         }
         t.push(TranscriptItem::Block {
@@ -3285,11 +3869,11 @@ mod tests {
         for width in [10u16, 24, 80] {
             let per_item: usize = items
                 .iter()
-                .map(|item| wrapped_count(message_lines(item, false, false, theme::dark()), width))
+                .map(|item| wrapped_count(message_lines(item, false, false, width, theme::dark()), width))
                 .sum();
             let whole: Vec<Line> = items
                 .iter()
-                .flat_map(|item| message_lines(item, false, false, theme::dark()))
+                .flat_map(|item| message_lines(item, false, false, width, theme::dark()))
                 .collect();
             assert_eq!(per_item, wrapped_count(whole, width), "width {width}");
         }
@@ -3307,6 +3891,7 @@ mod tests {
     use crate::content::ContentBlock;
     use crate::event::Event;
     use crate::llm::Delta;
+    use crate::llm::response::StopReason;
     use crate::ui::screen::ScreenOpts;
 
     /// Draws one frame with `draw` on a fresh `width`×`height` test terminal
@@ -3583,13 +4168,102 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual: cargo nextest run dump_demo_render --run-ignored all --no-capture"]
+    fn dump_demo_render() {
+        let screen = Screen::demo();
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(100, 70, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+        let mut out = String::from("\n");
+        for y in 0..70 {
+            // Bracket the leftmost 2 gutter columns so the spine / caret / blank
+            // is unambiguous, then the content.
+            let row = row_text(&terminal, y);
+            let split = row.char_indices().nth(2).map_or(row.len(), |(i, _)| i);
+            let (gutter, rest) = row.split_at(split);
+            out.push_str(&format!("{y:>2}|{gutter}|{}\n", rest.trim_end()));
+        }
+        eprintln!("{out}");
+    }
+
+    #[test]
+    fn the_demo_render_matches_the_confirmed_collapsed_turn_shape() {
+        // The demo is the living spec (ADR-0040): pin the load-bearing rows of
+        // the confirmed collapsed-turn shape so a regression trips here, not only
+        // in a manual dump. Rows are `(gutter, content)` where gutter is the
+        // leftmost LANE_GUTTER columns.
+        let terminal = draw_frame(100, 70, |f| {
+            render_viewport(f, f.area(), &Screen::demo(), &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+        });
+        let split = |y: u16| -> (String, String) {
+            let row = row_text(&terminal, y);
+            let at = row.char_indices().nth(2).map_or(row.len(), |(i, _)| i);
+            let (g, r) = row.split_at(at);
+            (g.to_string(), r.trim_end().to_string())
+        };
+        // The user prompt breaks to the caret at the margin.
+        assert_eq!(split(2), ("› ".into(), "evaluate this project".into()));
+        // Assistant text is flush under the spine.
+        assert_eq!(split(3).0, "│ ");
+        assert!(split(3).1.starts_with("I'll evaluate this project"));
+        // The lane's thoughts fold to ONE header - the LAST thought's text -
+        // flush under the spine.
+        assert_eq!(
+            split(5),
+            ("│ ".into(), "✦ thought: Let me check the build health and test coverage.".into())
+        );
+        // The windowed-out machinery collapses to a `⋯ N earlier actions` count,
+        // indented two columns.
+        assert_eq!(split(6), ("│ ".into(), "  ⋯ 6 earlier actions · ^O expand".into()));
+        // A governing marker indents two columns; its wrapped continuation stays
+        // indented (task 1: the wrap-indent fix).
+        assert_eq!(split(7).0, "│ ");
+        assert!(split(7).1.starts_with("  » [reading file after file"));
+        assert_eq!(split(8).0, "│ ");
+        assert!(split(8).1.starts_with("  instead;"), "wrapped marker stays indented: {:?}", split(8).1);
+        // The error tool result breaks out (always shown), indented two columns,
+        // with the ⚙ gutter.
+        assert_eq!(split(14).0, "│ ");
+        assert!(split(14).1.starts_with("  ⚙ run_command"));
+        assert!(split(14).1.contains("command denied"));
+        // Assistant text after the tools is flush again.
+        assert_eq!(split(15).0, "│ ");
+        assert!(split(15).1.starts_with("The project is a well-structured"));
+        // Code breaks out, inset two columns, under the spine.
+        assert_eq!(split(18).0, "│ ");
+        assert!(split(18).1.contains("fn tokenize"));
+    }
+
+    #[test]
+    fn the_collapsed_lane_spine_is_dense_and_continuous() {
+        // The lane has NO per-item blank separator: every content row of the
+        // turn (from the first assistant line through the last) carries the `│`
+        // spine, with no bare gap rows breaking it into segments.
+        let terminal = draw_frame(100, 70, |f| {
+            render_viewport(f, f.area(), &Screen::demo(), &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+        });
+        // Rows 3..=24 are the agent's turn (assistant, folded thought, machinery,
+        // markers, error, closing assistant + code). Every one starts with the
+        // spine - no blank separator rows interleave the machinery.
+        for y in 3..=14u16 {
+            let row = row_text(&terminal, y);
+            assert!(
+                row.starts_with('│'),
+                "row {y} broke the dense spine: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_viewport_draws_the_transcript_and_returns_the_measured_geometry() {
         let screen = screen_with_notices(vec!["a launch notice".to_string()]);
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         let terminal = draw_frame(80, 20, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
         });
         let text = buffer_text(&terminal);
         assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
@@ -3613,7 +4287,7 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut geometry = (0, 0);
         let terminal = draw_frame(40, 8, |f| {
-            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
         });
         let (total_lines, height) = geometry;
         assert!(total_lines > height, "the content overflows");
@@ -3632,7 +4306,527 @@ mod tests {
     }
 
     #[test]
-    fn a_streaming_thinking_snapshot_draws_the_one_line_indicator() {
+    fn lane_gutters_derives_the_spine_from_user_boundaries() {
+        // Before the first User the region is spineless (Blank); a User opens a
+        // lane (User caret) and every item until the next User hangs off it
+        // (Spine). A second User opens a fresh lane. The lane is the request,
+        // not the Turn - agent items with no intervening User stay on the spine.
+        let items = vec![
+            TranscriptItem::Info { text: "greeting".into() },
+            TranscriptItem::User { text: "first".into() },
+            TranscriptItem::Thinking { text: "hm".into() },
+            TranscriptItem::Assistant { text: "answer".into() },
+            TranscriptItem::User { text: "second".into() },
+            TranscriptItem::Assistant { text: "reply".into() },
+        ];
+        assert_eq!(
+            lane_gutters(&items),
+            vec![
+                GutterKind::Blank,
+                GutterKind::User,
+                GutterKind::Spine,
+                GutterKind::Spine,
+                GutterKind::User,
+                GutterKind::Spine,
+            ]
+        );
+    }
+
+    // ---- turn_fold: the rolling-window collapsed turn (ADR-0040) -----------
+
+    fn thought(t: &str) -> TranscriptItem {
+        TranscriptItem::Thinking { text: t.into() }
+    }
+    fn tool(name: &str) -> TranscriptItem {
+        TranscriptItem::ToolResult {
+            name: name.into(),
+            summary: "ok".into(),
+            is_error: false,
+            key_arg: None,
+        }
+    }
+    fn tool_err() -> TranscriptItem {
+        TranscriptItem::ToolResult {
+            name: "run".into(),
+            summary: "✗ boom".into(),
+            is_error: true,
+            key_arg: None,
+        }
+    }
+
+    #[test]
+    fn turn_fold_headers_the_last_thought_at_the_first_thoughts_slot() {
+        // Collapsed default: the LAST thought's text renders as a header at the
+        // FIRST thought's slot; the intervening thoughts drop.
+        let items = vec![
+            TranscriptItem::User { text: "go".into() },
+            thought("first"),
+            thought("middle"),
+            thought("LAST"),
+        ];
+        let fold = turn_fold(&items, false, false, MACHINERY_WINDOW);
+        // index 3 is the last thought; the header lands at index 1 (first slot).
+        assert_eq!(fold[1], FoldAction::Header(3));
+        assert_eq!(fold[2], FoldAction::Drop);
+        assert_eq!(fold[3], FoldAction::Drop);
+    }
+
+    #[test]
+    fn turn_fold_windows_machinery_and_elides_the_rest_with_a_count() {
+        // With window=2 and 5 machinery items, the last 2 Keep; the earlier 3
+        // collapse to an `Elided(3)` count at the first windowed-out slot.
+        let mut items = vec![TranscriptItem::User { text: "go".into() }];
+        for i in 0..5 {
+            items.push(tool(&format!("t{i}")));
+        }
+        let fold = turn_fold(&items, false, false, 2);
+        assert_eq!(fold[1], FoldAction::Elided(3)); // first windowed-out slot
+        assert_eq!(fold[2], FoldAction::Drop);
+        assert_eq!(fold[3], FoldAction::Drop);
+        assert_eq!(fold[4], FoldAction::Keep); // last two survive the window
+        assert_eq!(fold[5], FoldAction::Keep);
+    }
+
+    #[test]
+    fn turn_fold_keeps_errors_assistant_markers_and_blocks() {
+        // Errors, assistant text, markers and Blocks always Keep - they break
+        // out of the fold regardless of the window.
+        let items = vec![
+            TranscriptItem::User { text: "go".into() },
+            tool_err(),
+            TranscriptItem::Assistant { text: "answer".into() },
+            TranscriptItem::Marker { text: "» nudge".into(), tone: Tone::Aid },
+            TranscriptItem::Block { title: "diff".into(), lines: vec![] },
+        ];
+        let fold = turn_fold(&items, false, false, 0);
+        for (i, action) in fold.iter().enumerate().skip(1) {
+            assert_eq!(*action, FoldAction::Keep, "item {i} must break out");
+        }
+    }
+
+    #[test]
+    fn ctrl_t_disables_the_thought_fold() {
+        let items = vec![
+            TranscriptItem::User { text: "go".into() },
+            thought("first"),
+            thought("last"),
+        ];
+        // thinking_expanded = true: every thought Keeps, no header.
+        let fold = turn_fold(&items, true, false, MACHINERY_WINDOW);
+        assert_eq!(fold[1], FoldAction::Keep);
+        assert_eq!(fold[2], FoldAction::Keep);
+    }
+
+    #[test]
+    fn ctrl_o_disables_the_machinery_window() {
+        let mut items = vec![TranscriptItem::User { text: "go".into() }];
+        for i in 0..5 {
+            items.push(tool(&format!("t{i}")));
+        }
+        // tools_expanded = true: every action Keeps, no Elided count.
+        let fold = turn_fold(&items, false, true, 2);
+        for (i, action) in fold.iter().enumerate().skip(1) {
+            assert_eq!(*action, FoldAction::Keep, "action {i} must show");
+        }
+    }
+
+    #[test]
+    fn turn_fold_folds_each_lane_independently() {
+        // Two User-opened lanes: the second lane's thoughts fold on their own,
+        // not merged with the first lane's.
+        let items = vec![
+            TranscriptItem::User { text: "one".into() },
+            thought("a1"),
+            thought("a2"),
+            TranscriptItem::User { text: "two".into() },
+            thought("b1"),
+            thought("b2"),
+        ];
+        let fold = turn_fold(&items, false, false, MACHINERY_WINDOW);
+        assert_eq!(fold[1], FoldAction::Header(2)); // lane one: last is a2 (idx 2)
+        assert_eq!(fold[4], FoldAction::Header(5)); // lane two: last is b2 (idx 5)
+    }
+
+    // ---- wrap_words / indented_lines: the hanging block indent (task 1) ----
+
+    #[test]
+    fn wrap_words_greedily_wraps_on_spaces_within_width() {
+        assert_eq!(
+            wrap_words("the quick brown fox", 9),
+            vec!["the quick", "brown fox"]
+        );
+        // Every segment fits the width.
+        for seg in wrap_words("the quick brown fox jumps over", 9) {
+            assert!(seg.chars().count() <= 9, "segment over width: {seg:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_words_hard_splits_a_word_longer_than_the_width() {
+        // A single 10-char word at width 4 splits into 4+4+2, never overflowing.
+        let segs = wrap_words("abcdefghij", 4);
+        assert_eq!(segs, vec!["abcd", "efgh", "ij"]);
+        for seg in &segs {
+            assert!(seg.chars().count() <= 4);
+        }
+    }
+
+    #[test]
+    fn indented_lines_prefixes_every_wrapped_row_at_the_indent() {
+        // A long machinery line wraps; EVERY resulting row (first + continuation)
+        // is prefixed with the 2-space block indent and stays <= content width.
+        let style = Style::default();
+        let content = "⋯ list_files docs/adr with a very long trailing summary here";
+        let width = 20u16;
+        let lines = indented_lines(content, 2, width, style);
+        assert!(lines.len() > 1, "the long line wrapped");
+        for line in &lines {
+            let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+            assert!(text.starts_with("  "), "row not indented: {text:?}");
+            assert!(
+                text.chars().count() <= width as usize,
+                "row over content width: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_marker_continuation_lands_at_column_two_in_the_render() {
+        // Task 1 acceptance: a long marker soft-wraps and its continuation must
+        // sit at column 2 (block indent), not fall back to column 0. Render the
+        // real path and inspect the marker's second visual row.
+        let long = "[reading file after file fills your context - dispatch \
+                    explore with one focused question instead; a Scout searches \
+                    and reports back]";
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.submitted("go", Ok(()));
+        let (screen, _) = screen.apply_event(Event::ExploreNudge { text: long.into() });
+        let terminal = draw_frame(60, 20, |f| {
+            render_viewport(f, f.area(), &screen, &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+        });
+        // The marker's FIRST row carries `»`; its continuation is the next row.
+        let marker_y = (0..20)
+            .find(|&y| row_text(&terminal, y).contains('»'))
+            .expect("the marker row");
+        let cont = row_text(&terminal, marker_y + 1);
+        assert!(cont.contains("instead"), "the continuation row: {cont:?}");
+        // Columns are per-cell symbols. Column 0 is the spine `│`, column 1 the
+        // trailing gutter space; the content area begins at column LANE_GUTTER.
+        // The marker's own 2-space block indent means the content-area columns 0
+        // and 1 are blank on the continuation - it is NOT flush at the margin.
+        let cols: Vec<char> = cont.chars().collect();
+        assert_eq!(cols[0], '│', "the continuation keeps the spine");
+        let g = LANE_GUTTER as usize;
+        assert_eq!(
+            (cols[g], cols[g + 1]),
+            (' ', ' '),
+            "marker continuation not block-indented (content cols 0-1 not blank): {cont:?}"
+        );
+        // ...and real content follows the indent (not a fully blank row).
+        assert!(
+            cols[g + 2] != ' ',
+            "the continuation should carry text after the indent: {cont:?}"
+        );
+    }
+
+    // ---- collapsed_thought_line: one-row truncation ------------------------
+
+    #[test]
+    fn collapsed_thought_line_truncates_to_one_visual_row() {
+        let long = "z".repeat(400);
+        let line = collapsed_thought_line(&long, 40, theme::dark());
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(text.starts_with("✦ thought: "));
+        assert!(text.chars().count() <= 40, "one row: {}", text.chars().count());
+        assert!(text.ends_with('…'), "truncated: {text:?}");
+    }
+
+    #[test]
+    fn collapsed_thought_line_takes_the_first_source_line_only() {
+        let line = collapsed_thought_line("one\ntwo\nthree", 60, theme::dark());
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert_eq!(text, "✦ thought: one");
+    }
+
+    #[test]
+    fn the_reserved_gutter_forces_wrapping_at_the_reduced_content_width() {
+        // RED-1 (ADR-0029): the lane gutter is carved off the left, so content
+        // wraps in the narrower `content_area` and is DRAWN two columns in. This
+        // pins the reservation with a notice sized to wrap ONLY at the reduced
+        // width - it fits the text area but overflows the content area:
+        //
+        //   area.width 40 → text_area 39 (scrollbar col) → content 37 (gutter).
+        //   A 38-char word fits in 39 but must wrap in 37.
+        //
+        // Two facts both DEPEND on the 2-col reservation, so deleting LANE_GUTTER
+        // from the wrap width (measuring/drawing at 39) breaks both: the word
+        // (1) draws starting at column LANE_GUTTER, not column 0, and (2) wraps
+        // to a second row instead of fitting on one. A single 38-char token has
+        // no break point, so it wraps only because the width shrank.
+        let word = "x".repeat(38);
+        let screen = Screen::new(ScreenOpts {
+            notices: vec![word.clone()],
+            ..ScreenOpts::default()
+        });
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(40, 20, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+
+        // (1) The notice is drawn two columns in: the first row carrying the
+        // word begins with exactly LANE_GUTTER blank gutter cells (the notice is
+        // pre-lane, so the gutter is blank, not a spine), then the x's.
+        let word_row = (0..20)
+            .map(|y| row_text(&terminal, y))
+            .find(|r| r.contains('x'))
+            .expect("the notice row");
+        let indent = word_row.chars().take_while(|c| *c == ' ').count();
+        assert_eq!(
+            indent, LANE_GUTTER as usize,
+            "content draws at the reserved gutter offset, not column 0: {word_row:?}"
+        );
+
+        // (2) The 38-char word wrapped to exactly 2 visual content rows, which
+        // happens ONLY at the reduced 37-col width (the lane is dense - no
+        // trailing separator). At the un-reserved 39 cols it would be one row.
+        let word_rows: usize = cache
+            .settled()
+            .find_map(|(lines, wrapped)| {
+                lines
+                    .iter()
+                    .any(|l| l.spans.iter().any(|s| s.content.contains('x')))
+                    .then_some(wrapped)
+            })
+            .expect("the notice's cached entry");
+        assert_eq!(
+            word_rows, 2,
+            "the word wrapped to 2 rows at the reduced width, got {word_rows}"
+        );
+    }
+
+    #[test]
+    fn a_user_prompt_breaks_to_the_caret_and_the_agent_turn_hangs_off_the_spine() {
+        // The greeting (pre-lane) is spineless; a User prompt shows the `›`
+        // caret at the margin; the agent's answer in that turn shows the `│`
+        // spine. Column 0 carries the gutter glyph.
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.submitted("do the thing", Ok(()));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_end(
+            vec![ContentBlock::text("done")],
+            StopReason::EndTurn,
+        ));
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(40, 20, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+        // Gather the first column of every row and the text, to find each line.
+        let mut saw_caret_on_user = false;
+        let mut saw_spine_on_answer = false;
+        let mut saw_blank_on_greeting = false;
+        for y in 0..20 {
+            let row = row_text(&terminal, y);
+            let first = row.chars().next();
+            if row.contains("do the thing") {
+                saw_caret_on_user = first == Some('›');
+            }
+            if row.contains("done") {
+                saw_spine_on_answer = first == Some('│');
+            }
+            if row.contains("suspenders ready") {
+                saw_blank_on_greeting = first == Some(' ');
+            }
+        }
+        assert!(saw_caret_on_user, "user prompt caret at the margin");
+        assert!(saw_spine_on_answer, "agent answer hangs off the spine");
+        assert!(saw_blank_on_greeting, "the greeting is spineless");
+    }
+
+    #[test]
+    fn the_spine_stays_aligned_with_the_answer_when_scrolled_mid_item() {
+        // M3: at a NONZERO scroll offset, with a multi-row agent answer
+        // straddling the viewport top, every visible answer row must still carry
+        // the `│` spine and every non-answer row must not. This exercises the
+        // `skip(top)` slice of the flat row mapping - the path a `top == 0`
+        // test never reaches. A desync (gutter indexed differently from content)
+        // would land the spine on the wrong rows and trip an assertion below.
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.submitted("the question", Ok(()));
+        // A tall answer: many SHORT paragraphs (each one visual row at width 40,
+        // so no soft-wrap) each carrying a unique "ANSWER" marker, so every
+        // answer row is identifiable and none is a marker-less continuation.
+        let answer = (0..14)
+            .map(|i| format!("ANSWER-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_end(
+            vec![ContentBlock::text(&answer)],
+            StopReason::EndTurn,
+        ));
+
+        // Measure the geometry once, then scroll up so the top lands mid-answer.
+        let mut viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let mut geometry = (0, 0);
+        draw_frame(40, 10, |f| {
+            geometry = render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+        let (total, height) = geometry;
+        assert!(total > height, "the answer overflows the viewport");
+        viewport.scroll_up(4, total, height); // unpin, land 4 rows above the tail
+
+        let terminal = draw_frame(40, 10, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+        // Every visible answer row must still carry the spine in column 0 at
+        // this nonzero scroll. A desync (the gutter sliced differently from the
+        // content) would land the spine off the answer rows and drop one here.
+        // Answer paragraphs are short single-row lines, so an "ANSWER" row is
+        // never a marker-less soft-wrap continuation.
+        let mut answer_rows_seen = 0;
+        for y in 0..10 {
+            let row = row_text(&terminal, y);
+            if row.contains("ANSWER") {
+                answer_rows_seen += 1;
+                assert_eq!(
+                    row.chars().next(),
+                    Some('│'),
+                    "answer row {y} lost its spine at this scroll: {row:?}"
+                );
+            }
+        }
+        assert!(answer_rows_seen >= 2, "several answer rows must be visible");
+        // The scroll actually happened (we are not pinned at the tail): the
+        // last answer paragraph is off-screen below.
+        assert!(
+            !buffer_text(&terminal).contains("ANSWER-13"),
+            "the viewport scrolled up off the tail"
+        );
+    }
+
+    /// Vinnie's `evaluate this project` shape (~60 cols): a User prompt, a long
+    /// settled thought that would wrap, a real Aid nudge marker, and a tool
+    /// call. Returns the rendered terminal.
+    fn evaluate_project_screen(width: u16, height: u16) -> Terminal<TestBackend> {
+        // The exact ExploreNudge wording from voice.rs, so it matches Vinnie's
+        // `» [reading file after file...]` line.
+        let nudge = "[reading file after file fills your context - dispatch \
+                     explore with one focused question instead; a Scout searches \
+                     and reports back]";
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.submitted("evaluate this project", Ok(()));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("t".to_string()),
+            vec![ContentBlock::Thinking {
+                text: "I should read the manifest and the entry point and the tests \
+                       and then form a plan about what to evaluate first here"
+                    .to_string(),
+            }],
+        ));
+        // Settle the thought (empty final content → thinking materializes).
+        let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+        // An Aid nudge marker (the `» [...]` line); the screen prepends `» `.
+        let (screen, _) = screen.apply_event(Event::ExploreNudge {
+            text: nudge.to_string(),
+        });
+        let (screen, _) = screen.apply_event(Event::tool_call(
+            "id1",
+            "read_file",
+            serde_json::json!({"path": "Cargo.toml"}),
+        ));
+        draw_frame(width, height, |f| {
+            render_viewport(f, f.area(), &screen, &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+        })
+    }
+
+    #[test]
+    fn a_long_settled_thought_collapses_to_one_visual_row() {
+        // Symptom 1: a long newline-free thought must fold to ONE visual row,
+        // not soft-wrap to many. The collapsed line truncates to the content
+        // width with a trailing `…`.
+        let long = "z".repeat(400);
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.submitted("q", Ok(()));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("t".to_string()),
+            vec![ContentBlock::Thinking { text: long }],
+        ));
+        let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+        let terminal = draw_frame(60, 20, |f| {
+            render_viewport(f, f.area(), &screen, &Viewport::new(), &mut RenderCache::new(), 0, theme::dark());
+        });
+        // Exactly one row carries the collapsed thought, and it is truncated.
+        let thought_rows: Vec<String> = (0..20)
+            .map(|y| row_text(&terminal, y))
+            .filter(|r| r.contains("thought:"))
+            .collect();
+        assert_eq!(thought_rows.len(), 1, "the thought folds to one row: {thought_rows:?}");
+        assert!(thought_rows[0].contains('…'), "truncated: {:?}", thought_rows[0]);
+        // The z's did not spill onto a second row.
+        let z_rows = (0..20).filter(|&y| row_text(&terminal, y).contains('z')).count();
+        assert_eq!(z_rows, 1, "the long thought did not wrap to more rows");
+    }
+
+    #[test]
+    fn settled_thinking_uses_the_star_glyph_not_the_brain_emoji() {
+        // Symptom 3: settled thinking unifies on the `✦` family with the live
+        // tail, and drops the width-2 `🧠` emoji.
+        let collapsed = message_lines(
+            &TranscriptItem::Thinking { text: "a short thought".into() },
+            false,
+            false,
+            80,
+            theme::dark(),
+        );
+        assert_eq!(line_text(&collapsed[0]), "✦ thought: a short thought");
+        assert!(!line_text(&collapsed[0]).contains('🧠'));
+
+        let expanded = message_lines(
+            &TranscriptItem::Thinking { text: "line one\nline two".into() },
+            true,
+            false,
+            80,
+            theme::dark(),
+        );
+        assert_eq!(line_text(&expanded[0]), "✦ thought:");
+        assert!(!line_text(&expanded[0]).contains('🧠'));
+    }
+
+    #[test]
+    fn every_in_lane_visual_row_keeps_its_spine_in_the_evaluate_shape() {
+        // Symptom 2, TestBackend reproduction: the `evaluate this project` shape
+        // at 60 cols - a wrapped thought, a wrapped nudge marker, a tool call.
+        // In TestBackend EVERY in-lane visual row (including soft-wrapped
+        // continuations of the marker and the machinery line) keeps its `│`
+        // spine at column 0 and its content stays inside content_area. So the
+        // screenshot's column-0 fallback does NOT reproduce here - it is a
+        // terminal glyph-width artifact (the width-2 `🧠` emoji, now `✦`), not a
+        // gutter/content desync. If a real desync regressed expand_gutters, an
+        // in-lane content row would lose its spine and trip this.
+        let terminal = evaluate_project_screen(60, 24);
+        for y in 0..24 {
+            let row = row_text(&terminal, y);
+            let first = row.chars().next();
+            // Rows carrying agent content (the thought, the `»` marker, the `⋯`
+            // machinery) are all in-lane and must start with the spine.
+            let is_agent_content = row.contains("thought:")
+                || row.contains('»')
+                || row.contains('⋯')
+                || row.contains("explore with")
+                || row.contains("searches and report");
+            if is_agent_content {
+                assert_eq!(first, Some('│'), "row {y} lost its spine: {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_streaming_thinking_snapshot_draws_the_animated_header_and_reasoning_tail() {
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.apply_event(Event::message_start(1));
         let (screen, _) = screen.apply_event(Event::message_update(
@@ -3644,14 +4838,70 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
         });
         let text = buffer_text(&terminal);
-        // The in-flight indicator is the one-liner with a token estimate -
-        // never the thinking text itself.
-        assert!(text.contains("thinking… (~"), "the indicator:\n{text}");
-        assert!(text.contains("tokens)"));
-        assert!(!text.contains("pondering the viewport"));
+        // Live reasoning is content, not a metric (ADR-0040): the animated
+        // `✦ Thinking` header sits above the reasoning tail, and the reasoning
+        // text itself is shown - not a token count.
+        assert!(text.contains("✦ Thinking"), "the header:\n{text}");
+        assert!(
+            text.contains("pondering the viewport"),
+            "the reasoning tail:\n{text}"
+        );
+        assert!(!text.contains("tokens)"));
+    }
+
+    #[test]
+    fn the_reasoning_tail_shows_only_the_last_rows_under_the_header() {
+        // The rolling tail is the last THINKING_TAIL_ROWS source rows; older
+        // reasoning scrolls off the top of the sub-block.
+        let reasoning = "row one\nrow two\nrow three\nrow four\nrow five";
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("…".to_string()),
+            vec![ContentBlock::Thinking {
+                text: reasoning.to_string(),
+            }],
+        ));
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(80, 20, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+        let text = buffer_text(&terminal);
+        assert!(text.contains("row three") && text.contains("row five"));
+        // "row one"/"row two" scrolled off the three-row tail.
+        assert!(!text.contains("row one") && !text.contains("row two"));
+    }
+
+    #[test]
+    fn a_long_reasoning_line_is_truncated_so_the_tail_stays_bounded() {
+        // SHOULD-3: one very long unwrapped reasoning line would soft-wrap to
+        // many visual rows and let the "short tail" fill the viewport. The tail
+        // truncates each source row to the content width so it stays one visual
+        // row (marked with `…`), keeping the sub-block to header + N rows.
+        let long = "z".repeat(400); // far wider than any terminal
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("…".to_string()),
+            vec![ContentBlock::Thinking { text: long }],
+        ));
+        let viewport = Viewport::new();
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(40, 20, |f| {
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
+        });
+        // Exactly one row carries the reasoning z's, and it ends in the `…`
+        // truncation marker - the long line did not balloon into many rows.
+        let z_rows: Vec<String> = (0..20)
+            .map(|y| row_text(&terminal, y))
+            .filter(|r| r.contains('z'))
+            .collect();
+        assert_eq!(z_rows.len(), 1, "the long line stays one visual row: {z_rows:?}");
+        assert!(z_rows[0].contains('…'), "it is truncated: {:?}", z_rows[0]);
     }
 
     #[test]
@@ -3665,7 +4915,7 @@ mod tests {
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
         let terminal = draw_frame(80, 20, |f| {
-            render_viewport(f, f.area(), &screen, &viewport, &mut cache, theme::dark());
+            render_viewport(f, f.area(), &screen, &viewport, &mut cache, 0, theme::dark());
         });
         assert!(buffer_text(&terminal).contains("a streaming reply"));
     }

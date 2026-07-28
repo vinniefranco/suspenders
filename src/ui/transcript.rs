@@ -70,6 +70,33 @@ pub enum LineStyle {
     Default,
 }
 
+/// The semantic TONE of a harness-authored [`TranscriptItem::Marker`]
+/// (ADR-0040): names WHO acted and in what spirit, so the adapter tints the
+/// marker plane without ever sniffing the line's text. Like [`LineStyle`], the
+/// tone is the semantic fact; the terminal color mapping lives in
+/// `ui/components` (a Theme slot per tone). Stamped at the firing site (the
+/// Event that voiced the marker), carried into [`Transcript::marker`]; the
+/// store never classifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tone {
+    /// A budget mechanic tidying the Conversation: Eviction, Compaction,
+    /// Result-Cap cuts. Not a Governor's judgment - neutral gray.
+    Housekeeping,
+    /// A Governor helping the model along: a Nudge, a plan/anchor refresh, a
+    /// Recovery Turn. Warm amber (chosen away from error-red).
+    Aid,
+    /// A Governor limiting the model: tool-narrowing, the Endgame's turn-close
+    /// schedule. Cool blue (chosen away from success-green).
+    Constrain,
+    /// The user's own voice reaching a running Turn (the pending-Steering
+    /// marker): the prompt color, never the harness plane.
+    Steering,
+    /// A marker with no assigned tone - the default a plain `push`ed marker or
+    /// an older Session's line reads as. Muted, like an Info line.
+    #[default]
+    Plain,
+}
+
 /// One styled display line inside a [`TranscriptItem::Block`]: a semantic
 /// [`LineStyle`] plus its text. Mirrors baud's `{style, text}` line tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +133,11 @@ impl StyledLine {
 ///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
 /// * `Block { title, lines }` - `{:block, title, lines}`: a titled block of
 ///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
-/// * `Info { text }` - `{:info, text}`.
+/// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
+///   plane (the greeting, launch notices, the plugin-failure line).
+/// * `Marker { text, tone }` - a harness-authored line in the tinted marker
+///   plane (ADR-0040): eviction, compaction, Governor Interventions, Steering.
+///   The [`Tone`] tints it in the adapter; the store only carries the fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User {
@@ -142,6 +173,10 @@ pub enum TranscriptItem {
     },
     Info {
         text: String,
+    },
+    Marker {
+        text: String,
+        tone: Tone,
     },
 }
 
@@ -193,9 +228,12 @@ enum Anchor<'a> {
     /// parallel calls interleave, and the latest call with the id is the live
     /// one.
     ToolCall { id: &'a str },
-    /// The [`TranscriptItem::Info`] line with exactly this text, OLDEST match:
-    /// the first queued marker is the first delivered.
-    Info { text: &'a str },
+    /// The [`TranscriptItem::Marker`] with exactly this text, OLDEST match:
+    /// the first queued Steering marker is the first delivered. Tone is not in
+    /// the key - both queued and delivered fix it to [`Tone::Steering`], and
+    /// [`pending_steering_line`] is the single author of the text - so text
+    /// equality alone locates the pending marker.
+    Marker { text: &'a str },
 }
 
 /// The Transcript (CONTEXT.md): the display-side history of a Session, oldest
@@ -298,6 +336,19 @@ impl Transcript {
         self.push(TranscriptItem::Info { text: text.into() });
     }
 
+    /// Appends a harness marker in the tinted plane (ADR-0040): the caller
+    /// authors both the text (glyph included) and the [`Tone`] at the firing
+    /// site; the store only records the pair. An APPEND - never bumps the
+    /// revision. The Steering pending marker takes the same path through
+    /// [`Transcript::steering_queued`], which fixes the tone to
+    /// [`Tone::Steering`].
+    pub fn marker(&mut self, text: impl Into<String>, tone: Tone) {
+        self.push(TranscriptItem::Marker {
+            text: text.into(),
+            tone,
+        });
+    }
+
     /// Presents a Tool Call: stamps the `id` (for later result-pairing) and
     /// gives the live in-flight line a clean summary - the salient key arg
     /// (path/command/pattern by tool name), falling back to the raw
@@ -341,21 +392,25 @@ impl Transcript {
         });
     }
 
-    /// Appends the pending-Steering marker. Its text is authored HERE so
-    /// [`Transcript::steering_delivered`]'s removal-by-equality can never
+    /// Appends the pending-Steering marker (ADR-0040: a [`Tone::Steering`]
+    /// marker, the user's own voice in the plane). Its text is authored HERE
+    /// so [`Transcript::steering_delivered`]'s removal-by-equality can never
     /// desync from it.
     pub fn steering_queued(&mut self, text: &str) {
-        self.info(pending_steering_line(text));
+        self.marker(pending_steering_line(text), Tone::Steering);
     }
 
     /// Promotes delivered Steering to a user line (the text is now in the
     /// Conversation): removes the pending marker if present (a structural
     /// edit - the revision bumps), then appends the User item. A delivery
-    /// whose marker was never queued removes nothing and does not bump.
+    /// whose marker was never queued removes nothing and does not bump. The
+    /// removal anchors on the [`TranscriptItem::Marker`] by text
+    /// ([`Anchor::Marker`]), matching what [`Transcript::steering_queued`]
+    /// appended.
     pub fn steering_delivered(&mut self, text: impl Into<String>) {
         let text = text.into();
         let marker = pending_steering_line(&text);
-        self.supersede(Anchor::Info { text: &marker }, &HashMap::new(), |_| {
+        self.supersede(Anchor::Marker { text: &marker }, &HashMap::new(), |_| {
             TranscriptItem::User { text }
         });
     }
@@ -436,10 +491,10 @@ impl Transcript {
             Anchor::ToolCall { id } => self.items.iter().rposition(
                 |m| matches!(m, TranscriptItem::ToolCall { id: call_id, .. } if call_id == id),
             ),
-            Anchor::Info { text } => self
+            Anchor::Marker { text } => self
                 .items
                 .iter()
-                .position(|m| matches!(m, TranscriptItem::Info { text: t } if t == text)),
+                .position(|m| matches!(m, TranscriptItem::Marker { text: t, .. } if t == text)),
         }
     }
 }
@@ -452,7 +507,7 @@ impl Transcript {
 // `steering_delivered`, so the two can never disagree about the text the
 // delivery removes.
 fn pending_steering_line(text: &str) -> String {
-    format!("steering (queued): {text}")
+    format!("↳ queued: {text}")
 }
 
 // The fail-open Plugin report (ADR-0007) - sourced once, so the store's own
@@ -571,6 +626,12 @@ mod tests {
     }
     fn info(text: &str) -> TranscriptItem {
         TranscriptItem::Info { text: text.into() }
+    }
+    fn marker(text: &str, tone: Tone) -> TranscriptItem {
+        TranscriptItem::Marker {
+            text: text.into(),
+            tone,
+        }
     }
     fn tool_call_item(id: &str, name: &str, summary: &str) -> TranscriptItem {
         TranscriptItem::ToolCall {
@@ -857,10 +918,42 @@ mod tests {
     fn steering_queued_shows_the_pending_marker_delivered_promotes_it_to_user() {
         let mut t = fresh();
         t.steering_queued("check the README");
-        assert_eq!(t.items(), vec![info("steering (queued): check the README")]);
+        // A Steering-toned marker in the plane, not a plain Info line.
+        assert_eq!(
+            t.items(),
+            vec![marker("↳ queued: check the README", Tone::Steering)]
+        );
 
         t.steering_delivered("check the README");
         assert_eq!(t.items(), vec![user("check the README")]);
+    }
+
+    // A Steering marker whose text matches an existing Info line is NOT
+    // removed by delivery: the anchor targets the Marker variant only, so a
+    // look-alike Info cannot be superseded by a Steering delivery.
+    #[test]
+    fn steering_delivered_anchors_on_the_marker_variant_not_a_look_alike_info() {
+        let mut t = fresh();
+        t.info("↳ queued: not really steering");
+        t.steering_queued("not really steering");
+        // Info first, then the real Steering marker.
+        assert_eq!(
+            t.items(),
+            vec![
+                info("↳ queued: not really steering"),
+                marker("↳ queued: not really steering", Tone::Steering),
+            ]
+        );
+
+        t.steering_delivered("not really steering");
+        // The Marker was removed and promoted; the Info look-alike survives.
+        assert_eq!(
+            t.items(),
+            vec![
+                info("↳ queued: not really steering"),
+                user("not really steering"),
+            ]
+        );
     }
 
     // The render cache's append-only contract: pushes leave the revision
@@ -1043,6 +1136,10 @@ mod tests {
         type Step = (&'static str, Box<dyn FnOnce(&mut Transcript)>);
         let steps: Vec<Step> = vec![
             ("info", Box::new(|t| t.info("news"))),
+            (
+                "marker",
+                Box::new(|t| t.marker("✂ evicted 3 stale results", Tone::Housekeeping)),
+            ),
             ("user", Box::new(|t| t.user("hello"))),
             (
                 "push",
@@ -1116,6 +1213,25 @@ mod tests {
         // Both structural verbs actually removed something above - the prefix
         // half of the property was not satisfied vacuously.
         assert_eq!(bumps, 2, "steering_delivered and tool_result each bumped");
+    }
+
+    // --- marker plane (ADR-0040) -------------------------------------------------
+
+    // A marker APPENDS with its carried tone and never bumps the revision - it
+    // is an ordinary append, not a structural edit.
+    #[test]
+    fn marker_appends_with_its_tone_and_does_not_bump() {
+        let mut t = fresh();
+        t.marker("⟨ compacted 41 messages → summary ⟩", Tone::Housekeeping);
+        t.marker("⚑ plan refreshed", Tone::Aid);
+        assert_eq!(
+            t.items(),
+            vec![
+                marker("⟨ compacted 41 messages → summary ⟩", Tone::Housekeeping),
+                marker("⚑ plan refreshed", Tone::Aid),
+            ]
+        );
+        assert_eq!(t.revision(), 0);
     }
 
     // --- item vocabulary ---------------------------------------------------------

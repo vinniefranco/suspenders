@@ -250,8 +250,23 @@ theme_slots! {
     error,
     /// Extended-thinking lines (Ctrl-T's plane).
     thinking,
+    /// The live `✦ Thinking` header over the streaming reasoning tail
+    /// (ADR-0040): the animated brain, where motion sits during a Turn.
+    thinking_header,
     /// The `>` gutter marking the user's own prompts.
     prompt_gutter,
+    /// The dim `│` turn-lane spine the agent's whole Turn hangs off (ADR-0040):
+    /// background chrome, so it recedes like the machinery plane.
+    lane_spine,
+    /// The Housekeeping marker plane (ADR-0040): Eviction, Compaction,
+    /// Result-Cap cuts. Neutral gray - routine tidying, not a Governor.
+    marker_housekeeping,
+    /// The Aid marker plane (ADR-0040): a Governor helping the model - Nudges,
+    /// plan/anchor refresh, Recovery. Warm amber, kept clear of error-red.
+    marker_aid,
+    /// The Constrain marker plane (ADR-0040): a Governor limiting the model -
+    /// tool-narrowing, the Endgame's turn-close. Cool blue, clear of green.
+    marker_constrain,
     /// Assistant markdown headings.
     heading,
     /// Assistant markdown list bullets.
@@ -686,7 +701,12 @@ mod tests {
         assert_eq!(theme.machinery, Color::DarkGray);
         assert_eq!(theme.error, Color::Red);
         assert_eq!(theme.thinking, Color::DarkGray);
+        assert_eq!(theme.thinking_header, Color::DarkGray);
         assert_eq!(theme.prompt_gutter, Color::Cyan);
+        assert_eq!(theme.lane_spine, Color::DarkGray);
+        assert_eq!(theme.marker_housekeeping, Color::DarkGray);
+        assert_eq!(theme.marker_aid, Color::Rgb(215, 167, 95));
+        assert_eq!(theme.marker_constrain, Color::Rgb(106, 159, 212));
         assert_eq!(theme.heading, Color::Cyan);
         assert_eq!(theme.bullet, Color::Cyan);
         assert_eq!(theme.quote, Color::DarkGray);

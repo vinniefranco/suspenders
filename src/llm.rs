@@ -207,12 +207,22 @@ pub trait Llm: Send + Sync {
     /// into a Response (ADR-0002 amendment, ADR-0033): it is a discrete,
     /// user-triggered query, not the streaming Turn loop, so a plain `Err` the
     /// caller surfaces as an info line is simpler than the never-Err error
-    /// algebra. Connection refused, a non-2xx status, and an unparseable body
-    /// are all `Err`; a well-formed response with no `data` is `Ok(vec![])`.
+    /// algebra. Connection refused, a non-2xx status, an unparseable body,
+    /// and a request over [`DISCOVERY_TIMEOUT`] are all `Err`; a well-formed
+    /// response with no `data` is `Ok(vec![])`.
     ///
     /// [`complete`]: Llm::complete
     async fn list_models(&self, provider: &Provider) -> Result<Vec<String>, String>;
 }
+
+/// The total cap on one [`Llm::list_models`] request. Discovery is a
+/// discrete, user-triggered query behind the `/model` overlay's "loading
+/// models…" line (ADR-0033), so a blackholed host - a sleeping machine
+/// dropping SYNs with no RST - must degrade into its group's unreachable
+/// note within seconds, not sit on the OS TCP timeout's minutes. A live
+/// `GET /models` answers well inside this. [`Llm::complete`] deliberately
+/// carries no such cap: a Turn streams for minutes by design.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One Provider's offering for the `/model` selector (ADR-0037): the Provider
 /// id, its PICKABLE bare model ids, and its [`Availability`]. The UI scopes

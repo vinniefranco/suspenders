@@ -14,7 +14,16 @@ muted = "#6e7781"
 machinery = "#8c959f"
 error = "#cf222e"
 thinking = "#6e7781"
+thinking_header = "#6e7781"
 prompt_gutter = "#0969da"
+lane_spine = "#8c959f"
+
+# The tinted marker plane (ADR-0040): the harness voice, one tint per tone.
+# Housekeeping is the muted gray; Aid a warm amber (clear of error-red),
+# Constrain a calm blue (clear of success-green) - designed for a light ground.
+marker_housekeeping = "#6e7781"
+marker_aid = "#9a6700"
+marker_constrain = "#1f6feb"
 
 # Assistant markdown.
 heading = "#0550ae"

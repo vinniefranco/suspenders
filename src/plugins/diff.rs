@@ -496,10 +496,13 @@ mod tests {
             panic!("expected a block");
         };
         assert_eq!(title, "edit_file lib/x.ex (+1 -1)");
+        // Minimal diff (ADR-0040 Decision D): the `@@ … @@` hunk header is kept,
+        // the line-number gutter is dropped - the +/-/context markers and their
+        // semantic colors carry the change.
         assert!(lines.contains(&StyledLine::new(LineStyle::Muted, "@@ -1,3 +1,3 @@")));
-        assert!(lines.contains(&StyledLine::new(LineStyle::Removed, "   2 - b")));
-        assert!(lines.contains(&StyledLine::new(LineStyle::Added, "   2 + B")));
-        assert!(lines.contains(&StyledLine::new(LineStyle::Context, "   1   a")));
+        assert!(lines.contains(&StyledLine::new(LineStyle::Removed, "- b")));
+        assert!(lines.contains(&StyledLine::new(LineStyle::Added, "+ B")));
+        assert!(lines.contains(&StyledLine::new(LineStyle::Context, "  a")));
     }
 
     #[test]
@@ -523,7 +526,7 @@ mod tests {
             panic!("expected a block");
         };
         assert_eq!(title, "write_file lib/x.ex (new file, +1)");
-        assert_eq!(lines, vec![StyledLine::new(LineStyle::Added, "   1 + a")]);
+        assert_eq!(lines, vec![StyledLine::new(LineStyle::Added, "+ a")]);
     }
 
     #[test]

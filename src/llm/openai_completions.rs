@@ -119,7 +119,12 @@ pub(super) async fn complete(
 pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, String> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
 
-    let client = reqwest::Client::new();
+    // The discovery cap (see [`super::DISCOVERY_TIMEOUT`]): a blackholed
+    // host times out into the same request_failed Err as any other failure.
+    let client = reqwest::Client::builder()
+        .timeout(super::DISCOVERY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("request_failed: {e}"))?;
     let sent = authorized(client.get(&url), provider).send().await;
 
     let resp = match sent {

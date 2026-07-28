@@ -278,7 +278,15 @@ async fn build_request<D: TurnDeps>(
             let shaped = governor::shape_request(&state.ledger, &mut state.governors);
             for intervention in shaped {
                 match intervention {
-                    RequestIntervention::NarrowTools(narrowed) => tools = narrowed,
+                    RequestIntervention::NarrowTools(narrowed) => {
+                        // The Endgame narrowed the Offer (verify→run_command,
+                        // final→empty). Announce the surviving names so the
+                        // Transcript shows a concise Constrain marker (ADR-0040);
+                        // capture them BEFORE `narrowed` moves into `tools`.
+                        let names = narrowed.iter().map(|spec| spec.name.clone()).collect();
+                        state.emitter.emit(Event::tools_narrowed(names));
+                        tools = narrowed;
+                    }
                     RequestIntervention::SilenceThinking => no_think = true,
                 }
             }
@@ -535,9 +543,11 @@ fn apply_tail<D: TurnDeps>(
         AnswerIntervention::RideTail(Rider::Anchor { stale_line }) => {
             // The Anchor crosses the same emit seam as the Voiced riders so
             // the Session Log records what the model read (CONTEXT.md: every
-            // rider is logged); the Transcript ignores the event. The anchor
-            // Governor's stale-plan line is appended before the emit, so the
-            // logged text and the injected text stay one string.
+            // rider is logged); the Transcript shows a concise `⚑ plan
+            // refreshed` marker (ADR-0040) from this same event, never the plan
+            // body. The anchor Governor's stale-plan line is appended before
+            // the emit, so the logged text and the injected text stay one
+            // string.
             let mut anchor = state.plan.anchor();
             if let Some(line) = stale_line {
                 anchor.push_str("\n\n");
@@ -2137,6 +2147,51 @@ mod tests {
         );
     }
 
+    // The Verification Pass narrowing emits ToolsNarrowed with the surviving
+    // name (run_command) so the Transcript can show a concise Constrain marker
+    // (ADR-0040). Mirrors the VerificationPass-count assertion above.
+    #[tokio::test]
+    async fn verification_pass_narrowing_emits_tools_narrowed_to_run_command() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(4);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result(
+                    "w1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )),
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result(
+                    "r1",
+                    "run_command",
+                    json!({"command": "true"}),
+                )),
+                just(text_end("Verified and done.")),
+            ],
+        )
+        .with_approvals(vec![true]);
+        let (outcome, deps) = run_with(&session, "write a file", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let narrowed: Vec<&Vec<String>> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolsNarrowed { tools } => Some(tools),
+                _ => None,
+            })
+            .collect();
+        // The Endgame narrows on more than one Pass (verify, then final), each
+        // a distinct event with no dedup: the FIRST narrowing is the
+        // Verification Pass, surviving run_command; the last is the final
+        // Pass's empty withdrawal.
+        assert_eq!(narrowed.first(), Some(&&vec!["run_command".to_string()]));
+        assert_eq!(narrowed.last(), Some(&&Vec::<String>::new()));
+    }
+
     // The Verification Pass's narrowing is enforced at DISPATCH, not only by
     // the offered specs: a model that insists on a non-run_command call gets
     // the Voice's refusal and the call never executes (no file content leaks
@@ -2297,6 +2352,42 @@ mod tests {
         let lm = last_message(conv);
         assert!(
             matches!(&lm.content[0], ContentBlock::Text { text } if text.contains("Accomplished"))
+        );
+    }
+
+    // The final Pass withdraws every Tool (empty narrowing): ToolsNarrowed
+    // carries an empty name list, so the Transcript reads "tools withdrawn"
+    // (ADR-0040). The last narrowing of the Turn is the empty one.
+    #[tokio::test]
+    async fn final_pass_narrowing_emits_tools_narrowed_empty() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.turn_limit = Some(3);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(text_end(
+                    "Accomplished: listed files twice. Remains: nothing.",
+                )),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "big task", deps).await;
+        ok(&outcome);
+        let evs = events(&deps);
+        let last_narrowing = evs
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolsNarrowed { tools } => Some(tools),
+                _ => None,
+            })
+            .next_back()
+            .expect("the final Pass narrows the Offer");
+        assert!(
+            last_narrowing.is_empty(),
+            "the final Pass withdraws every tool, got {last_narrowing:?}"
         );
     }
 
