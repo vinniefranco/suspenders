@@ -187,30 +187,31 @@ pub fn recovery(setpoints: &RecoverySetpoints, ledger: &Ledger) -> Option<Recove
     let broken =
         ledger.unverified_writes() || (ledger.dangling_failure() && ledger.wrote_this_run());
 
-    if broken && ledger.recoveries_used() < setpoints.repair_limit {
-        let reason = if ledger.dangling_failure() {
-            ReopenReason::DanglingFailure
+    let (shape, reason, failing_command) =
+        if broken && ledger.recoveries_used() < setpoints.repair_limit {
+            let (reason, failing_command) = if ledger.dangling_failure() {
+                (
+                    ReopenReason::DanglingFailure,
+                    ledger.dangling_command().map(str::to_string),
+                )
+            } else {
+                (ReopenReason::UnverifiedWrites, None)
+            };
+            (setpoints.shape, reason, failing_command)
+        } else if !broken
+            && ledger.plan_open() == Some(PlanProgress::Incomplete)
+            && ledger.plan_advanced()
+            && ledger.advances_used() < setpoints.advance_limit
+        {
+            (RecoveryShape::Continuation, ReopenReason::OpenPlan, None)
         } else {
-            ReopenReason::UnverifiedWrites
+            return None;
         };
-        Some(Recovery {
-            shape: setpoints.shape,
-            reason,
-            failing_command: ledger.dangling_command().map(str::to_string),
-        })
-    } else if !broken
-        && ledger.plan_open() == Some(PlanProgress::Incomplete)
-        && ledger.plan_advanced()
-        && ledger.advances_used() < setpoints.advance_limit
-    {
-        Some(Recovery {
-            shape: RecoveryShape::Continuation,
-            reason: ReopenReason::OpenPlan,
-            failing_command: None,
-        })
-    } else {
-        None
-    }
+    Some(Recovery {
+        shape,
+        reason,
+        failing_command,
+    })
 }
 
 /// The Voice text riding a tool-results tail, tagged with the Transcript event

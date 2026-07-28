@@ -74,12 +74,6 @@ impl ApprovalId {
     pub fn from_ref(id: impl Into<String>) -> Self {
         ApprovalId(id.into())
     }
-
-    /// The opaque reference string (for the `approval_request` /
-    /// `approval_resolved` events and the reply-channel key).
-    pub fn as_ref_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// The user's decision on the pending Approval.

@@ -39,6 +39,7 @@ impl ContentBlock {
         ContentBlock::Text { text: text.into() }
     }
 
+    // qual:test_helper
     pub fn tool_use(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -159,6 +160,7 @@ pub struct Usage {
 
 impl Usage {
     /// A usage carrying only `input_tokens`.
+    // qual:test_helper
     pub fn with_input_tokens(input_tokens: u64) -> Self {
         Usage {
             input_tokens: Some(input_tokens),

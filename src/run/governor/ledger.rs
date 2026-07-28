@@ -435,15 +435,15 @@ impl Ledger {
 
         let category = failure_category::classify(result.content);
         let batch = self.batches;
-        let streak = match self.failures.iter_mut().find(|(tool, _)| tool == name) {
-            Some((_, s)) => s,
+        let idx = match self.failures.iter().position(|(tool, _)| tool == name) {
+            Some(i) => i,
             None => {
                 self.failures
                     .push((name.to_string(), FailureStreak::default()));
-                &mut self.failures.last_mut().unwrap().1
+                self.failures.len() - 1
             }
         };
-        streak.bump(category, batch);
+        self.failures[idx].1.bump(category, batch);
     }
 
     // A run_command verifies (approved, denied, or failed alike); a successful

@@ -43,6 +43,9 @@ use crate::ui::transcript::{Tone, Transcript, TranscriptItem};
 /// The greeting line a fresh Screen opens its Transcript with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
 
+/// The initial cumulative session cost before any priced response arrives.
+const INITIAL_SESSION_COST: f64 = 0.0;
+
 /// The semantic pressure level (ADR-0008): how full the live context window is,
 /// computed against the Eviction marks. `Ok` below the low-water mark,
 /// `Elevated` between it and the target, `Critical` above the target. The view
@@ -284,7 +287,7 @@ impl Screen {
             eviction_slack: opts.eviction_slack,
             pressure_level: PressureLevel::Ok,
             dead_mass_pct: None,
-            session_cost: 0.0,
+            session_cost: INITIAL_SESSION_COST,
             composer: Composer::new(opts.history),
             thinking_expanded: false,
             tools_expanded: false,
@@ -296,6 +299,7 @@ impl Screen {
     /// several Thinking passes, tool machinery, harness markers, and an answer
     /// with a code fence - the exact shape that exposed the fold / spine / blank
     /// -line bugs. No IO, no events; the transcript is authored directly.
+    // qual:test_helper - called only from render tests in ui::components
     pub fn demo() -> Self {
         let mut screen = Screen::new(ScreenOpts::default());
         let t = &mut screen.transcript;
@@ -1123,6 +1127,22 @@ mod tests {
         t.transcript().items().iter().skip(1).cloned().collect()
     }
 
+    // Asserts that pressing `key` while the approval modal is open produces no
+    // effects and leaves the pending approval untouched. Shared by the modal
+    // swallow tests so the loop shape is written once.
+    fn assert_key_swallowed_while_modal_open(key: Key) {
+        let label = format!("{key:?}");
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let pending_before = t.pending_approval.clone();
+        let (t, effects) = t.handle_key(key);
+        assert_eq!(effects, vec![], "expected no effects for {label}");
+        assert_eq!(
+            t.pending_approval, pending_before,
+            "pending approval changed for {label}"
+        );
+    }
+
     fn user(text: &str) -> TranscriptItem {
         TranscriptItem::User { text: text.into() }
     }
@@ -1461,7 +1481,6 @@ mod tests {
 
     #[test]
     fn every_other_key_swallowed_while_modal_open() {
-        let a = approval();
         for key in [
             Key::Enter,
             Key::Char('x'),
@@ -1469,11 +1488,7 @@ mod tests {
             Key::PageDown,
             Key::Char('q'),
         ] {
-            let t = with_pending_approval(fresh(), &a);
-            let pending_before = t.pending_approval.clone();
-            let (t, effects) = t.handle_key(key);
-            assert_eq!(effects, vec![]);
-            assert_eq!(t.pending_approval, pending_before);
+            assert_key_swallowed_while_modal_open(key);
         }
     }
 
@@ -2183,13 +2198,8 @@ mod tests {
 
     #[test]
     fn wheel_keys_swallowed_while_modal_open() {
-        let a = approval();
         for key in [Key::WheelUp, Key::WheelDown] {
-            let t = with_pending_approval(fresh(), &a);
-            let pending_before = t.pending_approval.clone();
-            let (t, effects) = t.handle_key(key);
-            assert_eq!(effects, vec![]);
-            assert_eq!(t.pending_approval, pending_before);
+            assert_key_swallowed_while_modal_open(key);
         }
     }
 
@@ -2213,13 +2223,9 @@ mod tests {
 
     #[test]
     fn modal_swallows_toggle_thinking() {
-        let a = approval();
-        let t = with_pending_approval(fresh(), &a);
-        let pending_before = t.pending_approval.clone();
-        let (t, effects) = t.handle_key(Key::ToggleThinking);
-        assert_eq!(effects, vec![]);
-        assert_eq!(t.pending_approval, pending_before);
-        assert!(!t.thinking_expanded);
+        assert_key_swallowed_while_modal_open(Key::ToggleThinking);
+        // The flag must not have flipped; a fresh Screen starts collapsed.
+        assert!(!fresh().thinking_expanded);
     }
 
     // --- Ctrl-O tools toggle -------------------------------------------------
@@ -2244,13 +2250,9 @@ mod tests {
 
     #[test]
     fn modal_swallows_toggle_tools() {
-        let a = approval();
-        let t = with_pending_approval(fresh(), &a);
-        let pending_before = t.pending_approval.clone();
-        let (t, effects) = t.handle_key(Key::ToggleTools);
-        assert_eq!(effects, vec![]);
-        assert_eq!(t.pending_approval, pending_before);
-        assert!(!t.tools_expanded);
+        assert_key_swallowed_while_modal_open(Key::ToggleTools);
+        // The flag must not have flipped; a fresh Screen starts collapsed.
+        assert!(!fresh().tools_expanded);
     }
 
     // --- the Approval gate vs the Composer ----------------------------------

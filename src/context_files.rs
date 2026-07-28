@@ -245,6 +245,7 @@ pub fn read_outcome(path: &str) -> ReadOutcome {
 /// Reads a file, returning `Some(content)` or `None` on any failure (including
 /// an empty file). The plain fail-open wrapper over [`read_outcome`], for
 /// callers with no skip to report. Never panics.
+// qual:test_helper
 pub fn try_read(path: &str) -> Option<String> {
     match read_outcome(path) {
         ReadOutcome::Loaded(content) => Some(content),

@@ -360,14 +360,11 @@ fn describe_categories(categories: &[(FailureCategory, u64)]) -> String {
         .map(|(cat, n)| describe_category(*cat, *n))
         .collect();
 
-    match parts.len() {
-        0 => "re-read the file or try a different approach".to_string(),
-        1 => parts[0].clone(),
-        2 => format!("{} and {}", parts[0], parts[1]),
-        _ => {
-            let (last, head) = parts.split_last().unwrap();
-            format!("{}; and {}", head.join("; "), last)
-        }
+    match parts.as_slice() {
+        [] => "re-read the file or try a different approach".to_string(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [head @ .., last] => format!("{}; and {}", head.join("; "), last),
     }
 }
 
@@ -581,12 +578,17 @@ fn serialize_message(message: &Message) -> String {
     texts.join("\n")
 }
 
+/// Maximum chars kept per Tool Result during compaction serialization. Mirrors
+/// baud's 2000-char gate; sliced on a char boundary to stay valid UTF-8.
+const COMPACTION_SERIALIZE_CAP: usize = 2000;
+
 fn truncate_for_serialization(content: &str) -> String {
-    // baud measures byte_size and slices by chars at 2000; mirror the byte
-    // gate but slice on a char boundary so the output stays valid UTF-8.
-    if content.len() > 2000 {
-        let head: String = content.chars().take(2000).collect();
-        format!("{head}\n[... {} more chars]", content.len() - 2000)
+    if content.len() > COMPACTION_SERIALIZE_CAP {
+        let head: String = content.chars().take(COMPACTION_SERIALIZE_CAP).collect();
+        format!(
+            "{head}\n[... {} more chars]",
+            content.len() - COMPACTION_SERIALIZE_CAP
+        )
     } else {
         content.to_string()
     }

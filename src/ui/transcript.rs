@@ -516,6 +516,11 @@ fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> Strin
     format!("plugin {extension} failed in {}: {message}", stage.as_str())
 }
 
+/// Maximum display width for a whole summary line (e.g. `key=value ...`).
+const SUMMARY_WIDTH: usize = 100;
+/// Maximum display width for a single field value inside a summary line.
+const VALUE_WIDTH: usize = 60;
+
 // The single salient input arg for a merged one-liner, picked by tool: the
 // `path` for read/edit/write, the `command` for run_command, the `pattern`/
 // `query` for grep/search; otherwise the first value in alphabetical key order.
@@ -559,7 +564,7 @@ fn summarize_input(input: &Value) -> String {
         .map(|key| format!("{key}={}", format_value(&obj[*key])))
         .collect::<Vec<_>>()
         .join(" ");
-    truncate(&joined, 100)
+    truncate(&joined, SUMMARY_WIDTH)
 }
 
 // One-line summary of a Tool Result content string.
@@ -567,9 +572,13 @@ fn summarize_result(content: &str) -> String {
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     match lines.as_slice() {
         [] => "(empty)".to_string(),
-        [line] => truncate(line, 100),
+        [line] => truncate(line, SUMMARY_WIDTH),
         [line, rest @ ..] => {
-            format!("{} (+{} more lines)", truncate(line, 100), rest.len())
+            format!(
+                "{} (+{} more lines)",
+                truncate(line, SUMMARY_WIDTH),
+                rest.len()
+            )
         }
     }
 }
@@ -578,9 +587,9 @@ fn format_value(value: &Value) -> String {
     match value {
         Value::String(s) => {
             let cleaned = s.replace(['\n', '\r'], "⏎");
-            truncate(&cleaned, 60)
+            truncate(&cleaned, VALUE_WIDTH)
         }
-        other => truncate(&inspect_value(other), 60),
+        other => truncate(&inspect_value(other), VALUE_WIDTH),
     }
 }
 

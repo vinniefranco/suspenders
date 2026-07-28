@@ -70,6 +70,7 @@ impl Token {
     /// Stores Middleware state under `key`, threading `pre_run` into `post_run`.
     /// Returns the token so it threads through a fold, mirroring baud's
     /// `Token.assign/3`.
+    // qual:api
     pub fn assign(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.assigns.insert(key.into(), value.into());
         self

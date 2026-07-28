@@ -273,6 +273,7 @@ pub enum Entry {
 impl Entry {
     /// An `assistant_blocks` entry with unknown Provenance; the live Agent
     /// appends stamped entries via the struct form.
+    // qual:test_helper - only called from test code; production appends the struct form directly.
     pub fn assistant_blocks(blocks: Vec<ContentBlock>) -> Entry {
         Entry::AssistantBlocks {
             blocks,
@@ -600,7 +601,9 @@ impl Log {
             .open(&path)?;
 
         let header = header(session);
-        writeln!(io, "{}", serde_json::to_string(&header).unwrap())?;
+        // The header is a fixed-shape struct; serialization cannot fail.
+        let header_line = serde_json::to_string(&header).map_err(std::io::Error::other)?;
+        writeln!(io, "{header_line}")?;
         io.flush()?;
 
         Ok(Log { path, io })
@@ -608,9 +611,13 @@ impl Log {
 
     /// Appends one entry as one line, flushed through immediately.
     pub fn append(&mut self, entry: Entry) -> &mut Self {
-        let line = serde_json::to_string(&entry.to_json()).unwrap();
-        let _ = writeln!(self.io, "{line}");
-        let _ = self.io.flush();
+        // `entry.to_json()` returns a `Value`; `to_string` of a `Value` is
+        // infallible in serde_json - skip writing on the vanishingly unlikely
+        // serializer error rather than panicking.
+        if let Ok(line) = serde_json::to_string(&entry.to_json()) {
+            let _ = writeln!(self.io, "{line}");
+            let _ = self.io.flush();
+        }
         self
     }
 }
@@ -675,13 +682,11 @@ pub fn latest(dir: &str) -> Option<String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.ends_with(".jsonl"))
         .collect();
-    if names.is_empty() {
-        return None;
-    }
     names.sort();
+    let newest = names.last()?;
     Some(
         std::path::Path::new(dir)
-            .join(names.last().unwrap())
+            .join(newest)
             .to_string_lossy()
             .into_owned(),
     )
@@ -765,18 +770,24 @@ fn label_from(text: &str) -> String {
     }
 }
 
-// `20260711-140205-3.jsonl` → `2026-07-11 14:02` (the [`utc_stamp`] shape,
+// `20260711-140205-3.jsonl` -> `2026-07-11 14:02` (the [`utc_stamp`] shape,
 // seconds and the uniquifier dropped). A name that doesn't carry that shape
 // falls back to its bare stem.
+
+/// Minimum bytes in the stamp prefix (YYYYMMDD-HHMMss = 15 chars).
+const STAMP_PREFIX_LEN: usize = 15;
+/// Byte offset of the date/time separator dash in the stamp.
+const STAMP_DASH_POS: usize = 8;
+
 fn human_stamp(name: &str) -> String {
     let stem = name.strip_suffix(".jsonl").unwrap_or(name);
     let raw = stem.as_bytes();
-    let stamped = raw.len() >= 15
-        && raw[8] == b'-'
-        && raw[..15]
+    let stamped = raw.len() >= STAMP_PREFIX_LEN
+        && raw[STAMP_DASH_POS] == b'-'
+        && raw[..STAMP_PREFIX_LEN]
             .iter()
             .enumerate()
-            .all(|(i, b)| i == 8 || b.is_ascii_digit());
+            .all(|(i, b)| i == STAMP_DASH_POS || b.is_ascii_digit());
     if !stamped {
         return stem.to_string();
     }
@@ -956,36 +967,43 @@ fn check_root(header: &serde_json::Value, session: &Session) -> Result<(), Resum
     }
 }
 
+fn push_drift(out: &mut Vec<Drift>, key: &'static str, logged: String, current: String) {
+    if logged != current {
+        out.push(Drift {
+            key,
+            logged,
+            current,
+        });
+    }
+}
+
 fn drift(header: &serde_json::Value, session: &Session) -> Vec<Drift> {
     let mut out = Vec::new();
 
     let logged_model = header.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    if logged_model != session.model.scoped_id() {
-        out.push(Drift {
-            key: "model",
-            logged: logged_model.to_string(),
-            current: session.model.scoped_id(),
-        });
-    }
+    push_drift(
+        &mut out,
+        "model",
+        logged_model.to_string(),
+        session.model.scoped_id(),
+    );
 
     let current_budget = session.context_budget_for(&session.model);
     let logged_budget = header.get("context_budget").and_then(|v| v.as_u64());
-    if logged_budget != Some(current_budget) {
-        out.push(Drift {
-            key: "context_budget",
-            logged: opt_num(logged_budget),
-            current: current_budget.to_string(),
-        });
-    }
+    push_drift(
+        &mut out,
+        "context_budget",
+        opt_num(logged_budget),
+        current_budget.to_string(),
+    );
 
     let logged_limit = header.get("turn_limit").and_then(|v| v.as_u64());
-    if logged_limit != Some(session.run_limit) {
-        out.push(Drift {
-            key: "turn_limit",
-            logged: opt_num(logged_limit),
-            current: session.run_limit.to_string(),
-        });
-    }
+    push_drift(
+        &mut out,
+        "turn_limit",
+        opt_num(logged_limit),
+        session.run_limit.to_string(),
+    );
 
     out
 }
@@ -1322,6 +1340,15 @@ mod tests {
         .unwrap()
     }
 
+    // Returns (tmp, session, log) - `tmp` must stay alive for the duration of
+    // the test so the temp directory is not deleted while the log is open.
+    fn open_log() -> (TempDir, Session, Log) {
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let log = Log::open(&session).unwrap();
+        (tmp, session, log)
+    }
+
     fn tool_use(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
         ContentBlock::tool_use(id, name, input)
     }
@@ -1342,9 +1369,7 @@ mod tests {
 
     #[test]
     fn a_settled_run_folds_back_into_the_exact_conversation_shape() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("list the files".into()));
         log.append(Entry::assistant_blocks(vec![
@@ -1385,9 +1410,7 @@ mod tests {
         // ADR-0009 keeps a tool_use whose result landed; ADR-0004 drops one that
         // never answered. A batch with both must keep t1 (+ its result) and drop
         // t2 entirely.
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![
@@ -1420,9 +1443,7 @@ mod tests {
     fn an_all_unanswered_batch_collapses_to_the_empty_response_marker() {
         // Every tool_use dropped (ADR-0004) leaves no assistant content, so the
         // batch close emits the empty-response marker instead of an empty message.
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![
@@ -1450,9 +1471,7 @@ mod tests {
 
     #[test]
     fn plan_restores_the_last_logged_plan_which_never_enters_the_folded_messages() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("do the thing".into()));
         log.append(Entry::Plan("Goal: A. 1. read [x] 2. edit [ ]".into()));
@@ -1481,9 +1500,7 @@ mod tests {
 
     #[test]
     fn a_log_with_no_plan_entry_restores_a_nil_plan() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, _session, mut log) = open_log();
 
         log.append(Entry::UserText("hi".into()));
         log.append(Entry::assistant_blocks(vec![text("hello")]));
@@ -1500,9 +1517,7 @@ mod tests {
 
     #[test]
     fn an_adr_0009_truncated_batch_folds_back_intact() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
@@ -1541,9 +1556,7 @@ mod tests {
 
     #[test]
     fn a_log_ending_mid_run_settles_as_failed_dangling_tool_use_dropped_marker_appended() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![
@@ -1563,12 +1576,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_run_limit_settlement_restores_the_closing_marker() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
-
+    // Shared setup: one completed run with a tool call, closed by a Settled entry.
+    // Returns the last reconstructed message after resume.
+    fn settled_last_message(outcome: Settled, stop_reason: StopReason) -> Message {
+        let (_tmp, session, mut log) = open_log();
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
@@ -1577,14 +1588,17 @@ mod tests {
         )]));
         log.append(Entry::ToolResult(tool_result("t1", "hits")));
         log.append(Entry::Settled {
-            outcome: Settled::Completed,
-            stop_reason: StopReason::RunLimit,
+            outcome,
+            stop_reason,
             reason: None,
         });
-
         let (messages, _) = resume(&log.path, &session).unwrap();
+        messages.into_iter().last().unwrap()
+    }
 
-        let last = messages.last().unwrap();
+    #[test]
+    fn a_run_limit_settlement_restores_the_closing_marker() {
+        let last = settled_last_message(Settled::Completed, StopReason::RunLimit);
         assert_eq!(last.role, Role::Assistant);
         assert_eq!(
             last.content,
@@ -1594,35 +1608,14 @@ mod tests {
 
     #[test]
     fn a_cancelled_settlement_closes_with_the_cancelled_marker() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
-
-        log.append(Entry::UserText("go".into()));
-        log.append(Entry::assistant_blocks(vec![tool_use(
-            "t1",
-            "grep",
-            json!({}),
-        )]));
-        log.append(Entry::ToolResult(tool_result("t1", "hits")));
-        log.append(Entry::Settled {
-            outcome: Settled::Cancelled,
-            stop_reason: StopReason::Unknown,
-            reason: None,
-        });
-
-        let (messages, _) = resume(&log.path, &session).unwrap();
-
-        let last = messages.last().unwrap();
+        let last = settled_last_message(Settled::Cancelled, StopReason::Unknown);
         assert_eq!(last.role, Role::Assistant);
         assert_eq!(last.content, vec![text("[turn cancelled by user]")]);
     }
 
     #[test]
     fn a_failed_settlement_carries_its_reason_string_forensically_the_fold_ignores_it() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![text("partial")]));
@@ -1645,9 +1638,7 @@ mod tests {
 
     #[test]
     fn a_verify_nudge_entry_folds_as_a_user_message() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("write it".into()));
         log.append(Entry::assistant_blocks(vec![text("wrote it")]));
@@ -1675,9 +1666,7 @@ mod tests {
 
     #[test]
     fn an_explore_nudge_folds_into_the_tool_results_user_message_it_rode_live() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("evaluate this project".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
@@ -1723,9 +1712,7 @@ mod tests {
 
     #[test]
     fn riders_fold_into_the_tool_results_user_message_they_rode_live() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
@@ -1768,9 +1755,7 @@ mod tests {
 
     #[test]
     fn the_verification_and_final_pass_prompts_fold_on_the_same_seam() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("edit it".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
@@ -1827,9 +1812,7 @@ mod tests {
 
     #[test]
     fn every_rider_tag_survives_the_file_round_trip() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         for (tag, text) in [
@@ -1867,9 +1850,7 @@ mod tests {
 
     #[test]
     fn a_torn_last_line_is_dropped() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![text("done")]));
@@ -1893,9 +1874,7 @@ mod tests {
 
     #[test]
     fn a_different_project_root_refuses_to_resume() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (tmp, session, mut log) = open_log();
         log.append(Entry::UserText("go".into()));
 
         let other_root = tmp.path().join("elsewhere");
@@ -1915,9 +1894,7 @@ mod tests {
 
     #[test]
     fn every_other_fact_yields_reported_as_drift() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (tmp, session, mut log) = open_log();
         log.append(Entry::UserText("go".into()));
 
         // A budget cap BELOW the model's window, so the derived launch budget
@@ -1979,9 +1956,7 @@ mod tests {
 
     #[test]
     fn a_compaction_fold_discards_raw_entries_before_the_compacted_marker() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("turn 1".into()));
         log.append(Entry::assistant_blocks(vec![text("old response")]));
@@ -2022,9 +1997,7 @@ mod tests {
 
     #[test]
     fn a_compaction_fold_reconstructs_the_mechanical_facts_task_and_file_ops() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("turn 1".into()));
         log.append(Entry::assistant_blocks(vec![text("old response")]));
@@ -2094,9 +2067,7 @@ mod tests {
         // Arrange: a Conversation of several Runs (user text + assistant text),
         // fat enough that the Compaction Keep leaves a real head to summarize.
         // The same ops feed the Session Log so the log mirrors the live events.
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         let opts = ConversationOpts::new(2000, 500).eviction_slack(0.0);
         let mut conv = Conversation::new("You are Baud.", opts);
@@ -2178,9 +2149,7 @@ mod tests {
 
     #[test]
     fn a_continuation_recovery_prompt_folds_as_a_fresh_user_message_after_the_marker() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("fix the tests".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
@@ -2223,9 +2192,7 @@ mod tests {
 
     #[test]
     fn a_handoff_fold_discards_history_and_recomposes_the_seed_with_the_prompt_merged() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("fix the tests".into()));
         log.append(Entry::assistant_blocks(vec![text("failing attempt")]));
@@ -2293,9 +2260,7 @@ mod tests {
 
     #[test]
     fn a_degraded_handoff_folds_without_a_narrative() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::Handoff {
@@ -2328,9 +2293,7 @@ mod tests {
 
     #[test]
     fn recovery_entries_round_trip_the_file_with_their_shape_and_reason() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, _session, mut log) = open_log();
 
         // Every (shape, reason) combination the mechanic produces: broken-state
         // reasons on either shape, and the Open Plan always on Continuation.
@@ -2395,9 +2358,7 @@ mod tests {
 
     #[test]
     fn retry_entries_round_trip_the_file_with_their_error_attempt_and_budget() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, _session, mut log) = open_log();
 
         log.append(Entry::Retry {
             error: "api_stream_error: Failed to generate a valid tool call".into(),
@@ -2435,9 +2396,7 @@ mod tests {
 
     #[test]
     fn a_retry_entry_is_silent_to_the_folded_conversation() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         // A retryable draw failed and was re-drawn silently; the re-issued
@@ -2470,9 +2429,7 @@ mod tests {
 
     #[test]
     fn recoveries_used_counts_recovery_entries_since_the_last_user_prompt() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, _session, mut log) = open_log();
 
         assert_eq!(recoveries_used(&log.path), 0);
 
@@ -2505,9 +2462,7 @@ mod tests {
     fn advances_used_counts_only_open_plan_recovery_entries_since_the_last_prompt() {
         // ADR-0043: the two budgets are separate counters over the same
         // `recovery` entries, split by reason.
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, _session, mut log) = open_log();
 
         assert_eq!(advances_used(&log.path), 0);
 
@@ -2644,9 +2599,7 @@ mod tests {
 
     #[test]
     fn resume_governed_plan_and_recoveries_match_the_standalone_queries() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         log.append(Entry::UserText("go".into()));
         log.append(Entry::Plan("Goal: A. 1. read [x]".into()));
@@ -2722,9 +2675,7 @@ mod tests {
 
     #[test]
     fn seeded_message_entries_replay_verbatim() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         let seeded = Message::assistant(vec![text("from a previous life")]);
         log.append(Entry::Message(seeded.clone()));
@@ -2738,9 +2689,7 @@ mod tests {
 
     #[test]
     fn assistant_provenance_round_trips_through_the_log_and_fold() {
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         let stamp = Provenance::new("anthropic", "claude-fable-5");
         log.append(Entry::UserText("go".into()));
@@ -2771,9 +2720,7 @@ mod tests {
     fn a_seeded_message_entry_keeps_its_provenance_across_log_generations() {
         // Resume seeds a fresh log with `message` entries; the stamp must
         // survive so a twice-resumed history still normalizes correctly.
-        let tmp = TempDir::new().unwrap();
-        let session = session_in(tmp.path());
-        let mut log = Log::open(&session).unwrap();
+        let (_tmp, session, mut log) = open_log();
 
         let seeded = Message::assistant_from(
             vec![text("stamped reply")],

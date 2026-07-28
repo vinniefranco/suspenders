@@ -44,11 +44,14 @@ pub struct WaveStats {
     pub dead_mass: f64,
 }
 
-/// The SINGLE rounding rule for a Dead Mass fraction → integer percent, shared
+/// Converts a fraction to integer percent (multiplier).
+const PERCENT_MULTIPLIER: f64 = 100.0;
+
+/// The SINGLE rounding rule for a Dead Mass fraction to integer percent, shared
 /// by every surface that shows it (the status bar, the transcript wave line, the
 /// engine's stdout wave print) so they can never disagree. Rounds to nearest.
 pub fn dead_mass_pct(fraction: f64) -> u64 {
-    (fraction * 100.0).round() as u64
+    (fraction * PERCENT_MULTIPLIER).round() as u64
 }
 
 impl WaveStats {
@@ -93,6 +96,15 @@ pub struct ConversationOpts {
     pub dead_mass_fraction: f64,
 }
 
+/// Clamp floor for float results that should never go below zero.
+const FLOAT_CLAMP_ZERO: f64 = 0.0;
+/// Default eviction slack fraction: no hysteresis overshoot by default.
+const DEFAULT_EVICTION_SLACK: f64 = 0.0;
+/// Default compaction keep fraction: keep the newest 50% of the live window.
+const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
+/// Default dead mass fraction threshold that triggers a reclaim wave.
+const DEFAULT_DEAD_MASS_FRACTION: f64 = 0.15;
+
 impl ConversationOpts {
     /// The two required knobs, with baud's defaults for the rest
     /// (`overhead_chars: 0`, `eviction_slack: 0.0`, `compaction_keep: 0.5`)
@@ -102,9 +114,9 @@ impl ConversationOpts {
             context_budget,
             max_tokens_reserve,
             overhead_chars: 0,
-            eviction_slack: 0.0,
-            compaction_keep: 0.5,
-            dead_mass_fraction: 0.15,
+            eviction_slack: DEFAULT_EVICTION_SLACK,
+            compaction_keep: DEFAULT_COMPACTION_KEEP,
+            dead_mass_fraction: DEFAULT_DEAD_MASS_FRACTION,
         }
     }
 
@@ -128,9 +140,6 @@ impl ConversationOpts {
         self
     }
 }
-
-/// File operations extracted from a set of messages.
-pub type ConversationFileOps = FileOps;
 
 impl Conversation {
     /// Builds a new Conversation from a system prompt and explicit options.
@@ -288,6 +297,7 @@ impl Conversation {
     /// dead content outside the recency guard - zero value by definition -
     /// and only a budget-pressure wave continues into the oldest-first live
     /// walk, eliding down to the low-water mark. Idempotent.
+    // qual:test_helper - only used in tests; production paths call for_request_traced -> evict_traced directly.
     pub fn evict(&self) -> Conversation {
         self.evict_traced().0
     }
@@ -602,7 +612,11 @@ pub fn compaction_keep_amount(
     compaction_keep: f64,
 ) -> u64 {
     let live_window = context_budget.saturating_sub(max_tokens_reserve) as f64;
-    (compaction_keep * live_window).trunc().max(0.0) as u64
+    // Clamp to zero: `saturating_sub` already ensures non-negative, but the
+    // float multiply can produce a tiny negative value near zero.
+    (compaction_keep * live_window)
+        .trunc()
+        .max(FLOAT_CLAMP_ZERO) as u64
 }
 
 /// Extracts file operations from a list of messages. Scans tool_use blocks for
@@ -701,11 +715,17 @@ pub fn command_result_for<'a>(messages: &'a [Message], command: &str) -> Option<
         })
 }
 
-// ceil(chars / 3.5) - a 3.5 ratio, not a div_ceil by 7, so keep as-is.
+// ceil(chars / 3.5): the numerator bias and denominator derive from the 3.5
+// chars-per-token ratio encoded as integer arithmetic (2*chars + 6) / 7.
+// These constants document that encoding; changing them changes the estimate.
+const CHARS_PER_TOKEN_NUMER: u64 = 2; // 1 / 3.5 = 2 / 7
+const CHARS_PER_TOKEN_BIAS: u64 = 6; // bias for ceil: 7 - 1
+const CHARS_PER_TOKEN_DENOM: u64 = 7;
+
 pub(crate) fn tokens_for_chars(chars: u64) -> u64 {
     #[allow(clippy::manual_div_ceil)]
     {
-        (2 * chars + 6) / 7
+        (CHARS_PER_TOKEN_NUMER * chars + CHARS_PER_TOKEN_BIAS) / CHARS_PER_TOKEN_DENOM
     }
 }
 
@@ -778,6 +798,26 @@ mod tests {
 
     fn tool_result_err(id: &str, content: &str, is_error: bool) -> ContentBlock {
         ContentBlock::tool_result(id, content, is_error)
+    }
+
+    // A minimal started conversation: system prompt "sys", budget 1000,
+    // one user message "hi". Used wherever a test just needs a conversation
+    // with at least one turn before appending assistant or result messages.
+    fn started_conv() -> Conversation {
+        let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
+        conv.add_user_text("hi");
+        conv
+    }
+
+    // Two tool-result-bearing user messages (at the recency guard boundary).
+    fn two_result_conv(opts: ConversationOpts, big: &str) -> Conversation {
+        let mut conv = Conversation::new("sys", opts);
+        conv.add_user_text("go");
+        conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
+        conv.add_tool_results(vec![tool_result("t1", big)], vec![]);
+        conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
+        conv.add_tool_results(vec![tool_result("t2", big)], vec![]);
+        conv
     }
 
     // Three tool-result-bearing user messages, so the oldest is evictable.
@@ -884,8 +924,7 @@ mod tests {
             ContentBlock::text("reading"),
             tool_use_input("t1", "read_file", json!({"path": "a"})),
         ];
-        let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
-        conv.add_user_text("hi");
+        let mut conv = started_conv();
         conv.add_assistant_blocks(blocks.clone());
         assert_eq!(conv.messages.last().unwrap(), &Message::assistant(blocks));
     }
@@ -893,8 +932,7 @@ mod tests {
     #[test]
     fn add_assistant_response_stamps_the_message_add_assistant_blocks_does_not() {
         let stamp = Provenance::new("anthropic", "claude-fable-5");
-        let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
-        conv.add_user_text("hi");
+        let mut conv = started_conv();
         conv.add_assistant_response(vec![ContentBlock::text("reply")], stamp.clone());
         conv.add_assistant_blocks(vec![ContentBlock::text("[marker]")]);
         assert_eq!(conv.messages[1].provenance, Some(stamp));
@@ -904,8 +942,7 @@ mod tests {
     #[test]
     fn add_tool_results_appends_all_results_as_one_user_message() {
         let results = vec![tool_result("t1", "one"), tool_result_err("t2", "two", true)];
-        let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
-        conv.add_user_text("hi");
+        let mut conv = started_conv();
         conv.add_assistant_blocks(vec![tool_use("t1", "grep"), tool_use("t2", "grep")]);
         conv.add_tool_results(results.clone(), vec![]);
         assert_eq!(conv.messages.len(), 3);
@@ -1086,12 +1123,7 @@ mod tests {
     #[test]
     fn for_request_fails_loudly_when_eviction_cannot_fit() {
         let big = "x".repeat(400);
-        let mut conv = Conversation::new("sys", ConversationOpts::new(10, 0));
-        conv.add_user_text("go");
-        conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
-        conv.add_tool_results(vec![tool_result("t1", &big)], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
-        conv.add_tool_results(vec![tool_result("t2", &big)], vec![]);
+        let conv = two_result_conv(ConversationOpts::new(10, 0), &big);
         assert_eq!(conv.for_request(), Err(ContextBudgetExhausted));
     }
 
@@ -1141,12 +1173,7 @@ mod tests {
     #[test]
     fn evict_does_nothing_when_only_two_bearing_messages() {
         let big = "c".repeat(400);
-        let mut conv = Conversation::new("sys", ConversationOpts::new(1, 0));
-        conv.add_user_text("go");
-        conv.add_assistant_blocks(vec![tool_use("t1", "read_file")]);
-        conv.add_tool_results(vec![tool_result("t1", &big)], vec![]);
-        conv.add_assistant_blocks(vec![tool_use("t2", "read_file")]);
-        conv.add_tool_results(vec![tool_result("t2", &big)], vec![]);
+        let conv = two_result_conv(ConversationOpts::new(1, 0), &big);
         assert_eq!(conv.evict(), conv);
     }
 
@@ -1469,22 +1496,37 @@ mod tests {
         ));
     }
 
+    // Multi-run conversation for compaction tests: N pairs of (user,assistant)
+    // messages, each padded to `chars_per_msg` characters, with the given opts.
+    fn multi_run_conv(
+        opts: ConversationOpts,
+        pairs: &[(&str, &str)],
+        chars_per_msg: usize,
+    ) -> Conversation {
+        let mut conv = Conversation::new("sys", opts);
+        for (u, a) in pairs {
+            conv.add_user_text(u.repeat(chars_per_msg));
+            conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(chars_per_msg))]);
+        }
+        conv
+    }
+
     #[test]
     fn prepare_compaction_keep_is_compaction_keep_of_window() {
-        let build = |keep: f64| -> Conversation {
-            let mut conv = Conversation::new(
-                "sys",
-                ConversationOpts::new(10_000, 0).compaction_keep(keep),
-            );
-            for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
-                conv.add_user_text(u.repeat(700));
-                conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(700))]);
-            }
-            conv
-        };
+        let pairs = [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")];
+        let small = multi_run_conv(
+            ConversationOpts::new(10_000, 0).compaction_keep(0.05),
+            &pairs,
+            700,
+        );
+        let large = multi_run_conv(
+            ConversationOpts::new(10_000, 0).compaction_keep(0.3),
+            &pairs,
+            700,
+        );
 
-        let (_, small_cutoff, _) = build(0.05).prepare_compaction().unwrap();
-        let (_, large_cutoff, _) = build(0.3).prepare_compaction().unwrap();
+        let (_, small_cutoff, _) = small.prepare_compaction().unwrap();
+        let (_, large_cutoff, _) = large.prepare_compaction().unwrap();
         assert!(small_cutoff > large_cutoff);
     }
 
@@ -1498,14 +1540,12 @@ mod tests {
         // (~172 tokens): a char walk crosses on it, snapping the cutoff to
         // the last run start (index 6); a token walk would need three
         // messages and snap to index 4.
-        let mut conv = Conversation::new(
-            "sys",
+        let pairs = [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")];
+        let conv = multi_run_conv(
             ConversationOpts::new(10_000, 0).compaction_keep(0.05),
+            &pairs,
+            600,
         );
-        for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
-            conv.add_user_text(u.repeat(600));
-            conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(600))]);
-        }
 
         let (to_summarize, cutoff_idx, _) = conv.prepare_compaction().unwrap();
         assert_eq!(cutoff_idx, 6);
@@ -1514,22 +1554,13 @@ mod tests {
 
     #[test]
     fn prepare_compaction_eviction_slack_no_longer_affects_cutoff() {
-        let build = |slack: f64| -> Conversation {
-            let mut conv = Conversation::new(
-                "sys",
-                ConversationOpts::new(1_000, 0)
-                    .compaction_keep(0.5)
-                    .eviction_slack(slack),
-            );
-            for (u, a) in [("a", "b"), ("c", "d"), ("e", "f")] {
-                conv.add_user_text(u.repeat(300));
-                conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(300))]);
-            }
-            conv
-        };
+        let pairs = [("a", "b"), ("c", "d"), ("e", "f")];
+        let make_opts = || ConversationOpts::new(1_000, 0).compaction_keep(0.5);
+        let zero = multi_run_conv(make_opts().eviction_slack(0.0), &pairs, 300);
+        let high = multi_run_conv(make_opts().eviction_slack(0.9), &pairs, 300);
 
-        let (_, cutoff_zero, _) = build(0.0).prepare_compaction().unwrap();
-        let (_, cutoff_high, _) = build(0.9).prepare_compaction().unwrap();
+        let (_, cutoff_zero, _) = zero.prepare_compaction().unwrap();
+        let (_, cutoff_high, _) = high.prepare_compaction().unwrap();
         assert_eq!(cutoff_zero, cutoff_high);
     }
 

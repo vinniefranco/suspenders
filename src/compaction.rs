@@ -35,6 +35,15 @@ use crate::llm::{Llm, LlmRequest};
 use crate::session::log::compose_summary;
 use crate::voice::{self, FileOps};
 
+/// The LLM call parameters for a Handoff seed: the boundary, the model, and
+/// the sampling temperature. Bundles the three repetitive args that appear in
+/// both [`Compaction::seed_handoff`] and [`Compaction::summarize`].
+pub struct SeedCall<'a> {
+    pub llm: &'a dyn Llm,
+    pub model: &'a Model,
+    pub temperature: Option<f64>,
+}
+
 /// The system prompt for the summarization call, mirroring baud's inline
 /// prompt (the harness owns the wording; the Voice module owns the body).
 const COMPACTION_SYSTEM: &str = "You are a summarization assistant. \
@@ -148,9 +157,7 @@ impl Compaction {
         conv: &Conversation,
         prompt: &str,
         failing_command: Option<&str>,
-        llm: &dyn Llm,
-        model: &Model,
-        temperature: Option<f64>,
+        call: &SeedCall<'_>,
     ) -> Handoff {
         let merged_ops = merge_ops(
             &self.file_ops,
@@ -167,7 +174,7 @@ impl Compaction {
         .map(|s| s.to_string());
 
         let narrative = self
-            .summarize(&conv.messages, llm, model, temperature)
+            .summarize(&conv.messages, call.llm, call.model, call.temperature)
             .await
             .ok();
 
@@ -243,6 +250,7 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
     /// Convenience wrapper for use as a Run `compact` Dep capture: runs and
     /// drops the new state - the caller fires the state update separately.
     /// Returns `Ok(conversation)` or `Err(reason)`.
+    // qual:test_helper
     pub async fn recovery_capture(
         &self,
         conv: &Conversation,
@@ -681,7 +689,16 @@ mod tests {
         let conv = dying_conversation();
 
         let handoff = Compaction::new()
-            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &test_model(), None)
+            .seed_handoff(
+                &conv,
+                "[recovery prompt]",
+                None,
+                &SeedCall {
+                    llm: &fake,
+                    model: &test_model(),
+                    temperature: None,
+                },
+            )
             .await;
 
         // One user message: the seed with the prompt merged onto it.
@@ -720,7 +737,16 @@ mod tests {
             file_ops: FileOps::default(),
         };
         let handoff = prev
-            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &test_model(), None)
+            .seed_handoff(
+                &conv,
+                "[recovery prompt]",
+                None,
+                &SeedCall {
+                    llm: &fake,
+                    model: &test_model(),
+                    temperature: None,
+                },
+            )
             .await;
 
         assert_eq!(handoff.narrative, None);
@@ -744,7 +770,16 @@ mod tests {
         conv.add_assistant_blocks(vec![ContentBlock::text("[turn limit reached]")]);
 
         let handoff = Compaction::new()
-            .seed_handoff(&conv, "[recovery prompt]", None, &fake, &test_model(), None)
+            .seed_handoff(
+                &conv,
+                "[recovery prompt]",
+                None,
+                &SeedCall {
+                    llm: &fake,
+                    model: &test_model(),
+                    temperature: None,
+                },
+            )
             .await;
 
         assert_eq!(handoff.verification, None);
@@ -785,9 +820,11 @@ mod tests {
                 &conv,
                 "[recovery prompt]",
                 Some("cargo test"),
-                &fake,
-                &test_model(),
-                None,
+                &SeedCall {
+                    llm: &fake,
+                    model: &test_model(),
+                    temperature: None,
+                },
             )
             .await;
 

@@ -337,6 +337,41 @@ mod tests {
         }
     }
 
+    /// Runs a single-pass Scout and returns the captured first [`LlmRequest`].
+    /// The fake LLM replies with `text_response("done")` to keep the Scout
+    /// from looping.
+    async fn run_and_capture_request(root: &TempDir) -> LlmRequest {
+        let captured: Arc<Mutex<Option<LlmRequest>>> = Arc::new(Mutex::new(None));
+        let cap = Arc::clone(&captured);
+        let fake = FakeLlm::script(vec![Entry::dynamic(
+            vec![],
+            move |req: &LlmRequest, _: &Model| {
+                *cap.lock().unwrap() = Some(req.clone());
+                text_response("done")
+            },
+        )]);
+        Scout::run("task", &fake, &model(), opts(root)).await;
+        captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("fake was called once")
+    }
+
+    fn assert_llm_error(outcome: ScoutOutcome) {
+        match outcome {
+            ScoutOutcome::LlmError { .. } => {}
+            other => panic!("expected LlmError, got {other:?}"),
+        }
+    }
+
+    fn assert_empty(outcome: ScoutOutcome) {
+        match outcome {
+            ScoutOutcome::Empty { .. } => {}
+            other => panic!("expected Empty, got {other:?}"),
+        }
+    }
+
     // ---- read-only enforcement (CONTEXT.md: Scout) ----
 
     // A Scout whose model hallucinates a command Tool Call gets the Voice's
@@ -419,22 +454,8 @@ mod tests {
     #[tokio::test]
     async fn uses_its_own_voice_owned_system_prompt_on_the_request() {
         let root = root();
-        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let cap = Arc::clone(&captured);
-        let fake = FakeLlm::script(vec![Entry::dynamic(
-            vec![],
-            move |req: &LlmRequest, _model: &Model| {
-                *cap.lock().unwrap() = Some(req.system.clone());
-                text_response("done")
-            },
-        )]);
-
-        Scout::run("task", &fake, &model(), opts(&root)).await;
-
-        assert_eq!(
-            captured.lock().unwrap().as_deref(),
-            Some(voice::scout_system_prompt())
-        );
+        let req = run_and_capture_request(&root).await;
+        assert_eq!(req.system, voice::scout_system_prompt());
     }
 
     // ---- read-only registry (no nesting) ----
@@ -513,19 +534,8 @@ mod tests {
     #[tokio::test]
     async fn absent_by_default() {
         let root = root();
-        let seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
-        let s = Arc::clone(&seen);
-        let fake = FakeLlm::script(vec![Entry::dynamic(
-            vec![],
-            move |req: &LlmRequest, _model: &Model| {
-                *s.lock().unwrap() = Some(req.no_think);
-                text_response("done")
-            },
-        )]);
-
-        Scout::run("task", &fake, &model(), opts(&root)).await;
-
-        assert_eq!(*seen.lock().unwrap(), Some(false));
+        let req = run_and_capture_request(&root).await;
+        assert!(!req.no_think);
     }
 
     // ---- the report Pass ----
@@ -646,12 +656,8 @@ mod tests {
     async fn an_llm_error_returns_llm_error_with_partial() {
         let root = root();
         let fake = FakeLlm::script(vec![Entry::error("connection_refused")]);
-
         let outcome = Scout::run("task", &fake, &model(), opts(&root)).await;
-        match outcome {
-            ScoutOutcome::LlmError { partial: _ } => {}
-            other => panic!("expected LlmError, got {other:?}"),
-        }
+        assert_llm_error(outcome);
     }
 
     #[tokio::test]
@@ -678,11 +684,7 @@ mod tests {
     async fn an_empty_report_returns_empty() {
         let root = root();
         let fake = FakeLlm::script(vec![Entry::just(text_response("   "))]);
-
         let outcome = Scout::run("task", &fake, &model(), opts(&root)).await;
-        match outcome {
-            ScoutOutcome::Empty { partial: _ } => {}
-            other => panic!("expected Empty, got {other:?}"),
-        }
+        assert_empty(outcome);
     }
 }

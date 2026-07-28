@@ -31,10 +31,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The broadcast channel capacity for the Agent's Event stream. Large enough
+/// to absorb a burst of events between subscriber polls without dropping.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::approvals::{ApprovalId, Approvals, Decide, Decision, Request};
-use crate::compaction::Compaction;
+use crate::compaction::{Compaction, SeedCall};
 use crate::content::{ContentBlock, Provenance};
 use crate::conversation::{Conversation, ConversationOpts};
 use crate::event::Event;
@@ -126,6 +130,7 @@ impl StartOpts {
         self
     }
 
+    // qual:test_helper
     pub fn with_resume(mut self, resume: Resume) -> Self {
         self.resume = Some(resume);
         self
@@ -328,7 +333,7 @@ impl AgentHandle {
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let (events, _rx0) = broadcast::channel(1024);
+        let (events, _rx0) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Session cost metering (ADR-0037): every model call this Session
         // makes - Run Passes, Scouts, Compaction, Handoff seeds - flows
@@ -1040,9 +1045,11 @@ fn spawn_handoff_run(
                 &dying,
                 &prompt,
                 failing_command.as_deref(),
-                llm.as_ref(),
-                &model,
-                temperature,
+                &SeedCall {
+                    llm: llm.as_ref(),
+                    model: &model,
+                    temperature,
+                },
             )
             .await;
         let _ = tx.send(Msg::Run(RunMsg::HandoffSeeded {

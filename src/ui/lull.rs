@@ -51,12 +51,21 @@ pub fn frame(quiet_ticks: u64, lull_seq: u64) -> Option<&'static str> {
     Some(scene.frames[idx])
 }
 
+/// Seconds in one minute, for `format_elapsed`'s boundary checks.
+const SECS_PER_MINUTE: u64 = 60;
+/// Seconds in one hour, for `format_elapsed`'s boundary checks.
+const SECS_PER_HOUR: u64 = 3600;
+
 /// A compact elapsed label for the lull timer: `"7s"` under a minute, `"2m 03s"`
 /// under an hour, `"1h 04m"` beyond. Pure string formatting - the caller runs
 /// `quiet_ticks` into seconds (it owns the tick cadence) and pads this to a
 /// fixed field so the animation column never jitters.
 pub fn format_elapsed(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let (h, m, s) = (
+        secs / SECS_PER_HOUR,
+        (secs % SECS_PER_HOUR) / SECS_PER_MINUTE,
+        secs % SECS_PER_MINUTE,
+    );
     if h > 0 {
         format!("{h}h {m:02}m")
     } else if m > 0 {
@@ -66,15 +75,26 @@ pub fn format_elapsed(secs: u64) -> String {
     }
 }
 
+// SplitMix64 finalizer constants (Steele & Vigna 2014). Three Weyl-sequence
+// multipliers chosen for their avalanche properties; the shift widths (30, 27,
+// 31) match the published reference implementation. Changing any value breaks
+// the deterministic lull->scene mapping the tests rely on.
+const SPLITMIX_ADDEND: u64 = 0x9E37_79B9_7F4A_7C15;
+const SPLITMIX_MUL1: u64 = 0xBF58_476D_1CE4_E5B9;
+const SPLITMIX_MUL2: u64 = 0x94D0_49BB_1331_11EB;
+const SPLITMIX_SHIFT1: u32 = 30;
+const SPLITMIX_SHIFT2: u32 = 27;
+const SPLITMIX_SHIFT3: u32 = 31;
+
 /// SplitMix64's finalizer: scrambles the lull counter into a well-spread value
 /// so consecutive lulls jump around the registry instead of marching through
 /// it. Deterministic (no `rand`, no clock) - the codebase avoids nondeterminism
 /// and the tests need a fixed lull->scene map.
 fn scramble(n: u64) -> u64 {
-    let mut x = n.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
+    let mut x = n.wrapping_add(SPLITMIX_ADDEND);
+    x = (x ^ (x >> SPLITMIX_SHIFT1)).wrapping_mul(SPLITMIX_MUL1);
+    x = (x ^ (x >> SPLITMIX_SHIFT2)).wrapping_mul(SPLITMIX_MUL2);
+    x ^ (x >> SPLITMIX_SHIFT3)
 }
 
 /// The scene registry. Each entry is one waiting animation; add a scene by
@@ -209,11 +229,17 @@ mod tests {
     // The registry is the extension point: it must be non-empty (the modulo
     // pick in `frame` would divide by zero otherwise) and every scene must
     // carry at least one frame (an empty cycle would panic the frame index).
+    // Exercised through `frame` - the public SUT - so an empty registry or a
+    // scene with no frames would panic rather than returning a wrong value.
     #[test]
-    fn scenes_is_non_empty_and_every_scene_has_frames() {
-        assert!(!SCENES.is_empty());
-        for scene in SCENES {
-            assert!(!scene.frames.is_empty());
+    fn frame_returns_some_for_every_scene_in_the_registry() {
+        assert!(!SCENES.is_empty(), "registry must be non-empty");
+        for lull in 0..SCENES.len() as u64 {
+            let result = frame(SETTLE_TICKS, lull);
+            assert!(
+                result.is_some(),
+                "frame returned None at lull {lull}, meaning a scene with no frames was picked"
+            );
         }
     }
 

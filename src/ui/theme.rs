@@ -83,14 +83,28 @@ impl std::str::FromStr for Color {
     }
 }
 
+/// The `#rrggbb` hex format requires exactly this many ASCII hex digit characters.
+const HEX_DIGIT_COUNT: usize = 6;
+/// Bit shift to extract the red byte from a packed `0xRRGGBB` value.
+const RED_SHIFT: u32 = 16;
+/// Bit shift to extract the green byte from a packed `0xRRGGBB` value.
+const GREEN_SHIFT: u32 = 8;
+/// Radix for hexadecimal parsing.
+const HEX_RADIX: u32 = 16;
+
 /// Parses a `#`-prefixed hex color; exactly six ASCII hex digits or rejection.
 /// The digit check is explicit because `from_str_radix` alone accepts a
 /// leading sign ("+12345" would sneak through a pairwise parse).
 fn parse_hex(s: &str) -> Result<Color, String> {
     let digits = s.strip_prefix('#').unwrap_or(s);
-    if digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let rgb = u32::from_str_radix(digits, 16).expect("six hex digits parse");
-        return Ok(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
+    if digits.len() == HEX_DIGIT_COUNT && digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let rgb = u32::from_str_radix(digits, HEX_RADIX)
+            .map_err(|e| format!("\"{s}\" is not a valid hex color: {e}"))?;
+        return Ok(Color::Rgb(
+            (rgb >> RED_SHIFT) as u8,
+            (rgb >> GREEN_SHIFT) as u8,
+            rgb as u8,
+        ));
     }
     Err(format!(
         "\"{s}\" is not a valid hex color: expected \"#rrggbb\""
@@ -517,6 +531,43 @@ fn load_user(name: &str, dir: &Path) -> Result<Theme, ThemeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_slot (the single-slot parse funnel) --------------------------
+
+    #[test]
+    fn parse_slot_passes_none_through_as_none() {
+        assert_eq!(parse_slot("added", None).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_slot_parses_a_valid_color_string() {
+        assert_eq!(
+            parse_slot("added", Some("green".to_string())).unwrap(),
+            Some(Color::Green)
+        );
+        assert_eq!(
+            parse_slot("added", Some("#ff0000".to_string())).unwrap(),
+            Some(Color::Rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn parse_slot_wraps_a_bad_value_as_invalid_naming_the_slot() {
+        let err = parse_slot("removed", Some("mauve".to_string())).unwrap_err();
+        let ThemeError::Invalid(reason) = &err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(reason.starts_with("colors.removed:"), "{reason}");
+        assert!(reason.contains("\"mauve\" is not a color"), "{reason}");
+    }
+
+    // --- missing_slot (the built-in totality error) -------------------------
+
+    #[test]
+    fn missing_slot_produces_an_invalid_error_naming_the_slot() {
+        let err = missing_slot("syntax");
+        assert_eq!(err, ThemeError::Invalid("missing slot \"syntax\"".into()));
+    }
 
     // --- Color parsing ------------------------------------------------------
 

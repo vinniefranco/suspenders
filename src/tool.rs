@@ -144,6 +144,9 @@ pub fn file_error(verb: &str, path: &str, reason: FileError) -> String {
     format!("could not {verb} {path}: {}{hint}", format_posix(reason))
 }
 
+/// Maximum number of closest-match file suggestions shown on ENOENT.
+const SUGGEST_FILES_LIMIT: usize = 5;
+
 /// Enriches an ENOENT error message with a suggestion of files in the same
 /// directory that closely match the model's path (Jaro-ranked recovery).
 pub fn suggest_files(path: &str) -> String {
@@ -166,7 +169,7 @@ pub fn suggest_files(path: &str) -> String {
         Err(_) => return String::new(),
     };
 
-    let suggestions = closest_matches(&basename, &entries, 5);
+    let suggestions = closest_matches(&basename, &entries, SUGGEST_FILES_LIMIT);
     if suggestions.is_empty() {
         String::new()
     } else {
@@ -178,11 +181,15 @@ pub fn suggest_files(path: &str) -> String {
     }
 }
 
+/// Minimum Jaro distance for a file to appear in the closest-match suggestions.
+const JARO_SUGGEST_THRESHOLD: f64 = 0.4;
+
 fn closest_matches(needle: &str, haystack: &[String], limit: usize) -> Vec<String> {
     if haystack.is_empty() {
         return Vec::new();
     }
-    // Sort by Jaro distance descending (stable), take limit, keep only > 0.4.
+    // Sort by Jaro distance descending (stable), take limit, keep only above
+    // the threshold.
     let mut scored: Vec<(f64, &String)> = haystack
         .iter()
         .map(|name| (jaro_distance(needle, name), name))
@@ -191,10 +198,19 @@ fn closest_matches(needle: &str, haystack: &[String], limit: usize) -> Vec<Strin
     scored
         .into_iter()
         .take(limit)
-        .filter(|(d, _)| *d > 0.4)
+        .filter(|(d, _)| *d > JARO_SUGGEST_THRESHOLD)
         .map(|(_, name)| name.clone())
         .collect()
 }
+
+/// The three-component denominator in the Jaro formula.
+const JARO_COMPONENT_COUNT: f64 = 3.0;
+/// Transpositions are counted in halves in the Jaro formula.
+const JARO_TRANSPOSITION_DIVISOR: f64 = 2.0;
+/// Jaro distance for two identical (or both empty) strings.
+const JARO_PERFECT_MATCH: f64 = 1.0;
+/// Jaro distance when one string is empty or there are no matching characters.
+const JARO_NO_MATCH: f64 = 0.0;
 
 /// Jaro distance (0.0..=1.0), matching Elixir's `String.jaro_distance/2`.
 pub fn jaro_distance(s1: &str, s2: &str) -> f64 {
@@ -203,10 +219,10 @@ pub fn jaro_distance(s1: &str, s2: &str) -> f64 {
     let (len1, len2) = (a.len(), b.len());
 
     if len1 == 0 && len2 == 0 {
-        return 1.0;
+        return JARO_PERFECT_MATCH;
     }
     if len1 == 0 || len2 == 0 {
-        return 0.0;
+        return JARO_NO_MATCH;
     }
 
     let match_distance = (len1.max(len2) / 2).saturating_sub(1);
@@ -229,7 +245,7 @@ pub fn jaro_distance(s1: &str, s2: &str) -> f64 {
     }
 
     if matches == 0 {
-        return 0.0;
+        return JARO_NO_MATCH;
     }
 
     // Count transpositions.
@@ -246,10 +262,10 @@ pub fn jaro_distance(s1: &str, s2: &str) -> f64 {
             k += 1;
         }
     }
-    let t = transpositions as f64 / 2.0;
+    let t = transpositions as f64 / JARO_TRANSPOSITION_DIVISOR;
     let m = matches as f64;
 
-    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / JARO_COMPONENT_COUNT
 }
 
 /// Resolves a model-supplied path against the Project Root and refuses paths
@@ -369,14 +385,16 @@ pub fn validate(
                 && prop.get("type").and_then(|t| t.as_str()) == Some("string")
                 && !input.get(*name).map(|v| v.is_string()).unwrap_or(false)
         })
-        .map(|(name, _)| {
-            let val = input.get(name).unwrap();
-            format!(
+        .filter_map(|(name, _)| {
+            // `contains_key` above guarantees `get` returns `Some`; use
+            // `filter_map` to propagate that without `unwrap`.
+            let val = input.get(name)?;
+            Some(format!(
                 "field {:?} should be a string, got: {} ({})",
                 name,
                 inspect(val),
                 type_name(val)
-            )
+            ))
         })
         .collect();
 

@@ -238,6 +238,7 @@ impl ExtensionSpec {
     }
 
     /// A `{name, opts}` entry.
+    // qual:test_helper
     pub fn with_opts(name: impl Into<String>, opts: Value) -> Self {
         ExtensionSpec {
             name: name.into(),

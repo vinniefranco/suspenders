@@ -391,6 +391,28 @@ mod tests {
         std::fs::read_to_string(root.join(name)).unwrap()
     }
 
+    fn assert_ambiguous_error(err: &str) {
+        assert!(err.contains("locations"), "expected 'locations' in: {err}");
+        assert!(
+            err.contains("more surrounding lines"),
+            "expected 'more surrounding lines' in: {err}"
+        );
+    }
+
+    fn assert_not_found_error(err: &str) {
+        assert!(
+            err.contains("old_str not found"),
+            "expected 'old_str not found' in: {err}"
+        );
+    }
+
+    fn assert_splits_identifier_error(err: &str) {
+        assert!(
+            err.contains("whole words"),
+            "expected 'whole words' in: {err}"
+        );
+    }
+
     #[test]
     fn spec_requires_path_old_str_new_str() {
         let spec = EditFile.spec();
@@ -445,8 +467,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("2 locations"));
-        assert!(err.contains("more surrounding lines"));
+        assert_ambiguous_error(&err);
         assert_eq!(read(tmp.path(), "a.txt"), "foo bar foo");
     }
 
@@ -617,7 +638,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("2 locations"));
+        assert_ambiguous_error(&err);
         assert_eq!(read(tmp.path(), "a.txt"), "  x = 1\n    x = 1\n");
     }
 
@@ -642,7 +663,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("whole words"));
+        assert_splits_identifier_error(&err);
         assert!(err.contains("  def amount_off(base, code) do"));
         assert!(read(tmp.path(), "discount.ex").contains("def amount_off(base, code) do"));
     }
@@ -658,7 +679,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("whole words"));
+        assert_splits_identifier_error(&err);
         assert_eq!(read(tmp.path(), "a.ex"), "x = subtotal_amount + 1\n");
     }
 
@@ -762,7 +783,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("old_str not found"));
+        assert_not_found_error(&err);
         assert!(err.contains("whitespace normalized"));
         assert_eq!(read(tmp.path(), "a.txt"), "actual content");
     }
@@ -786,7 +807,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("old_str not found"));
+        assert_not_found_error(&err);
         assert!(err.contains("Closest region in the file"));
         assert!(err.contains("  def total(items, tax_rate) do"));
         assert!(err.contains("Copy old_str"));
@@ -804,7 +825,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("old_str not found"));
+        assert_not_found_error(&err);
         assert!(!err.contains("Closest region in the file"));
     }
 
