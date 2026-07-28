@@ -112,7 +112,7 @@ CONTEXT.md's Handoff entry explicitly forbids
    arm now additionally requires that a write landed this Run - a new
    monotonic Ledger fact, distinct from `unverified_writes` (which clears
    on the next `run_command`). Recovery fires on `unverified_writes ||
-   (dangling_failure && wrote_this_turn)`. Per-Run scope; `recovery_limit`
+   (dangling_failure && wrote_this_run)`. Per-Run scope; `recovery_limit`
    already bounds re-firing. Accepted trade-off: a capped attempt that
    never managed a single write no longer recovers - but a Run with no
    writes across the whole cap has shown no progress a Handoff restart
