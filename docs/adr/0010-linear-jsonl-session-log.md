@@ -12,4 +12,4 @@ Considered and rejected:
 
 Cost accepted: a small codec between the internal content-block representation and JSON - half of which exists already in the wire conversion performed on every request.
 
-Consequences: Thinking is never in the log (it never enters the Conversation), so a resumed Transcript rebuilds from the Conversation alone. A log ending mid-Turn settles that Turn as failed on Resume, per the existing rule that a crash settles as a failure.
+Consequences: Thinking is never in the log (it never enters the Conversation), so a resumed Transcript rebuilds from the Conversation alone. A log ending mid-Run settles that Run as failed on Resume, per the existing rule that a crash settles as a failure.

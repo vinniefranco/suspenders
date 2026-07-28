@@ -1,23 +1,23 @@
-# The Recovery Turn: the eighth Intervention, with Handoff as its default shape
+# The Recovery Run: the eighth Intervention, with Handoff as its default shape
 
-For hard implementation tasks the Turn Limit, not ability, was the
+For hard implementation tasks the Run Limit, not ability, was the
 binding constraint: 12 of 15 f5 runs died at the 32-pass cap
 (docs/tuning/LOG.md 005–006), including near-misses one honest
-debugging turn from green and mid-refactor compile errors a single
-"make it compile" turn would repair - while the same model solved the
+debugging run from green and mid-refactor compile errors a single
+"make it compile" run would repair - while the same model solved the
 same fixture in 13 passes when its first design was sound. Variance,
-not capability, and a capped Turn had no recovery opportunity.
+not capability, and a capped Run had no recovery opportunity.
 
 ## Decision
 
 The closed Intervention set (ADR-0026) grows its eighth kind - **close
-the Turn and open a Recovery Turn** - issued by the Endgame Governor
-when a Turn closes at its Turn Limit with the Ledger showing unfinished
+the Run and open a Recovery Run** - issued by the Endgame Governor
+when a Run closes at its Run Limit with the Ledger showing unfinished
 work (`unverified_writes || command_failing`), bounded per user request
 by the `recovery_limit` Setpoint (default 1; 0 disables). The Agent
-executes the opening. A capped Turn that settled green closes plain.
+executes the opening. A capped Run that settled green closes plain.
 
-The Recovery Turn is the first Turn whose prompt belongs to the Voice
+The Recovery Run is the first Run whose prompt belongs to the Voice
 rather than the user; it still serves the original user request.
 Rollover outranks it (rolled-over Steering is the user's own
 continuation of the same request), and Cancellation suppresses it.
@@ -37,7 +37,7 @@ Two shapes, chosen by the `recovery_shape` Setpoint:
 
 ## Considered options
 
-- **Pick one shape by measurement first**: the c007 two-turn protocol
+- **Pick one shape by measurement first**: the c007 two-run protocol
   was designed for exactly this comparison but was invalidated by the
   model server going down and the fixtures are gone (/tmp reboot). Both
   arms are cheap once the trigger and vet plumbing exist, so both were
@@ -62,10 +62,10 @@ Two shapes, chosen by the `recovery_shape` Setpoint:
 
 ## Addendum (2026-07-13): two implementation holes, found live, closed
 
-The stated trigger - a Turn closing at its Turn Limit with unfinished
+The stated trigger - a Run closing at its Run Limit with unfinished
 work - was implemented only for the tool-answering cap and the
 tool-insistent reply. But ADR-0015 withdraws every tool on the final
-Pass, so a capped Turn nearly always ends as a plain text settle with
+Pass, so a capped Run nearly always ends as a plain text settle with
 `end_turn`, and that path never consulted the recovery judgment: in a
 5-run batch with every run capped and red, recovery fired once (the
 one tool-insistent reply). The final-Pass text settle now consults the
@@ -80,7 +80,7 @@ and models were observed laundering it: a red full-suite run followed
 by a green filtered rerun (`cargo test one_test_name`, exit 0) read as
 green at the cap. The failing arm is now the Dangling Failure: the
 Ledger records the most recent outcome per distinct command string
-this Turn, and the judgment (and the `verification_failing` fact the
+this Run, and the judgment (and the `verification_failing` fact the
 recovery prompt is parameterized with) fires when any command string's
 most recent run failed - a passing run clears only its own string.
 `command_failing` and its other consumers (the Verify-failed Nudge)
@@ -89,7 +89,7 @@ are untouched.
 ## Addendum (2026-07-14): a false recovery on read-only work, found live, closed
 
 A read-only "evaluate this repo" task settled green at the cap and yet
-opened a Handoff Recovery Turn, which handed the model a fresh
+opened a Handoff Recovery Run, which handed the model a fresh
 Conversation and made it restart the whole evaluation - the `restart`
 CONTEXT.md's Handoff entry explicitly forbids
 (session 20260714-174034). Three faults chained:
@@ -109,12 +109,12 @@ CONTEXT.md's Handoff entry explicitly forbids
    dangling-failure arm fired alone. But this ADR's whole evidence base
    is unverified writes and mid-fix near-misses; a failing command during
    pure exploration is not unfinished implementation. The dangling-failure
-   arm now additionally requires that a write landed this Turn - a new
+   arm now additionally requires that a write landed this Run - a new
    monotonic Ledger fact, distinct from `unverified_writes` (which clears
    on the next `run_command`). Recovery fires on `unverified_writes ||
-   (dangling_failure && wrote_this_turn)`. Per-Turn scope; `recovery_limit`
+   (dangling_failure && wrote_this_turn)`. Per-Run scope; `recovery_limit`
    already bounds re-firing. Accepted trade-off: a capped attempt that
-   never managed a single write no longer recovers - but a Turn with no
+   never managed a single write no longer recovers - but a Run with no
    writes across the whole cap has shown no progress a Handoff restart
    would not simply repeat. The laundering protection is untouched: that
    case always writes.

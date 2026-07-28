@@ -10,7 +10,7 @@ Ordered by expected leverage.
 ## 1. Tool-call inputs are invisible to Eviction (the biggest one)
 
 **Problem.** Eviction reclaims Tool *Results*, but the assistant's own
-`tool_use` blocks stay verbatim forever. On edit-heavy turns those inputs -
+`tool_use` blocks stay verbatim forever. On edit-heavy runs those inputs -
 `edit_file` old_str/new_str bodies - are the single largest context
 consumer, and they are dead weight: once an edit lands, the file on disk is
 the truth and the paste-buffer that produced it teaches the model nothing.
@@ -48,35 +48,35 @@ Signal fraction of cargo output ≈ 40% (the rest is warnings/Compiling
 boilerplate, repeated verbatim across ~8 runs).
 
 **Design.** When run_command executes a command string identical to a
-previous call in the same Turn, elide the previous result to
+previous call in the same Run, elide the previous result to
 `[superseded by a newer run of this command below]` at the moment the new
 result lands. Mechanical (correct-or-incorrect, no Setpoint) - a mechanic
 in the Eviction family, not a Governor. The same rule fits `read_file` of
 an identical path (audit: 18.1k of 20.9k read chars were redundant whole-file
 re-reads).
 
-**Risks.** Mid-turn history rewrites invalidate the prompt-cache prefix at
+**Risks.** Mid-run history rewrites invalidate the prompt-cache prefix at
 the rewrite point; the append of the new result already does that, so the
 marginal cost is near zero. The model occasionally compares old vs new
 output - rare for identical commands, and the newest dump survives.
 
-## 3. Auto-continuation at the Turn Limit (or Handoff)
+## 3. Auto-continuation at the Run Limit (or Handoff)
 
 **Problem.** For hard implementation tasks the 32-pass budget, not ability,
-is the binding constraint - and a Turn that dies at the cap can end broken
+is the binding constraint - and a Run that dies at the cap can end broken
 (mid-refactor compile errors) with no recovery opportunity.
 
 **Evidence.** 12 of 15 f5 runs ended at the cap; the failures include
-near-misses (15/16, 12/16 twice) that are one honest debugging turn from
+near-misses (15/16, 12/16 twice) that are one honest debugging run from
 green, and two compile-error end states (c006 runs 1–2) that a single
-"make it compile again" turn would likely repair. Meanwhile the same model
+"make it compile again" run would likely repair. Meanwhile the same model
 solved the same fixture in 13 passes when its first design was sound -
 variance, not capability.
 
 **Design (two shapes, measure before choosing).**
-- *Continuation:* when a Turn settles at its Turn Limit with writes
+- *Continuation:* when a Run settles at its Run Limit with writes
   unverified or the last verification failing, the harness auto-submits one
-  bounded continuation Turn in the same Conversation ("continue until the
+  bounded continuation Run in the same Conversation ("continue until the
   suite passes"), at most once or twice per task.
 - *Handoff:* instead of continuing the bloated Conversation, retire it and
   seed a fresh one with the compaction skeleton (task verbatim, Plan -
@@ -85,17 +85,17 @@ variance, not capability.
   compaction even on frontier models; on a 9B the gap should be wider.
 
 **Validation already scripted.** `TAG=c007 /tmp/run-batch2.sh f5-hard-algo`
-runs the two-turn protocol (task, then "continue until every test passes")
+runs the two-run protocol (task, then "continue until every test passes")
 N=5 - cycle 007 was invalidated by the server going down; re-run it first.
-If two-turn conversion is strong, Continuation is the cheap win and Handoff
+If two-run conversion is strong, Continuation is the cheap win and Handoff
 the follow-up comparison (same protocol, fresh session seeded from the
-summary instead of a second turn).
+summary instead of a second run).
 
 ## 4. Stale Plan riding every Anchor
 
 **Problem.** The Anchor exists to put the goal where the model attends, but
 it carries the Plan *as last written*. A plan set once at pass 5 and never
-updated means the tail of a 32-pass turn keeps re-reading an outdated
+updated means the tail of a 32-pass run keeps re-reading an outdated
 "Next step" - authoritative-looking wrong guidance, refreshed every 5
 passes.
 
@@ -104,7 +104,7 @@ carried the identical stale plan (steps 3–4 unchecked at turn end, "Next
 step: implement glob_match" while the model was 20 passes deep in
 debugging it).
 
-**Design.** The Turn Ledger already records Tool Calls per Pass; add
+**Design.** The Run Ledger already records Tool Calls per Pass; add
 passes-since-plan-update as a fact. A Governor (the Anchor Governor is the
 natural owner) appends one Voice line to the Anchor when the Plan is older
 than N passes with edits since: `[this plan has not changed in N passes -
@@ -128,7 +128,7 @@ tuning cycle, or Resume experiments will be quietly wrong.
 ## 6. Cargo output noise shaping (smaller)
 
 41% of the audited cargo output was warnings/Compiling boilerplate repeated
-verbatim across runs. A run_command-focused Plugin could strip repeated
+verbatim across runs. A run_command-focused Middleware could strip repeated
 warning blocks (same hash as the previous run's) at the after-execution
 hook. Deferred: supersession (#2) removes most of the duplication for free;
 revisit only if post-#2 audits still show boilerplate crowding.

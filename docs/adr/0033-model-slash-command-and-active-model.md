@@ -22,8 +22,8 @@ orthogonal to this decision.
 **The Active Model is mutable Agent state** (CONTEXT.md: **Active Model**),
 seeded from the connection at launch and living beside the fixed Session facts
 like the Conversation does. A new `Command::SetModel(String)` on the
-`AgentHandle` swaps it. Each Turn captures the model when it begins, so a change
-lands on the **next Turn**; an in-flight Turn finishes on the model it started
+`AgentHandle` swaps it. Each Run captures the model when it begins, so a change
+lands on the **next Run**; an in-flight Run finishes on the model it started
 with. No mid-stream swap, no synchronization.
 
 **Only the model identifier changes.** The identifier is inert everywhere except
@@ -72,7 +72,7 @@ Re-selecting the current model is a no-op - no swap, no write, no warning.
 ## Consequences
 
 - The model leaves the Session's fixed-facts set; CONTEXT.md's Session and the
-  new Active Model entries reflect this. Every Turn reads the model from the
+  new Active Model entries reflect this. Every Run reads the model from the
   Agent's mutable state, not the frozen Session value.
 - ADR-0031 gains a cross-referenced amendment: `/model` may create `config.json`
   and writes the `model` key by sparse merge; `token` is still never written.
@@ -92,17 +92,17 @@ connection." Providers (ADR-0037) remove that premise, and with it two
 decisions here:
 
 - **"Only the model identifier changes" is superseded.** The Active Model
-  becomes a scoped `provider/model-id`, and each Turn captures the whole
+  becomes a scoped `provider/model-id`, and each Run captures the whole
   Model - window, output cap, pricing, compat - not just the id. The
   Context Budget, Result Cap, and Eviction reserve derive from that capture
-  at Turn start, so a cross-Provider switch lands as ordinary budget
-  pressure on the next Turn instead of a silent mismatch.
+  at Run start, so a cross-Provider switch lands as ordinary budget
+  pressure on the next Run instead of a silent mismatch.
 - **The registry rejection is reversed.** A generated Catalog (models.dev)
   is the source of truth for built-in Providers; the live `GET /models`
   listing this ADR built survives for custom Providers, whose Models are
   synthesized from discovery plus config.
 
 What survives unchanged: the Active Model as mutable Agent state beside the
-fixed Session facts, change-on-next-Turn semantics, no mid-stream swap, the
+fixed Session facts, change-on-next-Run semantics, no mid-stream swap, the
 no-op on re-selection, and the sticky sparse write of the `model` key (now
 scoped) with its env-shadow warning.

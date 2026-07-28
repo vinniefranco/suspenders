@@ -10,7 +10,7 @@ reqwest carries the transport, streaming the response body with `bytes_stream()`
 
 ## Error algebra
 
-The boundary **never returns `Err` and never panics** for transport or stream failures. Connection refused, a non-2xx status, an SSE parse failure, and mid-stream death all yield a Response carrying an `Error` stop_reason plus whatever partial content had streamed. Failure is data the Turn loop reads, not an exception it must catch.
+The boundary **never returns `Err` and never panics** for transport or stream failures. Connection refused, a non-2xx status, an SSE parse failure, and mid-stream death all yield a Response carrying an `Error` stop_reason plus whatever partial content had streamed. Failure is data the Run loop reads, not an exception it must catch.
 
 Considered and rejected:
 
@@ -32,7 +32,7 @@ Anthropic models endpoint" are one wire shape here - no protocol fork.
 
 Unlike `complete`, `list_models` returns `Result<Vec<String>, String>`
 rather than folding failure into a Response: it is a discrete,
-user-triggered query, not the streaming Turn loop, so a plain error the
+user-triggered query, not the streaming Run loop, so a plain error the
 caller surfaces as an info line is simpler than the error algebra. A
 server with no `/models` route (404) is just an `Err` the `/model`
 command reports; nothing changes.

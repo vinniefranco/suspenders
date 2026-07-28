@@ -1,7 +1,7 @@
 # Eviction overshoots to a low-water mark (hysteresis)
 
 We run against local inference servers where prompt prefix caching is the
-difference between a snappy Turn and seconds of prefill: the server reuses its
+difference between a snappy Run and seconds of prefill: the server reuses its
 KV cache up to the first token that differs from the previous request, and
 recomputes everything after. Eviction rewrites the contents of old Tool
 Results, so every elision invalidates the cache from that point on - usually
@@ -24,9 +24,9 @@ prefix cache wants. One wave pays one re-prefill and buys many cheap requests.
 - **Stop at the target (status quo).** Minimal information loss per request,
   maximal cache loss per Session. Rejected: the model can re-run a tool for
   an elided result, but nothing can un-pay a prefill.
-- **Evict whole Turns instead of Tool Results.** Coarser waves, but violates
+- **Evict whole Runs instead of Tool Results.** Coarser waves, but violates
   CONTEXT.md: Eviction targets only Tool Results; the user's instructions in
-  past Turns survive.
+  past Runs survive.
 - **Server-side cache-reuse only.** Some runtimes can salvage chunks after a
   divergence point by KV shifting, and users should enable it - but it is
   runtime-specific, degrades quality slightly (RoPE shift), and is not

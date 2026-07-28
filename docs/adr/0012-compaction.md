@@ -3,12 +3,12 @@
 Eviction (ADR-0006) avoids the Context Budget cliff by hollowing out old
 Tool Results. But when every evictable result is already elided and the
 Conversation still exceeds the budget, building a request fails with a
-context-budget-exhausted error - the Turn fails and the Session is dead.
+context-budget-exhausted error - the Run fails and the Session is dead.
 Small local models with tight context windows hit this cliff much sooner
 than large hosted models.
 
 Compaction is the second line of defense: before (or when) Eviction runs
-dry, call the LLM to summarize old Turns into a structured markdown
+dry, call the LLM to summarize old Runs into a structured markdown
 summary, then replace them in the Conversation. The summary captures
 what was accomplished, what decisions were made, and what files were
 touched, so the model can continue without the full verbatim history.
@@ -21,17 +21,17 @@ Eviction is purely mechanical - replace old tool result content with a
 fixed string - so it lives inside the Conversation as a pure function.
 Compaction requires calling the LLM to produce a semantic summary, which
 is an effect. It therefore lives in its own Compaction module, invoked
-through a method on the Turn's effect trait (the Deps trait, ADR-0011) by
+through a method on the Run's effect trait (the Deps trait, ADR-0011) by
 both paths.
 
 > Amended 2026-07-10: the proactive path originally ran on the Agent
-> actor at Turn start. That put a long LLM summarization call inside the
+> actor at Run start. That put a long LLM summarization call inside the
 > Agent's command handler - the first time a live Session actually
 > crossed the target, the synchronous summarization blocked the caller
 > until it timed out, and the Agent was deaf to cancel/status for the
-> whole call. Both paths now run INSIDE the spawned Turn task (a tokio
+> whole call. Both paths now run INSIDE the spawned Run task (a tokio
 > task), never on the Agent actor, through the same compaction method on
-> the Deps trait; the proactive check happens in the Turn loop before the
+> the Deps trait; the proactive check happens in the Run loop before the
 > first Pass. The Agent stays responsive to commands.
 
 The Conversation gains two pure helpers - one to prepare Compaction (find
@@ -45,12 +45,12 @@ two inline fields plus a closure.
 
 ### Two lines of defense
 
-1. **Proactive** (Turn start): before the Turn's first Pass, check
+1. **Proactive** (Run start): before the Run's first Pass, check
    whether the Conversation's token estimate already exceeds the
    Compaction Target. If so, compact now rather than risking a cliff
-   mid-Turn. (Amended 2026-07-10: runs in the Turn task, not the Agent,
+   mid-Run. (Amended 2026-07-10: runs in the Run task, not the Agent,
    see above.)
-2. **Reactive** (Turn loop): while building a request, when request
+2. **Reactive** (Run loop): while building a request, when request
    construction returns context-budget-exhausted, invoke the Deps
    compaction method and retry. If Compaction also fails, the budget is
    truly exhausted.
@@ -58,7 +58,7 @@ two inline fields plus a closure.
 ### The cut point reuses the Eviction slack (superseded by ADR-0013)
 
 > Superseded 2026-07: sharing one knob made the post-compaction size sit
-> at the trigger line, so Compaction re-fired at nearly every Turn
+> at the trigger line, so Compaction re-fired at nearly every Run
 > boundary. The keep level is now its own knob, the Compaction Keep,
 > decoupled from the trigger ("fire high, keep low"). See ADR-0013.
 
@@ -74,14 +74,14 @@ Eviction's hysteresis and Compaction's recency. A user who sets the
 Eviction slack to 0.0 gets maximal Compaction - only the reply reserve
 survives.
 
-The cut point is always adjusted backward to the nearest turn-start user
-message (one whose first content block is text), so no Turn is split
+The cut point is always adjusted backward to the nearest run-start user
+message (one whose first content block is text), so no Run is split
 across the Compaction boundary.
 
-### Silent LLM call: Compaction bypasses the Turn loop
+### Silent LLM call: Compaction bypasses the Run loop
 
 The Deps compaction method calls the LLM completion path directly - not
-through a Turn - so the user never sees a "compacting..." phase in the
+through a Run - so the user never sees a "compacting..." phase in the
 Transcript. The Compaction request has no Tools and uses a dedicated
 system prompt.
 
@@ -95,8 +95,8 @@ Compaction has full file context.
 
 ### Session Log interaction
 
-Both Compaction paths (Proactive at Turn start and Reactive at the budget
-cliff, both via the Deps compaction method in the Turn task) write a
+Both Compaction paths (Proactive at Run start and Reactive at the budget
+cliff, both via the Deps compaction method in the Run task) write a
 compaction entry - summary, skip count, tokens before, file ops, original
 task - to the Session Log. The summary is the model's narrative ALONE;
 the mechanical facts (file ops, original task) ride as their own elements

@@ -14,7 +14,7 @@ carry the pure semantics:
 
 - `ui/markdown` folds assistant text into `MdLine`/`MdStyle` (pure, tested);
 - `LineStyle`/`StyledLine` (defined in `ui/transcript`) is the ADR-0008 Block
-  vocabulary a Plugin composes within.
+  vocabulary a Presenter composes within.
 
 Everything left in `ui/components::message_lines` is one of two things, and
 neither wants a new module:
@@ -36,25 +36,25 @@ ratatui paints - the bug the current design exists to prevent.
 
 Do not read the "extraction comes back shallow" verdict above as a claim that
 the whole display path is shallow. It is not. **Presentment** - the
-`Plugin::present` seam (`TranscriptItem -> TranscriptItem`, folded across every
-Plugin in `plugins::present`) - is a genuinely DEEP seam and is deliberately
+`Presenter::present` seam (`TranscriptItem -> TranscriptItem`, folded across every
+Presenter in `extensions::present`) - is a genuinely DEEP seam and is deliberately
 kept intact for the opposite reason the extractions are rejected.
 
-Run the deletion test on it: delete `Plugin::present` and every Plugin must
-emit ratatui `Line`s directly, `StyledLine` reappears inside each Plugin, the
-Presentment substitution logic (the diff Plugin swapping a Tool Result summary
+Run the deletion test on it: delete `Presenter::present` and every Presenter must
+emit ratatui `Line`s directly, `StyledLine` reappears inside each Presenter, the
+Presentment substitution logic (the diff Presenter swapping a Tool Result summary
 for a `Block`) duplicates across every site, and the panic-isolation that keeps
-one Plugin's failure off the Transcript fragments. Complexity cascades across N
-Plugins - the mark of a seam earning its keep, one semantic contract serving
-all Plugins with colors living in one place (ADR-0019).
+one Presenter's failure off the Transcript fragments. Complexity cascades across N
+Presenters - the mark of a seam earning its keep, one semantic contract serving
+all Presenters with colors living in one place (ADR-0019).
 
 The distinction that matters:
 
-- The `Plugin::present` **interface** is a deep seam Plugins participate in
+- The `Presenter::present` **interface** is a deep seam Presenters participate in
   WITHOUT touching ratatui - keep it.
 - The **vocabulary** it speaks (`LineStyle`/`StyledLine`, the `Block`) stays in
-  the core because Plugins READ it, not export it. Lifting the vocabulary into
-  its own module would scatter it across Plugins and tests and breach the
+  the core because Presenters READ it, not export it. Lifting the vocabulary into
+  its own module would scatter it across Presenters and tests and breach the
   ADR-0019 confinement - the same shallow move this ADR rejects for
   `message_lines`.
 

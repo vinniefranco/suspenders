@@ -32,7 +32,7 @@ ADR-0009's re-issue path.
 Compaction's trigger and its keep level are decoupled. ADR-0012 derived
 both from the single Eviction low-water mark, which made every
 post-compaction Conversation sit at the trigger line: Compaction re-fired
-at nearly every Turn boundary, each time summarizing a thin slice and
+at nearly every Run boundary, each time summarizing a thin slice and
 paying an LLM call plus a full prefix cache invalidation. Now the trigger
 stays at the low-water mark while the Compaction Keep is its own knob
 (default ~0.5 of the live window), so Compactions arrive rarely, each

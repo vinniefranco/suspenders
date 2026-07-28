@@ -7,7 +7,7 @@ fixture, the observed failure, the tweak, the N=5 confirmation, the verdict.
 The loop:
 - **Drive** - fixture in `/tmp` as a git repo; run headless.
 - **Vet** - stdout + Session Log + `git diff` + frontier-grade judgment;
-  "did it finish / burn turns / was the code good."
+  "did it finish / burn runs / was the code good."
 - **Tune** - whatever surface the vet points at: Setpoints, Voice, Anchor
   structure, Tool shape, Governor behavior.
 - **Repeat** - N=5 before a tweak is credited; `git reset --hard && git

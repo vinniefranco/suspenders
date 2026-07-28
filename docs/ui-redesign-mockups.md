@@ -11,14 +11,14 @@ since ASCII can't carry them.
 
 - **Your voice sits at the margin.** A prompt is `› ` flush-left, bold in the
   prompt-gutter color. That is the only thing at column 0 with no spine.
-- **The agent's turn is one lane.** Everything the agent produces in a turn —
+- **The agent's run is one lane.** Everything the agent produces in a run —
   thinking, tool machinery, the answer — hangs off a single dim vertical spine
-  `│` at column 0. A turn reads as one object; your prompts break the spine.
-  (This needs turn-boundary awareness in the renderer — an ADR, see below.)
+  `│` at column 0. A run reads as one object; your prompts break the spine.
+  (This needs run-boundary awareness in the renderer — an ADR, see below.)
 - **Two planes inside the lane.** Foreground = the answer prose (full color) and
   errors (red+bold). Background = tool machinery (`⋯`, dim) and thinking (`✦`,
   dim italic). Motion and the answer are the only things that pull the eye.
-- **Live reasoning is content, not a metric.** A running turn streams the last
+- **Live reasoning is content, not a metric.** A running run streams the last
   few reasoning lines as a rolling tail under an animated `✦ Thinking` header.
   The braille spinner animates *here*, at the brain, not in the status bar.
 - **Detail on demand.** Settled thinking collapses to a one-liner (Ctrl-T
@@ -77,7 +77,7 @@ the composer takes (current behavior, kept).
 
 ---
 
-## 3. Turn running — the hero shot (live reasoning + tools)
+## 3. Run running — the hero shot (live reasoning + tools)
 
 ```
  › split the token loop into its own function and keep
@@ -101,13 +101,14 @@ where your cursor sits. Older reasoning lines scroll up off the tail. The status
 bar mode block is now a static `● RUNNING` (dot, no motion). The composer stays
 live so you can steer without the thinking moving away from you.
 
+
 Decision A (RESOLVED): short tail — header + last ~3 reasoning lines.
 Decision B (RESOLVED): reasoning rows indent 2 cols under the `✦ Thinking`
 header (a sub-block off the spine), not flush at the tool indent.
 
 ---
 
-## 4. Turn running — answer streaming, thinking collapsed above
+## 4. Run running — answer streaming, thinking collapsed above
 
 ```
  › split the token loop into its own function …
@@ -132,7 +133,7 @@ spans (`Tokenizer::next`) keep the code color.
 
 ---
 
-## 5. Settled turn — at rest
+## 5. Settled run — at rest
 
 ```
  › split the token loop into its own function …
@@ -198,7 +199,7 @@ text under the `✦ Thinking` header). Toggle is global, matches today.
  › ▏
 ```
 
-Caption: Ctrl-O expands machinery. A write shows its diff (the diff Plugin's
+Caption: Ctrl-O expands machinery. A write shows its diff (the diff Presenter's
 Block via Presentment) with added/removed/context colors, indented under the
 spine. Read/grep stay one-liners (nothing to expand).
 
@@ -296,7 +297,7 @@ are skipped by the cursor.
 
 ---
 
-## 12. Error — a failed tool in a turn
+## 12. Error — a failed tool in a run
 
 ```
  › make it build
@@ -318,7 +319,7 @@ The failing detail line rides directly under it.
 
 ---
 
-## 13. Steering while a turn runs
+## 13. Steering while a run runs
 
 ```
  › split the token loop …
@@ -332,7 +333,7 @@ The failing detail line rides directly under it.
  › also keep the old fn as a deprecated shim▏
 ```
 
-Caption: you type into the composer while the turn runs. Steering doesn't
+Caption: you type into the composer while the run runs. Steering doesn't
 interrupt — it joins the Conversation after the in-flight response/tools finish
 (CONTEXT.md: Steering). On submit it drops a `↳ queued: …` marker into the lane
 (decision F, RESOLVED: visible), which clears when the steering actually lands.
@@ -365,7 +366,7 @@ The thinking tail keeps animating; your draft sits calmly below it.
 Caption: every harness action leaves a distinct-glyph trace in the lane
 (decision G, RESOLVED: all visible). Compaction = `⟨ compacted N → summary ⟩`,
 eviction = `✂ evicted N stale tool results`, plus the Governor interventions —
-`⚑ plan refreshed`, `⊘ tools narrowed to run_command`, `↺ recovery turn` — each
+`⚑ plan refreshed`, `⊘ tools narrowed to run_command`, `↺ recovery run` — each
 its own glyph. Distinct glyphs, all in the muted marker color so they read as
 one "harness voice" plane, legible but not shouting. The token gauge still
 carries the quantitative story (`▓▓▓▓ 22% dead`).
@@ -381,7 +382,7 @@ Decision I (RESOLVED): markers stay INLINE in chronological order — warmth nev
 groups or reorders them, it only tints the line. Three tints: housekeeping
 (eviction, compaction, cap-cuts) = neutral gray; a Governor that AIDS the model
 (nudge, plan refresh, recovery) = warm amber (not red); a Governor that
-CONSTRAINS it (tool-narrow, turn-close) = cool blue (not green). Steering
+CONSTRAINS it (tool-narrow, run-close) = cool blue (not green). Steering
 (`↳ queued`) wears the prompt color — the user's voice, never the harness.
 
 Mechanism: every marker is already a `TranscriptItem::Info` (steering, eviction,
@@ -391,7 +392,7 @@ sniffing text. Growing the item vocabulary at ADR-0008's deliberate chokepoint;
 enrolls in the prefix-or-bump property test (ADR-0034).
 
 Proposed glyphs (tunable): `✂` evict · `⟨ ⟩` compact · `»` nudge · `⚑` plan
-refresh · `⊘` tools narrowed · `▪` turn closed · `↺` recovery · `↳` steering.
+refresh · `⊘` tools narrowed · `▪` run closed · `↺` recovery · `↳` steering.
 
 ---
 
@@ -431,7 +432,7 @@ tone }` and `enum Tone { Housekeeping, Aid, Constrain, Steering, Plain }`. Tone
 stamped on the marker-bearing Events at the firing site; Screen copies onto the
 Marker item; adapter never classifies (ADR-0026). Re-point the Steering removal
 anchor from `Anchor::Info` to match `Marker` (keep `pending_steering_line` the
-sole author). Keep `plugin_failure` as `Info` on the Presentment-bypass path.
+sole author). Keep `extension_failure` as `Info` on the Presentment-bypass path.
 Default tone on Session-Log decode so old logs resume. Enroll the new/changed
 verbs in the prefix-or-bump property test; markers append (`bumps == 2` holds).
 One commit — all layers green together.
@@ -456,7 +457,7 @@ soft-wrapped continuations keep the spine. Never touch the RenderCache key or
 **Stage 4a — Bare code blocks.** `components.rs` `markdown_lines`. Additive inset
 padding + blank line above/below; syntect stays. No box/gutter.
 
-**Stage 4b — Minimal diffs (PURE PLUGIN).** `plugins/diff/display.rs` + its tests.
+**Stage 4b — Minimal diffs (PURE PRESENTER).** `extensions/diff/display.rs` + its tests.
 Drop the line-number `pad` column; keep the `@@` hunk header and added/removed/
 context semantic colors. Different file from the components chain.
 

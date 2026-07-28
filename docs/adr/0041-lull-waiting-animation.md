@@ -1,9 +1,9 @@
-# The Lull: a whimsical waiting animation for the quiet of a running Turn
+# The Lull: a whimsical waiting animation for the quiet of a running Run
 
-ADR-0040 made a running Turn a visual object: live reasoning streams as a
+ADR-0040 made a running Run a visual object: live reasoning streams as a
 `✦ Thinking` tail under the lane spine, and the running spinner moved from the
-status bar to that brain. But a Turn is not always streaming. Against a slow
-local model there are long stretches where the Turn is running yet nothing
+status bar to that brain. But a Run is not always streaming. Against a slow
+local model there are long stretches where the Run is running yet nothing
 streams - waiting on the first token, or a tool executing. ADR-0040's screen
 shows only a still lane and a motionless status dot: indistinguishable, at a
 glance, from a hung process. This ADR records the Lull - the animation that
@@ -11,22 +11,22 @@ fills that silence - and the decisions that keep it cheap, safe, and determinist
 
 ## Decision
 
-**A Lull is a quiet stretch WITHIN a running Turn - not the Agent being Idle.**
-The word matters: `Status::Idle` already means "no Turn running", and the status
-bar has an idle segment. The Lull is the opposite - the Turn *is* running, it is
+**A Lull is a quiet stretch WITHIN a running Run - not the Agent being Idle.**
+The word matters: `Status::Idle` already means "no Run running", and the status
+bar has an idle segment. The Lull is the opposite - the Run *is* running, it is
 just momentarily silent. The naming is pinned in CONTEXT.md so the distinction
 does not erode.
 
 **The Lull row is a third live entry, hanging off the lane.** Like the reasoning
 tail and the streaming answer, it is appended at render time under the running
-Turn's `│` spine, indented two columns as a sub-block. It draws only when the Turn
+Run's `│` spine, indented two columns as a sub-block. It draws only when the Run
 is Running AND neither a reasoning tail nor a streaming answer is on screen. That
 gate is exactly `!has_live_stream()` - one predicate on the Screen (reasoning OR
 answer text streaming) that BOTH the render gate and the adapter's lull clock read,
 so the two can never disagree about whether a Lull is happening.
 
 **The clock is tick-counted, never wall-clock.** The adapter already ticks ~10fps
-and repaints while a Turn runs (ADR-0040's spinner). The Lull rides that same tick:
+and repaints while a Run runs (ADR-0040's spinner). The Lull rides that same tick:
 a `quiet_ticks` counter resets whenever output streams and increments on every
 quiet tick; a `lull_seq` counter bumps on each 0→1 edge (a new Lull begins). No
 `Instant`, no timer thread - the codebase bans `Date::now`/`rand`-style
