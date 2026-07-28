@@ -39,6 +39,40 @@ column), unifying the user `›` gutter and the agent `│` spine. Content wraps
 is measured at the reduced width; lane membership is computed in the viewport's
 assembly pass, never inside `message_lines` and never in the RenderCache key.
 
+**A collapsed lane is a rolling window, not the full transcript** (design
+confirmed hands-on against a live demo buffer, `Screen::demo()` / the
+`dump_demo_render` test - the living spec). By default (thinking and tools
+collapsed) a lane folds to a tidy, scannable shape via a render-time
+`turn_fold` pass over the item sequence (`FoldAction { Keep, Drop, Header, Elided }`):
+
+- **The reasoning folds to ONE header: the LAST thought's text at the FIRST
+  thought's slot.** The intervening thoughts `Drop`. This departs from the
+  mockups' Decision C ("grouped, thinking-first, thinking stays in one place"):
+  hands-on, the *latest* thought is the one worth surfacing (it reflects where
+  the agent's reasoning landed), and a single header at the top of the turn reads
+  far denser than a preserved thinking block. Ctrl-T (`thinking_expanded`)
+  disables the fold and shows every thought.
+- **Low-signal machinery is a rolling window of the last `MACHINERY_WINDOW`
+  (=4).** Non-error `ToolResult`/`ToolCall` one-liners older than the window
+  `Drop`, replaced by a single `⋯ N earlier actions · ^O expand` count
+  (`Elided(n)`) at the first windowed-out slot - a fold never *silently* hides
+  work. Ctrl-O (`tools_expanded`) disables the window and shows every action.
+- **Errors, code/diff `Block`s, markers, assistant text and prompts always
+  `Keep` - they break out** of both folds and are always shown. An error tool
+  result is the one machinery item that stays foreground (red+bold, `⚙`, always
+  a `✗`); code and diffs would be mangled by windowing.
+- Each lane folds independently (delimited by `User` items).
+
+**Flush vs. indent, and a dense spine.** The thought header and assistant text
+sit FLUSH against the spine (`│ ` then content at column 0 of the content area);
+tool machinery, markers, the `⋯ N earlier actions` count, and errors INDENT two
+columns (a block indent, so a wrapped continuation stays at column 2, not the
+margin - ratatui's `Wrap` has no hanging indent, so the machinery/marker arms
+pre-word-wrap to `content_width - 2` and prefix every visual row). The lane is
+DENSE: there is NO per-item blank separator row (an earlier design appended one),
+so the `│` spine is continuous down the whole turn - the two-planes coloring, not
+whitespace, separates a turn's parts.
+
 **Harness events form one tinted marker plane, tone stamped at the firing site.**
 Every Suspenders-authored marker carries a semantic tone: Housekeeping (eviction,
 compaction, result-cap cuts), Aid (a Governor that helps the model - nudge,
@@ -105,6 +139,18 @@ the brain, not the bar). This
 redesign also carries one adjacent pure-core change that is NOT adapter-local: the
 diff Plugin drops its line-number gutter (`plugins/diff/display.rs`), a change to
 what the Plugin chooses to show (ADR-0008 leaves that to the Plugin) with its own
-tests. Cross-reference ADR-0029: the lane and tail land in `components.rs`, which
-0029 twice refused to split past semantic lines - the added code is not a signal
-to extract a `TranscriptItem`-to-line builder.
+tests. Cross-reference ADR-0029: the lane, tail, and the `turn_fold` collapse all
+land in `components.rs`, which 0029 twice refused to split past semantic lines -
+the added code is not a signal to extract a `TranscriptItem`-to-line builder.
+
+The collapsed fold is a display-time projection over the flat store, entirely
+adapter-local and reversible: the store keeps every thought and action, and the
+two toggles (Ctrl-T, Ctrl-O) reveal them. The confirmed shape is pinned by
+`Screen::demo()` and the `dump_demo_render` / `the_demo_render_matches_...` tests,
+which are the living spec (a future `--demo` CLI may surface the same buffer);
+change the fold rules and those tests change with them. The one hazard the fold
+adds is measure==draw: the synthetic header/count lines and the pre-word-wrapped
+machinery/marker rows must each be `<= content_width` so the viewport never
+re-wraps them, or `wrapped_count` desyncs from the drawn rows and the gutter slides
+off its content (ADR-0029). That invariant is unit-tested at the `wrap_words` /
+`indented_lines` seam and pinned end-to-end by the dense-spine render test.
