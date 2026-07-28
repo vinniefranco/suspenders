@@ -88,27 +88,17 @@ fn hunk_lines(hunk: &Hunk, created: bool) -> Vec<StyledLine> {
     }
 }
 
-// One number column: removed lines show their old-file number, everything else
-// the new-file number. The +/- markers survive without color.
+// Minimal diff lines (ADR-0040 Decision D): the `+`/`-`/context markers carry
+// the change and the semantic [`LineStyle`] carries the color, while the
+// `@@ … @@` hunk header carries the location - so the line-number gutter is
+// dropped. This is a Plugin display choice (ADR-0008: the Plugin decides WHAT
+// to show; the adapter maps the style to a color).
 fn display_line(line: &Line) -> StyledLine {
     match line.tag {
-        Tag::Context => StyledLine::new(
-            LineStyle::Context,
-            format!("{}   {}", pad(line.new.unwrap_or(0)), line.text),
-        ),
-        Tag::Added => StyledLine::new(
-            LineStyle::Added,
-            format!("{} + {}", pad(line.new.unwrap_or(0)), line.text),
-        ),
-        Tag::Removed => StyledLine::new(
-            LineStyle::Removed,
-            format!("{} - {}", pad(line.old.unwrap_or(0)), line.text),
-        ),
+        Tag::Context => StyledLine::new(LineStyle::Context, format!("  {}", line.text)),
+        Tag::Added => StyledLine::new(LineStyle::Added, format!("+ {}", line.text)),
+        Tag::Removed => StyledLine::new(LineStyle::Removed, format!("- {}", line.text)),
     }
-}
-
-fn pad(line_no: usize) -> String {
-    format!("{line_no:>4}")
 }
 
 #[cfg(test)]
@@ -172,7 +162,7 @@ mod tests {
             created: true,
         };
         let lines = lines(&diff, DISPLAY_LINES);
-        assert_eq!(lines, vec![StyledLine::new(LineStyle::Added, "   1 + a")]);
+        assert_eq!(lines, vec![StyledLine::new(LineStyle::Added, "+ a")]);
     }
 
     #[test]

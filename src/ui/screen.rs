@@ -38,7 +38,7 @@ use crate::event::Event;
 use crate::llm::response::StopReason;
 use crate::plugins::Registered;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
-use crate::ui::transcript::Transcript;
+use crate::ui::transcript::{Tone, Transcript};
 
 /// The greeting line a fresh Screen opens its Transcript with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
@@ -293,9 +293,11 @@ impl Screen {
 
     // ---- Agent events ------------------------------------------------------
 
-    /// Folds one [`Event`] into the Screen. The event vocabulary is
-    /// enumerated in [`crate::event`]; unknown events are ignored (a new event
-    /// must not break an old subscriber).
+    /// Folds one [`Event`] into the Screen. The event vocabulary is enumerated
+    /// in [`crate::event`] and this dispatch is EXHAUSTIVE over it: every
+    /// variant names a family (the Composer-consumed selector fills reach an
+    /// explicit no-op arm), so a new event kind is a compile error here until
+    /// it is placed - it can never silently fall through.
     pub fn apply_event(mut self, event: Event) -> (Self, Vec<Effect>) {
         // The Composer gets first refusal on events too (ADR-0034): the
         // overlay-filling deliveries (SelectorReady/SelectorFailed) are its
@@ -340,14 +342,21 @@ impl Screen {
             | Event::VerificationPass { .. }
             | Event::FinalPass { .. }
             | Event::RecoveryTurn { .. }
+            | Event::Anchor { .. }
+            | Event::ToolsNarrowed { .. }
             | Event::Retry { .. }) => self.apply_voice(event),
 
             event @ (Event::TurnFinished { .. }
             | Event::TurnCancelled
             | Event::TurnError { .. }) => self.apply_settlement(event),
 
-            // Unknown / display-irrelevant events are ignored.
-            _ => (self, vec![]),
+            // The selector fills are the Composer's own (ADR-0034): they are
+            // consumed by `self.composer.apply_event` at the top of this fold
+            // (line 304) and never reach this dispatch. Listed explicitly, with
+            // no wildcard, so the match stays EXHAUSTIVE over the Event
+            // vocabulary - a future variant is a compile error here, not a
+            // silent fallthrough.
+            Event::SelectorReady { .. } | Event::SelectorFailed { .. } => (self, vec![]),
         }
     }
 
@@ -420,13 +429,15 @@ impl Screen {
             // from this - it tracks the LIVE Dead Mass off `ContextPressure`,
             // and this wave has just cleared what it found.
             Event::EvictionWave { stats } => {
-                self.transcript.info(eviction_wave_line(&stats));
+                self.transcript
+                    .marker(eviction_wave_line(&stats), Tone::Housekeeping);
                 (self, vec![])
             }
 
-            // Compaction made progress: recede one Info line.
+            // Compaction made progress: recede one Housekeeping marker.
             Event::CompactionProgress { status } => {
-                self.transcript.info(format!("compaction: {status}"));
+                self.transcript
+                    .marker(compaction_line(&status), Tone::Housekeeping);
                 (self, vec![])
             }
 
@@ -532,9 +543,13 @@ impl Screen {
     // info line - the Session Log failure, the Nudges and Endgame riders, the
     // Recovery Turn prompt, and the bounded re-draw marks.
     fn apply_voice(mut self, event: Event) -> (Self, Vec<Effect>) {
+        // The rider's marker-plane tone (ADR-0040) is decided at the firing
+        // site ([`VoicedTag::tone`]) and recovered here BEFORE the match moves
+        // the event - the Screen carries it, it never classifies.
+        let rider_tone = event.voiced_tone();
         match event {
             // The Session Log died (IO failure); the Session continues
-            // unpersisted.
+            // unpersisted. Adapter news, not a harness marker - stays Info.
             Event::SessionLogError { message } => {
                 self.transcript.info(format!(
                     "session log failed ({message}); this session will not resume"
@@ -543,7 +558,9 @@ impl Screen {
             }
 
             // A Nudge / Endgame rider entered the Conversation; it is always
-            // visible, so the Transcript shows it as an info line.
+            // visible, so the Transcript shows it as a toned marker. The glyph
+            // rides the authored display line ([`marker_glyph`]), so the
+            // adapter tints by tone alone and never sniffs the text.
             Event::VerifyNudge { text }
             | Event::VerifyFailedNudge { text }
             | Event::EmptyResponseNudge { text }
@@ -551,16 +568,44 @@ impl Screen {
             | Event::WrapUpWarning { text }
             | Event::VerificationPass { text }
             | Event::FinalPass { text } => {
-                self.transcript.info(text);
+                // Every variant in this arm is a voiced rider, so
+                // `voiced_tone` returned `Some` above; asserting it here turns a
+                // future drift (a rider added to this arm but not to
+                // `voiced_tone`) into a test failure instead of a silently
+                // mistinted (Plain) marker (LOW-1).
+                let tone = rider_tone.expect("a voiced rider must carry a tone");
+                self.transcript.marker(marker_line(tone, &text), tone);
                 (self, vec![])
             }
 
             // A Recovery Turn opened: its Voice prompt entered the
-            // Conversation, so the Transcript shows it like every Nudge.
+            // Conversation, so the Transcript shows it like every Nudge - a
+            // Governor aiding the model, so an Aid-toned marker.
             Event::RecoveryTurn { text, .. } => {
-                self.transcript.info(text);
+                self.transcript
+                    .marker(marker_line(Tone::Aid, &text), Tone::Aid);
                 self.status = Status::Running;
                 (self, vec![Effect::PinBottom])
+            }
+
+            // The anchor Governor refreshed the Plan (CONTEXT.md: Anchor): the
+            // Session Log holds the full anchor block the model read; the
+            // Transcript shows only a concise Aid marker, never the plan body.
+            // The `⚑` glyph is intrinsic to this marker, so it is baked into
+            // the fixed wording rather than derived from the tone.
+            Event::Anchor { .. } => {
+                self.transcript.marker("⚑ plan refreshed", Tone::Aid);
+                (self, vec![])
+            }
+
+            // The Endgame narrowed the Offer (CONTEXT.md: Endgame): a Governor
+            // limiting the model, so a Constrain marker. The `⊘` glyph is
+            // intrinsic here; the wording names the surviving tools, or reads
+            // "withdrawn" when the final Pass offers none.
+            Event::ToolsNarrowed { tools } => {
+                self.transcript
+                    .marker(tools_narrowed_line(&tools), Tone::Constrain);
+                (self, vec![])
             }
 
             // A malformed-tool-call re-draw (ADR-0030): silent to the model's
@@ -872,9 +917,54 @@ fn eviction_wave_line(stats: &WaveStats) -> String {
         .collect();
     let pct = dead_mass_pct(stats.dead_mass);
     if parts.is_empty() {
-        format!("context wave · {pct}% dead mass")
+        format!("✂ context wave · {pct}% dead mass")
     } else {
-        format!("context wave · {pct}% dead mass · {}", parts.join(", "))
+        format!("✂ context wave · {pct}% dead mass · {}", parts.join(", "))
+    }
+}
+
+// One Compaction-progress marker line (CONTEXT.md: Compaction). The `⟨ … ⟩`
+// glyph pair marks it as a summary fold in the Housekeeping plane (ADR-0040),
+// distinct from the `✂` eviction glyph; the tint comes from the tone, never
+// from this text.
+fn compaction_line(status: &str) -> String {
+    format!("⟨ compaction: {status} → summary ⟩")
+}
+
+// One tools-narrowed marker line (CONTEXT.md: Endgame, Offer): the `⊘` glyph
+// then the surviving tool names, or "withdrawn" when the final Pass offers
+// none. The glyph is intrinsic to this Constrain marker, so it lives in the
+// text rather than in `marker_glyph`; the tint still comes from the tone.
+fn tools_narrowed_line(tools: &[String]) -> String {
+    if tools.is_empty() {
+        "⊘ tools withdrawn".to_string()
+    } else {
+        format!("⊘ tools narrowed to {}", tools.join(", "))
+    }
+}
+
+// The marker-plane glyph the Screen's display Voice prefixes to a toned line
+// (ADR-0040), chosen by TONE so the adapter tints by tone alone and never
+// reads the text. Aid riders (Nudges, Recovery) wear `»`/`↺`-family warmth via
+// `»`; the Endgame's turn-closing Constrain riders wear `▪`. Housekeeping and
+// Steering author their own glyphs at their own sites (`✂`/`⟨⟩`, `↳`).
+fn marker_glyph(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Aid => "»",
+        Tone::Constrain => "▪",
+        Tone::Housekeeping | Tone::Steering | Tone::Plain => "",
+    }
+}
+
+// A toned marker's display line: the tone's glyph (when it carries one) then
+// the authored text. Kept beside `marker_glyph` so the glyph choice and the
+// spacing live in one place.
+fn marker_line(tone: Tone, text: &str) -> String {
+    let glyph = marker_glyph(tone);
+    if glyph.is_empty() {
+        text.to_string()
+    } else {
+        format!("{glyph} {text}")
     }
 }
 
@@ -883,7 +973,7 @@ mod tests {
     use super::*;
     use crate::content::ContentBlock;
     use crate::event::Stage;
-    use crate::ui::transcript::TranscriptItem;
+    use crate::ui::transcript::{Tone, TranscriptItem};
     use std::collections::HashMap;
 
     // --- helpers mirroring transcript_test.exs -----------------------------
@@ -954,6 +1044,12 @@ mod tests {
     }
     fn info(text: &str) -> TranscriptItem {
         TranscriptItem::Info { text: text.into() }
+    }
+    fn marker(text: &str, tone: Tone) -> TranscriptItem {
+        TranscriptItem::Marker {
+            text: text.into(),
+            tone,
+        }
     }
 
     fn text_block(text: &str) -> ContentBlock {
@@ -1270,65 +1366,119 @@ mod tests {
             crate::event::VoicedTag::VerifyNudge,
             "[files changed but not verified]",
         ));
+        // A Nudge is a Governor aiding the model: an Aid marker with the `»`
+        // glyph, after the materialized assistant text.
         assert_eq!(
             items(&t),
             vec![
                 assistant("all done"),
-                info("[files changed but not verified]")
+                marker("» [files changed but not verified]", Tone::Aid)
             ]
         );
         assert_eq!(effects, vec![]);
     }
 
     #[test]
-    fn recovery_turn_shows_its_prompt_as_info_and_marks_running() {
+    fn recovery_turn_shows_its_prompt_as_an_aid_marker_and_marks_running() {
         let prompt = crate::voice::recovery_prompt(true);
         let (t, effects) = fresh().apply_event(Event::recovery_turn(
             crate::session::RecoveryShape::Handoff,
             prompt,
         ));
-        assert_eq!(items(&t), vec![info(prompt)]);
+        assert_eq!(items(&t), vec![marker(&format!("» {prompt}"), Tone::Aid)]);
         assert_eq!(t.status, Status::Running);
         assert_eq!(effects, vec![Effect::PinBottom]);
     }
 
+    // A Plan refresh (CONTEXT.md: Anchor) shows a CONCISE Aid marker, never the
+    // plan body: the full anchor text stays on the Session-Log emit seam.
     #[test]
-    fn wrap_up_warning_shows_as_info_line() {
+    fn an_anchor_shows_a_concise_plan_refreshed_aid_marker() {
+        let full_anchor = "[anchor - current goal and plan]\n\nOriginal task:\nfix it\n\n\
+                           Current plan:\n- step one\n- step two";
+        let (t, effects) = fresh().apply_event(Event::anchor(full_anchor));
+        assert_eq!(effects, vec![]);
+        // The concise marker, not the plan body.
+        assert_eq!(items(&t), vec![marker("⚑ plan refreshed", Tone::Aid)]);
+        let TranscriptItem::Marker { text, .. } = &items(&t)[0] else {
+            panic!("expected a Marker");
+        };
+        assert!(
+            !text.contains("step one"),
+            "the plan body must not reach the Transcript"
+        );
+    }
+
+    // The Endgame narrowing to run_command (the Verification Pass) shows a
+    // Constrain marker naming the surviving tool.
+    #[test]
+    fn tools_narrowed_to_a_tool_shows_a_constrain_marker() {
+        let (t, effects) =
+            fresh().apply_event(Event::tools_narrowed(vec!["run_command".to_string()]));
+        assert_eq!(effects, vec![]);
+        assert_eq!(
+            items(&t),
+            vec![marker("⊘ tools narrowed to run_command", Tone::Constrain)]
+        );
+    }
+
+    // The final Pass withdraws every Tool (empty narrowing): the Constrain
+    // marker reads "withdrawn", not an empty "narrowed to ".
+    #[test]
+    fn tools_withdrawn_on_the_final_pass_shows_a_constrain_marker() {
+        let (t, effects) = fresh().apply_event(Event::tools_narrowed(vec![]));
+        assert_eq!(effects, vec![]);
+        assert_eq!(items(&t), vec![marker("⊘ tools withdrawn", Tone::Constrain)]);
+    }
+
+    #[test]
+    fn wrap_up_warning_shows_as_a_constrain_marker() {
         let warning = crate::voice::wrap_up_warning(2);
         let (t, effects) = fresh().apply_event(Event::voiced(
             crate::event::VoicedTag::WrapUpWarning,
             warning.clone(),
         ));
-        assert_eq!(items(&t), vec![info(&warning)]);
+        // The Endgame turn-close schedule limits the model: a Constrain marker.
+        assert_eq!(
+            items(&t),
+            vec![marker(&format!("▪ {warning}"), Tone::Constrain)]
+        );
         assert_eq!(effects, vec![]);
     }
 
     #[test]
-    fn verification_pass_shows_as_info_line() {
+    fn verification_pass_shows_as_a_constrain_marker() {
         let prompt = crate::voice::verification_pass_prompt();
         let (t, effects) = fresh().apply_event(Event::voiced(
             crate::event::VoicedTag::VerificationPass,
             prompt,
         ));
-        assert_eq!(items(&t), vec![info(prompt)]);
+        assert_eq!(
+            items(&t),
+            vec![marker(&format!("▪ {prompt}"), Tone::Constrain)]
+        );
         assert_eq!(effects, vec![]);
     }
 
-    // The remaining voiced riders - the corrective tags beyond the three
-    // pinned above - each land as ONE info line with no effects, through the
-    // same shared arm.
+    // The remaining voiced riders each land as ONE toned marker with no
+    // effects, through the same shared arm: the corrective Nudges are Aid
+    // (`»`), the Endgame's FinalPass is Constrain (`▪`).
     #[test]
-    fn the_remaining_voiced_riders_show_as_info_lines() {
+    fn the_remaining_voiced_riders_show_as_toned_markers() {
         use crate::event::VoicedTag;
-        for tag in [
-            VoicedTag::VerifyFailedNudge,
-            VoicedTag::EmptyResponseNudge,
-            VoicedTag::ExploreNudge,
-            VoicedTag::FinalPass,
+        for (tag, tone, glyph) in [
+            (VoicedTag::VerifyFailedNudge, Tone::Aid, "»"),
+            (VoicedTag::EmptyResponseNudge, Tone::Aid, "»"),
+            (VoicedTag::ExploreNudge, Tone::Aid, "»"),
+            (VoicedTag::FinalPass, Tone::Constrain, "▪"),
         ] {
             let (t, effects) = fresh().apply_event(Event::voiced(tag, "[rider text]"));
             assert_eq!(effects, vec![], "{tag:?} minted effects");
-            assert_eq!(items(&t), vec![info("[rider text]")], "{tag:?}");
+            assert_eq!(
+                items(&t),
+                vec![marker(&format!("{glyph} [rider text]"), tone)],
+                "{tag:?}"
+            );
         }
     }
 
@@ -1426,20 +1576,21 @@ mod tests {
         }
     }
 
-    // An Eviction wave recedes ONE Info line. It must NOT touch the status
-    // bar's `dead_mass_pct` - the bar tracks the LIVE figure off
+    // An Eviction wave recedes ONE Housekeeping marker. It must NOT touch the
+    // status bar's `dead_mass_pct` - the bar tracks the LIVE figure off
     // ContextPressure, and this wave just cleared what it found (the S1 bug:
     // advertising the reclaimed snapshot).
     #[test]
-    fn an_eviction_wave_recedes_one_info_line_without_setting_the_live_bar() {
+    fn an_eviction_wave_recedes_one_marker_without_setting_the_live_bar() {
         let t = fresh();
         assert_eq!(t.dead_mass_pct, None);
         let (t, effects) = t.apply_event(Event::eviction_wave(wave_stats()));
         assert_eq!(effects, vec![]);
         assert_eq!(
             items(&t),
-            vec![info(
-                "context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked"
+            vec![marker(
+                "✂ context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked",
+                Tone::Housekeeping
             )]
         );
         // The wave did not set the live bar figure.
@@ -1494,13 +1645,16 @@ mod tests {
         assert_eq!(t.session_cost, 0.42);
     }
 
-    // Compaction progress recedes one Info line.
+    // Compaction progress recedes one Housekeeping marker.
     #[test]
-    fn compaction_progress_recedes_one_info_line() {
+    fn compaction_progress_recedes_one_marker() {
         let t = fresh();
         let (t, effects) = t.apply_event(Event::compaction_progress("working"));
         assert_eq!(effects, vec![]);
-        assert_eq!(items(&t), vec![info("compaction: working")]);
+        assert_eq!(
+            items(&t),
+            vec![marker("⟨ compaction: working → summary ⟩", Tone::Housekeeping)]
+        );
     }
 
     // The wave line names ONLY the nonzero counts, in kind order, with the Dead
@@ -1514,12 +1668,12 @@ mod tests {
         };
         assert_eq!(
             eviction_wave_line(&one_kind),
-            "context wave · 5% dead mass · 3 results"
+            "✂ context wave · 5% dead mass · 3 results"
         );
 
         assert_eq!(
             eviction_wave_line(&wave_stats()),
-            "context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked"
+            "✂ context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked"
         );
 
         // A wave with no reclaimable counts still names the Dead Mass share.
@@ -1527,7 +1681,36 @@ mod tests {
             dead_mass: 0.20,
             ..WaveStats::default()
         };
-        assert_eq!(eviction_wave_line(&none), "context wave · 20% dead mass");
+        assert_eq!(eviction_wave_line(&none), "✂ context wave · 20% dead mass");
+    }
+
+    // Every tone's glyph branch (ADR-0040): Aid/Constrain wear a glyph; the
+    // three tones that author their own glyph elsewhere (Housekeeping,
+    // Steering, Plain) carry none here.
+    #[test]
+    fn marker_glyph_covers_every_tone() {
+        assert_eq!(marker_glyph(Tone::Aid), "»");
+        assert_eq!(marker_glyph(Tone::Constrain), "▪");
+        assert_eq!(marker_glyph(Tone::Housekeeping), "");
+        assert_eq!(marker_glyph(Tone::Steering), "");
+        assert_eq!(marker_glyph(Tone::Plain), "");
+    }
+
+    // A toned line prefixes its glyph and a space when the tone carries one,
+    // and passes the text through unchanged when it does not (the empty-glyph
+    // branch).
+    #[test]
+    fn marker_line_prefixes_a_glyph_only_when_the_tone_has_one() {
+        // Non-empty glyph: prefix plus a space.
+        assert_eq!(marker_line(Tone::Aid, "plan refreshed"), "» plan refreshed");
+        assert_eq!(
+            marker_line(Tone::Constrain, "tools withdrawn"),
+            "▪ tools withdrawn"
+        );
+        // Empty glyph: the text is returned verbatim, no leading space.
+        assert_eq!(marker_line(Tone::Housekeeping, "✂ evicted"), "✂ evicted");
+        assert_eq!(marker_line(Tone::Steering, "↳ queued: x"), "↳ queued: x");
+        assert_eq!(marker_line(Tone::Plain, "news"), "news");
     }
 
     #[test]
@@ -1817,10 +2000,12 @@ mod tests {
     // --- unknown input -----------------------------------------------------
 
     #[test]
-    fn unknown_events_and_keys_are_ignored() {
+    fn a_stale_selector_fill_and_an_unknown_key_are_ignored() {
         let t = fresh();
-        // Anchor is display-irrelevant: not folded into a Transcript item.
-        let (t, effects) = t.apply_event(Event::anchor("anchored"));
+        // A selector fill with no overlay open is the Composer's own event
+        // (ADR-0034): it is consumed there, changes nothing, and never reaches
+        // a Transcript item.
+        let (t, effects) = t.apply_event(Event::selector_ready(0, vec![]));
         assert_eq!(effects, vec![]);
         assert_eq!(items(&t), vec![]);
 

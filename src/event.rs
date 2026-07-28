@@ -29,6 +29,7 @@ use crate::llm::Delta;
 use crate::llm::response::StopReason;
 use crate::session::RecoveryShape;
 use crate::ui::selector::SelectorRow;
+use crate::ui::transcript::Tone;
 
 /// The `plugin_error` stage: which point in the Plugin lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
@@ -68,6 +69,24 @@ pub enum VoicedTag {
     WrapUpWarning,
     VerificationPass,
     FinalPass,
+}
+
+impl VoicedTag {
+    /// The marker-plane [`Tone`] this rider carries (ADR-0040), stamped HERE at
+    /// the firing-site authority so no downstream fold classifies by kind or
+    /// text. A Governor's Nudge helps the model along ([`Tone::Aid`]); the
+    /// Endgame's turn-closing schedule limits it ([`Tone::Constrain`]).
+    pub fn tone(self) -> Tone {
+        match self {
+            VoicedTag::VerifyNudge
+            | VoicedTag::VerifyFailedNudge
+            | VoicedTag::EmptyResponseNudge
+            | VoicedTag::ExploreNudge => Tone::Aid,
+            VoicedTag::WrapUpWarning | VoicedTag::VerificationPass | VoicedTag::FinalPass => {
+                Tone::Constrain
+            }
+        }
+    }
 }
 
 /// Every event shape the Turn and the Agent emit.
@@ -192,8 +211,10 @@ pub enum Event {
     },
     /// An Anchor entered the Conversation (CONTEXT.md: Anchor). Placement is
     /// the anchor Governor's; the content is the Plan's - the model's voice,
-    /// so it carries no [`VoicedTag`]. Routine rather than corrective, the
-    /// Transcript ignores it; the Session Log persists it like every rider.
+    /// so it carries no [`VoicedTag`]. The `text` is the FULL anchor block the
+    /// Session Log persists (the model read it verbatim); the Transcript shows
+    /// only a concise `⚑ plan refreshed` marker (ADR-0040: an Aid tone), never
+    /// the plan body.
     Anchor {
         text: String,
     },
@@ -204,6 +225,16 @@ pub enum Event {
     RecoveryTurn {
         shape: RecoveryShape,
         text: String,
+    },
+
+    /// The Endgame narrowed the offered Tools (CONTEXT.md: Endgame, Offer;
+    /// ADR-0035): carries the surviving tool names (empty on the final Pass,
+    /// `run_command` alone on the Verification Pass). Display-side only - the
+    /// narrowing itself shapes the request, this event just lets the Transcript
+    /// show a concise `⊘ tools narrowed` marker (ADR-0040: a Constrain tone).
+    /// A Governor limiting the model, so it carries no [`VoicedTag`].
+    ToolsNarrowed {
+        tools: Vec<String>,
     },
 
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
@@ -316,6 +347,24 @@ impl Event {
         }
     }
 
+    /// The marker-plane [`Tone`] a voiced rider carries (ADR-0040), recovered
+    /// from the variant back to its [`VoicedTag`] so the tone decision stays in
+    /// ONE place ([`VoicedTag::tone`]) and the Screen fold never classifies.
+    /// `None` for a non-rider event.
+    pub fn voiced_tone(&self) -> Option<Tone> {
+        let tag = match self {
+            Event::VerifyNudge { .. } => VoicedTag::VerifyNudge,
+            Event::VerifyFailedNudge { .. } => VoicedTag::VerifyFailedNudge,
+            Event::EmptyResponseNudge { .. } => VoicedTag::EmptyResponseNudge,
+            Event::ExploreNudge { .. } => VoicedTag::ExploreNudge,
+            Event::WrapUpWarning { .. } => VoicedTag::WrapUpWarning,
+            Event::VerificationPass { .. } => VoicedTag::VerificationPass,
+            Event::FinalPass { .. } => VoicedTag::FinalPass,
+            _ => return None,
+        };
+        Some(tag.tone())
+    }
+
     pub fn anchor(text: impl Into<String>) -> Self {
         Event::Anchor { text: text.into() }
     }
@@ -325,6 +374,10 @@ impl Event {
             shape,
             text: text.into(),
         }
+    }
+
+    pub fn tools_narrowed(tools: Vec<String>) -> Self {
+        Event::ToolsNarrowed { tools }
     }
 
     pub fn retry(error: impl Into<String>, attempt: u64, budget: u64) -> Self {
