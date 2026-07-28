@@ -5,10 +5,10 @@
 //! messages; tests build one whose methods record into fields the test inspects.
 //! The loop itself spawns nothing and holds no pids.
 //!
-//! These are infrastructure, NOT Plugins: control-bearing and NOT fail-open
+//! These are infrastructure, NOT Extensions: control-bearing and NOT fail-open
 //! (ADR-0011). A `RunDeps` method that panics or returns an error fails the
-//! Run honestly. Plugins remain the fail-open, tool-scoped unit of extension
-//! (ADR-0007) - that isolation lives in `crate::plugins`, not here.
+//! Run honestly. Extensions remain the fail-open, tool-scoped unit of extension
+//! (ADR-0007) - that isolation lives in `crate::extensions`, not here.
 //!
 //! ## Static dispatch, no `async_trait`
 //!

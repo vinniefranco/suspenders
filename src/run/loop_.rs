@@ -21,10 +21,10 @@
 //! returned Interventions into effects.
 //!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
-//! [`RunDeps`]. Tool execution (the Plugin pipeline) runs in-loop as in baud,
-//! over a `plugins` list and a `ToolCtx` the caller supplies - the Rust Session
-//! carries plugin *names*, not `Registered` values, so these ride as explicit
-//! `run` arguments (the shell builds them from the Session).
+//! [`RunDeps`]. Tool execution (the Extension pipeline) runs in-loop as in
+//! baud, over an `extensions` list and a `ToolCtx` the caller supplies - the
+//! Rust Session carries extension *names*, not `Registered` values, so these
+//! ride as explicit `run` arguments (the shell builds them from the Session).
 
 use serde_json::Value;
 
@@ -34,8 +34,8 @@ use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{LlmRequest, StreamEvent};
+use crate::extensions::Registered;
 use crate::plan::Plan;
-use crate::plugins::Registered;
 use crate::session::Session;
 use crate::session::log;
 use crate::tool::ToolCtx;
@@ -108,7 +108,7 @@ pub struct RunOpts {
 pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) deps: &'a mut D,
     pub(super) emitter: Emitter,
-    pub(super) plugins: &'a [Registered],
+    pub(super) extensions: &'a [Registered],
     pub(super) tool_ctx: &'a ToolCtx,
     pub(super) ledger: Ledger,
     pub(super) governors: Governors,
@@ -127,12 +127,12 @@ pub(super) struct LoopState<'a, D: RunDeps> {
 /// Runs the loop until the model stops asking for tools, the Run Limit is hit,
 /// or the response errors (baud's `Baud.Turn.Loop.run/4`).
 ///
-/// `plugins` and `tool_ctx` supply the Plugin pipeline and Tool execution
-/// context (Session-derived; the Rust Session carries plugin names only).
+/// `extensions` and `tool_ctx` supply the Extension pipeline and Tool execution
+/// context (Session-derived; the Rust Session carries extension names only).
 pub async fn run<D: RunDeps>(
     mut conversation: Conversation,
     session: &Session,
-    plugins: &[Registered],
+    extensions: &[Registered],
     tool_ctx: &ToolCtx,
     deps: &mut D,
     opts: RunOpts,
@@ -146,7 +146,7 @@ pub async fn run<D: RunDeps>(
     let mut state = LoopState {
         deps,
         emitter,
-        plugins,
+        extensions,
         tool_ctx,
         ledger: Ledger::new(session.run_limit),
         offer: Offer::default(),
@@ -596,8 +596,8 @@ mod tests {
     use crate::llm::model::{Api, Model};
     use crate::llm::response::Response;
     use crate::llm::{Delta, malformed_input_marker};
-    use crate::plugin::{Plugin, Token};
-    use crate::plugins::Registered;
+    use crate::extensions::Registered;
+    use crate::middleware::{Middleware, Token};
     use crate::session::{Session, SessionOpts};
     use crate::test_support::Entry;
     use crate::test_support::FakeDeps;
@@ -3295,10 +3295,10 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
-    // ---- plugin lifecycle (ADR-0007) --------------------------------------
+    // ---- extension lifecycle (ADR-0007) -----------------------------------
 
     struct HaltEdits;
-    impl Plugin for HaltEdits {
+    impl Middleware for HaltEdits {
         fn pre_run(&self, token: Token, _opts: &Value) -> Token {
             if token.tool == "edit_file" {
                 token.halt("[edits are frozen by HaltEdits]")
@@ -3309,7 +3309,7 @@ mod tests {
     }
 
     struct Artifactor;
-    impl Plugin for Artifactor {
+    impl Middleware for Artifactor {
         fn post_run(&self, token: Token, _opts: &Value) -> Token {
             let tool = token.tool.clone();
             token.put_artifact("mark", Value::String(tool))
@@ -3317,7 +3317,7 @@ mod tests {
     }
 
     struct PreBoomer;
-    impl Plugin for PreBoomer {
+    impl Middleware for PreBoomer {
         fn pre_run(&self, _token: Token, _opts: &Value) -> Token {
             panic!("pre boom")
         }
@@ -3347,7 +3347,8 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins = vec![Registered::new("HaltEdits", Box::new(HaltEdits), json!([]))];
+        let plugins =
+            vec![Registered::new("HaltEdits", json!([])).with_middleware(Box::new(HaltEdits))];
         let (outcome, deps) = run_with_plugins(&session, "edit something", deps, plugins).await;
         ok(&outcome);
         let evs = events(&deps);
@@ -3382,11 +3383,8 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins = vec![Registered::new(
-            "Artifactor",
-            Box::new(Artifactor),
-            json!([]),
-        )];
+        let plugins =
+            vec![Registered::new("Artifactor", json!([])).with_middleware(Box::new(Artifactor))];
         let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
         ok(&outcome);
         let evs = events(&deps);
@@ -3421,7 +3419,8 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins = vec![Registered::new("PreBoomer", Box::new(PreBoomer), json!([]))];
+        let plugins =
+            vec![Registered::new("PreBoomer", json!([])).with_middleware(Box::new(PreBoomer))];
         let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
         ok(&outcome);
         let evs = events(&deps);

@@ -1,4 +1,4 @@
-//! The run_command exit-badge Plugin (ADR-0007), Stage 3 of the UI plan.
+//! The run_command exit-badge Extension (ADR-0007), Stage 3 of the UI plan.
 //!
 //! [`post_run`](RunCommand::post_run) reads the exit code out of a run_command
 //! result - the `[exit code: N]` tail [`crate::tools::run_command::report`]
@@ -19,12 +19,17 @@
 //! (it stays in model content). That is the recede-machinery goal, and the
 //! Stage 2 review's C2 gap ("large non-diff results don't fold") - accepted for
 //! Stage 3.
+//!
+//! This Extension composes both roles (ADR-0042): a Middleware (`post_run`
+//! attaches the exit-code/timeout Artifacts) and a Presenter (`present` runs
+//! those Artifacts into the badge).
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::plugin::{Plugin, Token};
+use crate::middleware::{Middleware, Token};
+use crate::presenter::Presenter;
 use crate::tools::run_command;
 use crate::ui::transcript::TranscriptItem;
 
@@ -44,10 +49,10 @@ mod keys {
 /// The one tool this plugin acts on.
 const TOOL: &str = "run_command";
 
-/// The run_command exit-badge plugin.
+/// The run_command exit-badge extension.
 pub struct RunCommand;
 
-impl Plugin for RunCommand {
+impl Middleware for RunCommand {
     fn post_run(&self, token: Token, _opts: &Value) -> Token {
         if token.tool != TOOL {
             return token;
@@ -64,7 +69,9 @@ impl Plugin for RunCommand {
             None => token,
         }
     }
+}
 
+impl Presenter for RunCommand {
     fn present(
         &self,
         item: TranscriptItem,
@@ -120,7 +127,7 @@ fn badge(artifacts: &HashMap<String, Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::token::TokenResult;
+    use crate::middleware::token::TokenResult;
     use crate::tool::ToolCtx;
     use serde_json::json;
 

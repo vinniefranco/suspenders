@@ -2,15 +2,15 @@
 //! vocabulary).
 //!
 //! Produces a title string and a list of [`StyledLine`]s from a diff artifact.
-//! Extracted from [`crate::plugins::diff`] so the rendering logic is
-//! unit-testable without a Plugin lifecycle.
+//! Extracted from [`crate::extensions::diff`] so the rendering logic is
+//! unit-testable without a Middleware lifecycle.
 //!
 //! Lines carry semantic styles - [`LineStyle::Added`], `Removed`, `Context`,
 //! `Muted` - that a later `ui/components` phase maps to terminal colors.
 
 use serde::{Deserialize, Serialize};
 
-use crate::plugins::diff::hunks::{Hunk, Line, Tag};
+use crate::extensions::diff::hunks::{Hunk, Line, Tag};
 use crate::ui::transcript::{LineStyle, StyledLine};
 
 /// The default display cap: hunks render at most this many lines before eliding
@@ -104,7 +104,7 @@ fn display_line(line: &Line) -> StyledLine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::diff::hunks;
+    use crate::extensions::diff::hunks;
 
     // ---- title/2 ----
 

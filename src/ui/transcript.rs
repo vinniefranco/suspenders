@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use crate::content::ContentBlock;
 use crate::event::Stage;
-use crate::plugins::{self, Registered};
+use crate::extensions::{self, Registered};
 use streaming::Streaming;
 
 /// The semantic style of one display line inside a [`TranscriptItem::Block`]
@@ -241,7 +241,7 @@ enum Anchor<'a> {
 /// [`Streaming`] snapshot, and Presentment - see the module doc for the
 /// invariants this seam holds.
 ///
-/// `plugins` are not `Clone`/`PartialEq`, so neither is the store (nor the
+/// `extensions` are not `Clone`/`PartialEq`, so neither is the store (nor the
 /// Screen that owns it).
 pub struct Transcript {
     /// The settled items. Private: every write routes through the append
@@ -254,19 +254,19 @@ pub struct Transcript {
     /// The in-flight streaming snapshot and its materialize rules (the private
     /// `streaming` child module owns the end/flush asymmetry).
     streaming: Streaming,
-    /// The configured Plugins whose pure `present` runs on every append.
-    plugins: Vec<Registered>,
+    /// The configured Extensions whose pure `present` runs on every append.
+    extensions: Vec<Registered>,
 }
 
 impl Transcript {
     /// An empty Transcript. The caller authors any opening line (the greeting
     /// is the Screen's Voice, recorded through [`Transcript::info`]).
-    pub fn new(plugins: Vec<Registered>) -> Self {
+    pub fn new(extensions: Vec<Registered>) -> Self {
         Transcript {
             items: Vec::new(),
             revision: 0,
             streaming: Streaming::idle(),
-            plugins,
+            extensions,
         }
     }
 
@@ -454,12 +454,12 @@ impl Transcript {
     // ---- Internals ----------------------------------------------------------
 
     // Presentment (CONTEXT.md), then push - the one append funnel. A crashing
-    // plugin is skipped fail-open (ADR-0007): the item from before it ran
+    // Presenter is skipped fail-open (ADR-0007): the item from before it ran
     // survives, and its failure report lands as a RAW info line - never
-    // re-presented, so a plugin that panics on every item cannot recurse on
+    // re-presented, so an Extension that panics on every item cannot recurse on
     // its own report.
     fn append(&mut self, item: TranscriptItem, artifacts: &HashMap<String, Value>) {
-        let (item, failures) = plugins::present(&self.plugins, item, artifacts);
+        let (item, failures) = extensions::present(&self.extensions, item, artifacts);
         self.items.push(item);
         for failure in failures {
             self.plugin_failure(&failure.plugin, failure.stage, &failure.message);
@@ -606,7 +606,7 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::Plugin;
+    use crate::presenter::Presenter;
     use serde_json::json;
 
     // --- helpers ------------------------------------------------------------
@@ -980,7 +980,7 @@ mod tests {
     // --- presentment -----------------------------------------------------------
 
     struct BlockPresenter;
-    impl Plugin for BlockPresenter {
+    impl Presenter for BlockPresenter {
         fn present(
             &self,
             item: TranscriptItem,
@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     struct PresentCrasher;
-    impl Plugin for PresentCrasher {
+    impl Presenter for PresentCrasher {
         fn present(
             &self,
             _item: TranscriptItem,
@@ -1013,8 +1013,8 @@ mod tests {
         }
     }
 
-    fn reg(name: &str, plugin: Box<dyn Plugin>) -> Registered {
-        Registered::new(name, plugin, Value::Null)
+    fn reg(name: &str, presenter: Box<dyn Presenter>) -> Registered {
+        Registered::new(name, Value::Null).with_presenter(presenter)
     }
 
     fn diff_artifacts() -> HashMap<String, Value> {

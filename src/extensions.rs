@@ -1,27 +1,30 @@
-//! Runs the Plugin pipeline (ADR-0007) around Tool execution.
+//! Runs the Extension pipeline (ADR-0007) around Tool execution.
 //!
-//! Plugins are a static, ordered list resolved once per Session. Ordering is
-//! onion-style: `pre_run` folds in registration order, `post_run` in reverse,
-//! so the first-registered plugin wraps the rest.
+//! Extensions are a static, ordered list resolved once per Session. Each
+//! Extension composes two roles (ADR-0042): an optional Middleware
+//! (execution-path: `pre_run`/`post_run`) and an optional Presenter
+//! (display-path: `present`). Ordering is onion-style: `pre_run` folds in
+//! registration order, `post_run` in reverse, so the first-registered
+//! Extension wraps the rest.
 //!
 //! Every stage call is wrapped: a panic skips that
-//! plugin's effect - the token passes through unchanged from before it ran -
+//! Extension's effect - the token passes through unchanged from before it ran -
 //! and comes back as a [`Failure`] for the caller to report. Fail-open with
 //! visibility (ADR-0007 / ADR-0018): the model never sees it, the Run never
 //! fails. In Rust the isolation is `std::panic::catch_unwind` around each
-//! synchronous stage call (`AssertUnwindSafe`, since the token/plugin are not
+//! synchronous stage call (`AssertUnwindSafe`, since the token/extension are not
 //! `UnwindSafe`); the panic message is recovered from the panic payload.
 //!
 //! [`execute`] is the Run's dispatch seam: [`crate::tools::execute`] (raw,
-//! unshaped), then the `post_run` fold, then Shaping - so plugins transform
+//! unshaped), then the `post_run` fold, then Shaping - so Middlewares transform
 //! the model-facing content BEFORE the Result Cap, and whatever they append is
 //! capped like any other content. Artifacts bypass Shaping entirely; they
 //! never enter the Conversation. [`crate::tools::run`] remains the
-//! plugin-free equivalent.
+//! extension-free equivalent.
 //!
 //! [`present`] folds the PURE Presentment stage over a Transcript Item in
 //! registration order. Like the other stages it is fail-open: a panicking
-//! `present` is skipped and the item from before that plugin is kept, with a
+//! `present` is skipped and the item from before that Extension is kept, with a
 //! [`Failure`] recorded. It reads only the Artifacts riding the `:tool_result`
 //! event and does no IO.
 
@@ -36,30 +39,53 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::event::Stage;
-use crate::plugin::token::TokenResult;
-use crate::plugin::{Plugin, Token};
+use crate::middleware::token::TokenResult;
+use crate::middleware::{Middleware, Token};
+use crate::presenter::Presenter;
 use crate::tools::{self, shaping};
 use crate::ui::transcript::TranscriptItem;
 
-/// One registered Plugin: a name (used to attribute a
-/// [`Failure`]), the plugin itself, and its registration options.
+/// One registered Extension (ADR-0042): a name (used to attribute a
+/// [`Failure`]), its optional Middleware and Presenter roles, and its
+/// registration options. An Extension carries `Some` for each role it
+/// implements and `None` for the roles it does not - a role-less slot the
+/// pipeline skips, observably identical to the old identity default.
 pub struct Registered {
     pub name: String,
-    pub plugin: Box<dyn Plugin>,
+    pub middleware: Option<Box<dyn Middleware>>,
+    pub presenter: Option<Box<dyn Presenter>>,
     pub opts: Value,
 }
 
 impl Registered {
-    pub fn new(name: impl Into<String>, plugin: Box<dyn Plugin>, opts: Value) -> Self {
+    /// A registration with no roles yet; add them with [`with_middleware`] /
+    /// [`with_presenter`].
+    ///
+    /// [`with_middleware`]: Registered::with_middleware
+    /// [`with_presenter`]: Registered::with_presenter
+    pub fn new(name: impl Into<String>, opts: Value) -> Self {
         Registered {
             name: name.into(),
-            plugin,
+            middleware: None,
+            presenter: None,
             opts,
         }
     }
+
+    /// Attaches the Middleware (execution-path) role.
+    pub fn with_middleware(mut self, middleware: Box<dyn Middleware>) -> Self {
+        self.middleware = Some(middleware);
+        self
+    }
+
+    /// Attaches the Presenter (display-path) role.
+    pub fn with_presenter(mut self, presenter: Box<dyn Presenter>) -> Self {
+        self.presenter = Some(presenter);
+        self
+    }
 }
 
-/// A Plugin stage that was skipped fail-open, with enough to report an info
+/// An Extension stage that was skipped fail-open, with enough to report an info
 /// line. The model never sees this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
@@ -79,19 +105,23 @@ pub struct PipelineResult {
     pub artifacts: std::collections::HashMap<String, Value>,
 }
 
-/// Folds `pre_run` in registration order. A halted token short-circuits the
-/// remaining plugins. Returns the token and any failures
+/// Folds `pre_run` in registration order over the Extensions that carry a
+/// Middleware role (a Presenter-only Extension is skipped). A halted token
+/// short-circuits the remaining Extensions. Returns the token and any failures
 /// in registration order.
-pub fn pre_run(plugins: &[Registered], token: Token) -> (Token, Vec<Failure>) {
+pub fn pre_run(extensions: &[Registered], token: Token) -> (Token, Vec<Failure>) {
     let mut token = token;
     let mut failures = Vec::new();
 
-    for reg in plugins {
+    for reg in extensions {
         if token.halted {
             break;
         }
-        token = stage(reg, Stage::PreRun, token, &mut failures, |reg, tok| {
-            reg.plugin.pre_run(tok, &reg.opts)
+        let Some(middleware) = reg.middleware.as_ref() else {
+            continue;
+        };
+        token = stage(reg, Stage::PreRun, token, &mut failures, |_reg, tok| {
+            middleware.pre_run(tok, &reg.opts)
         });
     }
 
@@ -99,9 +129,10 @@ pub fn pre_run(plugins: &[Registered], token: Token) -> (Token, Vec<Failure>) {
 }
 
 /// Executes the Tool and runs the back half of the pipeline: raw execution,
-/// `post_run` fold in REVERSE registration order, then Shaping.
-pub async fn execute(plugins: &[Registered], token: Token) -> (PipelineResult, Vec<Failure>) {
-    // Raw, unshaped execution - the plugin-facing result the post_run fold
+/// `post_run` fold in REVERSE registration order (Middleware role only), then
+/// Shaping.
+pub async fn execute(extensions: &[Registered], token: Token) -> (PipelineResult, Vec<Failure>) {
+    // Raw, unshaped execution - the Middleware-facing result the post_run fold
     // rewrites.
     let raw = tools::execute(&token.tool, &token.input, &token.ctx).await;
 
@@ -112,11 +143,15 @@ pub async fn execute(plugins: &[Registered], token: Token) -> (PipelineResult, V
     });
 
     // post_run folds in reverse registration order (onion): the last-registered
-    // plugin runs first, the first-registered wraps it.
+    // Extension runs first, the first-registered wraps it. A Presenter-only
+    // Extension has no Middleware role, so it is skipped.
     let mut failures = Vec::new();
-    for reg in plugins.iter().rev() {
-        token = stage(reg, Stage::PostRun, token, &mut failures, |reg, tok| {
-            reg.plugin.post_run(tok, &reg.opts)
+    for reg in extensions.iter().rev() {
+        let Some(middleware) = reg.middleware.as_ref() else {
+            continue;
+        };
+        token = stage(reg, Stage::PostRun, token, &mut failures, |_reg, tok| {
+            middleware.post_run(tok, &reg.opts)
         });
     }
     // Reversed registration order produced reversed failures; restore
@@ -142,23 +177,28 @@ pub async fn execute(plugins: &[Registered], token: Token) -> (PipelineResult, V
 }
 
 /// Folds `present` over a Transcript Item in registration order (Presentment,
-/// CONTEXT.md). Each call is wrapped fail-open (ADR-0007): a panicking `present`
-/// is skipped and the item from before that plugin is kept, with a [`Failure`]
-/// recorded. Returns the presented item and any failures in registration order.
+/// CONTEXT.md) over the Extensions that carry a Presenter role (a
+/// Middleware-only Extension is skipped). Each call is wrapped fail-open
+/// (ADR-0007): a panicking `present` is skipped and the item from before that
+/// Extension is kept, with a [`Failure`] recorded. Returns the presented item
+/// and any failures in registration order.
 pub fn present(
-    plugins: &[Registered],
+    extensions: &[Registered],
     item: TranscriptItem,
     artifacts: &HashMap<String, Value>,
 ) -> (TranscriptItem, Vec<Failure>) {
     let mut item = item;
     let mut failures = Vec::new();
 
-    for reg in plugins {
+    for reg in extensions {
+        let Some(presenter) = reg.presenter.as_ref() else {
+            continue;
+        };
         // The pre-stage item survives a panic; clone it so the closure can
         // consume its copy while we retain the fallback.
         let fallback = item.clone();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            reg.plugin.present(item, artifacts, &reg.opts)
+            presenter.present(item, artifacts, &reg.opts)
         }));
 
         item = match result {
@@ -177,21 +217,21 @@ pub fn present(
     (item, failures)
 }
 
-/// One entry in the configured Plugin list: a plugin name and its registration
-/// options. The Session carries plugins as these lightweight specs (a name plus
-/// opts) and resolves them into live [`Registered`] instances at Run/UI start.
-/// This is the analogue of the config `:plugins` entries - a bare `Module` or a
-/// `{Module, opts}` tuple.
+/// One entry in the configured Extension list: an extension name and its
+/// registration options. The Session carries extensions as these lightweight
+/// specs (a name plus opts) and resolves them into live [`Registered`]
+/// instances at Run/UI start. This is the analogue of the config `:plugins`
+/// entries - a bare `Module` or a `{Module, opts}` tuple.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PluginSpec {
+pub struct ExtensionSpec {
     pub name: String,
     pub opts: Value,
 }
 
-impl PluginSpec {
+impl ExtensionSpec {
     /// A bare name entry (no opts), the analogue of a bare `Module`.
     pub fn bare(name: impl Into<String>) -> Self {
-        PluginSpec {
+        ExtensionSpec {
             name: name.into(),
             opts: Value::Array(Vec::new()),
         }
@@ -199,41 +239,41 @@ impl PluginSpec {
 
     /// A `{name, opts}` entry.
     pub fn with_opts(name: impl Into<String>, opts: Value) -> Self {
-        PluginSpec {
+        ExtensionSpec {
             name: name.into(),
             opts,
         }
     }
 }
 
-impl From<&str> for PluginSpec {
+impl From<&str> for ExtensionSpec {
     fn from(name: &str) -> Self {
-        PluginSpec::bare(name)
+        ExtensionSpec::bare(name)
     }
 }
 
-impl From<String> for PluginSpec {
+impl From<String> for ExtensionSpec {
     fn from(name: String) -> Self {
-        PluginSpec::bare(name)
+        ExtensionSpec::bare(name)
     }
 }
 
-/// Normalizes a plugin entry into a `{name, opts}` spec. A bare name entry
+/// Normalizes an extension entry into a `{name, opts}` spec. A bare name entry
 /// gets an empty opts list; a `{name, opts}` entry passes its opts through.
 /// This is the direct analogue of the config-list normalization: bare `Module`
 /// or `{Module, opts}` both land as `{module, opts}`.
-pub fn normalize(entry: impl Into<PluginSpec>) -> PluginSpec {
+pub fn normalize(entry: impl Into<ExtensionSpec>) -> ExtensionSpec {
     entry.into()
 }
 
-/// Resolves the Session's ordered Plugin names into live [`Registered`]
-/// instances, in registration order. Each name maps to its plugin
+/// Resolves the Session's ordered Extension names into live [`Registered`]
+/// instances, in registration order. Each name maps to its extension
 /// implementation ([`build`]); an unknown name is skipped (it cannot be
 /// registered, so it has no effect and cannot fail a stage). This is the
 /// production registry: the shipped config resolves
-/// `["diff", "run_command", "condense"]` into the Diff plugin, the run_command
-/// exit-badge plugin, and the condense noise-collapse plugin, so the live app
-/// runs the Run/Presentment pipeline with all three.
+/// `["diff", "run_command", "condense"]` into the Diff extension, the
+/// run_command exit-badge extension, and the condense noise-collapse extension,
+/// so the live app runs the Run/Presentment pipeline with all three.
 pub fn configured(names: &[String]) -> Vec<Registered> {
     names
         .iter()
@@ -241,34 +281,37 @@ pub fn configured(names: &[String]) -> Vec<Registered> {
         .collect()
 }
 
-/// Builds the [`Registered`] plugin for one normalized spec, or `None` if the
-/// name has no registered implementation.
-fn build(spec: &PluginSpec) -> Option<Registered> {
+/// Builds the [`Registered`] extension for one normalized spec, or `None` if
+/// the name has no registered implementation. Maps each name to the role(s) it
+/// composes: `diff` is Middleware + Presenter, `run_command` is Middleware +
+/// Presenter, `condense` is Middleware-only. The concrete structs are ZSTs, so
+/// boxing one twice as two trait objects is free.
+fn build(spec: &ExtensionSpec) -> Option<Registered> {
     match spec.name.as_str() {
-        "diff" => Some(Registered::new(
-            "diff",
-            Box::new(diff::Diff),
-            spec.opts.clone(),
-        )),
-        "run_command" => Some(Registered::new(
-            "run_command",
-            Box::new(run_command::RunCommand),
-            spec.opts.clone(),
-        )),
-        "condense" => Some(Registered::new(
-            "condense",
-            Box::new(condense::Condense),
-            spec.opts.clone(),
-        )),
+        "diff" => Some(
+            Registered::new("diff", spec.opts.clone())
+                .with_middleware(Box::new(diff::Diff))
+                .with_presenter(Box::new(diff::Diff)),
+        ),
+        "run_command" => Some(
+            Registered::new("run_command", spec.opts.clone())
+                .with_middleware(Box::new(run_command::RunCommand))
+                .with_presenter(Box::new(run_command::RunCommand)),
+        ),
+        "condense" => Some(
+            Registered::new("condense", spec.opts.clone())
+                .with_middleware(Box::new(condense::Condense)),
+        ),
         _ => None,
     }
 }
 
-/// Runs one stage of one plugin fail-open. A panic in the stage skips its
+/// Runs one stage of one Extension fail-open. A panic in the stage skips its
 /// effect (the token passes through unchanged) and records a [`Failure`];
 /// otherwise the transformed token is returned. `AssertUnwindSafe` is required
-/// because [`Token`] and `dyn Plugin` are not `UnwindSafe`; a caught panic
-/// leaves no observable shared state (the pre-stage token is what we keep).
+/// because [`Token`] and the extension trait objects are not `UnwindSafe`; a
+/// caught panic leaves no observable shared state (the pre-stage token is what
+/// we keep).
 fn stage<F>(
     reg: &Registered,
     stage_name: Stage,
@@ -340,11 +383,11 @@ mod tests {
         Token::new("bogus_tool", json!({}), ctx())
     }
 
-    // ---- Test plugins, defined inline as baud does ----
+    // ---- Test extensions, defined inline as baud does ----
 
     // Records the order stages ran in, tagged by the :id opt, appending to a
     // `trace` list in assigns. baud's Recorder implements both pre_run and
-    // post_run; here it does too.
+    // post_run; here it does too, as a Middleware.
     struct Recorder;
     impl Recorder {
         fn record(token: Token, opts: &Value, stage: &str) -> Token {
@@ -359,7 +402,7 @@ mod tests {
             token.assign("trace", Value::Array(trace))
         }
     }
-    impl Plugin for Recorder {
+    impl Middleware for Recorder {
         fn pre_run(&self, token: Token, opts: &Value) -> Token {
             Self::record(token, opts, "pre_run")
         }
@@ -370,21 +413,24 @@ mod tests {
 
     // Halts in pre_run.
     struct Halter;
-    impl Plugin for Halter {
+    impl Middleware for Halter {
         fn pre_run(&self, token: Token, _opts: &Value) -> Token {
             token.halt("[blocked by halter]")
         }
     }
 
-    // Panics in both stages (baud's Crasher raises "pre boom"/"post boom").
+    // Panics in both execution stages and in present (baud's Crasher raises
+    // "pre boom"/"post boom"/"present boom"). It composes both roles.
     struct Crasher;
-    impl Plugin for Crasher {
+    impl Middleware for Crasher {
         fn pre_run(&self, _token: Token, _opts: &Value) -> Token {
             panic!("pre boom")
         }
         fn post_run(&self, _token: Token, _opts: &Value) -> Token {
             panic!("post boom")
         }
+    }
+    impl Presenter for Crasher {
         fn present(
             &self,
             _item: TranscriptItem,
@@ -397,7 +443,7 @@ mod tests {
 
     // Appends " <id>" to the result content in post_run.
     struct ContentTagger;
-    impl Plugin for ContentTagger {
+    impl Middleware for ContentTagger {
         fn post_run(&self, mut token: Token, opts: &Value) -> Token {
             let id = opts.get("id").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(result) = token.result.as_mut() {
@@ -408,13 +454,15 @@ mod tests {
     }
 
     // Attaches an artifact in post_run; in present, replaces a tool_result with
-    // a block when the `mark: seen` artifact is present (baud's ArtifactPresenter).
+    // a block when the `mark: seen` artifact is present (baud's
+    // ArtifactPresenter). It composes both roles.
     struct ArtifactPresenter;
-    impl Plugin for ArtifactPresenter {
+    impl Middleware for ArtifactPresenter {
         fn post_run(&self, token: Token, _opts: &Value) -> Token {
             token.put_artifact("mark", json!("seen"))
         }
-
+    }
+    impl Presenter for ArtifactPresenter {
         fn present(
             &self,
             item: TranscriptItem,
@@ -433,8 +481,17 @@ mod tests {
         }
     }
 
-    fn reg(name: &str, plugin: Box<dyn Plugin>, opts: Value) -> Registered {
-        Registered::new(name, plugin, opts)
+    // ---- reg helpers: register a double under the role(s) it implements ----
+
+    // A Middleware-only double.
+    fn mw(name: &str, middleware: Box<dyn Middleware>, opts: Value) -> Registered {
+        Registered::new(name, opts).with_middleware(middleware)
+    }
+
+    // A Presenter-only double.
+    #[allow(dead_code)]
+    fn pres(name: &str, presenter: Box<dyn Presenter>, opts: Value) -> Registered {
+        Registered::new(name, opts).with_presenter(presenter)
     }
 
     fn trace(token: &Token) -> Vec<(String, String)> {
@@ -467,26 +524,26 @@ mod tests {
     fn normalize_bare_and_name_opts_entries() {
         assert_eq!(
             normalize("Recorder"),
-            PluginSpec::with_opts("Recorder", json!([]))
+            ExtensionSpec::with_opts("Recorder", json!([]))
         );
         assert_eq!(
-            normalize(PluginSpec::with_opts("Halter", json!({ "a": 1 }))),
-            PluginSpec::with_opts("Halter", json!({ "a": 1 }))
+            normalize(ExtensionSpec::with_opts("Halter", json!({ "a": 1 }))),
+            ExtensionSpec::with_opts("Halter", json!({ "a": 1 }))
         );
     }
 
-    // Resolving the shipped config list `["diff"]` yields exactly one plugin,
-    // the Diff plugin, registered under the name "diff".
+    // Resolving the shipped config list `["diff"]` yields exactly one extension,
+    // the Diff extension, registered under the name "diff".
     #[test]
     fn configured_resolves_diff_name_to_one_diff_plugin() {
-        let plugins = configured(&["diff".to_string()]);
-        assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].name, "diff");
+        let extensions = configured(&["diff".to_string()]);
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].name, "diff");
     }
 
     // An unknown name has no implementation, so it is skipped (it cannot
     // register and thus cannot run or fail a stage). The empty test-env list
-    // resolves to no plugins.
+    // resolves to no extensions.
     #[test]
     fn configured_skips_unknown_names_and_empty_list_is_empty() {
         assert!(configured(&[]).is_empty());
@@ -499,12 +556,12 @@ mod tests {
 
     #[test]
     fn pre_run_folds_in_registration_order() {
-        let plugins = vec![
-            reg("Recorder", Box::new(Recorder), json!({ "id": "a" })),
-            reg("Recorder", Box::new(Recorder), json!({ "id": "b" })),
+        let extensions = vec![
+            mw("Recorder", Box::new(Recorder), json!({ "id": "a" })),
+            mw("Recorder", Box::new(Recorder), json!({ "id": "b" })),
         ];
 
-        let (token, failures) = pre_run(&plugins, token());
+        let (token, failures) = pre_run(&extensions, token());
 
         assert!(failures.is_empty());
         assert_eq!(
@@ -518,16 +575,16 @@ mod tests {
 
     #[test]
     fn pre_run_halted_token_short_circuits_the_remaining_plugins() {
-        let plugins = vec![
-            reg("Halter", Box::new(Halter), json!({})),
-            reg(
+        let extensions = vec![
+            mw("Halter", Box::new(Halter), json!({})),
+            mw(
                 "Recorder",
                 Box::new(Recorder),
                 json!({ "id": "after_halt" }),
             ),
         ];
 
-        let (token, failures) = pre_run(&plugins, token());
+        let (token, failures) = pre_run(&extensions, token());
 
         assert!(failures.is_empty());
         assert!(token.halted);
@@ -537,12 +594,12 @@ mod tests {
 
     #[test]
     fn pre_run_a_crashing_plugin_is_skipped_and_reported_the_rest_still_run() {
-        let plugins = vec![
-            reg("Crasher", Box::new(Crasher), json!({})),
-            reg("Recorder", Box::new(Recorder), json!({ "id": "survivor" })),
+        let extensions = vec![
+            mw("Crasher", Box::new(Crasher), json!({})),
+            mw("Recorder", Box::new(Recorder), json!({ "id": "survivor" })),
         ];
 
-        let (token, failures) = pre_run(&plugins, token());
+        let (token, failures) = pre_run(&extensions, token());
 
         assert_eq!(
             trace(&token),
@@ -569,13 +626,13 @@ mod tests {
     fn pre_run_plugins_without_the_stage_are_skipped() {
         // ContentTagger only overrides post_run; its pre_run is the default
         // identity, so the token passes through unchanged with no failures.
-        let plugins = vec![reg(
+        let extensions = vec![mw(
             "ContentTagger",
             Box::new(ContentTagger),
             json!({ "id": "x" }),
         )];
 
-        let (token, failures) = pre_run(&plugins, token());
+        let (token, failures) = pre_run(&extensions, token());
 
         assert!(failures.is_empty());
         assert!(!token.halted);
@@ -588,13 +645,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_runs_the_tool_and_returns_the_shaped_result_with_artifacts() {
-        let plugins = vec![reg(
+        let extensions = vec![mw(
             "ArtifactPresenter",
             Box::new(ArtifactPresenter),
             json!({}),
         )];
 
-        let (result, failures) = execute(&plugins, token()).await;
+        let (result, failures) = execute(&extensions, token()).await;
 
         assert!(failures.is_empty());
         assert!(result.is_error);
@@ -606,20 +663,20 @@ mod tests {
 
     #[tokio::test]
     async fn execute_post_run_folds_in_reverse_registration_order_onion() {
-        let plugins = vec![
-            reg(
+        let extensions = vec![
+            mw(
                 "ContentTagger",
                 Box::new(ContentTagger),
                 json!({ "id": "outer" }),
             ),
-            reg(
+            mw(
                 "ContentTagger",
                 Box::new(ContentTagger),
                 json!({ "id": "inner" }),
             ),
         ];
 
-        let (result, failures) = execute(&plugins, token()).await;
+        let (result, failures) = execute(&extensions, token()).await;
 
         assert!(failures.is_empty());
         // inner (last registered) runs first; outer wraps it.
@@ -628,14 +685,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_post_run_output_is_shaped_to_the_result_cap() {
-        let plugins = vec![reg(
+        let extensions = vec![mw(
             "ContentTagger",
             Box::new(ContentTagger),
             json!({ "id": "tag" }),
         )];
         let token = Token::new("bogus", json!({}), ctx_with_cap(10));
 
-        let (result, failures) = execute(&plugins, token).await;
+        let (result, failures) = execute(&extensions, token).await;
 
         assert!(failures.is_empty());
         assert!(result.content.contains("[truncated:"));
@@ -643,16 +700,16 @@ mod tests {
 
     #[tokio::test]
     async fn execute_a_crashing_post_run_is_skipped_and_reported() {
-        let plugins = vec![
-            reg(
+        let extensions = vec![
+            mw(
                 "ContentTagger",
                 Box::new(ContentTagger),
                 json!({ "id": "kept" }),
             ),
-            reg("Crasher", Box::new(Crasher), json!({})),
+            mw("Crasher", Box::new(Crasher), json!({})),
         ];
 
-        let (result, failures) = execute(&plugins, token()).await;
+        let (result, failures) = execute(&extensions, token()).await;
 
         // ContentTagger:kept survives; Crasher's post_run is skipped. Reverse
         // fold: Crasher runs first (panics, token unchanged), then kept tags.
@@ -679,14 +736,11 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let plugins = vec![reg(
-            "ArtifactPresenter",
-            Box::new(ArtifactPresenter),
-            json!({}),
-        )];
+        let extensions = vec![Registered::new("ArtifactPresenter", json!({}))
+            .with_presenter(Box::new(ArtifactPresenter))];
 
         // Empty artifacts: ArtifactPresenter's present leaves the item unchanged.
-        let (presented, failures) = present(&plugins, item.clone(), &HashMap::new());
+        let (presented, failures) = present(&extensions, item.clone(), &HashMap::new());
 
         assert!(failures.is_empty());
         assert_eq!(presented, item);
@@ -700,15 +754,12 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let plugins = vec![reg(
-            "ArtifactPresenter",
-            Box::new(ArtifactPresenter),
-            json!({}),
-        )];
+        let extensions = vec![Registered::new("ArtifactPresenter", json!({}))
+            .with_presenter(Box::new(ArtifactPresenter))];
         let mut artifacts = HashMap::new();
         artifacts.insert("mark".to_string(), json!("seen"));
 
-        let (presented, failures) = present(&plugins, item, &artifacts);
+        let (presented, failures) = present(&extensions, item, &artifacts);
 
         assert!(failures.is_empty());
         assert_eq!(
@@ -727,9 +778,10 @@ mod tests {
             name: "grep".to_string(),
             summary: "pattern=x".to_string(),
         };
-        let plugins = vec![reg("Crasher", Box::new(Crasher), json!({}))];
+        let extensions =
+            vec![Registered::new("Crasher", json!({})).with_presenter(Box::new(Crasher))];
 
-        let (presented, failures) = present(&plugins, item.clone(), &HashMap::new());
+        let (presented, failures) = present(&extensions, item.clone(), &HashMap::new());
 
         assert_eq!(presented, item);
         assert_eq!(

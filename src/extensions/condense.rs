@@ -1,4 +1,4 @@
-//! The condense Plugin: collapses noise runs in run_command results.
+//! The condense Extension: collapses noise runs in run_command results.
 //!
 //! Measurement across real Session Logs put run_command results at ~11% of
 //! Conversation token mass, and roughly half of that is noise lines: cargo
@@ -14,12 +14,15 @@
 //! silent cut). Everything outside a qualifying run passes through verbatim:
 //! FAILED/error/warning lines, blanks, and the `[exit code: N]` / timeout tail
 //! that [`crate::tools::run_command::report`] owns and the exit-badge plugin
-//! parses. The marker wording is this plugin's own (CONTEXT.md: strings a
-//! Plugin produces about its own decisions stay in that Plugin).
+//! parses. The marker wording is this Extension's own (CONTEXT.md: strings an
+//! Extension produces about its own decisions stay in that Extension).
+//!
+//! This is a Middleware-only Extension (ADR-0042): it rewrites model-facing
+//! content in `post_run` and has no display-side Presenter role.
 
 use serde_json::Value;
 
-use crate::plugin::{Plugin, Token};
+use crate::middleware::{Middleware, Token};
 
 /// The one tool this plugin acts on.
 const TOOL: &str = "run_command";
@@ -58,10 +61,10 @@ impl NoiseClass {
     }
 }
 
-/// The condense plugin.
+/// The condense extension.
 pub struct Condense;
 
-impl Plugin for Condense {
+impl Middleware for Condense {
     fn post_run(&self, mut token: Token, _opts: &Value) -> Token {
         // Pass and fail alike: a failing run carries compile-progress noise too.
         if token.tool != TOOL {
@@ -138,7 +141,7 @@ fn emit_run(out: &mut Vec<String>, run: &[&str], class: NoiseClass) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::token::TokenResult;
+    use crate::middleware::token::TokenResult;
     use crate::tool::ToolCtx;
     use serde_json::json;
 
@@ -323,9 +326,9 @@ mod tests {
 
     #[test]
     fn registry_resolves_condense_and_the_default_config_ships_it() {
-        let plugins = crate::plugins::configured(&["condense".to_string()]);
-        assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].name, "condense");
+        let extensions = crate::extensions::configured(&["condense".to_string()]);
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].name, "condense");
 
         let base = crate::session::SessionConfig::base();
         assert!(base.plugins.contains(&"condense".to_string()));

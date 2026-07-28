@@ -435,7 +435,7 @@ impl Event {
 
     // ---- The rest ----
 
-    /// Constructs a `plugin_error` from a pipeline [`crate::plugins::Failure`]'s
+    /// Constructs a `plugin_error` from a pipeline [`crate::extensions::Failure`]'s
     /// parts, mirroring baud's `plugin_error/1` which takes the failure map.
     pub fn plugin_error(
         plugin: impl Into<String>,

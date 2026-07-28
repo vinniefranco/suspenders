@@ -12,7 +12,7 @@ use crate::content::{ContentBlock, Message, Usage};
 use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::response::{Response, StopReason};
-use crate::plugins::Registered;
+use crate::extensions::Registered;
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::test_support::{Entry, FakeDeps, FakeLlm};
 use crate::tool::ToolCtx;
@@ -92,9 +92,9 @@ pub(super) async fn run_with(
     mut deps: FakeDeps,
 ) -> (Outcome, FakeDeps) {
     let conv = conversation(session, prompt);
-    let plugins: Vec<Registered> = Vec::new();
+    let extensions: Vec<Registered> = Vec::new();
     let ctx = tool_ctx(session);
-    let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+    let outcome = run(conv, session, &extensions, &ctx, &mut deps, RunOpts::default()).await;
     (outcome, deps)
 }
 

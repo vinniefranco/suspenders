@@ -10,10 +10,10 @@
 //! never run - ADR-0035), the Tool
 //! Call answering arbiter before execution ([`governor::answer_sent`],
 //! ADR-0026: an identical repeat draws a replacement Tool Result instead of a
-//! rerun), then the Plugin lifecycle (ADR-0007: pre_run - which may halt the
-//! call with the plugin's own wording - execution, post_run/Shaping), with
+//! rerun), then the Extension lifecycle (ADR-0007: pre_run - which may halt the
+//! call with the Extension's own wording - execution, post_run/Shaping), with
 //! Approval (ADR-0005) requested between pre_run and execution for the tools
-//! that require it, on the plugin-adjusted input; the arbiter is consulted
+//! that require it, on the Middleware-adjusted input; the arbiter is consulted
 //! again after execution ([`governor::answer_read`] - the consecutive-failure
 //! annotation). Once the batch finishes the Conversation is checkpointed with
 //! only the answered Tool Calls, so the checkpoint never persists an unanswered
@@ -31,9 +31,9 @@ use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::malformed_tool_input;
+use crate::extensions;
+use crate::middleware::Token;
 use crate::plan::Update;
-use crate::plugin::Token;
-use crate::plugins;
 use crate::run::deps::RunDeps;
 use crate::run::governor::ledger::{CallOutcome, ToolResult};
 use crate::run::governor::{self, AnswerIntervention};
@@ -226,7 +226,7 @@ impl Answer {
         }
     }
 
-    /// A Plugin halt reads as a failed run.
+    /// A Middleware halt reads as a failed run.
     fn halted(reason: String, artifacts: HashMap<String, Value>) -> Self {
         Answer {
             content: reason,
@@ -246,8 +246,8 @@ impl Answer {
         }
     }
 
-    /// The Plugin pipeline executed the call.
-    fn ran(result: plugins::PipelineResult) -> Self {
+    /// The Extension pipeline executed the call.
+    fn ran(result: extensions::PipelineResult) -> Self {
         Answer {
             content: result.content,
             is_error: result.is_error,
@@ -266,11 +266,11 @@ impl Answer {
     }
 }
 
-// The Plugin lifecycle (ADR-0007): the LLM layer tags malformed inputs - never
-// run those (mechanics, not a Governor's judgment). Otherwise the answering
-// arbiter judges what the model SENT (a replaced Tool Result skips execution),
-// then pre_run, Approval on the plugin-adjusted command, and execution with
-// post_run and Shaping.
+// The Extension lifecycle (ADR-0007): the LLM layer tags malformed inputs -
+// never run those (mechanics, not a Governor's judgment). Otherwise the
+// answering arbiter judges what the model SENT (a replaced Tool Result skips
+// execution), then pre_run, Approval on the Middleware-adjusted command, and
+// execution with post_run and Shaping.
 async fn run_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str, input: &Value) -> Answer {
     if let Some(raw) = malformed_tool_input(input) {
         return Answer::malformed(raw);
@@ -305,7 +305,7 @@ async fn run_lifecycle<D: RunDeps>(
     input: &Value,
 ) -> Answer {
     let token = Token::new(name, input.clone(), state.tool_ctx.clone());
-    let (token, failures) = plugins::pre_run(state.plugins, token);
+    let (token, failures) = extensions::pre_run(state.extensions, token);
     emit_plugin_errors(state, &failures);
 
     if token.halted {
@@ -315,7 +315,7 @@ async fn run_lifecycle<D: RunDeps>(
 
     // The one Approval seam: Some(text) gates and text is exactly what the
     // user reads (the command, or web_fetch's URL), read from the
-    // plugin-adjusted input; None means no gate (approvals::gate_text).
+    // Middleware-adjusted input; None means no gate (approvals::gate_text).
     match approvals::gate_text(name, &token.input) {
         Some(text) => {
             let id = new_ref();
@@ -330,12 +330,12 @@ async fn run_lifecycle<D: RunDeps>(
 }
 
 async fn execute_token<D: RunDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
-    let (result, failures) = plugins::execute(state.plugins, token).await;
+    let (result, failures) = extensions::execute(state.extensions, token).await;
     emit_plugin_errors(state, &failures);
     Answer::ran(result)
 }
 
-fn emit_plugin_errors<D: RunDeps>(state: &mut LoopState<'_, D>, failures: &[plugins::Failure]) {
+fn emit_plugin_errors<D: RunDeps>(state: &mut LoopState<'_, D>, failures: &[extensions::Failure]) {
     for failure in failures {
         state.emitter.emit(Event::plugin_error(
             failure.plugin.clone(),

@@ -36,7 +36,7 @@ use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::response::Response;
 use crate::llm::{Llm, LlmRequest, StreamEvent};
-use crate::plugins;
+use crate::extensions;
 use crate::scout::{Scout, ScoutOpts};
 use crate::session::Session;
 use crate::run::deps::{CompactError, Emitter, RunDeps};
@@ -203,7 +203,7 @@ impl RunDeps for AgentDeps {
     }
 }
 
-/// Runs the Run: builds the Plugin pipeline and
+/// Runs the Run: builds the Extension pipeline and
 /// Tool ctx (the ctx's `scout` capture dispatches a [`Scout`] over the Session's
 /// Llm/connection) and drives [`loop_::run`]. Returns the Loop outcome.
 pub async fn run(
@@ -212,10 +212,10 @@ pub async fn run(
     mut deps: AgentDeps,
     opts: RunOpts,
 ) -> Outcome {
-    // Resolve the Session's ordered Plugin names into the live pipeline. The
+    // Resolve the Session's ordered Extension names into the live pipeline. The
     // shipped config carries `["diff"]`, so the live app runs the Run with the
-    // Diff plugin; the test config carries `[]`.
-    let plugins = plugins::configured(&session.plugins);
+    // Diff extension; the test config carries `[]`.
+    let extensions = extensions::configured(&session.plugins);
 
     // The Tool ctx: the Session's Root and timeout plus the Result Cap derived
     // from this Run's captured Model (ADR-0037), and the `scout` capture
@@ -235,7 +235,15 @@ pub async fn run(
         },
     ));
 
-    loop_::run(conversation, &session, &plugins, &tool_ctx, &mut deps, opts).await
+    loop_::run(
+        conversation,
+        &session,
+        &extensions,
+        &tool_ctx,
+        &mut deps,
+        opts,
+    )
+    .await
 }
 
 // The Session knobs the `scout` capture carries into every dispatch, bundled

@@ -1,4 +1,4 @@
-//! The first Plugin (ADR-0007): diffs on file edits.
+//! The first Extension (ADR-0007): diffs on file edits.
 //!
 //! Covers edit_file and write_file. For edit_file, [`pre_run`](Diff::pre_run)
 //! snapshots the target file; [`post_run`](Diff::post_run) on a successful edit
@@ -17,6 +17,10 @@
 //! the tool's message. write_file writes the model's content verbatim, so it
 //! never needs grounding. This is the "only on fuzzy match" policy: Context
 //! Budget is spent exactly where the model would otherwise be blind.
+//!
+//! This Extension composes both roles (ADR-0042): a Middleware
+//! (`pre_run` snapshots, `post_run` computes hunks and attaches the Artifact)
+//! and a Presenter (`present` replaces the summary with a diff Block).
 
 pub mod display;
 pub mod hunks;
@@ -25,18 +29,19 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::plugin::{Plugin, Token};
+use crate::middleware::{Middleware, Token};
+use crate::presenter::Presenter;
 use crate::tool::resolve_path;
 use crate::ui::transcript::TranscriptItem;
 use display::Diff as DiffArtifact;
 
-/// The Token keys the Diff plugin reserves, declared in one place.
+/// The Token keys the Diff extension reserves, declared in one place.
 ///
-/// `assigns` and `artifacts` are open `HashMap`s by design (ADR-0007: Plugins
-/// are an open extension seam, so the core [`Token`] never closes the key
-/// universe). Each Plugin owns its own reserved keys instead; naming them here
-/// once means a producer and consumer that disagree fail to *compile* rather
-/// than silently missing the value - a rename touches this module alone.
+/// `assigns` and `artifacts` are open `HashMap`s by design (ADR-0007:
+/// Extensions are an open extension seam, so the core [`Token`] never closes
+/// the key universe). Each Extension owns its own reserved keys instead; naming
+/// them here once means a producer and consumer that disagree fail to *compile*
+/// rather than silently missing the value - a rename touches this module alone.
 mod keys {
     /// `assigns`: the pre-edit file snapshot [`super::Diff::pre_run`] captures,
     /// read back by [`super::Diff::post_run`] to compute the edit's hunks.
@@ -55,10 +60,10 @@ const TOOLS: [&str; 2] = ["edit_file", "write_file"];
 /// Display cap is looser - Artifacts cost no Context Budget.
 const MODEL_DIFF_LINES: usize = 40;
 
-/// The Diff plugin (ADR-0007).
+/// The Diff extension (ADR-0007).
 pub struct Diff;
 
-impl Plugin for Diff {
+impl Middleware for Diff {
     fn pre_run(&self, token: Token, _opts: &Value) -> Token {
         // Only edit_file needs a before-snapshot; write_file only creates.
         if token.tool != "edit_file" {
@@ -106,7 +111,9 @@ impl Plugin for Diff {
             _ => token,
         }
     }
+}
 
+impl Presenter for Diff {
     fn present(
         &self,
         item: TranscriptItem,
@@ -240,7 +247,7 @@ fn path(token: &Token) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::{self, Registered};
+    use crate::extensions::{self, Registered};
     use crate::tool::ToolCtx;
     use crate::ui::transcript::{LineStyle, StyledLine};
     use serde_json::json;
@@ -255,22 +262,26 @@ mod tests {
         }
     }
 
-    fn plugins() -> Vec<Registered> {
-        vec![Registered::new("Diff", Box::new(Diff), json!({}))]
+    fn extensions() -> Vec<Registered> {
+        vec![
+            Registered::new("Diff", json!({}))
+                .with_middleware(Box::new(Diff))
+                .with_presenter(Box::new(Diff)),
+        ]
     }
 
     // The lifecycle exactly as the Run runs it: pre_run, then execution with
-    // post_run and Shaping inside Plugins::execute.
-    async fn run(name: &str, input: Value, ctx: &ToolCtx) -> plugins::PipelineResult {
-        let regs = plugins();
-        let (token, failures) = plugins::pre_run(&regs, Token::new(name, input, ctx.clone()));
+    // post_run and Shaping inside extensions::execute.
+    async fn run(name: &str, input: Value, ctx: &ToolCtx) -> extensions::PipelineResult {
+        let regs = extensions();
+        let (token, failures) = extensions::pre_run(&regs, Token::new(name, input, ctx.clone()));
         assert!(failures.is_empty());
-        let (result, failures) = plugins::execute(&regs, token).await;
+        let (result, failures) = extensions::execute(&regs, token).await;
         assert!(failures.is_empty());
         result
     }
 
-    fn diff_of(result: &plugins::PipelineResult) -> DiffArtifact {
+    fn diff_of(result: &extensions::PipelineResult) -> DiffArtifact {
         read_diff_artifact(&result.artifacts).expect("diff artifact present")
     }
 
@@ -408,8 +419,8 @@ mod tests {
         let path = "existing.txt";
         std::fs::write(tmp.path().join(path), "old\n").unwrap();
 
-        let regs = plugins();
-        let (token, failures) = plugins::pre_run(
+        let regs = extensions();
+        let (token, failures) = extensions::pre_run(
             &regs,
             Token::new(
                 "write_file",

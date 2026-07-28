@@ -242,7 +242,7 @@ async fn run_loop(
     let mut screen = Some(Screen::new(ScreenOpts {
         context_budget: Some(session.context_budget_for(&session.model)),
         eviction_slack: session.eviction_slack,
-        plugins: crate::plugins::configured(&session.plugins),
+        extensions: crate::extensions::configured(&session.plugins),
         history,
         notices: launch_notices,
     }));

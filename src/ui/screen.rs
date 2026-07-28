@@ -35,8 +35,8 @@
 
 use crate::conversation::{WaveStats, compaction_target, dead_mass_pct};
 use crate::event::Event;
+use crate::extensions::Registered;
 use crate::llm::response::StopReason;
-use crate::plugins::Registered;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
 use crate::ui::transcript::{Tone, Transcript, TranscriptItem};
 
@@ -206,8 +206,8 @@ pub enum Effect {
 /// The pure Screen state (ADR-0034; the renamed fold root of baud's
 /// `%Baud.UI.Transcript{}`).
 ///
-/// The Transcript store's plugins are not `Clone`/`PartialEq`, so the core is
-/// not `Clone`; the fold takes and returns an owned `Screen` by value,
+/// The Transcript store's extensions are not `Clone`/`PartialEq`, so the core
+/// is not `Clone`; the fold takes and returns an owned `Screen` by value,
 /// mirroring the Elixir struct-threading style.
 pub struct Screen {
     /// The Transcript (ADR-0034): the display-side history, the streaming
@@ -257,7 +257,7 @@ pub struct Screen {
 pub struct ScreenOpts {
     pub context_budget: Option<u64>,
     pub eviction_slack: f64,
-    pub plugins: Vec<Registered>,
+    pub extensions: Vec<Registered>,
     pub history: Vec<String>,
     /// Launch-time info lines the adapter authors (context-file skips today):
     /// news from before the event loop existed, recorded right after the
@@ -270,7 +270,7 @@ impl Screen {
     pub fn new(opts: ScreenOpts) -> Self {
         // The greeting is this fold's Voice: the store opens empty and
         // records what its owner authors.
-        let mut transcript = Transcript::new(opts.plugins);
+        let mut transcript = Transcript::new(opts.extensions);
         transcript.info(GREETING);
         for notice in opts.notices {
             transcript.info(notice);
