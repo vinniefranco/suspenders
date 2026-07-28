@@ -594,6 +594,11 @@ async fn run_effects(
     screen
 }
 
+// The effect interpreter's dispatch seam: one arm per [`Effect`] family, each
+// routing to a cohesive handler so this function only integrates and never
+// operates. The families are the separable concerns - agent commands, viewport
+// motion, history persistence, and the slash-command seam - each of which owns
+// its own logic in the handler below.
 async fn run_effect(
     screen: Screen,
     effect: Effect,
@@ -601,66 +606,16 @@ async fn run_effect(
     state: &mut AdapterState,
     geometry: Geometry,
 ) -> Screen {
-    let agent = ctx.agent;
-    // Scroll effects clamp against the LAST draw's measure (see [`Geometry`]);
-    // the draw-time `top_offset` clamp corrects any staleness.
-    let (total_lines, height) = geometry;
     match effect {
-        Effect::Agent(AgentCommand::Submit(prompt)) => {
-            let result = agent.submit(prompt.clone()).await;
-            // The core records the outcome (ok appends the user line; busy
-            // retries as steer) and may emit MORE effects.
-            let outcome = result.map_err(|_| Busy);
-            let (core, effects) = screen.submitted(prompt, outcome);
-            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
-        }
-        Effect::Agent(AgentCommand::Steer(text)) => {
-            let result = agent.steer(text.clone()).await;
-            let outcome = result.map_err(|_| Idle);
-            let (core, effects) = screen.steered(text, outcome);
-            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
-        }
-        Effect::Agent(AgentCommand::Approve(id, decision)) => {
-            agent.approve(id, to_agent_decision(decision)).await;
-            screen
-        }
-        Effect::Agent(AgentCommand::Cancel) => {
-            agent.cancel().await;
-            screen
-        }
-        Effect::PinBottom => {
-            state.viewport.pin_bottom();
-            screen
-        }
-        Effect::ScrollUp(ScrollStep::Line) => {
-            state.viewport.scroll_up(WHEEL_LINES, total_lines, height);
-            screen
-        }
-        Effect::ScrollUp(ScrollStep::Page) => {
-            state.viewport.page_up(total_lines, height);
-            screen
-        }
-        Effect::ScrollDown(ScrollStep::Line) => {
-            state.viewport.scroll_down(WHEEL_LINES, total_lines, height);
-            screen
-        }
-        Effect::ScrollDown(ScrollStep::Page) => {
-            state.viewport.page_down(total_lines, height);
-            screen
+        Effect::Agent(command) => run_agent_command(command, screen, ctx, state, geometry).await,
+        Effect::PinBottom | Effect::ScrollUp(_) | Effect::ScrollDown(_) => {
+            apply_viewport(&effect, screen, state, geometry)
         }
         // Focus effects are a no-op in the ratatui adapter: there is no separate
         // focusable widget tree; the modal captures keys via the pure core's
         // pending_approval, and the composer is always the input target.
         Effect::FocusModal | Effect::FocusComposer => screen,
-        // Persist the submitted prompt so up/down recall survives across
-        // Sessions. The pure core already added it to its in-memory ring; this
-        // writes it through to the on-disk store (best-effort, never fatal).
-        Effect::HistoryAppend(prompt) => {
-            if let Some(path) = state.history.as_deref() {
-                append_history(path, &prompt);
-            }
-            screen
-        }
+        Effect::HistoryAppend(prompt) => persist_history(screen, state, prompt),
         // A committed Slash Command (ADR-0032/0033). The adapter routes it
         // through the single `command::run` seam - `is_handled` reflects exactly
         // what it routes, so an unwired registry entry is a visible info line,
@@ -675,6 +630,80 @@ async fn run_effect(
             value,
         } => command::choose(screen, ctx, state, &cmd, value).await,
     }
+}
+
+/// Runs one [`AgentCommand`] against the live [`AgentHandle`]: `submit`/`steer`
+/// feed their outcome back through the pure core (which may emit MORE effects,
+/// hence the recursion through [`run_effects`]), while `approve`/`cancel` are
+/// fire-through calls that leave the screen untouched.
+async fn run_agent_command(
+    command: AgentCommand,
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    state: &mut AdapterState,
+    geometry: Geometry,
+) -> Screen {
+    let agent = ctx.agent;
+    match command {
+        AgentCommand::Submit(prompt) => {
+            // The core records the outcome (ok appends the user line; busy
+            // retries as steer) and may emit MORE effects.
+            let outcome = agent.submit(prompt.clone()).await.map_err(|_| Busy);
+            let (core, effects) = screen.submitted(prompt, outcome);
+            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
+        }
+        AgentCommand::Steer(text) => {
+            let outcome = agent.steer(text.clone()).await.map_err(|_| Idle);
+            let (core, effects) = screen.steered(text, outcome);
+            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
+        }
+        AgentCommand::Approve(id, decision) => {
+            agent.approve(id, to_agent_decision(decision)).await;
+            screen
+        }
+        AgentCommand::Cancel => {
+            agent.cancel().await;
+            screen
+        }
+    }
+}
+
+/// Applies a viewport-motion effect (pin / scroll) and returns the screen
+/// unchanged - the ratatui adapter's viewport lives in [`AdapterState`], not the
+/// pure core. Scroll effects clamp against the LAST draw's measure (see
+/// [`Geometry`]); the draw-time `top_offset` clamp corrects any staleness. Only
+/// the viewport-family variants reach here (guarded by the `run_effect` router).
+fn apply_viewport(
+    effect: &Effect,
+    screen: Screen,
+    state: &mut AdapterState,
+    geometry: Geometry,
+) -> Screen {
+    let (total_lines, height) = geometry;
+    match effect {
+        Effect::PinBottom => state.viewport.pin_bottom(),
+        Effect::ScrollUp(ScrollStep::Line) => {
+            state.viewport.scroll_up(WHEEL_LINES, total_lines, height)
+        }
+        Effect::ScrollUp(ScrollStep::Page) => state.viewport.page_up(total_lines, height),
+        Effect::ScrollDown(ScrollStep::Line) => {
+            state.viewport.scroll_down(WHEEL_LINES, total_lines, height)
+        }
+        Effect::ScrollDown(ScrollStep::Page) => state.viewport.page_down(total_lines, height),
+        _ => {}
+    }
+    screen
+}
+
+/// Persists a submitted prompt to the on-disk history ring and returns the
+/// screen unchanged. The pure core already added it to its in-memory ring; this
+/// writes it through to the on-disk store (best-effort, never fatal) so up/down
+/// recall survives across Sessions.
+fn persist_history(screen: Screen, state: &AdapterState, prompt: String) -> Screen {
+    if let Some(path) = state.history.as_deref() {
+        append_history(path, &prompt);
+    }
+    screen
 }
 
 /// The on-disk prompt-history path for this Session: a `history` file beside the

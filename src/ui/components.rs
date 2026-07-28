@@ -233,6 +233,30 @@ pub struct Anim {
 /// transcript viewport - which is expected to shrink as the Composer grows.
 /// The wrap math runs at the exact width the Composer is drawn at (the frame
 /// minus the 2-cell gutter), so the measured cursor cell is the drawn one.
+/// Splits `area` into the three vertical frame zones: `[viewport, status_bar,
+/// composer]`. `composer_rows` is the already-capped Composer row count (see
+/// [`composer::max_visible_rows`]). Pure - no frame access.
+fn frame_chunks(area: Rect, composer_rows: usize) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),                       // transcript viewport
+            Constraint::Length(1),                    // status bar
+            Constraint::Length(composer_rows as u16), // composer (grows with the draft)
+        ])
+        .split(area)
+}
+
+/// The Composer's visible row count for this frame: the layout's row count
+/// capped by [`composer::max_visible_rows`] so a very tall draft never starves
+/// the transcript viewport. Pure - no frame access.
+fn capped_composer_height(layout: &ComposerLayout, frame_height: usize) -> usize {
+    layout
+        .rows
+        .len()
+        .min(composer::max_visible_rows(frame_height))
+}
+
 pub fn render(
     frame: &mut Frame,
     t: &Screen,
@@ -251,18 +275,8 @@ pub fn render(
         composer_view.cursor,
         area.width.saturating_sub(2) as usize,
     );
-    let composer_height = layout
-        .rows
-        .len()
-        .min(composer::max_visible_rows(area.height as usize));
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),                         // transcript viewport
-            Constraint::Length(1),                      // status bar
-            Constraint::Length(composer_height as u16), // composer (grows with the draft)
-        ])
-        .split(area);
+    let composer_height = capped_composer_height(&layout, area.height as usize);
+    let chunks = frame_chunks(area, composer_height);
 
     // The viewport renders FIRST: the status bar's position segment reads the
     // measured geometry (and the Viewport's clamped top) from this frame, not
@@ -304,6 +318,88 @@ pub fn render(
     geometry
 }
 
+/// Computes the bounding rect for the Composer overlay popup: body rows plus
+/// top/bottom border, capped so a long list never eats the screen, positioned
+/// just above `anchor_y` and horizontally centered within `area`. Pure - no
+/// frame access. `body_len` is the number of content lines the popup will hold.
+fn popup_rect(anchor_y: u16, area: Rect, body_len: usize) -> Rect {
+    let body_rows = body_len.max(1) as u16;
+    let height = (body_rows + 2).min(POPUP_MAX_ROWS + 2).min(area.height);
+    let width = area.width.saturating_sub(2).max(1);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = anchor_y.saturating_sub(height);
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// Resolves the title string for a Selector popup: the command's `list_title`
+/// from the registry, or the raw command name if it is not registered.
+fn selector_popup_title(command: &str) -> String {
+    slash::lookup(command)
+        .map(|c| c.list_title.to_string())
+        .unwrap_or_else(|| command.to_string())
+}
+
+/// Resolves the body lines for a Selector popup given the overlay status: a
+/// loading/error status line, or the full row list when ready. Pure - no draw
+/// calls, only styled [`Line`] construction.
+fn selector_popup_lines(
+    title: &str,
+    status: &OverlayStatus,
+    rows: &[SelectorRow],
+    highlight: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    match status {
+        OverlayStatus::Loading => vec![Line::styled(
+            format!("loading {title}…"),
+            Style::default()
+                .fg(tui_color(theme.muted))
+                .add_modifier(Modifier::ITALIC),
+        )],
+        OverlayStatus::Failed(msg) => vec![Line::styled(
+            format!("failed: {msg}"),
+            Style::default()
+                .fg(tui_color(theme.error))
+                .add_modifier(Modifier::BOLD),
+        )],
+        OverlayStatus::Ready => popup_rows(rows, highlight, theme),
+    }
+}
+
+/// Derives the popup title and body lines from the current overlay view.
+/// Pure - reads only the view and theme, emits no draw calls.
+fn popup_title_and_lines(view: &OverlayView, theme: &Theme) -> (String, Vec<Line<'static>>) {
+    match view {
+        OverlayView::Menu { rows, highlight } => {
+            ("commands".into(), popup_rows(rows, *highlight, theme))
+        }
+        OverlayView::Selector {
+            command,
+            status,
+            rows,
+            highlight,
+        } => {
+            let title = selector_popup_title(command);
+            let lines = selector_popup_lines(&title, status, rows, *highlight, theme);
+            (title, lines)
+        }
+    }
+}
+
+/// Returns the highlighted row index from an overlay view, used to scroll the
+/// list so the cursor stays visible when the popup overflows its height.
+fn popup_highlight(view: &OverlayView) -> usize {
+    match view {
+        OverlayView::Menu { highlight, .. } => *highlight,
+        OverlayView::Selector { highlight, .. } => *highlight,
+    }
+}
+
 /// The inline Composer overlay popup (ADR-0032/0033): a compact bordered list
 /// anchored just above `anchor_y` (the status bar's row), listing the current
 /// [`OverlayView`]'s rows with the highlighted one reversed and any hint
@@ -317,61 +413,9 @@ fn render_composer_popup(
     view: &OverlayView,
     theme: &Theme,
 ) {
-    // The lines the popup body holds, plus the title.
-    let (title, lines): (String, Vec<Line>) = match view {
-        OverlayView::Menu { rows, highlight } => {
-            ("commands".into(), popup_rows(rows, *highlight, theme))
-        }
-        OverlayView::Selector {
-            command,
-            status,
-            rows,
-            highlight,
-        } => {
-            // The popup titles itself after the command's own values -
-            // "models" for /model, "themes" for /theme - from the registry
-            // descriptor's `list_title` (grammar belongs to the registry, not
-            // the painter); an unregistered name falls back to the raw name.
-            let title = slash::lookup(command)
-                .map(|c| c.list_title.to_string())
-                .unwrap_or_else(|| command.clone());
-            match status {
-                OverlayStatus::Loading => {
-                    let line = Line::styled(
-                        format!("loading {title}…"),
-                        Style::default()
-                            .fg(tui_color(theme.muted))
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                    (title, vec![line])
-                }
-                OverlayStatus::Failed(msg) => (
-                    title,
-                    vec![Line::styled(
-                        format!("failed: {msg}"),
-                        Style::default()
-                            .fg(tui_color(theme.error))
-                            .add_modifier(Modifier::BOLD),
-                    )],
-                ),
-                OverlayStatus::Ready => (title, popup_rows(rows, *highlight, theme)),
-            }
-        }
-    };
-
-    // Body rows + top/bottom border, capped so a long list never eats the
-    // screen; width caps to the terminal.
-    let body_rows = lines.len().max(1) as u16;
-    let height = (body_rows + 2).min(POPUP_MAX_ROWS + 2).min(area.height);
-    let width = area.width.saturating_sub(2).max(1);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = anchor_y.saturating_sub(height);
-    let popup = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+    let (title, lines) = popup_title_and_lines(view, theme);
+    let highlight = popup_highlight(view);
+    let popup = popup_rect(anchor_y, area, lines.len());
 
     frame.render_widget(Clear, popup);
     let block = Block::default()
@@ -383,10 +427,6 @@ fn render_composer_popup(
 
     // Scroll the highlighted row into view when the list overflows the box.
     let visible = inner.height as usize;
-    let highlight = match view {
-        OverlayView::Menu { highlight, .. } => *highlight,
-        OverlayView::Selector { highlight, .. } => *highlight,
-    };
     let top = composer::first_visible_row(highlight, visible.max(1));
     let shown: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
     frame.render_widget(Paragraph::new(shown), inner);
@@ -1165,6 +1205,17 @@ struct GutterCtx<'a> {
 /// a gutter glyph lands on exactly the row its item occupies at any scroll
 /// position, soft-wrapped continuations included (M3). Draws nothing outside the
 /// item rows (a short transcript leaves the lower gutter clear).
+/// Resolves the paint style for one gutter cell: `Some(style)` when the cell
+/// should be painted (Caret or Spine), `None` for Blank (the reserved columns
+/// stay clear - nothing to paint).
+fn gutter_cell_style(cell: RowGutter, caret: Style, spine: Style) -> Option<Style> {
+    match cell {
+        RowGutter::Blank => None,
+        RowGutter::Caret => Some(caret),
+        RowGutter::Spine => Some(spine),
+    }
+}
+
 fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: &Theme) {
     let caret = Style::default()
         .fg(tui_color(theme.prompt_gutter))
@@ -1178,13 +1229,8 @@ fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: 
         .take(ctx.height)
         .enumerate()
     {
-        if *cell == RowGutter::Blank {
-            continue; // nothing to paint - the reserved columns stay clear.
-        }
-        let style = if *cell == RowGutter::Caret {
-            caret
-        } else {
-            spine
+        let Some(style) = gutter_cell_style(*cell, caret, spine) else {
+            continue;
         };
         let y = text_area.y + screen_row as u16;
         frame.render_widget(
@@ -1929,13 +1975,19 @@ fn text_rows(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn block_line(line: &StyledLine, theme: &Theme) -> Line<'static> {
-    let text = if line.text.is_empty() {
+/// Normalizes a [`StyledLine`]'s text for display: an empty line expands to a
+/// single space so ratatui renders it as a visible blank row; tabs become two
+/// spaces (consistent with [`text_rows`]).
+fn normalize_block_text(line: &StyledLine) -> String {
+    if line.text.is_empty() {
         " ".to_string()
     } else {
         line.text.replace('\t', "  ")
-    };
-    Line::styled(text, line_style(line.style, theme))
+    }
+}
+
+fn block_line(line: &StyledLine, theme: &Theme) -> Line<'static> {
+    Line::styled(normalize_block_text(line), line_style(line.style, theme))
 }
 
 /// The running-spinner animation frames (braille), advanced by the adapter's
@@ -2530,13 +2582,12 @@ pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str, theme
     frame.render_widget(body, inner);
 }
 
-/// The `--resume` Session Picker: a centered bordered list, one row per
-/// Session (`stamp  label`), the cursor row reversed+bold, and a dim key-hint
-/// footer. Key handling lives in the pure [`Picker`] core; this only draws.
-pub fn render_picker(frame: &mut Frame, picker: &Picker, theme: &Theme) {
+/// Computes the bounding rect for the Session Picker modal: derives the needed
+/// content width from the entries and footer, clamps both dimensions to the
+/// terminal, and returns a centered `Rect`. Pure - no frame access.
+fn picker_rect(picker: &Picker, area: Rect) -> Rect {
     const FOOTER: &str = "↑/↓ select · Enter resume · Esc fresh session · q quit";
 
-    let area = frame.area();
     let content_width = picker
         .entries
         .iter()
@@ -2544,13 +2595,22 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker, theme: &Theme) {
         .chain(std::iter::once(FOOTER.chars().count()))
         .max()
         .unwrap_or(0) as u16;
-    // rows + footer + borders; both dimensions capped to the terminal.
     let width = (content_width + PICKER_MIN_WIDTH_EXTRA)
         .max(MODAL_MIN_WIDTH)
         .min(area.width.saturating_sub(2));
     let height =
         (picker.entries.len() as u16 + PICKER_HEIGHT_OVERHEAD).min(area.height.saturating_sub(2));
-    let modal = centered_rect(width, height, area);
+    centered_rect(width, height, area)
+}
+
+/// The `--resume` Session Picker: a centered bordered list, one row per
+/// Session (`stamp  label`), the cursor row reversed+bold, and a dim key-hint
+/// footer. Key handling lives in the pure [`Picker`] core; this only draws.
+pub fn render_picker(frame: &mut Frame, picker: &Picker, theme: &Theme) {
+    const FOOTER: &str = "↑/↓ select · Enter resume · Esc fresh session · q quit";
+
+    let area = frame.area();
+    let modal = picker_rect(picker, area);
 
     frame.render_widget(Clear, modal);
     let block = Block::default()
@@ -5328,5 +5388,97 @@ mod tests {
         ));
         let terminal = draw_viewport(80, 20, &screen);
         assert!(buffer_text(&terminal).contains("a streaming reply"));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_block_text: the two normalization rules (empty -> space, tab
+    // -> two spaces) are the only logic in `block_line`; tested here so that
+    // render tests pin the VISIBLE output and these tests pin the TEXT rule.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_block_text_expands_empty_to_a_space() {
+        let line = StyledLine {
+            text: String::new(),
+            style: LineStyle::Default,
+        };
+        assert_eq!(normalize_block_text(&line), " ");
+    }
+
+    #[test]
+    fn normalize_block_text_replaces_tabs_with_two_spaces() {
+        let line = StyledLine {
+            text: "a\tb".to_string(),
+            style: LineStyle::Default,
+        };
+        assert_eq!(normalize_block_text(&line), "a  b");
+    }
+
+    #[test]
+    fn normalize_block_text_leaves_ordinary_text_unchanged() {
+        let line = StyledLine {
+            text: "hello world".to_string(),
+            style: LineStyle::Default,
+        };
+        assert_eq!(normalize_block_text(&line), "hello world");
+    }
+
+    // -----------------------------------------------------------------------
+    // gutter_cell_style: the Blank -> None, Caret/Spine -> Some mapping; the
+    // returned style is the concrete one the painter supplies (not a default).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gutter_cell_style_blank_returns_none() {
+        let caret = Style::default().fg(Color::Green);
+        let spine = Style::default().fg(Color::Blue);
+        assert_eq!(gutter_cell_style(RowGutter::Blank, caret, spine), None);
+    }
+
+    #[test]
+    fn gutter_cell_style_caret_returns_caret_style() {
+        let caret = Style::default().fg(Color::Green);
+        let spine = Style::default().fg(Color::Blue);
+        assert_eq!(
+            gutter_cell_style(RowGutter::Caret, caret, spine),
+            Some(caret)
+        );
+    }
+
+    #[test]
+    fn gutter_cell_style_spine_returns_spine_style() {
+        let caret = Style::default().fg(Color::Green);
+        let spine = Style::default().fg(Color::Blue);
+        assert_eq!(
+            gutter_cell_style(RowGutter::Spine, caret, spine),
+            Some(spine)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // popup_rect: the popup geometry is the only pure math that was tangled
+    // into render_composer_popup; tested here at the calculation level.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn popup_rect_height_is_body_plus_two_borders() {
+        let area = Rect::new(0, 0, 80, 24);
+        let r = popup_rect(10, area, 3); // 3 body rows -> height 5
+        assert_eq!(r.height, 5);
+    }
+
+    #[test]
+    fn popup_rect_height_is_capped_at_popup_max_plus_two() {
+        let area = Rect::new(0, 0, 80, 24);
+        // 100 body rows would be POPUP_MAX_ROWS + 2 once capped.
+        let r = popup_rect(20, area, 100);
+        assert_eq!(r.height, POPUP_MAX_ROWS + 2);
+    }
+
+    #[test]
+    fn popup_rect_is_anchored_above_anchor_y() {
+        let area = Rect::new(0, 0, 80, 24);
+        let r = popup_rect(10, area, 3); // height 5, y = 10 - 5 = 5
+        assert_eq!(r.y, 5);
     }
 }
