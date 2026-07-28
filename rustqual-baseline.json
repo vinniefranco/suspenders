@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "quality_score": 0.9265752966384349,
+  "quality_score": 0.9269637060095814,
   "iosp_score": 0.9981264637002342,
   "violations": 4,
   "total": 3244,
@@ -18,7 +18,7 @@
   "srp_struct_warnings": 4,
   "srp_module_warnings": 17,
   "wildcard_import_warnings": 0,
-  "sdp_violations": 10,
+  "sdp_violations": 8,
   "coupling_warnings": 1,
   "coupling_cycles": 2,
   "tq_no_assertion_warnings": 0,
@@ -28,22 +28,22 @@
   "tq_untested_logic_warnings": 0,
   "structural_srp_warnings": 1,
   "structural_coupling_warnings": 2,
-  "total_findings": 238,
+  "total_findings": 236,
   "violation_details": [
     {
       "name": "render",
       "file": "src/ui/components.rs",
-      "line": 260
+      "line": 261
     },
     {
       "name": "render_viewport",
       "file": "src/ui/components.rs",
-      "line": 548
+      "line": 549
     },
     {
       "name": "paint_gutter",
       "file": "src/ui/components.rs",
-      "line": 1219
+      "line": 1220
     },
     {
       "name": "main",

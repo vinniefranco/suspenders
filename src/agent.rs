@@ -19,7 +19,7 @@
 //!
 //! ## How the Run talks back
 //!
-//! The Run's [`crate::run::AgentDeps`] sends [`RunMsg`]s over the SAME `mpsc`
+//! The Run's [`deps::AgentDeps`] sends [`RunMsg`]s over the SAME `mpsc`
 //! the public Commands use, so the single owner serializes them and Event order
 //! is the owner's order. Fire-and-forget effects (`emit`, `checkpoint`,
 //! `set_plan`, `compacted`) are plain sends; `drain_steering` and
@@ -45,13 +45,15 @@ use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
-use crate::run::AgentDeps;
 use crate::run::governor::endgame::{Recovery, ReopenReason};
 use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
 use crate::session::{RecoveryShape, Session};
 use crate::{tools, voice};
+
+mod deps;
+use deps::AgentDeps;
 
 #[cfg(test)]
 mod tests;
@@ -902,7 +904,10 @@ fn spawn_run(state: &mut AgentState) {
     let session = state.session.clone();
     let opts = run_opts(state, state.compaction.original_task.clone());
 
-    let run = tokio::spawn(async move { crate::run::run(conversation, session, deps, opts).await });
+    let run = tokio::spawn(async move {
+        let capture = deps.capture();
+        crate::run::run(conversation, session, capture, deps, opts).await
+    });
     watch_run(state, run);
 }
 
@@ -1073,7 +1078,8 @@ fn spawn_handoff_run(
             original_task: seeded.state.original_task.clone(),
             ..opts
         };
-        crate::run::run(seeded.conversation, session, deps, opts).await
+        let capture = deps.capture();
+        crate::run::run(seeded.conversation, session, capture, deps, opts).await
     });
     watch_run(state, run);
 }
