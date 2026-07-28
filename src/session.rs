@@ -3,7 +3,7 @@
 //! sampling temperature, the budget-cap knob, the Eviction slack, the Dead
 //! Mass fraction, the Compaction Keep, the Run Limit, the Anchor cadence and
 //! stale-plan threshold, the Scout Pass cap, the no-think knobs, the command
-//! timeout, the Plugin list, and the LLM module. The Context Budget and the
+//! timeout, the Extension list, and the LLM module. The Context Budget and the
 //! Result Cap are NOT fixed facts: they derive from the Model each Run
 //! captures (ADR-0037).
 //!
@@ -85,7 +85,7 @@ pub struct Session {
     /// The module implementing the LLM boundary (a name; the trait wiring is a
     /// later phase - carried here as a module name).
     pub llm_module: String,
-    /// The Session's Plugin list (opaque here; entries carried as names).
+    /// The Session's Extension list (opaque here; entries carried as names).
     pub extensions: Vec<String>,
     /// The config `context_budget` knob, reinterpreted (ADR-0037, ADR-0031
     /// amendment): an optional global cap on every Model's effective budget,
@@ -234,7 +234,7 @@ impl SessionConfig {
         }
     }
 
-    /// The config the test env resolves to: fakes injected, empty plugin
+    /// The config the test env resolves to: fakes injected, empty extension
     /// list, tmp session dir.
     pub fn test_defaults() -> Self {
         let mut cfg = SessionConfig::base();

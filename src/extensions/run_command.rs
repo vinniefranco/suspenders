@@ -10,7 +10,7 @@
 //! The exit code is a SEMANTIC fact carried from execution as an Artifact, not
 //! re-parsed at fold time from the merged stdout/stderr: `run_command::report`
 //! is the single source for the tail, `run_command::parse_exit_code` its
-//! inverse, and this plugin the one consumer. The salient `key_arg` (the
+//! inverse, and this extension the one consumer. The salient `key_arg` (the
 //! command) is rendered separately by the transcript's `message_lines`, so the
 //! final line reads `⋯ run_command  cargo test · ✓ exit 0`.
 //!
@@ -33,8 +33,8 @@ use crate::presenter::Presenter;
 use crate::tools::run_command;
 use crate::ui::transcript::TranscriptItem;
 
-/// The Artifact keys this plugin reserves, declared in one place (the diff
-/// plugin's convention): a producer and consumer that disagree fail to compile.
+/// The Artifact keys this extension reserves, declared in one place (the diff
+/// extension's convention): a producer and consumer that disagree fail to compile.
 mod keys {
     /// `artifacts`: the run_command exit code [`super::RunCommand::post_run`]
     /// recovers from the result tail, read back by
@@ -46,7 +46,7 @@ mod keys {
     pub const TIMED_OUT: &str = "timed_out";
 }
 
-/// The one tool this plugin acts on.
+/// The one tool this extension acts on.
 const TOOL: &str = "run_command";
 
 /// The run_command exit-badge extension.

@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_halt_reads_as_a_failed_run() {
+    fn an_extension_halt_reads_as_a_failed_run() {
         let answer = Answer::halted("blocked by plugin".to_string(), Default::default());
         assert_eq!(answer.content, "blocked by plugin");
         assert!(answer.is_error);

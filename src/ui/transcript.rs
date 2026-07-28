@@ -1,12 +1,12 @@
 //! UI Transcript - the display-side history of a Session (CONTEXT.md), as a
 //! store (ADR-0034): the settled items, the revision counter the render cache
 //! keys on, the in-flight [`Streaming`] snapshot (a private child module), and
-//! Presentment (the Plugin list lives here, so `present` runs on every append
+//! Presentment (the Extension list lives here, so `present` runs on every append
 //! by construction). The [`crate::ui::screen`] fold delegates one verb per
 //! event arm; no caller can reach the items Vec directly.
 //!
 //! Pure like the rest of the core (ADR-0001/0019): no terminal, no async, no
-//! IO, no ratatui types. Not `Clone`/`PartialEq` - plugins aren't.
+//! IO, no ratatui types. Not `Clone`/`PartialEq` - extensions aren't.
 //!
 //! ## The invariants, held at this seam
 //!
@@ -19,10 +19,10 @@
 //! * **Pairing is by `id`**, never by position - parallel Tool Calls
 //!   interleave.
 //! * **Presentment runs before every append**, and a paired result's
-//!   `key_arg` is stamped BEFORE Presentment (a plugin may swap the item for
+//!   `key_arg` is stamped BEFORE Presentment (a extension may swap the item for
 //!   a Block; stamping after would stamp a dropped item).
-//! * **Fail-open lines bypass Presentment** (the recursion bound): a plugin
-//!   cannot re-present its own failure report, so a plugin that panics on
+//! * **Fail-open lines bypass Presentment** (the recursion bound): a extension
+//!   cannot re-present its own failure report, so a extension that panics on
 //!   every item still terminates in one item plus one raw info line.
 //! * The pending-Steering marker is authored HERE, by both
 //!   [`Transcript::steering_queued`] and [`Transcript::steering_delivered`],
@@ -36,7 +36,7 @@
 //! Voice strings stay with the Screen (the greeting, stop reasons, wave
 //! lines, nudges - recorded through [`Transcript::info`]); the store authors
 //! only the two lines its own invariants require verbatim: the pending
-//! Steering marker and the plugin-failure line.
+//! Steering marker and the extension-failure line.
 
 mod streaming;
 
@@ -128,13 +128,13 @@ impl StyledLine {
 ///   interprets it.
 /// * `ToolResult { name, summary, is_error, key_arg }` -
 ///   `{:tool_result, name, summary, is_error, key_arg}`, the default one-line
-///   summary a plugin's `present` may replace; `key_arg` is the salient input
+///   summary a extension's `present` may replace; `key_arg` is the salient input
 ///   arg (path/command/pattern) carried over from the paired call so the merged
 ///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
 /// * `Block { title, lines }` - `{:block, title, lines}`: a titled block of
 ///   [`StyledLine`]s, the semantic display vocabulary (ADR-0008).
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
-///   plane (the greeting, launch notices, the plugin-failure line).
+///   plane (the greeting, launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
 ///   plane (ADR-0040): eviction, compaction, Governor Interventions, Steering.
 ///   The [`Tone`] tints it in the adapter; the store only carries the fact.
@@ -415,7 +415,7 @@ impl Transcript {
         });
     }
 
-    /// Records the fail-open Plugin report line (ADR-0007) - ONE format
+    /// Records the fail-open Extension report line (ADR-0007) - ONE format
     /// whether the failure came from this store's own Presentment fold or from
     /// the `extension_error` event the Run reports. Bypasses Presentment like
     /// every fail-open line (the recursion bound - see the module doc).
@@ -510,7 +510,7 @@ fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
 }
 
-// The fail-open Plugin report (ADR-0007) - sourced once, so the store's own
+// The fail-open Extension report (ADR-0007) - sourced once, so the store's own
 // Presentment failures and the Run's `extension_error` events read identically.
 fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> String {
     format!("plugin {extension} failed in {}: {message}", stage.as_str())
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     // The recursion bound: the fail-open report line is pushed RAW, never
-    // re-presented - a plugin that panics on EVERY item (this one) would
+    // re-presented - a extension that panics on EVERY item (this one) would
     // otherwise crash on its own failure report, report that, crash on the
     // report of the report, and never terminate.
     #[test]
@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     // The diff-Block redundancy case: because the paired call is removed, the
-    // Diff plugin's Block (whose title summarizes the call) stands alone.
+    // Diff extension's Block (whose title summarizes the call) stands alone.
     #[test]
     fn a_diff_block_stands_alone_after_the_paired_call_is_removed() {
         let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);

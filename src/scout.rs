@@ -231,7 +231,7 @@ impl Scout {
                 }
                 StopReason::ToolUse if response.content.iter().any(ContentBlock::is_tool_use) => {
                     // The Scout asked for read-only tools: run them
-                    // (plugin-free, Shaped like any Tool Result), feed the
+                    // (extension-free, Shaped like any Tool Result), feed the
                     // results back, and loop for another Pass. The accumulated
                     // assistant text is remembered so a later failure can still
                     // return partial findings.

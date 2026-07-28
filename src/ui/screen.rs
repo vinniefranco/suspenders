@@ -534,7 +534,7 @@ impl Screen {
     }
 
     // Tool machinery: calls, results (paired by id in the store), and the
-    // Plugin failure report.
+    // Extension failure report.
     fn apply_tooling(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
             Event::ToolCall { id, name, input } => {

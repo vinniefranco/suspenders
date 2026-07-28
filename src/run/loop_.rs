@@ -3323,7 +3323,7 @@ mod tests {
         }
     }
 
-    async fn run_with_plugins(
+    async fn run_with_extensions(
         session: &Session,
         prompt: &str,
         mut deps: FakeDeps,
@@ -3336,7 +3336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn halting_plugin_denies_the_call_with_its_own_wording() {
+    async fn halting_extension_denies_the_call_with_its_own_wording() {
         let root = root();
         let session = session(root.path());
         let input = json!({"path": "f.txt", "old_str": "a", "new_str": "b"});
@@ -3349,7 +3349,7 @@ mod tests {
         );
         let extensions =
             vec![Registered::new("HaltEdits", json!([])).with_middleware(Box::new(HaltEdits))];
-        let (outcome, deps) = run_with_plugins(&session, "edit something", deps, extensions).await;
+        let (outcome, deps) = run_with_extensions(&session, "edit something", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let tr = evs
@@ -3385,7 +3385,7 @@ mod tests {
         );
         let extensions =
             vec![Registered::new("Artifactor", json!([])).with_middleware(Box::new(Artifactor))];
-        let (outcome, deps) = run_with_plugins(&session, "look around", deps, extensions).await;
+        let (outcome, deps) = run_with_extensions(&session, "look around", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let tr = evs
@@ -3409,7 +3409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crashing_plugin_is_fail_open() {
+    async fn crashing_extension_is_fail_open() {
         let root = root();
         let session = session(root.path());
         let deps = deps_for(
@@ -3421,7 +3421,7 @@ mod tests {
         );
         let extensions =
             vec![Registered::new("PreBoomer", json!([])).with_middleware(Box::new(PreBoomer))];
-        let (outcome, deps) = run_with_plugins(&session, "look around", deps, extensions).await;
+        let (outcome, deps) = run_with_extensions(&session, "look around", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let pe = evs

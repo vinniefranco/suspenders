@@ -5,7 +5,7 @@
 //! * **Trigger**: private freshness memory - `prev_calls` remembers the
 //!   previous response's calls whose results are still fresh, `fresh`
 //!   accumulates this batch's; membership is `{name, input}` equality. The
-//!   Governor keys on what the model SENT, before Plugins adjust it
+//!   Governor keys on what the model SENT, before Extensions adjust it
 //!   (CONTEXT.md: "the Nudge for duplicates keys on what the model sent").
 //!   A successful edit_file/write_file clears both sets, because results from
 //!   before a write are stale - an identical call after it (fix, then retest)

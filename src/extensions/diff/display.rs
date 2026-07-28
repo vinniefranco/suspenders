@@ -91,7 +91,7 @@ fn hunk_lines(hunk: &Hunk, created: bool) -> Vec<StyledLine> {
 // Minimal diff lines (ADR-0040 Decision D): the `+`/`-`/context markers carry
 // the change and the semantic [`LineStyle`] carries the color, while the
 // `@@ … @@` hunk header carries the location - so the line-number gutter is
-// dropped. This is a Plugin display choice (ADR-0008: the Plugin decides WHAT
+// dropped. This is a Extension display choice (ADR-0008: the Extension decides WHAT
 // to show; the adapter maps the style to a color).
 fn display_line(line: &Line) -> StyledLine {
     match line.tag {

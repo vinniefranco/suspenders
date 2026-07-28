@@ -4,7 +4,7 @@
 //!
 //! This is the one place semantics become terminal colors: [`LineStyle`] →
 //! color for a Block's lines, [`PressureLevel`] → color/emphasis for the status
-//! bar. Plugins and the Screen core never touch ratatui; they speak the
+//! bar. Extensions and the Screen core never touch ratatui; they speak the
 //! vocabulary and this module renders it. Everything here is pure presentation
 //! of [`TranscriptItem`]s - no state, no IO. Only this module and [`crate::ui`]
 //! `use ratatui` / `use crossterm` (ADR-0019 invariant).
@@ -66,7 +66,7 @@ fn tui_color(color: theme::Color) -> Color {
 }
 
 /// The ONE mapping from a semantic [`LineStyle`] to a ratatui [`Style`]
-/// (ADR-0008). Plugins produce styles; this runs them into the active
+/// (ADR-0008). Extensions produce styles; this runs them into the active
 /// Theme's colors.
 pub fn line_style(style: LineStyle, theme: &Theme) -> Style {
     match style {
@@ -1568,7 +1568,7 @@ fn message_lines(
         // design leans on this - red+bold alone is weaker for scanning and
         // colorblind users). The merged `key_arg` is kept so the failing
         // path/command stays visible. The one exception: when the `summary`
-        // already begins with a status glyph - a plugin badge like `✗ exit 1`
+        // already begins with a status glyph - a extension badge like `✗ exit 1`
         // (or `✓`) - the line injects none of its own, so a badge never doubles
         // up its glyph.
         TranscriptItem::ToolResult {
@@ -2504,7 +2504,7 @@ fn present_arg(key_arg: Option<&str>) -> Option<&str> {
     key_arg.filter(|a| !a.is_empty())
 }
 
-// Whether a Tool Result summary already opens with a status glyph - a plugin
+// Whether a Tool Result summary already opens with a status glyph - a extension
 // badge like `✗ exit 1` or `✓ exit 0`. The error line uses this to avoid
 // doubling the `✗` it otherwise injects.
 fn starts_with_status_glyph(summary: &str) -> bool {
@@ -3841,7 +3841,7 @@ mod tests {
 
     #[test]
     fn a_failing_merged_result_keeps_the_arg_and_shows_a_single_badge_glyph() {
-        // The summary already carries the plugin badge `✗ exit 1`; the error
+        // The summary already carries the extension badge `✗ exit 1`; the error
         // line injects no glyph of its own, so there is a SINGLE `✗`, not `✗ ✗`.
         let item = TranscriptItem::ToolResult {
             name: "run_command".to_string(),
@@ -3855,7 +3855,7 @@ mod tests {
 
     #[test]
     fn a_failing_result_without_a_badge_gets_an_injected_error_glyph() {
-        // A tool whose summary carries no glyph (no badge plugin): the line
+        // A tool whose summary carries no glyph (no badge extension): the line
         // injects a leading `✗` so the failure is never missed - the ⚙ gutter,
         // the arg, then `✗ {summary}`, all red+bold.
         let item = TranscriptItem::ToolResult {

@@ -32,7 +32,7 @@ const GATED: &[(&str, &str)] = &[("run_command", "command"), ("web_fetch", "url"
 /// Standing Approval matches); `None` means no gate. Because the same lookup
 /// answers both facts, "does this gate" and "what text" can never disagree.
 ///
-/// The text is read from the plugin-adjusted input the caller hands over.
+/// The text is read from the extension-adjusted input the caller hands over.
 pub fn gate_text(name: &str, input: &Value) -> Option<String> {
     let (_, field) = GATED.iter().find(|(tool, _)| *tool == name)?;
     Some(

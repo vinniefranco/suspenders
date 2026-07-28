@@ -91,8 +91,8 @@ impl VoicedTag {
 
 /// Every event shape the Run and the Agent emit.
 ///
-/// The `artifacts` on [`Event::ToolResult`] is display-side Plugin data
-/// (CONTEXT.md: Artifact) - a `HashMap<String, Value>`, `{}` when no plugin
+/// The `artifacts` on [`Event::ToolResult`] is display-side Presenter data
+/// (CONTEXT.md: Artifact) - a `HashMap<String, Value>`, `{}` when no extension
 /// attached any; it never enters the Conversation, is never shaped or evicted.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {

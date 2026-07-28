@@ -13,7 +13,7 @@
 //! (ADR-0039's honesty principle: omission must be self-detecting, not a
 //! silent cut). Everything outside a qualifying run passes through verbatim:
 //! FAILED/error/warning lines, blanks, and the `[exit code: N]` / timeout tail
-//! that [`crate::tools::run_command::report`] owns and the exit-badge plugin
+//! that [`crate::tools::run_command::report`] owns and the exit-badge extension
 //! parses. The marker wording is this Extension's own (CONTEXT.md: strings an
 //! Extension produces about its own decisions stay in that Extension).
 //!
@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::middleware::{Middleware, Token};
 
-/// The one tool this plugin acts on.
+/// The one tool this extension acts on.
 const TOOL: &str = "run_command";
 
 /// Minimum run length that collapses. Below 5 the first-line-plus-marker pair
@@ -77,7 +77,7 @@ impl Middleware for Condense {
     }
 }
 
-/// Classifies one line, or `None` for anything this plugin must not touch.
+/// Classifies one line, or `None` for anything this extension must not touch.
 fn classify(line: &str) -> Option<NoiseClass> {
     let trimmed = line.trim_start();
     if COMPILE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {

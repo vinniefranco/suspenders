@@ -535,7 +535,7 @@ mod tests {
     // Resolving the shipped config list `["diff"]` yields exactly one extension,
     // the Diff extension, registered under the name "diff".
     #[test]
-    fn configured_resolves_diff_name_to_one_diff_plugin() {
+    fn configured_resolves_diff_name_to_one_diff_extension() {
         let extensions = configured(&["diff".to_string()]);
         assert_eq!(extensions.len(), 1);
         assert_eq!(extensions[0].name, "diff");
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_run_halted_token_short_circuits_the_remaining_plugins() {
+    fn pre_run_halted_token_short_circuits_the_remaining_extensions() {
         let extensions = vec![
             mw("Halter", Box::new(Halter), json!({})),
             mw(
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_run_a_crashing_plugin_is_skipped_and_reported_the_rest_still_run() {
+    fn pre_run_a_crashing_extension_is_skipped_and_reported_the_rest_still_run() {
         let extensions = vec![
             mw("Crasher", Box::new(Crasher), json!({})),
             mw("Recorder", Box::new(Recorder), json!({ "id": "survivor" })),
@@ -623,7 +623,7 @@ mod tests {
     // (type-system-enforced), not deferred; noted in the report.
 
     #[test]
-    fn pre_run_plugins_without_the_stage_are_skipped() {
+    fn pre_run_extensions_without_the_stage_are_skipped() {
         // ContentTagger only overrides post_run; its pre_run is the default
         // identity, so the token passes through unchanged with no failures.
         let extensions = vec![mw(
@@ -729,7 +729,7 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn present_folds_over_the_item_plugins_that_pass_leave_it_unchanged() {
+    fn present_folds_over_the_item_extensions_that_pass_leave_it_unchanged() {
         let item = TranscriptItem::ToolResult {
             name: "edit_file".to_string(),
             summary: "edited x".to_string(),
@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn present_a_plugin_may_replace_the_item_using_the_artifacts() {
+    fn present_an_extension_may_replace_the_item_using_the_artifacts() {
         let item = TranscriptItem::ToolResult {
             name: "edit_file".to_string(),
             summary: "edited x".to_string(),
@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn present_a_crashing_present_keeps_the_item_from_before_that_plugin_and_reports() {
+    fn present_a_crashing_present_keeps_the_item_from_before_that_extension_and_reports() {
         let item = TranscriptItem::ToolCall {
             id: "t1".to_string(),
             name: "grep".to_string(),

@@ -53,7 +53,7 @@ mod keys {
     pub const DIFF: &str = "diff";
 }
 
-/// The tools the Diff plugin acts on.
+/// The tools the Diff extension acts on.
 const TOOLS: [&str; 2] = ["edit_file", "write_file"];
 
 /// Model-facing compact diff cap (lines); the Result Cap still applies on top.
@@ -434,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_refused_overwrite_error_result_no_diff_artifact() {
-        // write_file refuses to overwrite an existing file, so the Diff plugin
+        // write_file refuses to overwrite an existing file, so the Diff extension
         // has nothing to diff - the error passes through with no artifact.
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());

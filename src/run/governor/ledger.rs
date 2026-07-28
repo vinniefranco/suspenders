@@ -397,7 +397,7 @@ impl Ledger {
     // way, keyed by the call's command string - a passing run clears only
     // its own entry. Calls that never ran never reach here: [`Ledger::record`]
     // routes a Denied or Refused Answer past this method (ADR-0005,
-    // ADR-0035). A plugin-halted run_command also never
+    // ADR-0035). A extension-halted run_command also never
     // ran, but its halt DOES set the facts - the halt reads as a failed run
     // and the verify-failed gate follows suit. Only run_command outcomes
     // touch this.
