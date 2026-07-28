@@ -20,7 +20,7 @@
 //! token-filtered) registry into [`SelectorRow`]s so the menu renders through
 //! the generic selector.
 
-use crate::ui::selector::SelectorRow;
+use crate::view_model::SelectorRow;
 
 /// One command descriptor: the name typed after `/` and the one-line help the
 /// menu shows. The Effect the command produces is NOT here - the pure core

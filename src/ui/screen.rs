@@ -38,7 +38,8 @@ use crate::event::Event;
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
-use crate::ui::transcript::{Tone, Transcript, TranscriptItem};
+use crate::ui::transcript::{Transcript, TranscriptItem};
+use crate::view_model::Tone;
 
 /// The greeting line a fresh Screen opens its Transcript with.
 const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
@@ -1067,7 +1068,8 @@ mod tests {
     use super::*;
     use crate::content::ContentBlock;
     use crate::event::Stage;
-    use crate::ui::transcript::{Tone, TranscriptItem};
+    use crate::ui::transcript::TranscriptItem;
+    use crate::view_model::Tone;
     use std::collections::HashMap;
 
     // --- helpers mirroring transcript_test.exs -----------------------------
@@ -1990,7 +1992,7 @@ mod tests {
     #[test]
     fn a_selector_fill_is_consumed_by_the_composer_never_this_folds_arms() {
         use crate::ui::composer::{OverlayStatus, OverlayView};
-        use crate::ui::selector::SelectorRow;
+        use crate::view_model::SelectorRow;
 
         // Commit `/model` through the Screen: a Loading overlay opens and one
         // Command effect carries the activation generation to echo back.

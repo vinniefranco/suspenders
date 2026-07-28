@@ -47,6 +47,7 @@ use serde_json::Value;
 use crate::content::ContentBlock;
 use crate::event::Stage;
 use crate::extensions::{self, Registered};
+use crate::view_model::Tone;
 use streaming::Streaming;
 
 /// The semantic style of one display line inside a [`TranscriptItem::Block`]
@@ -68,33 +69,6 @@ pub enum LineStyle {
     /// Plain, unstyled text.
     #[default]
     Default,
-}
-
-/// The semantic TONE of a harness-authored [`TranscriptItem::Marker`]
-/// (ADR-0040): names WHO acted and in what spirit, so the adapter tints the
-/// marker plane without ever sniffing the line's text. Like [`LineStyle`], the
-/// tone is the semantic fact; the terminal color mapping lives in
-/// `ui/components` (a Theme slot per tone). Stamped at the firing site (the
-/// Event that voiced the marker), carried into [`Transcript::marker`]; the
-/// store never classifies it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tone {
-    /// A budget mechanic tidying the Conversation: Eviction, Compaction,
-    /// Result-Cap cuts. Not a Governor's judgment - neutral gray.
-    Housekeeping,
-    /// A Governor helping the model along: a Nudge, a plan/anchor refresh, a
-    /// Recovery Run. Warm amber (chosen away from error-red).
-    Aid,
-    /// A Governor limiting the model: tool-narrowing, the Endgame's run-close
-    /// schedule. Cool blue (chosen away from success-green).
-    Constrain,
-    /// The user's own voice reaching a running Run (the pending-Steering
-    /// marker): the prompt color, never the harness plane.
-    Steering,
-    /// A marker with no assigned tone - the default a plain `push`ed marker or
-    /// an older Session's line reads as. Muted, like an Info line.
-    #[default]
-    Plain,
 }
 
 /// One styled display line inside a [`TranscriptItem::Block`]: a semantic

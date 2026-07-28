@@ -66,8 +66,9 @@ use crate::event::Event;
 use crate::ui::draft;
 use crate::ui::history::History;
 use crate::ui::screen::{AgentCommand, Effect, Key, Status, UngatedKey};
-use crate::ui::selector::{FilteredRow, Selector, SelectorOutcome, SelectorRow};
+use crate::ui::selector::{FilteredRow, Selector, SelectorOutcome};
 use crate::ui::slash;
+use crate::view_model::SelectorRow;
 
 /// How the Composer answered an offered key (first refusal, ADR-0034).
 #[must_use = "a dropped KeyOutcome is a dropped key: fold the effects, or fold the refused key"]

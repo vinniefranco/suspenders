@@ -28,11 +28,12 @@ use crate::ui::lull;
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
-use crate::ui::selector::{RowRole, SelectorRow};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
-use crate::ui::transcript::{LineStyle, StyledLine, Tone, TranscriptItem};
+use crate::ui::transcript::{LineStyle, StyledLine, TranscriptItem};
 use crate::ui::viewport::Viewport;
+use crate::view_model::Tone;
+use crate::view_model::{RowRole, SelectorRow};
 
 // ---------------------------------------------------------------------------
 // The single semantic → color mapping (ADR-0008), colored by the active
@@ -4472,7 +4473,8 @@ mod tests {
 
     #[test]
     fn a_capped_group_fits_the_popup_window_when_its_note_is_highlighted() {
-        use crate::ui::selector::{COLLAPSED_REVEAL_CAP, RowRole, Selector};
+        use crate::ui::selector::{COLLAPSED_REVEAL_CAP, Selector};
+        use crate::view_model::RowRole;
 
         // The reachability contract behind note-last ordering and the cap:
         // the popup window shows POPUP_MAX_ROWS body rows ending at the

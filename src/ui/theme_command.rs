@@ -33,8 +33,8 @@
 use crate::event::Event;
 use crate::session::{SessionConfig, SessionError};
 use crate::ui::AdapterCtx;
-use crate::ui::selector::SelectorRow;
 use crate::ui::theme::{self, ActiveTheme, SparseTheme, ThemeError};
+use crate::view_model::SelectorRow;
 
 use super::screen::Screen;
 
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(rows[2].hint.as_deref(), Some("colors.added: bad"));
         assert_eq!(
             rows[2].role,
-            crate::ui::selector::RowRole::Note,
+            crate::view_model::RowRole::Note,
             "a note, not a header: a broken file starts no group, so the \
              valid neighbors never travel with it under filtering"
         );

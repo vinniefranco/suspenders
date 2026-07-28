@@ -20,6 +20,7 @@ pub mod session;
 pub mod tool;
 pub mod tools;
 pub mod ui;
+pub mod view_model;
 pub mod voice;
 
 pub mod app;

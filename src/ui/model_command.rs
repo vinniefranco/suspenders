@@ -21,7 +21,7 @@ use crate::event::Event;
 use crate::llm::{Availability, ProviderModels};
 use crate::session::{SessionConfig, SessionError};
 use crate::ui::AdapterCtx;
-use crate::ui::selector::SelectorRow;
+use crate::view_model::SelectorRow;
 
 use super::screen::Screen;
 
@@ -202,7 +202,7 @@ mod tests {
 
     // --- model_rows (the multi-Provider selector rows, ADR-0037) ------------
 
-    use crate::ui::selector::RowRole;
+    use crate::view_model::RowRole;
 
     fn listing(provider: &str, models: &[&str]) -> ProviderModels {
         ProviderModels {

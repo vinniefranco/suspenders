@@ -29,8 +29,7 @@ use crate::llm::Delta;
 use crate::llm::response::StopReason;
 use crate::run::governor::endgame::ReopenReason;
 use crate::session::RecoveryShape;
-use crate::ui::selector::SelectorRow;
-use crate::ui::transcript::Tone;
+use crate::view_model::{SelectorRow, Tone};
 
 /// The `extension_error` stage: which point in the extension's lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
