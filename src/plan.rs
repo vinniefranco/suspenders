@@ -90,7 +90,10 @@ fn strip_bullet(line: &str) -> &str {
     let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits > 0 {
         let after = &line[digits..];
-        if let Some(rest) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
             return rest;
         }
     }
@@ -325,32 +328,50 @@ mod tests {
 
     #[test]
     fn a_dash_open_box_reads_as_incomplete() {
-        assert_eq!(plan_with("- [ ] read the file").progress(), PlanProgress::Incomplete);
+        assert_eq!(
+            plan_with("- [ ] read the file").progress(),
+            PlanProgress::Incomplete
+        );
     }
 
     #[test]
     fn a_star_open_box_reads_as_incomplete() {
-        assert_eq!(plan_with("* [ ] read the file").progress(), PlanProgress::Incomplete);
+        assert_eq!(
+            plan_with("* [ ] read the file").progress(),
+            PlanProgress::Incomplete
+        );
     }
 
     #[test]
     fn a_plus_open_box_reads_as_incomplete() {
-        assert_eq!(plan_with("+ [ ] read the file").progress(), PlanProgress::Incomplete);
+        assert_eq!(
+            plan_with("+ [ ] read the file").progress(),
+            PlanProgress::Incomplete
+        );
     }
 
     #[test]
     fn a_dotted_ordered_open_box_reads_as_incomplete() {
-        assert_eq!(plan_with("1. [ ] read the file").progress(), PlanProgress::Incomplete);
+        assert_eq!(
+            plan_with("1. [ ] read the file").progress(),
+            PlanProgress::Incomplete
+        );
     }
 
     #[test]
     fn a_paren_ordered_open_box_reads_as_incomplete() {
-        assert_eq!(plan_with("2) [ ] read the file").progress(), PlanProgress::Incomplete);
+        assert_eq!(
+            plan_with("2) [ ] read the file").progress(),
+            PlanProgress::Incomplete
+        );
     }
 
     #[test]
     fn a_bare_open_box_without_a_bullet_reads_as_incomplete() {
-        assert_eq!(plan_with("[ ] read the file").progress(), PlanProgress::Incomplete);
+        assert_eq!(
+            plan_with("[ ] read the file").progress(),
+            PlanProgress::Incomplete
+        );
     }
 
     #[test]
@@ -363,7 +384,10 @@ mod tests {
 
     #[test]
     fn checked_steps_counts_the_checked_boxes() {
-        assert_eq!(plan_with("- [x] read\n- [X] edit\n- [x] build").checked_steps(), 3);
+        assert_eq!(
+            plan_with("- [x] read\n- [X] edit\n- [x] build").checked_steps(),
+            3
+        );
     }
 
     #[test]

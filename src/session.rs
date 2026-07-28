@@ -151,16 +151,9 @@ pub struct Session {
 
 /// Raised (returned) when a Session's fixed facts fail validation. The message
 /// carries the validation-failure text so callers can match on the reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct SessionError(pub String);
-
-impl std::fmt::Display for SessionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SessionError {}
 
 /// The resolved config defaults a Session is built against.
 /// [`SessionConfig::load`] composes it (base → file → env) and tests pass
@@ -202,6 +195,58 @@ pub struct SessionConfig {
     pub session_dir: String,
 }
 
+// ---- Base-config defaults (named constants so magic numbers appear once) ----
+
+/// The default local Provider's context window (tokens). A custom local
+/// server typically operates at this size out of the box.
+const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 64_000;
+
+/// The default output cap (max_tokens) every request sends.
+const DEFAULT_MAX_TOKENS: u64 = 8_000;
+
+/// The default sampling temperature: a mild value that avoids both the
+/// deterministic floor and the high-entropy ceiling.
+const DEFAULT_TEMPERATURE: f64 = 0.7;
+
+/// The default Eviction reserve as a fraction of the Context Budget.
+const DEFAULT_EVICTION_SLACK: f64 = 0.2;
+
+/// The default Dead Mass Setpoint: the fraction of the budget that elidable
+/// dead content may occupy before a wave fires without budget pressure.
+const DEFAULT_DEAD_MASS_FRACTION: f64 = 0.15;
+
+/// The default Compaction Keep fraction.
+const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
+
+/// The default command timeout in milliseconds (2 minutes).
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
+
+/// The default Run Limit (maximum Passes per user request).
+const DEFAULT_RUN_LIMIT: u64 = 32;
+
+/// The default Anchor cadence: an Anchor fires every this many Passes.
+const DEFAULT_ANCHOR_INTERVAL: u64 = 5;
+
+/// The default stale-plan threshold: a Plan may sit unchanged for this many
+/// Passes (while writes land) before each Anchor carries the stale-plan line.
+const DEFAULT_PLAN_STALE_AFTER: u64 = 8;
+
+/// The default malformed-tool-call re-draw budget per Run.
+const DEFAULT_MALFORMED_RETRY_BUDGET: u64 = 3;
+
+/// The default Scout Pass cap.
+const DEFAULT_SCOUT_PASS_LIMIT: u64 = 8;
+
+/// The valid temperature range upper bound (inclusive).
+const TEMPERATURE_MAX: f64 = 2.0;
+
+/// The valid eviction-slack range upper bound (exclusive).
+const FRACTION_UPPER_BOUND: f64 = 1.0;
+
+/// The valid fraction range lower bound (inclusive for left-closed, exclusive
+/// for open intervals).
+const FRACTION_LOWER_BOUND: f64 = 0.0;
+
 impl SessionConfig {
     /// The base config the app ships: the `local` custom Provider carrying the
     /// out-of-the-box endpoint (local servers speak the Anthropic protocol
@@ -213,30 +258,30 @@ impl SessionConfig {
                 ProviderConfig {
                     base_url: "http://localhost:8888/v1".into(),
                     api: Api::AnthropicMessages,
-                    context_window: Some(64_000),
+                    context_window: Some(DEFAULT_LOCAL_CONTEXT_WINDOW),
                     token: None,
                 },
             )]),
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             theme: "dark".into(),
-            max_tokens: 8_000,
-            temperature: Some(0.7),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            temperature: Some(DEFAULT_TEMPERATURE),
             // No global cap by default: every Model's own window is its
             // budget, so a wide-window Catalog model works out of the box.
             context_budget: None,
-            eviction_slack: 0.2,
-            dead_mass_fraction: 0.15,
-            compaction_keep: 0.5,
+            eviction_slack: DEFAULT_EVICTION_SLACK,
+            dead_mass_fraction: DEFAULT_DEAD_MASS_FRACTION,
+            compaction_keep: DEFAULT_COMPACTION_KEEP,
             llm_module: "Suspenders.LLM".into(),
-            command_timeout_ms: 120_000,
-            run_limit: 32,
-            anchor_interval: 5,
-            plan_stale_after: 8,
+            command_timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
+            run_limit: DEFAULT_RUN_LIMIT,
+            anchor_interval: DEFAULT_ANCHOR_INTERVAL,
+            plan_stale_after: DEFAULT_PLAN_STALE_AFTER,
             recovery_limit: 1,
             advance_limit: 3,
             recovery_shape: RecoveryShape::Handoff,
-            malformed_retry_budget: 3,
-            scout_pass_limit: 8,
+            malformed_retry_budget: DEFAULT_MALFORMED_RETRY_BUDGET,
+            scout_pass_limit: DEFAULT_SCOUT_PASS_LIMIT,
             scout_no_think: true,
             no_think_rescue: true,
             extensions: vec!["diff".into(), "run_command".into(), "condense".into()],
@@ -689,7 +734,7 @@ fn parse_positive_int(raw: &str) -> Result<u64, SessionError> {
 
 fn parse_temperature(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
-        Ok(v) if (0.0..=2.0).contains(&v) => Ok(v),
+        Ok(v) if (FRACTION_LOWER_BOUND..=TEMPERATURE_MAX).contains(&v) => Ok(v),
         _ => Err(SessionError(format!(
             "SUSPENDERS_TEMPERATURE must be a float in [0.0, 2.0], got: {raw:?}"
         ))),
@@ -698,7 +743,7 @@ fn parse_temperature(raw: &str) -> Result<f64, SessionError> {
 
 fn parse_eviction_slack(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
-        Ok(v) if (0.0..1.0).contains(&v) => Ok(v),
+        Ok(v) if (FRACTION_LOWER_BOUND..FRACTION_UPPER_BOUND).contains(&v) => Ok(v),
         _ => Err(SessionError(format!(
             "SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0), got: {raw:?}"
         ))),
@@ -707,7 +752,7 @@ fn parse_eviction_slack(raw: &str) -> Result<f64, SessionError> {
 
 fn parse_dead_mass_fraction(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
-        Ok(v) if v > 0.0 && v < 1.0 => Ok(v),
+        Ok(v) if v > FRACTION_LOWER_BOUND && v < FRACTION_UPPER_BOUND => Ok(v),
         _ => Err(SessionError(format!(
             "SUSPENDERS_DEAD_MASS_FRACTION must be a fraction in (0.0, 1.0), got: {raw:?}"
         ))),
@@ -733,7 +778,7 @@ fn parse_recovery_shape(raw: &str) -> Result<RecoveryShape, SessionError> {
 
 fn parse_compaction_keep(raw: &str) -> Result<f64, SessionError> {
     match raw.trim().parse::<f64>() {
-        Ok(v) if v > 0.0 && v < 1.0 => Ok(v),
+        Ok(v) if v > FRACTION_LOWER_BOUND && v < FRACTION_UPPER_BOUND => Ok(v),
         _ => Err(SessionError(format!(
             "SUSPENDERS_COMPACTION_KEEP must be a fraction in (0.0, 1.0), got: {raw:?}"
         ))),
@@ -1068,7 +1113,7 @@ fn validate_providers(s: &Session) -> Result<(), SessionError> {
 fn temperature(value: Option<f64>) -> Result<(), SessionError> {
     match value {
         None => Ok(()),
-        Some(v) if (0.0..=2.0).contains(&v) => Ok(()),
+        Some(v) if (FRACTION_LOWER_BOUND..=TEMPERATURE_MAX).contains(&v) => Ok(()),
         Some(_) => Err(SessionError(
             "connection :temperature must be a float in [0.0, 2.0] or nil".into(),
         )),
@@ -1086,7 +1131,7 @@ fn pos_int(value: u64, name: &str) -> Result<(), SessionError> {
 }
 
 fn fraction_left_closed(value: f64, name: &str) -> Result<(), SessionError> {
-    if (0.0..1.0).contains(&value) {
+    if (FRACTION_LOWER_BOUND..FRACTION_UPPER_BOUND).contains(&value) {
         Ok(())
     } else {
         Err(SessionError(format!(
@@ -1096,7 +1141,7 @@ fn fraction_left_closed(value: f64, name: &str) -> Result<(), SessionError> {
 }
 
 fn fraction_open(value: f64, name: &str) -> Result<(), SessionError> {
-    if value > 0.0 && value < 1.0 {
+    if value > FRACTION_LOWER_BOUND && value < FRACTION_UPPER_BOUND {
         Ok(())
     } else {
         Err(SessionError(format!(
@@ -1562,16 +1607,11 @@ mod tests {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.recovery_limit, 1);
 
-        let with_limit = |n: u64| {
-            Session::build(
-                SessionOpts {
-                    recovery_limit: Some(n),
-                    model: Some(test_model()),
-                    ..opts()
-                },
-                &cfg(),
-            )
-            .unwrap()
+        let with_limit = |n| {
+            build_session(|o| SessionOpts {
+                recovery_limit: Some(n),
+                ..o
+            })
         };
         assert_eq!(with_limit(3).recovery_limit, 3);
         // 0 is valid: it disables the Recovery Run mechanic entirely.
@@ -1585,16 +1625,11 @@ mod tests {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.advance_limit, 3);
 
-        let with_advance = |n: u64| {
-            Session::build(
-                SessionOpts {
-                    advance_limit: Some(n),
-                    model: Some(test_model()),
-                    ..opts()
-                },
-                &cfg(),
-            )
-            .unwrap()
+        let with_advance = |n| {
+            build_session(|o| SessionOpts {
+                advance_limit: Some(n),
+                ..o
+            })
         };
         assert_eq!(with_advance(5).advance_limit, 5);
         assert_eq!(with_advance(0).advance_limit, 0);
@@ -1636,16 +1671,11 @@ mod tests {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.malformed_retry_budget, 3);
 
-        let with_budget = |n: u64| {
-            Session::build(
-                SessionOpts {
-                    malformed_retry_budget: Some(n),
-                    model: Some(test_model()),
-                    ..opts()
-                },
-                &cfg(),
-            )
-            .unwrap()
+        let with_budget = |n| {
+            build_session(|o| SessionOpts {
+                malformed_retry_budget: Some(n),
+                ..o
+            })
         };
         assert_eq!(with_budget(5).malformed_retry_budget, 5);
         // 0 is valid: it disables the in-band re-draw entirely.
@@ -2070,6 +2100,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // Builds a Session from a partial opts closure, always injecting the
+    // shared test root and a valid model so callers need not repeat those.
+    fn build_session(f: impl FnOnce(SessionOpts) -> SessionOpts) -> Session {
+        let base = SessionOpts {
+            model: Some(test_model()),
+            ..opts()
+        };
+        Session::build(f(base), &cfg()).unwrap()
+    }
+
     // A temp path namespaced by PID + a caller label, so parallel tests never
     // collide on the filesystem seam.
     fn temp_config_path(label: &str) -> String {
@@ -2175,6 +2215,24 @@ mod tests {
         }
     }
 
+    // Sets one env var (after clearing), applies it, and returns the error
+    // message. Used wherever a test probes one malformed value in isolation.
+    fn env_error(name: &str, value: &str) -> String {
+        clear_suspenders_env();
+        set_env(name, value);
+        SessionConfig::apply_env(&mut SessionConfig::test_defaults())
+            .unwrap_err()
+            .0
+    }
+
+    // Asserts a persist path holds valid JSON, contains no standalone "token"
+    // key, and returns the parsed FileConfig for further assertions.
+    fn assert_no_token_and_parse(path: &str) -> FileConfig {
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(!raw.contains("\"token\""));
+        FileConfig::parse(&raw).unwrap()
+    }
+
     #[test]
     fn apply_env_overlays_the_scoped_model_onto_its_field() {
         clear_suspenders_env();
@@ -2253,19 +2311,12 @@ mod tests {
 
     #[test]
     fn apply_env_rejects_a_non_positive_integer() {
-        clear_suspenders_env();
-        set_env("SUSPENDERS_MAX_TOKENS", "0");
-        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert_eq!(
-            err.0,
+            env_error("SUSPENDERS_MAX_TOKENS", "0"),
             "SUSPENDERS_MAX_TOKENS must be a positive integer, got: \"0\""
         );
-
-        clear_suspenders_env();
-        set_env("SUSPENDERS_PLAN_STALE_AFTER", "0");
-        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert_eq!(
-            err.0,
+            env_error("SUSPENDERS_PLAN_STALE_AFTER", "0"),
             "SUSPENDERS_PLAN_STALE_AFTER must be a positive integer, got: \"0\""
         );
     }
@@ -2324,19 +2375,12 @@ mod tests {
 
     #[test]
     fn apply_env_rejects_a_non_boolean_flag() {
-        clear_suspenders_env();
-        set_env("SUSPENDERS_SCOUT_NO_THINK", "yes");
-        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert_eq!(
-            err.0,
+            env_error("SUSPENDERS_SCOUT_NO_THINK", "yes"),
             "SUSPENDERS_SCOUT_NO_THINK must be \"true\" or \"false\", got: \"yes\""
         );
-
-        clear_suspenders_env();
-        set_env("SUSPENDERS_NO_THINK_RESCUE", "1");
-        let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert_eq!(
-            err.0,
+            env_error("SUSPENDERS_NO_THINK_RESCUE", "1"),
             "SUSPENDERS_NO_THINK_RESCUE must be \"true\" or \"false\", got: \"1\""
         );
     }
@@ -2393,13 +2437,10 @@ mod tests {
 
         SessionConfig::persist_model(&path, "new/model").unwrap();
 
-        let raw = std::fs::read_to_string(&path).unwrap();
         // token is never persisted (the "token" substring in "max_tokens" is
-        // fine; the standalone key must be absent).
-        assert!(!raw.contains("\"token\""));
-        // The result re-parses via the DTO, with the merge applied and the
-        // pre-existing key preserved.
-        let fc = FileConfig::parse(&raw).unwrap();
+        // fine; the standalone key must be absent). The result re-parses via
+        // the DTO, with the merge applied and the pre-existing key preserved.
+        let fc = assert_no_token_and_parse(&path);
         assert_eq!(fc.model.as_deref(), Some("new/model"));
         assert_eq!(fc.context_budget, Some(12345));
 
@@ -2449,9 +2490,7 @@ mod tests {
 
         SessionConfig::persist_theme(&path, "gruvbox").unwrap();
 
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("\"token\""));
-        let fc = FileConfig::parse(&raw).unwrap();
+        let fc = assert_no_token_and_parse(&path);
         assert_eq!(fc.theme.as_deref(), Some("gruvbox"));
         assert_eq!(
             fc.model.as_deref(),

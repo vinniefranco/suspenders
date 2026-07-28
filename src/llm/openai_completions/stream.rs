@@ -202,6 +202,7 @@ impl StreamState {
 }
 
 /// Folds a sequence of parsed SSE events into a [`Response`] - the pure core.
+// qual:test_helper
 pub fn fold_sse(events: impl IntoIterator<Item = SseEvent>) -> Response {
     let mut state = StreamState::new();
     for event in events {

@@ -426,9 +426,9 @@ impl Screen {
             | Event::ToolsNarrowed { .. }
             | Event::Retry { .. }) => self.apply_voice(event),
 
-            event @ (Event::RunFinished { .. }
-            | Event::RunCancelled
-            | Event::RunError { .. }) => self.apply_settlement(event),
+            event @ (Event::RunFinished { .. } | Event::RunCancelled | Event::RunError { .. }) => {
+                self.apply_settlement(event)
+            }
 
             // The selector fills are the Composer's own (ADR-0034): they are
             // consumed by `self.composer.apply_event` at the top of this fold
@@ -561,7 +561,8 @@ impl Screen {
                 stage,
                 message,
             } => {
-                self.transcript.extension_failure(&extension, stage, &message);
+                self.transcript
+                    .extension_failure(&extension, stage, &message);
                 (self, vec![])
             }
 
@@ -1895,11 +1896,7 @@ mod tests {
     fn extension_error_events_become_info_lines() {
         let t = fold(
             fresh(),
-            vec![Event::extension_error(
-                "diff",
-                Stage::PreRun,
-                "boom",
-            )],
+            vec![Event::extension_error("diff", Stage::PreRun, "boom")],
         );
         let items = items(&t);
         assert_eq!(items.len(), 1);

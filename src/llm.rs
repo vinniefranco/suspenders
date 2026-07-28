@@ -36,6 +36,9 @@ pub mod response;
 pub mod throttle;
 pub mod transform;
 
+#[cfg(test)]
+pub mod adapter_test_support;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 

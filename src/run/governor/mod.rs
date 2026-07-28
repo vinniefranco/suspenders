@@ -57,10 +57,10 @@ use serde_json::Value;
 use crate::content::ContentBlock;
 use crate::event::VoicedTag;
 use crate::llm::response::StopReason;
-use crate::session::log;
-use crate::tool::ToolSpec;
 use crate::run::governor::endgame::TailRider;
 use crate::run::governor::ledger::{Ledger, ToolResult};
+use crate::session::log;
+use crate::tool::ToolSpec;
 use crate::voice;
 
 /// Interventions at the request-shaping moment.

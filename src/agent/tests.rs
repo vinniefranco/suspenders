@@ -124,6 +124,59 @@ fn is_run_finished(e: &Event) -> bool {
     matches!(e, Event::RunFinished { .. })
 }
 
+// Builds the canonical three-line test harness (dir + agent + rx) for the
+// most common case: a fresh tmp dir, `session_in`, `start`, and subscribe.
+// Returns the dir so the caller keeps it alive for the test's duration.
+fn harness(entries: Vec<Entry>) -> (TempDir, AgentHandle, broadcast::Receiver<Event>) {
+    let dir = TempDir::new().unwrap();
+    let agent = start(session_in(&dir), FakeLlm::script(entries));
+    let rx = agent.subscribe();
+    (dir, agent, rx)
+}
+
+// Like `harness` but also returns the session (needed when tests inspect
+// session facts such as `session_dir` or `model.provenance()`).
+fn harness_with_session(
+    entries: Vec<Entry>,
+) -> (TempDir, Session, AgentHandle, broadcast::Receiver<Event>) {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let agent = start(session.clone(), FakeLlm::script(entries));
+    let rx = agent.subscribe();
+    (dir, session, agent, rx)
+}
+
+// The recovery harness: a dir + recovery_session(shape) + start + subscribe.
+fn recovery_harness(
+    shape: crate::session::RecoveryShape,
+    entries: Vec<Entry>,
+) -> (TempDir, Session, AgentHandle, broadcast::Receiver<Event>) {
+    let dir = TempDir::new().unwrap();
+    let session = recovery_session(&dir, shape);
+    let agent = start(session.clone(), FakeLlm::script(entries));
+    let rx = agent.subscribe();
+    (dir, session, agent, rx)
+}
+
+// Generic session harness: caller supplies the Session builder.
+fn session_harness(
+    session: Session,
+    entries: Vec<Entry>,
+) -> (AgentHandle, broadcast::Receiver<Event>) {
+    let agent = start(session, FakeLlm::script(entries));
+    let rx = agent.subscribe();
+    (agent, rx)
+}
+
+// Extracts the approval_id from an ApprovalRequest event. Used wherever tests
+// receive an ApprovalRequest and immediately need its id for approve/deny.
+fn approval_id(ev: Event) -> String {
+    match ev {
+        Event::ApprovalRequest { approval_id, .. } => approval_id,
+        _ => panic!("expected ApprovalRequest, got {ev:?}"),
+    }
+}
+
 // ---- subscribe + submit happy path -----------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -236,7 +289,6 @@ async fn a_priced_response_broadcasts_the_cumulative_session_cost() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unpriced_model_broadcasts_no_session_cost() {
-    let dir = TempDir::new().unwrap();
     // Usage rides the Response, but the test session's Model carries no
     // pricing - a local-only Session must see no cost events at all.
     let unpriced = Response {
@@ -247,11 +299,7 @@ async fn an_unpriced_model_broadcasts_no_session_cost() {
         },
         ..text_end("Hello")
     };
-    let agent = start(
-        session_in(&dir),
-        FakeLlm::script(vec![Entry::just(unpriced)]),
-    );
-    let mut rx = agent.subscribe();
+    let (_dir, agent, mut rx) = harness(vec![Entry::just(unpriced)]);
 
     agent.submit("hi").await.unwrap();
 
@@ -271,11 +319,8 @@ async fn an_unpriced_model_broadcasts_no_session_cost() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_while_running_is_busy_idle_again_after_the_run() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let fake = FakeLlm::script(vec![barrier]);
-    let agent = start(session_in(&dir), fake);
-    let mut rx = agent.subscribe();
+    let (_dir, agent, mut rx) = harness(vec![barrier]);
 
     agent.submit("first").await.unwrap();
 
@@ -315,16 +360,10 @@ async fn denied_run_command_is_never_executed_and_yields_the_denial_tool_result(
     agent.submit("touch that file").await.unwrap();
 
     let req = recv_match(&mut rx, |e| matches!(e, Event::ApprovalRequest { .. })).await;
-    let id = match &req {
-        Event::ApprovalRequest {
-            approval_id,
-            command,
-        } => {
-            assert!(command.contains("touch"));
-            approval_id.clone()
-        }
-        _ => unreachable!(),
-    };
+    if let Event::ApprovalRequest { command, .. } = &req {
+        assert!(command.contains("touch"));
+    }
+    let id = approval_id(req);
 
     agent.approve(id.clone(), Decision::Deny).await;
 
@@ -354,29 +393,24 @@ async fn denied_run_command_is_never_executed_and_yields_the_denial_tool_result(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approved_run_command_executes_and_returns_its_output() {
-    let dir = TempDir::new().unwrap();
-    let script = vec![
+    let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "tu_run",
             "run_command",
             json!({ "command": "echo hi" }),
         )),
         Entry::just(text_end("it said hi")),
-    ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    ]);
 
     agent.submit("say hi").await.unwrap();
 
-    let req = recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
-    )
-    .await;
-    let id = match req {
-        Event::ApprovalRequest { approval_id, .. } => approval_id,
-        _ => unreachable!(),
-    };
+    let id = approval_id(
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
+        )
+        .await,
+    );
 
     agent.approve(id.clone(), Decision::Approve).await;
     recv_match(&mut rx, |e| {
@@ -398,8 +432,7 @@ async fn approved_run_command_executes_and_returns_its_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_always_records_the_command_the_identical_command_is_auto_approved() {
-    let dir = TempDir::new().unwrap();
-    let script = vec![
+    let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "r1",
             "run_command",
@@ -412,21 +445,17 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
             json!({ "command": "echo hi" }),
         )),
         Entry::just(text_end("done")),
-    ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    ]);
 
     agent.submit("run it twice").await.unwrap();
 
-    let req = recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
-    )
-    .await;
-    let id = match req {
-        Event::ApprovalRequest { approval_id, .. } => approval_id,
-        _ => unreachable!(),
-    };
+    let id = approval_id(
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
+        )
+        .await,
+    );
     agent.approve(id.clone(), Decision::ApproveAlways).await;
     recv_match(&mut rx, |e| {
         matches!(e, Event::ApprovalResolved { approval_id, approved: true } if *approval_id == id)
@@ -457,8 +486,7 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standing_approval_never_widens_beyond_the_identical_string() {
-    let dir = TempDir::new().unwrap();
-    let script = vec![
+    let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "r1",
             "run_command",
@@ -470,21 +498,17 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
             json!({ "command": "echo  hi" }),
         )),
         Entry::just(text_end("done")),
-    ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    ]);
 
     agent.submit("run variants").await.unwrap();
 
-    let req1 = recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
-    )
-    .await;
-    let id1 = match req1 {
-        Event::ApprovalRequest { approval_id, .. } => approval_id,
-        _ => unreachable!(),
-    };
+    let id1 = approval_id(
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo hi"),
+        )
+        .await,
+    );
     agent.approve(id1, Decision::ApproveAlways).await;
     recv_match(
         &mut rx,
@@ -493,15 +517,13 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
     .await;
 
     // Two spaces is a different command: the modal comes back.
-    let req2 = recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo  hi"),
-    )
-    .await;
-    let id2 = match req2 {
-        Event::ApprovalRequest { approval_id, .. } => approval_id,
-        _ => unreachable!(),
-    };
+    let id2 = approval_id(
+        recv_match(
+            &mut rx,
+            |e| matches!(e, Event::ApprovalRequest { command, .. } if command == "echo  hi"),
+        )
+        .await,
+    );
     agent.approve(id2, Decision::Deny).await;
     recv_match(&mut rx, |e| {
         matches!(e, Event::ToolResult { id, is_error: true, content, .. }
@@ -515,25 +537,21 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn steer_while_idle_is_idle() {
-    let dir = TempDir::new().unwrap();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![]));
+    let (_dir, agent, _rx) = harness(vec![]);
     assert_eq!(agent.steer("too early").await, Err(Idle));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let (second_tx, mut second_rx) = mpsc::unbounded_channel::<LlmRequest>();
-    let script = vec![
+    let (_dir, agent, mut rx) = harness(vec![
         barrier,
         Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
             let _ = second_tx.send(req.clone());
             text_end("done")
         }),
-    ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    ]);
 
     agent.submit("look around").await.unwrap();
 
@@ -574,18 +592,15 @@ async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rollover_steering_the_run_never_drained_auto_submits_the_next_run() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
     let (roll_tx, mut roll_rx) = mpsc::unbounded_channel::<LlmRequest>();
-    let script = vec![
+    let (_dir, agent, mut rx) = harness(vec![
         barrier,
         Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
             let _ = roll_tx.send(req.clone());
             text_end("second done")
         }),
-    ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    ]);
 
     agent.submit("first thing").await.unwrap();
 
@@ -613,10 +628,8 @@ async fn rollover_steering_the_run_never_drained_auto_submits_the_next_run() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_discards_queued_steering_no_rollover() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![barrier]));
-    let mut rx = agent.subscribe();
+    let (_dir, agent, mut rx) = harness(vec![barrier]);
 
     agent.submit("slow work").await.unwrap();
     recv_match(&mut rx, is_run_started).await;
@@ -641,10 +654,8 @@ async fn cancellation_discards_queued_steering_no_rollover() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_mid_run_emits_run_cancelled_and_records_the_cancellation() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![barrier]));
-    let mut rx = agent.subscribe();
+    let (_dir, agent, mut rx) = harness(vec![barrier]);
 
     agent.submit("do something slow").await.unwrap();
     let _inflight = inflight.recv().await.expect("parked in llm");
@@ -667,22 +678,18 @@ async fn cancel_mid_run_emits_run_cancelled_and_records_the_cancellation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_when_idle_is_a_no_op() {
-    let dir = TempDir::new().unwrap();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![]));
+    let (_dir, agent, _rx) = harness(vec![]);
     agent.cancel().await;
     assert_eq!(agent.status().await, Status::Idle);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let script = vec![
+    let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
         barrier,
-    ];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    ]);
 
     agent.submit("explore then hang").await.unwrap();
 
@@ -713,11 +720,8 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_marker() {
-    let dir = TempDir::new().unwrap();
-    let session = session_in(&dir);
+    let (_dir, session, agent, mut rx) = harness_with_session(vec![Entry::error("boom")]);
     let provenance = session.model.provenance();
-    let agent = start(session, FakeLlm::script(vec![Entry::error("boom")]));
-    let mut rx = agent.subscribe();
 
     agent.submit("hello?").await.unwrap();
 
@@ -747,15 +751,11 @@ async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_ma
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_marker() {
-    let dir = TempDir::new().unwrap();
-    let script = vec![
+    let (_dir, session, agent, mut rx) = harness_with_session(vec![
         Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
         Entry::error("boom"),
-    ];
-    let session = session_in(&dir);
+    ]);
     let provenance = session.model.provenance();
-    let agent = start(session, FakeLlm::script(script));
-    let mut rx = agent.subscribe();
 
     agent.submit("explore then die").await.unwrap();
 
@@ -782,15 +782,10 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_m
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error_reason() {
-    let dir = TempDir::new().unwrap();
-    let session = session_in(&dir);
-    let session_dir = session.session_dir.clone();
     // The error reason must reach the settled log entry verbatim.
-    let agent = start(
-        session,
-        FakeLlm::script(vec![Entry::error("{:llm_error, \"connection refused\"}")]),
-    );
-    let mut rx = agent.subscribe();
+    let (_dir, session, agent, mut rx) =
+        harness_with_session(vec![Entry::error("{:llm_error, \"connection refused\"}")]);
+    let session_dir = session.session_dir.clone();
 
     agent.submit("evaluate this project").await.unwrap();
 
@@ -824,15 +819,11 @@ async fn a_run_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
-    let dir = TempDir::new().unwrap();
-    let session = session_in(&dir);
-    let session_dir = session.session_dir.clone();
-    let script = vec![
+    let (_dir, session, first, mut rx) = harness_with_session(vec![
         Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
         Entry::just(text_end("Nothing here.")),
-    ];
-    let first = start(session.clone(), FakeLlm::script(script));
-    let mut rx = first.subscribe();
+    ]);
+    let session_dir = session.session_dir.clone();
 
     first.submit("look around").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -905,16 +896,15 @@ fn user_texts(conv: &Conversation) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capped_unfinished_run_opens_a_continuation_recovery_run() {
-    let dir = TempDir::new().unwrap();
-    let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
+    let (_dir, session, agent, mut rx) = recovery_harness(
+        crate::session::RecoveryShape::Continuation,
+        vec![
+            Entry::just(write_tool("w1", "a.txt")), // Run 1 Pass 1: the write lands.
+            Entry::just(insistent_reply("x1")),     // Run 1 Pass 2: refused, caps unverified.
+            Entry::just(text_end("recovered and done")), // The Recovery Run.
+        ],
+    );
     let session_dir = session.session_dir.clone();
-    let script = vec![
-        Entry::just(write_tool("w1", "a.txt")), // Run 1 Pass 1: the write lands.
-        Entry::just(insistent_reply("x1")),     // Run 1 Pass 2: refused, caps unverified.
-        Entry::just(text_end("recovered and done")), // The Recovery Run.
-    ];
-    let agent = start(session, FakeLlm::script(script));
-    let mut rx = agent.subscribe();
 
     agent.submit("write the file").await.unwrap();
 
@@ -922,7 +912,11 @@ async fn a_capped_unfinished_run_opens_a_continuation_recovery_run() {
     recv_match(&mut rx, is_run_finished).await;
     let recovery = recv_match(&mut rx, is_recovery_run).await;
     let prompt = match &recovery {
-        Event::RecoveryRun { shape, reason, text } => {
+        Event::RecoveryRun {
+            shape,
+            reason,
+            text,
+        } => {
             assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
             assert_eq!(
                 *reason,
@@ -960,18 +954,17 @@ async fn a_capped_unfinished_run_opens_a_continuation_recovery_run() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_run_never_resets_it() {
-    let dir = TempDir::new().unwrap();
-    let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
     // Run 1 caps unverified -> one recovery; the Recovery Run ALSO caps
     // unverified, but the request's budget (limit 1) is spent.
-    let script = vec![
-        Entry::just(write_tool("w1", "a.txt")),
-        Entry::just(insistent_reply("x1")),
-        Entry::just(write_tool("w2", "b.txt")),
-        Entry::just(insistent_reply("x2")),
-    ];
-    let agent = start(session, FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    let (_dir, _session, agent, mut rx) = recovery_harness(
+        crate::session::RecoveryShape::Continuation,
+        vec![
+            Entry::just(write_tool("w1", "a.txt")),
+            Entry::just(insistent_reply("x1")),
+            Entry::just(write_tool("w2", "b.txt")),
+            Entry::just(insistent_reply("x2")),
+        ],
+    );
 
     agent.submit("write the files").await.unwrap();
 
@@ -987,21 +980,20 @@ async fn the_recovery_limit_bounds_one_user_request_and_a_recovery_run_never_res
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_genuine_user_prompt_resets_the_recovery_count() {
-    let dir = TempDir::new().unwrap();
-    let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
-    let script = vec![
-        // Request 1: cap -> recovery -> cap (budget spent).
-        Entry::just(write_tool("w1", "a.txt")),
-        Entry::just(insistent_reply("x1")),
-        Entry::just(write_tool("w2", "b.txt")),
-        Entry::just(insistent_reply("x2")),
-        // Request 2: cap -> the reset budget grants a fresh recovery.
-        Entry::just(write_tool("w3", "c.txt")),
-        Entry::just(insistent_reply("x3")),
-        Entry::just(text_end("second request recovered")),
-    ];
-    let agent = start(session, FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    let (_dir, _session, agent, mut rx) = recovery_harness(
+        crate::session::RecoveryShape::Continuation,
+        vec![
+            // Request 1: cap -> recovery -> cap (budget spent).
+            Entry::just(write_tool("w1", "a.txt")),
+            Entry::just(insistent_reply("x1")),
+            Entry::just(write_tool("w2", "b.txt")),
+            Entry::just(insistent_reply("x2")),
+            // Request 2: cap -> the reset budget grants a fresh recovery.
+            Entry::just(write_tool("w3", "c.txt")),
+            Entry::just(insistent_reply("x3")),
+            Entry::just(text_end("second request recovered")),
+        ],
+    );
 
     agent.submit("first request").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1053,11 +1045,7 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
     agent.submit("fix the failing tests").await.unwrap();
 
     // Approve the failing verification.
-    let req = recv_match(&mut rx, |e| matches!(e, Event::ApprovalRequest { .. })).await;
-    let id = match req {
-        Event::ApprovalRequest { approval_id, .. } => approval_id,
-        _ => unreachable!(),
-    };
+    let id = approval_id(recv_match(&mut rx, |e| matches!(e, Event::ApprovalRequest { .. })).await);
     agent.approve(id, Decision::Approve).await;
 
     // The verification result the seed must carry verbatim.
@@ -1124,16 +1112,15 @@ async fn a_handoff_recovery_seeds_a_fresh_conversation_with_the_mechanical_facts
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_handoff_summarization_degrades_to_the_mechanical_skeleton() {
-    let dir = TempDir::new().unwrap();
-    let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
-    let script = vec![
-        Entry::just(write_tool("w1", "a.txt")), // Run 1 Pass 1: the write lands.
-        Entry::just(insistent_reply("x1")),     // Run 1 Pass 2: refused, caps unverified.
-        Entry::error("summarizer down"),        // The Handoff's LLM call fails.
-        Entry::just(text_end("recovered anyway")),
-    ];
-    let agent = start(session, FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    let (_dir, _session, agent, mut rx) = recovery_harness(
+        crate::session::RecoveryShape::Handoff,
+        vec![
+            Entry::just(write_tool("w1", "a.txt")), // Run 1 Pass 1: the write lands.
+            Entry::just(insistent_reply("x1")),     // Run 1 Pass 2: refused, caps unverified.
+            Entry::error("summarizer down"),        // The Handoff's LLM call fails.
+            Entry::just(text_end("recovered anyway")),
+        ],
+    );
 
     agent.submit("write the file").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1208,15 +1195,18 @@ async fn a_green_run_with_an_advanced_open_plan_opens_a_continuation() {
     // shape Setpoint and always continues (ADR-0043).
     let session = recovery_session(&dir, crate::session::RecoveryShape::Handoff);
     let session_dir = session.session_dir.clone();
-    let agent = start(session, FakeLlm::script(open_plan_script("all steps done now")));
-    let mut rx = agent.subscribe();
+    let (agent, mut rx) = session_harness(session, open_plan_script("all steps done now"));
 
     agent.submit("build it").await.unwrap();
 
     recv_match(&mut rx, is_run_finished).await;
     let recovery = recv_match(&mut rx, is_recovery_run).await;
     match &recovery {
-        Event::RecoveryRun { shape, reason, text } => {
+        Event::RecoveryRun {
+            shape,
+            reason,
+            text,
+        } => {
             // Continuation despite the Handoff Setpoint, and the Open Plan
             // reason carries the plan-continuation prompt.
             assert_eq!(*shape, crate::session::RecoveryShape::Continuation);
@@ -1253,8 +1243,7 @@ async fn an_open_plan_continuation_survives_resume() {
     let dir = TempDir::new().unwrap();
     let session = recovery_session(&dir, crate::session::RecoveryShape::Continuation);
     let session_dir = session.session_dir.clone();
-    let agent = start(session.clone(), FakeLlm::script(open_plan_script("all done")));
-    let mut rx = agent.subscribe();
+    let (agent, mut rx) = session_harness(session.clone(), open_plan_script("all done"));
 
     agent.submit("build it").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1360,8 +1349,7 @@ async fn riders_are_logged_in_linear_position_as_they_are_injected() {
     let dir = TempDir::new().unwrap();
     let session = rider_session(&dir);
     let session_dir = session.session_dir.clone();
-    let agent = start(session, FakeLlm::script(exploring_script()));
-    let mut rx = agent.subscribe();
+    let (agent, mut rx) = session_harness(session, exploring_script());
 
     agent.submit("look around").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1399,8 +1387,7 @@ async fn a_run_that_carried_riders_resumes_byte_for_byte() {
     let dir = TempDir::new().unwrap();
     let session = rider_session(&dir);
     let session_dir = session.session_dir.clone();
-    let agent = start(session.clone(), FakeLlm::script(exploring_script()));
-    let mut rx = agent.subscribe();
+    let (agent, mut rx) = session_harness(session.clone(), exploring_script());
 
     agent.submit("look around").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1429,18 +1416,19 @@ async fn an_unverified_write_logs_the_verification_pass_prompt_and_resumes_byte_
     // A successful write and no run_command: the Verification Pass prompt
     // subsumes the wrap-up warning at 2 remaining, and the Verify Nudge
     // (a standalone finish Nudge, not a rider) fires on the early finish.
-    let script = vec![
-        Entry::just(tool_use_result(
-            "w1",
-            "write_file",
-            json!({ "path": "new.txt", "content": "hello" }),
-        )),
-        Entry::just(tool_use_result("t2", "list_files", json!({ "path": "." }))),
-        Entry::just(text_end("not verified yet")),
-        Entry::just(text_end("done")),
-    ];
-    let agent = start(session.clone(), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    let (agent, mut rx) = session_harness(
+        session.clone(),
+        vec![
+            Entry::just(tool_use_result(
+                "w1",
+                "write_file",
+                json!({ "path": "new.txt", "content": "hello" }),
+            )),
+            Entry::just(tool_use_result("t2", "list_files", json!({ "path": "." }))),
+            Entry::just(text_end("not verified yet")),
+            Entry::just(text_end("done")),
+        ],
+    );
 
     agent.submit("write it").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1477,19 +1465,15 @@ async fn an_unverified_write_logs_the_verification_pass_prompt_and_resumes_byte_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
-    let dir = TempDir::new().unwrap();
-    let session = session_in(&dir);
-    let session_dir = session.session_dir.clone();
-    let script = vec![
+    let (_dir, session, first, mut rx) = harness_with_session(vec![
         Entry::just(tool_use_result(
             "p1",
             "plan",
             json!({ "plan": "Goal: Y. 1. do [ ]" }),
         )),
         Entry::just(text_end("planned")),
-    ];
-    let first = start(session.clone(), FakeLlm::script(script));
-    let mut rx = first.subscribe();
+    ]);
+    let session_dir = session.session_dir.clone();
 
     first.submit("do Y").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
@@ -1662,14 +1646,10 @@ async fn resume_from_a_different_project_root_fails_init_loudly() {
 // live subscriber still gets every event and the Agent stays healthy.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_subscriber_is_pruned_and_does_not_break_later_runs() {
-    let dir = TempDir::new().unwrap();
-    let agent = start(
-        session_in(&dir),
-        FakeLlm::script(vec![Entry::response(
-            vec![Delta::Text("ok".into())],
-            text_end("ok"),
-        )]),
-    );
+    let (_dir, agent, _initial_rx) = harness(vec![Entry::response(
+        vec![Delta::Text("ok".into())],
+        text_end("ok"),
+    )]);
 
     // A subscriber that immediately goes away.
     let dead = agent.subscribe();
@@ -1685,11 +1665,8 @@ async fn a_dropped_subscriber_is_pruned_and_does_not_break_later_runs() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_use_during_streaming_steer_then_unblock_no_crash() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let script = vec![barrier, Entry::just(text_end("done"))];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    let (_dir, agent, mut rx) = harness(vec![barrier, Entry::just(text_end("done"))]);
 
     agent.submit("test streaming").await.unwrap();
 
@@ -1727,10 +1704,8 @@ async fn tool_use_during_streaming_steer_then_unblock_no_crash() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_during_streaming_does_not_crash() {
-    let dir = TempDir::new().unwrap();
     let (barrier, mut inflight) = Entry::barrier();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![barrier]));
-    let mut rx = agent.subscribe();
+    let (_dir, agent, mut rx) = harness(vec![barrier]);
 
     agent.submit("cancel me").await.unwrap();
 
@@ -1747,8 +1722,7 @@ async fn cancel_during_streaming_does_not_crash() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn set_model_changes_what_active_model_returns() {
-    let dir = TempDir::new().unwrap();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![]));
+    let (_dir, agent, _rx) = harness(vec![]);
 
     // Seeded from the Session's launch-resolved Model (the scoped config id).
     assert_eq!(
@@ -1764,8 +1738,7 @@ async fn set_model_changes_what_active_model_returns() {
 async fn set_model_rejects_an_unknown_provider_and_keeps_the_active_model() {
     // Resolution against the Session's fixed Provider set guards the swap
     // (ADR-0037): an unknown provider is an Err and nothing changes.
-    let dir = TempDir::new().unwrap();
-    let agent = start(session_in(&dir), FakeLlm::script(vec![]));
+    let (_dir, agent, _rx) = harness(vec![]);
     let before = agent.active_model().await;
 
     let err = agent.set_model("nowhere/model".into()).await.unwrap_err();
@@ -1777,17 +1750,14 @@ async fn set_model_rejects_an_unknown_provider_and_keeps_the_active_model() {
 async fn a_run_spawned_after_set_model_uses_the_new_model() {
     // The next Run captures the Agent's mutable Model, so the boundary call
     // carries the new one - not the Session's launch-time one (ADR-0033).
-    let dir = TempDir::new().unwrap();
     let (model_tx, mut model_rx) = mpsc::unbounded_channel::<Model>();
-    let script = vec![Entry::dynamic(
+    let (_dir, agent, mut rx) = harness(vec![Entry::dynamic(
         vec![],
         move |_req: &LlmRequest, model: &Model| {
             let _ = model_tx.send(model.clone());
             text_end("done")
         },
-    )];
-    let agent = start(session_in(&dir), FakeLlm::script(script));
-    let mut rx = agent.subscribe();
+    )]);
 
     agent.set_model("local/picked-model".into()).await.unwrap();
     agent.submit("go").await.unwrap();

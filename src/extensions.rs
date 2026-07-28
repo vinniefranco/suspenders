@@ -734,8 +734,10 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let extensions = vec![Registered::new("ArtifactPresenter", json!({}))
-            .with_presenter(Box::new(ArtifactPresenter))];
+        let extensions = vec![
+            Registered::new("ArtifactPresenter", json!({}))
+                .with_presenter(Box::new(ArtifactPresenter)),
+        ];
 
         // Empty artifacts: ArtifactPresenter's present leaves the item unchanged.
         let (presented, failures) = present(&extensions, item.clone(), &HashMap::new());
@@ -752,8 +754,10 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let extensions = vec![Registered::new("ArtifactPresenter", json!({}))
-            .with_presenter(Box::new(ArtifactPresenter))];
+        let extensions = vec![
+            Registered::new("ArtifactPresenter", json!({}))
+                .with_presenter(Box::new(ArtifactPresenter)),
+        ];
         let mut artifacts = HashMap::new();
         artifacts.insert("mark".to_string(), json!("seen"));
 

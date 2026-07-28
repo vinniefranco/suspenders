@@ -41,12 +41,12 @@ use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
-use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
-use crate::session::{RecoveryShape, Session};
 use crate::run::AgentDeps;
 use crate::run::governor::endgame::{Recovery, ReopenReason};
 use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
+use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
+use crate::session::{RecoveryShape, Session};
 use crate::{tools, voice};
 
 #[cfg(test)]
@@ -897,8 +897,7 @@ fn spawn_run(state: &mut AgentState) {
     let session = state.session.clone();
     let opts = run_opts(state, state.compaction.original_task.clone());
 
-    let run =
-        tokio::spawn(async move { crate::run::run(conversation, session, deps, opts).await });
+    let run = tokio::spawn(async move { crate::run::run(conversation, session, deps, opts).await });
     watch_run(state, run);
 }
 

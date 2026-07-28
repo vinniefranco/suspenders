@@ -32,13 +32,10 @@ use crate::compaction::Compaction;
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
+use crate::extensions::Registered;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{LlmRequest, StreamEvent};
-use crate::extensions::Registered;
 use crate::plan::Plan;
-use crate::session::Session;
-use crate::session::log;
-use crate::tool::ToolCtx;
 use crate::run::deps::{AfterPass, Emitter, RunDeps};
 use crate::run::governor::ledger::Ledger;
 use crate::run::governor::{
@@ -46,6 +43,9 @@ use crate::run::governor::{
 };
 use crate::run::offer::Offer;
 use crate::run::{batch, finish};
+use crate::session::Session;
+use crate::session::log;
+use crate::tool::ToolCtx;
 use crate::voice;
 
 /// The Run loop's outcome (baud's `outcome`).
@@ -126,16 +126,23 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) malformed_retry_budget: u64,
 }
 
+/// The Extension pipeline and Tool execution context for one Run: always built
+/// from Session data by the caller, passed together because they are always
+/// produced together and belong together.
+pub struct RunEnv<'a> {
+    pub extensions: &'a [Registered],
+    pub tool_ctx: &'a ToolCtx,
+}
+
 /// Runs the loop until the model stops asking for tools, the Run Limit is hit,
 /// or the response errors (baud's `Baud.Turn.Loop.run/4`).
 ///
-/// `extensions` and `tool_ctx` supply the Extension pipeline and Tool execution
-/// context (Session-derived; the Rust Session carries extension names only).
+/// `env` bundles the Extension pipeline and Tool execution context (both
+/// Session-derived; the Rust Session carries extension names only).
 pub async fn run<D: RunDeps>(
     mut conversation: Conversation,
     session: &Session,
-    extensions: &[Registered],
-    tool_ctx: &ToolCtx,
+    env: RunEnv<'_>,
     deps: &mut D,
     opts: RunOpts,
 ) -> Outcome {
@@ -148,8 +155,8 @@ pub async fn run<D: RunDeps>(
     let mut state = LoopState {
         deps,
         emitter,
-        extensions,
-        tool_ctx,
+        extensions: env.extensions,
+        tool_ctx: env.tool_ctx,
         ledger: Ledger::new(session.run_limit),
         offer: Offer::default(),
         governors: Governors::new(
@@ -603,17 +610,21 @@ mod tests {
     use crate::content::Usage;
     use crate::content::{ContentBlock, Role};
     use crate::event::Stage;
+    use crate::extensions::Registered;
     use crate::llm::model::{Api, Model};
     use crate::llm::response::Response;
     use crate::llm::{Delta, malformed_input_marker};
-    use crate::extensions::Registered;
     use crate::middleware::{Middleware, Token};
+    use crate::run::deps::CompactError;
+    use crate::run::fixtures::{
+        conversation, count_voiced, deps_for, empty, events, find_tool_result, just, last_message,
+        ok, root, run_with, session, session_with, text_end, text_result, tool_ctx,
+        tool_use_result, write,
+    };
     use crate::session::{Session, SessionOpts};
     use crate::test_support::Entry;
     use crate::test_support::FakeDeps;
     use crate::tool::ToolCtx;
-    use crate::run::deps::CompactError;
-    use crate::run::fixtures::*;
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -2246,7 +2257,10 @@ mod tests {
         // recovers (the refusal and the recovery judgment compose).
         let (_conv, reason, recovery) = recover(&outcome);
         assert_eq!(reason, log::StopReason::RunLimit);
-        assert_eq!(recovery.reason, governor::endgame::ReopenReason::UnverifiedWrites);
+        assert_eq!(
+            recovery.reason,
+            governor::endgame::ReopenReason::UnverifiedWrites
+        );
     }
 
     // The final Pass offers NO Tools (ADR-0015/0035); a tool-insistent reply's
@@ -2500,8 +2514,8 @@ mod tests {
 
     // ---- Recovery Run (the close-and-recover Intervention) ----------------
 
-    use crate::session::RecoveryShape;
     use crate::run::governor::endgame::Recovery;
+    use crate::session::RecoveryShape;
 
     fn recover(outcome: &Outcome) -> (&Conversation, log::StopReason, Recovery) {
         match outcome {
@@ -2589,7 +2603,10 @@ mod tests {
 
         let (outcome, _deps) = run_with(&session, "run it", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
-        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
+        assert_eq!(
+            recovery.reason,
+            governor::endgame::ReopenReason::DanglingFailure
+        );
         assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
 
@@ -2653,7 +2670,10 @@ mod tests {
         .with_approvals(vec![true]);
         let (outcome, _deps) = run_with(&session, "run it", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
-        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
+        assert_eq!(
+            recovery.reason,
+            governor::endgame::ReopenReason::DanglingFailure
+        );
         assert_eq!(recovery.failing_command.as_deref(), Some("false"));
     }
 
@@ -2682,8 +2702,10 @@ mod tests {
         let outcome = run(
             conv,
             &session,
-            &extensions,
-            &ctx,
+            RunEnv {
+                extensions: &extensions,
+                tool_ctx: &ctx,
+            },
             &mut deps,
             RunOpts {
                 recoveries_used: 1,
@@ -2757,7 +2779,10 @@ mod tests {
         let (conv, reason, recovery) = recover(&outcome);
 
         assert_eq!(reason, log::StopReason::RunLimit);
-        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
+        assert_eq!(
+            recovery.reason,
+            governor::endgame::ReopenReason::DanglingFailure
+        );
         let lm = last_message(conv);
         assert!(
             matches!(&lm.content[0], ContentBlock::Text { text } if text == "half done; the tests are still red")
@@ -2806,7 +2831,10 @@ mod tests {
 
         let (outcome, _deps) = run_with(&session, "run the tests", deps).await;
         let (_conv, _reason, recovery) = recover(&outcome);
-        assert_eq!(recovery.reason, governor::endgame::ReopenReason::DanglingFailure);
+        assert_eq!(
+            recovery.reason,
+            governor::endgame::ReopenReason::DanglingFailure
+        );
     }
 
     // A clean cap (no writes, no failing command) settling Ok is covered by
@@ -3341,7 +3369,17 @@ mod tests {
     ) -> (Outcome, FakeDeps) {
         let conv = conversation(session, prompt);
         let ctx = tool_ctx(session);
-        let outcome = run(conv, session, &extensions, &ctx, &mut deps, RunOpts::default()).await;
+        let outcome = run(
+            conv,
+            session,
+            RunEnv {
+                extensions: &extensions,
+                tool_ctx: &ctx,
+            },
+            &mut deps,
+            RunOpts::default(),
+        )
+        .await;
         (outcome, deps)
     }
 
@@ -3359,7 +3397,8 @@ mod tests {
         );
         let extensions =
             vec![Registered::new("HaltEdits", json!([])).with_middleware(Box::new(HaltEdits))];
-        let (outcome, deps) = run_with_extensions(&session, "edit something", deps, extensions).await;
+        let (outcome, deps) =
+            run_with_extensions(&session, "edit something", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let tr = evs
@@ -3438,8 +3477,10 @@ mod tests {
             .iter()
             .find(|e| matches!(e, Event::ExtensionError { .. }))
             .unwrap();
-        assert!(matches!(pe, Event::ExtensionError { extension, stage, message }
-            if extension == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom")));
+        assert!(
+            matches!(pe, Event::ExtensionError { extension, stage, message }
+            if extension == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom"))
+        );
         let tr = evs
             .iter()
             .find(|e| matches!(e, Event::ToolResult { .. }))
@@ -3706,8 +3747,10 @@ mod tests {
         let outcome = run(
             conv,
             &session,
-            &extensions,
-            &ctx,
+            RunEnv {
+                extensions: &extensions,
+                tool_ctx: &ctx,
+            },
             &mut deps,
             RunOpts {
                 plan: Some("Goal: ship. 1. code [ ]".to_string()),
@@ -3764,8 +3807,10 @@ mod tests {
         let outcome = run(
             conv,
             &session,
-            &extensions,
-            &ctx,
+            RunEnv {
+                extensions: &extensions,
+                tool_ctx: &ctx,
+            },
             &mut deps,
             RunOpts::default(),
         )
@@ -3817,8 +3862,10 @@ mod tests {
         let outcome = run(
             conv,
             &session,
-            &extensions,
-            &ctx,
+            RunEnv {
+                extensions: &extensions,
+                tool_ctx: &ctx,
+            },
             &mut deps,
             RunOpts::default(),
         )
@@ -3876,9 +3923,18 @@ mod tests {
         mut deps: FakeDeps,
         ctx: ToolCtx,
     ) -> (Outcome, FakeDeps) {
-        let conv = conversation(session, prompt);
         let extensions: Vec<Registered> = Vec::new();
-        let outcome = run(conv, session, &extensions, &ctx, &mut deps, RunOpts::default()).await;
+        let outcome = run(
+            conversation(session, prompt),
+            session,
+            RunEnv {
+                extensions: &extensions,
+                tool_ctx: &ctx,
+            },
+            &mut deps,
+            RunOpts::default(),
+        )
+        .await;
         (outcome, deps)
     }
 

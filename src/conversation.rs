@@ -17,8 +17,8 @@
 //! system prompt, and live non-`tool_result` blocks are never touched.
 //! Running it twice changes nothing.
 
-mod supersession;
 mod run_boundary;
+mod supersession;
 
 use crate::content::{ContentBlock, Message, Provenance, Role, Usage};
 use crate::voice::{self, FileOps};

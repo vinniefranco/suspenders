@@ -30,8 +30,8 @@ use crate::approvals;
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::malformed_tool_input;
 use crate::extensions;
+use crate::llm::malformed_tool_input;
 use crate::middleware::Token;
 use crate::plan::Update;
 use crate::run::deps::RunDeps;
@@ -339,7 +339,10 @@ async fn execute_token<D: RunDeps>(state: &mut LoopState<'_, D>, token: Token) -
     Answer::ran(result)
 }
 
-fn emit_extension_errors<D: RunDeps>(state: &mut LoopState<'_, D>, failures: &[extensions::Failure]) {
+fn emit_extension_errors<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    failures: &[extensions::Failure],
+) {
     for failure in failures {
         state.emitter.emit(Event::extension_error(
             failure.extension.clone(),

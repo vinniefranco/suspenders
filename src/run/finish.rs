@@ -23,10 +23,10 @@ use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::event::{Event, VoicedTag};
 use crate::llm::response::{Response, StopReason};
-use crate::session::log;
 use crate::run::deps::RunDeps;
 use crate::run::governor::{self, FinishIntervention};
 use crate::run::loop_::{Flow, LoopState, Outcome, OutcomeStop};
+use crate::session::log;
 use crate::voice;
 
 pub(super) fn close<D: RunDeps>(

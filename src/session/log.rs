@@ -2335,17 +2335,17 @@ mod tests {
         // Every (shape, reason) combination the mechanic produces: broken-state
         // reasons on either shape, and the Open Plan always on Continuation.
         let cases = [
-            (RecoveryShape::Handoff, ReopenReason::DanglingFailure, "[df]"),
+            (
+                RecoveryShape::Handoff,
+                ReopenReason::DanglingFailure,
+                "[df]",
+            ),
             (
                 RecoveryShape::Handoff,
                 ReopenReason::UnverifiedWrites,
                 "[uw]",
             ),
-            (
-                RecoveryShape::Continuation,
-                ReopenReason::OpenPlan,
-                "[op]",
-            ),
+            (RecoveryShape::Continuation, ReopenReason::OpenPlan, "[op]"),
         ];
         for (shape, reason, text) in cases {
             log.append(Entry::Recovery {

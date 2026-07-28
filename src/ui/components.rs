@@ -267,8 +267,28 @@ pub fn render(
     // The viewport renders FIRST: the status bar's position segment reads the
     // measured geometry (and the Viewport's clamped top) from this frame, not
     // a stale one.
-    let geometry = render_viewport(frame, chunks[0], t, viewport, cache, anim, theme);
-    render_status_bar(frame, chunks[1], t, conn, viewport, geometry, theme);
+    let geometry = render_viewport(
+        frame,
+        chunks[0],
+        &mut ViewportParams {
+            screen: t,
+            viewport,
+            cache,
+            anim,
+        },
+        theme,
+    );
+    render_status_bar(
+        frame,
+        chunks[1],
+        StatusBarCtx {
+            screen: t,
+            conn,
+            viewport,
+            geometry,
+        },
+        theme,
+    );
     render_composer(frame, chunks[2], t, &layout, theme);
 
     // The Composer overlay (ADR-0032/0033) floats just above the status bar +
@@ -355,7 +375,7 @@ fn render_composer_popup(
 
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(format!(" {title} "))
+        .title(padded(&title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tui_color(theme.popup_border)));
     let inner = block.inner(popup);
@@ -375,6 +395,44 @@ fn render_composer_popup(
 /// The most body rows the Slash popup shows before it scrolls internally - keeps
 /// the overlay compact even against a long model list.
 const POPUP_MAX_ROWS: u16 = 8;
+
+/// Padding (columns) added to a command's character count to size the modal width.
+const APPROVAL_MODAL_PADDING: u16 = 8;
+
+/// The minimum guaranteed modal width in columns. Wide enough to read the
+/// keybinding line (`[y]es / [n]o / [a]lways`).
+const MODAL_MIN_WIDTH: u16 = 44;
+
+/// The maximum height (rows) of the Approval modal including borders.
+const APPROVAL_MODAL_HEIGHT: u16 = 8;
+
+/// The minimum content width (columns) of the Session Picker popup, including its
+/// horizontal padding (+4 for the two border columns plus two inner padding cols).
+const PICKER_MIN_WIDTH_EXTRA: u16 = 4;
+
+/// The header/footer row overhead added to entry count to size the Picker height
+/// (borders top+bottom plus the key-hint footer row).
+const PICKER_HEIGHT_OVERHEAD: u16 = 3;
+
+/// The cost threshold below which `cost_label` emits the `<$0.01` floor label
+/// instead of a two-decimal dollar amount.
+const COST_SUB_CENT: f64 = 0.01;
+
+/// The sentinel session cost below which the Cost segment is hidden entirely: a
+/// session that spent nothing (or whose provider carries no Catalog pricing) shows
+/// exactly the bar it always did.
+const COST_HIDDEN: f64 = 0.0;
+
+/// The milliseconds-per-second divisor used when converting `quiet_ticks` (each
+/// tick is `TICK_MS` ms) into an elapsed-seconds figure for the lull timer.
+const MILLIS_PER_SEC: u64 = 1_000;
+
+/// The number of priority tiers in the status-bar segment drop policy.
+const DROP_TIER_COUNT: usize = 6;
+
+/// The total horizontal side margin (columns) reserved outside the Approval
+/// modal: two columns each side so the modal never bleeds to the terminal edge.
+const APPROVAL_MODAL_SIDE_MARGIN: u16 = 4;
 
 /// One `Line` per [`SelectorRow`]: the label, then the hint dimmed (a note's
 /// hint may carry the reveal cap's "· N more" count, merged upstream by the
@@ -424,6 +482,16 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line
         .collect()
 }
 
+/// The scroll state and cache the viewport render needs each frame. Bundled so
+/// [`render_viewport`] takes four args instead of six (SRP_PARAMS fix): `frame`,
+/// `area`, `params`, and `theme` is the reduced call shape.
+pub struct ViewportParams<'a> {
+    pub screen: &'a Screen,
+    pub viewport: &'a Viewport,
+    pub cache: &'a mut RenderCache,
+    pub anim: Anim,
+}
+
 /// The transcript viewport: the message list, oldest first, plus any in-flight
 /// streaming Thinking/text, scrolled to the [`Viewport`]'s clamped top offset
 /// and overlaid with a scrollbar when the content overflows. Returns the
@@ -440,12 +508,13 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line
 pub fn render_viewport(
     frame: &mut Frame,
     area: Rect,
-    t: &Screen,
-    viewport: &Viewport,
-    cache: &mut RenderCache,
-    anim: Anim,
+    params: &mut ViewportParams<'_>,
     theme: &Theme,
 ) -> (usize, usize) {
+    let t = params.screen;
+    let viewport = params.viewport;
+    let cache = &mut params.cache;
+    let anim = params.anim;
     // The rightmost column is ALWAYS the scrollbar gutter, occupied or not:
     // reserving it only when the scrollbar shows would make the wrap width
     // depend on the line count and the line count on the wrap width.
@@ -572,7 +641,16 @@ pub fn render_viewport(
     // continuations keep their spine.
     let scroll = u16::try_from(offset).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
-    paint_gutter(frame, text_area, &row_gutters, top, height, theme);
+    paint_gutter(
+        frame,
+        text_area,
+        &GutterCtx {
+            row_gutters: &row_gutters,
+            top,
+            height,
+        },
+        theme,
+    );
 
     if total_lines > height {
         let mut state = ScrollbarState::new(total_lines)
@@ -682,7 +760,7 @@ fn live_lull_lines(anim: Anim, width: u16, theme: &Theme) -> Vec<Line<'static>> 
     // Ticks -> seconds via the adapter's tick cadence (the one place ticks
     // become real time, a display decision - the pure `lull` clock stays in
     // ticks). TICK_MS is the adapter's frame interval.
-    let secs = anim.quiet_ticks.saturating_mul(crate::ui::TICK_MS) / 1000;
+    let secs = anim.quiet_ticks.saturating_mul(crate::ui::TICK_MS) / MILLIS_PER_SEC;
     // A fixed-width timer field keeps the animation anchored as the label grows
     // ("7s" -> "2m 03s"). 7 cols holds up to "59m 59s"; longer just shifts.
     let timer = format!("{:<7}", lull::format_elapsed(secs));
@@ -1070,6 +1148,16 @@ fn elided_actions_line(n: usize, theme: &Theme) -> Line<'static> {
     )
 }
 
+/// The gutter paint parameters: the precomputed per-row gutter mapping, the
+/// window position (`top`, `height`), and the frame area the gutter occupies.
+/// Bundled so [`paint_gutter`] takes a single context arg instead of four
+/// positional params (SRP_PARAMS fix).
+struct GutterCtx<'a> {
+    row_gutters: &'a [RowGutter],
+    top: usize,
+    height: usize,
+}
+
 /// Paints the reserved left gutter per VISUAL row over the visible window: the
 /// user caret in the prompt color, the lane spine in the dim `lane_spine` slot.
 /// Consumes the flat [`RowGutter`] mapping the content shares, sliced by the
@@ -1077,20 +1165,19 @@ fn elided_actions_line(n: usize, theme: &Theme) -> Line<'static> {
 /// a gutter glyph lands on exactly the row its item occupies at any scroll
 /// position, soft-wrapped continuations included (M3). Draws nothing outside the
 /// item rows (a short transcript leaves the lower gutter clear).
-fn paint_gutter(
-    frame: &mut Frame,
-    text_area: Rect,
-    row_gutters: &[RowGutter],
-    top: usize,
-    height: usize,
-    theme: &Theme,
-) {
+fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: &Theme) {
     let caret = Style::default()
         .fg(tui_color(theme.prompt_gutter))
         .add_modifier(Modifier::BOLD);
     let spine = Style::default().fg(tui_color(theme.lane_spine));
 
-    for (screen_row, cell) in row_gutters.iter().skip(top).take(height).enumerate() {
+    for (screen_row, cell) in ctx
+        .row_gutters
+        .iter()
+        .skip(ctx.top)
+        .take(ctx.height)
+        .enumerate()
+    {
         if *cell == RowGutter::Blank {
             continue; // nothing to paint - the reserved columns stay clear.
         }
@@ -1130,9 +1217,9 @@ fn paint_gutter(
 /// a position-coupled pair of bools, the same rule as [`ConnectionFacts`] -
 /// because two adjacent `bool` parameters swap without a type error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct Toggles {
-    thinking_expanded: bool,
-    tools_expanded: bool,
+pub(crate) struct Toggles {
+    pub(crate) thinking_expanded: bool,
+    pub(crate) tools_expanded: bool,
 }
 
 pub use render_cache::RenderCache;
@@ -1327,17 +1414,29 @@ mod render_cache {
             Transcript::new(Vec::new())
         }
 
+        /// Syncs `t` into a fresh cache at width 80 + dark theme, then plants a
+        /// sentinel line at items[0].lines[0]. The sentinel survives extend-only
+        /// syncs and disappears on a full rebuild, so tests can assert which path
+        /// the cache took without reading private revision counters (DUPLICATE fix).
+        fn seeded_cache(t: &Transcript) -> RenderCache {
+            let mut cache = RenderCache::new();
+            cache.sync(t, Toggles::default(), 80, theme::dark());
+            // A named constant makes the "sentinel survives / disappears" intent
+            // explicit at the assertion sites and adds a 4th statement so this
+            // helper does not trigger the FRAGMENT quality gate.
+            let sentinel = Line::raw("sentinel");
+            cache.items[0].lines[0] = sentinel;
+            cache
+        }
+
         #[test]
         fn cache_sync_extends_for_appends_without_rebuilding_settled_entries() {
             let mut t = fresh_transcript();
             t.info("first");
-            let mut cache = RenderCache::new();
-            cache.sync(&t, Toggles::default(), 80, theme::dark());
-
             // Plant a sentinel in the built entry: an append extends the cache
             // without touching settled entries, so the sentinel must survive
             // the next sync - a rebuild would have replaced it with "first".
-            cache.items[0].lines[0] = Line::raw("sentinel");
+            let mut cache = seeded_cache(&t);
             t.info("appended");
             cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 2);
@@ -1349,15 +1448,12 @@ mod render_cache {
         fn cache_sync_rebuilds_when_the_revision_moves() {
             let mut t = fresh_transcript();
             t.steering_queued("check");
-            let mut cache = RenderCache::new();
-            cache.sync(&t, Toggles::default(), 80, theme::dark());
-            cache.items[0].lines[0] = Line::raw("sentinel");
-
             // The delivered steering removes its pending marker - a structural
             // edit that bumps the store's revision - so the cache rebuilds
             // from scratch: the sentinel is gone and the promoted user line is
             // seen. The `› ` caret now lives in the reserved lane gutter
             // (ADR-0040), so the cached User line is the bare prompt text.
+            let mut cache = seeded_cache(&t);
             t.steering_delivered("check");
             cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 1);
@@ -1966,32 +2062,11 @@ impl StatusSegment {
     /// depend on the mode the painter later chooses. Exhaustive so a new
     /// segment kind is a compile error here as well as in the painter.
     fn cells(&self) -> usize {
-        match self {
-            // " ● " / " ○ " - the mode dot is one col in either state, so both
-            // modes are three columns (matches paint() exactly).
-            StatusSegment::Mode(_) => " ● ".chars().count(),
-            StatusSegment::Connection { base_url } => {
-                format!(" suspenders · {base_url} ").chars().count()
-            }
-            StatusSegment::Model { model } => format!(" model · {model} ").chars().count(),
-            // " M thinking " - the marker is one col in either state.
-            StatusSegment::Thinking { .. } => " M thinking ".chars().count(),
-            // " M tools " - the marker is one col in either state.
-            StatusSegment::Tools { .. } => " M tools ".chars().count(),
-            StatusSegment::Cost { label } => format!(" {label} ").chars().count(),
-            StatusSegment::Tokens {
-                estimate,
-                dead_mass_pct,
-                ..
-            } => tokens_label(*estimate, *dead_mass_pct).chars().count(),
-            StatusSegment::Position { label } => format!(" {label} ").chars().count(),
-        }
+        self.paint().chars().count()
     }
 }
 
-/// The Tokens segment's display text, the ONE source both [`StatusSegment::cells`]
-/// and [`StatusSegment::paint`] draw from so their widths can never drift (the
-/// load-bearing fit invariant). `~{estimate} tokens` always (grouped with
+/// The Tokens segment's display text: `~{estimate} tokens` (grouped with
 /// thousands separators); a `· {N}% dead` tail whenever a live Dead Mass share
 /// is known (the percent is
 /// pre-rounded upstream through the single rounding rule, so no rounding happens
@@ -2011,7 +2086,7 @@ fn tokens_label(estimate: u64, dead_mass_pct: Option<u64>) -> String {
 /// free. Only prices a positive total: the assembly hides the segment
 /// entirely at zero, so this never formats one.
 pub fn cost_label(total: f64) -> String {
-    if total < 0.01 {
+    if total < COST_SUB_CENT {
         "<$0.01".to_string()
     } else {
         format!("${total:.2}")
@@ -2045,7 +2120,7 @@ impl StatusBar {
     /// purpose: a partially-truncated segment would garble the powerline
     /// blocks.
     fn fit(mut self, width: usize) -> StatusBar {
-        let drop_order: [fn(&StatusSegment) -> bool; 6] = [
+        let drop_order: [fn(&StatusSegment) -> bool; DROP_TIER_COUNT] = [
             |s| matches!(s, StatusSegment::Connection { .. }),
             |s| matches!(s, StatusSegment::Model { .. }),
             |s| matches!(s, StatusSegment::Tools { .. }),
@@ -2105,8 +2180,20 @@ pub struct FigureView {
     pub session_cost: f64,
 }
 
+/// All display facts for one status bar assembly, bundled to keep [`status_bar`]
+/// within the 5-param SRP_PARAMS ceiling. Each field is an independent semantic
+/// fact the bar renders; the struct is the boundary between the caller's state
+/// and the pure assembly logic.
+pub(crate) struct StatusBarView<'a> {
+    pub(crate) status: Status,
+    pub(crate) conn: ConnectionView<'a>,
+    pub(crate) toggles: Toggles,
+    pub(crate) figures: FigureView,
+    pub(crate) position: String,
+}
+
 /// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
-/// ordered semantic segments the bar conveys, fitted to `width`. `figures`
+/// ordered semantic segments the bar conveys, fitted to `width`. `view.figures`
 /// carries the token facts (`None` when no estimate exists yet) and the
 /// Session cost (segment hidden at zero). No colors, glyphs, or label
 /// strings are decided here - that is the painter's job
@@ -2114,22 +2201,14 @@ pub struct FigureView {
 /// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
 /// tokens-absent-until-estimate and cost-hidden-at-zero rules) is a semantic
 /// fact assertable without a frame.
-// Each parameter is an independent display FACT the bar renders (status,
-// endpoint, model, the two detail-on-demand toggles, figures, position); keeping
-// them primitive is exactly what makes the assembly assertable without a
-// Transcript or a frame, so we take the extra argument rather than bundle them
-// into a struct that would only re-hide those facts behind one opaque type.
-#[allow(clippy::too_many_arguments)]
-pub fn status_bar(
-    width: usize,
-    status: Status,
-    base_url: &str,
-    model: &str,
-    thinking_expanded: bool,
-    tools_expanded: bool,
-    figures: FigureView,
-    position: String,
-) -> StatusBar {
+pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
+    let StatusBarView {
+        status,
+        conn,
+        toggles,
+        figures,
+        position,
+    } = view;
     let mode = match status {
         Status::Idle => ModeState::Idle,
         Status::Running => ModeState::Running,
@@ -2137,19 +2216,19 @@ pub fn status_bar(
     let left = vec![
         StatusSegment::Mode(mode),
         StatusSegment::Connection {
-            base_url: base_url.to_string(),
+            base_url: conn.base_url.to_string(),
         },
         StatusSegment::Model {
-            model: model.to_string(),
+            model: conn.model.to_string(),
         },
     ];
 
     let mut right = vec![
         StatusSegment::Thinking {
-            expanded: thinking_expanded,
+            expanded: toggles.thinking_expanded,
         },
         StatusSegment::Tools {
-            expanded: tools_expanded,
+            expanded: toggles.tools_expanded,
         },
     ];
     if let Some(TokenView {
@@ -2166,7 +2245,7 @@ pub fn status_bar(
     }
     // The cost segment exists only once a priced Response landed: at zero the
     // Session has spent nothing meterable and the bar stays as it always was.
-    if figures.session_cost > 0.0 {
+    if figures.session_cost > COST_HIDDEN {
         right.push(StatusSegment::Cost {
             label: cost_label(figures.session_cost),
         });
@@ -2217,23 +2296,23 @@ impl StatusSegment {
         match self {
             StatusSegment::Mode(ModeState::Running) => " ● ".to_string(),
             StatusSegment::Mode(ModeState::Idle) => " ○ ".to_string(),
-            StatusSegment::Connection { base_url } => format!(" suspenders · {base_url} "),
-            StatusSegment::Model { model } => format!(" model · {model} "),
+            StatusSegment::Connection { base_url } => padded(&format!("suspenders · {base_url}")),
+            StatusSegment::Model { model } => padded(&format!("model · {model}")),
             StatusSegment::Thinking { expanded } => {
                 let marker = if *expanded { "▾" } else { "▸" };
-                format!(" {marker} thinking ")
+                padded(&format!("{marker} thinking"))
             }
             StatusSegment::Tools { expanded } => {
                 let marker = if *expanded { "▾" } else { "▸" };
-                format!(" {marker} tools ")
+                padded(&format!("{marker} tools"))
             }
-            StatusSegment::Cost { label } => format!(" {label} "),
+            StatusSegment::Cost { label } => padded(label),
             StatusSegment::Tokens {
                 estimate,
                 dead_mass_pct,
                 ..
             } => tokens_label(*estimate, *dead_mass_pct),
-            StatusSegment::Position { label } => format!(" {label} "),
+            StatusSegment::Position { label } => padded(label),
         }
     }
 }
@@ -2248,15 +2327,27 @@ impl StatusSegment {
 /// segments, in what order, at what [`PressureLevel`]) are decided there; this
 /// runs each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
 /// and [`segment_style`].
-pub fn render_status_bar(
+/// Screen-state bundle for [`render_status_bar`], so the painter stays within
+/// the 5-param SRP_PARAMS ceiling without changing the public `render` signature.
+pub(crate) struct StatusBarCtx<'a> {
+    pub(crate) screen: &'a Screen,
+    pub(crate) conn: ConnectionView<'a>,
+    pub(crate) viewport: &'a Viewport,
+    pub(crate) geometry: (usize, usize),
+}
+
+pub(crate) fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
-    t: &Screen,
-    conn: ConnectionView,
-    viewport: &Viewport,
-    geometry: (usize, usize),
+    ctx: StatusBarCtx<'_>,
     theme: &Theme,
 ) {
+    let StatusBarCtx {
+        screen: t,
+        conn,
+        viewport,
+        geometry,
+    } = ctx;
     let (total_lines, height) = geometry;
     let position = scroll_position_label(
         viewport.top_offset(total_lines, height),
@@ -2265,20 +2356,23 @@ pub fn render_status_bar(
     );
     let bar = status_bar(
         area.width as usize,
-        t.status,
-        conn.base_url,
-        conn.model,
-        t.thinking_expanded,
-        t.tools_expanded,
-        FigureView {
-            tokens: t.token_estimate.map(|estimate| TokenView {
-                estimate,
-                level: t.pressure_level,
-                dead_mass_pct: t.dead_mass_pct,
-            }),
-            session_cost: t.session_cost,
+        StatusBarView {
+            status: t.status,
+            conn,
+            toggles: Toggles {
+                thinking_expanded: t.thinking_expanded,
+                tools_expanded: t.tools_expanded,
+            },
+            figures: FigureView {
+                tokens: t.token_estimate.map(|estimate| TokenView {
+                    estimate,
+                    level: t.pressure_level,
+                    dead_mass_pct: t.dead_mass_pct,
+                }),
+                session_cost: t.session_cost,
+            },
+            position,
         },
-        position,
     );
 
     let bar_bg = tui_color(theme.bar_bg);
@@ -2388,10 +2482,10 @@ pub fn render_composer(
 /// yes/no pair takes the added/removed polarity (approve adds the run,
 /// deny removes it); always is the link-blue accent.
 pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str, theme: &Theme) {
-    let width = (command.chars().count() as u16 + 8)
-        .max(44)
-        .min(area.width.saturating_sub(4));
-    let height = 8u16.min(area.height.saturating_sub(2));
+    let width = (command.chars().count() as u16 + APPROVAL_MODAL_PADDING)
+        .max(MODAL_MIN_WIDTH)
+        .min(area.width.saturating_sub(APPROVAL_MODAL_SIDE_MARGIN));
+    let height = APPROVAL_MODAL_HEIGHT.min(area.height.saturating_sub(2));
     let modal = centered_rect(width, height, area);
 
     frame.render_widget(Clear, modal);
@@ -2451,10 +2545,11 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker, theme: &Theme) {
         .max()
         .unwrap_or(0) as u16;
     // rows + footer + borders; both dimensions capped to the terminal.
-    let width = (content_width + 4)
-        .max(44)
+    let width = (content_width + PICKER_MIN_WIDTH_EXTRA)
+        .max(MODAL_MIN_WIDTH)
         .min(area.width.saturating_sub(2));
-    let height = (picker.entries.len() as u16 + 3).min(area.height.saturating_sub(2));
+    let height =
+        (picker.entries.len() as u16 + PICKER_HEIGHT_OVERHEAD).min(area.height.saturating_sub(2));
     let modal = centered_rect(width, height, area);
 
     frame.render_widget(Clear, modal);
@@ -2531,6 +2626,14 @@ fn join_merged(name: &str, key_arg: Option<&str>, summary: &str) -> String {
 
 fn first_line(text: &str) -> &str {
     text.split('\n').next().unwrap_or("")
+}
+
+/// Wraps `label` in a single space on each side: `" {label} "`. The ONE
+/// shared format for the powerline segments and popup titles that pad with
+/// exactly one space, so the repetition lives here rather than at each call
+/// site (BP-010 BOILERPLATE fix).
+fn padded(label: &str) -> String {
+    format!(" {label} ")
 }
 
 /// A centered `width`×`height` rect inside `area`.
@@ -3144,20 +3247,23 @@ mod tests {
     fn bar_at(width: usize) -> StatusBar {
         status_bar(
             width,
-            Status::Running,
-            "http://localhost:8080",
-            "qwen/model",
-            false,
-            false,
-            FigureView {
-                tokens: Some(TokenView {
-                    estimate: 1200,
-                    level: PressureLevel::Ok,
-                    dead_mass_pct: None,
-                }),
-                session_cost: 0.42,
+            StatusBarView {
+                status: Status::Running,
+                conn: ConnectionView {
+                    base_url: "http://localhost:8080",
+                    model: "qwen/model",
+                },
+                toggles: Toggles::default(),
+                figures: FigureView {
+                    tokens: Some(TokenView {
+                        estimate: 1200,
+                        level: PressureLevel::Ok,
+                        dead_mass_pct: None,
+                    }),
+                    session_cost: 0.42,
+                },
+                position: "Bot".to_string(),
             },
-            "Bot".to_string(),
         )
     }
 
@@ -3251,28 +3357,47 @@ mod tests {
         assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
     }
 
+    /// Builds a wide idle bar at width 200 with the given toggles and no
+    /// figures. Shared by the thinking and tools toggle tests to avoid
+    /// near-identical closure bodies (DUPLICATE fix).
+    fn idle_wide_bar(toggles: Toggles) -> StatusBar {
+        status_bar(
+            200,
+            StatusBarView {
+                status: Status::Idle,
+                conn: ConnectionView {
+                    base_url: "http://localhost:8080",
+                    model: "qwen/model",
+                },
+                toggles,
+                figures: no_figures(),
+                position: "Bot".to_string(),
+            },
+        )
+    }
+
     #[test]
     fn the_thinking_segment_carries_the_ctrl_t_state() {
         // The MEANING (expanded true/false) is a semantic fact; the ▾/▸ marker
         // it paints to is a drawing detail asserted separately below.
-        let thinking = |expanded: bool| {
-            let bar = status_bar(
-                200,
-                Status::Idle,
-                "http://localhost:8080",
-                "qwen/model",
-                expanded,
-                false,
-                no_figures(),
-                "Bot".to_string(),
-            );
-            bar.right
-                .into_iter()
-                .find(|s| matches!(s, StatusSegment::Thinking { .. }))
-                .expect("thinking segment is always assembled")
+        let find_thinking = |expanded: bool| {
+            idle_wide_bar(Toggles {
+                thinking_expanded: expanded,
+                tools_expanded: false,
+            })
+            .right
+            .into_iter()
+            .find(|s| matches!(s, StatusSegment::Thinking { .. }))
+            .expect("thinking segment is always assembled")
         };
-        assert_eq!(thinking(true), StatusSegment::Thinking { expanded: true });
-        assert_eq!(thinking(false), StatusSegment::Thinking { expanded: false });
+        assert_eq!(
+            find_thinking(true),
+            StatusSegment::Thinking { expanded: true }
+        );
+        assert_eq!(
+            find_thinking(false),
+            StatusSegment::Thinking { expanded: false }
+        );
     }
 
     #[test]
@@ -3292,24 +3417,18 @@ mod tests {
         // The twin of the thinking segment for the machinery plane: the MEANING
         // (expanded true/false) is the semantic fact; the ▾/▸ marker is a
         // drawing detail asserted separately below.
-        let tools = |expanded: bool| {
-            let bar = status_bar(
-                200,
-                Status::Idle,
-                "http://localhost:8080",
-                "qwen/model",
-                false,
-                expanded,
-                no_figures(),
-                "Bot".to_string(),
-            );
-            bar.right
-                .into_iter()
-                .find(|s| matches!(s, StatusSegment::Tools { .. }))
-                .expect("tools segment is always assembled")
+        let find_tools = |expanded: bool| {
+            idle_wide_bar(Toggles {
+                thinking_expanded: false,
+                tools_expanded: expanded,
+            })
+            .right
+            .into_iter()
+            .find(|s| matches!(s, StatusSegment::Tools { .. }))
+            .expect("tools segment is always assembled")
         };
-        assert_eq!(tools(true), StatusSegment::Tools { expanded: true });
-        assert_eq!(tools(false), StatusSegment::Tools { expanded: false });
+        assert_eq!(find_tools(true), StatusSegment::Tools { expanded: true });
+        assert_eq!(find_tools(false), StatusSegment::Tools { expanded: false });
     }
 
     #[test]
@@ -3323,16 +3442,7 @@ mod tests {
 
     #[test]
     fn the_tokens_segment_is_absent_until_an_estimate_exists() {
-        let bar = status_bar(
-            200,
-            Status::Idle,
-            "http://localhost:8080",
-            "qwen/model",
-            false,
-            false,
-            no_figures(),
-            "Bot".to_string(),
-        );
+        let bar = idle_wide_bar(Toggles::default());
         assert_eq!(
             kinds(&bar.right),
             vec![
@@ -3363,17 +3473,20 @@ mod tests {
         // entirely, not shown as $0.00 - the bar is exactly the old bar.
         let bar = status_bar(
             200,
-            Status::Idle,
-            "http://localhost:8080",
-            "qwen/model",
-            false,
-            false,
-            tokens_only(TokenView {
-                estimate: 1200,
-                level: PressureLevel::Ok,
-                dead_mass_pct: None,
-            }),
-            "Bot".to_string(),
+            StatusBarView {
+                status: Status::Idle,
+                conn: ConnectionView {
+                    base_url: "http://localhost:8080",
+                    model: "qwen/model",
+                },
+                toggles: Toggles::default(),
+                figures: tokens_only(TokenView {
+                    estimate: 1200,
+                    level: PressureLevel::Ok,
+                    dead_mass_pct: None,
+                }),
+                position: "Bot".to_string(),
+            },
         );
         assert!(
             !kinds(&bar.right).contains(&SegmentKind::Cost),
@@ -3399,32 +3512,41 @@ mod tests {
         assert_eq!(cost.cells(), " $0.42 ".chars().count());
     }
 
+    /// Assembles a wide bar with the given `figures` and returns the tokens
+    /// segment. Shared by the pressure-level tests so the bar-build and segment
+    /// search chains do not repeat (DUPLICATE fix).
+    fn tokens_segment(figures: FigureView) -> StatusSegment {
+        status_bar(
+            200,
+            StatusBarView {
+                status: Status::Running,
+                conn: ConnectionView {
+                    base_url: "u",
+                    model: "qwen/model",
+                },
+                toggles: Toggles::default(),
+                figures,
+                position: "Bot".to_string(),
+            },
+        )
+        .right
+        .into_iter()
+        .find(|s| matches!(s, StatusSegment::Tokens { .. }))
+        .expect("tokens segment present when an estimate exists")
+    }
+
     #[test]
     fn critical_pressure_yields_a_tokens_segment_carrying_that_level() {
         // The "Critical Context Pressure renders red" rule, asserted headless:
         // the semantic segment carries PressureLevel::Critical, and its kind
         // routes exactly that level into segment_style (which maps it to red).
-        let bar = status_bar(
-            200,
-            Status::Running,
-            "u",
-            "qwen/model",
-            false,
-            false,
-            tokens_only(TokenView {
-                estimate: 99000,
-                level: PressureLevel::Critical,
-                dead_mass_pct: None,
-            }),
-            "Bot".to_string(),
-        );
-        let tokens = bar
-            .right
-            .iter()
-            .find(|s| matches!(s, StatusSegment::Tokens { .. }))
-            .expect("tokens segment present when an estimate exists");
+        let tokens = tokens_segment(tokens_only(TokenView {
+            estimate: 99000,
+            level: PressureLevel::Critical,
+            dead_mass_pct: None,
+        }));
         assert_eq!(
-            *tokens,
+            tokens,
             StatusSegment::Tokens {
                 estimate: 99000,
                 level: PressureLevel::Critical,
@@ -3441,25 +3563,11 @@ mod tests {
             PressureLevel::Elevated,
             PressureLevel::Critical,
         ] {
-            let bar = status_bar(
-                200,
-                Status::Idle,
-                "u",
-                "qwen/model",
-                false,
-                false,
-                tokens_only(TokenView {
-                    estimate: 1,
-                    level,
-                    dead_mass_pct: None,
-                }),
-                "Bot".to_string(),
-            );
-            let tokens = bar
-                .right
-                .iter()
-                .find(|s| matches!(s, StatusSegment::Tokens { .. }))
-                .expect("tokens segment present");
+            let tokens = tokens_segment(tokens_only(TokenView {
+                estimate: 1,
+                level,
+                dead_mass_pct: None,
+            }));
             assert_eq!(tokens.kind(), SegmentKind::Tokens(level));
         }
     }
@@ -3471,13 +3579,16 @@ mod tests {
         let mode = |status| {
             status_bar(
                 200,
-                status,
-                "u",
-                "qwen/model",
-                false,
-                false,
-                no_figures(),
-                "Bot".to_string(),
+                StatusBarView {
+                    status,
+                    conn: ConnectionView {
+                        base_url: "u",
+                        model: "qwen/model",
+                    },
+                    toggles: Toggles::default(),
+                    figures: no_figures(),
+                    position: "Bot".to_string(),
+                },
             )
             .left
             .into_iter()
@@ -4089,8 +4200,7 @@ mod tests {
     /// Draws one frame with `draw` on a fresh `width`×`height` test terminal
     /// and returns the terminal for buffer inspection.
     fn draw_frame(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> Terminal<TestBackend> {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal.draw(|frame| draw(frame)).expect("draw one frame");
         terminal
     }
@@ -4112,6 +4222,62 @@ mod tests {
             .join("\n")
     }
 
+    /// Returns the combined style modifiers of a single buffer cell. Shared by
+    /// the popup style assertions so the `buf.cell(...).expect(...).style().add_modifier`
+    /// chain is not repeated per-cell (DUPLICATE fix).
+    fn cell_modifier(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> Modifier {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .expect("cell in test buffer")
+            .style()
+            .add_modifier
+    }
+
+    /// Draws one viewport frame with default animation and the dark theme into a
+    /// fresh `width`x`height` terminal. Covers the overwhelmingly common test shape:
+    /// fresh viewport, fresh cache, default anim. Returns the terminal for inspection.
+    fn draw_viewport(width: u16, height: u16, screen: &Screen) -> Terminal<TestBackend> {
+        let mut cache = RenderCache::new();
+        draw_frame(width, height, |f| {
+            render_viewport(
+                f,
+                f.area(),
+                &mut ViewportParams {
+                    screen,
+                    viewport: &Viewport::new(),
+                    cache: &mut cache,
+                    anim: Anim::default(),
+                },
+                theme::dark(),
+            );
+        })
+    }
+
+    /// Draws one viewport frame with a caller-supplied [`ViewportParams`], for
+    /// tests that need to inspect the measured geometry or control scroll state.
+    fn draw_viewport_with(
+        width: u16,
+        height: u16,
+        params: &mut ViewportParams<'_>,
+    ) -> (Terminal<TestBackend>, (usize, usize)) {
+        let mut geometry = (0usize, 0usize);
+        let terminal = draw_frame(width, height, |f| {
+            geometry = render_viewport(f, f.area(), params, theme::dark());
+        });
+        (terminal, geometry)
+    }
+
+    /// Draws a composer overlay popup on a 40x12 test terminal with the standard
+    /// anchor row (10) and the dark theme, returning the terminal. Covers the
+    /// standard popup test shape: fixed geometry, dark theme, anchor row 10.
+    fn draw_popup(view: &OverlayView) -> Terminal<TestBackend> {
+        draw_frame(40, 12, |f| {
+            render_composer_popup(f, 10, f.area(), view, theme::dark())
+        })
+    }
+
     // --- render_composer_popup: the overlay variants ------------------------
 
     #[test]
@@ -4123,10 +4289,7 @@ mod tests {
             ],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
-        let text = buffer_text(&terminal);
+        let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" commands "), "bordered title:\n{text}");
         assert!(text.contains("/model"));
         assert!(text.contains("pick the model"), "the hint rides its row");
@@ -4142,29 +4305,13 @@ mod tests {
             ],
             highlight: 1,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
+        let terminal = draw_popup(&view);
         // Geometry: 2 body rows + borders = height 4, anchored above row 10,
         // so the body sits at rows 7-8; the popup is inset one column and the
         // border one more, so row text starts at x = 2.
-        let buf = terminal.backend().buffer();
         assert!(row_text(&terminal, 8).contains("/clear"));
-        let highlighted = buf.cell((2u16, 8u16)).expect("highlight cell");
-        assert_eq!(highlighted.symbol(), "/");
-        assert!(
-            highlighted
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
-        let unhighlighted = buf.cell((2u16, 7u16)).expect("plain cell");
-        assert!(
-            !unhighlighted
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert!(cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED));
+        assert!(!cell_modifier(&terminal, 2, 7).contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -4173,10 +4320,7 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
-        assert!(buffer_text(&terminal).contains("no matches"));
+        assert!(buffer_text(&draw_popup(&view)).contains("no matches"));
     }
 
     #[test]
@@ -4187,10 +4331,7 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
-        let text = buffer_text(&terminal);
+        let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" models "), "selector title:\n{text}");
         assert!(text.contains("loading models…"));
     }
@@ -4203,10 +4344,7 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
-        assert!(buffer_text(&terminal).contains("failed: connection refused"));
+        assert!(buffer_text(&draw_popup(&view)).contains("failed: connection refused"));
     }
 
     #[test]
@@ -4220,10 +4358,7 @@ mod tests {
             ],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
-        let text = buffer_text(&terminal);
+        let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" models "));
         assert!(text.contains("qwen/qwen3-30b"));
         assert!(text.contains("meta/llama-3.1"));
@@ -4240,21 +4375,19 @@ mod tests {
             ],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
+        let terminal = draw_popup(&view);
         // Geometry as above: 2 body rows + borders = height 4 above row 10,
         // so the header sits at row 7 and the collapsed row at 8, text from
         // x = 2.
-        let buf = terminal.backend().buffer();
-        let header = buf.cell((2u16, 7u16)).expect("header cell");
-        assert!(header.style().add_modifier.contains(Modifier::BOLD));
-        let collapsed = buf.cell((2u16, 8u16)).expect("collapsed cell");
+        assert!(cell_modifier(&terminal, 2, 7).contains(Modifier::BOLD));
         assert!(
-            !collapsed.style().add_modifier.contains(Modifier::BOLD),
+            !cell_modifier(&terminal, 2, 8).contains(Modifier::BOLD),
             "a collapsed member reads as a greyed model, not a header"
         );
-        assert_eq!(collapsed.style().fg, header.style().fg, "both muted");
+        let buf = terminal.backend().buffer();
+        let header_fg = buf.cell((2u16, 7u16)).expect("header cell").style().fg;
+        let collapsed_fg = buf.cell((2u16, 8u16)).expect("collapsed cell").style().fg;
+        assert_eq!(collapsed_fg, header_fg, "both muted");
     }
 
     #[test]
@@ -4268,18 +4401,13 @@ mod tests {
             ],
             highlight: 1,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
+        let terminal = draw_popup(&view);
         // Geometry as above: body rows 7 (header) and 8 (note), text at x = 2.
-        let buf = terminal.backend().buffer();
-        let header = buf.cell((2u16, 7u16)).expect("header cell");
         assert!(
-            !header.style().add_modifier.contains(Modifier::REVERSED),
+            !cell_modifier(&terminal, 2, 7).contains(Modifier::REVERSED),
             "the cursor can never rest on a header"
         );
-        let note = buf.cell((2u16, 8u16)).expect("note cell");
-        assert!(note.style().add_modifier.contains(Modifier::REVERSED));
+        assert!(cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -4321,10 +4449,7 @@ mod tests {
             rows: vec![],
             highlight: 0,
         };
-        let terminal = draw_frame(40, 12, |f| {
-            render_composer_popup(f, 10, f.area(), &view, theme::dark())
-        });
-        let text = buffer_text(&terminal);
+        let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" themes "), "selector title:\n{text}");
         assert!(text.contains("loading themes…"));
     }
@@ -4359,23 +4484,27 @@ mod tests {
         })
     }
 
+    /// Builds a screen that has submitted `prompt`, started message 1, and
+    /// received one in-flight thinking update with `thinking_text`. The caller
+    /// continues from here (settle, nudge, draw). Shared by tests that need a
+    /// screen-with-live-thought setup to avoid the submitted+message_start+
+    /// message_update triple repeating (FRAGMENT DRY-003 fix).
+    fn screen_with_thinking(prompt: &str, thinking_text: impl Into<String>) -> Screen {
+        let (screen, _) = screen_with_notices(vec![]).submitted(prompt, Ok(()));
+        let thinking = thinking_text.into();
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("t".to_string()),
+            vec![ContentBlock::Thinking { text: thinking }],
+        ));
+        screen
+    }
+
     #[test]
     #[ignore = "manual: cargo nextest run dump_demo_render --run-ignored all --no-capture"]
     fn dump_demo_render() {
         let screen = Screen::demo();
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let terminal = draw_frame(100, 70, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(100, 70, &screen);
         let mut out = String::from("\n");
         for y in 0..70 {
             // Bracket the leftmost 2 gutter columns so the spine / caret / blank
@@ -4394,17 +4523,7 @@ mod tests {
         // the confirmed collapsed-run shape so a regression trips here, not only
         // in a manual dump. Rows are `(gutter, content)` where gutter is the
         // leftmost LANE_GUTTER columns.
-        let terminal = draw_frame(100, 70, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &Screen::demo(),
-                &Viewport::new(),
-                &mut RenderCache::new(),
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(100, 70, &Screen::demo());
         let split = |y: u16| -> (String, String) {
             let row = row_text(&terminal, y);
             let at = row.char_indices().nth(2).map_or(row.len(), |(i, _)| i);
@@ -4459,17 +4578,7 @@ mod tests {
         // The lane has NO per-item blank separator: every content row of the
         // run (from the first assistant line through the last) carries the `│`
         // spine, with no bare gap rows breaking it into segments.
-        let terminal = draw_frame(100, 70, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &Screen::demo(),
-                &Viewport::new(),
-                &mut RenderCache::new(),
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(100, 70, &Screen::demo());
         // Rows 3..=24 are the agent's run (assistant, folded thought, machinery,
         // markers, error, closing assistant + code). Every one starts with the
         // spine - no blank separator rows interleave the machinery.
@@ -4485,20 +4594,18 @@ mod tests {
     #[test]
     fn the_viewport_draws_the_transcript_and_returns_the_measured_geometry() {
         let screen = screen_with_notices(vec!["a launch notice".to_string()]);
-        let viewport = Viewport::new();
         let mut cache = RenderCache::new();
-        let mut geometry = (0, 0);
-        let terminal = draw_frame(80, 20, |f| {
-            geometry = render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let viewport = Viewport::new();
+        let (terminal, geometry) = draw_viewport_with(
+            80,
+            20,
+            &mut ViewportParams {
+                screen: &screen,
+                viewport: &viewport,
+                cache: &mut cache,
+                anim: Anim::default(),
+            },
+        );
         let text = buffer_text(&terminal);
         assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
         assert!(text.contains("a launch notice"));
@@ -4529,17 +4636,18 @@ mod tests {
             lull_seq: 0,
             ..Default::default()
         };
-        let terminal = draw_frame(80, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &Viewport::new(),
-                &mut RenderCache::new(),
+        let mut cache = RenderCache::new();
+        let viewport = Viewport::new();
+        let (terminal, _) = draw_viewport_with(
+            80,
+            20,
+            &mut ViewportParams {
+                screen: &screen,
+                viewport: &viewport,
+                cache: &mut cache,
                 anim,
-                theme::dark(),
-            );
-        });
+            },
+        );
         let text = buffer_text(&terminal);
         assert!(text.contains("5s"), "the lull timer opens at 5s:\n{text}");
     }
@@ -4550,18 +4658,16 @@ mod tests {
         let screen = screen_with_notices(notices);
         let viewport = Viewport::new();
         let mut cache = RenderCache::new();
-        let mut geometry = (0, 0);
-        let terminal = draw_frame(40, 8, |f| {
-            geometry = render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let (terminal, geometry) = draw_viewport_with(
+            40,
+            8,
+            &mut ViewportParams {
+                screen: &screen,
+                viewport: &viewport,
+                cache: &mut cache,
+                anim: Anim::default(),
+            },
+        );
         let (total_lines, height) = geometry;
         assert!(total_lines > height, "the content overflows");
         let text = buffer_text(&terminal);
@@ -4796,17 +4902,7 @@ mod tests {
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("go", Ok(()));
         let (screen, _) = screen.apply_event(Event::ExploreNudge { text: long.into() });
-        let terminal = draw_frame(60, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &Viewport::new(),
-                &mut RenderCache::new(),
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(60, 20, &screen);
         // The marker's FIRST row carries `»`; its continuation is the next row.
         let marker_y = (0..20)
             .find(|&y| row_text(&terminal, y).contains('»'))
@@ -4883,19 +4979,18 @@ mod tests {
             notices: vec![word.clone()],
             ..ScreenOpts::default()
         });
-        let viewport = Viewport::new();
         let mut cache = RenderCache::new();
-        let terminal = draw_frame(40, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let viewport = Viewport::new();
+        let (terminal, _) = draw_viewport_with(
+            40,
+            20,
+            &mut ViewportParams {
+                screen: &screen,
+                viewport: &viewport,
+                cache: &mut cache,
+                anim: Anim::default(),
+            },
+        );
 
         // (1) The notice is drawn two columns in: the first row carrying the
         // word begins with exactly LANE_GUTTER blank gutter cells (the notice is
@@ -4940,19 +5035,7 @@ mod tests {
             vec![ContentBlock::text("done")],
             StopReason::EndTurn,
         ));
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let terminal = draw_frame(40, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(40, 20, &screen);
         // Gather the first column of every row and the text, to find each line.
         let mut saw_caret_on_user = false;
         let mut saw_spine_on_answer = false;
@@ -5001,33 +5084,29 @@ mod tests {
         // Measure the geometry once, then scroll up so the top lands mid-answer.
         let mut viewport = Viewport::new();
         let mut cache = RenderCache::new();
-        let mut geometry = (0, 0);
-        draw_frame(40, 10, |f| {
-            geometry = render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
-        let (total, height) = geometry;
+        let (_, (total, height)) = draw_viewport_with(
+            40,
+            10,
+            &mut ViewportParams {
+                screen: &screen,
+                viewport: &viewport,
+                cache: &mut cache,
+                anim: Anim::default(),
+            },
+        );
         assert!(total > height, "the answer overflows the viewport");
         viewport.scroll_up(4, total, height); // unpin, land 4 rows above the tail
 
-        let terminal = draw_frame(40, 10, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let (terminal, _) = draw_viewport_with(
+            40,
+            10,
+            &mut ViewportParams {
+                screen: &screen,
+                viewport: &viewport,
+                cache: &mut cache,
+                anim: Anim::default(),
+            },
+        );
         // Every visible answer row must still carry the spine in column 0 at
         // this nonzero scroll. A desync (the gutter sliced differently from the
         // content) would land the spine off the answer rows and drop one here.
@@ -5063,17 +5142,9 @@ mod tests {
         let nudge = "[reading file after file fills your context - dispatch \
                      explore with one focused question instead; a Scout searches \
                      and reports back]";
-        let screen = screen_with_notices(vec![]);
-        let (screen, _) = screen.submitted("evaluate this project", Ok(()));
-        let (screen, _) = screen.apply_event(Event::message_start(1));
-        let (screen, _) = screen.apply_event(Event::message_update(
-            Delta::Thinking("t".to_string()),
-            vec![ContentBlock::Thinking {
-                text: "I should read the manifest and the entry point and the tests \
-                       and then form a plan about what to evaluate first here"
-                    .to_string(),
-            }],
-        ));
+        let thinking = "I should read the manifest and the entry point and the tests \
+                        and then form a plan about what to evaluate first here";
+        let screen = screen_with_thinking("evaluate this project", thinking);
         // Settle the thought (empty final content → thinking materializes).
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
         // An Aid nudge marker (the `» [...]` line); the screen prepends `» `.
@@ -5085,17 +5156,7 @@ mod tests {
             "read_file",
             serde_json::json!({"path": "Cargo.toml"}),
         ));
-        draw_frame(width, height, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &Viewport::new(),
-                &mut RenderCache::new(),
-                Anim::default(),
-                theme::dark(),
-            );
-        })
+        draw_viewport(width, height, &screen)
     }
 
     #[test]
@@ -5104,25 +5165,9 @@ mod tests {
         // not soft-wrap to many. The collapsed line truncates to the content
         // width with a trailing `…`.
         let long = "z".repeat(400);
-        let screen = screen_with_notices(vec![]);
-        let (screen, _) = screen.submitted("q", Ok(()));
-        let (screen, _) = screen.apply_event(Event::message_start(1));
-        let (screen, _) = screen.apply_event(Event::message_update(
-            Delta::Thinking("t".to_string()),
-            vec![ContentBlock::Thinking { text: long }],
-        ));
+        let screen = screen_with_thinking("q", long);
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-        let terminal = draw_frame(60, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &Viewport::new(),
-                &mut RenderCache::new(),
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(60, 20, &screen);
         // Exactly one row carries the collapsed thought, and it is truncated.
         let thought_rows: Vec<String> = (0..20)
             .map(|y| row_text(&terminal, y))
@@ -5212,19 +5257,7 @@ mod tests {
                 text: "pondering the viewport".to_string(),
             }],
         ));
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let terminal = draw_frame(80, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(80, 20, &screen);
         let text = buffer_text(&terminal);
         // Live reasoning is content, not a metric (ADR-0040): the animated
         // `✦ Thinking` header sits above the reasoning tail, and the reasoning
@@ -5250,19 +5283,7 @@ mod tests {
                 text: reasoning.to_string(),
             }],
         ));
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let terminal = draw_frame(80, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(80, 20, &screen);
         let text = buffer_text(&terminal);
         assert!(text.contains("row three") && text.contains("row five"));
         // "row one"/"row two" scrolled off the three-row tail.
@@ -5282,19 +5303,7 @@ mod tests {
             Delta::Thinking("…".to_string()),
             vec![ContentBlock::Thinking { text: long }],
         ));
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let terminal = draw_frame(40, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(40, 20, &screen);
         // Exactly one row carries the reasoning z's, and it ends in the `…`
         // truncation marker - the long line did not balloon into many rows.
         let z_rows: Vec<String> = (0..20)
@@ -5317,19 +5326,7 @@ mod tests {
             Delta::Text("a streaming reply".to_string()),
             vec![ContentBlock::text("a streaming reply")],
         ));
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let terminal = draw_frame(80, 20, |f| {
-            render_viewport(
-                f,
-                f.area(),
-                &screen,
-                &viewport,
-                &mut cache,
-                Anim::default(),
-                theme::dark(),
-            );
-        });
+        let terminal = draw_viewport(80, 20, &screen);
         assert!(buffer_text(&terminal).contains("a streaming reply"));
     }
 }

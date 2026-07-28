@@ -11,12 +11,12 @@ use tempfile::TempDir;
 use crate::content::{ContentBlock, Message, Usage};
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::llm::response::{Response, StopReason};
 use crate::extensions::Registered;
+use crate::llm::response::{Response, StopReason};
+use crate::run::loop_::{Outcome, OutcomeStop, RunEnv, RunOpts, run};
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::test_support::{Entry, FakeDeps, FakeLlm};
 use crate::tool::ToolCtx;
-use crate::run::loop_::{Outcome, OutcomeStop, RunOpts, run};
 
 pub(super) fn session_with(root: &std::path::Path, opts: SessionOpts) -> Session {
     let mut opts = opts;
@@ -94,7 +94,17 @@ pub(super) async fn run_with(
     let conv = conversation(session, prompt);
     let extensions: Vec<Registered> = Vec::new();
     let ctx = tool_ctx(session);
-    let outcome = run(conv, session, &extensions, &ctx, &mut deps, RunOpts::default()).await;
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            extensions: &extensions,
+            tool_ctx: &ctx,
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
     (outcome, deps)
 }
 

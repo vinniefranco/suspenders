@@ -60,7 +60,7 @@ pub(super) async fn complete(
     let resp = match sent {
         Ok(resp) => resp,
         // Connection refused, DNS failure, etc. - no content streamed.
-        Err(e) => return Response::error(format!("request_failed: {e}")),
+        Err(e) => return Response::error(request_err(e)),
     };
 
     if !resp.status().is_success() {
@@ -124,13 +124,13 @@ pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, Stri
     let client = reqwest::Client::builder()
         .timeout(super::DISCOVERY_TIMEOUT)
         .build()
-        .map_err(|e| format!("request_failed: {e}"))?;
+        .map_err(request_err)?;
     let sent = authorized(client.get(&url), provider).send().await;
 
     let resp = match sent {
         Ok(resp) => resp,
         // Connection refused, DNS failure, etc.
-        Err(e) => return Err(format!("request_failed: {e}")),
+        Err(e) => return Err(request_err(e)),
     };
 
     if !resp.status().is_success() {
@@ -139,10 +139,7 @@ pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, Stri
         return Err(format!("request_failed: HTTP {status}: {body}"));
     }
 
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("request_failed: {e}"))?;
+    let body = resp.text().await.map_err(request_err)?;
     models_from_body(&body)
 }
 
@@ -190,6 +187,12 @@ fn non_empty_str(v: Option<&Value>) -> Option<&str> {
     v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
 }
 
+/// Formats a `request_failed: {e}` error string. Shared by every failure arm
+/// in this adapter so the literal is typed once.
+fn request_err(e: impl std::fmt::Display) -> String {
+    format!("request_failed: {e}")
+}
+
 // `eventsource-stream`'s `Eventsource` trait extension on byte streams.
 use eventsource_stream::Eventsource;
 
@@ -198,6 +201,7 @@ mod tests {
     use super::*;
     use crate::content::ContentBlock;
     use crate::content::Message;
+    use crate::llm::adapter_test_support as ats;
     use crate::llm::model::Api;
     use crate::llm::response::StopReason;
     use crate::llm::{Dispatcher, Llm, malformed_input_marker};
@@ -303,12 +307,8 @@ mod tests {
         )
         .await;
 
-        let mut events: Vec<StreamEvent> = Vec::new();
-        let mut on_event = |ev: &StreamEvent| events.push(ev.clone());
-
-        let result = dispatcher_for(&server)
-            .complete(&simple_request(), &test_model(), &mut on_event)
-            .await;
+        let (events, result) =
+            ats::run_and_collect(dispatcher_for(&server), &simple_request(), &test_model()).await;
 
         // At least the first delta (a thinking one) arrived through the callback.
         assert!(
@@ -354,12 +354,8 @@ mod tests {
         )
         .await;
 
-        let mut events: Vec<StreamEvent> = Vec::new();
-        let mut on_event = |ev: &StreamEvent| events.push(ev.clone());
-
-        let result = dispatcher_for(&server)
-            .complete(&simple_request(), &test_model(), &mut on_event)
-            .await;
+        let (events, result) =
+            ats::run_and_collect(dispatcher_for(&server), &simple_request(), &test_model()).await;
 
         assert_eq!(
             result.content,
@@ -444,8 +440,7 @@ mod tests {
             .complete(&simple_request(), &test_model(), &mut no_op())
             .await;
 
-        assert_eq!(result.stop_reason, StopReason::Error);
-        assert!(result.error.is_some());
+        ats::assert_complete_is_error(result);
     }
 
     #[tokio::test]
@@ -463,9 +458,7 @@ mod tests {
             .complete(&simple_request(), &test_model(), &mut no_op())
             .await;
 
-        assert_eq!(result.stop_reason, StopReason::Error);
-        assert_eq!(result.content, Vec::<ContentBlock>::new());
-        assert!(result.error.is_some());
+        ats::assert_complete_error_response_empty(result);
     }
 
     #[tokio::test]
@@ -657,13 +650,13 @@ mod tests {
         let server = MockServer::start().await;
         serve_sse(&server, sse_body(&[finish_frame("stop"), done()])).await;
 
-        let req = simple_request().with_no_think(true);
-        dispatcher_for(&server)
-            .complete(&req, &test_model(), &mut no_op())
-            .await;
-
-        let received = &server.received_requests().await.unwrap()[0];
-        let body: Value = received.body_json().unwrap();
+        let body = ats::body_for(
+            dispatcher_for(&server),
+            simple_request().with_no_think(true),
+            &test_model(),
+            &server,
+        )
+        .await;
         assert_eq!(
             body["chat_template_kwargs"],
             json!({ "enable_thinking": false })
@@ -735,7 +728,6 @@ mod tests {
         let result = Dispatcher::new(vec![refused.clone()])
             .list_models(&refused)
             .await;
-        assert!(result.is_err(), "expected Err, got {result:?}");
-        assert!(result.unwrap_err().contains("request_failed"));
+        ats::assert_list_models_request_failed(result);
     }
 }

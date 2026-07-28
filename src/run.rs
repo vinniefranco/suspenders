@@ -33,14 +33,14 @@ use crate::agent::{Msg, RunMsg};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::event::Event;
+use crate::extensions;
 use crate::llm::model::Model;
 use crate::llm::response::Response;
 use crate::llm::{Llm, LlmRequest, StreamEvent};
-use crate::extensions;
-use crate::scout::{Scout, ScoutOpts};
-use crate::session::Session;
 use crate::run::deps::{CompactError, Emitter, RunDeps};
 use crate::run::loop_::{Outcome, RunOpts};
+use crate::scout::{Scout, ScoutOpts};
+use crate::session::Session;
 
 /// The Run shell's [`RunDeps`]: every effect wired
 /// to the Agent's mpsc + the Session's Llm.
@@ -238,8 +238,10 @@ pub async fn run(
     loop_::run(
         conversation,
         &session,
-        &extensions,
-        &tool_ctx,
+        loop_::RunEnv {
+            extensions: &extensions,
+            tool_ctx: &tool_ctx,
+        },
         &mut deps,
         opts,
     )
