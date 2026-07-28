@@ -31,7 +31,7 @@ use crate::session::RecoveryShape;
 use crate::ui::selector::SelectorRow;
 use crate::ui::transcript::Tone;
 
-/// The `plugin_error` stage: which point in the Plugin lifecycle crashed
+/// The `extension_error` stage: which point in the extension's lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
 /// deferred `:present`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +147,9 @@ pub enum Event {
         command: String,
     },
 
-    // ---- Plugins / Session Log / Context ----
-    PluginError {
-        plugin: String,
+    // ---- Extensions / Session Log / Context ----
+    ExtensionError {
+        extension: String,
         stage: Stage,
         message: String,
     },
@@ -435,15 +435,15 @@ impl Event {
 
     // ---- The rest ----
 
-    /// Constructs a `plugin_error` from a pipeline [`crate::extensions::Failure`]'s
+    /// Constructs an `extension_error` from a pipeline [`crate::extensions::Failure`]'s
     /// parts, mirroring baud's `plugin_error/1` which takes the failure map.
-    pub fn plugin_error(
-        plugin: impl Into<String>,
+    pub fn extension_error(
+        extension: impl Into<String>,
         stage: Stage,
         message: impl Into<String>,
     ) -> Self {
-        Event::PluginError {
-            plugin: plugin.into(),
+        Event::ExtensionError {
+            extension: extension.into(),
             stage,
             message: message.into(),
         }

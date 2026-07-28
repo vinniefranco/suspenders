@@ -417,11 +417,11 @@ impl Transcript {
 
     /// Records the fail-open Plugin report line (ADR-0007) - ONE format
     /// whether the failure came from this store's own Presentment fold or from
-    /// the `plugin_error` event the Run reports. Bypasses Presentment like
+    /// the `extension_error` event the Run reports. Bypasses Presentment like
     /// every fail-open line (the recursion bound - see the module doc).
-    pub fn plugin_failure(&mut self, plugin: &str, stage: Stage, message: &str) {
+    pub fn extension_failure(&mut self, extension: &str, stage: Stage, message: &str) {
         self.items.push(TranscriptItem::Info {
-            text: plugin_failure_line(plugin, stage, message),
+            text: extension_failure_line(extension, stage, message),
         });
     }
 
@@ -462,7 +462,7 @@ impl Transcript {
         let (item, failures) = extensions::present(&self.extensions, item, artifacts);
         self.items.push(item);
         for failure in failures {
-            self.plugin_failure(&failure.plugin, failure.stage, &failure.message);
+            self.extension_failure(&failure.extension, failure.stage, &failure.message);
         }
     }
 
@@ -511,9 +511,9 @@ fn pending_steering_line(text: &str) -> String {
 }
 
 // The fail-open Plugin report (ADR-0007) - sourced once, so the store's own
-// Presentment failures and the Run's `plugin_error` events read identically.
-fn plugin_failure_line(plugin: &str, stage: Stage, message: &str) -> String {
-    format!("plugin {plugin} failed in {}: {message}", stage.as_str())
+// Presentment failures and the Run's `extension_error` events read identically.
+fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> String {
+    format!("plugin {extension} failed in {}: {message}", stage.as_str())
 }
 
 // The single salient input arg for a merged one-liner, picked by tool: the
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_replaces_tool_result_summary_using_artifacts() {
+    fn extension_replaces_tool_result_summary_using_artifacts() {
         let mut t = Transcript::new(vec![reg("BlockPresenter", Box::new(BlockPresenter))]);
         t.tool_result(
             "t1",
@@ -1176,8 +1176,8 @@ mod tests {
                 Box::new(|t| t.tool_result("t1", "grep".into(), "hit", false, &HashMap::new())),
             ),
             (
-                "plugin_failure",
-                Box::new(|t| t.plugin_failure("P", Stage::Present, "boom")),
+                "extension_failure",
+                Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
             ),
             ("message_start (again)", Box::new(|t| t.message_start())),
             (

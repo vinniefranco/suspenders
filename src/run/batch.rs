@@ -306,7 +306,7 @@ async fn run_lifecycle<D: RunDeps>(
 ) -> Answer {
     let token = Token::new(name, input.clone(), state.tool_ctx.clone());
     let (token, failures) = extensions::pre_run(state.extensions, token);
-    emit_plugin_errors(state, &failures);
+    emit_extension_errors(state, &failures);
 
     if token.halted {
         let reason = token.halt_reason.clone().unwrap_or_default();
@@ -331,14 +331,14 @@ async fn run_lifecycle<D: RunDeps>(
 
 async fn execute_token<D: RunDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
     let (result, failures) = extensions::execute(state.extensions, token).await;
-    emit_plugin_errors(state, &failures);
+    emit_extension_errors(state, &failures);
     Answer::ran(result)
 }
 
-fn emit_plugin_errors<D: RunDeps>(state: &mut LoopState<'_, D>, failures: &[extensions::Failure]) {
+fn emit_extension_errors<D: RunDeps>(state: &mut LoopState<'_, D>, failures: &[extensions::Failure]) {
     for failure in failures {
-        state.emitter.emit(Event::plugin_error(
-            failure.plugin.clone(),
+        state.emitter.emit(Event::extension_error(
+            failure.extension.clone(),
             failure.stage,
             failure.message.clone(),
         ));

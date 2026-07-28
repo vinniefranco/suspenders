@@ -331,6 +331,6 @@ mod tests {
         assert_eq!(extensions[0].name, "condense");
 
         let base = crate::session::SessionConfig::base();
-        assert!(base.plugins.contains(&"condense".to_string()));
+        assert!(base.extensions.contains(&"condense".to_string()));
     }
 }

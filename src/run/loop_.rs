@@ -2667,12 +2667,12 @@ mod tests {
 
         // The Agent stamps the recoveries this user request already consumed.
         let conv = conversation(&session, "write it");
-        let plugins: Vec<Registered> = Vec::new();
+        let extensions: Vec<Registered> = Vec::new();
         let ctx = tool_ctx(&session);
         let outcome = run(
             conv,
             &session,
-            &plugins,
+            &extensions,
             &ctx,
             &mut deps,
             RunOpts {
@@ -3327,11 +3327,11 @@ mod tests {
         session: &Session,
         prompt: &str,
         mut deps: FakeDeps,
-        plugins: Vec<Registered>,
+        extensions: Vec<Registered>,
     ) -> (Outcome, FakeDeps) {
         let conv = conversation(session, prompt);
         let ctx = tool_ctx(session);
-        let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        let outcome = run(conv, session, &extensions, &ctx, &mut deps, RunOpts::default()).await;
         (outcome, deps)
     }
 
@@ -3347,9 +3347,9 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins =
+        let extensions =
             vec![Registered::new("HaltEdits", json!([])).with_middleware(Box::new(HaltEdits))];
-        let (outcome, deps) = run_with_plugins(&session, "edit something", deps, plugins).await;
+        let (outcome, deps) = run_with_plugins(&session, "edit something", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let tr = evs
@@ -3383,9 +3383,9 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins =
+        let extensions =
             vec![Registered::new("Artifactor", json!([])).with_middleware(Box::new(Artifactor))];
-        let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
+        let (outcome, deps) = run_with_plugins(&session, "look around", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let tr = evs
@@ -3419,17 +3419,17 @@ mod tests {
                 just(text_end("ok")),
             ],
         );
-        let plugins =
+        let extensions =
             vec![Registered::new("PreBoomer", json!([])).with_middleware(Box::new(PreBoomer))];
-        let (outcome, deps) = run_with_plugins(&session, "look around", deps, plugins).await;
+        let (outcome, deps) = run_with_plugins(&session, "look around", deps, extensions).await;
         ok(&outcome);
         let evs = events(&deps);
         let pe = evs
             .iter()
-            .find(|e| matches!(e, Event::PluginError { .. }))
+            .find(|e| matches!(e, Event::ExtensionError { .. }))
             .unwrap();
-        assert!(matches!(pe, Event::PluginError { plugin, stage, message }
-            if plugin == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom")));
+        assert!(matches!(pe, Event::ExtensionError { extension, stage, message }
+            if extension == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom")));
         let tr = evs
             .iter()
             .find(|e| matches!(e, Event::ToolResult { .. }))
@@ -3691,12 +3691,12 @@ mod tests {
         );
 
         let conv = conversation(&session, "keep going");
-        let plugins: Vec<Registered> = Vec::new();
+        let extensions: Vec<Registered> = Vec::new();
         let ctx = tool_ctx(&session);
         let outcome = run(
             conv,
             &session,
-            &plugins,
+            &extensions,
             &ctx,
             &mut deps,
             RunOpts {
@@ -3749,12 +3749,12 @@ mod tests {
         conv.add_user_text("compact me");
         conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(4000))]);
 
-        let plugins: Vec<Registered> = Vec::new();
+        let extensions: Vec<Registered> = Vec::new();
         let ctx = tool_ctx(&session);
         let outcome = run(
             conv,
             &session,
-            &plugins,
+            &extensions,
             &ctx,
             &mut deps,
             RunOpts::default(),
@@ -3802,12 +3802,12 @@ mod tests {
         conv.add_user_text("original task");
         conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(12_000))]);
 
-        let plugins: Vec<Registered> = Vec::new();
+        let extensions: Vec<Registered> = Vec::new();
         let ctx = tool_ctx(&session);
         let outcome = run(
             conv,
             &session,
-            &plugins,
+            &extensions,
             &ctx,
             &mut deps,
             RunOpts::default(),
@@ -3867,8 +3867,8 @@ mod tests {
         ctx: ToolCtx,
     ) -> (Outcome, FakeDeps) {
         let conv = conversation(session, prompt);
-        let plugins: Vec<Registered> = Vec::new();
-        let outcome = run(conv, session, &plugins, &ctx, &mut deps, RunOpts::default()).await;
+        let extensions: Vec<Registered> = Vec::new();
+        let outcome = run(conv, session, &extensions, &ctx, &mut deps, RunOpts::default()).await;
         (outcome, deps)
     }
 

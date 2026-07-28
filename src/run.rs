@@ -215,7 +215,7 @@ pub async fn run(
     // Resolve the Session's ordered Extension names into the live pipeline. The
     // shipped config carries `["diff"]`, so the live app runs the Run with the
     // Diff extension; the test config carries `[]`.
-    let extensions = extensions::configured(&session.plugins);
+    let extensions = extensions::configured(&session.extensions);
 
     // The Tool ctx: the Session's Root and timeout plus the Result Cap derived
     // from this Run's captured Model (ADR-0037), and the `scout` capture

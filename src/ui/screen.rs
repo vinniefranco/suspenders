@@ -403,7 +403,7 @@ impl Screen {
 
             event @ (Event::ToolCall { .. }
             | Event::ToolResult { .. }
-            | Event::PluginError { .. }) => self.apply_tooling(event),
+            | Event::ExtensionError { .. }) => self.apply_tooling(event),
 
             event @ (Event::ApprovalRequest { .. }
             | Event::ApprovalResolved { .. }
@@ -554,14 +554,14 @@ impl Screen {
                 (self, vec![])
             }
 
-            // A Plugin crashed and was skipped (fail-open, ADR-0007) - the
+            // An Extension crashed and was skipped (fail-open, ADR-0007) - the
             // same report line the store's own Presentment failures use.
-            Event::PluginError {
-                plugin,
+            Event::ExtensionError {
+                extension,
                 stage,
                 message,
             } => {
-                self.transcript.plugin_failure(&plugin, stage, &message);
+                self.transcript.extension_failure(&extension, stage, &message);
                 (self, vec![])
             }
 
@@ -1890,10 +1890,10 @@ mod tests {
     }
 
     #[test]
-    fn plugin_error_events_become_info_lines() {
+    fn extension_error_events_become_info_lines() {
         let t = fold(
             fresh(),
-            vec![Event::plugin_error(
+            vec![Event::extension_error(
                 "Baud.Plugins.Diff",
                 Stage::PreRun,
                 "boom",

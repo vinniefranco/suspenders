@@ -86,7 +86,7 @@ pub struct Session {
     /// later phase - carried here as a module name).
     pub llm_module: String,
     /// The Session's Plugin list (opaque here; entries carried as names).
-    pub plugins: Vec<String>,
+    pub extensions: Vec<String>,
     /// The config `context_budget` knob, reinterpreted (ADR-0037, ADR-0031
     /// amendment): an optional global cap on every Model's effective budget,
     /// and the window figure for Models the Catalog does not know. The budget
@@ -189,7 +189,7 @@ pub struct SessionConfig {
     pub scout_pass_limit: u64,
     pub scout_no_think: bool,
     pub no_think_rescue: bool,
-    pub plugins: Vec<String>,
+    pub extensions: Vec<String>,
     pub session_dir: String,
 }
 
@@ -229,7 +229,7 @@ impl SessionConfig {
             scout_pass_limit: 8,
             scout_no_think: true,
             no_think_rescue: true,
-            plugins: vec!["diff".into(), "run_command".into(), "condense".into()],
+            extensions: vec!["diff".into(), "run_command".into(), "condense".into()],
             session_dir: default_session_dir(),
         }
     }
@@ -243,7 +243,7 @@ impl SessionConfig {
             .expect("base ships local")
             .base_url = "http://localhost:0/v1".into();
         cfg.llm_module = "Suspenders.FakeLLM".into();
-        cfg.plugins = vec![];
+        cfg.extensions = vec![];
         cfg.session_dir = std::env::temp_dir()
             .join("suspenders_test_sessions")
             .to_string_lossy()
@@ -466,7 +466,7 @@ pub struct ProviderConfig {
 /// plus the file-only `providers` table (ADR-0037 narrowed the lockstep rule
 /// to the scalars). Every field `Option<T>` so an absent key is an empty
 /// overlay. The deliberately excluded fields (`session_dir`, `llm_module`,
-/// `turn_limit`, `anchor_interval`, `scout_pass_limit`, `plugins`) are simply
+/// `turn_limit`, `anchor_interval`, `scout_pass_limit`, `extensions`) are simply
 /// absent, so `deny_unknown_fields` rejects them for free - as it now rejects
 /// the retired flat `base_url` and `token` keys.
 ///
@@ -742,7 +742,7 @@ fn parse_bool(raw: &str, name: &str) -> Result<bool, SessionError> {
 pub struct SessionOpts {
     pub root: Option<String>,
     pub llm_module: Option<String>,
-    pub plugins: Option<Vec<String>>,
+    pub extensions: Option<Vec<String>>,
     pub context_budget: Option<u64>,
     pub eviction_slack: Option<f64>,
     pub dead_mass_fraction: Option<f64>,
@@ -798,7 +798,7 @@ impl Session {
         let session = Session {
             root: opts.root.unwrap_or_else(default_root),
             llm_module: opts.llm_module.unwrap_or_else(|| config.llm_module.clone()),
-            plugins: opts.plugins.unwrap_or_else(|| config.plugins.clone()),
+            extensions: opts.extensions.unwrap_or_else(|| config.extensions.clone()),
             context_budget,
             eviction_slack: opts.eviction_slack.unwrap_or(config.eviction_slack),
             dead_mass_fraction: opts.dead_mass_fraction.unwrap_or(config.dead_mass_fraction),
@@ -1129,7 +1129,7 @@ mod tests {
         assert_eq!(session.llm_module, "Suspenders.FakeLLM");
         assert_eq!(session.context_budget, cfg().context_budget);
         assert_eq!(session.model.max_tokens, cfg().max_tokens);
-        assert_eq!(session.plugins, Vec::<String>::new());
+        assert_eq!(session.extensions, Vec::<String>::new());
     }
 
     #[test]
@@ -1212,7 +1212,7 @@ mod tests {
         let o = SessionOpts {
             root: Some("/tmp".into()),
             llm_module: Some("SomeLLM".into()),
-            plugins: Some(vec!["SomePlugin".into()]),
+            extensions: Some(vec!["SomePlugin".into()]),
             context_budget: Some(5_000),
             eviction_slack: Some(0.1),
             compaction_keep: Some(0.4),
@@ -1224,7 +1224,7 @@ mod tests {
         };
         let session = Session::build(o, &cfg()).unwrap();
         assert_eq!(session.llm_module, "SomeLLM");
-        assert_eq!(session.plugins, vec!["SomePlugin".to_string()]);
+        assert_eq!(session.extensions, vec!["SomePlugin".to_string()]);
         assert_eq!(session.context_budget, Some(5_000));
         assert_eq!(session.eviction_slack, 0.1);
         assert_eq!(session.compaction_keep, 0.4);

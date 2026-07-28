@@ -89,7 +89,7 @@ impl Registered {
 /// line. The model never sees this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
-    pub plugin: String,
+    pub extension: String,
     pub stage: Stage,
     pub message: String,
 }
@@ -205,7 +205,7 @@ pub fn present(
             Ok(item) => item,
             Err(payload) => {
                 failures.push(Failure {
-                    plugin: reg.name.clone(),
+                    extension: reg.name.clone(),
                     stage: Stage::Present,
                     message: panic_message(&payload),
                 });
@@ -331,7 +331,7 @@ where
         Ok(token) => token,
         Err(payload) => {
             failures.push(Failure {
-                plugin: reg.name.clone(),
+                extension: reg.name.clone(),
                 stage: stage_name,
                 message: panic_message(&payload),
             });
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(
             failures,
             vec![Failure {
-                plugin: "Crasher".to_string(),
+                extension: "Crasher".to_string(),
                 stage: Stage::PreRun,
                 message: "pre boom".to_string(),
             }]
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(
             failures,
             vec![Failure {
-                plugin: "Crasher".to_string(),
+                extension: "Crasher".to_string(),
                 stage: Stage::PostRun,
                 message: "post boom".to_string(),
             }]
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(
             failures,
             vec![Failure {
-                plugin: "Crasher".to_string(),
+                extension: "Crasher".to_string(),
                 stage: Stage::Present,
                 message: "present boom".to_string(),
             }]
