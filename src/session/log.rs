@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentBlock, Message, Provenance, Role};
 use crate::conversation;
+use crate::run::governor::endgame::ReopenReason;
 use crate::session::{RecoveryShape, Session};
 use crate::voice::{self, FileOps};
 
@@ -241,11 +242,15 @@ pub enum Entry {
     },
     /// The Voice-authored prompt that opened a Recovery Run (CONTEXT.md:
     /// Recovery Run) - a Run-starting prompt like `user_text`, but
-    /// distinguishable as Suspenders' voice; `shape` is forensic. The fold
-    /// merges it through the same seam the live path used, and
-    /// [`recoveries_used`] counts these to restore the per-request bound.
+    /// distinguishable as Suspenders' voice; `shape` is forensic. `reason`
+    /// (ADR-0043) records which of the three evidences reopened the Run, so an
+    /// Open-Plan continuation greps distinctly AND the fold restores the right
+    /// per-request budget: a broken-state entry restores `recoveries_used`, an
+    /// Open-Plan entry restores `advances_used`. The fold merges the prompt
+    /// through the same seam the live path used.
     Recovery {
         shape: RecoveryShape,
+        reason: ReopenReason,
         text: String,
     },
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
@@ -338,8 +343,12 @@ impl Entry {
                 "original_task": original_task,
                 "verification": verification,
             }),
-            Entry::Recovery { shape, text } => {
-                json!({"e": "recovery", "shape": shape.as_str(), "text": text})
+            Entry::Recovery {
+                shape,
+                reason,
+                text,
+            } => {
+                json!({"e": "recovery", "shape": shape.as_str(), "reason": reason.as_str(), "text": text})
             }
             Entry::Retry {
                 error,
@@ -477,6 +486,15 @@ fn parse_handoff(m: &serde_json::Value) -> Option<Entry> {
 fn parse_recovery(m: &serde_json::Value) -> Option<Entry> {
     Some(Entry::Recovery {
         shape: RecoveryShape::parse(m.get("shape")?.as_str()?)?,
+        // A pre-ADR-0043 entry (or a foreign token) has no valid reason: it
+        // degrades to a broken-state recovery, never a torn line - the same
+        // optional-field tolerance the settled entry's `reason` takes. Every
+        // logged recovery before ADR-0043 was broken-state, so this is exact.
+        reason: m
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .and_then(ReopenReason::parse)
+            .unwrap_or(ReopenReason::UnverifiedWrites),
         text: string_field(m, "text")?,
     })
 }
@@ -791,27 +809,53 @@ pub fn plan(path: &str) -> Option<String> {
     last
 }
 
-/// Recovery Runs the logged Session consumed serving its CURRENT user
-/// request: `recovery` entries since the last `user_text` (a genuine or
-/// rolled-over prompt resets the count exactly as the live Agent's does on a
-/// submit). Restores the per-request bound on Resume so a resumed Session
-/// cannot re-trigger recoveries unboundedly. A torn line stops the scan, like
-/// the fold.
+/// Broken-state Recovery Runs the logged Session consumed serving its CURRENT
+/// user request: `recovery` entries whose `reason` is NOT `OpenPlan`, since the
+/// last `user_text` (a genuine or rolled-over prompt resets the count exactly
+/// as the live Agent's does on a submit). Restores the `repair_limit` bound on
+/// Resume so a resumed Session cannot re-trigger recoveries unboundedly. A torn
+/// line stops the scan, like the fold.
 pub fn recoveries_used(path: &str) -> u64 {
+    recovery_counts(path).0
+}
+
+/// Open-Plan continuations the logged Session consumed serving its CURRENT user
+/// request (ADR-0043): `recovery` entries whose `reason` IS `OpenPlan`, since
+/// the last `user_text`. Restores the `advance_limit` bound on Resume,
+/// symmetrically to [`recoveries_used`].
+pub fn advances_used(path: &str) -> u64 {
+    recovery_counts(path).1
+}
+
+// The two per-request recovery budgets a Resume restores, from one scan:
+// `(recoveries, advances)` since the last `user_text`, split by the entry's
+// reason. A torn line stops the scan, like the fold; a foreign/missing reason
+// decoded as `UnverifiedWrites` counts as a broken-state recovery.
+fn recovery_counts(path: &str) -> (u64, u64) {
     let Ok(content) = std::fs::read_to_string(path) else {
-        return 0;
+        return (0, 0);
     };
-    let mut used = 0;
+    let mut recoveries = 0;
+    let mut advances = 0;
     // Skip the header line: it is not an entry.
     for line in content.lines().filter(|l| !l.is_empty()).skip(1) {
         match decode_line(line).and_then(|v| Entry::from_json(&v)) {
-            Some(Entry::UserText(_)) => used = 0,
-            Some(Entry::Recovery { .. }) => used += 1,
+            Some(Entry::UserText(_)) => {
+                recoveries = 0;
+                advances = 0;
+            }
+            Some(Entry::Recovery { reason, .. }) => {
+                if reason == ReopenReason::OpenPlan {
+                    advances += 1;
+                } else {
+                    recoveries += 1;
+                }
+            }
             Some(_) => {}
             None => break,
         }
     }
-    used
+    (recoveries, advances)
 }
 
 // ------------------------------------------------------------------
@@ -831,6 +875,7 @@ pub(crate) struct Resumed {
     pub(crate) drift: Vec<Drift>,
     pub(crate) plan: Option<String>,
     pub(crate) recoveries: u64,
+    pub(crate) advances: u64,
 }
 
 /// Folds a log file into the messages of a Conversation.
@@ -868,27 +913,39 @@ pub(crate) fn resume_governed(path: &str, session: &Session) -> Result<Resumed, 
         }
     }
 
-    // Derive the two governance facts from the same tolerated entry stream,
-    // mirroring `plan`/`recoveries_used` exactly: `plan` is the last Plan seen;
-    // `recoveries` counts Recovery entries since the last UserText (reset on a
-    // genuine or rolled-over prompt, as the live Agent resets on submit).
-    let mut plan: Option<String> = None;
-    let mut recoveries: u64 = 0;
-    for entry in &entries {
-        match entry {
-            Entry::Plan(text) => plan = Some(text.clone()),
-            Entry::UserText(_) => recoveries = 0,
-            Entry::Recovery { .. } => recoveries += 1,
-            _ => {}
-        }
-    }
+    let (plan, recoveries, advances) = governance_counts(&entries);
 
     Ok(Resumed {
         messages: fold(&entries),
         drift: drift(&header, session),
         plan,
         recoveries,
+        advances,
     })
+}
+
+// Derive the governance facts from the same tolerated entry stream,
+// mirroring `plan`/`recoveries_used`/`advances_used` exactly: `plan` is the
+// last Plan seen; `recoveries` counts broken-state Recovery entries and
+// `advances` counts Open-Plan ones since the last UserText (reset on a
+// genuine or rolled-over prompt, as the live Agent resets on submit).
+fn governance_counts(entries: &[Entry]) -> (Option<String>, u64, u64) {
+    let mut plan: Option<String> = None;
+    let mut recoveries: u64 = 0;
+    let mut advances: u64 = 0;
+    for entry in entries {
+        match entry {
+            Entry::Plan(text) => plan = Some(text.clone()),
+            Entry::UserText(_) => {
+                recoveries = 0;
+                advances = 0;
+            }
+            Entry::Recovery { reason, .. } if *reason == ReopenReason::OpenPlan => advances += 1,
+            Entry::Recovery { .. } => recoveries += 1,
+            _ => {}
+        }
+    }
+    (plan, recoveries, advances)
 }
 
 fn check_root(header: &serde_json::Value, session: &Session) -> Result<(), ResumeError> {
@@ -2139,6 +2196,7 @@ mod tests {
         });
         log.append(Entry::Recovery {
             shape: RecoveryShape::Continuation,
+            reason: ReopenReason::UnverifiedWrites,
             text: "[recovery prompt]".into(),
         });
         log.append(Entry::assistant_blocks(vec![text("recovered")]));
@@ -2187,6 +2245,7 @@ mod tests {
         });
         log.append(Entry::Recovery {
             shape: RecoveryShape::Handoff,
+            reason: ReopenReason::DanglingFailure,
             text: "[recovery prompt]".into(),
         });
         log.append(Entry::assistant_blocks(vec![text("recovered")]));
@@ -2247,6 +2306,7 @@ mod tests {
         });
         log.append(Entry::Recovery {
             shape: RecoveryShape::Handoff,
+            reason: ReopenReason::DanglingFailure,
             text: "[recovery prompt]".into(),
         });
         log.append(Entry::assistant_blocks(vec![text("done")]));
@@ -2267,19 +2327,33 @@ mod tests {
     }
 
     #[test]
-    fn recovery_entries_round_trip_the_file_with_their_shape() {
+    fn recovery_entries_round_trip_the_file_with_their_shape_and_reason() {
         let tmp = TempDir::new().unwrap();
         let session = session_in(tmp.path());
         let mut log = Log::open(&session).unwrap();
 
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
-            text: "[c]".into(),
-        });
-        log.append(Entry::Recovery {
-            shape: RecoveryShape::Handoff,
-            text: "[h]".into(),
-        });
+        // Every (shape, reason) combination the mechanic produces: broken-state
+        // reasons on either shape, and the Open Plan always on Continuation.
+        let cases = [
+            (RecoveryShape::Handoff, ReopenReason::DanglingFailure, "[df]"),
+            (
+                RecoveryShape::Handoff,
+                ReopenReason::UnverifiedWrites,
+                "[uw]",
+            ),
+            (
+                RecoveryShape::Continuation,
+                ReopenReason::OpenPlan,
+                "[op]",
+            ),
+        ];
+        for (shape, reason, text) in cases {
+            log.append(Entry::Recovery {
+                shape,
+                reason,
+                text: text.into(),
+            });
+        }
 
         let content = std::fs::read_to_string(&log.path).unwrap();
         let entries: Vec<Entry> = content
@@ -2289,16 +2363,31 @@ mod tests {
             .collect();
         assert_eq!(
             entries,
-            vec![
-                Entry::Recovery {
-                    shape: RecoveryShape::Continuation,
-                    text: "[c]".into(),
-                },
-                Entry::Recovery {
-                    shape: RecoveryShape::Handoff,
-                    text: "[h]".into(),
-                },
-            ]
+            cases
+                .iter()
+                .map(|(shape, reason, text)| Entry::Recovery {
+                    shape: *shape,
+                    reason: *reason,
+                    text: (*text).into(),
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_pre_adr_0043_recovery_entry_without_a_reason_decodes_as_broken_state() {
+        // Backward compatibility: a `recovery` line missing the `reason` key
+        // (every recovery logged before ADR-0043 was broken-state) decodes as
+        // UnverifiedWrites, never a torn line.
+        let line = r#"{"e":"recovery","shape":"handoff","text":"[r]"}"#;
+        let decoded = decode_line(line).and_then(|v| Entry::from_json(&v));
+        assert_eq!(
+            decoded,
+            Some(Entry::Recovery {
+                shape: RecoveryShape::Handoff,
+                reason: ReopenReason::UnverifiedWrites,
+                text: "[r]".into(),
+            })
         );
     }
 
@@ -2390,6 +2479,7 @@ mod tests {
         log.append(Entry::UserText("first request".into()));
         log.append(Entry::Recovery {
             shape: RecoveryShape::Continuation,
+            reason: ReopenReason::UnverifiedWrites,
             text: "[r1]".into(),
         });
         assert_eq!(recoveries_used(&log.path), 1);
@@ -2400,13 +2490,53 @@ mod tests {
 
         log.append(Entry::Recovery {
             shape: RecoveryShape::Handoff,
+            reason: ReopenReason::DanglingFailure,
             text: "[r2]".into(),
         });
         log.append(Entry::Recovery {
             shape: RecoveryShape::Handoff,
+            reason: ReopenReason::UnverifiedWrites,
             text: "[r3]".into(),
         });
         assert_eq!(recoveries_used(&log.path), 2);
+    }
+
+    #[test]
+    fn advances_used_counts_only_open_plan_recovery_entries_since_the_last_prompt() {
+        // ADR-0043: the two budgets are separate counters over the same
+        // `recovery` entries, split by reason.
+        let tmp = TempDir::new().unwrap();
+        let session = session_in(tmp.path());
+        let mut log = Log::open(&session).unwrap();
+
+        assert_eq!(advances_used(&log.path), 0);
+
+        log.append(Entry::UserText("request".into()));
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Handoff,
+            reason: ReopenReason::DanglingFailure,
+            text: "[broken]".into(),
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            reason: ReopenReason::OpenPlan,
+            text: "[open1]".into(),
+        });
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            reason: ReopenReason::OpenPlan,
+            text: "[open2]".into(),
+        });
+
+        // The broken-state entry counts as a recovery, the two Open-Plan
+        // entries as advances - neither budget bleeds into the other.
+        assert_eq!(recoveries_used(&log.path), 1);
+        assert_eq!(advances_used(&log.path), 2);
+
+        // A genuine user prompt resets BOTH.
+        log.append(Entry::UserText("next request".into()));
+        assert_eq!(recoveries_used(&log.path), 0);
+        assert_eq!(advances_used(&log.path), 0);
     }
 
     #[test]
@@ -2521,7 +2651,8 @@ mod tests {
         log.append(Entry::UserText("go".into()));
         log.append(Entry::Plan("Goal: A. 1. read [x]".into()));
         log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
+            shape: RecoveryShape::Handoff,
+            reason: ReopenReason::UnverifiedWrites,
             text: "[r1]".into(),
         });
         // A fresh prompt resets the recovery count (matching the live Agent's
@@ -2529,16 +2660,26 @@ mod tests {
         log.append(Entry::UserText("now do B".into()));
         log.append(Entry::Plan("Goal: B. 1. edit [ ]".into()));
         log.append(Entry::Recovery {
-            shape: RecoveryShape::Continuation,
+            shape: RecoveryShape::Handoff,
+            reason: ReopenReason::UnverifiedWrites,
             text: "[r2]".into(),
+        });
+        // An Open-Plan continuation this request too: it feeds `advances`, not
+        // `recoveries`, so the two governance counters stay separate (ADR-0043).
+        log.append(Entry::Recovery {
+            shape: RecoveryShape::Continuation,
+            reason: ReopenReason::OpenPlan,
+            text: "[r3]".into(),
         });
 
         let r = resume_governed(&log.path, &session).unwrap();
 
         assert_eq!(r.plan, plan(&log.path));
         assert_eq!(r.recoveries, recoveries_used(&log.path));
+        assert_eq!(r.advances, advances_used(&log.path));
         assert_eq!(r.plan, Some("Goal: B. 1. edit [ ]".to_string()));
         assert_eq!(r.recoveries, 1);
+        assert_eq!(r.advances, 1);
     }
 
     #[test]

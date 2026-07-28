@@ -44,7 +44,7 @@ use crate::llm::{Llm, ProviderModels};
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, RiderTag, StopReason};
 use crate::session::{RecoveryShape, Session};
 use crate::run::AgentDeps;
-use crate::run::governor::endgame::Recovery;
+use crate::run::governor::endgame::{Recovery, ReopenReason};
 use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
 use crate::{tools, voice};
@@ -196,6 +196,12 @@ pub enum RunMsg {
         narrative: Option<String>,
         verification: Option<String>,
         prompt: String,
+        /// Why the Recovery Run reopened (ADR-0043), so the logged `recovery`
+        /// entry carries the reason and Resume restores the right budget. A
+        /// Handoff is always a broken-state recovery (the Open-Plan arm is
+        /// Continuation-shaped), but the reason still distinguishes unverified
+        /// writes from a Dangling Failure.
+        reason: ReopenReason,
     },
 }
 
@@ -277,6 +283,7 @@ impl AgentHandle {
         let ResumedGovernance {
             plan,
             recoveries_used,
+            advances_used,
         } = governance;
 
         // The tool specs ride with every request but live outside the messages;
@@ -354,6 +361,7 @@ impl AgentHandle {
             steering: Vec::new(),
             compaction: Compaction::new(),
             recoveries_used,
+            advances_used,
             self_tx: tx.clone(),
         };
 
@@ -528,6 +536,12 @@ struct AgentState {
     // user prompt starts a new request (`Command::Submit`), NOT by Rollover
     // or a Recovery Run; a Resume restores it from the folded log.
     recoveries_used: u64,
+    // Open-Plan continuations consumed serving the CURRENT user request
+    // (ADR-0043): the sibling of `recoveries_used` for the Open-Plan arm, with
+    // its own `advance_limit` budget. Same lifecycle - reset only on a genuine
+    // `Command::Submit`, never by Rollover or a Recovery Run, and restored
+    // symmetrically on Resume.
+    advances_used: u64,
     // A clone of the mpsc sender, handed to the Run's AgentDeps so the Run
     // talks back over the same channel, and used to post the Run's outcome.
     self_tx: mpsc::UnboundedSender<Msg>,
@@ -550,11 +564,12 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             if state.task.is_some() {
                 let _ = reply.send(Err(Busy));
             } else {
-                // A genuine user prompt starts a new request: the recovery
-                // budget resets. Rollover starts its Run via `start_run`
-                // directly and keeps the count - its Steering missed a Run
-                // of the SAME request.
+                // A genuine user prompt starts a new request: BOTH recovery
+                // budgets reset (ADR-0043). Rollover starts its Run via
+                // `start_run` directly and keeps the counts - its Steering
+                // missed a Run of the SAME request.
                 state.recoveries_used = 0;
+                state.advances_used = 0;
                 start_run(state, prompt);
                 let _ = reply.send(Ok(()));
             }
@@ -658,6 +673,7 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             narrative,
             verification,
             prompt,
+            reason,
         } => {
             // The seed and its prompt enter the log the way Compaction does:
             // the narrative alone plus the mechanical facts as their own
@@ -676,6 +692,7 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
                 state,
                 LogEntry::Recovery {
                     shape: RecoveryShape::Handoff,
+                    reason,
                     text: prompt,
                 },
             );
@@ -909,6 +926,7 @@ fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {
         plan: state.plan.clone(),
         original_task,
         recoveries_used: state.recoveries_used,
+        advances_used: state.advances_used,
     }
 }
 
@@ -952,26 +970,40 @@ fn watch_run(state: &mut AgentState, run: tokio::task::JoinHandle<LoopOutcome>) 
 // Conversation and the Run lifecycle - opens the next Run. The prompt is the
 // Voice's: the only Run whose prompt Suspenders authors.
 fn start_recovery(state: &mut AgentState, recovery: Recovery) {
-    state.recoveries_used += 1;
-    let prompt = voice::recovery_prompt(recovery.verification_failing).to_string();
-    broadcast(state, Event::recovery_run(recovery.shape, prompt.clone()));
+    // Each arm spends its OWN budget (ADR-0043): an Open-Plan continuation
+    // burns `advances_used` against `advance_limit`; a broken-state recovery
+    // burns `recoveries_used` against `repair_limit`.
+    if recovery.reason == ReopenReason::OpenPlan {
+        state.advances_used += 1;
+    } else {
+        state.recoveries_used += 1;
+    }
+    let prompt = voice::recovery_prompt(recovery.reason).to_string();
+    broadcast(
+        state,
+        Event::recovery_run(recovery.shape, recovery.reason, prompt.clone()),
+    );
 
     match recovery.shape {
         // Continuation keeps the Conversation: the recovery prompt is the
         // next Run's prompt, mechanically like Rollover's auto-submit but
-        // logged as the Voice's, not the user's.
+        // logged as the Voice's, not the user's. Both the Open-Plan arm and a
+        // Continuation-shaped broken-state recovery pass here.
         RecoveryShape::Continuation => {
             log_entry(
                 state,
                 LogEntry::Recovery {
                     shape: RecoveryShape::Continuation,
+                    reason: recovery.reason,
                     text: prompt.clone(),
                 },
             );
             state.conversation.merge_user_text(prompt);
             spawn_run(state);
         }
-        RecoveryShape::Handoff => spawn_handoff_run(state, prompt, recovery.failing_command),
+        RecoveryShape::Handoff => {
+            spawn_handoff_run(state, prompt, recovery.reason, recovery.failing_command)
+        }
     }
 }
 
@@ -984,7 +1016,12 @@ fn start_recovery(state: &mut AgentState, recovery: Recovery) {
 // RunOpts verbatim - it survives the retirement untouched. `failing_command`
 // (the Dangling Failure the recovery names, `None` on an unverified-writes
 // recovery) tells the seed which command's result to carry verbatim.
-fn spawn_handoff_run(state: &mut AgentState, prompt: String, failing_command: Option<String>) {
+fn spawn_handoff_run(
+    state: &mut AgentState,
+    prompt: String,
+    reason: ReopenReason,
+    failing_command: Option<String>,
+) {
     reset_run_state(state);
     let dying = state.conversation.clone();
     let compaction = state.compaction.clone();
@@ -1015,6 +1052,7 @@ fn spawn_handoff_run(state: &mut AgentState, prompt: String, failing_command: Op
             narrative: seeded.narrative,
             verification: seeded.verification,
             prompt,
+            reason,
         }));
         // Built here, not before the spawn: the Run's deps must carry the
         // SEEDED compaction state so a later compaction telescopes from it.
@@ -1171,14 +1209,15 @@ fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
 // ---- Resume ----------------------------------------------------------------
 
 /// The governance facts a Resume restores alongside the Conversation: the last
-/// logged Plan (held outside the Conversation) and the recoveries the logged
-/// request consumed (per-request bound). Computed in the single fold, so they
-/// never belong on the Transcript-facing [`ResumeInfo`] - the Agent threads
-/// them privately instead.
+/// logged Plan (held outside the Conversation) and the two per-request recovery
+/// counts the logged request consumed - broken-state recoveries and Open-Plan
+/// continuations (ADR-0043). Computed in the single fold, so they never belong
+/// on the Transcript-facing [`ResumeInfo`] - the Agent threads them privately.
 #[derive(Default)]
 struct ResumedGovernance {
     plan: Option<String>,
     recoveries_used: u64,
+    advances_used: u64,
 }
 
 fn maybe_resume(
@@ -1210,6 +1249,7 @@ fn maybe_resume(
             ResumedGovernance {
                 plan: r.plan,
                 recoveries_used: r.recoveries,
+                advances_used: r.advances,
             },
         )),
         Err(ResumeError::RootMismatch) => Err(StartError::ResumeRootMismatch(path)),

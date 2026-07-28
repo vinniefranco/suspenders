@@ -1514,9 +1514,11 @@ mod tests {
 
     #[test]
     fn recovery_run_shows_its_prompt_as_an_aid_marker_and_marks_running() {
-        let prompt = crate::voice::recovery_prompt(true);
+        use crate::run::governor::endgame::ReopenReason;
+        let prompt = crate::voice::recovery_prompt(ReopenReason::DanglingFailure);
         let (t, effects) = fresh().apply_event(Event::recovery_run(
             crate::session::RecoveryShape::Handoff,
+            ReopenReason::DanglingFailure,
             prompt,
         ));
         assert_eq!(items(&t), vec![marker(&format!("» {prompt}"), Tone::Aid)]);

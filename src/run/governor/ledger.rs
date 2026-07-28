@@ -27,6 +27,7 @@ pub mod failure_category;
 
 use serde_json::Value;
 
+use crate::plan::PlanProgress;
 use crate::voice::FailureCategory;
 
 /// The Tools whose successful results are writes (they arm the
@@ -136,6 +137,27 @@ pub struct Ledger {
     retries_used: u64,
     // Plan recency (see [`PlanRecency`]): `None` until a Plan exists.
     plan: Option<PlanRecency>,
+    // The Plan's checkbox completeness (ADR-0043: the Open Plan), the fact the
+    // Endgame's Open-Plan recovery arm reads. `None` while no Plan exists. The
+    // Ledger STORES this computed fact; it never parses markdown - the caller
+    // (batch's plan store, the loop's carried-plan path) reads
+    // [`crate::plan::Plan::progress`] and passes the answer in, keeping the
+    // facts-not-opinions invariant.
+    plan_open: Option<PlanProgress>,
+    // The made-progress baseline (ADR-0043): the Plan's checked-box count at
+    // Run start (a carried Plan's), and the count now. `plan_advanced` is
+    // `checked_now > checked_at_run_start` - the guard that a green-but-open
+    // Run actually checked off a step this Run, mirroring the
+    // `wrote_this_run` addendum: a Run showing no progress is one a
+    // continuation would simply repeat.
+    checked_at_run_start: u64,
+    checked_now: u64,
+    // Open-Plan continuations already consumed serving the current user
+    // request - a fact the Agent owns across Runs and stamps once at Run
+    // start, exactly like `recoveries_used`, but counted against the
+    // `advance_limit` Setpoint (ADR-0043: a separate, larger budget than the
+    // broken-state `recovery_limit`).
+    advances_used: u64,
 }
 
 impl Ledger {
@@ -154,6 +176,10 @@ impl Ledger {
             recoveries_used: 0,
             retries_used: 0,
             plan: None,
+            plan_open: None,
+            checked_at_run_start: 0,
+            checked_now: 0,
+            advances_used: 0,
         }
     }
 
@@ -227,15 +253,28 @@ impl Ledger {
 
     /// The Run began with a Plan carried in from a previous Run: the
     /// recency clock starts at Run start - nothing changed the Plan THIS
-    /// Run yet, but a Plan exists to go stale.
-    pub fn note_plan_carried(&mut self) {
-        self.note_plan_updated();
+    /// Run yet, but a Plan exists to go stale. The carried Plan's checkbox
+    /// facts (ADR-0043) also seed the made-progress baseline: `progress` is
+    /// the Open-Plan fact, `checked` is BOTH the Run-start baseline and the
+    /// current count (no step has been checked off this Run yet). The caller
+    /// reads these off the carried [`crate::plan::Plan`] - the Ledger never
+    /// parses markdown.
+    pub fn note_plan_carried(&mut self, progress: PlanProgress, checked: u64) {
+        self.note_plan_updated(progress, checked);
+        self.checked_at_run_start = checked;
     }
 
     /// Stamped once at Run start: the Recovery Runs already consumed
     /// serving the current user request (an Agent-owned cross-Run count).
     pub fn note_recoveries_used(&mut self, n: u64) {
         self.recoveries_used = n;
+    }
+
+    /// Stamped once at Run start: the Open-Plan continuations already consumed
+    /// serving the current user request (an Agent-owned cross-Run count,
+    /// ADR-0043), read against the `advance_limit` Setpoint.
+    pub fn note_advances_used(&mut self, n: u64) {
+        self.advances_used = n;
     }
 
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): one
@@ -245,12 +284,19 @@ impl Ledger {
     }
 
     /// A successful plan Tool Call landed: the Plan just changed, so the
-    /// recency clock and the writes-since counter reset.
-    pub fn note_plan_updated(&mut self) {
+    /// recency clock and the writes-since counter reset. The Plan's checkbox
+    /// facts (ADR-0043) update too: `progress` is the Open-Plan fact and
+    /// `checked` is the current count (the made-progress baseline is set only
+    /// at [`note_plan_carried`], never here - the baseline is Run-start, not
+    /// this-update). The caller reads both off the updated
+    /// [`crate::plan::Plan`]; the Ledger never parses markdown.
+    pub fn note_plan_updated(&mut self, progress: PlanProgress, checked: u64) {
         self.plan = Some(PlanRecency {
             updated_at_pass: self.pass,
             writes_since: 0,
         });
+        self.plan_open = Some(progress);
+        self.checked_now = checked;
     }
 
     // ---- reads: Governors and the arbiter --------------------------------
@@ -317,6 +363,28 @@ impl Ledger {
     /// Recovery Runs already consumed serving the current user request.
     pub fn recoveries_used(&self) -> u64 {
         self.recoveries_used
+    }
+
+    /// The Plan's checkbox completeness (ADR-0043: the Open Plan), or `None`
+    /// while no Plan exists. The Endgame's Open-Plan recovery arm reads it; a
+    /// Plan showing an unchecked `[ ]` step is [`PlanProgress::Incomplete`].
+    pub fn plan_open(&self) -> Option<PlanProgress> {
+        self.plan_open
+    }
+
+    /// Did the Run check off a Plan step this Run (ADR-0043)? The made-progress
+    /// guard: `checked_now > checked_at_run_start`. False on a Plan set fresh
+    /// this Run (baseline 0, but the arm requires a CARRIED Incomplete Plan
+    /// advanced further) and false on a Run that edited but checked no new box -
+    /// a continuation would simply repeat it.
+    pub fn plan_advanced(&self) -> bool {
+        self.checked_now > self.checked_at_run_start
+    }
+
+    /// Open-Plan continuations already consumed serving the current user
+    /// request (ADR-0043), read against the `advance_limit` Setpoint.
+    pub fn advances_used(&self) -> u64 {
+        self.advances_used
     }
 
     /// Malformed-tool-call re-draws already spent this Run (ADR-0030), read
@@ -797,6 +865,56 @@ mod tests {
         assert_eq!(ledger.recoveries_used(), 2);
     }
 
+    // ----- the Open Plan facts (ADR-0043) -----
+
+    #[test]
+    fn plan_open_and_the_baseline_are_absent_and_zero_until_a_plan_exists() {
+        let ledger = Ledger::new(25);
+        assert_eq!(ledger.plan_open(), None);
+        assert!(!ledger.plan_advanced());
+        assert_eq!(ledger.advances_used(), 0);
+    }
+
+    #[test]
+    fn note_plan_carried_sets_plan_open_and_the_made_progress_baseline() {
+        // A carried Incomplete Plan with 2 boxes already checked: the baseline
+        // and the current count both start at 2, so no progress shows yet.
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried(PlanProgress::Incomplete, 2);
+        assert_eq!(ledger.plan_open(), Some(PlanProgress::Incomplete));
+        assert!(!ledger.plan_advanced());
+    }
+
+    #[test]
+    fn note_plan_updated_moves_the_current_count_but_not_the_baseline() {
+        // Carried at 2, then a plan Tool Call this Run checks a third box:
+        // checked_now rises to 3, the Run-start baseline stays 2, so the Run
+        // has advanced.
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried(PlanProgress::Incomplete, 2);
+        ledger.note_plan_updated(PlanProgress::Incomplete, 3);
+        assert_eq!(ledger.plan_open(), Some(PlanProgress::Incomplete));
+        assert!(ledger.plan_advanced());
+    }
+
+    #[test]
+    fn plan_advanced_is_false_when_the_checked_count_did_not_rise() {
+        // Carried at 2, an update that unchecked a box (or held): no progress.
+        let mut ledger = Ledger::new(25);
+        ledger.note_plan_carried(PlanProgress::Incomplete, 2);
+        ledger.note_plan_updated(PlanProgress::Incomplete, 2);
+        assert!(!ledger.plan_advanced());
+    }
+
+    #[test]
+    fn advances_used_starts_at_zero_and_holds_the_stamped_count() {
+        let mut ledger = Ledger::new(25);
+        assert_eq!(ledger.advances_used(), 0);
+
+        ledger.note_advances_used(3);
+        assert_eq!(ledger.advances_used(), 3);
+    }
+
     // ----- retries used (ADR-0030) -----
 
     #[test]
@@ -829,7 +947,7 @@ mod tests {
     #[test]
     fn a_carried_plan_counts_passes_since_run_start() {
         let mut ledger = Ledger::new(25);
-        ledger.note_plan_carried();
+        ledger.note_plan_carried(PlanProgress::NoCheckboxes, 0);
         assert_eq!(ledger.passes_since_plan_update(), Some(0));
 
         ledger.advance_pass();
@@ -840,14 +958,14 @@ mod tests {
     #[test]
     fn a_plan_update_resets_both_counters_to_its_pass() {
         let mut ledger = Ledger::new(25);
-        ledger.note_plan_carried();
+        ledger.note_plan_carried(PlanProgress::NoCheckboxes, 0);
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger.advance_pass();
         ledger.advance_pass();
         assert_eq!(ledger.passes_since_plan_update(), Some(2));
         assert_eq!(ledger.writes_since_plan_update(), Some(1));
 
-        ledger.note_plan_updated();
+        ledger.note_plan_updated(PlanProgress::NoCheckboxes, 0);
         assert_eq!(ledger.passes_since_plan_update(), Some(0));
         assert_eq!(ledger.writes_since_plan_update(), Some(0));
 
@@ -858,7 +976,7 @@ mod tests {
     #[test]
     fn only_successful_writes_count_since_the_plan_update() {
         let mut ledger = Ledger::new(25);
-        ledger.note_plan_updated();
+        ledger.note_plan_updated(PlanProgress::NoCheckboxes, 0);
 
         ledger.record("edit_file", &json!({}), &ok(), CallOutcome::Ran);
         ledger.record("write_file", &json!({}), &ok(), CallOutcome::Ran);

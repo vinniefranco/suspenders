@@ -150,7 +150,7 @@ mod tests {
     // later Pass position.
     fn planned_then_wrote(pass: u64) -> Ledger {
         let mut ledger = ledger_at(1);
-        ledger.note_plan_updated();
+        ledger.note_plan_updated(crate::plan::PlanProgress::NoCheckboxes, 0);
         ledger.record("edit_file", &json!({}), &ok_write(), CallOutcome::Ran);
         for _ in 1..pass {
             ledger.advance_pass();
@@ -175,7 +175,7 @@ mod tests {
     fn a_plan_during_pure_reading_is_not_stale() {
         // Plan on Pass 1, now Pass 20, zero writes since: analysis, not rot.
         let mut ledger = ledger_at(1);
-        ledger.note_plan_updated();
+        ledger.note_plan_updated(crate::plan::PlanProgress::NoCheckboxes, 0);
         for _ in 1..20 {
             ledger.advance_pass();
         }
@@ -194,7 +194,7 @@ mod tests {
         let mut ledger = planned_then_wrote(10);
         assert!(stale_after(8).stale_plan(&ledger).is_some());
 
-        ledger.note_plan_updated();
+        ledger.note_plan_updated(crate::plan::PlanProgress::NoCheckboxes, 0);
         assert_eq!(stale_after(8).stale_plan(&ledger), None);
     }
 

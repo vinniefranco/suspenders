@@ -157,7 +157,9 @@ async fn execute_tool<D: RunDeps>(
 // A successful plan Tool Call updates the Plan value and stores its content
 // through the set_plan Dep; the Loop's copy keeps this Run's Anchors current,
 // and the Ledger's plan-recency fact resets at the same firing site (written
-// once as it happens - ADR-0026).
+// once as it happens - ADR-0026). The updated Plan's checkbox facts (ADR-0043:
+// the Open Plan) go to the Ledger too - computed HERE where the Plan is in
+// scope, so the Ledger stores facts and never parses markdown.
 fn maybe_store_plan<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
@@ -168,8 +170,10 @@ fn maybe_store_plan<D: RunDeps>(
         state
             .deps
             .set_plan(plan.content.clone().unwrap_or_default());
+        let progress = plan.progress();
+        let checked = plan.checked_steps();
         state.plan = plan;
-        state.ledger.note_plan_updated();
+        state.ledger.note_plan_updated(progress, checked);
     }
 }
 

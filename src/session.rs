@@ -105,11 +105,19 @@ pub struct Session {
     /// unchanged - while writes land - before each Anchor carries the
     /// stale-plan line.
     pub plan_stale_after: u64,
-    /// The Endgame Governor's recovery Setpoint: at most this many Recovery
-    /// Runs may serve one user request. `0` disables the mechanic entirely.
+    /// The Endgame Governor's broken-state recovery Setpoint: at most this
+    /// many broken-state Recovery Runs may serve one user request (feeds
+    /// `repair_limit`). `0` disables the broken-state arms.
     pub recovery_limit: u64,
-    /// The Endgame Governor's recovery-shape Setpoint: which arm a Recovery
-    /// Run takes (CONTEXT.md: Handoff is the default shape).
+    /// The Endgame Governor's Open-Plan Setpoint (ADR-0043): at most this many
+    /// Open-Plan continuations may serve one user request. `0` disables the
+    /// Open-Plan arm. Larger than `recovery_limit` by default (3 vs 1):
+    /// self-continuing a green build is a different risk profile than one-shot
+    /// break-fixing.
+    pub advance_limit: u64,
+    /// The Endgame Governor's recovery-shape Setpoint: which arm a broken-state
+    /// Recovery Run takes (CONTEXT.md: Handoff is the default shape; an
+    /// Open-Plan continuation is always Continuation-shaped, ADR-0043).
     pub recovery_shape: RecoveryShape,
     /// The malformed-tool-call re-draw Setpoint (ADR-0030): at most this many
     /// in-band re-draws may follow a retryable generation error within one
@@ -184,6 +192,7 @@ pub struct SessionConfig {
     pub anchor_interval: u64,
     pub plan_stale_after: u64,
     pub recovery_limit: u64,
+    pub advance_limit: u64,
     pub recovery_shape: RecoveryShape,
     pub malformed_retry_budget: u64,
     pub scout_pass_limit: u64,
@@ -224,6 +233,7 @@ impl SessionConfig {
             anchor_interval: 5,
             plan_stale_after: 8,
             recovery_limit: 1,
+            advance_limit: 3,
             recovery_shape: RecoveryShape::Handoff,
             malformed_retry_budget: 3,
             scout_pass_limit: 8,
@@ -339,6 +349,7 @@ impl SessionConfig {
             compaction_keep: Some(base.compaction_keep),
             plan_stale_after: Some(base.plan_stale_after),
             recovery_limit: Some(base.recovery_limit),
+            advance_limit: Some(base.advance_limit),
             recovery_shape: Some(base.recovery_shape),
             malformed_retry_budget: Some(base.malformed_retry_budget),
             scout_no_think: Some(base.scout_no_think),
@@ -502,6 +513,8 @@ pub(crate) struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    advance_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     recovery_shape: Option<RecoveryShape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     malformed_retry_budget: Option<u64>,
@@ -538,6 +551,7 @@ impl FileConfig {
         overlay(&self.compaction_keep, &mut cfg.compaction_keep);
         overlay(&self.plan_stale_after, &mut cfg.plan_stale_after);
         overlay(&self.recovery_limit, &mut cfg.recovery_limit);
+        overlay(&self.advance_limit, &mut cfg.advance_limit);
         overlay(&self.recovery_shape, &mut cfg.recovery_shape);
         overlay(
             &self.malformed_retry_budget,
@@ -751,6 +765,7 @@ pub struct SessionOpts {
     pub anchor_interval: Option<u64>,
     pub plan_stale_after: Option<u64>,
     pub recovery_limit: Option<u64>,
+    pub advance_limit: Option<u64>,
     pub recovery_shape: Option<RecoveryShape>,
     pub malformed_retry_budget: Option<u64>,
     pub scout_pass_limit: Option<u64>,
@@ -807,6 +822,7 @@ impl Session {
             anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
             plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
             recovery_limit: opts.recovery_limit.unwrap_or(config.recovery_limit),
+            advance_limit: opts.advance_limit.unwrap_or(config.advance_limit),
             recovery_shape: opts.recovery_shape.unwrap_or(config.recovery_shape),
             malformed_retry_budget: opts
                 .malformed_retry_budget
@@ -1560,6 +1576,28 @@ mod tests {
         assert_eq!(with_limit(3).recovery_limit, 3);
         // 0 is valid: it disables the Recovery Run mechanic entirely.
         assert_eq!(with_limit(0).recovery_limit, 0);
+    }
+
+    #[test]
+    fn advance_limit_defaults_to_3_and_opts_override_including_the_off_value() {
+        // The Open-Plan budget (ADR-0043): larger than recovery_limit by
+        // default, its own knob, 0-disablable.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.advance_limit, 3);
+
+        let with_advance = |n: u64| {
+            Session::build(
+                SessionOpts {
+                    advance_limit: Some(n),
+                    model: Some(test_model()),
+                    ..opts()
+                },
+                &cfg(),
+            )
+            .unwrap()
+        };
+        assert_eq!(with_advance(5).advance_limit, 5);
+        assert_eq!(with_advance(0).advance_limit, 0);
     }
 
     #[test]

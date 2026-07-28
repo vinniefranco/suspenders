@@ -57,8 +57,8 @@ The mechanical schedule by which a Run ends at its Run Limit, counted in Passes 
 _Avoid_: wind-down, wrap-up phase (the wrap-up warning is one step of the Endgame, not its name)
 
 **Recovery Run**:
-A Run the harness opens itself when the previous Run settled at its Run Limit with unverified writes, or a Dangling Failure alongside a write that landed this Run - the work is demonstrably unfinished, so one more bounded attempt is issued rather than leaving a broken state. A Dangling Failure with no writes this Run is exploration, not unfinished implementation (a read-only task that merely ran a failing command), and opens no Recovery Run. Issued by the Endgame Governor through the close-and-open-a-Recovery-Run Intervention; a Setpoint bounds how many may follow one user request. Its prompt belongs to the Voice - the only Run whose prompt Suspenders authors - and it still serves the original user request. Two shapes: Continuation and Handoff.
-_Avoid_: retry (nothing is re-attempted from scratch; unfinished work continues), auto-continue (that's the Continuation shape, not the umbrella)
+A Run the harness opens itself when the previous Run settled at its Run Limit with the work demonstrably unfinished - one more bounded attempt rather than handing an unfinished request back to the user. Unfinished has three evidences: unverified writes, or a Dangling Failure alongside a write that landed this Run (both broken states); or an Open Plan - the Run settled green but the Plan still declares unchecked steps (correct, but not done). A Dangling Failure with no writes this Run is exploration, not unfinished implementation (a read-only task that merely ran a failing command), and opens no Recovery Run; an Open Plan opens one only from a green settle and only when the Run advanced the Plan (a step checked off this Run), never on no-progress churn. Issued by the Endgame Governor through the close-and-open-a-Recovery-Run Intervention; one Setpoint bounds how many broken-state recoveries, a separate Setpoint how many Open-Plan continuations, may follow one user request. Its prompt belongs to the Voice - the only Run whose prompt Suspenders authors - and it still serves the original user request. Two shapes: Continuation and Handoff.
+_Avoid_: retry (nothing is re-attempted from scratch; unfinished work continues), auto-continue (that's the Continuation shape, not the umbrella), Progress Run / a separate green-but-incomplete concept (Open Plan is a third evidence of this one Run, not a sibling Run)
 
 **Continuation**:
 The Recovery Run shape that keeps the Conversation: the recovery prompt is appended and the model continues with everything it saw before.
@@ -70,6 +70,10 @@ _Avoid_: restart (the work and its facts carry over; only the rot is left behind
 **Dangling Failure**:
 A command string whose most recent execution this Run failed. A passing run clears only its own command string, so a red full-suite run followed by a green filtered rerun still dangles - a capped Run cannot launder a failure by rerunning a narrower command. The failing arm of the Recovery Run's trigger, but only alongside a write that landed this Run; the Verify-failed Nudge keeps judging the last run only.
 _Avoid_: command failing (that's the last-run-only fact the Nudge reads), red build (too broad; the failure is per command string)
+
+**Open Plan**:
+The Plan's content shows at least one unchecked step (an open `[ ]` box), read as unfinished work even when the Run settles green - the third evidence of the Recovery Run's trigger, and the only one that opens from a green settle. Gated so a small model cannot spin: the Run must have advanced the Plan (a step checked off this Run) and a Setpoint bounds how many Open-Plan continuations may follow one user request. A Plan with no checkboxes cannot be Open - completeness is uninferrable from prose, so it never self-continues. A syntactic fact about a harness-owned artifact, never a judgment about the world; the harness reads the Plan's checkbox structure but still never authors its content. Unlike the broken-state arms, an Open Plan reopens as a Continuation, not a Handoff: a green, step-advancing Run is productive, not degraded, so keeping the Conversation preserves the working context the next steps need - retiring it forces the model to re-read what it just built (the cost observed live before this arm existed).
+_Avoid_: incomplete plan (a judgment; Open Plan is the syntactic fact of an unchecked box), stale plan (that's the Anchor's plan-recency, a different fact), Progress Run (Open Plan is an evidence, not a Run)
 
 **Tool**:
 A named capability with a JSON schema that the model can invoke (v1: read_file, list_files, edit_file, write_file, grep, run_command).
@@ -203,7 +207,7 @@ _Avoid_: interrupt (nothing is interrupted), injection (mechanism, not meaning),
 What happens to Steering the Run ended before delivering: it auto-submits as the next Run's prompt. Cancellation discards it instead - cancel means stop everything.
 
 **Plan**:
-The model-maintained statement of the current goal, its steps, and their progress, held by the harness outside the Conversation and updated through the plan Tool. The Plan is the model's voice - Suspenders never authors its content - and it survives Compaction verbatim because the harness owns it, not the summary.
+The model-maintained statement of the current goal, its steps, and their progress, held by the harness outside the Conversation and updated through the plan Tool. The Plan is the model's voice - Suspenders never authors its content - and it survives Compaction verbatim because the harness owns it, not the summary. The harness does *read* the Plan's checkbox structure (an unchecked `[ ]` step makes it an Open Plan) as a fact for the Endgame, but reading structure is not authoring content.
 _Avoid_: todo list, scratchpad (free-form; a Plan is structured), notes
 
 **Anchor**:
@@ -255,7 +259,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Session** draws with exactly one active **Theme**; the `/theme` **Slash Command** changes it live, and the choice outlives the Session
 - A **Theme** shapes only how the **Transcript** and the **Screen**'s chrome are colored, never what anything means; a broken Theme is refused whole, and the Session falls back to the built-in default rather than drawing half-right
 - A **Run** ends in exactly one **Run Settlement**: completed, failed, or cancelled
-- A **Recovery Run** opens only off a Run that settled at its **Run Limit** with unverified writes, or a **Dangling Failure** alongside a write that landed this Run (a failing command with no writes is exploration, not unfinished work); its prompt belongs to the **Voice**, and a **Setpoint** bounds how many may serve one user request
+- A **Recovery Run** opens only off a Run that settled at its **Run Limit** with unverified writes, or a **Dangling Failure** alongside a write that landed this Run (a failing command with no writes is exploration, not unfinished work), or an **Open Plan** from a green settle that advanced the Plan this Run; its prompt belongs to the **Voice**, and a **Setpoint** bounds broken-state recoveries while a separate **Setpoint** bounds **Open Plan** continuations, each per user request
+- An **Open Plan** opens a **Recovery Run** only from green (a broken state routes to the failing arms first) and only when the Run checked off a Plan step; a Plan with no `[ ]` boxes can never be Open
 - A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the **Dangling Failure**'s own result verbatim - the command the recovery prompt names, not merely the last one run; a **Continuation** keeps the whole **Conversation**
 - **Steering** is delivered after a Tool Call batch completes and before the next model call; a Run that ends first triggers **Rollover**, a **Cancellation** discards it
 - **Steering** belongs to the user's voice and is never part of the **Voice**
