@@ -43,6 +43,23 @@ pub(super) fn session(root: &std::path::Path) -> Session {
     session_with(root, SessionOpts::default())
 }
 
+/// A Session on `root` with the next-speaker check ENABLED (the test defaults
+/// turn it off; ADR-0043). The `run_limit` bounds any auto-continuation.
+#[allow(clippy::field_reassign_with_default)] // matches loop_'s test module: names the knob
+pub(super) fn session_next_speaker(root: &std::path::Path, run_limit: u64) -> Session {
+    let mut opts = SessionOpts::default();
+    opts.skip_next_speaker = Some(false);
+    opts.run_limit = Some(run_limit);
+    session_with(root, opts)
+}
+
+/// A side-query reply scripting the next-speaker verdict `speaker`
+/// (`"user"` ends the Run, `"model"` continues it): a bare JSON object, the
+/// lenient parser's happy path.
+pub(super) fn next_speaker_verdict(speaker: &str) -> Response {
+    text_end(&format!("{{\"next_speaker\": \"{speaker}\"}}"))
+}
+
 pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
     let mut conv = Conversation::new(
         "You are a test agent.",
@@ -50,7 +67,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
             session.context_budget_for(&session.model),
             session.model.max_tokens,
         )
-        .eviction_slack(session.eviction_slack)
+        .compaction_slack(session.compaction_slack)
         .compaction_keep(session.compaction_keep),
     );
     conv.add_user_text(prompt);

@@ -17,26 +17,92 @@ pub struct RunCommand;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
+const DESCRIPTION: &str = "\
+Executes a given shell command (as `bash -o pipefail -c <command>`) in a subprocess in the project \
+root, ensuring proper handling and security measures. stdout and stderr are merged and returned \
+together, followed by an exit-code tail, e.g. \"[exit code: 0]\". Every command must be approved by \
+the user before it runs, so keep commands simple and purposeful.\n\
+\n\
+IMPORTANT: This tool is for terminal operations like git, cargo, docker, etc. DO NOT use it for \
+file operations (reading, writing, editing, searching, finding files) - use the specialized tools \
+for this instead.\n\
+\n\
+**Usage notes**:\n\
+- The command argument is required.\n\
+- Commands run with `-o pipefail`: a piped pipeline reports the FIRST failing stage, not the last \
+stage's success. A red test suite piped anywhere still surfaces as a failure.\n\
+- Output is truncated automatically when it is long, keeping the start and the end (the exit code \
+and last errors live at the end). Do NOT pipe long output through `head`, `tail`, or `wc` - a pipe \
+hides the real exit code and defeats the truncation that already keeps the important parts. Prefer \
+a runner's own quiet flags (e.g. `cargo nextest run --status-level fail`, `cargo build -q`) so \
+passing runs stay short.\n\
+- A long-running command is killed when it exceeds the configured timeout (the whole process group \
+is signalled, not just the direct child). The default is 120000ms (2 minutes). Do not launch \
+servers or watchers that run indefinitely; they will time out.\n\
+- It is very helpful if you write a clear, concise description of what this command does in 5-10 \
+words.\n\
+\n\
+- Avoid using run_command with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` \
+commands, unless explicitly instructed or when these commands are truly necessary for the task. \
+Instead, always prefer using the dedicated tools for these operations:\n\
+  - File search: Use glob (NOT find or ls)\n\
+  - Content search: Use grep (NOT grep or rg)\n\
+  - Read files: Use read_file (NOT cat/head/tail)\n\
+  - Edit files: Use edit_file (NOT sed/awk)\n\
+  - Write files: Use write_file (NOT echo >/cat <<EOF)\n\
+  - Communication: Output text directly (NOT echo/printf)\n\
+- **Shell argument quoting and special characters**: The active shell is Bash. When passing \
+arguments that contain special characters (parentheses `()`, backticks `` ` ``, dollar signs `$`, \
+backslashes `\\`, semicolons `;`, pipes `|`, angle brackets `<>`, ampersands `&`, exclamation marks \
+`!`, etc.), you MUST ensure they are properly quoted to prevent Bash from misinterpreting them as \
+shell syntax:\n\
+  - **Single quotes** `'...'` pass everything literally, but cannot contain a literal single quote.\n\
+  - **ANSI-C quoting** `$'...'` supports escape sequences (e.g. `\\n` for newline, `\\'` for single \
+quote) and is the safest approach for multi-line strings or strings with single quotes.\n\
+  - **Heredoc** is the most robust approach for large, multi-line text with mixed quotes:\n\
+    ```bash\n\
+    gh pr create --title \"My Title\" --body \"$(cat <<'HEREDOC'\n\
+    Multi-line body with (parentheses), backticks, and 'single-quotes'.\n\
+    HEREDOC\n\
+    )\"\n\
+    ```\n\
+  - NEVER use unescaped single quotes inside single-quoted strings. Use `$'it\\'s'` or `\"it's\"` \
+instead.\n\
+  - If unsure, prefer double-quoting arguments and escape inner double-quotes as `\\\"`.\n\
+- When issuing multiple commands:\n\
+  - If the commands are independent and can run in parallel, make multiple run_command tool calls \
+in a single message.\n\
+  - If the commands depend on each other and must run sequentially, use a single run_command call \
+with `&&` to chain them together (e.g., `git add . && git commit -m \"message\"`). For instance, if \
+one operation must complete before another starts (like mkdir before cp, or git add before git \
+commit), run these operations sequentially instead.\n\
+  - Use `;` only when you need to run commands sequentially but don't care if earlier commands \
+fail.\n\
+  - DO NOT use newlines to separate commands (newlines are ok in quoted strings).\n\
+- The command always runs in the project root. Prefer absolute or root-relative paths and avoid \
+`cd`; run tools against their target path directly.\n\
+  <good-example>\n\
+  cargo nextest run -p mycrate\n\
+  </good-example>\n\
+  <bad-example>\n\
+  cd crates/mycrate && cargo nextest run\n\
+  </bad-example>";
+
 #[async_trait::async_trait]
 impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_command".into(),
-            description:
-                "Run a shell command (bash -o pipefail -c) in the project root and return stdout \
-                and stderr merged, followed by the exit code. Use this to compile, run tests, or \
-                inspect the project after making changes. Long-running commands are killed when \
-                they exceed the configured timeout. The user must approve each command before it \
-                runs. Do not pipe long output through head or tail; output is trimmed \
-                automatically. Prefer a runner's own quiet flags (e.g. \
-                `cargo nextest run --status-level fail`, `-q`) so passing runs stay short."
-                    .into(),
+            description: DESCRIPTION.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to run, e.g. \"mix test\"."
+                        "description": "Exact bash command to execute as `bash -o pipefail -c \
+                            <command>` in the project root, e.g. \"cargo nextest run\" or \"git \
+                            status\". Each command is shown to the user for approval before it \
+                            runs."
                     }
                 },
                 "required": ["command"]

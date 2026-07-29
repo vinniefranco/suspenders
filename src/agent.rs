@@ -286,7 +286,7 @@ impl AgentHandle {
             system_prompt,
             ConversationOpts::new(session.context_budget_for(&model), model.max_tokens)
                 .overhead_chars(overhead)
-                .eviction_slack(session.eviction_slack)
+                .compaction_slack(session.compaction_slack)
                 .compaction_keep(session.compaction_keep),
         );
         // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.
@@ -715,7 +715,8 @@ fn log_entry(state: &mut AgentState, entry: LogEntry) {
 }
 
 // The Conversation events worth persisting, picked off the relay path (baud's
-// log_event). Nudges ride as user-role {:nudge, ...} entries.
+// log_event). Steering and Voice-authored tail markers ride as user-role
+// entries.
 fn log_event(state: &mut AgentState, event: &Event) {
     match event {
         Event::MessageEnd { content, .. } => {
@@ -789,6 +790,7 @@ fn spawn_run(state: &mut AgentState) {
         Arc::clone(&state.llm),
         state.model.clone(),
         state.session.temperature,
+        state.session.thinking_budget,
         state.session.tool_call_style,
         state.compaction.clone(),
     );

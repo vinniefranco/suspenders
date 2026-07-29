@@ -17,14 +17,15 @@
 /// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
-    /// A budget mechanic tidying the Conversation: Eviction, Compaction,
-    /// Result-Cap cuts. Not a Governor's judgment - neutral gray.
+    /// A budget mechanic tidying the Conversation: Compaction, Result-Cap
+    /// cuts. Routine tidying, not a judgment - neutral gray.
     Housekeeping,
-    /// A Governor helping the model along: a Nudge, a plan/anchor refresh, a
-    /// Recovery Run. Warm amber (chosen away from error-red).
+    /// A marker that helps the model along. Warm amber (chosen away from
+    /// error-red). Reserved: no producer emits it since the nudge apparatus
+    /// was removed, but the plane is kept for a future aiding marker.
     Aid,
-    /// A Governor limiting the model: tool-narrowing, the Endgame's run-close
-    /// schedule. Cool blue (chosen away from success-green).
+    /// A guard limiting the model: the loop-detector's run-close. Cool blue
+    /// (chosen away from success-green).
     Constrain,
     /// The user's own voice reaching a running Run (the pending-Steering
     /// marker): the prompt color, never the harness plane.
@@ -196,8 +197,9 @@ pub struct DiffHunk {
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
 ///   plane (the greeting, launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
-///   plane (ADR-0040): eviction, compaction, Governor Interventions, Steering.
-///   The [`Tone`] tints it in the adapter; the store only carries the fact.
+///   plane (ADR-0040): compaction, result-cap cuts, the loop-detector close,
+///   Steering. The [`Tone`] tints it in the adapter; the store only carries
+///   the fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User {
@@ -224,7 +226,8 @@ pub enum TranscriptItem {
         /// The salient input arg (path/command/pattern) carried from the paired
         /// [`TranscriptItem::ToolCall`], so the merged line can read
         /// `name  <key_arg> · <result>`. `None` for a result with no live call
-        /// (e.g. governor-injected) - the line falls back to `name → result`.
+        /// (e.g. a Voice-authored answer to an orphaned Tool Call) - the line
+        /// falls back to `name → result`.
         key_arg: Option<String>,
     },
     Diff {

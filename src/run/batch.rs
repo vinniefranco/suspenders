@@ -124,8 +124,8 @@ async fn execute_tool<D: RunDeps>(
     ContentBlock::tool_result(id, content, is_error)
 }
 
-// A successful plan Tool Call updates the Plan value and stores its content
-// through the set_plan Dep; the Loop's copy keeps this Run's Anchors current.
+// A successful todo_write Tool Call replaces the Plan's task list and stores its
+// rendered form through the set_plan Dep; the Loop keeps this Run's copy.
 fn maybe_store_plan<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
@@ -133,9 +133,7 @@ fn maybe_store_plan<D: RunDeps>(
     is_error: bool,
 ) {
     if let Update::Updated(plan) = state.plan.update(name, input, is_error) {
-        state
-            .deps
-            .set_plan(plan.content.clone().unwrap_or_default());
+        state.deps.set_plan(plan.render());
         state.plan = plan;
     }
 }

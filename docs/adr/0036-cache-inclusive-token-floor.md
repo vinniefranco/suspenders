@@ -1,12 +1,12 @@
-# The token estimate floors on cache-inclusive API usage; the char estimate stays the Eviction currency
+# The token estimate floors on cache-inclusive API usage; the char estimate stays the reclaim currency
 
 `Conversation::token_estimate` is `ceil(chars / 3.5)` floored by the API's
 reported usage. The floor read only `input_tokens`, but per the Anthropic
 protocol `input_tokens` is the uncached remainder: the true size of the
 previous request is `input_tokens + cache_read_input_tokens +
 cache_creation_input_tokens`. Suspenders engineers a warm prompt cache by
-design - Eviction's rare waves and the Compaction Keep exist to hold the
-request prefix byte-stable (ADR-0006, ADR-0012) - so in steady state the
+design - rare, deep Compactions and the Compaction Keep exist to hold the
+request prefix byte-stable (ADR-0012) - so in steady state the
 floor collapsed to the new tail (hundreds of tokens against a six-figure
 real context) and the lossy char estimate silently carried every pressure
 and Compaction trigger. The bug was invisible precisely when the design
@@ -33,16 +33,16 @@ One `Usage` type, one derived fact:
   Conversation stores `content::Usage` and reads `context_floor()`.
 
 The floor is a lower bound on `token_estimate` only. The fit check in
-`for_request` and every Eviction decision keep the char estimate as their
-sole currency: Eviction rewrites the prefix bytes, and the API figure
-describes the request as it was before the rewrite, so it cannot measure
-what an elision saved.
+`for_request` and every Compaction decision keep the char estimate as
+their sole currency: Compaction rewrites the prefix bytes, and the API
+figure describes the request as it was before the rewrite, so it cannot
+measure what a summary saved.
 
 ## Considered options
 
 - **pi's decomposition** (prefix from API usage plus a char-estimated
-  tail). Rejected: it makes the API figure a currency Eviction must
-  transact in, and that figure cannot see Eviction's effect (above). The
+  tail). Rejected: it makes the API figure a currency Compaction must
+  transact in, and that figure cannot see Compaction's effect (above). The
   `.max()` floor gets the accuracy where it matters - trigger decisions -
   without splitting the estimate into two regimes.
 - **The `count_tokens` endpoint** as the authoritative estimate.

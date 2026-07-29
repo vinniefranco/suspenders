@@ -27,6 +27,7 @@ use crate::llm::response::{Response, StopReason};
 use crate::llm::{LlmRequest, StreamEvent};
 use crate::plan::Plan;
 use crate::run::deps::{AfterPass, Emitter, RunDeps};
+use crate::run::next_speaker::{self, NextSpeaker};
 use crate::run::{batch, finish};
 use crate::session::Session;
 use crate::session::log;
@@ -105,6 +106,10 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) last_tool_signature: Option<Vec<u8>>,
     pub(super) identical_count: u64,
     pub(super) identical_cap: u64,
+    // Skips the next-speaker check (ADR-0043), resolved from
+    // `session.skip_next_speaker` at Run start: when `true` a no-tool-call Pass
+    // finishes the Run as it did before the check existed.
+    pub(super) skip_next_speaker: bool,
 }
 
 /// The Extension pipeline and Tool execution context for one Run: always built
@@ -148,6 +153,7 @@ pub async fn run<D: RunDeps>(
         last_tool_signature: None,
         identical_count: 0,
         identical_cap: session.loop_stall_limit,
+        skip_next_speaker: session.skip_next_speaker,
     };
 
     conversation = maybe_compact_proactive(&mut state, conversation).await;
@@ -268,37 +274,104 @@ pub(super) enum Flow {
     Retry(Conversation),
 }
 
+// Dispatch keys on Tool Call PRESENCE, not the stop reason (qwen-code parity,
+// the parity spec's core inversion): a response carrying ANY tool_use block
+// continues the loop regardless of whether the stop reason was tool_use,
+// end_turn, max_tokens, or unknown. Only two reasons override that: `Error`
+// takes the error path (nothing executes), and `MaxTokens` with tool_use runs
+// the truncated-batch re-issue (ADR-0009: the cut-off arguments may be
+// incomplete, so nothing runs). Otherwise tool_use blocks execute. A response
+// with NO tool_use blocks consults the next-speaker check before finishing.
 async fn dispatch<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
 ) -> Flow {
-    match response.stop_reason {
-        StopReason::Error => error_flow(state, conversation, response),
-        StopReason::ToolUse => {
-            // A :tool_use stop with zero tool_use blocks is a server quirk, not
-            // a request for tools; treat it as end_turn (never append an empty
-            // Tool Results message and loop forever).
-            if response.content.iter().any(ContentBlock::is_tool_use) {
-                continue_tools(state, conversation, response).await
-            } else {
-                let content = response.content.clone();
-                finish::finish(state, conversation, content, StopReason::ToolUse)
-            }
-        }
-        StopReason::MaxTokens => {
-            if response.content.iter().any(ContentBlock::is_tool_use) {
-                truncated_batch(state, conversation, response).await
-            } else {
-                let content = response.content.clone();
-                finish::finish(state, conversation, content, StopReason::MaxTokens)
-            }
-        }
-        other => {
-            let content = response.content.clone();
-            finish::finish(state, conversation, content, other)
-        }
+    if response.stop_reason == StopReason::Error {
+        return error_flow(state, conversation, response);
     }
+
+    let has_tool_use = response.content.iter().any(ContentBlock::is_tool_use);
+    if has_tool_use {
+        // A max_tokens stop mid-batch re-issues every call; every other stop
+        // with tool_use executes them (the presence-gated continuation).
+        if response.stop_reason == StopReason::MaxTokens {
+            truncated_batch(state, conversation, response).await
+        } else {
+            continue_tools(state, conversation, response).await
+        }
+    } else if response.stop_reason == StopReason::MaxTokens {
+        // A max_tokens stop with no tool_use is a truncation, not a completed
+        // reply: it finishes with the truncation marker as before, NOT through
+        // the next-speaker check (a cut-off reply must not auto-continue - it is
+        // re-draw territory, ADR-0009).
+        let content = response.content.clone();
+        finish::finish(state, conversation, content, StopReason::MaxTokens)
+    } else {
+        // No Tool Calls and a normal completion: the point where the Run used to
+        // always end. Consult the next-speaker check first - it may decide the
+        // model should continue.
+        no_tool_call(state, conversation, response).await
+    }
+}
+
+// A Pass with no Tool Calls that completed normally (end_turn, a phantom
+// tool_use stop with zero blocks, stop_sequence, or unknown). Unless the check
+// is skipped, ask the next-speaker check who speaks next: `Model` injects a
+// "Please continue." user message and keeps looping (bounded by `max_turns`
+// through the loop's top-of-loop guard); `User` finishes the Run as before.
+// `skip_next_speaker` short-circuits straight to finishing (the pre-check
+// behavior).
+async fn no_tool_call<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+    response: Response,
+) -> Flow {
+    let content = response.content.clone();
+
+    if state.skip_next_speaker {
+        return finish::finish(state, conversation, content, response.stop_reason);
+    }
+
+    match next_speaker::check_next_speaker(state.deps, &response).await {
+        NextSpeaker::User => finish::finish(state, conversation, content, response.stop_reason),
+        NextSpeaker::Model => continue_after_no_tool(state, conversation, response),
+    }
+}
+
+// The next-speaker `Model` continuation (ADR-0043): append the model's reply as
+// an assistant message stamped with its Provenance, then a "Please continue."
+// user message (unstamped Voice string), announce it, and advance the turn.
+// The continuation is BOUNDED by `max_turns`: the loop's top-of-loop
+// `turn > max_turns` guard runs before the next request, so a model that keeps
+// producing no-tool replies can loop at most `max_turns` times before the Run
+// closes on the run-limit marker.
+fn continue_after_no_tool<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    response: Response,
+) -> Flow {
+    // The reply enters stamped (it is the model's own content); a thinking-only
+    // or empty reply contributes no speakable block, so nothing but the nudge
+    // is appended in that case.
+    let blocks: Vec<ContentBlock> = response
+        .content
+        .iter()
+        .filter(|b| !b.is_tool_use() && !matches!(b, ContentBlock::Thinking { .. }))
+        .cloned()
+        .collect();
+    if !blocks.is_empty() {
+        conversation.add_assistant_response(blocks, state.deps.provenance());
+    }
+
+    conversation.add_user_text(voice::please_continue());
+    state
+        .emitter
+        .emit(Event::steering_delivered(voice::please_continue()));
+    state.deps.checkpoint(&conversation);
+
+    state.turn += 1;
+    Flow::Continue(conversation)
 }
 
 // ADR-0030: a StopReason::Error whose error string classifies as retryable -
@@ -408,7 +481,7 @@ async fn truncated_batch<D: RunDeps>(
                 batch::display_input(input),
             ));
 
-            let content = voice::truncated_call_nudge().to_string();
+            let content = voice::truncated_call_reissue().to_string();
             state.emitter.emit(Event::tool_result(
                 id.clone(),
                 name.clone(),
@@ -472,9 +545,6 @@ fn emit_context_pressure<D: RunDeps>(state: &mut LoopState<'_, D>, conversation:
         conversation.token_estimate(),
         conversation.context_budget,
         conversation.max_tokens_reserve,
-        // Dead Mass is retired with the bespoke Eviction mechanic (Group D);
-        // the ContextPressure event keeps its shape and reports 0.0.
-        0.0,
     ));
 }
 
@@ -496,8 +566,8 @@ mod tests {
     use crate::run::deps::CompactError;
     use crate::run::fixtures::{
         FakeDeps, conversation, count_voiced, deps_for, empty, events, find_tool_result, just,
-        last_message, ok, root, run_with, session, session_with, session_with_limit, text_end,
-        text_result, tool_ctx, tool_use_result, write,
+        last_message, next_speaker_verdict, ok, root, run_with, session, session_next_speaker,
+        session_with, session_with_limit, text_end, text_result, tool_ctx, tool_use_result, write,
     };
     use crate::session::{Session, SessionOpts};
     use crate::test_support::Entry;
@@ -822,7 +892,6 @@ mod tests {
                     token_estimate,
                     context_budget,
                     max_tokens_reserve,
-                    ..
                 } => Some((*token_estimate, *context_budget, *max_tokens_reserve)),
                 _ => None,
             })
@@ -1432,6 +1501,211 @@ mod tests {
         }
     }
 
+    // ---- next-speaker check (ADR-0043) ------------------------------------
+
+    // A thinking-only reply (empty final content) auto-continues WITHOUT a
+    // side-query: the short-circuit injects "Please continue." and loops, and
+    // the next Pass finishes the Run. This is the #1 pain the check fixes.
+    #[tokio::test]
+    async fn a_thinking_only_reply_auto_continues_via_the_short_circuit() {
+        let root = root();
+        let session = session_next_speaker(root.path(), 50);
+        // First reply: only a thinking block (dropped from final content -> the
+        // Pass looks empty). Second reply (after "Please continue."): a real
+        // answer, then its next-speaker verdict ends the Run.
+        let thinking_only = Response {
+            content: vec![ContentBlock::Thinking {
+                text: "let me reason".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+            error: None,
+        };
+        let deps = deps_for(
+            &session,
+            vec![
+                just(thinking_only),
+                just(text_end("here is the answer")),
+                just(next_speaker_verdict("user")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "think then answer", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+
+        // A "Please continue." user message was injected between the two Passes,
+        // and announced as a delivered-steering event.
+        assert!(conv.messages.iter().any(|m| m.role == Role::User
+            && matches!(&m.content[0], ContentBlock::Text { text } if text == voice::please_continue())));
+        let evs = events(&deps);
+        assert!(evs.iter().any(
+            |e| matches!(e, Event::SteeringDelivered { text } if text == voice::please_continue())
+        ));
+
+        // The Run ends on the real answer.
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "here is the answer")
+        );
+    }
+
+    // A textful reply whose side-query returns {"next_speaker":"model"}
+    // auto-continues: the reply enters the Conversation (stamped), then
+    // "Please continue." nudges the model on.
+    #[tokio::test]
+    async fn a_model_verdict_continues_and_appends_the_reply_then_the_nudge() {
+        let root = root();
+        let session = session_next_speaker(root.path(), 50);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(text_end("Next, I will read the config.")),
+                just(next_speaker_verdict("model")),
+                just(text_end("Done reading it.")),
+                just(next_speaker_verdict("user")),
+            ],
+        );
+        let (outcome, _deps) = run_with(&session, "go", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+
+        // The announced-but-not-executed reply enters stamped with the Model's
+        // Provenance; the nudge follows as an unstamped user message.
+        let announce = conv
+            .messages
+            .iter()
+            .position(|m| m.role == Role::Assistant
+                && matches!(&m.content[0], ContentBlock::Text { text } if text == "Next, I will read the config."))
+            .expect("the first reply is in the Conversation");
+        assert_eq!(conv.messages[announce].provenance, Some(session.model.provenance()));
+        let nudge = &conv.messages[announce + 1];
+        assert_eq!(nudge.role, Role::User);
+        assert!(matches!(&nudge.content[0], ContentBlock::Text { text } if text == voice::please_continue()));
+        assert_eq!(nudge.provenance, None, "the nudge is Voice-authored, not the model's");
+
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "Done reading it."));
+    }
+
+    // A {"next_speaker":"user"} verdict ends the Run exactly as before: the
+    // reply is the closing message, no nudge injected.
+    #[tokio::test]
+    async fn a_user_verdict_finishes_the_run_with_no_nudge() {
+        let root = root();
+        let session = session_next_speaker(root.path(), 50);
+        let deps = deps_for(
+            &session,
+            vec![
+                just(text_end("All set. Let me know if you need anything.")),
+                just(next_speaker_verdict("user")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "finish up", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+
+        // No "Please continue." was injected.
+        assert!(!conv.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text == voice::please_continue()))));
+        let evs = events(&deps);
+        assert!(!evs.iter().any(
+            |e| matches!(e, Event::SteeringDelivered { text } if text == voice::please_continue())
+        ));
+
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "All set. Let me know if you need anything.")
+        );
+    }
+
+    // The auto-continuation is BOUNDED by max_turns: a model that keeps
+    // producing empty replies (short-circuit -> always continue) cannot loop
+    // forever - the run-limit guard closes the Run.
+    #[tokio::test]
+    async fn the_continuation_is_bounded_by_max_turns() {
+        let root = root();
+        // run_limit 3: at most three no-tool Passes, then the bound closes it.
+        let session = session_next_speaker(root.path(), 3);
+        let always_empty = || {
+            just(Response {
+                content: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+                error: None,
+            })
+        };
+        let deps = deps_for(
+            &session,
+            vec![
+                always_empty(),
+                always_empty(),
+                always_empty(),
+                // A fourth reply must never be requested - the bound closes
+                // after the third empty Pass.
+                just(text_end("should never be reached")),
+            ],
+        );
+        let (outcome, deps) = run_with(&session, "loop on empties", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
+
+        // Exactly three model calls (no side-query fires on the empty
+        // short-circuit): the fourth was never requested.
+        assert_eq!(deps.requests.lock().unwrap().len(), 3);
+        let lm = last_message(conv);
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
+        );
+    }
+
+    // `skip_next_speaker` restores the pre-check behavior: a no-tool reply
+    // finishes the Run immediately, with no side-query.
+    #[tokio::test]
+    async fn skip_next_speaker_finishes_without_the_check() {
+        let root = root();
+        let mut opts = SessionOpts::default();
+        opts.skip_next_speaker = Some(true);
+        let session = session_with(root.path(), opts);
+        let deps = deps_for(&session, vec![just(text_end("done"))]);
+        let (outcome, deps) = run_with(&session, "go", deps).await;
+        let (conv, stop) = ok(&outcome);
+        assert_eq!(*stop, OutcomeStop::end_turn());
+        // No side-query: exactly one model call.
+        assert_eq!(deps.requests.lock().unwrap().len(), 1);
+        let lm = last_message(conv);
+        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "done"));
+    }
+
+    // A tool-call reply continues on tool PRESENCE even when the stop reason is
+    // NOT tool_use (qwen-code parity, the core inversion): an EndTurn stop that
+    // still carries a tool_use block executes it rather than ending the Run.
+    #[tokio::test]
+    async fn tool_use_with_a_non_tool_use_stop_reason_still_continues() {
+        let root = root();
+        write(&root, "marker.txt", "");
+        let session = session(root.path());
+        // stop_reason EndTurn, but a tool_use block is present -> must execute.
+        let end_turn_with_tool = Response {
+            content: vec![ContentBlock::tool_use("t1", "list_files", json!({"path": "."}))],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+            error: None,
+        };
+        let deps = deps_for(
+            &session,
+            vec![just(end_turn_with_tool), just(text_end("done"))],
+        );
+        let (outcome, deps) = run_with(&session, "list", deps).await;
+        ok(&outcome);
+        // The tool ran despite the EndTurn stop reason.
+        let evs = events(&deps);
+        assert!(
+            matches!(find_tool_result(&evs, "t1"), Some(Event::ToolResult { is_error, .. }) if !is_error)
+        );
+    }
+
     // ---- approval gate (ADR-0005) -----------------------------------------
 
     #[tokio::test]
@@ -1468,7 +1742,7 @@ mod tests {
         let root = root();
         let mut opts = SessionOpts::default();
         opts.context_budget = Some(60);
-        opts.eviction_slack = Some(0.0);
+        opts.compaction_slack = Some(0.0);
         opts.model = Some(Model::new("local", "m", Api::AnthropicMessages, 64_000, 50));
         let session = session_with(root.path(), opts);
         // No script entries: any complete call would surface a different error.
@@ -1686,8 +1960,11 @@ mod tests {
             vec![
                 just(tool_use_result(
                     "p1",
-                    "plan",
-                    json!({"plan": "Goal: X. 1. read [ ]"}),
+                    "todo_write",
+                    json!({"todos": [
+                        { "content": "read", "status": "in_progress" },
+                        { "content": "edit", "status": "pending" },
+                    ]}),
                 )),
                 just(text_end("planned, done")),
             ],
@@ -1695,7 +1972,7 @@ mod tests {
         let (outcome, deps) = run_with(&session, "do X", deps).await;
         ok(&outcome);
         let plans = deps.plans.lock().unwrap();
-        assert_eq!(plans.as_slice(), &["Goal: X. 1. read [ ]".to_string()]);
+        assert_eq!(plans.as_slice(), &["[~] read\n[ ] edit".to_string()]);
     }
 
     #[tokio::test]
@@ -1705,7 +1982,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("p1", "plan", json!({}))),
+                just(tool_use_result("p1", "todo_write", json!({}))),
                 just(text_end("recovered")),
             ],
         );
@@ -1743,7 +2020,7 @@ mod tests {
         // assistant blob puts the estimate over target but under the cliff.
         let mut conv = Conversation::new(
             "sys",
-            crate::conversation::ConversationOpts::new(4000, 100).eviction_slack(0.3),
+            crate::conversation::ConversationOpts::new(4000, 100).compaction_slack(0.3),
         );
         conv.add_user_text("original task");
         conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(12_000))]);

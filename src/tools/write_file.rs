@@ -10,26 +10,37 @@ use serde_json::{Value, json};
 
 pub struct WriteFile;
 
+const DESCRIPTION: &str = "\
+Writes content to a new file in the project's filesystem, creating any missing parent directories \
+along the way.\n\
+\n\
+Usage:\n\
+- The `path` is relative to the project root (e.g. \"src/tools/new.rs\"), NOT an absolute path.\n\
+- This tool ONLY creates new files. It fails if the file already exists - to change an existing \
+file, use edit_file instead (targeted edits, not whole-file rewrites, keep changes reviewable and \
+avoid clobbering).\n\
+- Missing parent directories are created automatically, so you do not need to run a separate mkdir \
+command.\n\
+- `content` is written verbatim; provide the complete, final contents of the file.";
+
 #[async_trait::async_trait]
 impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description:
-                "Create a new file with the given content. Fails if the file already exists; \
-                change an existing file with edit_file. Parent directories are created \
-                automatically."
-                    .into(),
+            description: DESCRIPTION.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path relative to the project root."
+                        "description": "The path of the new file to create, relative to the \
+                            project root (e.g. \"src/tools/new.rs\"). Do not pass an absolute \
+                            path. Fails if the file already exists."
                     },
                     "content": {
                         "type": "string",
-                        "description": "The full contents to write to the file."
+                        "description": "The full, final content to write to the file."
                     }
                 },
                 "required": ["path", "content"]

@@ -2,9 +2,7 @@
 
 The Run loop maps every `StopReason::Error` to `finish::fail`
 (`run/loop_.rs`, the `dispatch` Error arm) - a terminal `Failed`
-settle. Because a failure is not a Run-Limit close, the Endgame never
-judges it: no Verification Pass, no final Pass, no Recovery Run. One bad
-generation discards the whole Run's work.
+settle. One bad generation discards the whole Run's work.
 
 But not every `StopReason::Error` is fatal. The local server emits an SSE
 `error` event carrying `Failed to generate a valid tool call` - a
@@ -47,27 +45,27 @@ existing string-based `failure_category::classify`.
 
 ## Considered options
 
-- **Nudge-and-continue (the ADR-0009 shape)** - append a Voice "re-issue
+- **Answer-and-continue (the ADR-0009 shape)** - append a Voice "re-issue
   your tool call" and advance a Pass. Rejected as the default: a
   constrained-decoding miss is a sampler transient, not a reasoning error
-  the model needs to see; nudging costs a Pass, pollutes the context, and
-  assumes a self-correction the failure mode does not reflect. Left as a
-  possible escalation if the re-draw proves insufficient at N - not built.
+  the model needs to see; answering it costs a Pass, pollutes the context,
+  and assumes a self-correction the failure mode does not reflect. Left as
+  a possible escalation if the re-draw proves insufficient at N - not built.
 - **Per-Pass retry cap instead of a per-Run budget** - bounded only by
   `turn_limit × cap` (up to ~64 draws). Technically safe, but a per-Run
   budget is a small absolute ceiling and the tighter dead-loop guard;
   chosen for reassurance and simplicity.
-- **Route the error through the settle path so Recovery can act** -
-  rejected: Recovery is cap-shaped (it needs a Run-Limit close and the
-  Ledger's unfinished-work facts). A mid-Run generation error is neither.
-  A bounded re-draw fits the failure mode; a Recovery Run does not.
+- **Route the error through the settle path** - rejected: settling turns
+  a recoverable sampler transient into a terminal `Failed`, discarding the
+  Run's work over a miss a re-draw usually clears. A bounded in-band
+  re-draw fits the failure mode; a settle does not.
 
 ## Consequences
 
 - The fault model gains a third path beside settle and fail (ADR-0018):
   a bounded in-band re-draw for one transient error class. It lives in
-  the loop's `dispatch`, not a Governor - it is a mechanical response to
-  a wire event and carries no trajectory judgment.
+  the loop's `dispatch` as a mechanical response to a wire event and
+  carries no trajectory judgment.
 - A new Setpoint (`malformed_retry_budget`, default 3) resolved once per
   Session, overridable via `SUSPENDERS_MALFORMED_RETRY_BUDGET`; a new
   `retry` Session Log entry. The retry count is transient (a resumed Run

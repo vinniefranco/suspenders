@@ -200,8 +200,9 @@ impl Transcript {
     /// empty string; the render layer normalizes any empty value once), the
     /// redundant call line is removed (a structural edit - the revision
     /// bumps), and the arg is stamped onto the result BEFORE Presentment. An
-    /// unpaired result (governor-injected, no live call) removes nothing, does
-    /// not bump, and carries no `key_arg` - a defined case, not an error.
+    /// unpaired result (a Voice answer to an orphaned call, no live call)
+    /// removes nothing, does not bump, and carries no `key_arg` - a defined
+    /// case, not an error.
     pub fn tool_result(
         &mut self,
         id: &str,
@@ -712,8 +713,8 @@ mod tests {
         );
     }
 
-    // A result with no live call (governor-injected) removes nothing, does not
-    // bump, and carries no key_arg.
+    // A result with no live call (a Voice answer to an orphaned call) removes
+    // nothing, does not bump, and carries no key_arg.
     #[test]
     fn an_unpaired_result_does_not_bump_and_has_no_key_arg() {
         let mut t = fresh();

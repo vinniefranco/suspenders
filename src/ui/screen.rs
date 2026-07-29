@@ -34,7 +34,7 @@
 //!   which wins over the Approval.
 
 use crate::conversation::compaction_target;
-use crate::event::{Event, WaveStats, dead_mass_pct};
+use crate::event::Event;
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
@@ -225,14 +225,8 @@ pub struct Screen {
     pub pending_approval: Option<PendingApproval>,
     pub token_estimate: Option<u64>,
     pub context_budget: Option<u64>,
-    pub eviction_slack: f64,
+    pub compaction_slack: f64,
     pub pressure_level: PressureLevel,
-    /// The live Dead Mass share (integer percent) from the most recent
-    /// [`Event::ContextPressure`], for the status bar. `None` until the first
-    /// pressure event; folded into the Tokens segment as a `· N% dead` tail so
-    /// context reclamation is legible AS IT STANDS - not the pre-reclaim
-    /// snapshot a past wave found (which a wave clears the instant it fires).
-    pub dead_mass_pct: Option<u64>,
     /// The Session's cumulative dollar cost from the most recent
     /// [`Event::SessionCost`] (ADR-0037: pricing rides the Catalog Model;
     /// surfacing is display-side only). Stays 0.0 on unpriced (local/custom)
@@ -261,7 +255,7 @@ pub struct Screen {
 #[derive(Default)]
 pub struct ScreenOpts {
     pub context_budget: Option<u64>,
-    pub eviction_slack: f64,
+    pub compaction_slack: f64,
     pub extensions: Vec<Registered>,
     pub history: Vec<String>,
     /// Launch-time info lines the adapter authors (context-file skips today):
@@ -403,9 +397,8 @@ impl Screen {
             pending_approval: None,
             token_estimate: None,
             context_budget: opts.context_budget,
-            eviction_slack: opts.eviction_slack,
+            compaction_slack: opts.compaction_slack,
             pressure_level: PressureLevel::Ok,
-            dead_mass_pct: None,
             session_cost: INITIAL_SESSION_COST,
             composer: Composer::new(opts.history),
             thinking_expanded: false,
@@ -559,7 +552,6 @@ impl Screen {
             | Event::MessageEnd { .. }) => self.apply_streaming(event),
 
             event @ (Event::ContextPressure { .. }
-            | Event::EvictionWave { .. }
             | Event::CompactionProgress { .. }
             | Event::SessionCost { .. }) => self.apply_pressure(event),
 
@@ -576,7 +568,6 @@ impl Screen {
             }
 
             event @ (Event::SessionLogError { .. }
-            | Event::ToolsNarrowed { .. }
             | Event::Retry { .. }
             | Event::LoopStall { .. }) => self.apply_voice(event),
 
@@ -630,41 +621,26 @@ impl Screen {
         }
     }
 
-    // Context pressure / Eviction / Compaction (ADR-0008; CONTEXT.md: Eviction,
-    // Dead Mass): the status-bar figures and the receded machinery lines.
+    // Context pressure / Eviction / Compaction (ADR-0008; CONTEXT.md: Eviction):
+    // the status-bar figures and the receded machinery lines.
     fn apply_pressure(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
             // Live context-pressure indication: refresh the status bar's token
-            // estimate, budget, and LIVE Dead Mass share mid-Run and name the
-            // semantic pressure level (ADR-0008). NEVER a Transcript item. The
-            // Dead Mass here is the current figure, refreshed every pass - the
-            // bar tracks it, not a wave's cleared snapshot.
+            // estimate and budget mid-Run and name the semantic pressure level
+            // (ADR-0008). NEVER a Transcript item.
             Event::ContextPressure {
                 token_estimate,
                 context_budget,
                 max_tokens_reserve,
-                dead_mass,
             } => {
                 self.token_estimate = Some(token_estimate);
                 self.context_budget = Some(context_budget);
-                self.dead_mass_pct = Some(dead_mass_pct(dead_mass));
                 self.pressure_level = pressure_level(
                     token_estimate,
                     context_budget,
                     max_tokens_reserve,
-                    self.eviction_slack,
+                    self.compaction_slack,
                 );
-                (self, vec![])
-            }
-
-            // An Eviction wave rewrote the request copy (CONTEXT.md: Eviction,
-            // Dead Mass): recede ONE terse Info line naming the wave and its
-            // at-wave (pre-reclaim) snapshot. The status bar does NOT derive
-            // from this - it tracks the LIVE Dead Mass off `ContextPressure`,
-            // and this wave has just cleared what it found.
-            Event::EvictionWave { stats } => {
-                self.transcript
-                    .marker(eviction_wave_line(&stats), Tone::Housekeeping);
                 (self, vec![])
             }
 
@@ -785,16 +761,6 @@ impl Screen {
                 self.transcript.info(format!(
                     "session log failed ({message}); this session will not resume"
                 ));
-                (self, vec![])
-            }
-
-            // The Endgame narrowed the Offer (CONTEXT.md: Endgame): a Governor
-            // limiting the model, so a Constrain marker. The `⊘` glyph is
-            // intrinsic here; the wording names the surviving tools, or reads
-            // "withdrawn" when the final Pass offers none.
-            Event::ToolsNarrowed { tools } => {
-                self.transcript
-                    .marker(tools_narrowed_line(&tools), Tone::Constrain);
                 (self, vec![])
             }
 
@@ -1105,53 +1071,12 @@ fn pressure_level(estimate: u64, budget: u64, reserve: u64, slack: f64) -> Press
     }
 }
 
-// One terse recede line for an Eviction wave (CONTEXT.md: Eviction, Dead Mass):
-// the Dead Mass share plus ONLY the nonzero counts, by kind, so a wave that
-// reclaimed one kind reads cleanly (`context wave · 12% dead mass · 3 results`)
-// and a mixed wave stays single-line. Dead Mass is the AT-WAVE (pre-reclaim)
-// fraction from [`WaveStats::dead_mass`] - correct for a historical line -
-// rounded through the shared [`dead_mass_pct`] rule so this line and the status
-// bar can never disagree. Kept quiet - this is machinery, and Info is already
-// DarkGray italic.
-fn eviction_wave_line(stats: &WaveStats) -> String {
-    let counts = [
-        (stats.results_elided, "results"),
-        (stats.cmd_superseded, "cmd superseded"),
-        (stats.read_superseded, "read superseded"),
-        (stats.edits_husked, "husked"),
-        (stats.anchors_elided, "anchors"),
-    ];
-    let parts: Vec<String> = counts
-        .iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, label)| format!("{n} {label}"))
-        .collect();
-    let pct = dead_mass_pct(stats.dead_mass);
-    if parts.is_empty() {
-        format!("✂ context wave · {pct}% dead mass")
-    } else {
-        format!("✂ context wave · {pct}% dead mass · {}", parts.join(", "))
-    }
-}
-
 // One Compaction-progress marker line (CONTEXT.md: Compaction). The `⟨ … ⟩`
 // glyph pair marks it as a summary fold in the Housekeeping plane (ADR-0040),
 // distinct from the `✂` eviction glyph; the tint comes from the tone, never
 // from this text.
 fn compaction_line(status: &str) -> String {
     format!("⟨ compaction: {status} → summary ⟩")
-}
-
-// One tools-narrowed marker line (CONTEXT.md: Endgame, Offer): the `⊘` glyph
-// then the surviving tool names, or "withdrawn" when the final Pass offers
-// none. The glyph is intrinsic to this Constrain marker, so it lives in the
-// text; the tint still comes from the tone.
-fn tools_narrowed_line(tools: &[String]) -> String {
-    if tools.is_empty() {
-        "⊘ tools withdrawn".to_string()
-    } else {
-        format!("⊘ tools narrowed to {}", tools.join(", "))
-    }
 }
 
 #[cfg(test)]
@@ -1452,10 +1377,10 @@ mod tests {
         fold(
             fresh_opts(ScreenOpts {
                 context_budget: Some(1200),
-                eviction_slack: 0.10,
+                compaction_slack: 0.10,
                 ..Default::default()
             }),
-            vec![Event::context_pressure(estimate, 1200, 200, 0.0)],
+            vec![Event::context_pressure(estimate, 1200, 200)],
         )
     }
 
@@ -1491,10 +1416,10 @@ mod tests {
         let t = fold(
             fresh_opts(ScreenOpts {
                 context_budget: Some(100),
-                eviction_slack: 0.0,
+                compaction_slack: 0.0,
                 ..Default::default()
             }),
-            vec![Event::context_pressure(1500, 2000, 200, 0.0)],
+            vec![Event::context_pressure(1500, 2000, 200)],
         );
         assert_eq!(t.context_budget, Some(2000));
         assert_eq!(t.pressure_level, PressureLevel::Ok);
@@ -1596,31 +1521,6 @@ mod tests {
         assert_eq!(effects, vec![]);
     }
 
-    // The Endgame narrowing to run_command (the Verification Pass) shows a
-    // Constrain marker naming the surviving tool.
-    #[test]
-    fn tools_narrowed_to_a_tool_shows_a_constrain_marker() {
-        let (t, effects) =
-            fresh().apply_event(Event::tools_narrowed(vec!["run_command".to_string()]));
-        assert_eq!(effects, vec![]);
-        assert_eq!(
-            items(&t),
-            vec![marker("⊘ tools narrowed to run_command", Tone::Constrain)]
-        );
-    }
-
-    // The final Pass withdraws every Tool (empty narrowing): the Constrain
-    // marker reads "withdrawn", not an empty "narrowed to ".
-    #[test]
-    fn tools_withdrawn_on_the_final_pass_shows_a_constrain_marker() {
-        let (t, effects) = fresh().apply_event(Event::tools_narrowed(vec![]));
-        assert_eq!(effects, vec![]);
-        assert_eq!(
-            items(&t),
-            vec![marker("⊘ tools withdrawn", Tone::Constrain)]
-        );
-    }
-
     // A bounded re-draw (ADR-0030) is silent to the Conversation but never to
     // the operator: one info line names the attempt against the budget.
     #[test]
@@ -1705,69 +1605,6 @@ mod tests {
 
     // --- context visibility (Bundle A) -------------------------------------
 
-    fn wave_stats() -> WaveStats {
-        WaveStats {
-            results_elided: 3,
-            read_superseded: 1,
-            edits_husked: 2,
-            dead_mass: 0.12,
-            ..WaveStats::default()
-        }
-    }
-
-    // An Eviction wave recedes ONE Housekeeping marker. It must NOT touch the
-    // status bar's `dead_mass_pct` - the bar tracks the LIVE figure off
-    // ContextPressure, and this wave just cleared what it found (the S1 bug:
-    // advertising the reclaimed snapshot).
-    #[test]
-    fn an_eviction_wave_recedes_one_marker_without_setting_the_live_bar() {
-        let t = fresh();
-        assert_eq!(t.dead_mass_pct, None);
-        let (t, effects) = t.apply_event(Event::eviction_wave(wave_stats()));
-        assert_eq!(effects, vec![]);
-        assert_eq!(
-            items(&t),
-            vec![marker(
-                "✂ context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked",
-                Tone::Housekeeping
-            )]
-        );
-        // The wave did not set the live bar figure.
-        assert_eq!(t.dead_mass_pct, None);
-    }
-
-    // The status bar's Dead Mass is LIVE: ContextPressure refreshes it every
-    // pass (pre-rounded through the shared rule), NOT the wave.
-    #[test]
-    fn context_pressure_sets_the_live_dead_mass_pct() {
-        let t = fresh();
-        let (t, _) = t.apply_event(Event::context_pressure(1500, 2000, 200, 0.128));
-        assert_eq!(t.dead_mass_pct, Some(13));
-
-        // A later pass with the dead mass reclaimed refreshes to the new figure.
-        let (t, _) = t.apply_event(Event::context_pressure(1500, 2000, 200, 0.0));
-        assert_eq!(t.dead_mass_pct, Some(0));
-    }
-
-    // S2 lock: the wave line's percent and the bar's percent are the SAME
-    // function of the same fraction (both via `dead_mass_pct`), so they agree.
-    #[test]
-    fn the_wave_line_and_the_bar_round_the_dead_mass_the_same_way() {
-        let fraction = 0.128;
-        let (t, _) = fresh().apply_event(Event::context_pressure(1, 2, 0, fraction));
-        let bar_pct = t.dead_mass_pct.expect("pressure set the live figure");
-
-        let stats = WaveStats {
-            dead_mass: fraction,
-            ..WaveStats::default()
-        };
-        let line = eviction_wave_line(&stats);
-        assert!(
-            line.contains(&format!("{bar_pct}% dead mass")),
-            "wave line {line:?} disagrees with bar percent {bar_pct}"
-        );
-    }
-
     // A Session cost update refreshes the bar figure and nothing else: no
     // Transcript item, no effects - and later totals replace, never add.
     #[test]
@@ -1797,33 +1634,6 @@ mod tests {
                 Tone::Housekeeping
             )]
         );
-    }
-
-    // The wave line names ONLY the nonzero counts, in kind order, with the Dead
-    // Mass share as an integer percent - a single-kind wave reads cleanly.
-    #[test]
-    fn eviction_wave_line_names_only_nonzero_counts() {
-        let one_kind = WaveStats {
-            results_elided: 3,
-            dead_mass: 0.05,
-            ..WaveStats::default()
-        };
-        assert_eq!(
-            eviction_wave_line(&one_kind),
-            "✂ context wave · 5% dead mass · 3 results"
-        );
-
-        assert_eq!(
-            eviction_wave_line(&wave_stats()),
-            "✂ context wave · 12% dead mass · 3 results, 1 read superseded, 2 husked"
-        );
-
-        // A wave with no reclaimable counts still names the Dead Mass share.
-        let none = WaveStats {
-            dead_mass: 0.20,
-            ..WaveStats::default()
-        };
-        assert_eq!(eviction_wave_line(&none), "✂ context wave · 20% dead mass");
     }
 
     #[test]

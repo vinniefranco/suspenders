@@ -29,6 +29,35 @@ enum Pass {
     Fuzzy,
 }
 
+const DESCRIPTION: &str = "\
+Replaces one occurrence of `old_str` with `new_str` in an existing file. This tool requires \
+providing significant context around the change to ensure precise targeting. Always use the \
+read_file tool to examine the file's current content before attempting a text replacement.\n\
+\n\
+Expectation for required parameters:\n\
+1. `path` MUST be a path relative to the project root (e.g. \"src/main.rs\"), NOT an absolute \
+path.\n\
+2. `old_str` MUST be the exact literal text to replace (including all whitespace, indentation, \
+newlines, and surrounding code etc.), copied verbatim from read_file output.\n\
+3. `new_str` MUST be the exact literal text to replace `old_str` with (also including all \
+whitespace, indentation, newlines, and surrounding code etc.). Ensure the resulting code is correct \
+and idiomatic. `new_str` may be empty to delete `old_str`.\n\
+4. NEVER escape `old_str` or `new_str`, that would break the exact literal text requirement.\n\
+\n\
+**Important:** If ANY of the above are not satisfied, the tool will fail. CRITICAL for `old_str`: \
+it MUST uniquely identify the single instance to change. `old_str` must match EXACTLY ONE location \
+in the file. Include enough surrounding context - at least 3 lines BEFORE and AFTER the target \
+text, matching whitespace and indentation precisely - to make the match unique. If `old_str` \
+matches multiple locations, the tool fails with the match count and asks you to add context. If it \
+matches zero locations, the tool fails and quotes the closest region of the real file so you can \
+correct it.\n\
+\n\
+**One change per call:** This tool replaces a single occurrence. To change several places, call \
+edit_file once per place, each with enough surrounding context to be unique.\n\
+\n\
+**Existing files only:** This tool only edits files that already exist. To create a new file, use \
+write_file instead.";
+
 // Threshold below which no line is "close enough" to be worth quoting.
 const CLOSEST_THRESHOLD: f64 = 0.6;
 // Context lines kept on each side of the best line.
@@ -39,29 +68,30 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace one occurrence of old_str with new_str in an existing file. \
-                old_str must match exactly one location: copy it verbatim from \
-                read_file output, including whitespace and indentation, and include \
-                enough surrounding lines to make it unique. Zero matches or more \
-                than one match is an error. To create a new file, use write_file \
-                instead. Make small, targeted edits, one change per call."
-                .into(),
+            description: DESCRIPTION.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path of an existing file, relative to the project root."
+                        "description": "The path of an existing file to modify, relative to the \
+                            project root (e.g. \"src/main.rs\"). Do not pass an absolute path."
                     },
                     "old_str": {
                         "type": "string",
-                        "description": "Exact text to replace, copied verbatim from the file. Must match \
-                            exactly one location; include surrounding lines to disambiguate. \
-                            Must not be empty."
+                        "description": "The exact literal text to replace, unescaped, copied \
+                            verbatim from read_file output including all whitespace, indentation, \
+                            and newlines. Must uniquely identify a single location - include at \
+                            least 3 lines of context BEFORE and AFTER the target text, matching \
+                            whitespace and indentation precisely. If it is not the exact literal \
+                            text (i.e. you escaped it), matches multiple locations, or matches \
+                            none, the tool will fail. Must not be empty."
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "Replacement text. May be empty to delete old_str."
+                        "description": "The exact literal text to replace `old_str` with, \
+                            unescaped. Provide the EXACT text; ensure the resulting code is correct \
+                            and idiomatic. May be empty to delete `old_str`."
                     }
                 },
                 "required": ["path", "old_str", "new_str"]

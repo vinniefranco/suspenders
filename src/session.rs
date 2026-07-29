@@ -1,11 +1,11 @@
 //! The Session's fixed facts (CONTEXT.md: Session), resolved and validated
 //! once at launch: the Project Root, the Provider set, the launch Model, the
-//! sampling temperature, the budget-cap knob, the Eviction slack, the Dead
-//! Mass fraction, the Compaction Keep, the Run Limit, the Anchor cadence and
-//! stale-plan threshold, the no-think knob, the command
-//! timeout, the Extension list, and the LLM module. The Context Budget and the
-//! Result Cap are NOT fixed facts: they derive from the Model each Run
-//! captures (ADR-0037).
+//! sampling temperature, the budget-cap knob, the Compaction slack, the
+//! Compaction Keep, the Run Limit, the loop-detector stall limit, the
+//! malformed-retry budget, the tool-call style, the command timeout, the
+//! Extension list, and the LLM module. The Context Budget and the Result Cap
+//! are NOT fixed facts: they derive from the Model each Run captures
+//! (ADR-0037).
 //!
 //! This is the composition seam for configuration. [`Session::new`] resolves
 //! these keys once (via [`SessionConfig::load`]) by overlaying, in order, the
@@ -15,7 +15,7 @@
 //! downstream receives values from this struct, so the cross-module invariants
 //! live in one place:
 //!
-//! * the Context Budget, the Eviction reserve, and the Result Cap are NOT
+//! * the Context Budget, the reply reserve, and the Result Cap are NOT
 //!   fixed facts (ADR-0037): they derive from the Model each Run captures,
 //!   through [`Session::context_budget_for`] and [`Session::tool_ctx`]
 //! * a Model's output cap must leave room in its effective budget - checked
@@ -59,7 +59,7 @@ pub struct Session {
     /// itself is NOT a fixed fact - [`Session::context_budget_for`] derives it
     /// from the Model each Run captures.
     pub context_budget: Option<u64>,
-    pub eviction_slack: f64,
+    pub compaction_slack: f64,
     pub compaction_keep: f64,
     pub run_limit: u64,
     /// The loop-detector's stall Setpoint (the passive circuit breaker): how
@@ -67,17 +67,16 @@ pub struct Session {
     /// before the Run is terminated. A small number (default
     /// [`DEFAULT_LOOP_STALL_LIMIT`]); `1` would trip on the first repeat.
     pub loop_stall_limit: u64,
-    pub anchor_interval: u64,
-    /// The anchor Governor's stale-plan Setpoint: the Passes a Plan may sit
-    /// unchanged - while writes land - before each Anchor carries the
-    /// stale-plan line.
-    pub plan_stale_after: u64,
     /// The malformed-tool-call re-draw Setpoint (ADR-0030): at most this many
     /// in-band re-draws may follow a retryable generation error within one
     /// Run. `0` disables the mechanic entirely (the loud failure runs
     /// immediately, as before).
     pub malformed_retry_budget: u64,
-    pub no_think_rescue: bool,
+    /// Skips the next-speaker check (ADR-0043, qwen-code's
+    /// `getSkipNextSpeakerCheck`): when `true`, a no-tool-call Pass finishes the
+    /// Run as it did before the check existed - no continuation, no side-query.
+    /// Default `false` (the check runs).
+    pub skip_next_speaker: bool,
     pub command_timeout_ms: u64,
     pub session_dir: String,
     /// The resolved Provider set (ADR-0037): custom Providers from config,
@@ -95,6 +94,15 @@ pub struct Session {
     /// to the server's own defaults. Resolved once here, applied by the
     /// request-building callers (ADR-0037: temperature belongs to the request).
     pub temperature: Option<f64>,
+    /// The extended-thinking token budget the MAIN conversation request carries
+    /// (qwen-code parity): `Some(n)` arms `thinking: {type: "enabled",
+    /// budget_tokens: n}` on the Anthropic wire, which keeps the local
+    /// reasoning model producing a Thinking block THEN a Tool Call every turn.
+    /// `None` disables it (the model may think and stop). Resolved once here,
+    /// applied by the request-building caller like temperature; the
+    /// checkNextSpeaker side-query's `no_think` suppresses it, and Compaction
+    /// never receives it.
+    pub thinking_budget: Option<u64>,
     /// How every request resolves Tool Calls the model emits (qwen parity):
     /// [`ToolCallStyle::Auto`] recovers a text-emitted call from the content
     /// channel when the structured one is empty; `Structured` opts out. Resolved
@@ -129,22 +137,25 @@ pub struct SessionConfig {
     pub theme: String,
     pub max_tokens: u64,
     pub temperature: Option<f64>,
+    /// The extended-thinking budget the main request carries (qwen-code
+    /// parity); `None` disables it. Env/file-settable like the scalars, with
+    /// `0` (or empty) mapping to `None` to turn it off.
+    pub thinking_budget: Option<u64>,
     /// The Tool Call resolution style every request carries (qwen parity):
     /// [`ToolCallStyle::Auto`] by default. Env/file-settable like the scalars.
     pub tool_call_style: ToolCallStyle,
     /// The optional global budget cap and catalog-less window figure
     /// (ADR-0037); `None` leaves every Model's own window uncapped.
     pub context_budget: Option<u64>,
-    pub eviction_slack: f64,
+    pub compaction_slack: f64,
     pub compaction_keep: f64,
     pub llm_module: String,
     pub command_timeout_ms: u64,
     pub run_limit: u64,
     pub loop_stall_limit: u64,
-    pub anchor_interval: u64,
-    pub plan_stale_after: u64,
     pub malformed_retry_budget: u64,
-    pub no_think_rescue: bool,
+    /// Skips the next-speaker check (ADR-0043); `false` runs it.
+    pub skip_next_speaker: bool,
     pub extensions: Vec<String>,
     pub session_dir: String,
 }
@@ -162,8 +173,14 @@ const DEFAULT_MAX_TOKENS: u64 = 8_000;
 /// deterministic floor and the high-entropy ceiling.
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 
-/// The default Eviction reserve as a fraction of the Context Budget.
-const DEFAULT_EVICTION_SLACK: f64 = 0.2;
+/// The default extended-thinking budget (qwen-code sends exactly this): arming
+/// the thinking param keeps the local reasoning model producing a Thinking
+/// block THEN a Tool Call every turn, rather than thinking and stopping.
+const DEFAULT_THINKING_BUDGET: u64 = 32_000;
+
+/// The default Compaction slack: the headroom below the Context Budget, as a
+/// fraction of it, that lowers the compaction target.
+const DEFAULT_COMPACTION_SLACK: f64 = 0.2;
 
 /// The default Compaction Keep fraction.
 const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
@@ -182,20 +199,13 @@ const DEFAULT_RUN_LIMIT: u64 = 100;
 /// may emit the IDENTICAL Tool Call batch before the Run is terminated.
 const DEFAULT_LOOP_STALL_LIMIT: u64 = 5;
 
-/// The default Anchor cadence: an Anchor fires every this many Passes.
-const DEFAULT_ANCHOR_INTERVAL: u64 = 5;
-
-/// The default stale-plan threshold: a Plan may sit unchanged for this many
-/// Passes (while writes land) before each Anchor carries the stale-plan line.
-const DEFAULT_PLAN_STALE_AFTER: u64 = 8;
-
 /// The default malformed-tool-call re-draw budget per Run.
 const DEFAULT_MALFORMED_RETRY_BUDGET: u64 = 3;
 
 /// The valid temperature range upper bound (inclusive).
 const TEMPERATURE_MAX: f64 = 2.0;
 
-/// The valid eviction-slack range upper bound (exclusive).
+/// The valid compaction-slack range upper bound (exclusive).
 const FRACTION_UPPER_BOUND: f64 = 1.0;
 
 /// The valid fraction range lower bound (inclusive for left-closed, exclusive
@@ -221,29 +231,35 @@ impl SessionConfig {
             theme: "dark".into(),
             max_tokens: DEFAULT_MAX_TOKENS,
             temperature: Some(DEFAULT_TEMPERATURE),
+            // Armed by default (qwen-code parity): the main request carries the
+            // thinking budget so the local reasoning model stays on the rails.
+            thinking_budget: Some(DEFAULT_THINKING_BUDGET),
             // Auto by default: a text-emitted Tool Call is recovered, nothing
             // changes for a host whose structured channel already works.
             tool_call_style: ToolCallStyle::Auto,
             // No global cap by default: every Model's own window is its
             // budget, so a wide-window Catalog model works out of the box.
             context_budget: None,
-            eviction_slack: DEFAULT_EVICTION_SLACK,
+            compaction_slack: DEFAULT_COMPACTION_SLACK,
             compaction_keep: DEFAULT_COMPACTION_KEEP,
             llm_module: "Suspenders.LLM".into(),
             command_timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
             run_limit: DEFAULT_RUN_LIMIT,
             loop_stall_limit: DEFAULT_LOOP_STALL_LIMIT,
-            anchor_interval: DEFAULT_ANCHOR_INTERVAL,
-            plan_stale_after: DEFAULT_PLAN_STALE_AFTER,
             malformed_retry_budget: DEFAULT_MALFORMED_RETRY_BUDGET,
-            no_think_rescue: true,
+            // The next-speaker check runs by default (ADR-0043): a no-tool-call
+            // Pass consults it before ending the Run.
+            skip_next_speaker: false,
             extensions: vec!["diff".into(), "run_command".into(), "condense".into()],
             session_dir: default_session_dir(),
         }
     }
 
     /// The config the test env resolves to: fakes injected, empty extension
-    /// list, tmp session dir.
+    /// list, tmp session dir. The next-speaker check is OFF here (ADR-0043) so
+    /// the loop and agent tests exercise the tool loop without a side-query
+    /// firing on every text reply; the check's own behavior is covered by the
+    /// tests that opt back in (`skip_next_speaker: Some(false)`).
     pub fn test_defaults() -> Self {
         let mut cfg = SessionConfig::base();
         cfg.providers
@@ -252,6 +268,7 @@ impl SessionConfig {
             .base_url = "http://localhost:0/v1".into();
         cfg.llm_module = "Suspenders.FakeLLM".into();
         cfg.extensions = vec![];
+        cfg.skip_next_speaker = true;
         cfg.session_dir = std::env::temp_dir()
             .join("suspenders_test_sessions")
             .to_string_lossy()
@@ -338,17 +355,17 @@ impl SessionConfig {
             theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
             temperature: base.temperature,
+            thinking_budget: base.thinking_budget,
             tool_call_style: Some(base.tool_call_style),
             // Absent from the template on purpose (ADR-0037): the base config
             // carries no global cap, and baking one in would pin wide-window
             // Catalog models under it.
             context_budget: base.context_budget,
-            eviction_slack: Some(base.eviction_slack),
+            compaction_slack: Some(base.compaction_slack),
             compaction_keep: Some(base.compaction_keep),
             loop_stall_limit: Some(base.loop_stall_limit),
-            plan_stale_after: Some(base.plan_stale_after),
             malformed_retry_budget: Some(base.malformed_retry_budget),
-            no_think_rescue: Some(base.no_think_rescue),
+            skip_next_speaker: Some(base.skip_next_speaker),
         };
 
         let json = serde_json::to_string_pretty(&template)
@@ -472,7 +489,7 @@ pub struct ProviderConfig {
 /// plus the file-only `providers` table (ADR-0037 narrowed the lockstep rule
 /// to the scalars). Every field `Option<T>` so an absent key is an empty
 /// overlay. The deliberately excluded fields (`session_dir`, `llm_module`,
-/// `turn_limit`, `anchor_interval`, `extensions`) are simply
+/// `turn_limit`, `extensions`) are simply
 /// absent, so `deny_unknown_fields` rejects them for free - as it now rejects
 /// the retired flat `base_url` and `token` keys.
 ///
@@ -495,22 +512,25 @@ pub(crate) struct FileConfig {
     /// env seam).
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    /// The extended-thinking budget (qwen-code parity). Presence sets `Some`;
+    /// like the env seam, the file cannot null it out - set the env's `0` to
+    /// disable it per-invocation instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_style: Option<ToolCallStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    eviction_slack: Option<f64>,
+    compaction_slack: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction_keep: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     loop_stall_limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    plan_stale_after: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     malformed_retry_budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    no_think_rescue: Option<bool>,
+    skip_next_speaker: Option<bool>,
 }
 
 impl FileConfig {
@@ -534,17 +554,17 @@ impl FileConfig {
         overlay(&self.theme, &mut cfg.theme);
         overlay(&self.max_tokens, &mut cfg.max_tokens);
         overlay_opt(&self.temperature, &mut cfg.temperature);
+        overlay_opt(&self.thinking_budget, &mut cfg.thinking_budget);
         overlay(&self.tool_call_style, &mut cfg.tool_call_style);
         overlay_opt(&self.context_budget, &mut cfg.context_budget);
-        overlay(&self.eviction_slack, &mut cfg.eviction_slack);
+        overlay(&self.compaction_slack, &mut cfg.compaction_slack);
         overlay(&self.compaction_keep, &mut cfg.compaction_keep);
         overlay(&self.loop_stall_limit, &mut cfg.loop_stall_limit);
-        overlay(&self.plan_stale_after, &mut cfg.plan_stale_after);
         overlay(
             &self.malformed_retry_budget,
             &mut cfg.malformed_retry_budget,
         );
-        overlay(&self.no_think_rescue, &mut cfg.no_think_rescue);
+        overlay(&self.skip_next_speaker, &mut cfg.skip_next_speaker);
     }
 }
 
@@ -613,9 +633,15 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         cfg.temperature = Some(parse_temperature(v)?);
         Ok(())
     }),
+    // Integer, with a disable convention (qwen-code parity): `0` or empty maps
+    // to `None` (extended thinking off); any positive integer arms the budget.
+    ("SUSPENDERS_THINKING_BUDGET", |cfg, v| {
+        cfg.thinking_budget = parse_thinking_budget(v)?;
+        Ok(())
+    }),
     // Fraction in [0.0, 1.0).
-    ("SUSPENDERS_EVICTION_SLACK", |cfg, v| {
-        cfg.eviction_slack = parse_eviction_slack(v)?;
+    ("SUSPENDERS_COMPACTION_SLACK", |cfg, v| {
+        cfg.compaction_slack = parse_compaction_slack(v)?;
         Ok(())
     }),
     // Fraction in (0.0, 1.0).
@@ -628,19 +654,14 @@ const ENV_OVERRIDES: &[(&str, EnvSetter)] = &[
         cfg.loop_stall_limit = parse_loop_stall_limit(v)?;
         Ok(())
     }),
-    // Positive integer.
-    ("SUSPENDERS_PLAN_STALE_AFTER", |cfg, v| {
-        cfg.plan_stale_after = parse_plan_stale_after(v)?;
-        Ok(())
-    }),
     // Non-negative integer; 0 disables the malformed-retry re-draw.
     ("SUSPENDERS_MALFORMED_RETRY_BUDGET", |cfg, v| {
         cfg.malformed_retry_budget = parse_int(v, "SUSPENDERS_MALFORMED_RETRY_BUDGET")?;
         Ok(())
     }),
-    // Booleans.
-    ("SUSPENDERS_NO_THINK_RESCUE", |cfg, v| {
-        cfg.no_think_rescue = parse_bool(v, "SUSPENDERS_NO_THINK_RESCUE")?;
+    // Boolean; `true` skips the next-speaker check (ADR-0043).
+    ("SUSPENDERS_SKIP_NEXT_SPEAKER", |cfg, v| {
+        cfg.skip_next_speaker = parse_bool(v, "SUSPENDERS_SKIP_NEXT_SPEAKER")?;
         Ok(())
     }),
 ];
@@ -649,6 +670,16 @@ fn parse_int(raw: &str, name: &str) -> Result<u64, SessionError> {
     raw.trim()
         .parse::<u64>()
         .map_err(|_| SessionError(format!("{name} must be an integer, got: {raw:?}")))
+}
+
+fn parse_bool(raw: &str, name: &str) -> Result<bool, SessionError> {
+    match raw.trim() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(SessionError(format!(
+            "{name} must be \"true\" or \"false\", got: {raw:?}"
+        ))),
+    }
 }
 
 fn parse_positive_int(raw: &str) -> Result<u64, SessionError> {
@@ -669,20 +700,28 @@ fn parse_temperature(raw: &str) -> Result<f64, SessionError> {
     }
 }
 
-fn parse_eviction_slack(raw: &str) -> Result<f64, SessionError> {
-    match raw.trim().parse::<f64>() {
-        Ok(v) if (FRACTION_LOWER_BOUND..FRACTION_UPPER_BOUND).contains(&v) => Ok(v),
-        _ => Err(SessionError(format!(
-            "SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0), got: {raw:?}"
+/// Parses the extended-thinking budget with a disable convention (qwen-code
+/// parity): an empty string or `0` yields `None` (thinking off); any other
+/// value must be a positive integer, yielding `Some(n)`. A non-integer is an
+/// error naming the accepted forms.
+fn parse_thinking_budget(raw: &str) -> Result<Option<u64>, SessionError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(SessionError(format!(
+            "SUSPENDERS_THINKING_BUDGET must be a non-negative integer (0 or empty disables), got: {raw:?}"
         ))),
     }
 }
 
-fn parse_plan_stale_after(raw: &str) -> Result<u64, SessionError> {
-    match raw.trim().parse::<u64>() {
-        Ok(n) if n > 0 => Ok(n),
+fn parse_compaction_slack(raw: &str) -> Result<f64, SessionError> {
+    match raw.trim().parse::<f64>() {
+        Ok(v) if (FRACTION_LOWER_BOUND..FRACTION_UPPER_BOUND).contains(&v) => Ok(v),
         _ => Err(SessionError(format!(
-            "SUSPENDERS_PLAN_STALE_AFTER must be a positive integer, got: {raw:?}"
+            "SUSPENDERS_COMPACTION_SLACK must be a fraction in [0.0, 1.0), got: {raw:?}"
         ))),
     }
 }
@@ -713,16 +752,6 @@ fn parse_compaction_keep(raw: &str) -> Result<f64, SessionError> {
     }
 }
 
-fn parse_bool(raw: &str, name: &str) -> Result<bool, SessionError> {
-    match raw {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(SessionError(format!(
-            "{name} must be \"true\" or \"false\", got: {raw:?}"
-        ))),
-    }
-}
-
 /// The overrides a caller supplies to [`Session::build`]; any `None` falls back
 /// to the [`SessionConfig`]. These are the constructor's keyword-style opts.
 #[derive(Debug, Clone, Default)]
@@ -731,20 +760,19 @@ pub struct SessionOpts {
     pub llm_module: Option<String>,
     pub extensions: Option<Vec<String>>,
     pub context_budget: Option<u64>,
-    pub eviction_slack: Option<f64>,
+    pub compaction_slack: Option<f64>,
     pub compaction_keep: Option<f64>,
     pub run_limit: Option<u64>,
     pub loop_stall_limit: Option<u64>,
-    pub anchor_interval: Option<u64>,
-    pub plan_stale_after: Option<u64>,
     pub malformed_retry_budget: Option<u64>,
-    pub no_think_rescue: Option<bool>,
+    pub skip_next_speaker: Option<bool>,
     pub command_timeout_ms: Option<u64>,
     pub session_dir: Option<String>,
     /// A prebuilt launch Model, bypassing scoped-id resolution (the test seam;
     /// the Provider set still resolves from config).
     pub model: Option<Model>,
     pub temperature: Option<Option<f64>>,
+    pub thinking_budget: Option<Option<u64>>,
     pub tool_call_style: Option<ToolCallStyle>,
 }
 
@@ -784,16 +812,16 @@ impl Session {
             llm_module: opts.llm_module.unwrap_or_else(|| config.llm_module.clone()),
             extensions: opts.extensions.unwrap_or_else(|| config.extensions.clone()),
             context_budget,
-            eviction_slack: opts.eviction_slack.unwrap_or(config.eviction_slack),
+            compaction_slack: opts.compaction_slack.unwrap_or(config.compaction_slack),
             compaction_keep: opts.compaction_keep.unwrap_or(config.compaction_keep),
             run_limit: opts.run_limit.unwrap_or(config.run_limit),
             loop_stall_limit: opts.loop_stall_limit.unwrap_or(config.loop_stall_limit),
-            anchor_interval: opts.anchor_interval.unwrap_or(config.anchor_interval),
-            plan_stale_after: opts.plan_stale_after.unwrap_or(config.plan_stale_after),
             malformed_retry_budget: opts
                 .malformed_retry_budget
                 .unwrap_or(config.malformed_retry_budget),
-            no_think_rescue: opts.no_think_rescue.unwrap_or(config.no_think_rescue),
+            skip_next_speaker: opts
+                .skip_next_speaker
+                .unwrap_or(config.skip_next_speaker),
             command_timeout_ms: opts.command_timeout_ms.unwrap_or(config.command_timeout_ms),
             session_dir: opts
                 .session_dir
@@ -802,6 +830,7 @@ impl Session {
             model: launch_model,
             theme: config.theme.clone(),
             temperature: opts.temperature.unwrap_or(config.temperature),
+            thinking_budget: opts.thinking_budget.unwrap_or(config.thinking_budget),
             tool_call_style: opts.tool_call_style.unwrap_or(config.tool_call_style),
             max_tokens: config.max_tokens,
         };
@@ -856,7 +885,7 @@ impl Session {
         let keep_amount =
             conversation::compaction_keep_amount(budget, model.max_tokens, self.compaction_keep);
         let trigger =
-            conversation::compaction_target(budget, model.max_tokens, self.eviction_slack);
+            conversation::compaction_target(budget, model.max_tokens, self.compaction_slack);
         if keep_amount >= trigger {
             return Err(format!(
                 "model {}: :compaction_keep is too high - the Compaction Keep must sit below the compaction trigger (fire high, keep low)",
@@ -996,11 +1025,9 @@ fn validate_scalars(s: &Session) -> Result<(), SessionError> {
     pos_int(s.model.max_tokens, "model :max_tokens")?;
     pos_int(s.run_limit, ":turn_limit")?;
     pos_int(s.loop_stall_limit, ":loop_stall_limit")?;
-    pos_int(s.anchor_interval, ":anchor_interval")?;
-    pos_int(s.plan_stale_after, ":plan_stale_after")?;
     pos_int(s.command_timeout_ms, ":command_timeout_ms")?;
 
-    fraction_left_closed(s.eviction_slack, ":eviction_slack")?;
+    fraction_left_closed(s.compaction_slack, ":compaction_slack")?;
     fraction_open(s.compaction_keep, ":compaction_keep")?;
     temperature(s.temperature)?;
     Ok(())
@@ -1192,10 +1219,9 @@ mod tests {
             llm_module: Some("SomeLLM".into()),
             extensions: Some(vec!["some_extension".into()]),
             context_budget: Some(5_000),
-            eviction_slack: Some(0.1),
+            compaction_slack: Some(0.1),
             compaction_keep: Some(0.4),
             run_limit: Some(3),
-            anchor_interval: Some(7),
             command_timeout_ms: Some(1_000),
             model: Some(test_model()),
             ..Default::default()
@@ -1204,66 +1230,17 @@ mod tests {
         assert_eq!(session.llm_module, "SomeLLM");
         assert_eq!(session.extensions, vec!["some_extension".to_string()]);
         assert_eq!(session.context_budget, Some(5_000));
-        assert_eq!(session.eviction_slack, 0.1);
+        assert_eq!(session.compaction_slack, 0.1);
         assert_eq!(session.compaction_keep, 0.4);
         assert_eq!(session.run_limit, 3);
-        assert_eq!(session.anchor_interval, 7);
         assert_eq!(session.command_timeout_ms, 1_000);
         assert_eq!(session.model.max_tokens, 1_000);
-    }
-
-    #[test]
-    fn anchor_interval_defaults_to_5_and_must_be_positive() {
-        let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.anchor_interval, 5);
-
-        let err = Session::build(
-            SessionOpts {
-                anchor_interval: Some(0),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap_err();
-        assert!(err.0.contains(":anchor_interval"));
     }
 
     #[test]
     fn compaction_keep_defaults_from_config() {
         let session = Session::build(opts(), &cfg()).unwrap();
         assert_eq!(session.compaction_keep, cfg().compaction_keep);
-    }
-
-    #[test]
-    fn plan_stale_after_defaults_to_8_and_opts_override() {
-        let session = Session::build(opts(), &cfg()).unwrap();
-        assert_eq!(session.plan_stale_after, 8);
-
-        let session = Session::build(
-            SessionOpts {
-                plan_stale_after: Some(12),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap();
-        assert_eq!(session.plan_stale_after, 12);
-    }
-
-    #[test]
-    fn plan_stale_after_must_be_positive() {
-        let err = Session::build(
-            SessionOpts {
-                plan_stale_after: Some(0),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap_err();
-        assert!(err.0.contains(":plan_stale_after"));
     }
 
     // ---- loop_stall_limit (the loop-detector knob) ----
@@ -1325,6 +1302,105 @@ mod tests {
         assert_eq!(cfg.loop_stall_limit, 7);
         let session = Session::build(opts(), &cfg).unwrap();
         assert_eq!(session.loop_stall_limit, 7);
+    }
+
+    // ---- thinking_budget (the extended-thinking knob, qwen-code parity) ----
+
+    #[test]
+    fn thinking_budget_defaults_to_qwen_codes_32000() {
+        assert_eq!(SessionConfig::base().thinking_budget, Some(32_000));
+        let session = Session::build(opts(), &cfg()).unwrap();
+        assert_eq!(session.thinking_budget, Some(32_000));
+    }
+
+    #[test]
+    fn env_thinking_budget_parses_and_disables_on_zero_or_empty() {
+        assert_eq!(parse_thinking_budget("32000").unwrap(), Some(32_000));
+        assert_eq!(parse_thinking_budget(" 16000 ").unwrap(), Some(16_000));
+        // The disable convention: 0 or empty turns extended thinking off.
+        assert_eq!(parse_thinking_budget("0").unwrap(), None);
+        assert_eq!(parse_thinking_budget("").unwrap(), None);
+        assert_eq!(parse_thinking_budget("   ").unwrap(), None);
+        assert!(
+            parse_thinking_budget("nope")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_THINKING_BUDGET must be a non-negative integer")
+        );
+    }
+
+    #[test]
+    fn file_thinking_budget_overlays_onto_base() {
+        let mut cfg = SessionConfig::test_defaults();
+        FileConfig::parse(r#"{"thinking_budget": 8000}"#)
+            .unwrap()
+            .apply(&mut cfg);
+        assert_eq!(cfg.thinking_budget, Some(8_000));
+        let session = Session::build(opts(), &cfg).unwrap();
+        assert_eq!(session.thinking_budget, Some(8_000));
+    }
+
+    #[test]
+    fn thinking_budget_opts_override_config_and_can_disable() {
+        let session = Session::build(
+            SessionOpts {
+                thinking_budget: Some(None),
+                model: Some(test_model()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        assert_eq!(session.thinking_budget, None);
+    }
+
+    // ---- skip_next_speaker (the next-speaker-check knob, ADR-0043) ----
+
+    #[test]
+    fn skip_next_speaker_defaults_off_in_base_and_on_in_test_defaults() {
+        // Production ships with the check running (base()); the test env turns
+        // it off so the loop/agent tests don't fire a side-query on every reply.
+        assert!(!SessionConfig::base().skip_next_speaker);
+        assert!(SessionConfig::test_defaults().skip_next_speaker);
+    }
+
+    #[test]
+    fn skip_next_speaker_opts_override_config() {
+        let session = Session::build(
+            SessionOpts {
+                skip_next_speaker: Some(false),
+                model: Some(test_model()),
+                ..opts()
+            },
+            &cfg(),
+        )
+        .unwrap();
+        assert!(!session.skip_next_speaker);
+    }
+
+    #[test]
+    fn env_skip_next_speaker_parses_bool_forms() {
+        assert!(parse_bool("true", "SUSPENDERS_SKIP_NEXT_SPEAKER").unwrap());
+        assert!(parse_bool(" 1 ", "SUSPENDERS_SKIP_NEXT_SPEAKER").unwrap());
+        assert!(!parse_bool("false", "SUSPENDERS_SKIP_NEXT_SPEAKER").unwrap());
+        assert!(!parse_bool("0", "SUSPENDERS_SKIP_NEXT_SPEAKER").unwrap());
+        assert!(
+            parse_bool("nope", "SUSPENDERS_SKIP_NEXT_SPEAKER")
+                .unwrap_err()
+                .0
+                .contains("SUSPENDERS_SKIP_NEXT_SPEAKER must be")
+        );
+    }
+
+    #[test]
+    fn file_skip_next_speaker_overlays_onto_base() {
+        let mut cfg = SessionConfig::test_defaults();
+        FileConfig::parse(r#"{"skip_next_speaker": false}"#)
+            .unwrap()
+            .apply(&mut cfg);
+        assert!(!cfg.skip_next_speaker);
+        let session = Session::build(opts(), &cfg).unwrap();
+        assert!(!session.skip_next_speaker);
     }
 
     // ---- the per-Model budget derivation (ADR-0037) ----
@@ -1439,13 +1515,13 @@ mod tests {
 
         assert!(
             with(SessionOpts {
-                eviction_slack: Some(1.0),
+                compaction_slack: Some(1.0),
                 model: Some(test_model()),
                 ..opts()
             })
             .unwrap_err()
             .0
-            .contains(":eviction_slack")
+            .contains(":compaction_slack")
         );
 
         assert!(
@@ -1506,7 +1582,7 @@ mod tests {
         let err = Session::build(
             SessionOpts {
                 context_budget: Some(10_000),
-                eviction_slack: Some(0.1),
+                compaction_slack: Some(0.1),
                 compaction_keep: Some(0.95),
                 model: Some(model_with_cap(1_000)),
                 ..opts()
@@ -1523,7 +1599,7 @@ mod tests {
         let session = Session::build(
             SessionOpts {
                 context_budget: Some(10_000),
-                eviction_slack: Some(0.1),
+                compaction_slack: Some(0.1),
                 compaction_keep: Some(0.5),
                 model: Some(model_with_cap(1_000)),
                 ..opts()
@@ -1604,27 +1680,6 @@ mod tests {
         );
     }
 
-    // ---- no_think_rescue ----
-
-    #[test]
-    fn no_think_rescue_defaults_to_true() {
-        assert!(Session::build(opts(), &cfg()).unwrap().no_think_rescue);
-    }
-
-    #[test]
-    fn no_think_rescue_opts_override() {
-        let session = Session::build(
-            SessionOpts {
-                no_think_rescue: Some(false),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap();
-        assert!(!session.no_think_rescue);
-    }
-
     // ---- SUSPENDERS_* env parsing/validation ----
 
     #[test]
@@ -1673,27 +1728,14 @@ mod tests {
     }
 
     #[test]
-    fn env_eviction_slack_left_closed() {
-        assert_eq!(parse_eviction_slack("0.0").unwrap(), 0.0);
+    fn env_compaction_slack_left_closed() {
+        assert_eq!(parse_compaction_slack("0.0").unwrap(), 0.0);
         assert!(
-            parse_eviction_slack("1.0")
+            parse_compaction_slack("1.0")
                 .unwrap_err()
                 .0
-                .contains("SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0)")
+                .contains("SUSPENDERS_COMPACTION_SLACK must be a fraction in [0.0, 1.0)")
         );
-    }
-
-    #[test]
-    fn env_plan_stale_after_positive_integer() {
-        assert_eq!(parse_plan_stale_after("12").unwrap(), 12);
-        assert_eq!(parse_plan_stale_after(" 8 ").unwrap(), 8);
-        assert!(
-            parse_plan_stale_after("0")
-                .unwrap_err()
-                .0
-                .contains("SUSPENDERS_PLAN_STALE_AFTER must be a positive integer")
-        );
-        assert!(parse_plan_stale_after("eight").is_err());
     }
 
     #[test]
@@ -1710,18 +1752,6 @@ mod tests {
                 .unwrap_err()
                 .0
                 .contains("(0.0, 1.0)")
-        );
-    }
-
-    #[test]
-    fn env_bool_true_false_only() {
-        assert!(parse_bool("true", "SUSPENDERS_NO_THINK_RESCUE").unwrap());
-        assert!(!parse_bool("false", "SUSPENDERS_NO_THINK_RESCUE").unwrap());
-        assert_eq!(
-            parse_bool("yes", "SUSPENDERS_NO_THINK_RESCUE")
-                .unwrap_err()
-                .0,
-            "SUSPENDERS_NO_THINK_RESCUE must be \"true\" or \"false\", got: \"yes\""
         );
     }
 
@@ -1846,12 +1876,12 @@ mod tests {
         let before_budget = cfg.context_budget;
         let fc = FileConfig {
             model: Some("overlaid/model".into()),
-            plan_stale_after: Some(11),
+            loop_stall_limit: Some(11),
             ..Default::default()
         };
         fc.apply(&mut cfg);
         assert_eq!(cfg.model, "overlaid/model");
-        assert_eq!(cfg.plan_stale_after, 11);
+        assert_eq!(cfg.loop_stall_limit, 11);
         // Absent fields untouched.
         assert_eq!(cfg.context_budget, before_budget);
     }
@@ -1860,11 +1890,11 @@ mod tests {
     fn out_of_range_file_value_surfaces_via_the_build_path() {
         // Range errors are NOT caught by parse(); they surface at validate().
         let mut cfg = SessionConfig::test_defaults();
-        FileConfig::parse(r#"{"eviction_slack": 1.0}"#)
+        FileConfig::parse(r#"{"compaction_slack": 1.0}"#)
             .unwrap()
             .apply(&mut cfg);
         let err = Session::build(opts(), &cfg).unwrap_err();
-        assert!(err.0.contains(":eviction_slack"));
+        assert!(err.0.contains(":compaction_slack"));
     }
 
     #[test]
@@ -1890,8 +1920,8 @@ mod tests {
             Some(SessionConfig::base().model.as_str())
         );
         assert_eq!(
-            fc.plan_stale_after,
-            Some(SessionConfig::base().plan_stale_after)
+            fc.loop_stall_limit,
+            Some(SessionConfig::base().loop_stall_limit)
         );
         // The providers table rides the template, tokenless.
         let providers = fc.providers.clone().unwrap();
@@ -1974,12 +2004,10 @@ mod tests {
         // The one deliberate absence besides token (ADR-0037): the base config
         // carries no global budget cap, so the template writes none.
         assert!(fc.context_budget.is_none());
-        assert!(fc.eviction_slack.is_some());
+        assert!(fc.compaction_slack.is_some());
         assert!(fc.compaction_keep.is_some());
         assert!(fc.loop_stall_limit.is_some());
-        assert!(fc.plan_stale_after.is_some());
         assert!(fc.malformed_retry_budget.is_some());
-        assert!(fc.no_think_rescue.is_some());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2054,9 +2082,8 @@ mod tests {
         set_env("SUSPENDERS_CONTEXT_BUDGET", "48000");
         set_env("SUSPENDERS_MAX_TOKENS", "2048");
         set_env("SUSPENDERS_TEMPERATURE", "1.5");
-        set_env("SUSPENDERS_EVICTION_SLACK", "0.25");
+        set_env("SUSPENDERS_COMPACTION_SLACK", "0.25");
         set_env("SUSPENDERS_COMPACTION_KEEP", "0.4");
-        set_env("SUSPENDERS_PLAN_STALE_AFTER", "6");
         // The 0-disables knob proves non-negative (not positive) parsing.
         set_env("SUSPENDERS_MALFORMED_RETRY_BUDGET", "0");
 
@@ -2066,22 +2093,9 @@ mod tests {
         assert_eq!(cfg.context_budget, Some(48_000));
         assert_eq!(cfg.max_tokens, 2048);
         assert_eq!(cfg.temperature, Some(1.5));
-        assert_eq!(cfg.eviction_slack, 0.25);
+        assert_eq!(cfg.compaction_slack, 0.25);
         assert_eq!(cfg.compaction_keep, 0.4);
-        assert_eq!(cfg.plan_stale_after, 6);
         assert_eq!(cfg.malformed_retry_budget, 0);
-    }
-
-    #[test]
-    fn apply_env_overlays_the_bool_vars_onto_their_fields() {
-        clear_suspenders_env();
-        set_env("SUSPENDERS_NO_THINK_RESCUE", "false");
-
-        // test_defaults has true, so the landing is visible.
-        let mut cfg = SessionConfig::test_defaults();
-        SessionConfig::apply_env(&mut cfg).unwrap();
-
-        assert!(!cfg.no_think_rescue);
     }
 
     #[test]
@@ -2131,10 +2145,6 @@ mod tests {
             env_error("SUSPENDERS_MAX_TOKENS", "0"),
             "SUSPENDERS_MAX_TOKENS must be a positive integer, got: \"0\""
         );
-        assert_eq!(
-            env_error("SUSPENDERS_PLAN_STALE_AFTER", "0"),
-            "SUSPENDERS_PLAN_STALE_AFTER must be a positive integer, got: \"0\""
-        );
     }
 
     #[test]
@@ -2150,13 +2160,13 @@ mod tests {
 
     #[test]
     fn apply_env_rejects_an_out_of_range_fraction() {
-        // eviction_slack is half-open [0.0, 1.0): 1.0 falls outside.
+        // compaction_slack is half-open [0.0, 1.0): 1.0 falls outside.
         clear_suspenders_env();
-        set_env("SUSPENDERS_EVICTION_SLACK", "1.0");
+        set_env("SUSPENDERS_COMPACTION_SLACK", "1.0");
         let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert_eq!(
             err.0,
-            "SUSPENDERS_EVICTION_SLACK must be a fraction in [0.0, 1.0), got: \"1.0\""
+            "SUSPENDERS_COMPACTION_SLACK must be a fraction in [0.0, 1.0), got: \"1.0\""
         );
 
         // compaction_keep is open (0.0, 1.0): the endpoints fall outside.
@@ -2170,20 +2180,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_env_rejects_a_non_boolean_flag() {
-        assert_eq!(
-            env_error("SUSPENDERS_NO_THINK_RESCUE", "1"),
-            "SUSPENDERS_NO_THINK_RESCUE must be \"true\" or \"false\", got: \"1\""
-        );
-    }
-
-    #[test]
     fn apply_env_reports_the_first_malformed_value_in_table_order() {
         // Two malformed values: the error names the one whose row comes first
-        // (CONTEXT_BUDGET precedes NO_THINK_RESCUE in ENV_OVERRIDES).
+        // (CONTEXT_BUDGET precedes MALFORMED_RETRY_BUDGET in ENV_OVERRIDES).
         clear_suspenders_env();
         set_env("SUSPENDERS_CONTEXT_BUDGET", "nope");
-        set_env("SUSPENDERS_NO_THINK_RESCUE", "yes");
+        set_env("SUSPENDERS_MALFORMED_RETRY_BUDGET", "yes");
         let err = SessionConfig::apply_env(&mut SessionConfig::test_defaults()).unwrap_err();
         assert!(err.0.contains("SUSPENDERS_CONTEXT_BUDGET"));
     }

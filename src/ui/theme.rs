@@ -284,14 +284,15 @@ theme_slots! {
     /// The dim `│` run-lane spine the agent's whole Run hangs off (ADR-0040):
     /// background chrome, so it recedes like the machinery plane.
     lane_spine,
-    /// The Housekeeping marker plane (ADR-0040): Eviction, Compaction,
-    /// Result-Cap cuts. Neutral gray - routine tidying, not a Governor.
+    /// The Housekeeping marker plane (ADR-0040): Compaction, Result-Cap cuts.
+    /// Neutral gray - routine tidying, not a judgment.
     marker_housekeeping,
-    /// The Aid marker plane (ADR-0040): a Governor helping the model - Nudges,
-    /// plan/anchor refresh, Recovery. Warm amber, kept clear of error-red.
+    /// The Aid marker plane (ADR-0040): a marker that helps the model. Warm
+    /// amber, kept clear of error-red. Reserved - no producer emits it since
+    /// the nudge apparatus was removed.
     marker_aid,
-    /// The Constrain marker plane (ADR-0040): a Governor limiting the model -
-    /// tool-narrowing, the Endgame's run-close. Cool blue, clear of green.
+    /// The Constrain marker plane (ADR-0040): a guard limiting the model - the
+    /// loop-detector's run-close. Cool blue, clear of green.
     marker_constrain,
     /// Assistant markdown headings.
     heading,

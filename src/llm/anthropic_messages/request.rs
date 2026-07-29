@@ -20,11 +20,12 @@ use crate::tool::ToolSpec;
 ///
 /// Sets the model (the Model's bare id - scoping is a Suspenders fact, not a
 /// wire one), system prompt, max_tokens (the Model's output cap), streaming
-/// flag, messages, tool specs, and (conditionally) temperature and the
-/// no-think field. Keys the server should default are omitted, not sent empty:
-/// no `"tools"` when `tools` is empty (a Compaction request offers none, and
-/// so does the Scout's forced report Pass - ADR-0014), no `"temperature"` when
-/// the request carries `None` (sampling stays with the server).
+/// flag, messages, tool specs, and (conditionally) temperature, the no-think
+/// field, and the extended-thinking budget (mutually exclusive with no-think).
+/// Keys the server should default are omitted, not sent empty:
+/// no `"tools"` when `tools` is empty (a Compaction request offers none),
+/// no `"temperature"` when the request carries `None` (sampling stays with the
+/// server).
 pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
     let mut obj = Map::new();
     obj.insert("model".into(), json!(model.id));
@@ -47,10 +48,25 @@ pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
         obj.insert("temperature".into(), json!(temp));
     }
 
+    // no_think and the thinking budget are mutually exclusive: no_think means
+    // "answer directly, no reasoning" (the checkNextSpeaker side-query), so it
+    // suppresses the thinking param. Otherwise a Some budget arms extended
+    // thinking, which keeps the local reasoning model producing a Thinking
+    // block THEN a Tool Call every turn (qwen-code parity).
+    //
+    // NB: qwen-code sends budget_tokens (32000) larger than max_tokens (8000)
+    // and llama.cpp accepts it - so no max_tokens>budget guard here. A real
+    // Claude endpoint would reject budget>max_tokens, but the target here is
+    // the local reasoning model.
     if request.no_think {
         obj.insert(
             "chat_template_kwargs".into(),
             json!({ "enable_thinking": false }),
+        );
+    } else if let Some(budget) = request.thinking_budget {
+        obj.insert(
+            "thinking".into(),
+            json!({ "type": "enabled", "budget_tokens": budget }),
         );
     }
 
@@ -254,6 +270,43 @@ mod tests {
                 .unwrap()
                 .get("chat_template_kwargs")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn thinking_budget_arms_extended_thinking_when_set_and_not_no_think() {
+        let armed = build_request(
+            &LlmRequest::new("s", vec![], vec![]).with_thinking_budget(Some(32_000)),
+            &model(),
+        );
+        assert_eq!(
+            armed["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 32_000 })
+        );
+    }
+
+    #[test]
+    fn nil_thinking_budget_omits_the_thinking_key() {
+        // Unset budget: no thinking param at all.
+        let plain = build("s", vec![], vec![]);
+        assert!(plain.as_object().unwrap().get("thinking").is_none());
+    }
+
+    #[test]
+    fn no_think_suppresses_the_thinking_budget_even_when_set() {
+        // no_think means "answer directly, no reasoning": the two are mutually
+        // exclusive, so a no-think request carries chat_template_kwargs and NO
+        // thinking param, even with a budget set (the checkNextSpeaker query).
+        let req = build_request(
+            &LlmRequest::new("s", vec![], vec![])
+                .with_no_think(true)
+                .with_thinking_budget(Some(32_000)),
+            &model(),
+        );
+        assert!(req.as_object().unwrap().get("thinking").is_none());
+        assert_eq!(
+            req["chat_template_kwargs"],
+            json!({ "enable_thinking": false })
         );
     }
 

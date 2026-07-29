@@ -2,7 +2,7 @@
 
 A local-first terminal coding agent: a full-screen TUI where an LLM - a locally-served small model by default, any configured provider's model when you switch - completes coding tasks in your project by calling tools.
 
-Big hosted models tolerate a sloppy context. Small local ones don't - their attention rots on stale tool output and superseded edits long before you run out of tokens. Suspenders is built around that constraint. It evicts dead content, compacts old history into summaries, and runs a set of governors that watch the model and intervene when it drifts. The goal is to keep a model small enough to run on your laptop on task long enough to finish one.
+Big hosted models tolerate a sloppy context. Small local ones don't - their attention rots on stale tool output and superseded edits long before you run out of tokens. Suspenders is built around that constraint. It compacts old history into summaries before the window fills, and pairs that with a strong static prompt and a plain ReAct loop tuned for small local models. The goal is to keep a model small enough to run on your laptop on task long enough to finish one.
 
 It ports an earlier Elixir project (Baud/Breeze); this is the Rust rewrite.
 
@@ -10,7 +10,7 @@ It ports an earlier Elixir project (Baud/Breeze); this is the Rust rewrite.
 
 Launch it in a project, describe a task, and the model reads code, greps, edits files, and runs commands until the work settles. The TUI streams the model's thinking, collapses tool results into summaries, shows diffs instead of prose for writes, and gates `run_command` behind an approval prompt. Every session is written to an append-only JSONL log you can resume from.
 
-Tools: `read_file`, `write_file`, `edit_file`, `list_files`, `grep`, `run_command`, `explore` (dispatches a read-only scout), `plan`, `web_fetch`.
+Tools: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`, `web_fetch`, `todo_write`.
 
 ## The unit of work
 
@@ -18,11 +18,8 @@ A **run** is one user request and everything the agent does to answer it. Within
 
 ## How the context stays alive
 
-- **Eviction**: stale content (old tool results, superseded blocks, the bodies of successful writes) is mechanically replaced with an elision marker. Dead mass has its own trigger, separate from budget pressure, because it rots attention first.
-- **Compaction**: when the conversation crosses its target, old blocks are summarized by the model and recent history is kept verbatim.
-- **Governors**: tunable rules that watch each pass and intervene through a closed set of actions (nudge, refresh the plan anchor, narrow the offered tools, close the run, open a recovery run). Anchor, Duplicate, Empty, Failure, Explore, Endgame.
-- **Endgame**: a run ends at its run limit on a fixed schedule, not on a request. Wrap-up warning, then a verification pass (`run_command` only) if writes are unverified, then a final pass with no tools. Small models comply with mechanics, not asks.
-- **Recovery runs**: if a run caps out with unverified writes or a dangling failure, the harness issues one more bounded attempt. Default shape is Handoff: retire the degraded conversation, seed a fresh one from a structured summary.
+- **Compaction**: when the conversation crosses its target, old blocks are summarized by the model and recent history is kept verbatim. This is the only context-reclaiming path (ADR-0045).
+- **Compaction slack**: `compaction_slack` carves headroom below the Context Budget, lowering the compaction target so a summary fires before the window is truly full.
 
 The vocabulary is deliberate. `CONTEXT.md` is the glossary, the ubiquitous language of the domain and the single source of truth for what these words mean. Architecture decisions live in `docs/adr/`. The module tree mirrors the glossary (ADR-0022).
 
@@ -68,12 +65,12 @@ Keys in `config.json`:
 |---|---|---|
 | `model` | `local/qwen/Qwen3.6-27B-MTP-GGUF` | the active model, scoped `provider/model-id` |
 | `providers` | `local` → `localhost:8888/v1` | a table of providers, each with `base_url`, `api`, and optionally `token` / `context_window` |
-| `max_tokens` | 8000 | output cap; the eviction reserve derives from it |
+| `max_tokens` | 8000 | output cap; the reply reserve derives from it |
 | `temperature` | 0.7 | sampling temperature, omitted if unset |
 | `context_budget` | model window | optional global cap on the conversation's token allowance; unset means each model's own window is the budget |
 | `theme` | `dark` | color theme; `/theme` switches it live |
 
-The setpoints that encode small-model tuning (`eviction_slack`, `dead_mass_fraction`, `compaction_keep`, `plan_stale_after`, `recovery_limit`, `recovery_shape`, `malformed_retry_budget`, `scout_no_think`, `no_think_rescue`) are config keys too, each with a `SUSPENDERS_*` env override.
+The setpoints that encode small-model tuning (`compaction_slack`, `compaction_keep`, `malformed_retry_budget`, `loop_stall_limit`, `tool_call_style`) are config keys too, each with a `SUSPENDERS_*` env override.
 
 ## Layout
 
@@ -81,10 +78,9 @@ The setpoints that encode small-model tuning (`eviction_slack`, `dead_mass_fract
 src/main.rs        CLI parsing
 src/app.rs         composition root: run_tui / run_headless
 src/agent.rs       orchestrator: runs runs, spawned over channels (ADR-0017)
-src/run/           the pass loop, batch execution, settlement, governors, endgame
+src/run/           the pass loop, batch execution, settlement
 src/llm/           Api adapters (anthropic-messages, openai-completions), providers, the Catalog (ADR-0037)
 src/tools/         the tools
-src/scout.rs       disposable read-only worker (the explore tool)
 src/conversation.rs / compaction.rs   history + the summary that shrinks it
 src/middleware.rs / src/presenter.rs / src/extensions/   the extension pipeline: diff, run_command, condense
 src/ui/            ratatui TUI: viewport, composer, transcript, streaming, slash menu

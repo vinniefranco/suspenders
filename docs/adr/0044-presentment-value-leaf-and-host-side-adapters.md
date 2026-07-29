@@ -8,9 +8,9 @@ several small two-cycles knotted together, each the same shape: a type defined
 in a "high" module (`ui`, `run`, `agent`) but imported by a module that the high
 module in turn depends on. `event` imported `ui::{Tone, SelectorRow}` while `ui`
 imported `event::Event`; `run` imported `agent::{Msg, RunMsg}` while `agent`
-imported `run`; `event` reached into `run::governor::endgame::ReopenReason` while
-`run` imported `event`. The domain layer was reaching outward into the layers
-that should depend on it.
+imported `run`; `event` reached into a settlement-domain enum defined under
+`run` while `run` imported `event`. The domain layer was reaching outward into
+the layers that should depend on it.
 
 ## Decision
 
@@ -42,12 +42,12 @@ new abstraction:
    llm }` the host builds its tooling from, rather than reaching into a
    particular adapter's fields. `run` no longer imports `agent`.
 
-A recovery-domain enum, `ReopenReason`, followed the same principle by a third
-route: it is vocabulary the Endgame Governor *produces* but the event, log,
-voice, and ui layers *consume*, and its own doc already modelled it as a sibling
-of `session::RecoveryShape` (same `as_str`/`parse` pairing). It moves next to
-`RecoveryShape` in `session`; the Endgame produces values of a type it imports.
-`event` no longer imports `run`.
+A settlement-domain enum followed the same principle by a third route: it was
+vocabulary a Run's finish path *produced* but the event, log, voice, and ui
+layers *consumed*, so it belonged with the settlement vocabulary in `session`
+that those layers already depend on, not under `run`. Moving it there let the
+producer import the type rather than the reverse, and `event` no longer imports
+`run`.
 
 The dependency direction now points inward: `view_model` and the domain
 vocabulary sit at the bottom; `run`, `ui`, and `agent` orchestrate above them

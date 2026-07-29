@@ -27,17 +27,21 @@ impl Tool for WebFetch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_fetch".into(),
-            description: "Fetch a web page or documentation URL over http/https and return its \
-                readable text (HTML is converted to plain text). Use this to look up \
-                documentation for a library, API, or error message. Large pages are truncated. \
-                The user must approve each URL before it is fetched."
+            description: "Fetch an http/https URL and return its readable text. \
+                Usage:\n\
+                - HTML is converted to plain text; other text/* and JSON pass through raw.\n\
+                - Use this to look up documentation for a library, API, or an error message, \
+                e.g. \"https://docs.rs/tokio\".\n\
+                - Large pages are truncated automatically.\n\
+                - The user must approve each URL before it is fetched."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The full http/https URL to fetch, e.g. \"https://docs.rs/tokio\"."
+                        "description": "The full http/https URL to fetch, e.g. \
+                            \"https://docs.rs/tokio\"."
                     }
                 },
                 "required": ["url"]

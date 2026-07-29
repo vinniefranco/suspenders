@@ -27,7 +27,7 @@ lands on the **next Run**; an in-flight Run finishes on the model it started
 with. No mid-stream swap, no synchronization.
 
 **Only the model identifier changes.** The identifier is inert everywhere except
-`request::build_request` (the wire `model` field); `result_cap`, the Eviction
+`request::build_request` (the wire `model` field); `result_cap`, the reply
 reserve, and the budget invariants all derive from `max_tokens` and
 `context_budget`, never the model name. So swapping the identifier alone needs
 **no re-validation**. The price: switching to a model with a smaller context
@@ -94,7 +94,7 @@ decisions here:
 - **"Only the model identifier changes" is superseded.** The Active Model
   becomes a scoped `provider/model-id`, and each Run captures the whole
   Model - window, output cap, pricing, compat - not just the id. The
-  Context Budget, Result Cap, and Eviction reserve derive from that capture
+  Context Budget, Result Cap, and reply reserve derive from that capture
   at Run start, so a cross-Provider switch lands as ordinary budget
   pressure on the next Run instead of a silent mismatch.
 - **The registry rejection is reversed.** A generated Catalog (models.dev)

@@ -10,28 +10,45 @@ use serde_json::{Value, json};
 
 pub struct ReadFile;
 
+const DESCRIPTION: &str = "\
+Reads and returns the text content of a specified file. If the file is large, the content will be \
+truncated. The tool's response will clearly indicate if truncation has occurred and will provide \
+the `start_line` value you can pass back to read more of the file. This tool reads text files and \
+returns their contents; it can read a specific window of a file by line.\n\
+\n\
+Usage:\n\
+- Always read a file with this tool before you edit it, so that edit_file's `old_str` matches the \
+real text exactly, including whitespace and indentation.\n\
+- The `path` is relative to the project root (e.g. \"src/main.rs\" or \"Cargo.toml\"), NOT an \
+absolute path.\n\
+- Large files are truncated to keep the response manageable. When that happens, a note at the cut \
+tells you the exact `start_line` to continue from; call read_file again with that `start_line` to \
+page through the rest of the file. Repeat until you have read everything you need.\n\
+- `start_line` is 1-based and defaults to 1 (the top of the file).\n\
+- If you are unsure the file exists, run list_files or grep first.";
+
 #[async_trait::async_trait]
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description:
-                "Read the contents of a text file. Always read a file before you edit it. \
-                Long output is truncated with a note naming the start_line that continues \
-                the read - pass it to page through a large file. \
-                If you are unsure the file exists, use list_files or grep first."
-                    .into(),
+            description: DESCRIPTION.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path relative to the project root, e.g. \"src/main.rs\"."
+                        "description": "The path of the file to read, relative to the project root \
+                            (e.g. \"src/main.rs\" or \"Cargo.toml\"). Do not pass an absolute \
+                            path."
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "1-based line to start reading from (default 1). A truncated \
-                            read's note names the value that continues it."
+                        "description": "Optional 1-based line number to start reading from \
+                            (default 1). Use it to page through a large file: when a read is \
+                            truncated, the truncation note names the exact start_line that \
+                            continues where it left off - pass that value back to read the next \
+                            window."
                     }
                 },
                 "required": ["path"]

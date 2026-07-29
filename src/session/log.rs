@@ -49,8 +49,9 @@ use crate::voice::{self, FileOps};
 /// A Run's terminal stop reason as it enters the Session Log and the
 /// settlement event. Spans the LLM-reported reasons that ride through a
 /// completed Run (`end_turn`, `max_tokens`, ...) and the Run-Limit reasons
-/// the Endgame mints (`turn_limit`, `turn_limit_stuck`). `Error`/`Unknown` are
-/// the synthetic reasons Settlement writes for failed/cancelled Runs.
+/// the loop mints (`turn_limit` at the max-turns bound, `turn_limit_stuck`
+/// when the loop-detector trips). `Error`/`Unknown` are the synthetic reasons
+/// Settlement writes for failed/cancelled Runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     EndTurn,
@@ -508,7 +509,7 @@ fn utc_stamp() -> String {
 /// `context_budget`, and `turn_limit` (drift-checked in [`drift`]; the resuming
 /// Session's value wins and the difference is reported). Everything else the
 /// Session resolves at launch is deliberately NOT persisted: Setpoints such as
-/// `eviction_slack` and `compaction_keep` are user-tunable (ADR-0031) and simply
+/// `compaction_slack` and `compaction_keep` are user-tunable (ADR-0031) and simply
 /// yield to the resuming Session's values, so they are neither logged nor
 /// drift-checked. When adding a Session field, decide which it is - a durable
 /// fact (add it here AND to [`drift`]) or a Setpoint (omit it; it takes the
@@ -1439,8 +1440,8 @@ mod tests {
     }
 
     #[test]
-    fn a_setpoint_like_eviction_slack_yields_on_resume_and_never_drifts() {
-        // eviction_slack is a Setpoint (ADR-0031), not a durable header fact: it
+    fn a_setpoint_like_compaction_slack_yields_on_resume_and_never_drifts() {
+        // compaction_slack is a Setpoint (ADR-0031), not a durable header fact: it
         // is never persisted, so a resuming Session with a different value
         // reports NO drift for it and simply keeps its own value.
         let tmp = TempDir::new().unwrap();
@@ -1452,7 +1453,7 @@ mod tests {
                 SessionOpts {
                     root: Some(root.clone()),
                     session_dir: Some(session_dir.clone()),
-                    eviction_slack: Some(slack),
+                    compaction_slack: Some(slack),
                     ..Default::default()
                 },
                 &SessionConfig::test_defaults(),
@@ -1467,9 +1468,9 @@ mod tests {
         let resuming = build(0.25);
         let (_messages, drift) = resume(&log.path, &resuming).unwrap();
 
-        assert!(!drift.iter().any(|d| d.key == "eviction_slack"));
+        assert!(!drift.iter().any(|d| d.key == "compaction_slack"));
         // The resuming Session keeps its own Setpoint; the logged 0.15 is gone.
-        assert_eq!(resuming.eviction_slack, 0.25);
+        assert_eq!(resuming.compaction_slack, 0.25);
     }
 
     #[test]
@@ -1587,7 +1588,7 @@ mod tests {
         // The same ops feed the Session Log so the log mirrors the live events.
         let (_tmp, session, mut log) = open_log();
 
-        let opts = ConversationOpts::new(2000, 500).eviction_slack(0.0);
+        let opts = ConversationOpts::new(2000, 500).compaction_slack(0.0);
         let mut conv = Conversation::new("You are Baud.", opts);
         for i in (1..=5).rev() {
             let body = format!("{}: turn {i}", "line ".repeat(50));

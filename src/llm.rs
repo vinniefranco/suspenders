@@ -1,6 +1,6 @@
 //! The LLM client boundary (ADR-0002, ADR-0037).
 //!
-//! Callers - the Run, the Scout, and Compaction - speak only the typed shapes
+//! Callers - the Run and Compaction - speak only the typed shapes
 //! here: an [`LlmRequest`] plus the captured [`Model`]. Wire building, headers,
 //! SSE decoding, stop-reason mapping, and usage extraction all live behind the
 //! [`Llm`] trait, one adapter module per [`Api`]:
@@ -115,9 +115,18 @@ pub struct LlmRequest {
     /// Top-k sampling cutoff; `None` leaves it to the server. Like `top_p`,
     /// only the OpenAI-completions wire builder emits it, and only when set.
     pub top_k: Option<u64>,
-    /// The break-glass no-think rescue flag (DESIGN.md: Empty-response Nudge)
-    /// and the Scout default (ADR-0014).
+    /// The break-glass no-think request flag: when set, the wire builders tell
+    /// the server to skip the model's Thinking for this request.
     pub no_think: bool,
+    /// The extended-thinking token budget (qwen-code parity): when `Some(n)`,
+    /// the Anthropic wire builder emits `thinking: {type: "enabled",
+    /// budget_tokens: n}`, which keeps the local reasoning model producing a
+    /// Thinking block THEN a Tool Call every turn (an unset budget lets it
+    /// think and stop, an empty turn). `None` omits it. Mutually exclusive with
+    /// `no_think`: a no-think request suppresses it (answer directly, no
+    /// reasoning). Only the Anthropic-messages wire reads it - the OpenAI path
+    /// gets reasoning via `reasoning_content` and needs no thinking param.
+    pub thinking_budget: Option<u64>,
     /// How the stream adapter resolves Tool Calls (qwen parity). Only the
     /// OpenAI-completions adapter reads it; [`ToolCallStyle::Auto`] by default.
     pub tool_call_style: ToolCallStyle,
@@ -133,12 +142,18 @@ impl LlmRequest {
             top_p: None,
             top_k: None,
             no_think: false,
+            thinking_budget: None,
             tool_call_style: ToolCallStyle::Auto,
         }
     }
 
     pub fn with_no_think(mut self, no_think: bool) -> Self {
         self.no_think = no_think;
+        self
+    }
+
+    pub fn with_thinking_budget(mut self, thinking_budget: Option<u64>) -> Self {
+        self.thinking_budget = thinking_budget;
         self
     }
 

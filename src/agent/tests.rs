@@ -833,11 +833,10 @@ async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
     assert_eq!(info.drift, vec![]);
 }
 
-// ---- riders in the Session Log (Anchors + Endgame prompts) ------------
+// ---- a multi-Pass Run in the Session Log ------------------------------
 
-// Session facts tuned so riders fire: run_limit 4 puts the wrap-up
-// warning on Pass 2 and the final-Pass prompt on Pass 3; anchor_interval 2
-// places an Anchor on Pass 2.
+// A Session with run_limit 4 so the exploration script runs several Passes
+// and writes a multi-message Conversation to the log for the resume check.
 fn rider_session(dir: &TempDir) -> Session {
     let root = dir.path().to_string_lossy().into_owned();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -846,7 +845,6 @@ fn rider_session(dir: &TempDir) -> Session {
             root: Some(root),
             session_dir: Some(session_dir),
             run_limit: Some(4),
-            anchor_interval: Some(2),
             ..Default::default()
         },
         &SessionConfig::test_defaults(),
@@ -887,7 +885,7 @@ async fn a_run_that_carried_riders_resumes_byte_for_byte() {
     .expect("resumes");
 
     // The reconstructed Conversation carries the same bytes the model
-    // read live - Anchor and Endgame prompts included.
+    // read live.
     assert_eq!(resumed.conversation().await.messages, live.messages);
 }
 
@@ -896,8 +894,8 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     let (_dir, session, first, mut rx) = harness_with_session(vec![
         Entry::just(tool_use_result(
             "p1",
-            "plan",
-            json!({ "plan": "Goal: Y. 1. do [ ]" }),
+            "todo_write",
+            json!({ "todos": [{ "content": "do Y", "status": "in_progress" }] }),
         )),
         Entry::just(text_end("planned")),
     ]);
@@ -906,7 +904,7 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     first.submit("do Y").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
 
-    assert_eq!(first.plan().await.as_deref(), Some("Goal: Y. 1. do [ ]"));
+    assert_eq!(first.plan().await.as_deref(), Some("[~] do Y"));
     drop(first);
 
     let path = log::latest(&session_dir).expect("a log file");
@@ -917,7 +915,7 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     )
     .expect("resumes");
 
-    assert_eq!(resumed.plan().await.as_deref(), Some("Goal: Y. 1. do [ ]"));
+    assert_eq!(resumed.plan().await.as_deref(), Some("[~] do Y"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -942,9 +940,29 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             // doubled the prompt and moved it from 4800; the Scout removal
             // (Group E: dropped the explore tool spec and reworded the
             // Understand step to inline grep/list_files/read_file) shrank both
-            // the prompt and the tool-spec overhead and moved it from 5900).
-            context_budget: Some(5750),
-            eviction_slack: Some(0.3),
+            // the prompt and the tool-spec overhead and moved it from 5900;
+            // Stage 4a (added the glob tool spec and rewrote every tool
+            // description in qwen-code's concrete style) grew the tool-spec
+            // overhead and moved it from 5750; Stage 4b (replaced the flat
+            // one-string `plan` tool with the nested `todos` array `todo_write`
+            // spec and reworded the Plan Workflow step) grew the tool-spec
+            // overhead again and moved it from 6480; the faithful qwen-code
+            // tool-description port (Stage 4c: each of the 8 tool descriptions
+            // rewritten to carry qwen-code's full depth - todo_write alone
+            // ~9.3k chars, run_command ~4.2k, edit_file ~1.8k - grew the
+            // serialized tool-spec overhead from ~7.9k to ~25.3k chars, about
+            // +5.0k tokens on every request's estimate) moved it from 6900).
+            //
+            // Retune mechanism: `Compaction::proactive` fires when
+            // `token_estimate > compaction_target`, with `compaction_target =
+            // budget - reserve(200) - trunc(0.3 * budget) ~= 0.7*budget - 200`.
+            // The estimate is `ceil((overhead + system_prompt + messages)/3.5)`
+            // and is INDEPENDENT of `budget`, so `budget` is the free knob that
+            // slides the target. Measured estimates here are run2 ~9411 tokens
+            // and run3 ~9770; budget 13786 puts the target at 9451, which sits
+            // between them so exactly the third Run crosses.
+            context_budget: Some(13786),
+            compaction_slack: Some(0.3),
             compaction_keep: Some(0.1),
             ..Default::default()
         },
@@ -1279,7 +1297,13 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
         crate::session::ProviderConfig {
             base_url: "http://localhost:0/v1".into(),
             api: Api::AnthropicMessages,
-            context_window: Some(4_000),
+            // A narrower window than the 64k launch window, but still wide
+            // enough to hold the tool-spec overhead (~25.3k chars ~= 7.2k
+            // tokens after the faithful qwen-code description port) plus the
+            // reserve and a small Conversation - otherwise the post-swap Run
+            // can never fit its request and this test would hang. The value
+            // only has to be distinct from the launch window for the assertion.
+            context_window: Some(16_000),
             token: None,
         },
     );
@@ -1313,5 +1337,5 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
     agent.set_model("tiny/m".into()).await.unwrap();
     agent.submit("second").await.unwrap();
     let ev = recv_match(&mut rx, is_run_finished).await;
-    assert_eq!(finished_budget(&ev), Some(4_000), "the captured window");
+    assert_eq!(finished_budget(&ev), Some(16_000), "the captured window");
 }

@@ -6,12 +6,13 @@
 //! extension-free dispatch path.
 
 pub mod edit_file;
+pub mod glob;
 pub mod grep;
 pub mod list_files;
-pub mod plan;
 pub mod read_file;
 pub mod run_command;
 pub mod shaping;
+pub mod todo_write;
 pub mod web_fetch;
 pub mod write_file;
 
@@ -26,14 +27,15 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-// The registry, in prompt order. The plan Tool leads so a small model sees it
-// first and plans early (CONTEXT.md: Plan). Boxed trait objects so the async
-// `run` stays object-safe (async-trait).
+// The registry, in prompt order. The todo_write Tool leads so a small model
+// sees it first and records its task list early (CONTEXT.md: Plan). Boxed trait
+// objects so the async `run` stays object-safe (async-trait).
 fn tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(plan::PlanTool),
+        Box::new(todo_write::TodoWriteTool),
         Box::new(read_file::ReadFile),
         Box::new(list_files::ListFiles),
+        Box::new(glob::Glob),
         Box::new(grep::Grep),
         Box::new(edit_file::EditFile),
         Box::new(write_file::WriteFile),
@@ -45,14 +47,6 @@ fn tools() -> Vec<Box<dyn Tool>> {
 /// All tool specs, in prompt order.
 pub fn specs() -> Vec<ToolSpec> {
     tools().iter().map(|t| t.spec()).collect()
-}
-
-/// Tool specs for the Verification Pass (ADR-0016): run_command only.
-pub fn verification_specs() -> Vec<ToolSpec> {
-    specs()
-        .into_iter()
-        .filter(|s| s.name == "run_command")
-        .collect()
 }
 
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
@@ -108,9 +102,10 @@ mod tests {
     use tempfile::TempDir;
 
     const EXPECTED_NAMES: &[&str] = &[
-        "plan",
+        "todo_write",
         "read_file",
         "list_files",
+        "glob",
         "grep",
         "edit_file",
         "write_file",
@@ -129,8 +124,8 @@ mod tests {
     // ---- all/specs ----
 
     #[test]
-    fn returns_every_tool_in_prompt_order_plan_first() {
-        assert_eq!(tools().len(), 8);
+    fn returns_every_tool_in_prompt_order_todo_write_first() {
+        assert_eq!(tools().len(), 9);
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
     }

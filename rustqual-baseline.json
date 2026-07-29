@@ -1,25 +1,25 @@
 {
   "version": 2,
-  "quality_score": 0.9302037051156744,
-  "iosp_score": 0.99812734082397,
+  "quality_score": 0.9405002068367102,
+  "iosp_score": 0.9976998274870615,
   "violations": 4,
-  "total": 3242,
+  "total": 2637,
   "complexity_warnings": 0,
-  "magic_number_warnings": 10,
+  "magic_number_warnings": 9,
   "nesting_depth_warnings": 0,
   "function_length_warnings": 0,
   "unsafe_warnings": 2,
-  "error_handling_warnings": 19,
-  "duplicate_groups": 32,
-  "dead_code_warnings": 1,
+  "error_handling_warnings": 15,
+  "duplicate_groups": 26,
+  "dead_code_warnings": 4,
   "dead_type_warnings": 0,
-  "fragment_groups": 90,
-  "boilerplate_warnings": 24,
-  "srp_struct_warnings": 4,
-  "srp_module_warnings": 14,
+  "fragment_groups": 42,
+  "boilerplate_warnings": 10,
+  "srp_struct_warnings": 2,
+  "srp_module_warnings": 10,
   "wildcard_import_warnings": 0,
-  "sdp_violations": 1,
-  "coupling_warnings": 4,
+  "sdp_violations": 2,
+  "coupling_warnings": 3,
   "coupling_cycles": 0,
   "tq_no_assertion_warnings": 0,
   "tq_no_sut_warnings": 0,
@@ -28,22 +28,22 @@
   "tq_untested_logic_warnings": 0,
   "structural_srp_warnings": 1,
   "structural_coupling_warnings": 2,
-  "total_findings": 225,
+  "total_findings": 153,
   "violation_details": [
     {
       "name": "render",
       "file": "src/ui/components.rs",
-      "line": 261
+      "line": 269
     },
     {
       "name": "render_viewport",
       "file": "src/ui/components.rs",
-      "line": 549
+      "line": 557
     },
     {
       "name": "paint_gutter",
       "file": "src/ui/components.rs",
-      "line": 1220
+      "line": 1228
     },
     {
       "name": "main",

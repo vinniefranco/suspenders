@@ -10,6 +10,7 @@ mod batch;
 pub mod deps;
 mod finish;
 pub mod loop_;
+pub mod next_speaker;
 pub mod settlement;
 
 // Shared test fixtures for the split Loop (today only `loop_`'s tests; any

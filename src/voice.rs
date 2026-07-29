@@ -1,12 +1,13 @@
 //! The Voice (CONTEXT.md): every Suspenders-voiced string the model reads -
-//! the system prompt, the Nudges, and the markers that enter the
-//! Conversation. The boundary is voice, not arity: wording may be
-//! parameterized, but Suspenders authors it.
+//! the system prompt, the compaction prompt, and the markers that enter the
+//! Conversation (malformed input, tool-result/error answers, run-close). The
+//! boundary is voice, not arity: wording may be parameterized, but Suspenders
+//! authors it.
 //!
 //! Wording is the highest-leverage tuning surface for small local models;
 //! owning it in one module means swapping wordings model-by-model touches one
 //! file. Strings a tool produces about its own execution (path-bearing errors)
-//! stay in that tool - only Suspenders' own steering text lives here.
+//! stay in that tool - only Suspenders' own authored text lives here.
 //!
 //! Everything returned here either enters the Conversation or is the system
 //! prompt. Markers are bracketed (`[...]`) so a small model can tell the Voice
@@ -39,12 +40,14 @@ if they caused an error or the user asked.
 
 # Workflow
 
-- Understand. Before changing code, find the relevant parts: use grep to \
-search for symbols and strings, list_files to see what exists, and read_file to \
-read what you will change or must quote exactly. Read only what you need - avoid \
-reading whole files or trees you will not touch.
-- Plan. Call the plan tool early with your goal and steps; keep it current as \
-steps complete.
+- Understand. Before changing code, find the relevant parts: use glob to find \
+files by name or pattern, grep to search for symbols and strings, list_files to \
+see a directory, and read_file to read what you will change or must quote \
+exactly. Read only what you need - avoid reading whole files or trees you will \
+not touch.
+- Plan. For multi-step work, call todo_write to record your task list, then \
+keep it current - mark one item in_progress and check items off as you finish. \
+Skip it for simple one-step tasks.
 - Implement. Make small, targeted edits with edit_file; use write_file only for \
 new files. Do not add features or refactor beyond what was asked. Three similar \
 lines beat a premature abstraction. Prefer editing existing files over creating \
@@ -84,7 +87,7 @@ model: [calls grep for \"retry\" across src]
 Retries live in src/net/client.rs, in send_with_backoff. Want me to open it?
 
 user: run_command times out on slow hosts; bump the default to 30s
-model: [calls plan with goal and steps]
+model: [calls todo_write: [~] find the timeout default, [ ] bump it to 30s, [ ] update the test]
 [calls grep for \"timeout\" across src/tools]
 [calls read_file on src/tools/run_command.rs]
 [calls edit_file on src/tools/run_command.rs]
@@ -113,24 +116,19 @@ pub fn command_denied() -> &'static str {
     "[command denied by user]"
 }
 
-// The Anchor's opening line, the framing prefix the Plan wraps its verbatim
-// task and plan in ([`anchor`]).
-const ANCHOR_PREFIX: &str = "[anchor - current goal and plan";
-
-/// The Voice-neutral confirmation the plan Tool returns as its Tool Result.
-pub fn plan_confirmation() -> &'static str {
-    "[plan recorded]"
+/// The user-role nudge injected when the next-speaker check decides the model
+/// should keep going after a no-tool-call Pass (ADR-0043, qwen-code's
+/// "Please continue." continuation). It enters the Conversation as an ordinary
+/// user message (unstamped), prompting the model to take the next action it
+/// announced but did not execute.
+pub fn please_continue() -> &'static str {
+    "Please continue."
 }
 
-/// The Anchor (CONTEXT.md): the Voice-framed wrapper around the verbatim
-/// original task statement and the current Plan. The framing is Suspenders'
-/// voice; `task` and `plan` ride verbatim. A `None` plan means the model has
-/// not set one yet.
-pub fn anchor(task: &str, plan: Option<&str>) -> String {
-    let plan_text = plan.unwrap_or("- no plan set yet; call the plan tool");
-    format!(
-        "{ANCHOR_PREFIX} - keep working toward this]\n\nOriginal task:\n{task}\n\nCurrent plan:\n{plan_text}"
-    )
+/// The Voice-neutral confirmation the todo_write Tool returns as its Tool
+/// Result.
+pub fn todos_confirmation() -> &'static str {
+    "[todos updated]"
 }
 
 /// Assistant marker closing a Run that hit its Run Limit.
@@ -140,7 +138,7 @@ pub fn run_limit_marker() -> &'static str {
 
 /// Tool Result answering a Tool Call from a max_tokens-truncated response
 /// (ADR-0009).
-pub fn truncated_call_nudge() -> &'static str {
+pub fn truncated_call_reissue() -> &'static str {
     "[response was cut by max_tokens - the call may be incomplete, re-issue it]"
 }
 
@@ -368,8 +366,9 @@ mod tests {
     // ---- system_prompt/0 ----
 
     #[test]
-    fn system_prompt_tells_the_model_to_maintain_its_plan() {
-        assert!(system_prompt().contains("plan"));
+    fn system_prompt_tells_the_model_to_maintain_its_task_list() {
+        assert!(system_prompt().contains("todo_write"));
+        assert!(system_prompt().contains("in_progress"));
     }
 
     #[test]
@@ -436,9 +435,10 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Understand"));
         assert!(prompt.contains("Verify"));
-        // The Understand step points the model at inline exploration - grep,
-        // list_files, read_file - not a delegated Scout.
-        assert!(prompt.contains("use grep to search for symbols"));
+        // The Understand step points the model at inline exploration - glob,
+        // grep, list_files, read_file - not a delegated Scout.
+        assert!(prompt.contains("use glob to find files"));
+        assert!(prompt.contains("grep to search for symbols"));
         assert!(!prompt.contains("explore tool"));
         // Faithful reporting: never claim a green suite that is not green.
         assert!(prompt.contains("never claim green when it is not"));
@@ -460,39 +460,25 @@ mod tests {
         assert!(prompt.contains("[calls grep"));
     }
 
-    // ---- anchor/2 ----
+    // ---- todos_confirmation/0 ----
 
     #[test]
-    fn anchor_wraps_verbatim_task_and_plan_in_voiced_framing() {
-        let a = anchor(
-            "Fix the flaky test",
-            Some("Goal: green tests. 1. read [x] 2. fix [ ]"),
-        );
-
-        assert!(a.contains('['));
-        assert!(a.contains(']'));
-        assert!(a.contains("Fix the flaky test"));
-        assert!(a.contains("Goal: green tests. 1. read [x] 2. fix [ ]"));
+    fn todos_confirmation_is_a_short_confirmation_string() {
+        assert!(todos_confirmation().chars().count() < 120);
     }
 
-    #[test]
-    fn anchor_carries_the_task_even_without_a_plan() {
-        let a = anchor("Fix the flaky test", None);
-        assert!(a.contains("Fix the flaky test"));
-    }
+    // ---- please_continue/0 ----
 
     #[test]
-    fn anchor_no_plan_fallback_does_not_end_in_a_stray_closing_bracket() {
-        let a = anchor("Fix the flaky test", None);
-        assert!(!a.ends_with(']'));
-        assert!(a.ends_with("- no plan set yet; call the plan tool"));
-    }
-
-    // ---- plan_confirmation/0 ----
-
-    #[test]
-    fn plan_confirmation_is_a_short_confirmation_string() {
-        assert!(plan_confirmation().chars().count() < 120);
+    fn please_continue_is_the_next_speaker_nudge() {
+        // The unstamped user nudge injected on a `model` next-speaker verdict
+        // (ADR-0043): short, plain, no bracketed-marker framing (it is an
+        // ordinary user turn, not a Voice marker).
+        let nudge = please_continue();
+        assert_eq!(nudge, "Please continue.");
+        assert!(!nudge.starts_with('['));
+        assert!(!nudge.contains('\u{2014}')); // em-dash
+        assert!(!nudge.contains('\u{2013}')); // en-dash
     }
 
     // ---- compaction_prompt/0 ----

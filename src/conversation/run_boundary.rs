@@ -6,10 +6,9 @@
 //! boundary: its first block is a ToolResult, so a new user request always
 //! opens with the request text itself.
 //!
-//! This rule has one owner so its two readers cannot drift: Compaction snaps
-//! its cutoff back to the nearest run-start ([`run_start_indices`]), and
-//! Supersession counts Runs to scope same-Run duplicate results
-//! ([`is_run_start`]). Change the rule here and both follow.
+//! This rule has one owner so it cannot drift: Compaction snaps its cutoff
+//! back to the nearest run-start ([`run_start_indices`]). Change the rule here
+//! and Compaction follows.
 
 use crate::content::{ContentBlock, Message, Role};
 

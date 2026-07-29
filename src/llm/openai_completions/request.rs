@@ -330,8 +330,9 @@ mod tests {
 
     #[test]
     fn user_tail_text_follows_the_tool_messages() {
-        // The Run's results tail (a Nudge riding the results) stays after
-        // the tool messages, as it does in the typed message.
+        // The Run's results tail (text riding the results, e.g. Steering or a
+        // run-close marker) stays after the tool messages, as it does in the
+        // typed message.
         let mut out = Vec::new();
         wire_messages(
             &Message::user(vec![
@@ -445,6 +446,18 @@ mod tests {
             &model(),
         );
         assert_eq!(with_top_k["top_k"], json!(20));
+    }
+
+    #[test]
+    fn thinking_budget_is_ignored_on_the_openai_wire() {
+        // The OpenAI path gets reasoning via reasoning_content automatically;
+        // the thinking budget is simply not part of this dialect. A request
+        // carrying it produces no thinking-related key.
+        let req = build_request(
+            &LlmRequest::new("s", vec![], vec![]).with_thinking_budget(Some(32_000)),
+            &model(),
+        );
+        assert!(req.as_object().unwrap().get("thinking").is_none());
     }
 
     #[test]

@@ -14,7 +14,7 @@ One session of the Suspenders TUI, from launch to exit, holding exactly one Conv
 The ordered message history sent to the model - user messages, assistant messages, and Tool Results.
 
 **Active Model**:
-The Model the next Run will call, named by a scoped identifier - `provider/model-id`. Owned by the Agent as mutable state beside the Session value - not one of the Session's fixed facts. Seeded from config at launch and changed by the `/model` Slash Command. A change takes effect on the next Run: each Run captures the whole Model (window, output cap, pricing, compat) when it begins, and the Context Budget, Result Cap, and Eviction reserve derive from that capture - so a switch needs no re-validation, and an in-flight Run finishes on the Model it captured.
+The Model the next Run will call, named by a scoped identifier - `provider/model-id`. Owned by the Agent as mutable state beside the Session value - not one of the Session's fixed facts. Seeded from config at launch and changed by the `/model` Slash Command. A change takes effect on the next Run: each Run captures the whole Model (window, output cap, pricing, compat) when it begins, and the Context Budget, Result Cap, and reply reserve derive from that capture - so a switch needs no re-validation, and an in-flight Run finishes on the Model it captured.
 _Avoid_: current model, model connection (retired with the single-connection era; the Provider owns the endpoint and credential, the Active Model is the mutable choice of which Model to call).
 
 **Provider**:
@@ -42,41 +42,22 @@ One user request and everything the Agent does to answer it - the model may make
 _Avoid_: iteration, round, turn (the ecosystem's "turn" is one Pass, not the whole request; Suspenders names the request cycle a Run, matching OpenAI's Run - a call that processes across many steps until it needs input again). Renamed from "Turn" (2026-07): the old name reassigned the ecosystem's "turn" to the outer level and misled newcomers.
 
 **Agent**:
-The orchestrator that drives Runs: it streams the model's output, executes Tool Calls, and appends results to the Conversation.
+The orchestrator that drives Runs. The loop is a plain ReAct loop (ADR-0045): each Pass builds one request (the static system prompt, the full Conversation, the full Tool registry - no per-Pass narrowing), streams the response, executes any Tool Calls, appends the results, and repeats until the model returns no Tool Calls, bounded by the Run Limit. It injects nothing to steer the model; the only runtime intervention is the passive Loop-detector.
 
 **Pass**:
 One model response and the Tool Calls it carries - the unit the loop repeats within a Run. A Run is one or more Passes.
 _Avoid_: turn (pi and much of the ecosystem call a Pass a "turn"; Suspenders keeps the coined "Pass" so it need not reassign "turn" - the outer request is a Run. Adopting "turn" for a Pass is a possible later step, deferred to avoid a two-way rename), iteration
 
 **Run Limit**:
-The maximum number of Passes allowed within one Run. The last permitted Pass is a forced final Pass (ADR-0015): no tools offered, prompted to state what was accomplished, what remains, and whether changes are verified - so a capped Run ends with the model's conclusion rather than a bare marker. The Pass before it is a Verification Pass (ADR-0016) when writes are unverified: run_command only, so a capped Run cannot end with unverified changes for lack of opportunity. A model that still answers with Tool Calls ends the Run on the marker with a distinct stop reason; the user may start a new Run to continue.
+The maximum number of Passes allowed within one Run (the `max_turns` bound, default generous enough for a real multi-step task). A Run that reaches the limit while the model is still answering with Tool Calls ends on the run-limit marker with a distinct stop reason; the user may start a new Run to continue. The bound is a backstop, not a schedule: it withdraws no tools and injects no steering as it approaches.
 _Avoid_: iteration cap, loop limit
 
-**Endgame**:
-The mechanical schedule by which a Run ends at its Run Limit, counted in Passes remaining: at 2, the wrap-up warning rides the results tail (or the Verification Pass prompt in its place when writes are unverified); at 1, the Verification Pass narrows the offered Tools to run_command when writes are unverified, and the final-Pass prompt rides the tail; at 0, the final Pass offers no Tools and a tool-insistent reply (real Tool Calls or serialized markup in text) closes on the run-limit marker instead of passing as a conclusion. The narrowing is enforced at dispatch, not just in the request (ADR-0035): a Tool Call the Pass did not offer is answered with the Voice's refusal and never executes - a mechanic beside the malformed-input sentinel, not a Governor's judgment. Mechanical because small models comply with mechanics, not requests.
-_Avoid_: wind-down, wrap-up phase (the wrap-up warning is one step of the Endgame, not its name)
-
-**Recovery Run**:
-A Run the harness opens itself when the previous Run settled at its Run Limit with the work demonstrably unfinished - one more bounded attempt rather than handing an unfinished request back to the user. Unfinished has three evidences: unverified writes, or a Dangling Failure alongside a write that landed this Run (both broken states); or an Open Plan - the Run settled green but the Plan still declares unchecked steps (correct, but not done). A Dangling Failure with no writes this Run is exploration, not unfinished implementation (a read-only task that merely ran a failing command), and opens no Recovery Run; an Open Plan opens one only from a green settle and only when the Run advanced the Plan (a step checked off this Run), never on no-progress churn. Issued by the Endgame Governor through the close-and-open-a-Recovery-Run Intervention; one Setpoint bounds how many broken-state recoveries, a separate Setpoint how many Open-Plan continuations, may follow one user request. Its prompt belongs to the Voice - the only Run whose prompt Suspenders authors - and it still serves the original user request. Two shapes: Continuation and Handoff.
-_Avoid_: retry (nothing is re-attempted from scratch; unfinished work continues), auto-continue (that's the Continuation shape, not the umbrella), Progress Run / a separate green-but-incomplete concept (Open Plan is a third evidence of this one Run, not a sibling Run)
-
-**Continuation**:
-The Recovery Run shape that keeps the Conversation: the recovery prompt is appended and the model continues with everything it saw before.
-
-**Handoff**:
-The Recovery Run shape that retires the Conversation: Compaction seeds a fresh one - the original task verbatim, the Plan verbatim, files touched, the model's narrative - plus the failing verification result verbatim - the Dangling Failure's own output, the command the recovery prompt names, never merely the last command run - and the recovery prompt starts it clean. The default shape: a fresh context with a structured handoff beats continuing a degraded one, and the gap widens as models shrink.
-_Avoid_: restart (the work and its facts carry over; only the rot is left behind)
-
-**Dangling Failure**:
-A command string whose most recent execution this Run failed. A passing run clears only its own command string, so a red full-suite run followed by a green filtered rerun still dangles - a capped Run cannot launder a failure by rerunning a narrower command. The failing arm of the Recovery Run's trigger, but only alongside a write that landed this Run; the Verify-failed Nudge keeps judging the last run only.
-_Avoid_: command failing (that's the last-run-only fact the Nudge reads), red build (too broad; the failure is per command string)
-
-**Open Plan**:
-The Plan's content shows at least one unchecked step (an open `[ ]` box), read as unfinished work even when the Run settles green - the third evidence of the Recovery Run's trigger, and the only one that opens from a green settle. Gated so a small model cannot spin: the Run must have advanced the Plan (a step checked off this Run) and a Setpoint bounds how many Open-Plan continuations may follow one user request. A Plan with no checkboxes cannot be Open - completeness is uninferrable from prose, so it never self-continues. A syntactic fact about a harness-owned artifact, never a judgment about the world; the harness reads the Plan's checkbox structure but still never authors its content. Unlike the broken-state arms, an Open Plan reopens as a Continuation, not a Handoff: a green, step-advancing Run is productive, not degraded, so keeping the Conversation preserves the working context the next steps need - retiring it forces the model to re-read what it just built (the cost observed live before this arm existed).
-_Avoid_: incomplete plan (a judgment; Open Plan is the syntactic fact of an unchecked box), stale plan (that's the Anchor's plan-recency, a different fact), Progress Run (Open Plan is an evidence, not a Run)
+**Loop-detector**:
+The one runtime intervention: a passive circuit breaker that ends the Run when the model emits the byte-identical tool-call batch `loop_stall_limit` times in a row (default 5). It injects nothing into the Conversation - no corrective text, no steering - it ends the Run with a close marker and emits an Event. The whole point is that a clean context plus a good prompt keeps a small model on task more often than corrective text pulled it back; the detector is the silent safety for the rare genuine runaway (ADR-0045).
+_Avoid_: nudge, governor (it judges nothing and injects nothing; it counts identical batches and stops), guard rail
 
 **Tool**:
-A named capability with a JSON schema that the model can invoke (v1: read_file, list_files, edit_file, write_file, grep, run_command).
+A named capability with a JSON schema that the model can invoke: read_file, write_file, edit_file, run_command, grep, glob, list_files, web_fetch, and todo_write. Named and shaped to match qwen-code's tools so a small local model calls them without translation (ADR-0045). Every request offers the full registry - there is no per-Pass narrowing.
 
 **Tool Call**:
 A structured `tool_use` block emitted by the model requesting one Tool execution.
@@ -86,12 +67,8 @@ _Avoid_: invocation (the legacy text-protocol term), tool request
 The structured outcome of executing a Tool Call, returned to the model as a `tool_result` block.
 
 **Answer**:
-How the Run's batch answered one Tool Call: the Tool Result the model will read plus the typed fact of whether the call ran - Ran (executed, and the outcomes that read as runs: a Governor's replaced result, a Middleware halt, a malformed-input answer), Denied (the Approval gate), or Refused (the Pass did not offer the Tool, ADR-0035). Built only through constructors that pair the Voice's wording with the fact so the two cannot drift, and recorded on the Run Ledger through one method: the batch states the fact, the Ledger owns what each fact moves.
+How the Run's batch answered one Tool Call: the Tool Result the model will read plus the typed fact of whether the call ran - Ran (executed, and the outcomes that read as runs: a Middleware halt, a malformed-input answer) or Denied (the Approval gate). Built only through constructors that pair the Voice's wording with the fact so the two cannot drift: the batch states the fact.
 _Avoid_: response (a Response is the model's), reply (also the model's), outcome alone (the ran-fact is one part of an Answer)
-
-**Offer**:
-The Tools one Pass puts before the model. The narrowed specs move into the Offer at the request-shaping moment (after the Governors' NarrowTools Intervention); the request carries exactly what the Offer holds, and the batch refuses any Tool Call the Offer does not name (ADR-0035). One value with two readers, so the enforced set and the wire set cannot drift. Before the first request is shaped, the Offer offers nothing - and the batch can never run before then.
-_Avoid_: allowlist, whitelist (a filter's framing; the Offer is a fact of the Pass), available tools
 
 **Thinking**:
 The model's reasoning stream, displayed but never fed back into the Conversation.
@@ -136,18 +113,6 @@ _Avoid_: allowlist (implementation term), whitelist
 **Context Budget**:
 The token allowance the Conversation must fit within, derived each Run from the captured Model's context window. Config supplies the window for Models the Catalog does not know, and may cap it globally.
 
-**Eviction**:
-Replacing the contents of dead Conversation blocks with an elision marker: old Tool Results, superseded Anchors, results made dead by Supersession, and the input bodies of successful writes. A wave fires when the Conversation presses the Context Budget or when Dead Mass crosses its threshold; once triggered, Eviction overshoots to a low-water mark, so elisions arrive in rare waves and the request prefix stays byte-stable for server-side prompt caching between them.
-_Avoid_: truncation (that's what the server does when we fail), compaction
-
-**Dead Mass**:
-The total size of Conversation content whose information is already superseded - the input bodies of successful writes (the file on disk holds the result), older results of repeated identical Tool Calls, redundant re-reads, stale Anchors. Dead Mass rots a small model's attention long before the Context Budget is threatened, so it has its own Eviction trigger: when it exceeds its threshold fraction of the Context Budget, a wave fires even with budget to spare.
-_Avoid_: bloat, garbage (both too vague to trigger on)
-
-**Supersession**:
-The rule that classifies Conversation content as dead: a newer result of an identical Tool Call supersedes the older ones (the newest survives verbatim), and a successful write supersedes its own input body - the file on disk is the truth. Identity is the full Tool Call (name and input), never a judgment call. A failed edit's input is not superseded by its failure; only a later successful write to the same file supersedes the attempt chain.
-_Avoid_: deduplication (mechanism, not meaning), pruning
-
 **Result Cap**:
 The size ceiling one Tool Result may occupy in the Conversation, derived from the Context Budget the Run captured. Oversized Tool Results are cut before they enter the Conversation: run_command keeps its start and end (the exit code lives at the end), every other Tool keeps its start.
 _Avoid_: output limit, truncation (reserved for the server's failure mode)
@@ -158,26 +123,6 @@ The user aborting a running Run; the Conversation records a clean partial state.
 **Run Settlement**:
 How an ended Run enters the Conversation. Every Run settles exactly one way: completed, failed, or cancelled (a crash settles as a failure). A Run that did not complete settles on its partial state, closed with a marker so roles keep alternating.
 _Avoid_: completion (reserved for the model's response), run management
-
-**Governor**:
-A tunable rule that watches the Pass cycle and intervenes to keep the model on course. Each Governor owns its trigger and its setpoints - the thresholds and cadences tuned from observed model behavior - and acts only through an Intervention. Nudges, Anchors, and the Endgame schedule are all issued by Governors. Compaction and Eviction are budget mechanics, not Governors: what they elide is correct or incorrect, never an opinion - though the cadence of their waves carries tuned thresholds.
-_Avoid_: rider (one delivery shape of a Nudge, not the rule that sends it), heuristic (the informal name; a Governor is the thing itself), rule, policy
-
-**Intervention**:
-One of the closed set of actions a Governor may take: replace a Tool Result, annotate one, stand alone as a user message, ride the results tail, narrow the offered Tools, silence Thinking for a Pass, close the Run on a marker, or close the Run and open a Recovery Run. The set is deliberately closed: a new Governor is routine, a new kind of Intervention is a visible design decision.
-_Avoid_: action (too generic), effect (mechanism, not meaning)
-
-**Setpoint**:
-A tunable value - a threshold, cadence, or cap that encodes a learning about how small models drift. Every Setpoint belongs to exactly one owner - a Governor or a named mechanic - and carries a default; the Session resolves them once at launch, and a Setpoint becomes user-configurable only when a real model has demanded a different value.
-_Avoid_: constant (a Setpoint is tuned, not fixed), config option (most are never exposed), magic number
-
-**Run Ledger**:
-The record of facts about the running Run, written once as each thing happens: the Tool Calls each Pass carried, per-Tool failure tallies, writes and whether a verification has run since, Passes remaining. The Ledger holds facts, never opinions or setpoints - Governors read it and judge; no Governor reads another Governor's state.
-_Avoid_: nudge state (the legacy state bag), shared state, blackboard
-
-**Nudge**:
-Suspenders-voiced text the Run injects into the Conversation to redirect a drifting model: replacing a Tool Result (identical Tool Call repeated), annotating one (repeated failures of the same Tool), standing alone as a user message (changes left unverified, the model finishing while its last run_command failed, or the model's reply arriving empty), or riding the tool-results user message (consecutive Passes spent hand-exploring inline - reading files or shelling out to search - instead of dispatching a Scout). A Nudge never enters the system prompt.
-_Avoid_: hint, warning
 
 **Middleware**:
 A unit of extension that wraps a Tool Call's execution at two points: before the Tool executes (may adjust or deny the call, short-circuiting it) and after it executes (may transform the Tool Result the model sees). Middleware wrap one another, first-registered outermost - the onion familiar from Tower and Rack. Middleware never add Tools; they wrap existing ones. A denial still produces exactly one Tool Result, voiced by that Middleware. The execution-path counterpart to a Presenter (the display-path role); one registered extension may fill either role or both.
@@ -196,7 +141,7 @@ Display-side data a Presenter derives from a Tool Call - a diff, an annotation -
 _Avoid_: metadata, attachment
 
 **Voice**:
-Every Suspenders-voiced string the model reads: the system prompt, every Nudge, and every marker (elision, run limit, the wrap-up warning two Passes before it, cancellation, Result Cap cuts, malformed input, the offered-set refusals). The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Middleware produces about its own decisions stay in that Middleware. Owned by one module so wording can be tuned per model in one place.
+Every Suspenders-voiced string the model reads: the system prompt, the compaction prompt, and every marker (run limit, cancellation, Result Cap cuts, malformed input, the run-close markers, and the error answers to a truncated or orphaned Tool Call). The Voice no longer authors any mid-Conversation steering - the nudge, anchor, and endgame apparatus is gone; the loop-detector's run-close marker is the only intervention text and it merely ends the Run. The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Middleware produces about its own decisions stay in that Middleware. Owned by one module so wording can be tuned per model in one place.
 _Avoid_: prompt strings, constants, "static strings" (parameterized wording still belongs), Steering Vocabulary (legacy name; Steering now means mid-Run user input)
 
 **Steering**:
@@ -206,17 +151,9 @@ _Avoid_: interrupt (nothing is interrupted), injection (mechanism, not meaning),
 **Rollover**:
 What happens to Steering the Run ended before delivering: it auto-submits as the next Run's prompt. Cancellation discards it instead - cancel means stop everything.
 
-**Plan**:
-The model-maintained statement of the current goal, its steps, and their progress, held by the harness outside the Conversation and updated through the plan Tool. The Plan is the model's voice - Suspenders never authors its content - and it survives Compaction verbatim because the harness owns it, not the summary. The harness does *read* the Plan's checkbox structure (an unchecked `[ ]` step makes it an Open Plan) as a fact for the Endgame, but reading structure is not authoring content.
-_Avoid_: todo list, scratchpad (free-form; a Plan is structured), notes
-
-**Anchor**:
-An injected copy of the Plan and the original task statement, placed near the tail of the Conversation and refreshed periodically and immediately after a Compaction, so the goal always sits where a small model actually attends. The framing around an Anchor belongs to the Voice; its Plan content does not. Stale Anchors are ordinary evictable blocks.
-_Avoid_: reminder, re-injection (mechanism, not meaning), reorientation nudge (a Nudge is corrective and fires only while its trigger persists; an Anchor is routine)
-
-**Scout**:
-A disposable read-only worker the model dispatches through the explore Tool: it searches the Project Root (grep, list, read) in its own fresh Conversation with a hard Pass cap and returns a structured findings report as an ordinary Tool Result. The cap's last Pass is a forced report Pass (no tools offered - the only move left is the report), and Scouts run without Thinking by default (ADR-0014). The exploration never enters the main Conversation - only the report does. A Scout cannot edit, run commands, or dispatch further Scouts - enforced at dispatch (ADR-0035), not just by the offered specs: a hallucinated mutating or command Tool Call is answered with the Voice's refusal and never executes.
-_Avoid_: subagent (generic; Suspenders has exactly one delegation shape), task agent, worker
+**todo_write**:
+The model's structured task list, held by the harness outside the Conversation and updated through the `todo_write` Tool (replacing the freeform `plan`). It is the model's voice - Suspenders never authors its content - and it survives Compaction verbatim because the harness owns it, not the summary. Shaped and named to match what a small model saw in training, so it calls it without translation (ADR-0045). Purely a record the model keeps for itself: the harness neither reads its checkbox structure to drive behavior nor injects it back into the Conversation.
+_Avoid_: plan (the retired freeform name), scratchpad (free-form; the task list is structured), notes
 
 **Session Log**:
 The durable, append-only record of one Session: its fixed facts, then every Conversation event in order, written as each happens. The Session Log records the Conversation, not the Transcript - Thinking and info lines are never in it.
@@ -231,54 +168,41 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Session**'s fixed facts are resolved and validated once at launch; every **Run** and **Tool Call** reads them from that value, never from ambient configuration
 - The **Active Model** is the one thing a **Run** does NOT read from the fixed **Session** value: the **Agent** owns it mutably and each **Run** captures its whole **Model** when it begins, so a `/model` change lands on the next **Run**, never mid-flight
 - A **Session** holds a fixed **Provider** set; the **Active Model** names one Provider's **Model**, and every request travels over that Provider's endpoint and credential through the adapter its **Api** selects
-- The **Context Budget**, the **Result Cap**, and the Eviction reserve derive from the **Model** the **Run** captured, recomputed at each Run's start
+- The **Context Budget**, the **Result Cap**, and the reply reserve derive from the **Model** the **Run** captured, recomputed at each Run's start
 - Every assistant message carries **Provenance**; request-shaping replays history that matches the target **Model** verbatim and normalizes the rest, so a **Conversation** crosses **Providers** without a restart
 - A **Conversation** is a sequence of **Runs**
-- A **Run** is one or more **Passes**; the **Run Limit** counts **Passes**
+- A **Run** is one or more **Passes**; the **Run Limit** bounds the **Passes**
 - A **Run** contains zero or more **Tool Calls**, each producing exactly one **Tool Result**
-- A **Run** ends at its **Run Limit** even if the model is still asking for Tools; the **Endgame** schedules how it ends, counted in **Passes** remaining
+- Each **Pass** builds one request carrying the full **Tool** registry - there is no per-Pass narrowing; the **Agent** repeats **Passes** until the model returns no **Tool Calls** or the **Run Limit** is reached
 - A **Tool Call** for run_command requires an **Approval** before execution, unless a **Standing Approval** covers its exact command string
 - A **Standing Approval** belongs to the **Session** - it does not survive restart and never widens beyond the identical command string
-- **Eviction** targets dead content - old **Tool Results**, blocks dead by **Supersession**, the input bodies of successful writes, superseded **Anchors** - oldest first, and never the system prompt, the two most recent tool-result exchanges, or the most recent **Anchor**
-- **Eviction** fires in waves on either of two triggers - Context Budget pressure, or **Dead Mass** crossing its threshold; once triggered it elides down to a low-water mark, so between waves the request prefix is byte-stable and the server's prompt cache holds
-- When **Eviction** cannot fit the **Conversation** within the **Context Budget**, the **Run** fails loudly; an over-budget request is never sent
+- **Compaction** is the sole context-reclaim mechanism; when the **Conversation** cannot fit the **Context Budget** even after Compaction, the **Run** fails loudly and an over-budget request is never sent
 - Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** the **Run** captured
-- The system prompt, every **Nudge**, and every marker belong to the **Voice**; the **Governors** that fire them own the when, not the wording
-- Every **Nudge**, every **Anchor** placement, and every **Endgame** step is issued by a **Governor**; **Compaction** and **Eviction** are not
-- A **Governor** acts only through an **Intervention**; when several **Governors** fire at the same moment, one explicit precedence decides which speaks
-- Every **Intervention** belongs to exactly one of the three moments of a **Pass** - shaping the request, answering a **Tool Call**, settling a finish - and precedence is decided within a moment, never across moments
-- Facts live in the **Run Ledger**, opinions in exactly one **Governor**; a **Governor** reads the Ledger and its own trigger state, never a sibling's
-- A **Governor** judges the Run's trajectory; a **Middleware** acts on one **Tool Call** in isolation - a decision that needs Run history belongs to a **Governor**, never a Middleware
-- At the Tool Call moment, **Governors** judge what the model sent and what the model will read; **Middleware** shape what actually runs in between
-- The **Approval** gate is neither **Governor** nor **Middleware**: it encodes the user's judgment, not a tuned learning
+- The system prompt, the compaction prompt, and every marker belong to the **Voice**; the **Voice** authors no mid-Conversation steering
+- The **Loop-detector** ends a **Run** when the model repeats the byte-identical **Tool Call** batch `loop_stall_limit` times; it injects nothing into the **Conversation** and appends only a run-close marker
+- The **Approval** gate encodes the user's judgment, not a tuned learning
 - **Middleware** wrap every **Tool Call**'s execution at two points, before and after, wrapping one another first-registered outermost; a **Presenter** shapes the same Tool Call's **Presentment** on the display side
-- A **Middleware** may adjust or deny a **Tool Call** before execution: the **Nudge** for duplicates keys on what the model sent, and an **Approval** always shows the final, middleware-adjusted command
+- A **Middleware** may adjust or deny a **Tool Call** before execution, and an **Approval** always shows the final, middleware-adjusted command
 - A **Middleware** denial still produces exactly one **Tool Result**, voiced by that Middleware
 - An **Artifact** a **Presenter** derives travels with its **Tool Result** to **Presentment** and appears only in the **Transcript**, never the **Conversation**
 - A **Middleware** or **Presenter** failure never fails the **Run** and never reaches the model; the **Transcript** records it as an info line and the Tool Call proceeds without that extension
 - A **Session** draws with exactly one active **Theme**; the `/theme` **Slash Command** changes it live, and the choice outlives the Session
 - A **Theme** shapes only how the **Transcript** and the **Screen**'s chrome are colored, never what anything means; a broken Theme is refused whole, and the Session falls back to the built-in default rather than drawing half-right
 - A **Run** ends in exactly one **Run Settlement**: completed, failed, or cancelled
-- A **Recovery Run** opens only off a Run that settled at its **Run Limit** with unverified writes, or a **Dangling Failure** alongside a write that landed this Run (a failing command with no writes is exploration, not unfinished work), or an **Open Plan** from a green settle that advanced the Plan this Run; its prompt belongs to the **Voice**, and a **Setpoint** bounds broken-state recoveries while a separate **Setpoint** bounds **Open Plan** continuations, each per user request
-- An **Open Plan** opens a **Recovery Run** only from green (a broken state routes to the failing arms first) and only when the Run checked off a Plan step; a Plan with no `[ ]` boxes can never be Open
-- A **Handoff** carries the **Plan** and original task verbatim (harness-owned facts, never trusted to the summary) plus the **Dangling Failure**'s own result verbatim - the command the recovery prompt names, not merely the last one run; a **Continuation** keeps the whole **Conversation**
 - **Steering** is delivered after a Tool Call batch completes and before the next model call; a Run that ends first triggers **Rollover**, a **Cancellation** discards it
 - **Steering** belongs to the user's voice and is never part of the **Voice**
-- A **Scout** runs its own fresh **Conversation** against the same captured **Model**; its report is an ordinary **Tool Result**, subject to the **Result Cap**, and its exploration never enters the main **Conversation**
-- A **Plan** is the model's voice, held by the harness outside the **Conversation**; only its **Anchor** copies enter the **Conversation**
-- An **Anchor** is refreshed immediately after every **Compaction** and periodically between them; stale **Anchors** are evictable like any old block
+- The model's **todo_write** task list is held by the harness outside the **Conversation** and survives **Compaction** verbatim; it is the model's own record and never re-injected into the **Conversation**
 - **Compaction** fires at the **Compaction Target** and retains the **Compaction Keep**; the two are decoupled so Compactions are rare and deep
 - A **Session** appends every **Conversation** event to its **Session Log** as it happens; **Resume** folds that log into a new Session's **Conversation**
 - **Resume** requires the same **Project Root**; every other Session fact yields to the resuming Session's, and the **Transcript** notes what changed
 - A **Tool Call** in a truncated response is answered with an error **Tool Result** (re-issue it) and none of its batch executes; only **Cancellation** drops a **Tool Call** from the **Conversation**, and the **Transcript** still shows it
 - **Thinking** belongs to a **Run** and appears in the **Transcript**, but never enters the **Conversation**
 - Every **Tool Call** executes within the **Project Root**
-- A **Nudge** belongs to the **Conversation** (the model must see it) and therefore also appears in the **Transcript**; a **Nudge** fires only while its trigger persists, and the **Run Limit** bounds all of them
 
 ## Example dialogue
 
 > **Dev:** "When the model hits the **Context Budget** mid-**Run**, do we drop old **Runs**?"
-> **Domain expert:** "No - **Eviction** only hollows out old **Tool Results**. The user's instructions in past **Runs** survive; a stale file listing doesn't need to."
+> **Domain expert:** "No - **Compaction** replaces old finished **Runs** with one LLM summary of what was accomplished, so the user's instructions survive as summary and the working tail stays verbatim. It is the only reclaim mechanism; there is no mechanical eviction."
 >
 > **Dev:** "And if the user cancels while a run_command **Approval** modal is open?"
 > **Domain expert:** "**Cancellation** wins: the **Tool Call** is recorded as cancelled, no **Tool Result** is fabricated, and the **Run** ends."
@@ -288,23 +212,21 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - "Turn" was the outer request cycle, but the ecosystem (pi, Anthropic, OpenAI) calls one **Pass** a "turn" - a standard word reassigned to the opposite level, a false friend for newcomers - resolved 2026-07: the outer cycle is now a **Run** (matching OpenAI's Run), and **Pass** keeps its coined name. This was a half rename by design: it removes the collision one-way without reassigning "turn". Adopting "turn" for a **Pass** (the full alignment) is a possible later step, deferred because it is a two-way rename sharing the token. "Run" brushes against run_command and the informal "run of the TUI" (now a **Session**); context disambiguates.
 - **Middleware** and **Presenter** were one term, "Plugin", covering both the Tool Call execution wrap and the display-side enrichment - resolved 2026-07: split to name the two seams honestly. "Plugin" connoted "adds a capability", the opposite of what these do (they wrap existing Tools); the execution wrap is textbook **Middleware** (Tower/Rack onion), and the display role is a **Presenter**. One registered extension may fill either role or both. Supersedes the naming in ADR-0007 (plugin-lifecycle); the lifecycle itself is unchanged.
 
-- ADR-0015/0016 tolerated Tool Calls on narrowed Passes ("those Tools run"); ADR-0035 (2026-07) reversed the tolerance - such calls are refused at dispatch as mechanics beside the malformed-input sentinel, NOT issued by a Governor. The relationship "every Endgame step is issued by a Governor" covers the schedule (warning, narrowing, prompts, closes); the refusal is the enforcement of that schedule, one layer down.
+- The whole steering apparatus (Governor, Nudge, Anchor, Endgame, Recovery Run, Scout, and mechanical Eviction/Dead Mass/Supersession) was removed 2026-07 in favor of a plain ReAct loop, a strong static system prompt, and a passive **Loop-detector** (ADR-0045). The wager: a clean, predictable context keeps a small local model on task more often than corrective text pulled it back. Those terms are retired from the language; git history holds their design.
 
 - "invocation" previously meant a parsed text-protocol tool request (`extract_invocations`); with native tool calling it is retired in favor of **Tool Call**.
-- "truncation" was used for both server-side context overflow and our own management strategy - resolved: ours is **Eviction**; "truncation" refers only to the server's silent behavior we're preventing.
-- the **Compaction Target** was documented as the full budget target while the code fired at the low-water mark - resolved 2026-07: the trigger is the low-water mark, and the keep level is its own decoupled knob, the **Compaction Keep**.
-- "toggling thinking" was read as enabling/disabling the model's **Thinking** when it means expanding/collapsing settled Thinking items in the **Transcript** - resolved 2026-07: Ctrl-T is a display expansion toggle; whether the model thinks at all is a request-level knob (today fixed: on for the main Conversation, off for **Scouts**) with no user-facing toggle.
-- **Anchors** and Endgame prompts are Conversation events the model actually read, but only Nudges were persisted, so **Resume** rebuilt a Conversation the model never saw - resolved 2026-07: every rider is logged to the **Session Log** like a Nudge.
+- the **Compaction Target** trigger and the **Compaction Keep** recency were once one knob; resolved 2026-07: they are decoupled - fire high, keep low.
+- "toggling thinking" was read as enabling/disabling the model's **Thinking** when it means expanding/collapsing settled Thinking items in the **Transcript** - resolved 2026-07: Ctrl-T is a display expansion toggle; whether the model thinks at all is a request-level knob (today fixed: on for the main Conversation) with no user-facing toggle.
 - the **Compaction Keep** is configured and validated in token-space (a fraction of the live window), but the cutoff walk accumulates raw chars, so the executed keep is ~3.5x smaller than the configured fraction - discovered 2026-07-21, dates to the original port. Deliberately preserved and pinned by test for now; whether to fix the units (and retune the default) is an open tuning decision.
 
 ## Compaction
 
 **Compaction**:
 Replacing old messages in the Conversation with a structured LLM-generated
-summary so the model can continue working within the Context Budget. Distinct
-from **Eviction** (which is purely mechanical - replacing Tool Result content
-with a fixed marker): compaction is semantic - it calls the LLM to extract
-what was accomplished, what decisions were made, and what files were touched.
+summary so the model can continue working within the Context Budget. The sole
+context-reclaim mechanism: it calls the LLM to extract what was accomplished,
+what decisions were made, and what files were touched. Semantic, not mechanical
+- there is no bespoke elision path beside it.
 _Avoid_: summarization, context compression (those describe the mechanism,
 not the policy)
 
@@ -317,10 +239,9 @@ Its own knob, deliberately decoupled from the trigger: fire high, keep low.
 _Avoid_: keep_recent (implementation name), recent-budget
 
 **Compaction Target**:
-The token estimate at which Compaction fires - the same low-water mark
-Eviction settles to. The Conversation is proactively compacted at a Run
-boundary when its estimate exceeds this target, and reactively mid-Run only
-when Eviction alone cannot bring the estimate under budget.
+The token estimate at which Compaction fires. The Conversation is proactively
+compacted at a Run boundary when its estimate exceeds this target, and
+reactively mid-Run when the fit-check finds the request still over budget.
 _Avoid_: compaction threshold (ambiguous with Compaction Keep)
 
 **Proactive Compaction**:
@@ -331,5 +252,5 @@ hitting the budget cliff during the Run.
 
 **Reactive Compaction**:
 Compaction triggered mid-Run when building a request finds the Conversation
-still over budget after Eviction has run dry - the last recovery attempt
+over budget (the fit-check returns exhausted) - the last recovery attempt
 before the Run fails.

@@ -25,7 +25,7 @@ pub struct Conversation {
     pub max_tokens_reserve: u64,
     pub last_usage: Option<Usage>,
     pub overhead_chars: u64,
-    pub eviction_slack: f64,
+    pub compaction_slack: f64,
     pub compaction_keep: f64,
 }
 
@@ -38,26 +38,27 @@ pub struct ConversationOpts {
     pub context_budget: u64,
     pub max_tokens_reserve: u64,
     pub overhead_chars: u64,
-    pub eviction_slack: f64,
+    pub compaction_slack: f64,
     pub compaction_keep: f64,
 }
 
 /// Clamp floor for float results that should never go below zero.
 const FLOAT_CLAMP_ZERO: f64 = 0.0;
-/// Default eviction slack fraction: no hysteresis overshoot by default.
-const DEFAULT_EVICTION_SLACK: f64 = 0.0;
+/// Default compaction slack fraction: no compaction headroom below the budget
+/// by default.
+const DEFAULT_COMPACTION_SLACK: f64 = 0.0;
 /// Default compaction keep fraction: keep the newest 50% of the live window.
 const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
 
 impl ConversationOpts {
     /// The two required knobs, with baud's defaults for the rest
-    /// (`overhead_chars: 0`, `eviction_slack: 0.0`, `compaction_keep: 0.5`).
+    /// (`overhead_chars: 0`, `compaction_slack: 0.0`, `compaction_keep: 0.5`).
     pub fn new(context_budget: u64, max_tokens_reserve: u64) -> Self {
         ConversationOpts {
             context_budget,
             max_tokens_reserve,
             overhead_chars: 0,
-            eviction_slack: DEFAULT_EVICTION_SLACK,
+            compaction_slack: DEFAULT_COMPACTION_SLACK,
             compaction_keep: DEFAULT_COMPACTION_KEEP,
         }
     }
@@ -67,8 +68,8 @@ impl ConversationOpts {
         self
     }
 
-    pub fn eviction_slack(mut self, v: f64) -> Self {
-        self.eviction_slack = v;
+    pub fn compaction_slack(mut self, v: f64) -> Self {
+        self.compaction_slack = v;
         self
     }
 
@@ -88,7 +89,7 @@ impl Conversation {
             max_tokens_reserve: opts.max_tokens_reserve,
             last_usage: None,
             overhead_chars: opts.overhead_chars,
-            eviction_slack: opts.eviction_slack,
+            compaction_slack: opts.compaction_slack,
             compaction_keep: opts.compaction_keep,
         }
     }
@@ -173,13 +174,14 @@ impl Conversation {
         }
     }
 
-    /// The Compaction Target: the low-water mark shared by Eviction's
-    /// overshoot floor, Compaction's trigger, and the Session's validation.
+    /// The Compaction Target: the low-water mark shared by Compaction's
+    /// trigger and the Session's validation. `compaction_slack` lowers it,
+    /// carving compaction headroom below the Context Budget.
     pub fn compaction_target(&self) -> u64 {
         compaction_target(
             self.context_budget,
             self.max_tokens_reserve,
-            self.eviction_slack,
+            self.compaction_slack,
         )
     }
 
@@ -286,9 +288,9 @@ pub struct ContextBudgetExhausted;
 
 /// [`Conversation::merge_user_text`] over bare messages: a trailing user-role
 /// message gains a text block; otherwise a fresh user message is appended.
-/// The one seam every tail rider crosses - Steering, Nudges, Endgame prompts,
-/// and Anchors alike - shared with Resume's fold so a logged rider replays
-/// through the same code that placed it live.
+/// The one seam every tail rider crosses - Steering and any Voice-authored
+/// marker that rides the tail - shared with Resume's fold so a logged rider
+/// replays through the same code that placed it live.
 pub fn merge_user_text(messages: &mut Vec<Message>, text: impl Into<String>) {
     match messages.last_mut() {
         Some(last) if last.role == Role::User => {
@@ -300,10 +302,10 @@ pub fn merge_user_text(messages: &mut Vec<Message>, text: impl Into<String>) {
 
 /// `compaction_target` over plain numbers, for callers that hold the Session
 /// facts but no Conversation:
-/// `max(context_budget - max_tokens_reserve - trunc(eviction_slack * context_budget), 0)`.
-pub fn compaction_target(context_budget: u64, max_tokens_reserve: u64, eviction_slack: f64) -> u64 {
+/// `max(context_budget - max_tokens_reserve - trunc(compaction_slack * context_budget), 0)`.
+pub fn compaction_target(context_budget: u64, max_tokens_reserve: u64, compaction_slack: f64) -> u64 {
     let target = context_budget.saturating_sub(max_tokens_reserve);
-    let slack = (context_budget as f64 * eviction_slack).trunc() as u64;
+    let slack = (context_budget as f64 * compaction_slack).trunc() as u64;
     target.saturating_sub(slack)
 }
 
@@ -465,12 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn new_eviction_slack_defaults_to_zero_and_is_settable() {
+    fn new_compaction_slack_defaults_to_zero_and_is_settable() {
         let base = Conversation::new("sys", ConversationOpts::new(123, 0));
         let with_slack =
-            Conversation::new("sys", ConversationOpts::new(123, 0).eviction_slack(0.5));
-        assert_eq!(base.eviction_slack, 0.0);
-        assert_eq!(with_slack.eviction_slack, 0.5);
+            Conversation::new("sys", ConversationOpts::new(123, 0).compaction_slack(0.5));
+        assert_eq!(base.compaction_slack, 0.0);
+        assert_eq!(with_slack.compaction_slack, 0.5);
     }
 
     #[test]
@@ -631,7 +633,7 @@ mod tests {
 
     #[test]
     fn compaction_target_is_live_window_minus_slack() {
-        let conv = Conversation::new("sys", ConversationOpts::new(1000, 200).eviction_slack(0.3));
+        let conv = Conversation::new("sys", ConversationOpts::new(1000, 200).compaction_slack(0.3));
         assert_eq!(conv.compaction_target(), 500);
         assert_eq!(compaction_target(1000, 200, 0.3), 500);
     }
@@ -756,7 +758,7 @@ mod tests {
 
     #[test]
     fn prepare_compaction_finds_cutoff_across_runs() {
-        let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0).eviction_slack(0.0));
+        let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0).compaction_slack(0.0));
         for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
             conv.add_user_text(u.repeat(100));
             conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(100))]);
@@ -832,11 +834,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compaction_eviction_slack_no_longer_affects_cutoff() {
+    fn prepare_compaction_compaction_slack_no_longer_affects_cutoff() {
         let pairs = [("a", "b"), ("c", "d"), ("e", "f")];
         let make_opts = || ConversationOpts::new(1_000, 0).compaction_keep(0.5);
-        let zero = multi_run_conv(make_opts().eviction_slack(0.0), &pairs, 300);
-        let high = multi_run_conv(make_opts().eviction_slack(0.9), &pairs, 300);
+        let zero = multi_run_conv(make_opts().compaction_slack(0.0), &pairs, 300);
+        let high = multi_run_conv(make_opts().compaction_slack(0.9), &pairs, 300);
 
         let (_, cutoff_zero, _) = zero.prepare_compaction().unwrap();
         let (_, cutoff_high, _) = high.prepare_compaction().unwrap();

@@ -14,16 +14,27 @@ impl Tool for ListFiles {
         ToolSpec {
             name: "list_files".into(),
             description:
-                "List the entries of a directory, one per line. Directories end with a trailing / \
-                and are listed first; everything is sorted. Omit path to list the project root. \
-                Use this to explore the project before reading or editing files."
+                "Lists the names of files and subdirectories directly within a single specified \
+                directory, one entry per line.\n\
+                \n\
+                Usage:\n\
+                - Subdirectories end with a trailing `/` and are listed first; within each group \
+                entries are sorted. An empty directory is reported as \"[empty directory]\".\n\
+                - The `path` is relative to the project root (e.g. \"src/tools\"), NOT an absolute \
+                path. Omit it to list the project root.\n\
+                - This lists exactly ONE directory (its direct children), not the whole tree. To \
+                find files by name across the tree, use glob; to search file contents, use grep.\n\
+                - Use this to orient yourself and explore the project's structure before reading or \
+                editing files."
                     .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Directory path relative to the project root. Defaults to \".\" (the project root)."
+                        "description": "The directory to list, relative to the project root (e.g. \
+                            \"src/tools\"). Defaults to \".\" (the project root). Do not pass an \
+                            absolute path."
                     }
                 },
                 "required": []

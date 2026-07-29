@@ -41,7 +41,7 @@ pub trait Llm: Send + Sync {
 }
 ```
 
-Callers (Run, Scout, Compaction) speak only typed domain structs. Each Api
+Callers (Run and Compaction) speak only typed domain structs. Each Api
 adapter owns end to end: native request building, transport and headers,
 its SSE dialect's decoding (a pure fold, as before), stop-reason mapping,
 usage extraction, and error capture. The production implementation of `Llm`
@@ -128,13 +128,13 @@ recompute from that capture at Run start:
 
 - context window → Context Budget (config `context_budget` remains as the
   window for catalog-less Models and as an optional global cap),
-- output cap → the Eviction reserve,
+- output cap → the reply reserve,
 - Context Budget → the Result Cap.
 
 A switch to a smaller window lands as ordinary budget pressure on the next
-Run - Eviction and Compaction already know what to do. An in-flight Run
-finishes on the Model it captured; nothing swaps mid-flight. Scout and
-Compaction run on the same captured figures.
+Run - Compaction already knows what to do. An in-flight Run finishes on the
+Model it captured; nothing swaps mid-flight. Compaction runs on the same
+captured figures.
 
 The precedence (implemented in Stage E): a Model's window is the Catalog's
 figure for a known built-in model, else its Provider's config
@@ -153,7 +153,7 @@ fit is rejected with the reason instead of exploding on a later Run.
 - **Keeping `build_request` outside the trait with a protocol switch** -
   rejected: every caller learns there are N wire formats; the interface
   grows where it should deepen.
-- **A trait per Api instead of a dispatcher** - rejected: Run, Scout, and
+- **A trait per Api instead of a dispatcher** - rejected: Run and
   Compaction want one injected boundary (ADR-0020); which adapter speaks is
   the dispatcher's fact, routed on `model.api`.
 - **Gitignored generated Catalog data (pi's way)** - rejected: puts the

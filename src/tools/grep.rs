@@ -37,23 +37,44 @@ impl Tool for Grep {
         ToolSpec {
             name: "grep".into(),
             description: format!(
-                "Search file contents with a regular expression (PCRE). Returns matching lines as \
-                path:line: text, capped at {MAX_MATCHES} matches. Searches recursively under \
-                path (default: the project root); path may also be a single file. Skips .git, \
-                _build, deps, node_modules and binary files. A pattern that is not valid regex \
-                is searched as literal text. Use this to find where something is defined or \
-                used before reading files."
+                "A powerful content-search tool that scans file contents with a regular expression \
+                and returns matching lines as `path:line: text`.\n\
+                \n\
+                Usage:\n\
+                - ALWAYS use this grep tool for searching file contents. Do NOT invoke `grep` or \
+                `rg` through run_command - this tool is set up with the correct project confinement \
+                (it stays inside the project root, skips vendored/build directories, and never \
+                follows symlinks).\n\
+                - Supports full regular-expression syntax, e.g. \"log.*Error\", \"fn\\\\s+\\\\w+\", \
+                \"TODO|FIXME\". Special regex metacharacters need escaping to match them literally \
+                (use \"interface\\\\{{\\\\}}\" to find `interface{{}}` in Go code).\n\
+                - Forgiving fallback: a pattern that fails to compile as a regex is retried as \
+                literal text (with a note prefixed to the result) rather than erroring, so \
+                \"foo(bar\" finds the literal characters. Zero matches from a VALID regex is a real \
+                answer and never falls back.\n\
+                - Scope: searches recursively under `path` (default the project root); `path` may \
+                also be a single file. Skips .git, _build, deps, node_modules and other \
+                vendored/build directories, and skips binary files.\n\
+                - Output is capped at {MAX_MATCHES} matches; a trailer notes when the cap was \
+                reached. \"[no matches]\" is returned when nothing matches.\n\
+                - Use this to find where a symbol or string is defined or used before reading \
+                files. To find files by NAME rather than by content, use glob instead."
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Regular expression to search for, matched against each line."
+                        "description": "The regular expression to search for in file contents, \
+                            matched against each line, e.g. \"fn run\" or \"impl\\\\s+Tool\". A \
+                            pattern that is not valid regex is searched as literal text instead of \
+                            erroring."
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory or file to search, relative to the project root. Defaults to \".\"."
+                        "description": "The directory or file to search in, relative to the \
+                            project root (e.g. \"src/tools\"). Defaults to \".\" (the project \
+                            root). Do not pass an absolute path."
                     }
                 },
                 "required": ["pattern"]

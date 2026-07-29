@@ -9,9 +9,8 @@
 //! the token through unchanged.
 //!
 //! * `pre_run` - before the Tool executes. May replace the token's input,
-//!   [`Token::halt`] the call, or capture state into `assigns`. Runs after the
-//!   Duplicate Nudge check and before the Approval gate, so the user always
-//!   approves the Middleware-adjusted command.
+//!   [`Token::halt`] the call, or capture state into `assigns`. Runs before the
+//!   Approval gate, so the user always approves the Middleware-adjusted command.
 //! * `post_run` - after execution, before Shaping. May transform
 //!   `token.result` (the content the model sees) and attach Artifacts.
 //!

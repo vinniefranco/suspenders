@@ -930,8 +930,8 @@ enum GutterKind {
 /// Derives the per-item lane gutter for the settled items, in order (ADR-0040):
 /// a `User` item opens a lane and every item after it hangs off that lane until
 /// the next `User`; the region before the first `User` is spineless. The lane is
-/// the user REQUEST, not the Run - a Recovery Run injects no `User` item, so
-/// its work correctly stays on the prior request's spine. Pure over the item
+/// the user REQUEST, not the Run - harness-produced work injects no `User` item,
+/// so it correctly stays on the prior request's spine. Pure over the item
 /// sequence, so it is asserted without a frame; the two live entries (reasoning
 /// tail, streaming answer) are appended as `Spine` by the caller.
 fn lane_gutters(items: &[TranscriptItem]) -> Vec<GutterKind> {
@@ -2373,12 +2373,6 @@ pub enum StatusSegment {
         estimate: u64,
         /// How close to the budget the Conversation sits.
         level: PressureLevel,
-        /// The LIVE Dead Mass share as an integer percent (from the most recent
-        /// ContextPressure), or `None` before any pressure event. When `Some`,
-        /// the segment appends a `· N% dead` tail - pre-rounded upstream (the
-        /// single rounding rule) and baked into `cells()` like every other
-        /// segment fact, never recomputed in the painter.
-        dead_mass_pct: Option<u64>,
     },
     /// The viewport scroll position label (`Bot`/`Top`/`NN%`), already derived
     /// from this frame's geometry by [`scroll_position_label`].
@@ -2420,17 +2414,10 @@ impl StatusSegment {
 }
 
 /// The Tokens segment's display text: `~{estimate} tokens` (grouped with
-/// thousands separators); a `· {N}% dead` tail whenever a live Dead Mass share
-/// is known (the percent is
-/// pre-rounded upstream through the single rounding rule, so no rounding happens
-/// here). The tail shows even at `Some(0)` - a live zero is the meaningful "no
-/// dead mass" fact, not an absence.
-fn tokens_label(estimate: u64, dead_mass_pct: Option<u64>) -> String {
+/// thousands separators).
+fn tokens_label(estimate: u64) -> String {
     let estimate = estimate.separate_with_commas();
-    match dead_mass_pct {
-        Some(pct) => format!(" ~{estimate} tokens · {pct}% dead "),
-        None => format!(" ~{estimate} tokens "),
-    }
+    format!(" ~{estimate} tokens ")
 }
 
 /// The Cost segment's display text (ADR-0037: the Session's cumulative
@@ -2506,18 +2493,11 @@ impl StatusBar {
 }
 
 /// The token facts the status bar's Tokens segment needs: the `estimate` it
-/// draws, the [`PressureLevel`] that colors it, and the live
-/// `dead_mass_pct` (an integer percent, pre-rounded through the single rounding
-/// rule) from the most recent ContextPressure (`None` before any pressure
-/// event). A named struct rather than a tuple so the extra Dead Mass fact
-/// rides in cleanly and the `status_bar` arg COUNT stays at 8 (no 9th arg - the
-/// Stage 3 review's binding precondition against growing the already-suppressed
-/// signature).
+/// draws and the [`PressureLevel`] that colors it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenView {
     pub estimate: u64,
     pub level: PressureLevel,
-    pub dead_mass_pct: Option<u64>,
 }
 
 /// The figures the bar's right side draws beside the toggles: the token facts
@@ -2584,17 +2564,8 @@ pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
             expanded: toggles.tools_expanded,
         },
     ];
-    if let Some(TokenView {
-        estimate,
-        level,
-        dead_mass_pct,
-    }) = figures.tokens
-    {
-        right.push(StatusSegment::Tokens {
-            estimate,
-            level,
-            dead_mass_pct,
-        });
+    if let Some(TokenView { estimate, level }) = figures.tokens {
+        right.push(StatusSegment::Tokens { estimate, level });
     }
     // The cost segment exists only once a priced Response landed: at zero the
     // Session has spent nothing meterable and the bar stays as it always was.
@@ -2660,11 +2631,7 @@ impl StatusSegment {
                 padded(&format!("{marker} tools"))
             }
             StatusSegment::Cost { label } => padded(label),
-            StatusSegment::Tokens {
-                estimate,
-                dead_mass_pct,
-                ..
-            } => tokens_label(*estimate, *dead_mass_pct),
+            StatusSegment::Tokens { estimate, .. } => tokens_label(*estimate),
             StatusSegment::Position { label } => padded(label),
         }
     }
@@ -2720,7 +2687,6 @@ pub(crate) fn render_status_bar(
                 tokens: t.token_estimate.map(|estimate| TokenView {
                     estimate,
                     level: t.pressure_level,
-                    dead_mass_pct: t.dead_mass_pct,
                 }),
                 session_cost: t.session_cost,
             },
@@ -3627,7 +3593,6 @@ mod tests {
                     tokens: Some(TokenView {
                         estimate: 1200,
                         level: PressureLevel::Ok,
-                        dead_mass_pct: None,
                     }),
                     session_cost: 0.42,
                 },
@@ -3852,7 +3817,6 @@ mod tests {
                 figures: tokens_only(TokenView {
                     estimate: 1200,
                     level: PressureLevel::Ok,
-                    dead_mass_pct: None,
                 }),
                 position: "Bot".to_string(),
             },
@@ -3912,14 +3876,12 @@ mod tests {
         let tokens = tokens_segment(tokens_only(TokenView {
             estimate: 99000,
             level: PressureLevel::Critical,
-            dead_mass_pct: None,
         }));
         assert_eq!(
             tokens,
             StatusSegment::Tokens {
                 estimate: 99000,
                 level: PressureLevel::Critical,
-                dead_mass_pct: None,
             }
         );
         assert_eq!(tokens.kind(), SegmentKind::Tokens(PressureLevel::Critical));
@@ -3935,7 +3897,6 @@ mod tests {
             let tokens = tokens_segment(tokens_only(TokenView {
                 estimate: 1,
                 level,
-                dead_mass_pct: None,
             }));
             assert_eq!(tokens.kind(), SegmentKind::Tokens(level));
         }
@@ -3994,7 +3955,6 @@ mod tests {
             StatusSegment::Tokens {
                 estimate: 1200,
                 level: PressureLevel::Ok,
-                dead_mass_pct: None,
             }
             .paint(),
             " ~1,200 tokens "
@@ -4002,48 +3962,18 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_mass_share_appends_a_percent_dead_tail() {
-        // Once a live Dead Mass share is known the Tokens segment grows a `· N%
-        // dead` tail (the integer percent, pre-rounded upstream); `None` paints
-        // the old form. A live `Some(0)` is meaningful - it shows the tail.
-        let with_dead = StatusSegment::Tokens {
+    fn the_tokens_segment_cells_match_its_paint() {
+        // The load-bearing fit invariant: cells() must equal the painted width,
+        // or the bar over/underflows.
+        let seg = StatusSegment::Tokens {
             estimate: 1200,
             level: PressureLevel::Ok,
-            dead_mass_pct: Some(12),
         };
-        assert_eq!(with_dead.paint(), " ~1,200 tokens · 12% dead ");
-
-        let zero = StatusSegment::Tokens {
-            estimate: 1200,
-            level: PressureLevel::Ok,
-            dead_mass_pct: Some(0),
-        };
-        assert_eq!(zero.paint(), " ~1,200 tokens · 0% dead ");
-
-        let without = StatusSegment::Tokens {
-            estimate: 1200,
-            level: PressureLevel::Ok,
-            dead_mass_pct: None,
-        };
-        assert_eq!(without.paint(), " ~1,200 tokens ");
-    }
-
-    #[test]
-    fn the_tokens_segment_cells_match_its_paint_with_and_without_dead_mass() {
-        // The load-bearing fit invariant: cells() must equal the painted width
-        // in BOTH forms, or the bar over/underflows once a share lands.
-        for dead_mass_pct in [None, Some(0), Some(12)] {
-            let seg = StatusSegment::Tokens {
-                estimate: 1200,
-                level: PressureLevel::Ok,
-                dead_mass_pct,
-            };
-            assert_eq!(
-                seg.cells(),
-                seg.paint().chars().count(),
-                "{seg:?} cells() disagrees with painted width"
-            );
-        }
+        assert_eq!(
+            seg.cells(),
+            seg.paint().chars().count(),
+            "{seg:?} cells() disagrees with painted width"
+        );
     }
 
     #[test]
@@ -5619,22 +5549,19 @@ mod tests {
         // Task 1 acceptance: a long marker soft-wraps and its continuation must
         // sit at column 2 (block indent), not fall back to column 0. Render the
         // real path and inspect the marker's second visual row.
-        let long: Vec<String> = "reading file after file fills your context dispatch \
+        let long = "reading file after file fills your context dispatch \
                     a focused search instead and let a helper report back with just \
-                    the answer you actually need to keep moving"
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+                    the answer you actually need to keep moving";
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("go", Ok(()));
-        let (screen, _) = screen.apply_event(Event::tools_narrowed(long));
+        let (screen, _) = screen.apply_event(Event::compaction_progress(long));
         let terminal = draw_viewport(60, 20, &screen);
-        // The marker's FIRST row carries `⊘`; its continuation is the next row.
+        // The marker's FIRST row carries the compaction glyph `⟨`; its
+        // continuation is the next row.
         let marker_y = (0..20)
-            .find(|&y| row_text(&terminal, y).contains('⊘'))
+            .find(|&y| row_text(&terminal, y).contains('⟨'))
             .expect("the marker row");
         let cont = row_text(&terminal, marker_y + 1);
-        assert!(cont.contains("instead"), "the continuation row: {cont:?}");
         // Columns are per-cell symbols. Column 0 is the spine `│`, column 1 the
         // trailing gutter space; the content area begins at column LANE_GUTTER.
         // The marker's own 2-space block indent means the content-area columns 0
@@ -5863,22 +5790,19 @@ mod tests {
     /// settled thought that would wrap, a wrapping in-lane marker, and a tool
     /// call. Returns the rendered terminal.
     fn evaluate_project_screen(width: u16, height: u16) -> Terminal<TestBackend> {
-        // A long tools-narrowed marker (`⊘ tools narrowed to ...`) that soft-
+        // A long Compaction marker (`⟨ compaction: ... → summary ⟩`) that soft-
         // wraps at 60 cols, standing in for the wrapping in-lane marker this
         // shape exercises.
-        let tools: Vec<String> = "read_file list_files grep run_command edit_file \
-                     write_file plan and every other tool name that could plausibly \
-                     appear so the marker wraps across several visual rows here"
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let status = "reading the manifest and the entry point and every other file \
+                     that could plausibly appear so the marker wraps across several \
+                     visual rows here";
         let thinking = "I should read the manifest and the entry point and the tests \
                         and then form a plan about what to evaluate first here";
         let screen = screen_with_thinking("evaluate this project", thinking);
         // Settle the thought (empty final content → thinking materializes).
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-        // A wrapping in-lane Constrain marker (the `⊘ ...` line).
-        let (screen, _) = screen.apply_event(Event::tools_narrowed(tools));
+        // A wrapping in-lane Housekeeping marker (the `⟨ compaction: ... ⟩` line).
+        let (screen, _) = screen.apply_event(Event::compaction_progress(status));
         let (screen, _) = screen.apply_event(Event::tool_call(
             "id1",
             "read_file",
@@ -5950,7 +5874,7 @@ mod tests {
     #[test]
     fn every_in_lane_visual_row_keeps_its_spine_in_the_evaluate_shape() {
         // Symptom 2, TestBackend reproduction: the `evaluate this project` shape
-        // at 60 cols - a wrapped thought, a wrapped nudge marker, a tool call.
+        // at 60 cols - a wrapped thought, a wrapped machinery marker, a tool call.
         // In TestBackend EVERY in-lane visual row (including soft-wrapped
         // continuations of the marker and the machinery line) keeps its `│`
         // spine at column 0 and its content stays inside content_area. So the
@@ -5962,13 +5886,14 @@ mod tests {
         for y in 0..24 {
             let row = row_text(&terminal, y);
             let first = row.chars().next();
-            // Rows carrying agent content (the thought, the `⊘` marker, the `⋯`
-            // machinery) are all in-lane and must start with the spine.
+            // Rows carrying agent content (the thought, the `⟨ compaction …`
+            // marker and its wrapped body, the `⋯` machinery) are all in-lane
+            // and must start with the spine.
             let is_agent_content = row.contains("thought:")
-                || row.contains('⊘')
+                || row.contains('⟨')
                 || row.contains('⋯')
-                || row.contains("tools narrowed")
-                || row.contains("every other tool");
+                || row.contains("compaction:")
+                || row.contains("every other file");
             if is_agent_content {
                 assert_eq!(first, Some('│'), "row {y} lost its spine: {row:?}");
             }

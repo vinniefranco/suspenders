@@ -278,7 +278,7 @@ mod tests {
     }
 
     fn opts() -> ConversationOpts {
-        ConversationOpts::new(2000, 500).eviction_slack(0.0)
+        ConversationOpts::new(2000, 500).compaction_slack(0.0)
     }
 
     fn conversation_with_runs(count: u64) -> Conversation {
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn fires_at_the_compaction_target_not_the_budget_target() {
-        let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).eviction_slack(0.3));
+        let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).compaction_slack(0.3));
         conv.add_user_text("a".repeat(2100));
 
         assert!(conv.token_estimate() > conv.compaction_target());
@@ -360,7 +360,7 @@ mod tests {
         // (`token_estimate` is the char estimate floored by the usage's
         // context floor), the binding term at Run start when the previous
         // Run's usage is on record.
-        let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).eviction_slack(0.0));
+        let mut conv = Conversation::new("", ConversationOpts::new(1000, 200).compaction_slack(0.0));
         conv.add_user_text("short");
         assert_eq!(conv.compaction_target(), 800);
 

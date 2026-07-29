@@ -8,7 +8,6 @@
 // ===========================================================================
 use super::*;
 use crate::content::{ContentBlock, Usage};
-use crate::event::WaveStats;
 use crate::llm::response::{Response, StopReason};
 use crate::session::SessionConfig;
 use crate::test_support::{Entry, FakeLlm};
@@ -99,38 +98,16 @@ fn tool_result_flags_ok_and_err_with_the_byte_count() {
 }
 
 #[test]
-fn context_pressure_prints_the_budget_numbers_and_the_dead_mass_percent() {
+fn context_pressure_prints_the_budget_numbers() {
     let event = Event::ContextPressure {
         token_estimate: 1000,
         context_budget: 2000,
         max_tokens_reserve: 300,
-        dead_mass: 0.25,
     };
     assert_eq!(
         event_lines(&event, 0.0),
         vec![
-            "   ## pressure token_estimate=1000 context_budget=2000 max_tokens_reserve=300 (dead_mass=25%) (t=0.0s)"
-                .to_string()
-        ]
-    );
-}
-
-#[test]
-fn eviction_wave_prints_the_per_kind_counts() {
-    let event = Event::EvictionWave {
-        stats: WaveStats {
-            results_elided: 1,
-            cmd_superseded: 2,
-            read_superseded: 3,
-            edits_husked: 4,
-            anchors_elided: 5,
-            dead_mass: 0.5,
-        },
-    };
-    assert_eq!(
-        event_lines(&event, 0.0),
-        vec![
-            "   ## EVICTION wave: results=1 cmd_superseded=2 read_superseded=3 edit_husked=4 anchors=5 (dead_mass=50%) (t=0.0s)"
+            "   ## pressure token_estimate=1000 context_budget=2000 max_tokens_reserve=300 (t=0.0s)"
                 .to_string()
         ]
     );

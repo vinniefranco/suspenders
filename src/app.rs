@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::agent::{AgentHandle, StartOpts};
 use crate::approvals::Decision;
-use crate::event::{Event, dead_mass_pct};
+use crate::event::Event;
 use crate::llm::Dispatcher;
 use crate::session::{Session, SessionOpts};
 use crate::ui::picker::PickerOutcome;
@@ -175,10 +175,10 @@ async fn drive(
             continue;
         }
 
-        // Drain events until this Run settles - including any Recovery Run
-        // the settlement opens (the Agent starts it before answering the
-        // status query, so Running here means recovery is underway; ADR-0019:
-        // headless drives the same Agent seam, recovery included).
+        // Drain events until this Run settles (ADR-0019: headless drives the
+        // same Agent seam). A settle event normally leaves the Agent idle; the
+        // status recheck is a defensive backstop - if the Agent still reports
+        // Running, keep draining until it truly settles.
         loop {
             match events.recv().await {
                 Ok(event) => {
@@ -187,7 +187,7 @@ async fn drive(
                     if settled {
                         print_estimate(agent, &mut *out).await;
                         if agent.status().await == crate::agent::Status::Running {
-                            out("   .. recovery turn running; draining until it settles"
+                            out("   .. agent still running; draining until it settles"
                                 .to_string());
                             continue;
                         }
@@ -324,22 +324,9 @@ fn event_lines(event: &Event, elapsed_secs: f64) -> Vec<String> {
             token_estimate,
             context_budget,
             max_tokens_reserve,
-            dead_mass,
         } => {
             vec![format!(
-                "   ## pressure token_estimate={token_estimate} context_budget={context_budget} max_tokens_reserve={max_tokens_reserve} (dead_mass={}%) (t={t}s)",
-                dead_mass_pct(*dead_mass)
-            )]
-        }
-        Event::EvictionWave { stats } => {
-            vec![format!(
-                "   ## EVICTION wave: results={} cmd_superseded={} read_superseded={} edit_husked={} anchors={} (dead_mass={}%) (t={t}s)",
-                stats.results_elided,
-                stats.cmd_superseded,
-                stats.read_superseded,
-                stats.edits_husked,
-                stats.anchors_elided,
-                dead_mass_pct(stats.dead_mass)
+                "   ## pressure token_estimate={token_estimate} context_budget={context_budget} max_tokens_reserve={max_tokens_reserve} (t={t}s)"
             )]
         }
         Event::CompactionProgress { status } => {

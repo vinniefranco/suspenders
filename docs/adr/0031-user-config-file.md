@@ -34,13 +34,11 @@ was) because the seam is no longer env-only.
 
 **Schema is exactly the env-settable key set.** The file and the env
 seam are two serializations of one schema - `base_url`, `token`, `model`,
-`max_tokens`, `temperature`, `context_budget`, `eviction_slack`,
-`dead_mass_fraction`, `compaction_keep`, `plan_stale_after`,
-`recovery_limit`, `recovery_shape`, `malformed_retry_budget`,
-`scout_no_think`, `no_think_rescue`. Fields the env never exposed
-(`session_dir`, `llm_module`, `turn_limit`, `anchor_interval`,
-`scout_pass_limit`, the extensions list) stay out of both; closing that gap means
-adding to both seams, not letting the file diverge.
+`max_tokens`, `temperature`, `context_budget`, `compaction_slack`,
+`compaction_keep`, `loop_stall_limit`, `malformed_retry_budget`,
+`tool_call_style`, `theme`. Fields the env never exposed (`session_dir`,
+`llm_module`, `max_turns`, the extensions list) stay out of both; closing
+that gap means adding to both seams, not letting the file diverge.
 
 **A `FileConfig` DTO carries the schema** - every field `Option<T>`,
 `#[serde(deny_unknown_fields)]`, with an `apply(&self, &mut

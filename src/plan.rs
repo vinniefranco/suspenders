@@ -1,11 +1,15 @@
-//! The Plan and the original task as one value (CONTEXT.md: Plan, Anchor).
+//! The Plan and the original task as one value (CONTEXT.md: Plan).
 //!
-//! The Plan is the model-maintained statement of the current goal, held by the
+//! The Plan is the model-maintained task list for the current goal, held by the
 //! harness outside the Conversation; the original task is the user's verbatim
-//! first prompt. The Anchor is an injected copy of both, placed near the
-//! Conversation's tail. This module owns the value and its composition; the
-//! Run loop keeps the *when* (Anchor cadence, when to fire `set_plan`), the
-//! Agent keeps the storage, and `crate::voice` keeps the Anchor's framing.
+//! first prompt. This module owns the value and its composition; the Run loop
+//! keeps the *when* (when to fire `set_plan`), the Agent keeps the storage, and
+//! `crate::voice` keeps the tool's confirmation framing.
+//!
+//! The task list is the model's voice: it arrives as a `todo_write` Tool Call
+//! carrying a `todos` array (each item a `content` string and a `status`), and
+//! this value stores it verbatim - never rewritten, never interpreted. A
+//! malformed or errored call stores nothing.
 //!
 //! ## Where the original task comes from
 //!
@@ -13,22 +17,63 @@
 //! ([`crate::conversation::Conversation::original_task`]) - unless the caller
 //! already holds a durable copy. After a Compaction the Conversation's head is
 //! the summary message, whose first block is also user text: a fresh capture
-//! there would anchor the summary blob, not the task. The durable copy lives in
+//! there would carry the summary blob, not the task. The durable copy lives in
 //! the Compaction state (captured at the first Compaction), and the Agent
-//! threads it into every later Run, so the Anchor keeps carrying the verbatim
-//! task statement per CONTEXT.md.
+//! threads it into every later Run, so compaction keeps re-appending the
+//! verbatim task statement per CONTEXT.md.
 
 use crate::conversation::Conversation;
-use crate::voice;
 use serde_json::Value;
 
-/// The Plan value: the model's current goal statement (`content`) and the
-/// user's verbatim first prompt (`original_task`), both optional before they
-/// are known.
+/// One item in the model's task list: a `content` line in the model's voice and
+/// its `status`. Held verbatim; the harness never edits the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+/// A task item's status, the `todo_write` vocabulary: not started, the single
+/// item currently being worked, or finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    /// Parses the `todo_write` status enum, returning `None` for any token
+    /// outside the vocabulary (a malformed item the caller drops).
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(TodoStatus::Pending),
+            "in_progress" => Some(TodoStatus::InProgress),
+            "completed" => Some(TodoStatus::Completed),
+            _ => None,
+        }
+    }
+
+    /// The checklist glyph for this status: `[ ]` pending, `[~]` in progress,
+    /// `[x]` completed. Used to render the list for the log and the UI.
+    fn glyph(self) -> &'static str {
+        match self {
+            TodoStatus::Pending => "[ ]",
+            TodoStatus::InProgress => "[~]",
+            TodoStatus::Completed => "[x]",
+        }
+    }
+}
+
+/// The Plan value: the model's current task list (`todos`) and the user's
+/// verbatim first prompt (`original_task`). The `restored` render is the plan
+/// string carried in from a previous Run (the Agent holds it), used only as the
+/// rendered form until a fresh `todo_write` replaces the list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
-    pub content: Option<String>,
+    pub todos: Vec<TodoItem>,
     pub original_task: Option<String>,
+    restored: Option<String>,
 }
 
 /// The outcome of folding one Tool Call into the Plan: `Updated` carries the
@@ -40,82 +85,17 @@ pub enum Update {
     Unchanged,
 }
 
-/// The Plan's checkbox completeness, read syntactically from its content.
-/// A fact about the Plan text, never a judgment: the Endgame decides what to
-/// do with it (see the Open Plan, CONTEXT.md; ADR-0043).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanProgress {
-    /// At least one unchecked `[ ]` step.
-    Incomplete,
-    /// At least one checkbox and none unchecked.
-    Complete,
-    /// No checkboxes at all - completeness is uninferrable.
-    NoCheckboxes,
-}
-
-/// One line's checkbox reading: whether it is an open box, a checked box, or
-/// not a checkbox line at all. The grammar is fail-safe toward stopping -
-/// ambiguity never reads as `Open`, so a malformed token cannot make the Plan
-/// look Incomplete (failing toward autonomy is the dangerous direction).
-enum BoxKind {
-    Open,
-    Checked,
-    None,
-}
-
-/// Reads one non-fenced line as a checkbox. Trims leading whitespace, strips an
-/// optional list bullet (`- `/`* `/`+ ` or an ordered `12) `/`3. ` marker),
-/// then requires a line-anchored checkbox token: `[ ]` open, `[x]`/`[X]`
-/// checked, anything else no box.
-fn read_box(line: &str) -> BoxKind {
-    let rest = strip_bullet(line.trim_start());
-    if rest.starts_with("[ ]") {
-        BoxKind::Open
-    } else if rest.starts_with("[x]") || rest.starts_with("[X]") {
-        BoxKind::Checked
-    } else {
-        BoxKind::None
-    }
-}
-
-/// Strips a leading list bullet from an already-left-trimmed line, returning the
-/// remainder. Handles `- `/`* `/`+ ` and ordered markers (digits then `.` or `)`
-/// then a space). Leaves the line untouched when no bullet is present.
-fn strip_bullet(line: &str) -> &str {
-    for bullet in ["- ", "* ", "+ "] {
-        if let Some(rest) = line.strip_prefix(bullet) {
-            return rest;
-        }
-    }
-    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits > 0 {
-        let after = &line[digits..];
-        if let Some(rest) = after
-            .strip_prefix(". ")
-            .or_else(|| after.strip_prefix(") "))
-        {
-            return rest;
-        }
-    }
-    line
-}
-
-/// A line that toggles a fenced code block: trimmed-start begins with three
-/// backticks or three tildes. Fence delimiters and their contents are ignored
-/// so example markdown cannot trigger false incompleteness.
-fn is_fence(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("```") || t.starts_with("~~~")
-}
-
 impl Plan {
-    /// Builds the Run's Plan value: `content` restored from the previous Run
-    /// (the Agent holds it), `original_task` from a durable copy when one
-    /// exists (the Compaction state after the first Compaction).
-    pub fn new(content: Option<String>, original_task: Option<String>) -> Self {
+    /// Builds the Run's Plan value: `restored` is the plan string from the
+    /// previous Run (the Agent holds it), `original_task` from a durable copy
+    /// when one exists (the Compaction state after the first Compaction). The
+    /// restored string is a rendered checklist, not structured todos, so it is
+    /// kept only as the render fallback until a fresh `todo_write` replaces it.
+    pub fn new(restored: Option<String>, original_task: Option<String>) -> Self {
         Plan {
-            content,
+            todos: Vec::new(),
             original_task,
+            restored,
         }
     }
 
@@ -129,87 +109,61 @@ impl Plan {
         self
     }
 
-    /// Folds one executed Tool Call into the Plan: a successful plan Tool Call
-    /// with non-empty content updates it, anything else leaves it alone. The
-    /// Plan content is the model's voice, verbatim - never rewritten (a
-    /// malformed input sentinel or an errored call stores nothing).
+    /// Folds one executed Tool Call into the Plan: a successful `todo_write`
+    /// call carrying a non-empty, well-formed `todos` array replaces the list;
+    /// anything else leaves the Plan alone. The items are the model's voice,
+    /// verbatim - never rewritten (a malformed input sentinel, an errored call,
+    /// or a list with no valid item stores nothing).
     pub fn update(&self, name: &str, input: &Value, is_error: bool) -> Update {
-        if name == "plan"
+        if name == "todo_write"
             && !is_error
-            && let Some(Value::String(content)) = input.get("plan")
-            && !content.is_empty()
+            && let Some(todos) = parse_todos(input)
+            && !todos.is_empty()
         {
             let mut updated = self.clone();
-            updated.content = Some(content.clone());
+            updated.todos = todos;
+            updated.restored = None;
             return Update::Updated(updated);
         }
         Update::Unchanged
     }
 
-    /// Composes the Anchor text: the original task and the current Plan inside
-    /// the Voice-owned framing ([`crate::voice::anchor`]). The framing belongs
-    /// to the Voice; the content is this value's.
-    pub fn anchor(&self) -> String {
-        voice::anchor(
-            self.original_task.as_deref().unwrap_or(""),
-            self.content.as_deref(),
-        )
+    /// Renders the task list as a checklist string for the log and the UI: one
+    /// line per item, its status glyph then its content. When the list is empty
+    /// (a resumed Run before any fresh `todo_write`), the restored render is
+    /// returned as-is.
+    pub fn render(&self) -> String {
+        if self.todos.is_empty() {
+            return self.restored.clone().unwrap_or_default();
+        }
+        self.todos
+            .iter()
+            .map(|t| format!("{} {}", t.status.glyph(), t.content))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
+}
 
-    /// Reads the Plan's checkbox completeness syntactically (see [`PlanProgress`]):
-    /// any open box makes it `Incomplete`, otherwise a present-but-all-checked
-    /// Plan is `Complete`, and a Plan without checkboxes is `NoCheckboxes`. No
-    /// content reads as `NoCheckboxes`. Fenced code blocks are excluded so an
-    /// example `[ ]` cannot make the Plan look Incomplete.
-    pub fn progress(&self) -> PlanProgress {
-        let Some(content) = self.content.as_deref() else {
-            return PlanProgress::NoCheckboxes;
-        };
-        let mut in_fence = false;
-        let mut checked = false;
-        for line in content.lines() {
-            if is_fence(line) {
-                in_fence = !in_fence;
-                continue;
+/// Parses the `todos` array from a `todo_write` input, returning the well-formed
+/// items. An item needs a non-empty string `content` and a known `status`;
+/// malformed items are dropped. A missing or non-array `todos` yields `None`.
+fn parse_todos(input: &Value) -> Option<Vec<TodoItem>> {
+    let items = input.get("todos")?.as_array()?;
+    let todos = items
+        .iter()
+        .filter_map(|item| {
+            let content = item.get("content")?.as_str()?;
+            if content.is_empty() {
+                return None;
             }
-            if in_fence {
-                continue;
-            }
-            match read_box(line) {
-                BoxKind::Open => return PlanProgress::Incomplete,
-                BoxKind::Checked => checked = true,
-                BoxKind::None => {}
-            }
-        }
-        if checked {
-            PlanProgress::Complete
-        } else {
-            PlanProgress::NoCheckboxes
-        }
-    }
-
-    /// Counts the Plan's checked-box lines (`[x]`/`[X]`), skipping fenced code
-    /// blocks. No content counts as zero.
-    pub fn checked_steps(&self) -> u64 {
-        let Some(content) = self.content.as_deref() else {
-            return 0;
-        };
-        let mut in_fence = false;
-        let mut count = 0;
-        for line in content.lines() {
-            if is_fence(line) {
-                in_fence = !in_fence;
-                continue;
-            }
-            if in_fence {
-                continue;
-            }
-            if matches!(read_box(line), BoxKind::Checked) {
-                count += 1;
-            }
-        }
-        count
-    }
+            let status = TodoStatus::parse(item.get("status")?.as_str()?)?;
+            Some(TodoItem {
+                content: content.to_string(),
+                status,
+            })
+        })
+        .collect();
+    Some(todos)
 }
 
 #[cfg(test)]
@@ -220,6 +174,13 @@ mod tests {
 
     fn conversation() -> Conversation {
         Conversation::new("sys", ConversationOpts::new(10_000, 0))
+    }
+
+    fn todos(input: Value) -> Vec<TodoItem> {
+        match Plan::default().update("todo_write", &input, false) {
+            Update::Updated(plan) => plan.todos,
+            Update::Unchanged => panic!("expected Updated"),
+        }
     }
 
     // ---- capture_task/2 ----
@@ -245,7 +206,7 @@ mod tests {
     #[test]
     fn the_durable_copy_wins_over_a_summary_head_post_compaction() {
         // After a Compaction the Conversation's head is the summary message -
-        // also user text. A fresh capture would anchor the summary blob; the
+        // also user text. A fresh capture would carry the summary blob; the
         // carried copy from the Compaction state keeps the verbatim task.
         let mut base = conversation();
         base.add_user_text("original task");
@@ -266,186 +227,152 @@ mod tests {
     // ---- update/4 ----
 
     #[test]
-    fn a_successful_plan_tool_call_updates_the_content() {
-        let result = Plan::default().update("plan", &json!({ "plan": "1. read 2. edit" }), false);
-        match result {
-            Update::Updated(plan) => {
-                assert_eq!(plan.content.as_deref(), Some("1. read 2. edit"));
-            }
-            Update::Unchanged => panic!("expected Updated"),
-        }
+    fn a_successful_todo_write_call_replaces_the_list() {
+        let items = todos(json!({
+            "todos": [
+                { "content": "read the file", "status": "completed" },
+                { "content": "edit the file", "status": "in_progress" },
+                { "content": "build", "status": "pending" },
+            ]
+        }));
+        assert_eq!(
+            items,
+            vec![
+                TodoItem {
+                    content: "read the file".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "edit the file".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    content: "build".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ]
+        );
     }
 
     #[test]
-    fn other_tools_errored_calls_and_empty_or_malformed_content_do_not() {
+    fn other_tools_errored_calls_and_malformed_lists_do_not_update() {
         let plan = Plan::new(Some("keep me".to_string()), Some("task".to_string()));
+        let good = json!({ "todos": [{ "content": "x", "status": "pending" }] });
 
+        // A different tool leaves the Plan alone.
         assert_eq!(
             plan.update("read_file", &json!({ "path": "x" }), false),
             Update::Unchanged
         );
+        // An errored todo_write call stores nothing.
+        assert_eq!(plan.update("todo_write", &good, true), Update::Unchanged);
+        // A missing or non-array todos stores nothing.
         assert_eq!(
-            plan.update("plan", &json!({ "plan": "ignored" }), true),
+            plan.update("todo_write", &json!({}), false),
             Update::Unchanged
         );
         assert_eq!(
-            plan.update("plan", &json!({ "plan": "" }), false),
+            plan.update("todo_write", &json!({ "todos": "nope" }), false),
             Update::Unchanged
         );
+        // An empty list stores nothing.
         assert_eq!(
-            plan.update("plan", &json!({ "plan": 42 }), false),
+            plan.update("todo_write", &json!({ "todos": [] }), false),
             Update::Unchanged
         );
+        // A malformed input sentinel stores nothing.
         assert_eq!(
-            plan.update("plan", &crate::llm::malformed_input_marker("raw"), false),
+            plan.update(
+                "todo_write",
+                &crate::llm::malformed_input_marker("raw"),
+                false
+            ),
             Update::Unchanged
         );
     }
 
-    // ---- anchor/1 ----
-
     #[test]
-    fn composes_the_task_and_plan_inside_the_voice_framing() {
+    fn malformed_items_are_dropped_but_the_valid_ones_survive() {
+        let items = todos(json!({
+            "todos": [
+                { "content": "kept", "status": "pending" },
+                { "content": "", "status": "pending" },
+                { "content": "bad status", "status": "blocked" },
+                { "status": "pending" },
+                { "content": "also kept", "status": "completed" },
+            ]
+        }));
         assert_eq!(
-            Plan::new(Some("the plan".to_string()), Some("the task".to_string())).anchor(),
-            voice::anchor("the task", Some("the plan"))
+            items,
+            vec![
+                TodoItem {
+                    content: "kept".to_string(),
+                    status: TodoStatus::Pending,
+                },
+                TodoItem {
+                    content: "also kept".to_string(),
+                    status: TodoStatus::Completed,
+                },
+            ]
         );
     }
 
     #[test]
-    fn a_missing_task_anchors_on_an_empty_string() {
-        assert_eq!(
-            Plan::new(Some("the plan".to_string()), None).anchor(),
-            voice::anchor("", Some("the plan"))
-        );
-    }
-
-    // ---- progress/1 + checked_steps/1 ----
-
-    fn plan_with(content: &str) -> Plan {
-        Plan::new(Some(content.to_string()), None)
-    }
-
-    #[test]
-    fn a_dash_open_box_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("- [ ] read the file").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn a_star_open_box_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("* [ ] read the file").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn a_plus_open_box_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("+ [ ] read the file").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn a_dotted_ordered_open_box_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("1. [ ] read the file").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn a_paren_ordered_open_box_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("2) [ ] read the file").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn a_bare_open_box_without_a_bullet_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("[ ] read the file").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn all_checked_boxes_read_as_complete() {
-        assert_eq!(
-            plan_with("- [x] read\n- [X] edit").progress(),
-            PlanProgress::Complete
-        );
-    }
-
-    #[test]
-    fn checked_steps_counts_the_checked_boxes() {
-        assert_eq!(
-            plan_with("- [x] read\n- [X] edit\n- [x] build").checked_steps(),
-            3
-        );
-    }
-
-    #[test]
-    fn a_mix_of_checked_and_open_reads_as_incomplete() {
-        assert_eq!(
-            plan_with("- [x] read\n- [ ] edit").progress(),
-            PlanProgress::Incomplete
-        );
-    }
-
-    #[test]
-    fn a_prose_plan_has_no_checkboxes() {
-        assert_eq!(
-            plan_with("First read the file, then edit it, then build.").progress(),
-            PlanProgress::NoCheckboxes
-        );
-    }
-
-    #[test]
-    fn the_done_heading_style_has_no_checkboxes() {
-        let plan = plan_with("## Step 6: DONE ✅\n## Step 7: in progress");
-        assert_eq!(plan.progress(), PlanProgress::NoCheckboxes);
-        assert_eq!(plan.checked_steps(), 0);
-    }
-
-    #[test]
-    fn an_open_box_inside_a_code_fence_does_not_read_as_incomplete() {
-        // The load-bearing fail-safe: example markdown must never make the Plan
-        // look Incomplete. This fence holds the only box, so the Plan has none.
-        let plan = plan_with("Write markdown like:\n```\n- [ ] a step\n```\nDone.");
-        assert_eq!(plan.progress(), PlanProgress::NoCheckboxes);
-    }
-
-    #[test]
-    fn a_tilde_code_fence_also_hides_its_boxes() {
-        let plan = plan_with("~~~\n- [ ] a step\n~~~");
-        assert_eq!(plan.progress(), PlanProgress::NoCheckboxes);
-    }
-
-    #[test]
-    fn a_real_open_box_outside_a_fence_still_reads_as_incomplete() {
-        let plan = plan_with("```\n- [x] example\n```\n- [ ] real step");
-        assert_eq!(plan.progress(), PlanProgress::Incomplete);
-    }
-
-    #[test]
-    fn none_content_has_no_checkboxes_and_zero_checked_steps() {
+    fn a_list_of_only_malformed_items_stores_nothing() {
         let plan = Plan::default();
-        assert_eq!(plan.progress(), PlanProgress::NoCheckboxes);
-        assert_eq!(plan.checked_steps(), 0);
+        assert_eq!(
+            plan.update(
+                "todo_write",
+                &json!({ "todos": [{ "content": "", "status": "pending" }] }),
+                false
+            ),
+            Update::Unchanged
+        );
+    }
+
+    // ---- render/0 ----
+
+    #[test]
+    fn render_writes_a_status_glyph_checklist() {
+        let plan = match Plan::default().update(
+            "todo_write",
+            &json!({
+                "todos": [
+                    { "content": "read", "status": "completed" },
+                    { "content": "edit", "status": "in_progress" },
+                    { "content": "build", "status": "pending" },
+                ]
+            }),
+            false,
+        ) {
+            Update::Updated(plan) => plan,
+            Update::Unchanged => panic!("expected Updated"),
+        };
+        assert_eq!(plan.render(), "[x] read\n[~] edit\n[ ] build");
     }
 
     #[test]
-    fn malformed_boxes_are_ignored_not_open() {
-        // `[-]`, `[]`, `[ x]` are none of open/checked; the Plan reads as having
-        // no checkboxes rather than as Incomplete (fail-safe toward stopping).
-        let plan = plan_with("- [-] one\n- [] two\n- [ x] three");
-        assert_eq!(plan.progress(), PlanProgress::NoCheckboxes);
-        assert_eq!(plan.checked_steps(), 0);
+    fn an_empty_list_renders_the_restored_string() {
+        let plan = Plan::new(Some("[ ] restored step".to_string()), None);
+        assert_eq!(plan.render(), "[ ] restored step");
+    }
+
+    #[test]
+    fn an_empty_list_with_no_restore_renders_empty() {
+        assert_eq!(Plan::default().render(), "");
+    }
+
+    #[test]
+    fn a_fresh_todo_write_supersedes_the_restored_render() {
+        let plan = Plan::new(Some("[ ] old".to_string()), None);
+        let updated = match plan.update(
+            "todo_write",
+            &json!({ "todos": [{ "content": "new", "status": "pending" }] }),
+            false,
+        ) {
+            Update::Updated(plan) => plan,
+            Update::Unchanged => panic!("expected Updated"),
+        };
+        assert_eq!(updated.render(), "[ ] new");
     }
 }

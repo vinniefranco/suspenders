@@ -34,6 +34,12 @@ pub(crate) struct AgentDeps {
     /// The Session-resolved sampling temperature, applied to every request
     /// this shell builds (ADR-0037: temperature rides the request).
     temperature: Option<f64>,
+    /// The Session-resolved extended-thinking budget (qwen-code parity),
+    /// applied to every request this shell builds - it rides the request like
+    /// temperature. The next-speaker side-query's `no_think` suppresses it at
+    /// the wire, and Compaction never receives it (it does not flow through
+    /// `complete`).
+    thinking_budget: Option<u64>,
     /// The Session-resolved Tool Call style (qwen parity), applied to every
     /// request this shell builds - it rides the request like temperature.
     tool_call_style: ToolCallStyle,
@@ -49,6 +55,7 @@ impl AgentDeps {
         llm: Arc<dyn Llm>,
         model: Model,
         temperature: Option<f64>,
+        thinking_budget: Option<u64>,
         tool_call_style: ToolCallStyle,
         compaction: Compaction,
     ) -> Self {
@@ -57,6 +64,7 @@ impl AgentDeps {
             llm,
             model,
             temperature,
+            thinking_budget,
             tool_call_style,
             compaction,
         }
@@ -83,11 +91,15 @@ impl RunDeps for AgentDeps {
         req: LlmRequest,
         on_event: &mut (dyn FnMut(&StreamEvent) + Send),
     ) -> impl Future<Output = Response> + Send {
-        // Attach the Session's temperature and Tool Call style, then call the
-        // injected boundary with the captured Model; each StreamEvent forwards
-        // to on_event (the Loop runs it into a message_update event).
+        // Attach the Session's temperature, thinking budget, and Tool Call
+        // style, then call the injected boundary with the captured Model; each
+        // StreamEvent forwards to on_event (the Loop runs it into a
+        // message_update event). The next-speaker side-query also flows through
+        // here, but its `no_think` request flag suppresses the thinking budget
+        // at the Anthropic wire - the two are mutually exclusive there.
         let req = req
             .with_temperature(self.temperature)
+            .with_thinking_budget(self.thinking_budget)
             .with_tool_call_style(self.tool_call_style);
         let llm = Arc::clone(&self.llm);
         let model = self.model.clone();

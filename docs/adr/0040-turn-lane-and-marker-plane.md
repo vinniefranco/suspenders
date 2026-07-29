@@ -5,8 +5,8 @@ all terminal markup in the adapter; ADR-0034 split the store but kept the flat
 shape; ADR-0029 kept the render pipeline whole in the adapter. That flat list,
 drawn with per-item glyphs and the two-planes coloring, reads as a stream of
 disconnected events: a run never becomes one object, live reasoning shows only
-as a `~N tokens` counter, and every harness event (eviction, compaction,
-Governor Interventions, Steering) draws as an identical `Info` line. This ADR
+as a `~N tokens` counter, and every harness event (compaction, result-cap cuts,
+loop-detector close, Steering) draws as an identical `Info` line. This ADR
 records the display principles that fix that, and the single schema change they
 require.
 
@@ -24,11 +24,10 @@ renders it instead of counting it.
 produces in service of one request - Thinking, tool machinery, the answer - hangs
 off one dim vertical spine; the user's prompts break to the margin. A *lane-opener*
 is a `User` item; every item until the next `User` hangs off that lane. This is
-deliberately scoped to the user request, not the Run: a Recovery Run (ADR-0028)
-is a harness-opened Run whose prompt is Voiced, not a `User` item, so its work
-correctly shares the originating request's lane, with the `↺ recovery run`
-marker as the in-lane seam. The region before the first `User` item (the greeting,
-launch notices) is spineless by definition. The lane is computed by the adapter
+deliberately scoped to the user request, not the Run: any harness-produced work
+without a fresh `User` item (its prompt is Voiced, not a `User` item) correctly
+shares the originating request's lane. The region before the first `User` item
+(the greeting, launch notices) is spineless by definition. The lane is computed by the adapter
 from the existing item sequence, so NO run structure is stored and no revision
 contract changes; the store stays the flat append-only list ADR-0034 defined.
 
@@ -74,20 +73,19 @@ so the `│` spine is continuous down the whole run - the two-planes coloring, n
 whitespace, separates a run's parts.
 
 **Harness events form one tinted marker plane, tone stamped at the firing site.**
-Every Suspenders-authored marker carries a semantic tone: Housekeeping (eviction,
-compaction, result-cap cuts), Aid (a Governor that helps the model - nudge,
-plan/anchor refresh, recovery), Constrain (a Governor that limits it -
-tool-narrowing, run-close), or Steering (the user's own voice). Aid-vs-Constrain
-is a Governor's *intent* - a domain judgment - so per ADR-0026 ("opinions live in
-exactly one Governor") the tone is stamped where the Intervention is voiced and
-carried on the Event, the same shape as an Artifact or Provenance: display-only
-data derived at the site that already knows the intent. The Screen copies it onto
-a new `TranscriptItem::Marker { text, tone }` item; the adapter tints by tone -
-Housekeeping neutral gray, Aid warm amber, Constrain cool blue, Steering the
-prompt color (amber/blue chosen to dodge the error-red / success-green palette).
-The adapter NEVER classifies tone from text or variant - that would re-derive a
-Governor's judgment in the display layer. The tone only tints a line in place; it
-never groups or reorders markers, which stay in chronological order.
+Every Suspenders-authored marker carries a semantic tone: Housekeeping (compaction,
+result-cap cuts), Aid (a marker that helps the model), Constrain (a guard that
+limits it - the loop-detector's run-close), or Steering (the user's own voice).
+Aid-vs-Constrain is the firing site's *intent* - a domain judgment - so the tone
+is stamped where the marker is voiced and carried on the Event, the same shape as
+an Artifact or Provenance: display-only data derived at the site that already
+knows the intent. The Screen copies it onto a new `TranscriptItem::Marker { text,
+tone }` item; the adapter tints by tone - Housekeeping neutral gray, Aid warm
+amber, Constrain cool blue, Steering the prompt color (amber/blue chosen to dodge
+the error-red / success-green palette). The adapter NEVER classifies tone from
+text or variant - that would re-derive the firing site's judgment in the display
+layer. The tone only tints a line in place; it never groups or reorders markers,
+which stay in chronological order.
 
 This is the one schema change, and it is cross-layer, not store-local: the tone
 field on the marker-bearing Events, the `Marker` variant carrying it, and
@@ -106,8 +104,8 @@ keeps Steering's removal-by-equality working once its anchor re-points to `Marke
 - **Storing run boundaries in the Transcript.** Unnecessary: a boundary is
   derivable from `User`-item position, so grouping stays render-time and
   reversible, honoring ADR-0029's whole-pipeline-in-the-adapter boundary. (The
-  next engineer will see a Recovery Run share a lane and be tempted to "fix" it
-  with a stored boundary - it is not a bug; the lane is a user request.)
+  next engineer will see harness-produced work share a lane and be tempted to
+  "fix" it with a stored boundary - it is not a bug; the lane is a user request.)
 - **`tone` on the `Info` item.** Rejected: `Info` carries non-marker uses (the
   greeting, launch notices, the extension-failure line that bypasses Presentment as
   the recursion bound), and the Steering pending marker is keyed by `Info`-text
@@ -115,12 +113,12 @@ keeps Steering's removal-by-equality working once its anchor re-points to `Marke
   makes the steering-removal breakage invisible to the compiler. A `Marker`
   variant isolates the plane.
 - **The adapter inferring tone from the event or text.** Rejected: reconstructing
-  Aid-vs-Constrain in the display layer re-derives a Governor's judgment outside
-  the Governor (ADR-0026). Tone is stamped at the firing site and carried.
-- **One flat color for all harness markers.** Calmest, but a Governor firing
-  reads identically to routine tidying - and Governor tuning (watching
-  Interventions fire in the Transcript) is a first-class workflow here, so the
-  Aid/Constrain tints earn their keep.
+  Aid-vs-Constrain in the display layer re-derives the firing site's judgment
+  outside it. Tone is stamped at the firing site and carried.
+- **One flat color for all harness markers.** Calmest, but a guard firing (the
+  loop-detector's close) reads identically to routine tidying - and watching
+  those markers fire in the Transcript is a first-class tuning workflow here, so
+  the Aid/Constrain tints earn their keep.
 - **Warm/cold as a grouping.** Rejected explicitly: warmth tints a line, it does
   not cluster the markers. Grouping would break chronology and hide the causal
   order in which the harness acted.

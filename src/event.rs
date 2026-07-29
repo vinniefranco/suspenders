@@ -28,37 +28,6 @@ use crate::llm::Delta;
 use crate::llm::response::StopReason;
 use crate::view_model::SelectorRow;
 
-/// What one Eviction wave reclaimed, counted by kind, with the Dead Mass
-/// share at wave time. Retained as a dormant display-side type after the
-/// bespoke Eviction mechanic was retired (Group D): [`Event::EvictionWave`]
-/// and the UI that renders it are no longer emitted, pending a follow-up
-/// prune, so this stub keeps them compiling.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct WaveStats {
-    /// Live Tool Results elided by the budget-pressure walk.
-    pub results_elided: u64,
-    /// Older run_command results superseded by an identical later call.
-    pub cmd_superseded: u64,
-    /// Older read_file results superseded by an identical later call.
-    pub read_superseded: u64,
-    /// Successful writes' input bodies replaced with the path-keeping husk.
-    pub edits_husked: u64,
-    /// Superseded Anchors elided.
-    pub anchors_elided: u64,
-    /// The Dead Mass at wave time, as a fraction of the Context Budget.
-    pub dead_mass: f64,
-}
-
-/// Converts a fraction to integer percent (multiplier).
-const PERCENT_MULTIPLIER: f64 = 100.0;
-
-/// The SINGLE rounding rule for a Dead Mass fraction to integer percent, shared
-/// by every surface that shows it (the status bar, the transcript wave line, the
-/// engine's stdout wave print) so they can never disagree. Rounds to nearest.
-pub fn dead_mass_pct(fraction: f64) -> u64 {
-    (fraction * PERCENT_MULTIPLIER).round() as u64
-}
-
 /// The `extension_error` stage: which point in the extension's lifecycle crashed
 /// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
 /// deferred `:present`).
@@ -150,19 +119,6 @@ pub enum Event {
         token_estimate: u64,
         context_budget: u64,
         max_tokens_reserve: u64,
-        /// The LIVE Dead Mass share (CONTEXT.md: Dead Mass) this pass, as a
-        /// fraction of the Context Budget. Refreshed every pass alongside the
-        /// token estimate, so the status bar shows dead mass as it currently
-        /// stands, not the pre-reclaim snapshot a past wave found.
-        dead_mass: f64,
-    },
-    /// An Eviction wave fired while shaping a request (CONTEXT.md: Eviction,
-    /// Dead Mass): the counts by kind and the Dead Mass share at wave time.
-    /// Display-side only - a wave rewrites the request copy, never the
-    /// Session Log (the log's schema is replay-sensitive; Resume re-applies
-    /// waves request-time), so this event is how wave behavior gets vetted.
-    EvictionWave {
-        stats: WaveStats,
     },
     CompactionProgress {
         status: String,
@@ -178,19 +134,6 @@ pub enum Event {
     },
     SessionLogError {
         message: String,
-    },
-
-    /// The Endgame narrowed the offered Tools (CONTEXT.md: Endgame, Offer;
-    /// ADR-0035): carries the surviving tool names (empty on the final Pass,
-    /// `run_command` alone on the Verification Pass). Display-side only - the
-    /// narrowing itself shapes the request, this event just lets the Transcript
-    /// show a concise `⊘ tools narrowed` marker (ADR-0040: a Constrain tone).
-    /// A Governor limiting the model, so it carries no rider tone. Currently
-    /// dormant: the Governor-free loop emits no narrowing (Group C teardown);
-    /// the variant and its Transcript arm remain so a later Offer mechanic can
-    /// re-emit it without re-plumbing the Screen.
-    ToolsNarrowed {
-        tools: Vec<String>,
     },
 
     /// A malformed-tool-call generation was re-drawn in-band (ADR-0030): the
@@ -295,10 +238,6 @@ impl Event {
         }
     }
 
-    pub fn tools_narrowed(tools: Vec<String>) -> Self {
-        Event::ToolsNarrowed { tools }
-    }
-
     pub fn retry(error: impl Into<String>, attempt: u64, budget: u64) -> Self {
         Event::Retry {
             error: error.into(),
@@ -376,18 +315,12 @@ impl Event {
         token_estimate: u64,
         context_budget: u64,
         max_tokens_reserve: u64,
-        dead_mass: f64,
     ) -> Self {
         Event::ContextPressure {
             token_estimate,
             context_budget,
             max_tokens_reserve,
-            dead_mass,
         }
-    }
-
-    pub fn eviction_wave(stats: WaveStats) -> Self {
-        Event::EvictionWave { stats }
     }
 
     pub fn compaction_progress(status: impl Into<String>) -> Self {
