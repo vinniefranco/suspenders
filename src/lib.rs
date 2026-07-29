@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod compaction;
 pub mod content;
 pub mod context_files;
+pub mod env_context;
 pub mod conversation;
 pub mod event;
 pub mod extensions;

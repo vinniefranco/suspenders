@@ -118,6 +118,7 @@ pub fn load(root: &str) -> ContextFiles {
     load_append_md(root, &mut acc);
     load_project_context_files(root, &mut acc);
     load_global_context_files(&mut acc);
+    append_environment_context(root, &mut acc);
 
     ContextFiles {
         system_prompt: acc.system_prompt,
@@ -172,6 +173,19 @@ fn load_global_context_files(acc: &mut Acc) {
     let config_dir = global_config_dir();
     load_context_file(&config_dir, "AGENTS.md", SourceType::Global, acc);
     load_context_file(&config_dir, "CLAUDE.md", SourceType::Global, acc);
+}
+
+// -- Environment grounding (appended after the resolved prompt) --------------
+
+// The opening environment block (date, OS, cwd, folder tree, git snapshot)
+// rides in AFTER SYSTEM.md/APPEND_SYSTEM.md and every context file, so whatever
+// prompt resolves, the Run still starts grounded in the live project state.
+// Built from live facts, never a context source, so it is not listed in
+// `sources` and cannot be a `skipped` file - it degrades in place instead.
+fn append_environment_context(root: &str, acc: &mut Acc) {
+    let block = crate::env_context::environment_context(Path::new(&expand(root)));
+    acc.system_prompt.push_str("\n\n");
+    acc.system_prompt.push_str(&block);
 }
 
 // -- Helpers -----------------------------------------------------------------
@@ -326,7 +340,10 @@ mod tests {
         let tmp = temp_dir();
         let result = load(&root(&tmp));
 
-        assert_eq!(result.system_prompt, voice::system_prompt());
+        // The resolved prompt is the Voice default, then the appended
+        // environment grounding; the base leads, and no context source loaded.
+        assert!(result.system_prompt.starts_with(voice::system_prompt()));
+        assert!(result.system_prompt.contains("# Environment"));
         assert_eq!(result.sources, Vec::new());
     }
 
@@ -338,7 +355,7 @@ mod tests {
         write(&tmp, ".suspenders/SYSTEM.md", "You are a custom agent.");
 
         let result = load(&root(&tmp));
-        assert_eq!(result.system_prompt, "You are a custom agent.");
+        assert!(result.system_prompt.starts_with("You are a custom agent."));
         assert!(result.sources.iter().any(|(t, _)| *t == SourceType::System));
     }
 
@@ -348,7 +365,7 @@ mod tests {
         write(&tmp, ".suspenders/SYSTEM.md", "\n  Be brief.  \n");
 
         let result = load(&root(&tmp));
-        assert_eq!(result.system_prompt, "Be brief.");
+        assert!(result.system_prompt.starts_with("Be brief."));
     }
 
     #[test]
@@ -357,7 +374,7 @@ mod tests {
         write(&tmp, ".suspenders/SYSTEM.md", "");
 
         let result = load(&root(&tmp));
-        assert_eq!(result.system_prompt, voice::system_prompt());
+        assert!(result.system_prompt.starts_with(voice::system_prompt()));
         assert_eq!(result.sources, Vec::new());
     }
 
@@ -385,9 +402,10 @@ mod tests {
         write(&tmp, ".suspenders/APPEND_SYSTEM.md", "Extra instructions.");
 
         let result = load(&root(&tmp));
-        assert_eq!(
-            result.system_prompt,
-            "Custom prompt.\n\nExtra instructions."
+        assert!(
+            result
+                .system_prompt
+                .starts_with("Custom prompt.\n\nExtra instructions.")
         );
     }
 
@@ -650,6 +668,29 @@ mod tests {
     fn default_prompt_when_no_files_exist() {
         let tmp = temp_dir();
         let result = load(&root(&tmp));
-        assert_eq!(result.system_prompt, voice::system_prompt());
+        assert!(result.system_prompt.starts_with(voice::system_prompt()));
+    }
+
+    // ---- environment grounding is appended last ----
+
+    #[test]
+    fn appends_the_environment_block_after_the_resolved_prompt() {
+        let tmp = temp_dir();
+        write(&tmp, ".suspenders/SYSTEM.md", "Custom prompt.");
+        write(&tmp, ".suspenders/AGENTS.md", "Project conventions.");
+
+        let result = load(&root(&tmp));
+
+        // The base and context files lead; the grounding block trails them,
+        // carrying the cwd and OS so the Run starts grounded.
+        let env_at = result.system_prompt.find("# Environment").unwrap();
+        let ctx_at = result.system_prompt.find("Project conventions.").unwrap();
+        assert!(ctx_at < env_at, "context files precede the env block");
+        assert!(result.system_prompt.contains("My operating system is:"));
+        assert!(
+            result
+                .system_prompt
+                .contains("I'm currently working in the directory:")
+        );
     }
 }

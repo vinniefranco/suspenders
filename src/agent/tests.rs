@@ -951,17 +951,23 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             // rewritten to carry qwen-code's full depth - todo_write alone
             // ~9.3k chars, run_command ~4.2k, edit_file ~1.8k - grew the
             // serialized tool-spec overhead from ~7.9k to ~25.3k chars, about
-            // +5.0k tokens on every request's estimate) moved it from 6900).
+            // +5.0k tokens on every request's estimate) moved it from 6900; the
+            // faithful qwen-code system-prompt port (Core Mandates, Task
+            // Management, the Understand->Verify workflow, Operational
+            // Guidelines, Executing-with-care, Git-as-source-of-truth, worked
+            // Examples, Final Reminder - grew the system prompt from ~5k to
+            // ~22.6k chars, about +5.0k tokens on every request's estimate)
+            // moved it from 13786).
             //
             // Retune mechanism: `Compaction::proactive` fires when
             // `token_estimate > compaction_target`, with `compaction_target =
             // budget - reserve(200) - trunc(0.3 * budget) ~= 0.7*budget - 200`.
             // The estimate is `ceil((overhead + system_prompt + messages)/3.5)`
             // and is INDEPENDENT of `budget`, so `budget` is the free knob that
-            // slides the target. Measured estimates here are run2 ~9411 tokens
-            // and run3 ~9770; budget 13786 puts the target at 9451, which sits
+            // slides the target. Measured estimates here are run2 ~14283 tokens
+            // and run3 ~14642; budget 20950 puts the target at 14465, which sits
             // between them so exactly the third Run crosses.
-            context_budget: Some(13786),
+            context_budget: Some(20_950),
             compaction_slack: Some(0.3),
             compaction_keep: Some(0.1),
             ..Default::default()

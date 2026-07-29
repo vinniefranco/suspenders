@@ -21,7 +21,9 @@ use std::path::Path;
 pub struct Glob;
 
 // The same vendored/build directories grep and list_files never descend into.
-const SKIP_DIRS: &[&str] = &[
+// Public so the opening environment tree (env_context) prunes the SAME set the
+// read-only tools do, and the tree the model sees matches what glob would walk.
+pub const SKIP_DIRS: &[&str] = &[
     ".claude",
     ".git",
     "_build",
