@@ -312,7 +312,10 @@ impl Composer {
     // fall-through.
     fn selector_key(&mut self, key: Key, rest: String, status: Status) -> KeyOutcome {
         match key {
-            Key::ArrowUp | Key::WheelUp | Key::ArrowDown | Key::WheelDown => {
+            // Arrow-only nav (ADR-0046): the main loop no longer mints
+            // Key::Wheel* (mouse capture is gone; native scrollback owns
+            // history), so the overlay navigates by the arrows alone.
+            Key::ArrowUp | Key::ArrowDown => {
                 if let Some(CommandSelector {
                     status: SelectorStatus::Ready(sel),
                     ..
@@ -378,11 +381,14 @@ impl Composer {
         let rows = slash::rows(name);
         self.slash_cursor = self.slash_cursor.min(rows.len().saturating_sub(1));
         match key {
-            Key::ArrowUp | Key::WheelUp => {
+            // Arrow-only nav (ADR-0046): no Key::Wheel* is minted into the
+            // Composer anymore (mouse capture removed), so the menu moves by the
+            // arrows alone.
+            Key::ArrowUp => {
                 self.slash_cursor = self.slash_cursor.saturating_sub(1);
                 consumed(vec![])
             }
-            Key::ArrowDown | Key::WheelDown => {
+            Key::ArrowDown => {
                 if self.slash_cursor + 1 < rows.len() {
                     self.slash_cursor += 1;
                 }
@@ -1328,7 +1334,9 @@ mod tests {
     }
 
     #[test]
-    fn arrows_and_the_wheel_move_within_the_filtered_rows_of_a_ready_overlay() {
+    fn arrows_move_within_the_filtered_rows_of_a_ready_overlay() {
+        // Arrow-only nav (ADR-0046): the wheel no longer reaches the Composer
+        // (mouse capture removed), so the overlay navigates by the arrows alone.
         let rows = vec![model_row("qwen"), model_row("llama"), model_row("gpt")];
         let mut c = model_selector_ready(rows);
         assert_eq!(
@@ -1337,12 +1345,11 @@ mod tests {
             "arrows drive the overlay, not a scroll"
         );
         assert_eq!(highlight_of(&c), 1);
-        // The wheel is consumed too while the overlay is open: it navigates.
-        assert_eq!(fold_consumed(&mut c, Key::WheelDown), vec![]);
+        fold_consumed(&mut c, Key::ArrowDown);
         assert_eq!(highlight_of(&c), 2);
         fold_consumed(&mut c, Key::ArrowDown);
         assert_eq!(highlight_of(&c), 2, "saturates at the last row");
-        fold_consumed(&mut c, Key::WheelUp);
+        fold_consumed(&mut c, Key::ArrowUp);
         assert_eq!(highlight_of(&c), 1);
     }
 
@@ -1667,8 +1674,9 @@ mod tests {
 
     #[test]
     fn escape_and_the_wheel_are_refused_pure_when_no_overlay_is_open() {
-        // With no overlay, Escape belongs to Cancellation and the wheel to
-        // the viewport - both the caller's, whatever the draft or ring holds.
+        // With no overlay, Escape belongs to Cancellation; the wheel is inert
+        // (ADR-0046: no mouse capture, native scrollback owns history), so the
+        // Composer refuses both to the caller, whatever the draft or ring holds.
         for state in [fresh(), with_draft("plain draft", 5), mid_recall()] {
             for key in [Key::Escape, Key::WheelUp, Key::WheelDown] {
                 assert_refusal_is_pure(&state, key, Status::Running);

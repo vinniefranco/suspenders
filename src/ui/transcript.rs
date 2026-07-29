@@ -88,6 +88,15 @@ pub struct Transcript {
     streaming: Streaming,
     /// The configured Extensions whose pure `present` runs on every append.
     extensions: Vec<Registered>,
+    /// How many leading items the adapter has already frozen into native
+    /// scrollback (ADR-0046, the inline `insert_before` seam). A monotonic
+    /// high-water mark into [`Transcript::items`]: everything below it has been
+    /// committed and is never redrawn; everything at/above it is still the
+    /// pending region. Advanced by [`Transcript::mark_committed`], never
+    /// regressed - and it moves neither `items` nor `revision`, so it is not a
+    /// structural edit (it enrolls in the prefix-or-bump property test with a
+    /// "neither" expectation).
+    committed: usize,
 }
 
 impl Transcript {
@@ -99,6 +108,7 @@ impl Transcript {
             revision: 0,
             streaming: Streaming::idle(),
             extensions,
+            committed: 0,
         }
     }
 
@@ -284,6 +294,52 @@ impl Transcript {
         self.streaming.thinking()
     }
 
+    // ---- The Commit seam (ADR-0046) ----------------------------------------
+
+    /// How many leading items have been frozen into native scrollback - the
+    /// monotonic high-water mark the inline adapter's `insert_before` seam
+    /// keeps. Items `[0, committed_high_water())` are committed and never
+    /// redrawn; the pending region is `items()[committed_high_water()..]`.
+    // qual:allow(dry, boilerplate) reason: "the `committed` mark is the pure
+    // core's own state; making the field pub would let the adapter regress it and
+    // break committed immutability (ADR-0046). The read stays behind this getter,
+    // the same encapsulation boundary as `items`/`revision`."
+    pub fn committed_high_water(&self) -> usize {
+        self.committed
+    }
+
+    /// How far the pending region may be committed right now: the count of
+    /// leading items that are FINAL and in order, stopping at the first
+    /// non-terminal one (a live [`TranscriptItem::ToolCall`] awaiting its
+    /// result, or a [`Tone::Steering`] marker awaiting delivery). Clamped to
+    /// never fall below the high-water mark, so the seam only ever advances.
+    ///
+    /// `User`/`Info`/`ToolResult`/`Assistant`/`Thinking`/`Diff` are terminal:
+    /// the live stream lives in [`Streaming`], never in `items`, so any settled
+    /// `Assistant`/`Thinking` is final. A `ToolCall` is the boundary - a later
+    /// `ToolResult` supersedes it (a structural edit that would rewrite frozen
+    /// scrollback). A `Tone::Steering` marker is non-terminal - delivery removes
+    /// it - so it must never be committed.
+    pub fn committable_upto(&self) -> usize {
+        self.items
+            .iter()
+            .take_while(|it| item_terminal(it))
+            .count()
+            .max(self.committed)
+    }
+
+    /// Advances the high-water mark by `n` committed items (the adapter has
+    /// frozen them into scrollback). Monotonic: it never regresses, and it
+    /// mutates neither `items` nor `revision` - committing is not a structural
+    /// edit, so the RenderCache contract is untouched.
+    // qual:allow(dry, boilerplate) reason: "not a plain setter - it CLAMPS
+    // (saturating add, capped at len) to keep the mark monotonic and in-bounds,
+    // the load-bearing half of the transactional commit seam (ADR-0046). The
+    // field must stay private so this clamp cannot be bypassed."
+    pub fn mark_committed(&mut self, n: usize) {
+        self.committed = self.committed.saturating_add(n).min(self.items.len());
+    }
+
     // ---- Internals ----------------------------------------------------------
 
     // Presentment (CONTEXT.md), then push - the one append funnel. A crashing
@@ -341,6 +397,22 @@ impl Transcript {
 // delivery removes.
 fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
+}
+
+// Whether a settled item is FINAL - safe to freeze into native scrollback
+// (ADR-0046). A `ToolCall` awaits its result (a later `ToolResult` supersedes
+// it), and a `Tone::Steering` marker awaits delivery (which removes it); both
+// are structural edits that would rewrite frozen output, so neither commits.
+// Everything else is terminal.
+fn item_terminal(item: &TranscriptItem) -> bool {
+    !matches!(
+        item,
+        TranscriptItem::ToolCall { .. }
+            | TranscriptItem::Marker {
+                tone: Tone::Steering,
+                ..
+            }
+    )
 }
 
 // The fail-open Extension report (ADR-0007) - sourced once, so the store's own
@@ -820,6 +892,86 @@ mod tests {
         assert_eq!(t.revision(), 1);
     }
 
+    // --- the Commit seam (ADR-0046) --------------------------------------------
+
+    // Leading terminal items commit; a live ToolCall is the boundary and
+    // everything from it on stays pending.
+    #[test]
+    fn committable_stops_at_the_first_live_tool_call() {
+        let mut t = fresh();
+        t.user("do a thing");
+        t.push(assistant("on it"));
+        t.tool_call("t1".into(), "read_file".into(), &json!({"path": "a.rs"}));
+        t.push(info("news after the call"));
+        // Two leading terminals (User, Assistant); the ToolCall blocks the rest.
+        assert_eq!(t.committable_upto(), 2);
+    }
+
+    // A Tone::Steering marker is non-terminal (delivery removes it) and blocks
+    // the commit; a plain marker is terminal and commits.
+    #[test]
+    fn committable_treats_a_steering_marker_as_non_terminal() {
+        let mut t = fresh();
+        t.info("a");
+        t.marker("housekeeping", Tone::Housekeeping);
+        t.steering_queued("steer me");
+        t.info("b");
+        // Info, Marker(Housekeeping) commit; the Steering marker is the boundary.
+        assert_eq!(t.committable_upto(), 2);
+    }
+
+    // Delivery promotes the pending Steering marker to a terminal User item, so
+    // the whole prefix becomes committable.
+    #[test]
+    fn committable_advances_once_steering_is_delivered() {
+        let mut t = fresh();
+        t.info("a");
+        t.steering_queued("steer me");
+        assert_eq!(t.committable_upto(), 1);
+        t.steering_delivered("steer me");
+        // Now Info, User - both terminal.
+        assert_eq!(t.committable_upto(), 2);
+    }
+
+    // mark_committed is monotonic, clamps to the item count, and moves neither
+    // the items nor the revision.
+    #[test]
+    fn mark_committed_is_monotonic_and_clamped() {
+        let mut t = fresh();
+        t.info("a");
+        t.info("b");
+        let rev = t.revision();
+        let items = t.items().to_vec();
+
+        assert_eq!(t.committed_high_water(), 0);
+        t.mark_committed(1);
+        assert_eq!(t.committed_high_water(), 1);
+        // Advances, never regresses.
+        t.mark_committed(1);
+        assert_eq!(t.committed_high_water(), 2);
+        // Clamps to the item count - an over-advance cannot outrun the items.
+        t.mark_committed(10);
+        assert_eq!(t.committed_high_water(), 2);
+
+        // Committing is not a structural edit.
+        assert_eq!(t.revision(), rev);
+        assert_eq!(t.items(), items.as_slice());
+    }
+
+    // committable_upto never falls below the high-water mark, even when the
+    // pending front becomes non-terminal after a commit.
+    #[test]
+    fn committable_never_regresses_below_the_high_water_mark() {
+        let mut t = fresh();
+        t.info("a");
+        t.info("b");
+        t.mark_committed(2);
+        // A live ToolCall now leads the pending region, but the two already
+        // committed items keep committable at the high-water mark.
+        t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}));
+        assert_eq!(t.committable_upto(), 2);
+    }
+
     // --- presentment -----------------------------------------------------------
 
     // A first-class Diff item as the Diff extension's Presenter would emit.
@@ -1012,6 +1164,12 @@ mod tests {
                 "extension_failure",
                 Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
             ),
+            // mark_committed moves neither items nor revision (ADR-0046): it is
+            // enrolled with a "neither" expectation - the prefix half of the
+            // property holds vacuously (items are identical), and it must not
+            // bump. Runs after a couple of appends so there is something to
+            // commit.
+            ("mark_committed", Box::new(|t| t.mark_committed(1))),
             ("message_start (again)", Box::new(|t| t.message_start())),
             (
                 "message_update (again)",
@@ -1046,6 +1204,85 @@ mod tests {
         // Both structural verbs actually removed something above - the prefix
         // half of the property was not satisfied vacuously.
         assert_eq!(bumps, 2, "steering_delivered and tool_result each bumped");
+    }
+
+    // COMMITTED IMMUTABILITY (ADR-0046): once the high-water mark covers a
+    // prefix, NO verb may ever change an item in `items[0..committed]`. Frozen
+    // scrollback is written once and never redrawn, so a structural edit that
+    // touched a committed item would silently diverge the live pending region
+    // from what is already on screen. The Screen never marks a non-terminal item
+    // committed (a `ToolCall`/`Steering` marker is excluded by `committable_upto`
+    // and is the only thing structural verbs remove), so this holds - but it is a
+    // load-bearing invariant, so pin it as a property over every verb.
+    #[test]
+    fn no_committed_item_is_ever_removed_or_changed_by_any_verb() {
+        type Step = (&'static str, Box<dyn FnOnce(&mut Transcript)>);
+        // The same verb list as the revision property, minus the ones that
+        // append a NON-terminal item the mark would (correctly) never cover; each
+        // runs against a transcript whose committed prefix is exactly its
+        // terminal leading items.
+        let steps: Vec<Step> = vec![
+            ("info", Box::new(|t| t.info("news"))),
+            ("user", Box::new(|t| t.user("hello"))),
+            ("push", Box::new(|t| t.push(diff_item("edit_file")))),
+            ("message_start", Box::new(|t| t.message_start())),
+            (
+                "message_end",
+                Box::new(|t| t.message_end(&[text_block("done")])),
+            ),
+            (
+                "steering_queued",
+                Box::new(|t| t.steering_queued("steer me")),
+            ),
+            (
+                "steering_delivered",
+                Box::new(|t| t.steering_delivered("steer me")),
+            ),
+            (
+                "tool_call",
+                Box::new(|t| t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}))),
+            ),
+            (
+                "tool_result",
+                Box::new(|t| t.tool_result("t1", "grep".into(), "hit", false, &HashMap::new())),
+            ),
+            (
+                "extension_failure",
+                Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
+            ),
+            (
+                "close",
+                Box::new(|t| t.close(Some("turn cancelled".into()))),
+            ),
+            ("discard_streaming", Box::new(|t| t.discard_streaming())),
+        ];
+
+        for (name, step) in steps {
+            let mut t = fresh();
+            // Seed a couple of appends and commit everything terminal, so the
+            // committed prefix is non-empty before the verb under test runs.
+            t.info("committed A");
+            t.user("committed B");
+            let committed = t.committable_upto();
+            t.mark_committed(committed);
+            let frozen = t.items()[..committed].to_vec();
+            assert!(!frozen.is_empty(), "{name}: seeded a committed prefix");
+
+            step(&mut t);
+
+            // The committed prefix is byte-for-byte identical after the verb: no
+            // reorder, no supersede, no removal ever touches frozen items.
+            assert_eq!(
+                &t.items()[..committed],
+                &frozen[..],
+                "{name} changed a COMMITTED item - frozen scrollback would diverge"
+            );
+            // And the mark itself never regresses.
+            assert!(
+                t.committed_high_water() >= committed,
+                "{name} regressed the high-water mark"
+            );
+        }
     }
 
     // --- marker plane (ADR-0040) -------------------------------------------------

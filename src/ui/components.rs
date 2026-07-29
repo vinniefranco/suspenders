@@ -12,12 +12,11 @@
 use std::sync::OnceLock;
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxSet;
 
@@ -31,7 +30,6 @@ use crate::ui::picker::Picker;
 use crate::ui::screen::{PressureLevel, Screen, Status};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
-use crate::ui::viewport::Viewport;
 use crate::view_model::Tone;
 use crate::view_model::{DiffHunk, DiffSide, TranscriptItem};
 use crate::view_model::{RowRole, SelectorRow};
@@ -230,26 +228,37 @@ pub struct Anim {
     pub lull_seq: u64,
 }
 
-/// Renders the whole frame: the transcript viewport, the status bar, the
-/// Composer, and - when an Approval is pending - the modal on top. The
-/// [`Viewport`] holds the pure scroll state; the returned `(total_lines,
-/// height)` is the geometry the viewport was measured/drawn at, which the
-/// adapter stores for the scroll effects that execute between draws.
+/// The per-frame render context the inline pending path draws WITH: the
+/// connection facts the status bar shows, the animation clocks, and the Theme
+/// this frame renders in (the live `/theme` preview or the active Theme).
+/// Bundled as ONE named-field carrier - the same style as [`PendingBodyParams`],
+/// [`GutterCtx`], [`StatusBarCtx`] and the adapter's `AdapterCtx` - so
+/// [`render_pending`] and the adapter's `draw`/`draw_previewed` take four args
+/// instead of six, and a new frame-wide input is a field, not another parameter.
+#[derive(Clone, Copy)]
+pub struct FrameCtx<'a> {
+    pub conn: ConnectionView<'a>,
+    pub anim: Anim,
+    pub theme: &'a Theme,
+}
+
+/// Splits the inline frame `area` into the three vertical zones the pending
+/// region draws into: `[pending_body, status_bar, composer]` (ADR-0046). There
+/// is no scroll state and no geometry return - native scrollback owns history,
+/// so the pending body is simply bottom-anchored + top-clipped in the top zone.
 ///
 /// The Composer GROWS with its draft: its height is the wrapped row count
 /// (hard newlines and width-wrapping both), capped by
-/// [`composer::max_visible_rows`] so a tall draft never starves the
-/// transcript viewport - which is expected to shrink as the Composer grows.
-/// The wrap math runs at the exact width the Composer is drawn at (the frame
-/// minus the 2-cell gutter), so the measured cursor cell is the drawn one.
-/// Splits `area` into the three vertical frame zones: `[viewport, status_bar,
-/// composer]`. `composer_rows` is the already-capped Composer row count (see
-/// [`composer::max_visible_rows`]). Pure - no frame access.
+/// [`composer::max_visible_rows`] so a tall draft never starves the pending
+/// body - which is expected to shrink as the Composer grows. The wrap math runs
+/// at the exact width the Composer is drawn at (the frame minus the 2-cell
+/// gutter), so the measured cursor cell is the drawn one. `composer_rows` is the
+/// already-capped Composer row count. Pure - no frame access.
 fn frame_chunks(area: Rect, composer_rows: usize) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),                       // transcript viewport
+            Constraint::Min(1),                       // inline pending body (ADR-0046)
             Constraint::Length(1),                    // status bar
             Constraint::Length(composer_rows as u16), // composer (grows with the draft)
         ])
@@ -258,7 +267,7 @@ fn frame_chunks(area: Rect, composer_rows: usize) -> std::rc::Rc<[Rect]> {
 
 /// The Composer's visible row count for this frame: the layout's row count
 /// capped by [`composer::max_visible_rows`] so a very tall draft never starves
-/// the transcript viewport. Pure - no frame access.
+/// the pending body. Pure - no frame access.
 fn capped_composer_height(layout: &ComposerLayout, frame_height: usize) -> usize {
     layout
         .rows
@@ -266,18 +275,19 @@ fn capped_composer_height(layout: &ComposerLayout, frame_height: usize) -> usize
         .min(composer::max_visible_rows(frame_height))
 }
 
-pub fn render(
-    frame: &mut Frame,
-    t: &Screen,
-    conn: ConnectionView,
-    anim: Anim,
-    viewport: &Viewport,
-    cache: &mut RenderCache,
-    theme: &Theme,
-) -> (usize, usize) {
+/// Renders the inline PENDING region (ADR-0046): the uncommitted transcript
+/// tail (`cache.settled()[hw..]` plus the live reasoning tail, streaming answer,
+/// and lull row), the status bar, the Composer, and any open overlay/approval.
+/// Committed items are NOT drawn here - they were frozen into native scrollback
+/// by [`render_committed_slice`] via the adapter's `insert_before`.
+///
+/// The transcript body is BOTTOM-ANCHORED in its zone and TOP-CLIPPED on
+/// overflow (qwen's `MaxSizedBox overflowDirection:"top"`): the newest rows
+/// always show, older rows drop off the top. There is no scroll state and no
+/// scrollbar - native scrollback owns history.
+pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ctx: FrameCtx) {
+    let FrameCtx { conn, anim, theme } = ctx;
     let area = frame.area();
-    // The Composer's one render window (ADR-0034): the draft, the char-index
-    // cursor, and the open overlay, read together.
     let composer_view = t.composer().view();
     let layout = composer::layout(
         composer_view.draft,
@@ -287,44 +297,229 @@ pub fn render(
     let composer_height = capped_composer_height(&layout, area.height as usize);
     let chunks = frame_chunks(area, composer_height);
 
-    // The viewport renders FIRST: the status bar's position segment reads the
-    // measured geometry (and the Viewport's clamped top) from this frame, not
-    // a stale one.
-    let geometry = render_viewport(
+    let body_area = chunks[0];
+    render_pending_body(
         frame,
-        chunks[0],
-        &mut ViewportParams {
+        body_area,
+        &mut PendingBodyParams {
             screen: t,
-            viewport,
             cache,
             anim,
         },
         theme,
     );
-    render_status_bar(
-        frame,
-        chunks[1],
-        StatusBarCtx {
-            screen: t,
-            conn,
-            viewport,
-            geometry,
-        },
-        theme,
-    );
+
+    // The status bar's position segment is a literal `Bot` in the inline model
+    // (ADR-0046): native scrollback owns history and the pending body always
+    // follows the tail, so there is no scroll position to report.
+    render_status_bar(frame, chunks[1], StatusBarCtx { screen: t, conn }, theme);
     render_composer(frame, chunks[2], t, &layout, theme);
 
-    // The Composer overlay (ADR-0032/0033) floats just above the status bar +
-    // Composer - an inline popup, a Composer state, not a modal. Drawn after
-    // the Composer so it sits on top; skipped entirely when none is open.
     if let Some(overlay) = composer_view.overlay {
         render_composer_popup(frame, chunks[1].y, area, &overlay, theme);
     }
-
     if let Some(pending) = &t.pending_approval {
         render_approval_modal(frame, area, &pending.command, theme);
     }
-    geometry
+}
+
+/// The scroll-free state [`render_pending_body`] needs each frame: the Screen it
+/// reads the pending items and live snapshot from, the cache the settled tail's
+/// lines come from, and the animation counters. Bundled so the body render takes
+/// four args (the reduced SRP_PARAMS call shape).
+pub struct PendingBodyParams<'a> {
+    pub screen: &'a Screen,
+    pub cache: &'a mut RenderCache,
+    pub anim: Anim,
+}
+
+/// Draws the pending transcript body into `area`, bottom-anchored and
+/// top-clipped (ADR-0046). Returns the total wrapped-row count of the pending
+/// stack (before clipping) so the caller can label the status bar. The assembly
+/// is the pending pipeline - cache sync, the collapsed-run fold over the
+/// full items, the three live entries - but slices the settled tail from the
+/// high-water mark ([`assemble_pending`]) and anchors to the bottom instead of
+/// consulting a [`Viewport`].
+fn render_pending_body(
+    frame: &mut Frame,
+    area: Rect,
+    params: &mut PendingBodyParams<'_>,
+    theme: &Theme,
+) -> usize {
+    let hw = params.screen.transcript().committed_high_water();
+    render_pending_body_at(frame, area, params, theme, hw)
+}
+
+/// Draws the pending body starting AT an explicit high-water mark `hw`: it emits
+/// the uncommitted settled tail `items[hw..]` plus the live stream, bottom-
+/// anchored and top-clipped (ADR-0046). [`render_pending_body`] calls this with
+/// the store's live
+/// [`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water)
+/// (committed items are already in native scrollback); passing `0` draws the
+/// WHOLE settled transcript, which is what a headless test wants to see on a
+/// TestBackend that has no real scrollback.
+fn render_pending_body_at(
+    frame: &mut Frame,
+    area: Rect,
+    params: &mut PendingBodyParams<'_>,
+    theme: &Theme,
+    hw: usize,
+) -> usize {
+    let t = params.screen;
+    let cache = &mut params.cache;
+    let anim = params.anim;
+
+    let content_area = Rect {
+        x: area.x + LANE_GUTTER,
+        width: area.width.saturating_sub(LANE_GUTTER),
+        ..area
+    };
+    cache.sync(
+        t.transcript(),
+        Toggles {
+            thinking_expanded: t.thinking_expanded,
+            tools_expanded: t.tools_expanded,
+        },
+        content_area.width,
+        theme,
+    );
+
+    let thinking = t.transcript().streaming_thinking();
+    let thinking_lines = live_thinking_lines(&thinking, anim.spinner, content_area.width, theme);
+
+    let items = t.transcript().items();
+    let lane = lane_gutters(items);
+    // FULL-CONTENT pending body (ADR-0046): the uncommitted settled tail renders
+    // each item from its cached lines EXACTLY as `render_committed_slice` blits
+    // the committed prefix - no collapsed-run fold, no machinery window. Committed
+    // and pending are the same rendering of the same cache, so nothing reflows at
+    // the commit seam (qwen's `<Static>` prints history un-clamped; the ONLY
+    // overflow reduction is the bottom-anchor + top-clip below). The stack's
+    // three facts (lines, wrapped-count, gutter) travel together as one row so
+    // they can never desync.
+    let mut stack = assemble_pending(cache, &lane, hw);
+
+    // The live entries follow the settled tail, newest last: the reasoning tail,
+    // then the streaming answer, then (only when nothing is streaming) the lull
+    // row. `thinking_lines`/`lull_lines` are borrowed into the stack, so they
+    // outlive it here.
+    stack.push_live(&thinking_lines, content_area.width);
+    let tail = cache.streaming_tail();
+    if let Some((lines, wrapped)) = tail {
+        stack.push(lines, wrapped, GutterKind::Spine);
+    }
+    let lull_lines = if lull_visible(t.status, thinking_lines.is_empty(), tail.is_some()) {
+        live_lull_lines(anim, content_area.width, theme)
+    } else {
+        Vec::new()
+    };
+    stack.push_live(&lull_lines, content_area.width);
+
+    // Integration (IOSP): compute the anchor/clip geometry in the pure
+    // [`anchor_clip`] operation, then only issue the draw calls. All the
+    // bottom-anchor + top-clip arithmetic lives in the operation; here we just
+    // paint the content, mirror the gutter, and (on overflow) the marker.
+    let row_gutters = stack.expand_gutters();
+    let clip = anchor_clip(stack.total_lines(), area, content_area);
+
+    frame.render_widget(
+        Paragraph::new(stack.flat_lines())
+            .wrap(Wrap { trim: false })
+            .scroll((clip.scroll, 0)),
+        clip.content_draw,
+    );
+    // The gutter mirrors the content: same `top` offset into `row_gutters`, same
+    // top-clip, so the spine/caret stay aligned with their rows.
+    paint_gutter(
+        frame,
+        clip.gutter_draw,
+        &GutterCtx {
+            row_gutters: &row_gutters,
+            top: clip.top,
+            height: clip.gutter_draw.height as usize,
+        },
+        theme,
+    );
+    if let Some(marker_draw) = clip.marker_draw {
+        draw_overflow_marker(frame, marker_draw, theme);
+    }
+
+    clip.total_lines
+}
+
+/// The bottom-anchor + top-clip geometry a pending body draws at (ADR-0046),
+/// resolved from the stack's `total_lines` against the zone `area`/`content_area`.
+/// Every field is a ready-to-draw value, so [`render_pending_body_at`] holds no
+/// layout arithmetic of its own (IOSP). `marker_draw` is `Some` only when the
+/// stack overflows the zone.
+struct PendingClip {
+    /// The stack's total wrapped rows, echoed back for the caller's return value.
+    total_lines: usize,
+    /// Relative scroll into the flat row stream (== the top-clipped row count).
+    top: usize,
+    /// Content Paragraph scroll offset (`top`, saturated into `u16`).
+    scroll: u16,
+    content_draw: Rect,
+    gutter_draw: Rect,
+    /// The `… Ctrl-S to show more` marker row, present only on overflow.
+    marker_draw: Option<Rect>,
+}
+
+/// Operation (IOSP): the pure anchor/clip math for a pending body of
+/// `total_lines` wrapped rows in a `content_area` inside the zone `area`. When the
+/// stack overflows, keep the LAST `height` rows (drop from the top, qwen's
+/// `overflowDirection:"top"`) and reserve the top row for the overflow marker; when
+/// it fits, bottom-anchor it via `pad_top`. No frame access, no side effects.
+fn anchor_clip(total_lines: usize, area: Rect, content_area: Rect) -> PendingClip {
+    let height = area.height as usize;
+    let overflowed = total_lines > height;
+
+    let (top, drawn_rows, pad_top) = if overflowed {
+        (total_lines - height + 1, height, 0)
+    } else {
+        (0, total_lines, height - total_lines)
+    };
+
+    // On overflow the top visible row is the marker, so the content/gutter both
+    // start one row down and lose that row of height.
+    let content_top_pad: u16 = if overflowed { 1 } else { 0 };
+    let draw_height = drawn_rows.saturating_sub(content_top_pad as usize) as u16;
+    let y_off = pad_top as u16 + content_top_pad;
+
+    PendingClip {
+        total_lines,
+        top,
+        scroll: u16::try_from(top).unwrap_or(u16::MAX),
+        content_draw: Rect {
+            y: content_area.y + y_off,
+            height: draw_height,
+            ..content_area
+        },
+        gutter_draw: Rect {
+            y: area.y + y_off,
+            height: draw_height,
+            ..area
+        },
+        marker_draw: overflowed.then_some(Rect {
+            y: area.y + pad_top as u16,
+            height: 1,
+            ..area
+        }),
+    }
+}
+
+/// Draws the `… Ctrl-S to show more` overflow marker (ADR-0046, qwen's
+/// `ShowMoreLines`) on the reserved top row. Ctrl-S expand handling is deferred -
+/// Phase 1 wires the marker + clip only.
+// TODO(ADR-0046): Ctrl-S to flip an expanded, unclamped one-shot view.
+fn draw_overflow_marker(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let marker_style = Style::default()
+        .fg(tui_color(theme.muted))
+        .add_modifier(Modifier::ITALIC);
+    frame.render_widget(
+        Paragraph::new(Line::styled("… Ctrl-S to show more", marker_style)),
+        area,
+    );
 }
 
 /// Computes the bounding rect for the Composer overlay popup: body rows plus
@@ -531,187 +726,124 @@ fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line
         .collect()
 }
 
-/// The scroll state and cache the viewport render needs each frame. Bundled so
-/// [`render_viewport`] takes four args instead of six (SRP_PARAMS fix): `frame`,
-/// `area`, `params`, and `theme` is the reduced call shape.
-pub struct ViewportParams<'a> {
-    pub screen: &'a Screen,
-    pub viewport: &'a Viewport,
-    pub cache: &'a mut RenderCache,
-    pub anim: Anim,
+/// Brings the [`RenderCache`] up to date with `screen`'s Transcript at
+/// `content_width` (ADR-0046): the adapter's public door onto the cache's
+/// (crate-private) sync, so [`commit_items`](crate::ui::commit_items) can sync
+/// at the SAME content width the committed slice draws at (frame width minus
+/// [`LANE_GUTTER`]) before measuring and blitting - keeping measure == draw
+/// (ADR-0029). The [`Toggles`] mirror the Screen's Ctrl-T/Ctrl-O flags.
+pub fn sync_commit_cache(
+    cache: &mut RenderCache,
+    screen: &Screen,
+    content_width: u16,
+    theme: &Theme,
+) {
+    cache.sync(
+        screen.transcript(),
+        Toggles {
+            thinking_expanded: screen.thinking_expanded,
+            tools_expanded: screen.tools_expanded,
+        },
+        content_width,
+        theme,
+    );
 }
 
-/// The transcript viewport: the message list, oldest first, plus any in-flight
-/// streaming Thinking/text, scrolled to the [`Viewport`]'s clamped top offset
-/// and overlaid with a scrollbar when the content overflows. Returns the
-/// measured geometry `(total wrapped lines, viewport height)`.
+/// The total wrapped height (visual rows) the committed slice `[hw, hw + count)`
+/// draws to at `width` (ADR-0046): the sum of the cached wrapped counts, so the
+/// adapter can size the [`Buffer`] `insert_before` scrolls into scrollback. The
+/// slice is drawn WHOLE - a tall commit overflows into native scrollback above
+/// the inline viewport, never clamped. `width` is the content width the cache
+/// was synced at; the committed content sits one [`LANE_GUTTER`] in, exactly
+/// like the pending region.
+pub fn commit_slice_height(cache: &RenderCache, hw: usize, count: usize) -> u16 {
+    let total: usize = cache
+        .settled()
+        .skip(hw)
+        .take(count)
+        .map(|(_, wrapped)| wrapped)
+        .sum();
+    u16::try_from(total).unwrap_or(u16::MAX)
+}
+
+/// Blits the committed slice `[hw, hw + count)` of the cached settled items into
+/// `buf` (ADR-0046, the inline `insert_before` seam): each item's cached content
+/// [`Line`]s draw at successive `y` in the content columns, with its lane gutter
+/// (the user `› ` caret / dim `│ ` spine) painted into the reserved
+/// [`LANE_GUTTER`] columns per visual row - the SAME two-plane layout the
+/// pending region uses ([`render_pending`]), so a committed item looks identical
+/// once it freezes. No scroll math: the caller sizes `buf` to
+/// [`commit_slice_height`], and a slice taller than the terminal scrolls whole
+/// into native scrollback. The lane state is derived over the FULL `items` list
+/// (a lane opened by a `User` item before `hw` still spines the committed tail),
+/// then only the slice's rows are painted.
 ///
-/// Per-frame cost is O(visible), not O(session): settled items' lines and
-/// wrapped counts come from the [`RenderCache`] (built once per item, per
-/// width), the total comes from summing the cached counts, and only the items
-/// intersecting the visible window ([`visible_window`]) are handed to the
-/// `Paragraph` - with a scroll offset RELATIVE to that slice. Measuring and
-/// drawing still agree exactly: each item was measured with the same
-/// `Wrap { trim: false }` at the same width it is drawn at, and ratatui wraps
-/// each `Line` independently, so per-item counts sum to the whole.
-pub fn render_viewport(
-    frame: &mut Frame,
-    area: Rect,
-    params: &mut ViewportParams<'_>,
-    theme: &Theme,
-) -> (usize, usize) {
-    let t = params.screen;
-    let viewport = params.viewport;
-    let cache = &mut params.cache;
-    let anim = params.anim;
-    // The rightmost column is ALWAYS the scrollbar gutter, occupied or not:
-    // reserving it only when the scrollbar shows would make the wrap width
-    // depend on the line count and the line count on the wrap width.
-    let text_area = Rect {
-        width: area.width.saturating_sub(1),
-        ..area
-    };
-    // The leftmost LANE_GUTTER columns are ALWAYS reserved for the run-lane
-    // spine / user caret (ADR-0040), occupied or not - the same unconditional
-    // reservation as the scrollbar column, and for the same reason: content
-    // wraps in the narrower `content_area`, so the wrap width never depends on
-    // whether a given row carries a spine. Everything below (`cache.sync`, the
-    // live tail's `wrapped_count`) MUST measure at `content_area.width` so
-    // measuring and drawing agree exactly (ADR-0029, the load-bearing gutter
-    // invariant).
-    let content_area = Rect {
-        x: text_area.x + LANE_GUTTER,
-        width: text_area.width.saturating_sub(LANE_GUTTER),
-        ..text_area
-    };
-    cache.sync(
-        t.transcript(),
-        Toggles {
-            thinking_expanded: t.thinking_expanded,
-            tools_expanded: t.tools_expanded,
-        },
-        content_area.width,
-        theme,
-    );
+/// Committed items render in their FULL cached form (qwen's `<Static>` feed
+/// prints history un-clamped): the collapsed-run fold and the overflow clip are
+/// live-region affordances only.
+/// The committed slice `[hw, hw + count)` to freeze into scrollback: the cache to
+/// blit from, the FULL `items` list the lane gutter is derived over (a lane opened
+/// before `hw` still spines the committed tail), and the ACTIVE `theme` the frozen
+/// rows bake. Bundled so [`render_committed_slice`] takes a single source arg
+/// beside its `buf` target instead of five positional params (SRP_PARAMS fix),
+/// matching the [`PendingBodyParams`]/[`GutterCtx`] param-struct style.
+pub struct CommittedSlice<'a> {
+    pub cache: &'a RenderCache,
+    pub items: &'a [TranscriptItem],
+    pub hw: usize,
+    pub count: usize,
+    pub theme: &'a Theme,
+}
 
-    // The live streaming snapshot renders below the settled items: the
-    // animated `✦ Thinking` header + a rolling reasoning tail (rebuilt each
-    // frame - the tail's window is non-monotonic so it is NOT cached; a few
-    // lines are cheap) and the streaming markdown (cached - see
-    // [`RenderCache::sync`]). `streaming_thinking()` stays whole in the store;
-    // the last-N windowing is a display policy, so it lives here (ADR-0029).
-    let thinking = t.transcript().streaming_thinking();
-    let thinking_lines = live_thinking_lines(&thinking, anim.spinner, content_area.width, theme);
-
-    // One (lines, wrapped-count, gutter-kind) entry per window "item": every
-    // KEPT settled message, then the live tail - a single indexing shared by the
-    // window selection, the slice assembly, and the per-visual-row gutter mapping
-    // below. The lane is DERIVED here at render time (ADR-0040), never stored and
-    // never in the RenderCache key: `lane_gutters` walks the settled items in
-    // order, and both live entries (the reasoning tail, the streaming answer)
-    // hang off the running Run's lane, so they take the spine. The lane is dense
-    // - no per-item blank separator - so the spine stays continuous.
-    let items = t.transcript().items();
-    let lane = lane_gutters(items);
-    // A collapsed run reads tidy: the LAST thought becomes a header, and beneath
-    // it only the last few actions show as a rolling window - older low-signal
-    // machinery (list/read) is suppressed, while code/diff Blocks and errors
-    // always break out. Ctrl-T reveals every thought; Ctrl-O every action.
-    let fold = run_fold(
+pub fn render_committed_slice(buf: &mut Buffer, slice: &CommittedSlice<'_>) {
+    let CommittedSlice {
+        cache,
         items,
-        t.thinking_expanded,
-        t.tools_expanded,
-        MACHINERY_WINDOW,
-    );
-    // The fold's synthetic lines (a thought header carrying the LAST thought's
-    // text at the FIRST thought's slot, or a `⋯ N earlier actions` count),
-    // owned here so the assembly below can borrow them.
-    let synthetic = fold_synthetic_lines(&fold, items, content_area.width, theme);
-    // Apply the fold: kept items contribute their cached lines, Header/Elided
-    // their synthetic line, Drops nothing - the per-item branch structure lives
-    // in `assemble_settled` so it stays off `render_viewport`'s complexity.
-    let (mut item_lines, mut counts, mut gutters) =
-        assemble_settled(cache, &fold, &synthetic, &lane, content_area.width);
-    if !thinking_lines.is_empty() {
-        counts.push(wrapped_count(thinking_lines.clone(), content_area.width));
-        item_lines.push(&thinking_lines);
-        gutters.push(GutterKind::Spine);
-    }
-    // Captured once so the lull gate below can test `is_none()` without a
-    // second borrow of `cache` (streaming_tail borrows it immutably).
-    let tail = cache.streaming_tail();
-    if let Some((lines, wrapped)) = tail {
-        counts.push(wrapped);
-        item_lines.push(lines);
-        gutters.push(GutterKind::Spine);
-    }
-    // The lull "waiting" row is the third live entry, mutually exclusive with
-    // the two above BY CONSTRUCTION: it draws only when the Run runs and
-    // NEITHER a reasoning tail nor a streaming answer is on screen. Declared
-    // in this scope so the `&lull_lines` reference `item_lines` holds outlives
-    // the draw, exactly like `thinking_lines`. `push_live_entry` folds the
-    // emptiness branch out of this body so appending the row does not raise
-    // `render_viewport`'s complexity past its baseline (the settle window and
-    // the gate already keep the row empty when it must not show).
-    let lull_lines = if lull_visible(t.status, thinking_lines.is_empty(), tail.is_some()) {
-        live_lull_lines(anim, content_area.width, theme)
-    } else {
-        Vec::new()
-    };
-    push_live_entry(
-        &lull_lines,
-        &mut item_lines,
-        &mut counts,
-        &mut gutters,
-        content_area.width,
-    );
-
-    // The ONE per-visual-row mapping both the content and the gutter consume:
-    // expanding the per-item kinds over each item's wrapped rows yields a flat
-    // `RowGutter` per content row, in the same order the Paragraph lays rows
-    // out. Slicing it by the absolute `top` offset is exactly the content's
-    // `scroll`, so the gutter and the content can never desync (M3).
-    let row_gutters = expand_gutters(&gutters, &counts);
-
-    let total_lines: usize = counts.iter().sum();
-    let height = area.height as usize;
-    let top = viewport.top_offset(total_lines, height);
-    let (range, offset) = visible_window(&counts, top, height);
-    let visible: Vec<Line> = item_lines[range.clone()]
-        .iter()
-        .flat_map(|lines| lines.iter().cloned())
-        .collect();
-    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
-    // The pure window math speaks usize; saturate only here, at the ratatui
-    // boundary. The relative offset is bounded by ONE item's wrapped rows
-    // (the item straddling the window top), never the session's. Content draws
-    // into `content_area` (the gutter carved off the left); the gutter glyphs
-    // are painted into the reserved columns per VISUAL row, so soft-wrapped
-    // continuations keep their spine.
-    let scroll = u16::try_from(offset).unwrap_or(u16::MAX);
-    frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
-    paint_gutter(
-        frame,
-        text_area,
-        &GutterCtx {
-            row_gutters: &row_gutters,
-            top,
-            height,
-        },
+        hw,
+        count,
         theme,
-    );
+    } = *slice;
+    let width = buf.area.width;
+    let content_x = buf.area.x + LANE_GUTTER;
+    let content_width = width.saturating_sub(LANE_GUTTER);
 
-    if total_lines > height {
-        let mut state = ScrollbarState::new(total_lines)
-            .position(top)
-            .viewport_content_length(height);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area,
-            &mut state,
-        );
+    // The lane gutter over ALL items, sliced to the committed range - so a lane
+    // opened before `hw` correctly spines the committed tail. The lane styles are
+    // computed ONCE, the SAME way the pending gutter derives them - so a frozen
+    // item's caret/spine is identical to the live one's (ADR-0046).
+    let lane = lane_gutters(items);
+    let styles = LaneStyles::from_theme(theme);
+
+    let mut y = buf.area.y;
+    for (i, (lines, wrapped)) in cache.settled().enumerate().skip(hw).take(count) {
+        // The content plane: cached lines drawn one visual row apart. Each line
+        // was measured with `Wrap { trim: false }` at `content_width`, so it
+        // occupies exactly `wrapped` rows and never re-wraps here (measure ==
+        // draw, ADR-0029).
+        let content_area = Rect {
+            x: content_x,
+            y,
+            width: content_width,
+            height: wrapped as u16,
+        };
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .render(content_area, buf);
+
+        // The gutter plane: expand this ONE item's lane kind over its wrapped
+        // rows (caret on the first row of a User item, spine on every in-lane
+        // row) and paint the reserved columns via the SAME cell→widget rule the
+        // pending gutter uses ([`gutter_cell_widget`]/[`gutter_rect`]).
+        let kind = lane.get(i).copied().unwrap_or(GutterKind::Blank);
+        for row in 0..wrapped {
+            let cell = row_gutter_for(kind, row);
+            if let Some(widget) = gutter_cell_widget(cell, styles) {
+                widget.render(gutter_rect(buf.area.x, y + row as u16), buf);
+            }
+        }
+
+        y = y.saturating_add(wrapped as u16);
     }
-    (total_lines, height)
 }
 
 /// The rolling reasoning tail shown while a Run streams: an animated
@@ -760,48 +892,29 @@ fn live_thinking_lines(
     out
 }
 
-/// The lull "waiting" row shown while a Run runs but nothing streams: an
-/// elapsed timer (left, fixed-width so the animation column never jitters) then
-/// the current [`lull`] scene frame, indented two columns under the running
-/// lane like the reasoning tail. Empty until the lull passes the settle window
-/// (so a brief token gap never flashes a scene) and empty whenever output is
-/// streaming (the caller gates on that - see [`render_viewport`]).
-///
-/// `width` is the `content_area` width this draws in (the same measured==drawn
-/// width the rest of the viewport uses, ADR-0029). The row is truncated to that
-/// width so it stays exactly one visual row and cannot desync the lane spine.
-/// Appends one live entry (a reasoning tail, a streaming answer, or the lull
-/// row) to the render window as a single lane-spine item - but only when it
-/// carries lines. Borrows `lines` for as long as `item_lines` holds the
-/// reference, so the caller must keep the backing `Vec` alive until the draw.
-/// The emptiness branch lives HERE so appending a live entry does not raise
-/// [`render_viewport`]'s cyclomatic complexity.
-fn push_live_entry<'a>(
-    lines: &'a [Line<'static>],
-    item_lines: &mut Vec<&'a [Line<'static>]>,
-    counts: &mut Vec<usize>,
-    gutters: &mut Vec<GutterKind>,
-    width: u16,
-) {
-    if lines.is_empty() {
-        return;
-    }
-    counts.push(wrapped_count(lines.to_vec(), width));
-    item_lines.push(lines);
-    gutters.push(GutterKind::Spine);
-}
-
 /// Whether the lull "waiting" row should draw this frame: the Run is Running
 /// and NEITHER live entry (the reasoning tail, the streaming answer) is on
 /// screen. The one gate, matching [`Screen::has_live_stream`] by construction
 /// (`thinking_empty == streaming_thinking().is_empty()` and `tail_present ==
 /// !streaming_text().is_empty()`) so the row and the adapter's lull clock never
-/// disagree. Pulled out of [`render_viewport`] so the multi-clause boolean and
+/// disagree. Pulled out of `render_pending_body` so the multi-clause boolean and
 /// its emptiness branch stay off that function's cyclomatic complexity.
 fn lull_visible(status: Status, thinking_empty: bool, tail_present: bool) -> bool {
     status == Status::Running && thinking_empty && !tail_present
 }
 
+/// The lull "waiting" row shown while a Run runs but nothing streams: an
+/// elapsed timer (left, fixed-width so the animation column never jitters) then
+/// the current [`lull`] scene frame, indented two columns under the running
+/// lane like the reasoning tail. Empty until the lull passes the settle window
+/// (so a brief token gap never flashes a scene) and empty whenever output is
+/// streaming (the caller gates on that - see `render_pending_body`).
+///
+/// `width` is the `content_area` width this draws in (the same measured==drawn
+/// width the rest of the viewport uses, ADR-0029). The row is truncated to that
+/// width so it stays exactly one visual row and cannot desync the lane spine.
+/// (Live entries are appended to the render window by
+/// [`PendingStack::push_live`], which owns the emptiness branch.)
 fn live_lull_lines(anim: Anim, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let Some(glyph) = lull::frame(anim.quiet_ticks, anim.lull_seq) else {
         return vec![];
@@ -910,7 +1023,9 @@ fn indented_lines(
 /// plane (ADR-0040). Two columns - a glyph and a trailing space - so content
 /// sits one clear column off the spine. Carved unconditionally off the text
 /// area so the content wrap width never depends on lane membership.
-const LANE_GUTTER: u16 = 2;
+/// `pub(crate)` so the adapter can size the committed-slice content width
+/// (ADR-0046) at the same gutter reservation the pending region uses.
+pub(crate) const LANE_GUTTER: u16 = 2;
 
 /// What the reserved left gutter draws beside one transcript item's rows
 /// (ADR-0040). Derived at render time from the item sequence, never stored.
@@ -951,8 +1066,8 @@ fn lane_gutters(items: &[TranscriptItem]) -> Vec<GutterKind> {
 
 /// What one VISUAL content row draws in the reserved gutter (ADR-0040): the
 /// user's `› ` caret, the dim `│ ` lane spine, or nothing. This is the flat
-/// per-row mapping [`expand_gutters`] produces and both the content and the
-/// gutter index by, so they can never desync.
+/// per-row mapping [`PendingStack::expand_gutters`] produces and both the content
+/// and the gutter index by, so they can never desync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowGutter {
     /// A `User` prompt's first visual row - the caret at the margin.
@@ -974,170 +1089,135 @@ impl RowGutter {
     }
 }
 
-/// Expands the per-item lane `gutters` over each item's `counts` wrapped rows
-/// into one [`RowGutter`] per VISUAL content row, in Paragraph layout order -
-/// the single mapping the content and the gutter share (M3). A `User` item's
-/// caret shows only on its first row; a `Spine` item spines every row (the lane
-/// is dense - no per-item blank separator - so the spine stays continuous).
-fn expand_gutters(gutters: &[GutterKind], counts: &[usize]) -> Vec<RowGutter> {
-    let mut rows = Vec::with_capacity(counts.iter().sum());
-    for (i, &n) in counts.iter().enumerate() {
-        for row in 0..n {
-            let cell = match gutters[i] {
-                GutterKind::User if row == 0 => RowGutter::Caret,
-                GutterKind::User => RowGutter::Blank,
-                GutterKind::Spine => RowGutter::Spine,
-                GutterKind::Blank => RowGutter::Blank,
-            };
-            rows.push(cell);
-        }
+/// The [`RowGutter`] one visual `row` of an item with lane `kind` draws: a
+/// `User` item's caret shows only on row 0, a `Spine` item spines every row, a
+/// `Blank` item never paints. The ONE lane-kind → row-glyph rule, shared by the
+/// pending render's [`PendingStack::expand_gutters`] and the committed slice's
+/// blit ([`render_committed_slice`]) so the two can never disagree.
+fn row_gutter_for(kind: GutterKind, row: usize) -> RowGutter {
+    match kind {
+        GutterKind::User if row == 0 => RowGutter::Caret,
+        GutterKind::User => RowGutter::Blank,
+        GutterKind::Spine => RowGutter::Spine,
+        GutterKind::Blank => RowGutter::Blank,
     }
-    rows
 }
 
-/// How many of a run's most recent low-signal actions (list/read-style tool
-/// one-liners) the collapsed view keeps as a rolling window; older ones are
-/// suppressed. Errors and Diffs are never windowed - they break out.
-const MACHINERY_WINDOW: usize = 4;
-
-/// What the collapsed render does with one settled item ([`run_fold`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FoldAction {
-    /// Render the item from its cached lines.
-    Keep,
-    /// Suppress it (a non-last thought, or an action older than the window).
-    Drop,
-    /// Render a synthetic one-line thought header here (the FIRST thought's slot)
-    /// carrying the text of the lane's LAST thought (the index).
-    Header(usize),
-    /// Render a `⋯ N earlier actions` count here (the FIRST windowed-out action's
-    /// slot), so a fold never silently hides work; the rest of the run `Drop`s.
-    Elided(usize),
+/// One entry in the [`PendingStack`]: a borrowed run of content [`Line`]s, the
+/// number of VISUAL rows they occupy once wrapped (`wrapped`), and the lane
+/// [`GutterKind`] that paints their reserved gutter columns. Bundling the three
+/// as ONE row makes the index-alignment invariant (the N-th lines, the N-th
+/// count, and the N-th gutter always describe the same item) a TYPE property
+/// rather than three parallel `Vec`s a caller could push out of step.
+struct PendingRow<'a> {
+    lines: &'a [Line<'static>],
+    wrapped: usize,
+    gutter: GutterKind,
 }
 
-/// Folds a collapsed run to a tidy shape (ADR-0040): per lane (a `User`-opened
-/// request), the reasoning collapses to a single header - the LAST thought's
-/// text rendered at the FIRST thought's slot, with the intervening thoughts
-/// dropped - and the low-signal machinery (paired/one-line tool results and
-/// calls) becomes a rolling window of the last `window` items, older ones
-/// dropped. Errors, [`Diff`]s, assistant text, markers and prompts always Keep
-/// (they break out). `thinking_expanded` (Ctrl-T) disables the thought fold;
-/// `tools_expanded` (Ctrl-O) disables the machinery window.
-///
-/// [`Diff`]: TranscriptItem::Diff
-fn run_fold(
-    items: &[TranscriptItem],
-    thinking_expanded: bool,
-    tools_expanded: bool,
-    window: usize,
-) -> Vec<FoldAction> {
-    let mut fold = vec![FoldAction::Keep; items.len()];
-    // Lanes are delimited by `User` items; the region before the first is its
-    // own (greeting) lane. Fold each independently.
-    let mut start = 0;
-    let fold_lane = |fold: &mut Vec<FoldAction>, range: std::ops::Range<usize>| {
-        let mut thoughts = Vec::new();
-        let mut machinery = Vec::new();
-        for i in range {
-            match &items[i] {
-                TranscriptItem::Thinking { .. } => thoughts.push(i),
-                // Low-signal machinery: a merged tool result or a bare call.
-                // Errors and Diffs are NOT here - they always break out.
-                TranscriptItem::ToolResult {
-                    is_error: false, ..
-                }
-                | TranscriptItem::ToolCall { .. } => machinery.push(i),
-                _ => {}
-            }
-        }
-        if !thinking_expanded
-            && let (Some(&first), Some(&last)) = (thoughts.first(), thoughts.last())
-        {
-            fold[first] = FoldAction::Header(last);
-            for &t in &thoughts {
-                if t != first {
-                    fold[t] = FoldAction::Drop;
-                }
-            }
-        }
-        if !tools_expanded && machinery.len() > window {
-            let dropped = &machinery[..machinery.len() - window];
-            // A count marker at the first windowed-out slot, the rest suppressed.
-            fold[dropped[0]] = FoldAction::Elided(dropped.len());
-            for &m in &dropped[1..] {
-                fold[m] = FoldAction::Drop;
-            }
-        }
-    };
-    for (i, item) in items.iter().enumerate() {
-        if matches!(item, TranscriptItem::User { .. }) && i > start {
-            fold_lane(&mut fold, start..i);
-            start = i;
-        }
+/// The ordered stack of [`PendingRow`]s the inline pending body draws (ADR-0046):
+/// the uncommitted settled tail plus the live entries (reasoning tail, streaming
+/// answer, lull row), top to bottom. Replaces the three lockstep
+/// `item_lines`/`counts`/`gutters` `Vec`s that used to be threaded together.
+struct PendingStack<'a> {
+    rows: Vec<PendingRow<'a>>,
+}
+
+impl<'a> PendingStack<'a> {
+    /// Seats a precomputed run of [`PendingRow`]s as the initial stack (the
+    /// settled tail from [`pending_tail_rows`]); live entries are pushed after.
+    fn from_rows(rows: Vec<PendingRow<'a>>) -> Self {
+        Self { rows }
     }
-    fold_lane(&mut fold, start..items.len());
-    fold
+
+    /// Appends one row. The three facts travel together, so they can never
+    /// desync.
+    fn push(&mut self, lines: &'a [Line<'static>], wrapped: usize, gutter: GutterKind) {
+        self.rows.push(PendingRow {
+            lines,
+            wrapped,
+            gutter,
+        });
+    }
+
+    /// Appends a LIVE entry (a reasoning tail, a streaming answer, or the lull
+    /// row) as a single lane-spine row - but only when it carries lines. The
+    /// emptiness branch lives HERE so the caller does not repeat it per entry.
+    /// `width` is the content width the entry is measured at.
+    fn push_live(&mut self, lines: &'a [Line<'static>], width: u16) {
+        if lines.is_empty() {
+            return;
+        }
+        let wrapped = wrapped_count(lines.to_vec(), width);
+        self.push(lines, wrapped, GutterKind::Spine);
+    }
+
+    /// The total VISUAL rows the whole stack occupies (before any clip).
+    fn total_lines(&self) -> usize {
+        self.rows.iter().map(|r| r.wrapped).sum()
+    }
+
+    /// Every content [`Line`] in order, flattened - the Paragraph the body
+    /// scrolls and clips.
+    fn flat_lines(&self) -> Vec<Line<'static>> {
+        self.rows
+            .iter()
+            .flat_map(|r| r.lines.iter().cloned())
+            .collect()
+    }
+
+    /// The per-VISUAL-row [`RowGutter`] mapping the gutter paints, expanded from
+    /// each row's `(gutter, wrapped)` in Paragraph layout order - the single
+    /// mapping the content and the gutter share (M3), so they can never desync.
+    fn expand_gutters(&self) -> Vec<RowGutter> {
+        let mut out = Vec::with_capacity(self.total_lines());
+        for r in &self.rows {
+            for row in 0..r.wrapped {
+                out.push(row_gutter_for(r.gutter, row));
+            }
+        }
+        out
+    }
 }
 
-/// The synthetic line each [`FoldAction`] contributes, indexed to match the
-/// items: `Header(last)` builds the collapsed thought header from the LAST
-/// thought's text at the FIRST thought's slot; `Elided(n)` builds the
-/// `⋯ N earlier actions` count; every other action contributes `None` (its own
-/// cached lines are used). Split out of `render_viewport` so the fold's branch
-/// structure does not inflate that function's complexity.
-fn fold_synthetic_lines(
-    fold: &[FoldAction],
-    items: &[TranscriptItem],
-    width: u16,
-    theme: &Theme,
-) -> Vec<Option<Vec<Line<'static>>>> {
-    fold.iter()
-        .map(|f| match f {
-            FoldAction::Header(last) => match &items[*last] {
-                TranscriptItem::Thinking { text } => {
-                    Some(vec![collapsed_thought_line(text, width, theme)])
-                }
-                _ => None,
-            },
-            FoldAction::Elided(n) => Some(vec![elided_actions_line(*n, theme)]),
-            _ => None,
+/// Assembles the uncommitted settled tail of the transcript into a
+/// [`PendingStack`] (ADR-0046): skips the committed items `[0, hw)` (already
+/// frozen into scrollback) and takes each remaining item's cached lines VERBATIM,
+/// the SAME cache slice [`render_committed_slice`] blits, so committed and
+/// pending render identically (no collapsed-run fold, no machinery window; the
+/// only overflow reduction is the caller's bottom-anchor + top-clip). The lane
+/// is computed over the FULL item sequence so a lane opened before `hw` keeps
+/// its spine over the pending tail; only the emitted rows start at `hw`.
+fn assemble_pending<'a>(
+    cache: &'a RenderCache,
+    lane: &[GutterKind],
+    hw: usize,
+) -> PendingStack<'a> {
+    // Integration (IOSP): compute the tail rows in the operation below, then only
+    // seat them in a fresh stack here. No control flow of its own.
+    PendingStack::from_rows(pending_tail_rows(cache, lane, hw))
+}
+
+/// Operation (IOSP): the uncommitted settled tail as [`PendingRow`]s - the cached
+/// items `[hw..]`, each paired with its lane [`GutterKind`]. Pure over the cache
+/// and lane (no side effects, no I/O), so [`assemble_pending`] stays a straight
+/// orchestration. The `[0, hw)` prefix is already frozen into scrollback, so it
+/// is skipped.
+fn pending_tail_rows<'a>(
+    cache: &'a RenderCache,
+    lane: &[GutterKind],
+    hw: usize,
+) -> Vec<PendingRow<'a>> {
+    cache
+        .settled()
+        .enumerate()
+        .skip(hw)
+        .map(|(i, (lines, wrapped))| PendingRow {
+            lines,
+            wrapped,
+            gutter: lane[i],
         })
         .collect()
-}
-
-/// Applies the collapsed-run [`run_fold`] to the cached settled items,
-/// producing the parallel `(lines, wrapped-count, gutter-kind)` the viewport's
-/// window math and gutter mapping consume. A `Keep` contributes the item's
-/// cached lines and count; a `Header`/`Elided` its synthetic line (re-measured
-/// at `width`); a `Drop` nothing. Borrows the cached and synthetic lines, so the
-/// returned slices live as long as both. Split out of `render_viewport` to keep
-/// the fold's branch structure off that function's complexity.
-fn assemble_settled<'a>(
-    cache: &'a RenderCache,
-    fold: &[FoldAction],
-    synthetic: &'a [Option<Vec<Line<'static>>>],
-    lane: &[GutterKind],
-    width: u16,
-) -> (Vec<&'a [Line<'static>]>, Vec<usize>, Vec<GutterKind>) {
-    let mut item_lines: Vec<&[Line<'static>]> = Vec::new();
-    let mut counts: Vec<usize> = Vec::new();
-    let mut gutters: Vec<GutterKind> = Vec::new();
-    for (i, (cached, wrapped)) in cache.settled().enumerate() {
-        match fold[i] {
-            FoldAction::Drop => continue,
-            FoldAction::Keep => {
-                item_lines.push(cached);
-                counts.push(wrapped);
-            }
-            FoldAction::Header(_) | FoldAction::Elided(_) => {
-                let syn = synthetic[i].as_deref().unwrap_or(cached);
-                counts.push(wrapped_count(syn.to_vec(), width));
-                item_lines.push(syn);
-            }
-        }
-        gutters.push(lane[i]);
-    }
-    (item_lines, counts, gutters)
 }
 
 /// The collapsed one-line thought (the fold header and the settled collapsed
@@ -1187,16 +1267,6 @@ fn settled_thinking_lines(
     out
 }
 
-/// The `⋯ N earlier actions` count that stands in for a run of windowed-out
-/// low-signal machinery, indented under the thought header like the tool work,
-/// so a fold never silently hides what the agent did (Ctrl-O reveals it all).
-fn elided_actions_line(n: usize, theme: &Theme) -> Line<'static> {
-    Line::styled(
-        format!("  ⋯ {n} earlier actions · ^O expand"),
-        machinery_style(theme),
-    )
-}
-
 /// The gutter paint parameters: the precomputed per-row gutter mapping, the
 /// window position (`top`, `height`), and the frame area the gutter occupies.
 /// Bundled so [`paint_gutter`] takes a single context arg instead of four
@@ -1207,6 +1277,60 @@ struct GutterCtx<'a> {
     height: usize,
 }
 
+/// The two lane-gutter paint styles, computed ONCE from the theme: the user
+/// prompt caret (bold `prompt_gutter`) and the dim lane spine (`lane_spine`). A
+/// newtype so the committed slice and the pending gutter derive them the same
+/// way - "committed looks identical to pending once frozen" is then a code
+/// guarantee, not two copies of the same `Style::default().fg(...)` chain that
+/// could drift.
+#[derive(Debug, Clone, Copy)]
+struct LaneStyles {
+    caret: Style,
+    spine: Style,
+}
+
+impl LaneStyles {
+    fn from_theme(theme: &Theme) -> Self {
+        Self {
+            caret: Style::default()
+                .fg(tui_color(theme.prompt_gutter))
+                .add_modifier(Modifier::BOLD),
+            spine: Style::default().fg(tui_color(theme.lane_spine)),
+        }
+    }
+
+    /// The paint style for one gutter cell: `Some` for Caret/Spine, `None` for
+    /// Blank (the reserved columns stay clear - nothing to paint).
+    fn cell_style(&self, cell: RowGutter) -> Option<Style> {
+        match cell {
+            RowGutter::Blank => None,
+            RowGutter::Caret => Some(self.caret),
+            RowGutter::Spine => Some(self.spine),
+        }
+    }
+}
+
+/// The 1-row × [`LANE_GUTTER`]-wide rect one gutter cell paints into, at column
+/// `x` and row `y`. One place for the BP-009 `Rect` boilerplate both gutter
+/// painters (the pending frame and the committed-slice blit) reuse.
+fn gutter_rect(x: u16, y: u16) -> Rect {
+    Rect {
+        x,
+        y,
+        width: LANE_GUTTER,
+        height: 1,
+    }
+}
+
+/// One gutter cell as a styled [`Paragraph`], or `None` when the cell is Blank.
+/// The single glyph+style→widget rule the committed slice and the pending gutter
+/// share, so a painted spine is byte-identical in both.
+fn gutter_cell_widget(cell: RowGutter, styles: LaneStyles) -> Option<Paragraph<'static>> {
+    styles
+        .cell_style(cell)
+        .map(|style| Paragraph::new(Line::styled(cell.glyph(), style)))
+}
+
 /// Paints the reserved left gutter per VISUAL row over the visible window: the
 /// user caret in the prompt color, the lane spine in the dim `lane_spine` slot.
 /// Consumes the flat [`RowGutter`] mapping the content shares, sliced by the
@@ -1214,23 +1338,8 @@ struct GutterCtx<'a> {
 /// a gutter glyph lands on exactly the row its item occupies at any scroll
 /// position, soft-wrapped continuations included (M3). Draws nothing outside the
 /// item rows (a short transcript leaves the lower gutter clear).
-/// Resolves the paint style for one gutter cell: `Some(style)` when the cell
-/// should be painted (Caret or Spine), `None` for Blank (the reserved columns
-/// stay clear - nothing to paint).
-fn gutter_cell_style(cell: RowGutter, caret: Style, spine: Style) -> Option<Style> {
-    match cell {
-        RowGutter::Blank => None,
-        RowGutter::Caret => Some(caret),
-        RowGutter::Spine => Some(spine),
-    }
-}
-
 fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: &Theme) {
-    let caret = Style::default()
-        .fg(tui_color(theme.prompt_gutter))
-        .add_modifier(Modifier::BOLD);
-    let spine = Style::default().fg(tui_color(theme.lane_spine));
-
+    let styles = LaneStyles::from_theme(theme);
     for (screen_row, cell) in ctx
         .row_gutters
         .iter()
@@ -1238,19 +1347,10 @@ fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: 
         .take(ctx.height)
         .enumerate()
     {
-        let Some(style) = gutter_cell_style(*cell, caret, spine) else {
-            continue;
-        };
-        let y = text_area.y + screen_row as u16;
-        frame.render_widget(
-            Paragraph::new(Line::styled(cell.glyph(), style)),
-            Rect {
-                x: text_area.x,
-                y,
-                width: LANE_GUTTER,
-                height: 1,
-            },
-        );
+        if let Some(widget) = gutter_cell_widget(*cell, styles) {
+            let y = text_area.y + screen_row as u16;
+            frame.render_widget(widget, gutter_rect(text_area.x, y));
+        }
     }
 }
 
@@ -1292,10 +1392,10 @@ mod render_cache {
     use crate::ui::theme::{self, Theme};
     use crate::ui::transcript::Transcript;
 
-    /// Per-item render state for the transcript viewport, owned by the
-    /// adapter's run loop and threaded through [`super::render`]. Holds
-    /// ratatui [`Line`]s, so it lives HERE, not in the pure modules
-    /// (ADR-0019).
+    /// Per-item render state for the inline pending body and the committed-slice
+    /// blit (ADR-0046), owned by the adapter's run loop and threaded through
+    /// [`super::render_pending`] and [`super::render_committed_slice`]. Holds
+    /// ratatui [`Line`]s, so it lives HERE, not in the pure modules (ADR-0019).
     pub struct RenderCache {
         /// The text width everything below was built/measured at.
         width: u16,
@@ -1324,7 +1424,7 @@ mod render_cache {
     }
 
     /// One settled item's built lines and its wrapped row count at the
-    /// cache's width - the numbers [`super::visible_window`] does its
+    /// cache's width - the numbers the pending body does its
     /// prefix-sum math over.
     struct CachedItem {
         lines: Vec<Line<'static>>,
@@ -1599,34 +1699,6 @@ fn wrapped_count(lines: Vec<Line<'static>>, width: u16) -> usize {
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .line_count(width)
-}
-
-/// The visible window over per-item wrapped row counts, pure: given the
-/// clamped top offset and the viewport height, the range of items whose rows
-/// intersect `[top, top + height)` and the scroll offset RELATIVE to the
-/// range's first row. Rendering only this slice (scrolled by the relative
-/// offset) draws exactly what rendering everything (scrolled by `top`) would.
-fn visible_window(counts: &[usize], top: usize, height: usize) -> (std::ops::Range<usize>, usize) {
-    // Walk to the first item whose rows reach past `top` (prefix sums).
-    let mut start = counts.len();
-    let mut before = 0;
-    for (i, &count) in counts.iter().enumerate() {
-        if before + count > top {
-            start = i;
-            break;
-        }
-        before += count;
-    }
-    // `top` beyond the content (degenerate; the caller clamps) selects nothing.
-    let offset = top.saturating_sub(before);
-    // Extend until the slice covers the window's bottom row (or runs out).
-    let mut end = start;
-    let mut covered = 0;
-    while end < counts.len() && covered < offset + height {
-        covered += counts[end];
-        end += 1;
-    }
-    (start..end, offset)
 }
 
 /// The backgrounded "machinery" style for tool-call lines: dim DarkGray, NOT
@@ -2374,12 +2446,10 @@ pub enum StatusSegment {
         /// How close to the budget the Conversation sits.
         level: PressureLevel,
     },
-    /// The viewport scroll position label (`Bot`/`Top`/`NN%`), already derived
-    /// from this frame's geometry by [`scroll_position_label`].
-    Position {
-        /// The vim-ruler style position label.
-        label: String,
-    },
+    /// The position marker - a literal `Bot` (ADR-0046). With native scrollback
+    /// owning history, the inline pending region always follows the tail, so
+    /// there is no scroll position to report; the segment is a unit.
+    Position,
 }
 
 impl StatusSegment {
@@ -2398,7 +2468,7 @@ impl StatusSegment {
             StatusSegment::Tools { .. } => SegmentKind::Tools,
             StatusSegment::Cost { .. } => SegmentKind::Cost,
             StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
-            StatusSegment::Position { .. } => SegmentKind::Position,
+            StatusSegment::Position => SegmentKind::Position,
         }
     }
 
@@ -2522,7 +2592,6 @@ pub(crate) struct StatusBarView<'a> {
     pub(crate) conn: ConnectionView<'a>,
     pub(crate) toggles: Toggles,
     pub(crate) figures: FigureView,
-    pub(crate) position: String,
 }
 
 /// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
@@ -2540,7 +2609,6 @@ pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
         conn,
         toggles,
         figures,
-        position,
     } = view;
     let mode = match status {
         Status::Idle => ModeState::Idle,
@@ -2574,7 +2642,9 @@ pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
             label: cost_label(figures.session_cost),
         });
     }
-    right.push(StatusSegment::Position { label: position });
+    // Native scrollback owns history (ADR-0046): the pending body always follows
+    // the tail, so the position segment is a literal `Bot` - a unit, no state.
+    right.push(StatusSegment::Position);
 
     StatusBar { left, right }.fit(width)
 }
@@ -2632,7 +2702,8 @@ impl StatusSegment {
             }
             StatusSegment::Cost { label } => padded(label),
             StatusSegment::Tokens { estimate, .. } => tokens_label(*estimate),
-            StatusSegment::Position { label } => padded(label),
+            // Native scrollback owns history (ADR-0046): always the tail.
+            StatusSegment::Position => padded("Bot"),
         }
     }
 }
@@ -2652,8 +2723,6 @@ impl StatusSegment {
 pub(crate) struct StatusBarCtx<'a> {
     pub(crate) screen: &'a Screen,
     pub(crate) conn: ConnectionView<'a>,
-    pub(crate) viewport: &'a Viewport,
-    pub(crate) geometry: (usize, usize),
 }
 
 pub(crate) fn render_status_bar(
@@ -2662,18 +2731,7 @@ pub(crate) fn render_status_bar(
     ctx: StatusBarCtx<'_>,
     theme: &Theme,
 ) {
-    let StatusBarCtx {
-        screen: t,
-        conn,
-        viewport,
-        geometry,
-    } = ctx;
-    let (total_lines, height) = geometry;
-    let position = scroll_position_label(
-        viewport.top_offset(total_lines, height),
-        total_lines,
-        height,
-    );
+    let StatusBarCtx { screen: t, conn } = ctx;
     let bar = status_bar(
         area.width as usize,
         StatusBarView {
@@ -2690,7 +2748,6 @@ pub(crate) fn render_status_bar(
                 }),
                 session_cost: t.session_cost,
             },
-            position,
         },
     );
 
@@ -2726,24 +2783,6 @@ pub(crate) fn render_status_bar(
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
     frame.render_widget(bar, area);
-}
-
-/// The position segment's label, vim-ruler style: `Bot` at the tail, `Top` at
-/// the top of overflowing content, otherwise the percentage of the scroll
-/// range. Content that FITS the viewport is `Bot`, not `Top`: the tail is
-/// visible, which is what a pinned reader cares about - and it keeps the
-/// label stable as a fresh session grows past one page.
-fn scroll_position_label(top: usize, total_lines: usize, height: usize) -> String {
-    let max_top = total_lines.saturating_sub(height);
-    if top >= max_top {
-        // Also covers max_top == 0 (content fits, or empty/degenerate
-        // geometry) - no division by zero below.
-        "Bot".to_string()
-    } else if top == 0 {
-        "Top".to_string()
-    } else {
-        format!("{}%", top * 100 / max_top)
-    }
 }
 
 /// The Composer: the draft, pre-wrapped by the pure [`composer::layout`]
@@ -3516,46 +3555,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The scroll-position label.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn scroll_position_label_is_bot_at_the_tail() {
-        // top == max_top (100 - 20 = 80): the tail is on screen.
-        assert_eq!(scroll_position_label(80, 100, 20), "Bot");
-    }
-
-    #[test]
-    fn scroll_position_label_is_top_at_the_top_of_overflowing_content() {
-        assert_eq!(scroll_position_label(0, 100, 20), "Top");
-    }
-
-    #[test]
-    fn scroll_position_label_is_the_percentage_of_the_scroll_range() {
-        // max_top = 80; vim-ruler style: 0% at the top, 100% at the tail.
-        assert_eq!(scroll_position_label(40, 100, 20), "50%");
-        assert_eq!(scroll_position_label(8, 100, 20), "10%");
-        assert_eq!(scroll_position_label(79, 100, 20), "98%");
-    }
-
-    #[test]
-    fn scroll_position_label_shows_bot_when_the_content_fits() {
-        // The tail is visible, so a pinned reader sees `Bot` - and the label
-        // does not flap Top→Bot as a fresh session grows past one page.
-        assert_eq!(scroll_position_label(0, 5, 20), "Bot");
-        assert_eq!(scroll_position_label(0, 20, 20), "Bot");
-        assert_eq!(scroll_position_label(0, 0, 20), "Bot");
-    }
-
-    #[test]
-    fn scroll_position_label_survives_zero_heights() {
-        // Degenerate geometry (zero-height viewport) must not divide by zero.
-        assert_eq!(scroll_position_label(0, 0, 0), "Bot");
-        assert_eq!(scroll_position_label(100, 100, 0), "Bot");
-        assert_eq!(scroll_position_label(0, 100, 0), "Top");
-        assert_eq!(scroll_position_label(50, 100, 0), "50%");
-    }
-
     // -----------------------------------------------------------------------
     // The powerline segment assembly.
     // -----------------------------------------------------------------------
@@ -3596,7 +3595,6 @@ mod tests {
                     }),
                     session_cost: 0.42,
                 },
-                position: "Bot".to_string(),
             },
         )
     }
@@ -3705,7 +3703,6 @@ mod tests {
                 },
                 toggles,
                 figures: no_figures(),
-                position: "Bot".to_string(),
             },
         )
     }
@@ -3818,7 +3815,6 @@ mod tests {
                     estimate: 1200,
                     level: PressureLevel::Ok,
                 }),
-                position: "Bot".to_string(),
             },
         );
         assert!(
@@ -3859,7 +3855,6 @@ mod tests {
                 },
                 toggles: Toggles::default(),
                 figures,
-                position: "Bot".to_string(),
             },
         )
         .right
@@ -3914,7 +3909,6 @@ mod tests {
                     },
                     toggles: Toggles::default(),
                     figures: no_figures(),
-                    position: "Bot".to_string(),
                 },
             )
             .left
@@ -4010,51 +4004,6 @@ mod tests {
                 "{kind:?} has no bg"
             );
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // The visible-window math (per-item wrapped counts → slice + offset).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn visible_window_at_offset_zero_starts_at_the_first_item() {
-        // Items of 3+4+5 rows, window of 6: items 0 and 1 cover rows 0..7.
-        assert_eq!(visible_window(&[3, 4, 5], 0, 6), (0..2, 0));
-    }
-
-    #[test]
-    fn visible_window_at_the_tail_reaches_the_last_item() {
-        // total 12, height 5 → clamped top 7: row 7 is item 2's first row.
-        assert_eq!(visible_window(&[3, 4, 5], 7, 5), (2..3, 0));
-    }
-
-    #[test]
-    fn visible_window_keeps_an_item_straddling_the_top_boundary() {
-        // top 5 lands inside item 1 (rows 3..7): the slice starts there and
-        // the offset is relative to ITS first row, not the session's.
-        assert_eq!(visible_window(&[3, 4, 5], 5, 4), (1..3, 2));
-    }
-
-    #[test]
-    fn visible_window_inside_a_single_huge_item_selects_just_it() {
-        assert_eq!(visible_window(&[1000], 500, 20), (0..1, 500));
-    }
-
-    #[test]
-    fn visible_window_of_an_empty_transcript_is_empty() {
-        assert_eq!(visible_window(&[], 0, 20), (0..0, 0));
-    }
-
-    #[test]
-    fn visible_window_taller_than_the_content_takes_everything() {
-        assert_eq!(visible_window(&[3, 4, 5], 0, 100), (0..3, 0));
-    }
-
-    #[test]
-    fn visible_window_survives_an_offset_past_the_content() {
-        // The caller clamps `top`; a degenerate overshoot selects nothing
-        // rather than panicking or underflowing.
-        assert_eq!(visible_window(&[3, 4], 50, 10), (2..2, 43));
     }
 
     // -----------------------------------------------------------------------
@@ -4692,72 +4641,9 @@ mod tests {
         row.spans.iter().map(|s| s.content.width()).sum()
     }
 
-    // The Stage 2 review's deferred scroll test: an unpinned viewport stores an
-    // absolute top offset, so flipping Ctrl-O and back - which changes the total
-    // line count while expanded but restores it when collapsed - leaves the
-    // clamped draw-time offset exactly where it was.
-    #[test]
-    fn a_ctrl_o_round_trip_leaves_the_viewport_position_stable() {
-        use crate::ui::viewport::Viewport;
-
-        let mut t = fresh_transcript();
-        // Enough prose above the fold that the COLLAPSED content already
-        // overflows the viewport (the lane is dense now - no per-item blank
-        // separators - so more rows are needed to overflow), then a tall
-        // foldable block so expand/collapse changes the total wrapped-line count.
-        // Overflow-while-collapsed is what makes `scroll_up` truly unpin, which
-        // is the precondition for the stationary-across-expand invariant.
-        for i in 0..16 {
-            t.info(format!("prose line {i}"));
-        }
-        t.push(diff_item(
-            "edit_file big.rs",
-            (0..30)
-                .map(|i| DiffLine::new(DiffSide::Added, format!("line {i}")))
-                .collect(),
-        ));
-
-        let width = 80u16;
-        let height = 10usize;
-
-        let mut cache = RenderCache::new();
-
-        let total_lines = |cache: &mut RenderCache, t: &Transcript, tools: bool| -> usize {
-            cache.sync(
-                t,
-                Toggles {
-                    tools_expanded: tools,
-                    ..Toggles::default()
-                },
-                width,
-                theme::dark(),
-            );
-            cache.settled().map(|(_, wrapped)| wrapped).sum()
-        };
-
-        // Collapsed: scroll up a few lines to an absolute offset (unpins).
-        let collapsed_total = total_lines(&mut cache, &t, false);
-        let mut vp = Viewport::new();
-        vp.scroll_up(5, collapsed_total, height);
-        let collapsed_top = vp.top_offset(collapsed_total, height);
-
-        // Expand: the total grows, but the stored absolute offset is stationary.
-        let expanded_total = total_lines(&mut cache, &t, true);
-        assert!(expanded_total > collapsed_total, "expanding adds body rows");
-        let expanded_top = vp.top_offset(expanded_total, height);
-        assert_eq!(
-            expanded_top, collapsed_top,
-            "an unpinned viewport is stationary across the expand"
-        );
-
-        // Collapse again: the total returns, and so does the drawn offset.
-        let collapsed_again_total = total_lines(&mut cache, &t, false);
-        let collapsed_again_top = vp.top_offset(collapsed_again_total, height);
-        assert_eq!(
-            collapsed_top, collapsed_again_top,
-            "a Ctrl-O round trip returns the viewport to the same position"
-        );
-    }
+    // (The Ctrl-O viewport-stability test is retired: there is no adapter-side
+    // viewport now - native scrollback owns history, ADR-0046. Ctrl-O's effect
+    // on the cached line counts is still covered by the cache toggle tests.)
 
     #[test]
     fn per_item_wrapped_counts_sum_to_the_whole_paragraph_measure() {
@@ -4847,38 +4733,380 @@ mod tests {
             .add_modifier
     }
 
-    /// Draws one viewport frame with default animation and the dark theme into a
-    /// fresh `width`x`height` terminal. Covers the overwhelmingly common test shape:
-    /// fresh viewport, fresh cache, default anim. Returns the terminal for inspection.
+    /// Draws the inline PENDING transcript body (ADR-0046) for `screen` into a
+    /// fresh `width`x`height` terminal, TOP-aligned so the content-assertion
+    /// tests (which scan rows for known text/gutter glyphs) read a stable layout.
+    /// Uses [`render_pending_body_at`] directly (no status bar / composer) over
+    /// the whole area; the pending body draws the uncommitted settled tail plus
+    /// the live stream. Fresh cache, default anim, dark theme - the
+    /// overwhelmingly common test shape.
+    ///
+    /// Top-aligned: when the content FITS, [`render_pending_body`] bottom-anchors,
+    /// so we draw into a body zone exactly as tall as the content when it fits,
+    /// and the full area when it overflows (top-clipped, newest kept).
     fn draw_viewport(width: u16, height: u16, screen: &Screen) -> Terminal<TestBackend> {
         let mut cache = RenderCache::new();
         draw_frame(width, height, |f| {
-            render_viewport(
+            let area = f.area();
+            // Measure the pending stack once to decide the zone height: a fitting
+            // stack draws in a zone its own height (so it top-aligns), an
+            // overflowing one uses the full area (top-clipped).
+            let total = pending_body_height(screen, &mut cache, area.width, theme::dark());
+            let zone_h = (total as u16).min(area.height).max(1);
+            let zone = Rect {
+                height: zone_h,
+                ..area
+            };
+            // hw = 0: draw the WHOLE settled transcript (committed items live in
+            // scrollback on a real TTY, but a headless content test wants them).
+            render_pending_body_at(
                 f,
-                f.area(),
-                &mut ViewportParams {
+                zone,
+                &mut PendingBodyParams {
                     screen,
-                    viewport: &Viewport::new(),
                     cache: &mut cache,
                     anim: Anim::default(),
                 },
                 theme::dark(),
+                0,
             );
         })
     }
 
-    /// Draws one viewport frame with a caller-supplied [`ViewportParams`], for
-    /// tests that need to inspect the measured geometry or control scroll state.
-    fn draw_viewport_with(
+    /// The pending stack's total wrapped rows for `screen` at `width` (test
+    /// helper): mirrors [`render_pending_body`]'s measurement so `draw_viewport`
+    /// can top-align a fitting stack.
+    fn pending_body_height(
+        screen: &Screen,
+        cache: &mut RenderCache,
         width: u16,
-        height: u16,
-        params: &mut ViewportParams<'_>,
-    ) -> (Terminal<TestBackend>, (usize, usize)) {
-        let mut geometry = (0usize, 0usize);
-        let terminal = draw_frame(width, height, |f| {
-            geometry = render_viewport(f, f.area(), params, theme::dark());
+        theme: &Theme,
+    ) -> usize {
+        let content_width = width.saturating_sub(LANE_GUTTER);
+        cache.sync(
+            screen.transcript(),
+            Toggles {
+                thinking_expanded: screen.thinking_expanded,
+                tools_expanded: screen.tools_expanded,
+            },
+            content_width,
+            theme,
+        );
+        let items = screen.transcript().items();
+        // hw = 0: measure the WHOLE settled transcript (the test helper draws it
+        // all top-aligned). Full-content, no fold (ADR-0046).
+        let lane = lane_gutters(items);
+        let mut total: usize = assemble_pending(cache, &lane, 0).total_lines();
+        // Add the live stream rows the body would append.
+        let thinking = screen.transcript().streaming_thinking();
+        let thinking_lines = live_thinking_lines(&thinking, 0, content_width, theme);
+        if !thinking_lines.is_empty() {
+            total += wrapped_count(thinking_lines, content_width);
+        }
+        if let Some((_, wrapped)) = cache.streaming_tail() {
+            total += wrapped;
+        }
+        total
+    }
+
+    // --- render_committed_slice (ADR-0046, the inline `insert_before` seam) ---
+
+    /// A whole [`Buffer`] as newline-joined rows of symbols.
+    fn commit_buffer_text(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Blits `[hw, hw + count)` of `cache` into `buf` under the dark theme - the
+    /// one place these tests spell the [`CommittedSlice`] bundle, so each case
+    /// reads as the `(hw, count)` window it exercises.
+    fn blit_slice(
+        buf: &mut Buffer,
+        cache: &RenderCache,
+        items: &[TranscriptItem],
+        hw: usize,
+        count: usize,
+    ) {
+        render_committed_slice(
+            buf,
+            &CommittedSlice {
+                cache,
+                items,
+                hw,
+                count,
+                theme: theme::dark(),
+            },
+        );
+    }
+
+    // A committed slice blits each item's cached content one visual row apart,
+    // with the same two-plane gutter the pending region uses: the user `› `
+    // caret on the request row, the dim `│ ` spine on the agent lines that hang
+    // off it. Golden against the exact rows the pending body draws for the same
+    // items (see the seam-identity test above).
+    #[test]
+    fn render_committed_slice_blits_content_and_the_lane_gutter() {
+        // Author a tiny request lane directly on a bare store: an info line,
+        // a User prompt, then one agent answer line.
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.info("opening");
+        t.user("do a thing");
+        t.push(TranscriptItem::Assistant {
+            text: "sure".into(),
         });
-        (terminal, geometry)
+
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let count = items.len();
+
+        // Sync the cache at the SAME content width the slice draws at.
+        let width: u16 = 40;
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), width - LANE_GUTTER, theme::dark());
+
+        let height = commit_slice_height(&cache, 0, count);
+        assert!(height >= 3, "info + user + answer are at least 3 rows");
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        blit_slice(&mut buf, &cache, &items, 0, count);
+
+        let text = commit_buffer_text(&buf);
+        // The content landed, one item per its rows.
+        assert!(text.contains("do a thing"), "user prompt drawn:\n{text}");
+        assert!(text.contains("sure"), "answer drawn:\n{text}");
+        // The caret marks the user request row; the spine marks the agent line.
+        assert!(
+            text.lines().any(|l| l.starts_with("› ")),
+            "user caret in the gutter:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l.starts_with("│ ")),
+            "lane spine in the gutter:\n{text}"
+        );
+    }
+
+    // MEASURE == DRAW (ADR-0029/0046): `commit_slice_height` (what the adapter
+    // sizes the `insert_before` buffer to) must equal the number of NON-BLANK
+    // rows `render_committed_slice` actually writes into an OVERSIZED buffer. If
+    // measure and draw drifted (a width mismatch, a wrap discrepancy), the freeze
+    // would clip content or leave a gap; this pins them together. `Screen::demo`
+    // exercises every item kind (thoughts, machinery, markers, an error,
+    // wrapping assistant text, code) so the agreement holds across them all.
+    #[test]
+    fn commit_slice_height_agrees_with_the_rows_render_committed_slice_writes() {
+        let screen = Screen::demo();
+        let width: u16 = 100;
+        let count = screen.transcript().items().len();
+
+        let mut cache = RenderCache::new();
+        cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            width - LANE_GUTTER,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+
+        let measured = commit_slice_height(&cache, 0, count);
+        assert!(measured > 0, "the demo run has content");
+
+        // Draw into a buffer TALLER than the measurement, then count the rows
+        // that actually got content. A blank row past the content proves nothing
+        // overflowed the measured height; a blank row WITHIN it would mean the
+        // draw under-filled what it measured.
+        let oversized = measured + 5;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, oversized));
+        blit_slice(&mut buf, &cache, &items, 0, count);
+
+        let text = commit_buffer_text(&buf);
+        let non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
+        // The demo has interior blank rows (code fences, spacing), so compare the
+        // LAST non-blank row's index + 1 against the measured height: the draw
+        // occupies exactly `[0, measured)` and writes nothing at/after `measured`.
+        let last_non_blank = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+            .map(|(i, _)| i)
+            .max()
+            .expect("some content drew");
+        assert!(
+            (last_non_blank as u16) < measured,
+            "draw wrote past the measured height ({last_non_blank} >= {measured})"
+        );
+        assert!(
+            non_blank > 0 && non_blank <= measured as usize,
+            "non-blank rows ({non_blank}) fit within the measured height ({measured})"
+        );
+        // No content leaked into the oversized tail rows `[measured, oversized)`.
+        for y in measured..oversized {
+            let row = row_symbols(&buf, y);
+            assert!(
+                row.trim().is_empty(),
+                "row {y} past the measured height must be blank: {row:?}"
+            );
+        }
+    }
+
+    /// One buffer row as its concatenated symbols (test helper for the
+    /// measure==draw agreement check).
+    fn row_symbols(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
+            .collect()
+    }
+
+    // The committed slice honors the high-water offset: committing only the tail
+    // `[hw, hw + count)` draws that tail and nothing before it.
+    #[test]
+    fn render_committed_slice_draws_only_the_requested_range() {
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.info("EARLIER");
+        t.info("LATER");
+
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let width: u16 = 40;
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), width - LANE_GUTTER, theme::dark());
+
+        // Skip EARLIER (hw = 1), commit only LATER (count = 1).
+        let hw = items.len() - 1;
+        let height = commit_slice_height(&cache, hw, 1);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
+        blit_slice(&mut buf, &cache, &items, hw, 1);
+
+        let text = commit_buffer_text(&buf);
+        assert!(text.contains("LATER"), "the requested tail drew:\n{text}");
+        assert!(
+            !text.contains("EARLIER"),
+            "items before the high-water mark are not redrawn:\n{text}"
+        );
+    }
+
+    // THE identity guarantee (ADR-0046): the committed slice for a whole run,
+    // and the pending body's rendering of that SAME prefix, produce the
+    // IDENTICAL rows - gutter and content - so nothing reflows when an item
+    // crosses the commit seam. This is the property `run_fold`'s retirement buys:
+    // both paths read the SAME cache lines (no collapse, no window) and paint the
+    // SAME two-plane gutter. Uses `Screen::demo()` so the run has thoughts,
+    // machinery, markers, an error, closing text and code - every item kind.
+    #[test]
+    fn the_committed_slice_equals_the_pending_body_for_the_same_prefix() {
+        let screen = Screen::demo();
+        let width: u16 = 100;
+        let count = screen.transcript().items().len();
+
+        // (a) The committed slice `[0, count)` blitted into a bare buffer.
+        let mut commit_cache = RenderCache::new();
+        commit_cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            width - LANE_GUTTER,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+        let height = commit_slice_height(&commit_cache, 0, count);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        blit_slice(&mut buf, &commit_cache, &items, 0, count);
+        let committed = commit_buffer_text(&buf);
+
+        // (b) The pending body (hw = 0) drawn TOP-aligned into a zone exactly as
+        // tall as the content, so the two are directly comparable row-for-row.
+        let terminal = draw_viewport(width, height, &screen);
+        let pending: String = (0..height)
+            .map(|y| row_text(&terminal, y).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let committed_trimmed: String = committed
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed_trimmed, pending,
+            "committed and pending must render the same prefix identically (no seam reflow)"
+        );
+    }
+
+    // --- render_pending (ADR-0046): bottom-anchor + top-clip -----------------
+
+    /// Draws one full inline pending frame (transcript body + status +
+    /// composer) for the given screen into a fresh `width`x`height` terminal.
+    fn draw_pending(width: u16, height: u16, screen: &Screen) -> Terminal<TestBackend> {
+        let mut cache = RenderCache::new();
+        let conn = ConnectionFacts {
+            base_url: "http://test".into(),
+            model: "m".into(),
+        };
+        draw_frame(width, height, |f| {
+            render_pending(
+                f,
+                screen,
+                &mut cache,
+                FrameCtx {
+                    conn: conn.view(),
+                    anim: Anim::default(),
+                    theme: theme::dark(),
+                },
+            );
+        })
+    }
+
+    // A short pending stack is anchored to the BOTTOM of its zone: the top rows
+    // of the body zone are blank and the content sits just above the status bar.
+    #[test]
+    fn render_pending_bottom_anchors_a_short_stack() {
+        // A fresh screen: only the greeting Info line is pending.
+        let screen = Screen::new(ScreenOpts::default());
+        let terminal = draw_pending(60, 12, &screen);
+
+        // The greeting wraps to a few rows and anchors to the BOTTOM of the
+        // body zone, so the top rows are blank and the content sits low. Find
+        // the first non-blank body row: it must be past the top of the zone.
+        let first_content = (0..10)
+            .find(|&y| !row_text(&terminal, y).trim().is_empty())
+            .expect("some content drew");
+        assert!(
+            first_content > 0,
+            "the top of the body zone is blank (bottom-anchored); first content at row {first_content}"
+        );
+        // The greeting text is present in the drawn body.
+        assert!(
+            buffer_text(&terminal).contains("suspenders ready"),
+            "the greeting drew in the body"
+        );
+    }
+
+    // An overflowing pending stack is top-clipped: the NEWEST rows survive and
+    // the oldest drop off the top (qwen's overflowDirection:"top"), with the
+    // `… Ctrl-S to show more` marker on the top row.
+    #[test]
+    fn render_pending_top_clips_an_overflowing_stack() {
+        // Many notice lines overflow a short terminal.
+        let screen = Screen::new(ScreenOpts {
+            notices: (1..=40).map(|i| format!("notice-{i:02}")).collect(),
+            ..ScreenOpts::default()
+        });
+        let terminal = draw_pending(40, 10, &screen);
+        let text = buffer_text(&terminal);
+
+        // The newest notice is on screen; the oldest scrolled off the top.
+        assert!(text.contains("notice-40"), "newest kept:\n{text}");
+        assert!(
+            !text.contains("notice-01"),
+            "oldest clipped off the top:\n{text}"
+        );
+        // The overflow marker is on the top row of the body zone (ADR-0046).
+        assert!(
+            text.contains("Ctrl-S to show more"),
+            "the overflow marker draws:\n{text}"
+        );
     }
 
     /// Draws a composer overlay popup on a 40x12 test terminal with the standard
@@ -5088,7 +5316,7 @@ mod tests {
         assert!(!text.contains("model-00"), "the top rows scrolled out");
     }
 
-    // --- render_viewport: geometry, the scrollbar gutter, streaming ---------
+    // --- pending body: layout, the lane gutter, streaming -------------------
 
     fn screen_with_notices(notices: Vec<String>) -> Screen {
         Screen::new(ScreenOpts {
@@ -5131,11 +5359,11 @@ mod tests {
     }
 
     // The non-interactive smoke for the `diff-demo` binary: the seeded
-    // `Screen::demo_diffs()` renders through the real viewport path (the same
-    // `render_viewport` a live frame uses) without panicking, in BOTH fold
-    // states - collapsed (each diff a fold-title one-liner, the app's default)
-    // and expanded (Ctrl-O / the binary's `o` key: the code rows and the elided
-    // tail). The binary only adds the terminal lifecycle on top of this render.
+    // `Screen::demo_diffs()` renders through the real pending-body path (the same
+    // one a live inline frame uses) without panicking, in BOTH diff-fold states -
+    // collapsed (each diff a fold-title one-liner, the app's default) and
+    // expanded (Ctrl-O / the binary's `o` key: the code rows and the diff's own
+    // elided tail). The binary only adds the terminal lifecycle on top of this.
     #[test]
     fn the_diff_demo_screen_renders_its_diffs_without_panicking() {
         // Collapsed (default): the lane opens and each diff shows its fold title.
@@ -5171,11 +5399,14 @@ mod tests {
     }
 
     #[test]
-    fn the_demo_render_matches_the_confirmed_collapsed_run_shape() {
-        // The demo is the living spec (ADR-0040): pin the load-bearing rows of
-        // the confirmed collapsed-run shape so a regression trips here, not only
-        // in a manual dump. Rows are `(gutter, content)` where gutter is the
-        // leftmost LANE_GUTTER columns.
+    fn the_demo_render_matches_the_confirmed_full_content_run_shape() {
+        // The demo is the living spec (ADR-0040/0046): the pending body renders
+        // each item in FULL, identically to the frozen committed slice - NO
+        // run-level thought fold, NO machinery window (qwen's `<Static>` prints
+        // history un-clamped). So every thought shows (each a one-line cached
+        // `✦ thought:` under Ctrl-T's default collapse) and every tool one-liner
+        // shows. Pin the load-bearing rows so a reflow regression trips here, not
+        // only in a manual dump. Rows are `(gutter, content)`.
         let terminal = draw_viewport(100, 70, &Screen::demo());
         let split = |y: u16| -> (String, String) {
             let row = row_text(&terminal, y);
@@ -5184,58 +5415,60 @@ mod tests {
             (g.to_string(), r.trim_end().to_string())
         };
         // The user prompt breaks to the caret at the margin.
-        assert_eq!(split(2), ("› ".into(), "evaluate this project".into()));
+        assert_eq!(split(1), ("› ".into(), "evaluate this project".into()));
         // Assistant text is flush under the spine.
-        assert_eq!(split(3).0, "│ ");
-        assert!(split(3).1.starts_with("I'll evaluate this project"));
-        // The lane's thoughts fold to ONE header - the LAST thought's text -
-        // flush under the spine.
-        assert_eq!(
-            split(5),
-            (
-                "│ ".into(),
-                "✦ thought: Let me check the build health and test coverage.".into()
-            )
+        assert_eq!(split(2).0, "│ ");
+        assert!(split(2).1.starts_with("I'll evaluate this project"));
+        // The FIRST thought now shows (not folded away): a one-line cached
+        // `✦ thought:` under the spine.
+        assert_eq!(split(4).0, "│ ");
+        assert!(
+            split(4)
+                .1
+                .starts_with("✦ thought: The user wants me to evaluate"),
+            "the first thought shows in full-content mode: {:?}",
+            split(4).1
         );
-        // The windowed-out machinery collapses to a `⋯ N earlier actions` count,
-        // indented two columns.
-        assert_eq!(
-            split(6),
-            ("│ ".into(), "  ⋯ 6 earlier actions · ^O expand".into())
+        // Every tool one-liner shows (no `⋯ N earlier actions` elision): the
+        // first list_files action is now a real row, indented two columns.
+        assert_eq!(split(5).0, "│ ");
+        assert!(
+            split(5).1.starts_with("  ⋯ list_files"),
+            "machinery shows in full, not windowed: {:?}",
+            split(5).1
         );
         // A governing marker indents two columns; its wrapped continuation stays
         // indented (task 1: the wrap-indent fix).
-        assert_eq!(split(7).0, "│ ");
-        assert!(split(7).1.starts_with("  » [reading file after file"));
-        assert_eq!(split(8).0, "│ ");
+        assert_eq!(split(13).0, "│ ");
+        assert!(split(13).1.starts_with("  » [reading file after file"));
+        assert_eq!(split(14).0, "│ ");
         assert!(
-            split(8).1.starts_with("  instead;"),
+            split(14).1.starts_with("  instead;"),
             "wrapped marker stays indented: {:?}",
-            split(8).1
+            split(14).1
         );
         // The error tool result breaks out (always shown), indented two columns,
         // with the ⚙ gutter.
-        assert_eq!(split(14).0, "│ ");
-        assert!(split(14).1.starts_with("  ⚙ run_command"));
-        assert!(split(14).1.contains("command denied"));
+        assert_eq!(split(23).0, "│ ");
+        assert!(split(23).1.starts_with("  ⚙ run_command"));
+        assert!(split(23).1.contains("command denied"));
         // Assistant text after the tools is flush again.
-        assert_eq!(split(15).0, "│ ");
-        assert!(split(15).1.starts_with("The project is a well-structured"));
+        assert_eq!(split(24).0, "│ ");
+        assert!(split(24).1.starts_with("The project is a well-structured"));
         // Code breaks out, inset two columns, under the spine.
-        assert_eq!(split(18).0, "│ ");
-        assert!(split(18).1.contains("fn tokenize"));
+        assert_eq!(split(27).0, "│ ");
+        assert!(split(27).1.contains("fn tokenize"));
     }
 
     #[test]
-    fn the_collapsed_lane_spine_is_dense_and_continuous() {
+    fn the_lane_spine_is_dense_and_continuous() {
         // The lane has NO per-item blank separator: every content row of the
-        // run (from the first assistant line through the last) carries the `│`
-        // spine, with no bare gap rows breaking it into segments.
+        // run (from the first assistant line through the last tool line) carries
+        // the `│` spine, with no bare gap rows breaking it into segments. Rows
+        // 2..=23 are the agent's run (assistant, thoughts, machinery, markers,
+        // error) in full-content mode (ADR-0046).
         let terminal = draw_viewport(100, 70, &Screen::demo());
-        // Rows 3..=24 are the agent's run (assistant, folded thought, machinery,
-        // markers, error, closing assistant + code). Every one starts with the
-        // spine - no blank separator rows interleave the machinery.
-        for y in 3..=14u16 {
+        for y in 2..=23u16 {
             let row = row_text(&terminal, y);
             assert!(
                 row.starts_with('│'),
@@ -5244,40 +5477,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_viewport_draws_the_transcript_and_returns_the_measured_geometry() {
-        let screen = screen_with_notices(vec!["a launch notice".to_string()]);
+    /// Draws the inline pending body with a caller-supplied [`Anim`] (for the
+    /// lull-row test) TOP-aligned, like [`draw_viewport`].
+    fn draw_viewport_anim(
+        width: u16,
+        height: u16,
+        screen: &Screen,
+        anim: Anim,
+    ) -> Terminal<TestBackend> {
         let mut cache = RenderCache::new();
-        let viewport = Viewport::new();
-        let (terminal, geometry) = draw_viewport_with(
-            80,
-            20,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
+        draw_frame(width, height, |f| {
+            let area = f.area();
+            let total = pending_body_height(screen, &mut cache, area.width, theme::dark());
+            let zone_h = (total as u16).min(area.height).max(1);
+            let zone = Rect {
+                height: zone_h,
+                ..area
+            };
+            render_pending_body_at(
+                f,
+                zone,
+                &mut PendingBodyParams {
+                    screen,
+                    cache: &mut cache,
+                    anim,
+                },
+                theme::dark(),
+                0,
+            );
+        })
+    }
+
+    #[test]
+    fn the_pending_body_draws_the_transcript() {
+        let screen = screen_with_notices(vec!["a launch notice".to_string()]);
+        let terminal = draw_viewport(80, 20, &screen);
         let text = buffer_text(&terminal);
         assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
         assert!(text.contains("a launch notice"));
-        let (total_lines, height) = geometry;
-        assert_eq!(height, 20, "height is the drawn area's");
-        assert!(total_lines > 0 && total_lines <= height, "content fits");
-        // Fitting content draws no scrollbar, but the gutter column is still
-        // reserved: the rightmost column stays empty.
-        for y in 0..20 {
-            let row = row_text(&terminal, y);
-            assert_eq!(row.chars().last(), Some(' '), "row {y}: {row:?}");
-        }
     }
 
-    // The lull row draws through the full render path: a Running Run with
+    // The lull row draws through the pending render path: a Running Run with
     // nothing streaming, quiet past the settle window, paints the timer into the
     // buffer as a third live entry under the running lane.
     #[test]
-    fn the_viewport_draws_the_lull_row_when_running_and_quiet() {
+    fn the_pending_body_draws_the_lull_row_when_running_and_quiet() {
         let (screen, _) = screen_with_notices(vec!["a launch notice".to_string()])
             .apply_event(Event::run_started("r1"));
         assert!(
@@ -5289,52 +5533,23 @@ mod tests {
             lull_seq: 0,
             ..Default::default()
         };
-        let mut cache = RenderCache::new();
-        let viewport = Viewport::new();
-        let (terminal, _) = draw_viewport_with(
-            80,
-            20,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim,
-            },
-        );
+        let terminal = draw_viewport_anim(80, 20, &screen, anim);
         let text = buffer_text(&terminal);
         assert!(text.contains("5s"), "the lull timer opens at 5s:\n{text}");
     }
 
+    // An overflowing pending body top-clips (ADR-0046): the tail (newest) is on
+    // screen and the top is dropped. There is no scrollbar - native scrollback
+    // owns history.
     #[test]
-    fn an_overflowing_transcript_pins_the_tail_and_draws_the_scrollbar() {
+    fn an_overflowing_pending_body_top_clips_and_keeps_the_tail() {
         let notices: Vec<String> = (0..30).map(|i| format!("notice line {i:02}")).collect();
         let screen = screen_with_notices(notices);
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let (terminal, geometry) = draw_viewport_with(
-            40,
-            8,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
-        let (total_lines, height) = geometry;
-        assert!(total_lines > height, "the content overflows");
+        let terminal = draw_viewport(40, 8, &screen);
         let text = buffer_text(&terminal);
-        // A fresh viewport is pinned: the tail is on screen, the top is not.
+        // The tail is on screen, the top is clipped.
         assert!(text.contains("notice line 29"));
         assert!(!text.contains("notice line 00"));
-        // The reserved gutter now carries scrollbar glyphs.
-        let gutter: Vec<char> = (0..8)
-            .filter_map(|y| row_text(&terminal, y).chars().last())
-            .collect();
-        assert!(
-            gutter.iter().any(|c| *c != ' '),
-            "scrollbar in the gutter: {gutter:?}"
-        );
     }
 
     #[test]
@@ -5372,126 +5587,6 @@ mod tests {
                 GutterKind::Spine,
             ]
         );
-    }
-
-    // ---- run_fold: the rolling-window collapsed run (ADR-0040) -----------
-
-    fn thought(t: &str) -> TranscriptItem {
-        TranscriptItem::Thinking { text: t.into() }
-    }
-    fn tool(name: &str) -> TranscriptItem {
-        TranscriptItem::ToolResult {
-            name: name.into(),
-            summary: "ok".into(),
-            is_error: false,
-            key_arg: None,
-        }
-    }
-    fn tool_err() -> TranscriptItem {
-        TranscriptItem::ToolResult {
-            name: "run".into(),
-            summary: "✗ boom".into(),
-            is_error: true,
-            key_arg: None,
-        }
-    }
-
-    #[test]
-    fn run_fold_headers_the_last_thought_at_the_first_thoughts_slot() {
-        // Collapsed default: the LAST thought's text renders as a header at the
-        // FIRST thought's slot; the intervening thoughts drop.
-        let items = vec![
-            TranscriptItem::User { text: "go".into() },
-            thought("first"),
-            thought("middle"),
-            thought("LAST"),
-        ];
-        let fold = run_fold(&items, false, false, MACHINERY_WINDOW);
-        // index 3 is the last thought; the header lands at index 1 (first slot).
-        assert_eq!(fold[1], FoldAction::Header(3));
-        assert_eq!(fold[2], FoldAction::Drop);
-        assert_eq!(fold[3], FoldAction::Drop);
-    }
-
-    #[test]
-    fn run_fold_windows_machinery_and_elides_the_rest_with_a_count() {
-        // With window=2 and 5 machinery items, the last 2 Keep; the earlier 3
-        // collapse to an `Elided(3)` count at the first windowed-out slot.
-        let mut items = vec![TranscriptItem::User { text: "go".into() }];
-        for i in 0..5 {
-            items.push(tool(&format!("t{i}")));
-        }
-        let fold = run_fold(&items, false, false, 2);
-        assert_eq!(fold[1], FoldAction::Elided(3)); // first windowed-out slot
-        assert_eq!(fold[2], FoldAction::Drop);
-        assert_eq!(fold[3], FoldAction::Drop);
-        assert_eq!(fold[4], FoldAction::Keep); // last two survive the window
-        assert_eq!(fold[5], FoldAction::Keep);
-    }
-
-    #[test]
-    fn run_fold_keeps_errors_assistant_markers_and_diffs() {
-        // Errors, assistant text, markers and Diffs always Keep - they break
-        // out of the fold regardless of the window.
-        let items = vec![
-            TranscriptItem::User { text: "go".into() },
-            tool_err(),
-            TranscriptItem::Assistant {
-                text: "answer".into(),
-            },
-            TranscriptItem::Marker {
-                text: "» nudge".into(),
-                tone: Tone::Aid,
-            },
-            diff_item("diff", vec![]),
-        ];
-        let fold = run_fold(&items, false, false, 0);
-        for (i, action) in fold.iter().enumerate().skip(1) {
-            assert_eq!(*action, FoldAction::Keep, "item {i} must break out");
-        }
-    }
-
-    #[test]
-    fn ctrl_t_disables_the_thought_fold() {
-        let items = vec![
-            TranscriptItem::User { text: "go".into() },
-            thought("first"),
-            thought("last"),
-        ];
-        // thinking_expanded = true: every thought Keeps, no header.
-        let fold = run_fold(&items, true, false, MACHINERY_WINDOW);
-        assert_eq!(fold[1], FoldAction::Keep);
-        assert_eq!(fold[2], FoldAction::Keep);
-    }
-
-    #[test]
-    fn ctrl_o_disables_the_machinery_window() {
-        let mut items = vec![TranscriptItem::User { text: "go".into() }];
-        for i in 0..5 {
-            items.push(tool(&format!("t{i}")));
-        }
-        // tools_expanded = true: every action Keeps, no Elided count.
-        let fold = run_fold(&items, false, true, 2);
-        for (i, action) in fold.iter().enumerate().skip(1) {
-            assert_eq!(*action, FoldAction::Keep, "action {i} must show");
-        }
-    }
-
-    #[test]
-    fn run_fold_folds_each_lane_independently() {
-        // Two User-opened lanes: the second lane's thoughts fold on their own,
-        // not merged with the first lane's.
-        let items = vec![
-            TranscriptItem::User { text: "one".into() },
-            thought("a1"),
-            thought("a2"),
-            TranscriptItem::User { text: "two".into() },
-            thought("b1"),
-            thought("b2"),
-        ];
-        let fold = run_fold(&items, false, false, MACHINERY_WINDOW);
-        assert_eq!(fold[1], FoldAction::Header(2)); // lane one: last is a2 (idx 2)
-        assert_eq!(fold[4], FoldAction::Header(5)); // lane two: last is b2 (idx 5)
     }
 
     // ---- wrap_words / indented_lines: the hanging block indent (task 1) ----
@@ -5614,32 +5709,32 @@ mod tests {
         // RED-1 (ADR-0029): the lane gutter is carved off the left, so content
         // wraps in the narrower `content_area` and is DRAWN two columns in. This
         // pins the reservation with a notice sized to wrap ONLY at the reduced
-        // width - it fits the text area but overflows the content area:
+        // width - it fits the full area but overflows the content area
+        // (ADR-0046: there is no scrollbar column now, so the only reservation
+        // is the lane gutter):
         //
-        //   area.width 40 → text_area 39 (scrollbar col) → content 37 (gutter).
-        //   A 38-char word fits in 39 but must wrap in 37.
+        //   area.width 40 → content 38 (gutter). A 39-char word fits in 40 but
+        //   must wrap in 38.
         //
         // Two facts both DEPEND on the 2-col reservation, so deleting LANE_GUTTER
-        // from the wrap width (measuring/drawing at 39) breaks both: the word
+        // from the wrap width (measuring/drawing at 40) breaks both: the word
         // (1) draws starting at column LANE_GUTTER, not column 0, and (2) wraps
-        // to a second row instead of fitting on one. A single 38-char token has
+        // to a second row instead of fitting on one. A single 39-char token has
         // no break point, so it wraps only because the width shrank.
-        let word = "x".repeat(38);
+        let word = "x".repeat(39);
         let screen = Screen::new(ScreenOpts {
             notices: vec![word.clone()],
             ..ScreenOpts::default()
         });
+        let terminal = draw_viewport(40, 20, &screen);
+        // A local cache synced at the same content width the body drew at, for
+        // the wrapped-count assertion below.
         let mut cache = RenderCache::new();
-        let viewport = Viewport::new();
-        let (terminal, _) = draw_viewport_with(
-            40,
-            20,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
+        cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            40 - LANE_GUTTER,
+            theme::dark(),
         );
 
         // (1) The notice is drawn two columns in: the first row carrying the
@@ -5655,9 +5750,9 @@ mod tests {
             "content draws at the reserved gutter offset, not column 0: {word_row:?}"
         );
 
-        // (2) The 38-char word wrapped to exactly 2 visual content rows, which
-        // happens ONLY at the reduced 37-col width (the lane is dense - no
-        // trailing separator). At the un-reserved 39 cols it would be one row.
+        // (2) The 39-char word wrapped to exactly 2 visual content rows, which
+        // happens ONLY at the reduced 38-col width (the lane is dense - no
+        // trailing separator). At the un-reserved 40 cols it would be one row.
         let word_rows: usize = cache
             .settled()
             .find_map(|(lines, wrapped)| {
@@ -5709,18 +5804,17 @@ mod tests {
     }
 
     #[test]
-    fn the_spine_stays_aligned_with_the_answer_when_scrolled_mid_item() {
-        // M3: at a NONZERO scroll offset, with a multi-row agent answer
-        // straddling the viewport top, every visible answer row must still carry
-        // the `│` spine and every non-answer row must not. This exercises the
-        // `skip(top)` slice of the flat row mapping - the path a `top == 0`
-        // test never reaches. A desync (gutter indexed differently from content)
-        // would land the spine on the wrong rows and trip an assertion below.
+    fn the_spine_stays_aligned_with_the_answer_when_top_clipped() {
+        // M3 (ADR-0046 inline variant): with a multi-row agent answer that
+        // OVERFLOWS the pending body, the top-clip keeps the newest rows and
+        // drops the oldest; every VISIBLE answer row must still carry the `│`
+        // spine in column 0. This exercises the `skip(top)` slice of the flat
+        // row mapping - a desync (gutter indexed differently from content) would
+        // land the spine off the answer rows and trip an assertion below.
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("the question", Ok(()));
         // A tall answer: many SHORT paragraphs (each one visual row at width 40,
-        // so no soft-wrap) each carrying a unique "ANSWER" marker, so every
-        // answer row is identifiable and none is a marker-less continuation.
+        // so no soft-wrap) each carrying a unique "ANSWER" marker.
         let answer = (0..14)
             .map(|i| format!("ANSWER-{i}"))
             .collect::<Vec<_>>()
@@ -5731,37 +5825,8 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        // Measure the geometry once, then scroll up so the top lands mid-answer.
-        let mut viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let (_, (total, height)) = draw_viewport_with(
-            40,
-            10,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
-        assert!(total > height, "the answer overflows the viewport");
-        viewport.scroll_up(4, total, height); // unpin, land 4 rows above the tail
-
-        let (terminal, _) = draw_viewport_with(
-            40,
-            10,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
-        // Every visible answer row must still carry the spine in column 0 at
-        // this nonzero scroll. A desync (the gutter sliced differently from the
-        // content) would land the spine off the answer rows and drop one here.
-        // Answer paragraphs are short single-row lines, so an "ANSWER" row is
-        // never a marker-less soft-wrap continuation.
+        // A short body zone forces the top-clip.
+        let terminal = draw_viewport(40, 10, &screen);
         let mut answer_rows_seen = 0;
         for y in 0..10 {
             let row = row_text(&terminal, y);
@@ -5770,17 +5835,15 @@ mod tests {
                 assert_eq!(
                     row.chars().next(),
                     Some('│'),
-                    "answer row {y} lost its spine at this scroll: {row:?}"
+                    "answer row {y} lost its spine after the top-clip: {row:?}"
                 );
             }
         }
         assert!(answer_rows_seen >= 2, "several answer rows must be visible");
-        // The scroll actually happened (we are not pinned at the tail): the
-        // last answer paragraph is off-screen below.
-        assert!(
-            !buffer_text(&terminal).contains("ANSWER-13"),
-            "the viewport scrolled up off the tail"
-        );
+        // The top-clip kept the NEWEST answer paragraph; the oldest dropped.
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ANSWER-13"), "the tail (newest) is kept");
+        assert!(!text.contains("ANSWER-0"), "the oldest clipped off the top");
     }
 
     /// Vinnie's `evaluate this project` shape (~60 cols): a User prompt, a long
@@ -5997,35 +6060,32 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // gutter_cell_style: the Blank -> None, Caret/Spine -> Some mapping; the
-    // returned style is the concrete one the painter supplies (not a default).
+    // LaneStyles::cell_style: the Blank -> None, Caret/Spine -> Some mapping; the
+    // returned style is the concrete lane style (not a default).
     // -----------------------------------------------------------------------
+
+    fn test_lane_styles() -> LaneStyles {
+        LaneStyles {
+            caret: Style::default().fg(Color::Green),
+            spine: Style::default().fg(Color::Blue),
+        }
+    }
 
     #[test]
     fn gutter_cell_style_blank_returns_none() {
-        let caret = Style::default().fg(Color::Green);
-        let spine = Style::default().fg(Color::Blue);
-        assert_eq!(gutter_cell_style(RowGutter::Blank, caret, spine), None);
+        assert_eq!(test_lane_styles().cell_style(RowGutter::Blank), None);
     }
 
     #[test]
     fn gutter_cell_style_caret_returns_caret_style() {
-        let caret = Style::default().fg(Color::Green);
-        let spine = Style::default().fg(Color::Blue);
-        assert_eq!(
-            gutter_cell_style(RowGutter::Caret, caret, spine),
-            Some(caret)
-        );
+        let styles = test_lane_styles();
+        assert_eq!(styles.cell_style(RowGutter::Caret), Some(styles.caret));
     }
 
     #[test]
     fn gutter_cell_style_spine_returns_spine_style() {
-        let caret = Style::default().fg(Color::Green);
-        let spine = Style::default().fg(Color::Blue);
-        assert_eq!(
-            gutter_cell_style(RowGutter::Spine, caret, spine),
-            Some(spine)
-        );
+        let styles = test_lane_styles();
+        assert_eq!(styles.cell_style(RowGutter::Spine), Some(styles.spine));
     }
 
     // -----------------------------------------------------------------------

@@ -69,7 +69,9 @@ pub(super) async fn run(
     match handled(name) {
         Some(Handled::Model) => model_command::run(screen, ctx, generation).await,
         Some(Handled::Theme) => theme_command::run(screen, ctx, &mut state.themes, generation),
-        None => screen.info(format!("/{name}: no handler")),
+        // The info line's Commit is re-derived by dispatch's trailing freeze
+        // (ADR-0046), so drop it here - this seam returns only the Screen.
+        None => screen.info(format!("/{name}: no handler")).0,
     }
 }
 
@@ -86,7 +88,8 @@ pub(super) async fn choose(
     match handled(command) {
         Some(Handled::Model) => model_command::choose(screen, ctx, value).await,
         Some(Handled::Theme) => theme_command::choose(screen, ctx, &mut state.themes, value),
-        None => screen.info(format!("/{command}: no handler")),
+        // Info line's Commit re-derived by dispatch's trailing freeze (ADR-0046).
+        None => screen.info(format!("/{command}: no handler")).0,
     }
 }
 

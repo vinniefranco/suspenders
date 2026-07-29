@@ -84,11 +84,13 @@ pub enum Key {
     Escape,
     PageUp,
     PageDown,
-    /// Mouse wheel up - scrolls by a few lines where [`Key::PageUp`] scrolls
-    /// by a whole page; otherwise handled identically in every state.
+    /// Mouse wheel up - list-nav ONLY, for the pre-agent Session Picker's own
+    /// alt-screen list (`ui::pick_loop` mints it via `map_mouse`). The main
+    /// inline loop no longer captures the mouse (ADR-0046: native scrollback owns
+    /// history), so it never mints this into the Screen/Composer.
     WheelUp,
-    /// Mouse wheel down - scrolls by a few lines where [`Key::PageDown`]
-    /// scrolls by a whole page; otherwise handled identically in every state.
+    /// Mouse wheel down - list-nav ONLY for the Session Picker, like
+    /// [`Key::WheelUp`]; never minted into the main inline loop (ADR-0046).
     WheelDown,
     ArrowUp,
     ArrowDown,
@@ -161,18 +163,6 @@ pub enum Decision {
     ApproveAlways,
 }
 
-/// How far one scroll Effect moves: the wheel steps by [`ScrollStep::Line`]s,
-/// the page keys by whole viewport [`ScrollStep::Page`]s. The core only names
-/// the granularity - the adapter's `ui::viewport` knows the geometry and runs
-/// it into an actual line count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollStep {
-    /// A few lines (one mouse-wheel tick).
-    Line,
-    /// One viewport page (PageUp/PageDown).
-    Page,
-}
-
 /// An Effect the adapter carries out after a fold (baud's `effect` type).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -182,12 +172,16 @@ pub enum Effect {
     FocusModal,
     /// Move keyboard focus back to the composer.
     FocusComposer,
-    /// Pin the viewport to the bottom (follow the tail).
-    PinBottom,
-    /// Scroll the viewport up by one [`ScrollStep`].
-    ScrollUp(ScrollStep),
-    /// Scroll the viewport down by one [`ScrollStep`].
-    ScrollDown(ScrollStep),
+    /// Freeze `count` leading pending items into native scrollback (ADR-0046,
+    /// the inline `insert_before` seam). Carries only the COUNT - the rendering
+    /// belongs to the adapter/components (ADR-0019): the adapter reads the items
+    /// through [`Screen::transcript`] + its `RenderCache` and blits the slice
+    /// `[committed_high_water(), committed_high_water() + count)` above the
+    /// pending region, then - and ONLY on a successful blit - advances the
+    /// high-water mark by `count` (the freeze is TRANSACTIONAL; the pure fold
+    /// does not move the mark). Emitted only when `count > 0`. Replaces the old
+    /// `PinBottom` effect - pinning is meaningless with native scrollback.
+    Commit { count: usize },
     /// Persist a submitted prompt into the on-disk history file.
     HistoryAppend(String),
     /// A committed Slash Command (ADR-0032): the Composer recognized `/name`
@@ -537,15 +531,19 @@ impl Screen {
         // The Composer gets first refusal on events too (ADR-0034): the
         // overlay-filling deliveries (SelectorReady/SelectorFailed) are its
         // own, stale fills included - this fold never sees them, and a future
-        // overlay fed by a new event needs no new arm here.
+        // overlay fed by a new event needs no new arm here. The Composer's own
+        // effects never touch the Transcript, so no commit is due for them.
         let event = match self.composer.apply_event(event) {
             EventOutcome::Consumed(effects) => return (self, effects),
             EventOutcome::Refused(event) => event,
         };
 
         // The flat family dispatch: each arm names one event family and hands
-        // the whole event to that family's fold below.
-        match event {
+        // the whole event to that family's fold below. Every arm can settle
+        // items into the Transcript, so the whole dispatch is wrapped in the
+        // commit seam (ADR-0046): whatever newly-terminal prefix the fold
+        // produced is frozen into scrollback on the way out.
+        let (screen, effects) = match event {
             event @ (Event::RunStarted(..)
             | Event::MessageStart { .. }
             | Event::MessageUpdate { .. }
@@ -582,7 +580,8 @@ impl Screen {
             // vocabulary - a future variant is a compile error here, not a
             // silent fallthrough.
             Event::SelectorReady { .. } | Event::SelectorFailed { .. } => (self, vec![]),
-        }
+        };
+        screen.with_commit(effects)
     }
 
     // ---- Event families ------------------------------------------------------
@@ -599,7 +598,9 @@ impl Screen {
             Event::RunStarted(_reference) => {
                 self.status = Status::Running;
                 self.transcript.discard_streaming();
-                (self, vec![Effect::PinBottom])
+                // No PinBottom (ADR-0046): native scrollback owns history and
+                // the inline pending region always follows the tail.
+                (self, vec![])
             }
 
             Event::MessageStart { .. } => {
@@ -738,7 +739,9 @@ impl Screen {
         match event {
             Event::SteeringQueued { text } => {
                 self.transcript.steering_queued(&text);
-                (self, vec![Effect::PinBottom])
+                // No PinBottom (ADR-0046): the inline pending region follows the
+                // tail; the queued marker shows at the bottom by construction.
+                (self, vec![])
             }
 
             Event::SteeringDelivered { text } => {
@@ -856,7 +859,7 @@ impl Screen {
             let (t, mut effects) = self.clear_approval();
             let mut out = vec![Effect::Agent(command)];
             out.append(&mut effects);
-            return (t, out);
+            return t.with_commit(out);
         }
 
         // The Composer gets first refusal (ADR-0034): every key the modal did
@@ -873,25 +876,23 @@ impl Screen {
                 if let Some(text) = notice {
                     self.transcript.info(text);
                 }
-                return (self, effects);
+                return self.with_commit(effects);
             }
             KeyOutcome::Refused(key) => key,
         };
 
-        match key {
+        let (screen, effects) = match key {
             // Escape means Cancellation while a Run runs; the Composer has
             // already refused it (no overlay was open to close).
             Key::Escape if self.status == Status::Running => {
                 (self, vec![Effect::Agent(AgentCommand::Cancel)])
             }
 
-            // Both scroll in every non-modal state; the wheel steps by lines,
-            // the page keys by whole pages. The wheel only reaches here when
-            // no overlay is open - an open one consumes it as row navigation.
-            Key::PageUp => (self, vec![Effect::ScrollUp(ScrollStep::Page)]),
-            Key::PageDown => (self, vec![Effect::ScrollDown(ScrollStep::Page)]),
-            Key::WheelUp => (self, vec![Effect::ScrollUp(ScrollStep::Line)]),
-            Key::WheelDown => (self, vec![Effect::ScrollDown(ScrollStep::Line)]),
+            // PageUp/PageDown and the mouse wheel no longer scroll the
+            // transcript (ADR-0046): native scrollback owns history, so these
+            // fall through to the no-op arm below. They remain in [`Key`] for
+            // the pre-agent Session Picker (its own alt-screen list still
+            // navigates by wheel/page).
 
             // Ctrl-T: flip the Thinking expansion; a pure display toggle, no
             // effects. The status bar's thinking segment renders this flag,
@@ -911,13 +912,15 @@ impl Screen {
             }
 
             _ => (self, vec![]),
-        }
+        };
+        screen.with_commit(effects)
     }
 
-    /// Records how the `Submit` effect went: `Ok` appends the user line (with
-    /// the PinBottom that belongs beside it) and hands the Composer its
-    /// success - [`Composer::submitted_ok`] records the prompt into the ring,
-    /// clears the draft, and mints the on-disk `HistoryAppend`. `Err(Busy)`
+    /// Records how the `Submit` effect went: `Ok` appends the user line and
+    /// routes through the commit seam (ADR-0046: the settled User line freezes
+    /// on this exit), and hands the Composer its success -
+    /// [`Composer::submitted_ok`] records the prompt into the ring, clears the
+    /// draft, and mints the on-disk `HistoryAppend`. `Err(Busy)`
     /// means the submit raced a starting Run - retry as Steering. The retry
     /// lives HERE (ADR-0034): it touches only Agent status, and the draft
     /// must survive it (the Composer is not told, so nothing clears).
@@ -930,9 +933,12 @@ impl Screen {
         match result {
             Ok(()) => {
                 self.transcript.user(prompt.clone());
-                let mut effects = vec![Effect::PinBottom];
-                effects.extend(self.composer.submitted_ok(&prompt));
-                (self, effects)
+                // Route through the commit seam (ADR-0046): the settled User line
+                // is terminal, so this public transcript-mutating exit advances
+                // the commit seam uniformly like the two folds do, instead of
+                // waiting for the next event to freeze it.
+                let effects = self.composer.submitted_ok(&prompt);
+                self.with_commit(effects)
             }
             Err(Busy) => {
                 self.status = Status::Running;
@@ -955,7 +961,13 @@ impl Screen {
         match result {
             Ok(()) => {
                 self.composer.steered_ok();
-                (self, vec![])
+                // Route through the commit seam (ADR-0046) for uniformity: this
+                // hook mutates no terminal item itself (the pending steering
+                // marker arrives via `steering_queued` and is non-terminal), but
+                // routing it keeps "every public transcript-mutating fold exit
+                // advances the commit seam" a uniform rule rather than an
+                // exception - it freezes any already-terminal prefix.
+                self.with_commit(vec![])
             }
             Err(Idle) => {
                 self.status = Status::Idle;
@@ -964,10 +976,13 @@ impl Screen {
         }
     }
 
-    /// Appends an info line (Resume drift notes, adapter-side news).
-    pub fn info(mut self, text: impl Into<String>) -> Self {
+    /// Appends an info line (Resume drift notes, adapter-side news). The info
+    /// line is terminal, so this routes through the commit seam (ADR-0046) like
+    /// every other public transcript-mutating exit; the returned effects carry
+    /// the `Commit` the adapter drains.
+    pub fn info(mut self, text: impl Into<String>) -> (Self, Vec<Effect>) {
         self.transcript.info(text);
-        self
+        self.with_commit(vec![])
     }
 
     /// Resets to a truthful state after the Agent crashed and was restarted:
@@ -990,6 +1005,18 @@ impl Screen {
         &self.transcript
     }
 
+    /// Advances the committed high-water mark by `n` (ADR-0046): the adapter
+    /// half of the TRANSACTIONAL commit seam. The pure fold emits `Commit { n }`
+    /// but does NOT move the mark; the adapter (`ui::commit_items`) blits the
+    /// slice into native scrollback and calls THIS only on a successful freeze,
+    /// so a failed blit leaves the items uncommitted (they redraw pending). This
+    /// is the ONE mutable door on the Transcript outside the folds, kept narrow
+    /// on purpose: it moves only the mark (never `items`/`revision`, see
+    /// [`Transcript::mark_committed`]), so the TEA invariant holds.
+    pub fn mark_committed(&mut self, n: usize) {
+        self.transcript.mark_committed(n);
+    }
+
     /// Whether live model output is currently streaming - reasoning under the
     /// `✦ Thinking` tail or assistant answer text. The adapter resets the lull
     /// clock while this holds, and the render gate shows the idle animation only
@@ -1009,6 +1036,32 @@ impl Screen {
     }
 
     // ---- Internals ---------------------------------------------------------
+
+    // The Commit seam at a public fold exit (ADR-0046): appends an
+    // [`Effect::Commit`] carrying the count of newly-committable leading items
+    // (`committable_upto() - committed_high_water()`) when it is positive, so
+    // the adapter can freeze that slice into native scrollback.
+    //
+    // TRANSACTIONAL (ADR-0046): the pure fold does NOT advance the high-water
+    // mark - it only computes and EMITS the count. Advancing the mark is the
+    // adapter's job, done ONLY after `insert_before` succeeds (`ui::commit_items`
+    // calls `mark_committed`). This keeps the freeze atomic: a failed blit
+    // leaves the items uncommitted so they redraw in the pending region rather
+    // than being silently dropped. At most ONE `Commit` is appended per fold (the
+    // trailing position), so the emitted count is unambiguous. Both `apply_event`
+    // and `handle_key` route their final effect vector through here.
+    fn with_commit(self, mut effects: Vec<Effect>) -> (Self, Vec<Effect>) {
+        debug_assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Commit { .. })),
+            "with_commit must be the sole minter of Effect::Commit (at-most-one per fold)"
+        );
+        let hw = self.transcript.committed_high_water();
+        let count = self.transcript.committable_upto().saturating_sub(hw);
+        if count > 0 {
+            effects.push(Effect::Commit { count });
+        }
+        (self, effects)
+    }
 
     fn clear_approval(mut self) -> (Self, Vec<Effect>) {
         match self.pending_approval {
@@ -1096,6 +1149,20 @@ mod tests {
 
     fn fresh_opts(opts: ScreenOpts) -> Screen {
         Screen::new(opts)
+    }
+
+    // Drops a trailing [`Effect::Commit`] (ADR-0046) so a fold's OWN effects
+    // can be asserted without threading the commit-seam count through every
+    // pre-existing effect test. A fresh Screen opens with an uncommitted
+    // greeting, so the first public fold exit legitimately appends a
+    // `Commit { count }`; the seam has its own dedicated tests below, and these
+    // orthogonal assertions strip it. Only ever drops from the END (the seam
+    // appends there) and only a Commit, so a mislaid effect still fails.
+    fn sans_commit(mut effects: Vec<Effect>) -> Vec<Effect> {
+        if matches!(effects.last(), Some(Effect::Commit { .. })) {
+            effects.pop();
+        }
+        effects
     }
 
     // Runs events through the fold, discarding effects.
@@ -1279,7 +1346,7 @@ mod tests {
     // --- streaming (the arms; the materialize rules live with the store) ----
 
     #[test]
-    fn run_started_marks_running_clears_snapshot_and_pins() {
+    fn run_started_marks_running_and_clears_snapshot() {
         let t = fold(
             fresh(),
             vec![
@@ -1296,7 +1363,8 @@ mod tests {
             t.transcript().streaming_text().is_empty()
                 && t.transcript().streaming_thinking().is_empty()
         );
-        assert_eq!(effects, vec![Effect::PinBottom]);
+        // No PinBottom (ADR-0046); the greeting may still commit here.
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
     // --- run_finished -----------------------------------------------------
@@ -1435,7 +1503,7 @@ mod tests {
             command: a.command.clone(),
         });
         assert_eq!(t.pending_approval, Some(a));
-        assert_eq!(effects, vec![Effect::FocusModal]);
+        assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
     }
 
     #[test]
@@ -1445,7 +1513,7 @@ mod tests {
         let (t, effects) = t.handle_key(Key::Char('y'));
         assert_eq!(t.pending_approval, None);
         assert_eq!(
-            effects,
+            sans_commit(effects),
             vec![
                 Effect::Agent(AgentCommand::Approve(a.approval_id, Decision::Approve)),
                 Effect::FocusComposer,
@@ -1460,7 +1528,7 @@ mod tests {
         let (t, effects) = t.handle_key(Key::Char('n'));
         assert_eq!(t.pending_approval, None);
         assert_eq!(
-            effects,
+            sans_commit(effects),
             vec![
                 Effect::Agent(AgentCommand::Approve(a.approval_id, Decision::Deny)),
                 Effect::FocusComposer,
@@ -1475,7 +1543,7 @@ mod tests {
         let (t, effects) = t.handle_key(Key::Char('a'));
         assert_eq!(t.pending_approval, None);
         assert_eq!(
-            effects,
+            sans_commit(effects),
             vec![
                 Effect::Agent(AgentCommand::Approve(
                     a.approval_id,
@@ -1492,7 +1560,7 @@ mod tests {
         let (t, effects) = t.handle_key(Key::Escape);
         assert_eq!(t.pending_approval, None);
         assert_eq!(
-            effects,
+            sans_commit(effects),
             vec![Effect::Agent(AgentCommand::Cancel), Effect::FocusComposer]
         );
     }
@@ -1518,7 +1586,7 @@ mod tests {
             Some(&info("auto-approved (standing): mix test"))
         );
         assert_eq!(t.pending_approval, None);
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
     // A bounded re-draw (ADR-0030) is silent to the Conversation but never to
@@ -1526,7 +1594,7 @@ mod tests {
     #[test]
     fn a_retry_recedes_one_bounded_redraw_info_line() {
         let (t, effects) = fresh().apply_event(Event::retry("unknown tool", 1, 3));
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(
             items(&t),
             vec![info("malformed tool call - re-drawing (1/3)")]
@@ -1538,15 +1606,15 @@ mod tests {
         let a = approval();
         let t = with_pending_approval(fresh(), &a);
 
-        // Stale id: nothing happens.
+        // Stale id: nothing happens (the greeting's Commit is orthogonal).
         let (t, effects) = t.apply_event(Event::approval_resolved("some-other-ref", true));
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(t.pending_approval, Some(a.clone()));
 
         // Matching id: cleared, composer refocused.
         let (t, effects) = t.apply_event(Event::approval_resolved(a.approval_id.clone(), true));
         assert_eq!(t.pending_approval, None);
-        assert_eq!(effects, vec![Effect::FocusComposer]);
+        assert_eq!(sans_commit(effects), vec![Effect::FocusComposer]);
     }
 
     // --- submit / steer outcomes --------------------------------------------
@@ -1557,18 +1625,19 @@ mod tests {
     // the Agent status, and because the draft must survive a retry.
 
     #[test]
-    fn successful_submit_appends_user_clears_records_history_and_pins() {
+    fn successful_submit_appends_user_clears_and_records_history() {
         let t = press(fresh(), typed("fix the bug"));
         let (t, effects) = t.submitted("fix the bug", Ok(()));
         assert_eq!(items(&t), vec![user("fix the bug")]);
         assert_eq!(t.composer().view().draft, "");
+        // The on-disk HistoryAppend, then the commit seam (ADR-0046): submitted
+        // now routes through `with_commit`, so the terminal greeting + the new
+        // User line freeze on THIS exit (count 2), not the next event.
         assert_eq!(
-            effects,
-            vec![
-                Effect::PinBottom,
-                Effect::HistoryAppend("fix the bug".into())
-            ]
+            sans_commit(effects.clone()),
+            vec![Effect::HistoryAppend("fix the bug".into())]
         );
+        assert_eq!(commit_count(&effects), Some(2));
         // Recorded into the ring through the Composer's hook: Up recalls it.
         let (t, _) = t.handle_key(Key::ArrowUp);
         assert_eq!(t.composer().view().draft, "fix the bug");
@@ -1590,16 +1659,21 @@ mod tests {
     // --- steering ------------------------------------------------------------
     //
     // The marker text and the queued→delivered promotion are the store's rule
-    // (`ui::transcript`); this pins the ARM - queued pins the viewport,
-    // delivered is silent, and both land in the store.
+    // (`ui::transcript`); this pins the ARM - queued and delivered are both
+    // silent of scroll effects now (native scrollback follows the tail), and
+    // both land in the store.
 
     #[test]
-    fn steering_events_delegate_and_queued_pins_bottom() {
+    fn steering_events_delegate_and_land_in_the_store() {
         let (t, effects) = fresh().apply_event(Event::steering_queued("check the README"));
-        assert_eq!(effects, vec![Effect::PinBottom]);
+        // The greeting commits on this first fold; the Steering marker itself
+        // is non-terminal, so it stays pending (ADR-0046). No PinBottom.
+        assert_eq!(sans_commit(effects), vec![]);
 
         let (t, effects) = t.apply_event(Event::steering_delivered("check the README"));
-        assert_eq!(effects, vec![]);
+        // Delivery promotes the marker to a terminal User line, which now
+        // commits.
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(items(&t), vec![user("check the README")]);
     }
 
@@ -1612,7 +1686,7 @@ mod tests {
         let t = fresh();
         assert_eq!(t.session_cost, 0.0);
         let (t, effects) = t.apply_event(Event::session_cost(0.007));
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(t.session_cost, 0.007);
         assert_eq!(items(&t), vec![], "never a Transcript item");
 
@@ -1626,7 +1700,7 @@ mod tests {
     fn compaction_progress_recedes_one_marker() {
         let t = fresh();
         let (t, effects) = t.apply_event(Event::compaction_progress("working"));
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(
             items(&t),
             vec![marker(
@@ -1642,7 +1716,10 @@ mod tests {
         let t = press(t, typed("check the README"));
         let (t, effects) = t.steered("check the README", Ok(()));
         assert_eq!(t.composer().view().draft, "");
-        assert_eq!(effects, vec![]);
+        // steered_ok adds no terminal item of its own, but routes through the
+        // commit seam (ADR-0046) for uniformity: it freezes the still-pending
+        // greeting, so the exit carries a Commit. No effect of its own beyond it.
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
     #[test]
@@ -1700,7 +1777,7 @@ mod tests {
             "read_file",
             serde_json::json!({"path": "src/main.rs"}),
         ));
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(
             items(&t),
             vec![TranscriptItem::ToolCall {
@@ -1709,6 +1786,179 @@ mod tests {
                 summary: "src/main.rs".into(),
             }]
         );
+    }
+
+    // --- the Commit seam at the fold exits (ADR-0046) ------------------------
+
+    // Returns the count a trailing Commit carries, or None when the fold
+    // emitted no commit.
+    fn commit_count(effects: &[Effect]) -> Option<usize> {
+        effects.iter().find_map(|e| match e {
+            Effect::Commit { count } => Some(*count),
+            _ => None,
+        })
+    }
+
+    // A fold that leaves a live ToolCall at the pending front commits only the
+    // terminal items BEFORE it - here just the greeting - and never the call.
+    #[test]
+    fn a_pending_tool_call_blocks_the_commit_after_it() {
+        let (_t, effects) = fresh().apply_event(Event::tool_call(
+            "t1",
+            "read_file",
+            serde_json::json!({"path": "src/main.rs"}),
+        ));
+        // Greeting commits (1); the ToolCall stays pending.
+        assert_eq!(commit_count(&effects), Some(1));
+    }
+
+    // Folds one event and returns the count a trailing Commit carried (or
+    // None), ADVANCING the store's high-water mark by that count to mimic the
+    // adapter's post-blit `mark_committed` - the pure fold no longer moves the
+    // mark (ADR-0046, transactional commit), so a test that chains folds must
+    // stand in for the adapter here or every subsequent Commit re-counts the
+    // same leading items.
+    fn fold_and_commit(mut t: Screen, event: Event) -> (Screen, Option<usize>) {
+        let (mut next, effects) = t.apply_event(event);
+        let count = commit_count(&effects);
+        if let Some(n) = count {
+            next.transcript.mark_committed(n);
+        }
+        t = next;
+        (t, count)
+    }
+
+    // Once the result merges the call away, the whole run tail becomes terminal
+    // and the next fold exit commits it.
+    #[test]
+    fn a_tool_result_merge_lets_the_run_commit() {
+        // First fold commits the greeting; the call stays pending.
+        let (t, first) = fold_and_commit(
+            fresh(),
+            Event::tool_call(
+                "t1",
+                "run_command",
+                serde_json::json!({"command": "cargo test"}),
+            ),
+        );
+        assert_eq!(first, Some(1));
+        // The result supersedes the call: the merged ToolResult is terminal, so
+        // it now commits (count 1 - the greeting was already committed).
+        let (_t, second) = fold_and_commit(
+            t,
+            Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
+        );
+        assert_eq!(second, Some(1));
+    }
+
+    // message_end settles the streamed answer into a terminal Assistant item,
+    // which the fold exit commits.
+    #[test]
+    fn message_end_commits_the_settled_answer() {
+        let (t, _) = fold_and_commit(fresh(), Event::run_started("r1"));
+        let (t, _) = fold_and_commit(t, Event::message_start(1));
+        let (t, _) = fold_and_commit(
+            t,
+            Event::message_update(
+                crate::llm::Delta::Text("Done.".into()),
+                vec![text_block("Done.")],
+            ),
+        );
+        // The greeting committed on the first fold; the streaming snapshot is
+        // not an item, so message_end is what settles the terminal answer.
+        let (_t, count) = fold_and_commit(
+            t,
+            Event::message_end(vec![text_block("Done.")], StopReason::EndTurn),
+        );
+        assert_eq!(count, Some(1));
+    }
+
+    // Steering delivery promotes the pending marker to a terminal User line;
+    // the delivering fold exit commits it. The queuing fold does not commit the
+    // marker (it is non-terminal).
+    #[test]
+    fn steering_delivery_commits_the_promoted_user_line() {
+        // Only the greeting commits on queue; the marker stays pending.
+        let (t, queued) = fold_and_commit(fresh(), Event::steering_queued("check the README"));
+        assert_eq!(queued, Some(1));
+        // The promoted User line commits (count 1 - the greeting was already
+        // committed).
+        let (_t, delivered) = fold_and_commit(t, Event::steering_delivered("check the README"));
+        assert_eq!(delivered, Some(1));
+    }
+
+    // TRANSACTIONAL commit (ADR-0046): a fold that EMITS `Commit { count }` must
+    // NOT advance the high-water mark itself - the mark moves only when the
+    // adapter's `insert_before` succeeds (`ui::commit_items` -> `mark_committed`).
+    // So folding the same event twice through the pure core (without the adapter
+    // running in between) re-emits the SAME commit: the mark never budged.
+    #[test]
+    fn the_pure_fold_does_not_advance_the_high_water_mark() {
+        let t = fresh();
+        assert_eq!(t.transcript().committed_high_water(), 0);
+        // The greeting is committable; the fold emits Commit { 1 } but must leave
+        // the mark at 0 (the adapter has not blitted yet).
+        let (t, first) = t.apply_event(Event::run_started("r1"));
+        assert_eq!(commit_count(&first), Some(1));
+        assert_eq!(
+            t.transcript().committed_high_water(),
+            0,
+            "the pure fold must not move the mark - the adapter does, post-blit"
+        );
+        // A second fold, still no adapter: the same greeting is STILL uncommitted,
+        // so it re-emits Commit { 1 } rather than dropping the count to zero.
+        let (t, second) = t.apply_event(Event::message_start(1));
+        assert_eq!(commit_count(&second), Some(1));
+        assert_eq!(t.transcript().committed_high_water(), 0);
+    }
+
+    // A single fold can turn MORE than one leading item terminal at once: here a
+    // pending ToolCall is superseded by its result while a second call had
+    // already settled behind it, so the fold that merges the first result frees a
+    // batch. The emitted count covers all newly-committable leading items.
+    #[test]
+    fn one_fold_can_commit_a_batch_of_newly_terminal_items() {
+        // Greeting + two tool calls in flight; the greeting commits, both calls
+        // stay pending (the first blocks the second).
+        let (t, _) = fold_and_commit(
+            fresh(),
+            Event::tool_call("t1", "read_file", serde_json::json!({"path": "a.rs"})),
+        );
+        let (t, blocked) = fold_and_commit(
+            t,
+            Event::tool_call("t2", "read_file", serde_json::json!({"path": "b.rs"})),
+        );
+        // The leading ToolCall (t1) is non-terminal, so nothing new commits.
+        assert_eq!(blocked, None);
+        // Resolve t2 first (behind the still-pending t1): still blocked by t1.
+        let (t, still_blocked) = fold_and_commit(
+            t,
+            Event::tool_result("t2", "read_file", "ok", false, HashMap::new()),
+        );
+        assert_eq!(still_blocked, None);
+        // Now resolve t1: t1's result AND t2's already-settled result both become
+        // leading terminal items - ONE fold commits the batch of two.
+        let (_t, batch) = fold_and_commit(
+            t,
+            Event::tool_result("t1", "read_file", "ok", false, HashMap::new()),
+        );
+        assert_eq!(batch, Some(2), "one fold committed both freed results");
+    }
+
+    // Negative case: a fold that only ADDS a still-pending leading ToolCall (with
+    // nothing terminal ahead of it) emits no Commit at all.
+    #[test]
+    fn a_fold_that_only_adds_a_pending_tool_call_commits_nothing_new() {
+        // Commit the greeting first (via the adapter stand-in).
+        let (t, greeting) = fold_and_commit(fresh(), Event::run_started("r1"));
+        assert_eq!(greeting, Some(1));
+        // Now the only uncommitted item added is a live ToolCall: nothing new is
+        // terminal, so no Commit is emitted.
+        let (_t, none) = fold_and_commit(
+            t,
+            Event::tool_call("t1", "read_file", serde_json::json!({"path": "a.rs"})),
+        );
+        assert_eq!(none, None);
     }
 
     #[test]
@@ -1761,6 +2011,7 @@ mod tests {
         // Command effect carries the activation generation to echo back.
         let t = press(fresh(), typed("/model"));
         let (t, effects) = t.handle_key(Key::Enter);
+        let effects = sans_commit(effects);
         let generation = match effects.as_slice() {
             [Effect::Command { name, generation }] if name == "model" => *generation,
             other => panic!("expected one Command effect, got {other:?}"),
@@ -1791,21 +2042,30 @@ mod tests {
             "menu opens while running"
         );
         let (t, effects) = t.handle_key(Key::Escape);
-        assert_eq!(effects, vec![], "no Cancel - the Composer consumed Escape");
+        assert_eq!(
+            sans_commit(effects),
+            vec![],
+            "no Cancel - the Composer consumed Escape"
+        );
         assert!(t.composer().view().overlay.is_none());
         assert_eq!(t.status, Status::Running, "the Turn is untouched");
         // With the Composer emptied, Escape is refused and Cancellation fires.
         let (_t, effects) = t.handle_key(Key::Escape);
-        assert_eq!(effects, vec![Effect::Agent(AgentCommand::Cancel)]);
+        assert_eq!(
+            sans_commit(effects),
+            vec![Effect::Agent(AgentCommand::Cancel)]
+        );
     }
 
     // A refused key comes back BY VALUE and still reaches the arms below,
-    // mid-draft included: refusal returns the key, it does not drop it.
+    // mid-draft included: refusal returns the key, it does not drop it. PageUp
+    // no longer scrolls (ADR-0046), so it falls through with no effect - but the
+    // draft stays untouched, proving the key was refused (not consumed as text).
     #[test]
-    fn a_refused_key_reaches_the_scroll_arms_mid_draft() {
+    fn a_refused_key_reaches_the_arms_below_mid_draft() {
         let t = press(fresh(), typed("half a thought"));
         let (t, effects) = t.handle_key(Key::PageUp);
-        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Page)]);
+        assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(
             t.composer().view().draft,
             "half a thought",
@@ -1819,7 +2079,8 @@ mod tests {
     fn a_composer_notice_becomes_an_info_line() {
         let t = press(fresh(), typed("/nope"));
         let (t, effects) = t.handle_key(Key::Enter);
-        assert_eq!(effects, vec![], "no Turn, no command effect");
+        // The unknown-command info line commits on this exit (ADR-0046).
+        assert_eq!(sans_commit(effects), vec![], "no Turn, no command effect");
         assert_eq!(items(&t), vec![info("unknown command: /nope")]);
         assert_eq!(t.composer().view().draft, "", "draft cleared");
     }
@@ -1830,13 +2091,16 @@ mod tests {
     fn escape_while_running_no_modal_cancels() {
         let (t, _) = fresh().apply_event(Event::run_started("r1"));
         let (_t, effects) = t.handle_key(Key::Escape);
-        assert_eq!(effects, vec![Effect::Agent(AgentCommand::Cancel)]);
+        assert_eq!(
+            sans_commit(effects),
+            vec![Effect::Agent(AgentCommand::Cancel)]
+        );
     }
 
     #[test]
     fn escape_while_idle_does_nothing() {
         let (_t, effects) = fresh().handle_key(Key::Escape);
-        assert_eq!(effects, vec![]);
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
     #[test]
@@ -1866,7 +2130,7 @@ mod tests {
         let t = with_pending_approval(t, &approval());
         let (t, effects) = t.apply_event(Event::RunCancelled);
         assert_eq!(t.pending_approval, None);
-        assert_eq!(effects, vec![Effect::FocusComposer]);
+        assert_eq!(sans_commit(effects), vec![Effect::FocusComposer]);
     }
 
     #[test]
@@ -1912,8 +2176,11 @@ mod tests {
     // adapter-authored news append as one info line through the store.
     #[test]
     fn info_appends_one_adapter_authored_line() {
-        let t = fresh().info("resume: 2 turns replayed with drift");
+        let (t, effects) = fresh().info("resume: 2 turns replayed with drift");
         assert_eq!(items(&t), vec![info("resume: 2 turns replayed with drift")]);
+        // The info line routes through the commit seam (ADR-0046): the greeting
+        // and the new info line are both terminal, so the exit emits a Commit.
+        assert_eq!(commit_count(&effects), Some(2));
     }
 
     // --- unknown input -----------------------------------------------------
@@ -1929,36 +2196,28 @@ mod tests {
         assert_eq!(items(&t), vec![]);
 
         let (_t, effects) = t.handle_key(Key::Other);
-        assert_eq!(effects, vec![]);
+        // The greeting was still uncommitted (the selector fill returned via
+        // the Composer without a fold exit), so this no-op key commits it.
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
-    // --- PageUp/PageDown ---------------------------------------------------
+    // --- scroll keys are inert in the Screen (ADR-0046) --------------------
+    //
+    // Native scrollback owns history now: PageUp/PageDown and the mouse wheel no
+    // longer emit a scroll effect from the Screen. They stay in [`Key`] for the
+    // pre-agent Session Picker (its alt-screen list still navigates by them),
+    // but the transcript fold produces nothing for them.
 
     #[test]
-    fn page_keys_map_to_page_scroll_effects() {
-        let (_t, effects) = fresh().handle_key(Key::PageUp);
-        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Page)]);
-        let (_t, effects) = fresh().handle_key(Key::PageDown);
-        assert_eq!(effects, vec![Effect::ScrollDown(ScrollStep::Page)]);
-    }
+    fn page_and_wheel_keys_are_inert_idle_and_running() {
+        for key in [Key::PageUp, Key::PageDown, Key::WheelUp, Key::WheelDown] {
+            let (_t, effects) = fresh().handle_key(key.clone());
+            assert_eq!(sans_commit(effects), vec![], "{key:?} idle is inert");
 
-    // --- mouse wheel (line steps, where the page keys step pages) ------------
-
-    #[test]
-    fn wheel_keys_map_to_line_scroll_effects_while_idle() {
-        let (_t, effects) = fresh().handle_key(Key::WheelUp);
-        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Line)]);
-        let (_t, effects) = fresh().handle_key(Key::WheelDown);
-        assert_eq!(effects, vec![Effect::ScrollDown(ScrollStep::Line)]);
-    }
-
-    #[test]
-    fn wheel_keys_scroll_while_running() {
-        let (t, _) = fresh().apply_event(Event::run_started("r1"));
-        let (t, effects) = t.handle_key(Key::WheelUp);
-        assert_eq!(effects, vec![Effect::ScrollUp(ScrollStep::Line)]);
-        let (_t, effects) = t.handle_key(Key::WheelDown);
-        assert_eq!(effects, vec![Effect::ScrollDown(ScrollStep::Line)]);
+            let (t, _) = fresh().apply_event(Event::run_started("r1"));
+            let (_t, effects) = t.handle_key(key.clone());
+            assert_eq!(sans_commit(effects), vec![], "{key:?} running is inert");
+        }
     }
 
     #[test]
@@ -1979,11 +2238,16 @@ mod tests {
     fn toggle_thinking_flips_on_and_off_with_no_effects() {
         let (t, effects) = fresh().handle_key(Key::ToggleThinking);
         assert!(t.thinking_expanded);
-        assert_eq!(effects, vec![]);
+        // The first fold on a fresh Screen commits the greeting (ADR-0046);
+        // the toggle itself emits nothing.
+        assert_eq!(sans_commit(effects), vec![]);
 
         let (t, effects) = t.handle_key(Key::ToggleThinking);
         assert!(!t.thinking_expanded);
-        assert_eq!(effects, vec![]);
+        // The greeting is STILL uncommitted (the pure fold never advances the
+        // mark - the adapter does, post-blit), so this fold re-emits the same
+        // Commit; the toggle itself still emits nothing.
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
     #[test]
@@ -2006,11 +2270,14 @@ mod tests {
     fn toggle_tools_flips_on_and_off_with_no_effects() {
         let (t, effects) = fresh().handle_key(Key::ToggleTools);
         assert!(t.tools_expanded);
-        assert_eq!(effects, vec![]);
+        // The first fold on a fresh Screen commits the greeting (ADR-0046).
+        assert_eq!(sans_commit(effects), vec![]);
 
         let (t, effects) = t.handle_key(Key::ToggleTools);
         assert!(!t.tools_expanded);
-        assert_eq!(effects, vec![]);
+        // Still uncommitted (the adapter advances the mark, not the fold), so the
+        // greeting's Commit repeats; the toggle emits nothing of its own.
+        assert_eq!(sans_commit(effects), vec![]);
     }
 
     #[test]

@@ -2,15 +2,16 @@
 //!
 //! The submodules split by testability: [`screen`] is the PURE TEA fold root
 //! (The Elm Architecture, ADR-0001), [`transcript`] the display-history store
-//! it delegates to, and [`composer`] the Composer it offers keys and events to
-//! first (ADR-0034), each with its rules and its tests;
-//! [`viewport`] is the pure, tested scroll state (bottom-anchored, clamped,
-//! only user actions re-pin); [`components`] is the ONE semantic→terminal
+//! it delegates to (which now also owns the Commit high-water mark, ADR-0046),
+//! and [`composer`] the Composer it offers keys and events to first (ADR-0034),
+//! each with its rules and its tests; [`components`] is the ONE semantic→terminal
 //! color mapping (ADR-0008); and this file - the `run` adapter - is the
-//! untested-by-design driver that owns the terminal, maps crossterm input to
-//! the core's pure [`screen::Key`], carries out the [`screen::Effect`]s
-//! the core returns, and renders via [`components`]. Only this module and
-//! [`components`] `use ratatui` / `use crossterm` (ADR-0019 invariant).
+//! untested-by-design driver that owns the INLINE terminal (ADR-0046: committed
+//! history scrolls into native scrollback via `insert_before`, the live pending
+//! region redraws each frame), maps crossterm input to the core's pure
+//! [`screen::Key`], carries out the [`screen::Effect`]s the core returns, and
+//! renders via [`components`]. Only this module and [`components`] `use ratatui`
+//! / `use crossterm` (ADR-0019 invariant).
 
 pub mod command;
 pub mod components;
@@ -27,16 +28,31 @@ pub mod slash;
 pub mod theme;
 pub mod theme_command;
 pub mod transcript;
-pub mod viewport;
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEvent,
     KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use futures_util::{Stream, StreamExt};
-use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::{Terminal, TerminalOptions, Viewport as TermViewport};
 use tokio::sync::broadcast::error::RecvError;
+
+/// The desired inline viewport height (rows) the pending region reserves
+/// (ADR-0046): a fixed `Inline(cap)` where `cap = min(PENDING_CAP_DESIRED,
+/// term_height - 1)`. Sized to hold the growing Composer (max ~min(term/3, 8))
+/// plus room for an approval prompt or a short diff. On a real TTY these rows
+/// stay reserved even when the live region is short (Ink does the same); older
+/// pending rows scroll into native scrollback above.
+const PENDING_CAP_DESIRED: u16 = 16;
+
+/// Fallback terminal HEIGHT (rows) when `crossterm::terminal::size` cannot report
+/// one (a detached/pipe context) - a conventional 80x24 terminal's height.
+const FALLBACK_TERM_HEIGHT: u16 = 24;
+
+/// Fallback terminal WIDTH (cols) when the backend cannot report its size while
+/// sizing a committed-slice blit - a conventional 80-column terminal.
+const FALLBACK_TERM_WIDTH: u16 = 80;
 
 use crate::agent::AgentHandle;
 use crate::approvals::Decision as AgentDecision;
@@ -44,11 +60,8 @@ use crate::event::Event;
 use crate::session::log::SessionEntry;
 use crate::session::{Session, default_config_path};
 use picker::{Picker, PickerOutcome};
-use screen::{
-    AgentCommand, Busy, Decision, Effect, Idle, Key, Screen, ScreenOpts, ScrollStep, Status,
-};
+use screen::{AgentCommand, Busy, Decision, Effect, Idle, Key, Screen, ScreenOpts, Status};
 use theme::ActiveTheme;
-use viewport::{Viewport, WHEEL_LINES};
 
 /// How often the status-bar spinner advances while a Run is running (~10 fps).
 /// `pub(crate)` so `components::live_lull_lines` can run the lull's tick count
@@ -56,29 +69,23 @@ use viewport::{Viewport, WHEEL_LINES};
 /// place ticks become real time).
 pub(crate) const TICK_MS: u64 = 100;
 
-/// The last draw's measured viewport geometry: `(total wrapped lines,
-/// viewport height)`. Scroll effects execute BETWEEN draws, and the adapter
-/// cannot know the wrap-aware line total outside one (only the render path
-/// measures the built `Paragraph`), so it feeds the pure [`Viewport`] the
-/// previous frame's numbers. At worst one frame stale - harmless, because the
-/// draw-time [`Viewport::top_offset`] clamp against the fresh measure is
-/// authoritative.
-type Geometry = (usize, usize);
-
 /// Runs the ratatui frontend against a live [`AgentHandle`], returning when the
-/// user quits (Ctrl-C / Ctrl-Q). Enters raw mode + the alternate screen for the
-/// duration, restoring the terminal on the way out (even on error).
+/// user quits (Ctrl-C / Ctrl-Q). Uses the INLINE viewport model (ADR-0046), NOT
+/// the alternate screen: it enters raw mode and builds a fixed-height
+/// `Viewport::Inline(cap)` terminal, so committed history scrolls into the
+/// terminal's NATIVE scrollback (via `insert_before`) above a live pending
+/// region that redraws each frame. Teardown leaves raw mode and drops a trailing
+/// newline (no alt-screen to restore), on both the success and error paths.
 ///
 /// The loop is a `tokio::select!` over crossterm's async [`EventStream`] and the
 /// Agent's broadcast [`Receiver`](tokio::sync::broadcast::Receiver): key presses
 /// fold through the Screen core, agent events fold through it too, and the
-/// returned [`Effect`]s are executed here (Agent calls, scroll/focus, history).
+/// returned [`Effect`]s are executed here (Agent calls, the `Commit` freeze,
+/// focus, history).
 ///
-/// Mouse capture is enabled for the duration so the wheel scrolls the viewport
-/// ([`Key::WheelUp`]/[`Key::WheelDown`]). A deliberate trade: capturing the
-/// mouse disables the terminal's native text selection (shift-click usually
-/// bypasses the capture). Capture is released before the terminal is restored,
-/// on the error path too.
+/// NO mouse capture (ADR-0046): the wheel no longer scrolls the viewport - native
+/// scrollback owns history - so the terminal's own scroll and text selection work
+/// unimpeded.
 ///
 /// `launch_notices` are info lines from before the terminal existed (a
 /// context-file skip at load, the theme fallback); the Screen records them
@@ -91,12 +98,51 @@ pub async fn run(
     launch_notices: Vec<String>,
     themes: ActiveTheme,
 ) -> anyhow::Result<()> {
-    let mut terminal = ratatui::init();
-    // Best-effort: a terminal without mouse support still gets a working TUI.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // The INLINE terminal (ADR-0046): committed history scrolls into native
+    // scrollback above a fixed-height live viewport, NOT the alternate screen.
+    // `ratatui::init()` would enter the alt-screen; instead build the backend
+    // directly with an `Inline(cap)` viewport and enter raw mode explicitly.
+    // `cap = min(PENDING_CAP_DESIRED, term_height - 1)` so the reserved region
+    // never eats the whole terminal.
+    let term_height = crossterm::terminal::size()
+        .map(|(_, h)| h)
+        .unwrap_or(FALLBACK_TERM_HEIGHT);
+    // FLOOR the inline cap at 1 (ADR-0046): on a degenerate 1-row terminal
+    // `term_height - 1` is 0, and `Viewport::Inline(0)` would leave no live
+    // region at all. `Inline(1)` still renders (a single bottom-anchored row -
+    // the composer/status get clipped by the layout's `Min(1)`), so the UI stays
+    // usable rather than blank. `PENDING_CAP_DESIRED` caps the reserved rows on a
+    // normal terminal so the live region never eats the whole screen.
+    let cap = PENDING_CAP_DESIRED
+        .min(term_height.saturating_sub(1))
+        .max(1);
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(std::io::stdout()),
+        TerminalOptions {
+            viewport: TermViewport::Inline(cap),
+        },
+    )?;
+    let _ = crossterm::terminal::enable_raw_mode();
+
+    // Restore the terminal on a PANIC too (ADR-0046): the inline path has no
+    // alt-screen to unwind, but raw mode must still be left or the shell is
+    // wedged (no echo, no line editing). Chain the previous hook so the default
+    // panic message still prints. A best-effort `disable_raw_mode` in the hook is
+    // safe to run even on the normal exit path's double-call below.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        previous_hook(info);
+    }));
+
     let result = run_loop(&mut terminal, agent, session, launch_notices, themes).await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    ratatui::restore();
+
+    // Teardown: leave raw mode and drop a trailing newline so the shell prompt
+    // lands below the last live frame. No alt-screen to restore. (The panic hook
+    // covers the abnormal path; this covers the normal and `?`-propagated ones.)
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = std::panic::take_hook();
+    println!();
     result
 }
 
@@ -189,7 +235,6 @@ pub(crate) struct AdapterCtx<'a> {
 /// parameter per field.
 pub(crate) struct AdapterState {
     pub(crate) themes: ActiveTheme,
-    pub(crate) viewport: Viewport,
     pub(crate) history: Option<String>,
 }
 
@@ -248,10 +293,9 @@ async fn run_loop(
     }));
 
     // The mutable adapter state the Effect handlers thread as one carrier:
-    // the Theme state (ADR-0038), the scroll state, the history path.
+    // the Theme state (ADR-0038) and the history path.
     let mut state = AdapterState {
         themes,
-        viewport: Viewport::new(),
         history: history_store,
     };
 
@@ -273,9 +317,8 @@ async fn run_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut anim = components::Anim::default();
 
-    // Initial paint; `geometry` tracks the last draw's measure for the scroll
-    // effects (see [`Geometry`]).
-    let mut geometry = draw_previewed(
+    // Initial paint of the inline pending region.
+    draw_previewed(
         terminal,
         screen.as_ref().unwrap(),
         &conn,
@@ -303,7 +346,7 @@ async fn run_loop(
                         }
                         anim.quiet_ticks = anim.quiet_ticks.saturating_add(1);
                     }
-                    geometry = draw_previewed(terminal, s, &conn, anim, &mut cache, &state)?;
+                    draw_previewed(terminal, s, &conn, anim, &mut cache, &state)?;
                 } else {
                     // Idle between Runs: keep the lull clock at zero so the
                     // next Run's first quiet stretch is a fresh lull (fresh
@@ -313,12 +356,12 @@ async fn run_loop(
                 continue;
             }
 
-            // Terminal input. Bursts (wheel ticks, paste, held keys) are
-            // coalesced: after handling one event, any IMMEDIATELY-available
-            // events drain through the exact same path - quit checks, key
-            // mapping, effects - and the batch pays for ONE draw, not one per
-            // event. `dirty` mirrors the old per-event behavior: only
-            // Release-kind keys skipped the repaint.
+            // Terminal input. Bursts (paste, held keys) are coalesced: after
+            // handling one event, any IMMEDIATELY-available events drain through
+            // the exact same path - quit checks, key mapping, effects (Commit
+            // included) - and the batch pays for ONE draw, not one per event.
+            // `dirty` mirrors the old per-event behavior: only Release-kind keys
+            // skipped the repaint.
             maybe_input = input.next() => {
                 let mut pending = maybe_input;
                 let mut dirty = false;
@@ -335,20 +378,17 @@ async fn run_loop(
                                 // tested place.
                                 let core = screen.take().unwrap();
                                 let (core, effects) = core.handle_key(map_key(&key_event));
-                                screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
+                                screen = Some(
+                                    dispatch(
+                                        terminal,
+                                        core,
+                                        effects,
+                                        &mut Adapter { ctx: &ctx, state: &mut state, cache: &mut cache },
+                                    )
+                                    .await?,
+                                );
                                 dirty = true;
                             }
-                        }
-                        // Wheel scroll folds through the pure core like
-                        // PageUp/PageDown (line steps rather than page steps);
-                        // other mouse kinds are ignored.
-                        Some(Ok(CtEvent::Mouse(mouse))) => {
-                            if let Some(key) = map_mouse(&mouse) {
-                                let core = screen.take().unwrap();
-                                let (core, effects) = core.handle_key(key);
-                                screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
-                            }
-                            dirty = true;
                         }
                         Some(Ok(_)) => dirty = true, // resize/etc.
                         Some(Err(_)) => dirty = true, // read error; keep going
@@ -379,7 +419,15 @@ async fn run_loop(
                     Ok(event) => {
                         let core = screen.take().unwrap();
                         let (core, effects) = core.apply_event(event);
-                        screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
+                        screen = Some(
+                                    dispatch(
+                                        terminal,
+                                        core,
+                                        effects,
+                                        &mut Adapter { ctx: &ctx, state: &mut state, cache: &mut cache },
+                                    )
+                                    .await?,
+                                );
                     }
                     // The broadcast lagged; resync by continuing (the next
                     // events carry the accumulated snapshot).
@@ -389,13 +437,31 @@ async fn run_loop(
                     Err(RecvError::Closed) => {
                         let core = screen.take().unwrap();
                         let (core, effects) = core.agent_down();
-                        screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
-                        let geometry = draw_previewed(terminal, screen.as_ref().unwrap(), &conn, anim, &mut cache, &state)?;
+                        screen = Some(
+                                    dispatch(
+                                        terminal,
+                                        core,
+                                        effects,
+                                        &mut Adapter { ctx: &ctx, state: &mut state, cache: &mut cache },
+                                    )
+                                    .await?,
+                                );
+                        draw_previewed(terminal, screen.as_ref().unwrap(), &conn, anim, &mut cache, &state)?;
                         // Nothing more will arrive; wait only on input now. The
                         // frozen frames draw in the ACTIVE Theme - any open
                         // /theme preview ends with the Agent.
                         let active = state.themes.active().clone();
-                        return drain_input(terminal, input, screen.take().unwrap(), state.viewport, geometry, conn, cache, active).await;
+                        return drain_input(
+                            terminal,
+                            input,
+                            FrozenFrame {
+                                screen: screen.take().unwrap(),
+                                cache,
+                                conn,
+                                theme: active,
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -408,7 +474,15 @@ async fn run_loop(
             Some(event) = selector_rx.recv() => {
                 let core = screen.take().unwrap();
                 let (core, effects) = core.apply_event(event);
-                screen = Some(run_effects(core, effects, &ctx, &mut state, geometry).await);
+                screen = Some(
+                                    dispatch(
+                                        terminal,
+                                        core,
+                                        effects,
+                                        &mut Adapter { ctx: &ctx, state: &mut state, cache: &mut cache },
+                                    )
+                                    .await?,
+                                );
                 // The fetch result never changes the model, but a pick could
                 // have raced in; refresh to stay truthful (still off the tick).
                 conn.model = agent.active_model().await;
@@ -416,7 +490,7 @@ async fn run_loop(
             }
         }
 
-        geometry = draw_previewed(
+        draw_previewed(
             terminal,
             screen.as_ref().unwrap(),
             &conn,
@@ -427,65 +501,183 @@ async fn run_loop(
     }
 }
 
-/// After the Agent is gone we keep the TUI responsive to quit/scroll only. The
-/// Active Model can no longer change (no Agent to swap it), so the connection
-/// facts are frozen - carried as one owned [`components::ConnectionFacts`].
-#[allow(clippy::too_many_arguments)] // the run loop's frozen state, handed over whole
+/// The loop-level effect dispatcher for the inline model (ADR-0046): freezes any
+/// [`Effect::Commit`] slice into native scrollback via `insert_before` (the ONE
+/// place with the terminal + cache + theme to draw the committed items), then
+/// runs the remaining effects through [`run_effects`]. Commit effects originate
+/// only at the two public fold exits (`apply_event`/`handle_key`), never from
+/// the submit/steer recursion inside `run_effects`, so handling them here - once
+/// per fold, before the rest - is complete.
+/// The adapter environment [`dispatch`] runs an effect fold in: the immutable
+/// [`AdapterCtx`] plumbing, the mutable [`AdapterState`], and the render `cache`
+/// the commit seam blits through. These three always travel together through the
+/// loop's effect dispatch, so they ride as ONE borrow-scoped carrier instead of
+/// three positional params (SRP_PARAMS fix) - constructed per call so it does not
+/// hold the loop's `state`/`cache` borrowed across the wider `select!`.
+struct Adapter<'a> {
+    ctx: &'a AdapterCtx<'a>,
+    state: &'a mut AdapterState,
+    cache: &'a mut components::RenderCache,
+}
+
+async fn dispatch<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut core: Screen,
+    effects: Vec<Effect>,
+    adapter: &mut Adapter<'_>,
+) -> anyhow::Result<Screen> {
+    let Adapter { ctx, state, cache } = adapter;
+    let ctx: &AdapterCtx = ctx;
+    let state: &mut AdapterState = state;
+    let cache: &mut components::RenderCache = cache;
+    // Freeze committed slices first, while `core` (and its cache) still describe
+    // the state the commit was computed against. Committed items are terminal
+    // and immutable, so freezing before running the other effects is safe. The
+    // theme is the ACTIVE one - frozen scrollback must never bake a live
+    // /theme preview. The commit is TRANSACTIONAL (ADR-0046): `commit_items`
+    // advances the pure core's high-water mark ONLY after `insert_before`
+    // succeeds, and a blit error propagates as FATAL (`?`) so the run loop can
+    // tear the terminal down rather than leave the seam half-applied.
+    let active = state.themes.active().clone();
+    let mut rest = Vec::with_capacity(effects.len());
+    for effect in effects {
+        match effect {
+            Effect::Commit { count } => commit_items(terminal, &mut core, cache, count, &active)?,
+            other => rest.push(other),
+        }
+    }
+    let mut core = run_effects(core, rest, ctx, state).await;
+
+    // A TRAILING freeze (ADR-0046): the submit/steer/command effects run through
+    // the pure core's outcome hooks (`submitted`/`steered`/`info`), which route
+    // through `with_commit` and so can make a new leading prefix terminal (the
+    // just-appended User or info line). Those hooks run inside `run_effects`,
+    // which has no terminal, so their `Commit` is dropped there and re-derived
+    // HERE - keeping ALL freezing in `dispatch` (the one place with the terminal)
+    // and the "every public transcript-mutating exit advances the seam" rule
+    // uniform. `committable_upto - committed_high_water` is the exact same
+    // computation `with_commit` runs, so this freezes precisely the prefix those
+    // hooks marked committable and nothing more.
+    let trailing = core
+        .transcript()
+        .committable_upto()
+        .saturating_sub(core.transcript().committed_high_water());
+    if trailing > 0 {
+        commit_items(terminal, &mut core, cache, trailing, &active)?;
+    }
+    Ok(core)
+}
+
+/// Freezes the just-committed slice `[hw, hw + count)` into native scrollback
+/// (ADR-0046): sizes a temp [`Buffer`](ratatui::buffer::Buffer) to the slice's
+/// wrapped height and hands it to `terminal.insert_before`, which scrolls it
+/// into the region above the inline viewport (overflow past the top goes to the
+/// terminal's own scrollback). The cache is synced at the same full content
+/// width the pending region measures at, so the committed wrap matches the
+/// pending wrap exactly (ADR-0029). A no-op on a non-inline viewport (e.g. a
+/// `TestBackend` without `Inline`), so headless tests stay valid.
+///
+/// TRANSACTIONAL (ADR-0046): the pure fold left the high-water mark UNMOVED - it
+/// only emitted the count. This adapter is the sole mover: it advances the mark
+/// via [`Screen::mark_committed`] ONLY after `insert_before` returns `Ok`. A
+/// blit error is FATAL and propagates (`?`): the slice stays uncommitted, so it
+/// redraws in the pending region rather than vanishing, and the caller tears the
+/// terminal down. The `height == 0` case (a fully-blank slice) still advances the
+/// mark - zero rows commit, nothing is lost.
+fn commit_items<B: Backend>(
+    terminal: &mut Terminal<B>,
+    screen: &mut Screen,
+    cache: &mut components::RenderCache,
+    count: usize,
+    theme: &theme::Theme,
+) -> anyhow::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    // Capture the mark ONCE: the slice to freeze is `[hw, hw + count)` (the pure
+    // fold did not advance it).
+    let hw = screen.transcript().committed_high_water();
+
+    // Sync the cache at the content width the commit draws at (full frame width
+    // minus the lane gutter, no scrollbar) so measure == draw. `insert_before`
+    // renders into a full-terminal-width buffer, so the content width is the
+    // terminal width minus the gutter.
+    let width = terminal
+        .size()
+        .map(|s| s.width)
+        .unwrap_or(FALLBACK_TERM_WIDTH);
+    let content_width = width.saturating_sub(components::LANE_GUTTER);
+    components::sync_commit_cache(cache, screen, content_width, theme);
+
+    let height = components::commit_slice_height(cache, hw, count);
+    if height > 0 {
+        let items = screen.transcript().items().to_vec();
+        // FATAL on error (`?`): a failed blit must not leave the mark advanced,
+        // so we advance it only on the `Ok` path below.
+        terminal.insert_before(height, |buf| {
+            components::render_committed_slice(
+                buf,
+                &components::CommittedSlice {
+                    cache,
+                    items: &items,
+                    hw,
+                    count,
+                    theme,
+                },
+            );
+        })?;
+    }
+    // Only now - after a successful blit (or a zero-height no-op) - advance the
+    // pure core's high-water mark so a later fold never re-freezes this slice.
+    screen.mark_committed(count);
+    Ok(())
+}
+
+/// The static render state a post-Agent [`drain_input`] repaints from: the frozen
+/// [`Screen`], its render `cache`, and the connection facts + theme that build the
+/// still [`FrameCtx`]. After the Agent is gone none of these changes, so they ride
+/// as ONE owned carrier instead of four positional params (SRP_PARAMS fix).
+struct FrozenFrame {
+    screen: Screen,
+    cache: components::RenderCache,
+    conn: components::ConnectionFacts,
+    theme: theme::Theme,
+}
+
+/// After the Agent is gone we keep the TUI responsive to quit only (native
+/// scrollback owns history now, so there is nothing left to scroll). The Active
+/// Model can no longer change (no Agent to swap it), so the connection facts are
+/// frozen - carried in [`FrozenFrame`]. Repaints the pending region on
+/// resize/read-error so the frozen frame stays coherent.
 async fn drain_input<B, S>(
     terminal: &mut Terminal<B>,
     mut input: S,
-    screen: Screen,
-    mut viewport: Viewport,
-    mut geometry: Geometry,
-    conn: components::ConnectionFacts,
-    mut cache: components::RenderCache,
-    theme: theme::Theme,
+    frame: FrozenFrame,
 ) -> anyhow::Result<()>
 where
     B: Backend,
     S: Stream<Item = std::io::Result<CtEvent>> + Unpin,
 {
+    let FrozenFrame {
+        screen,
+        mut cache,
+        conn,
+        theme,
+    } = frame;
+    // The frozen frame context, built ONCE: after the Agent is gone the conn and
+    // theme never change and the Anim is still, so every repaint below shares it.
+    let ctx = components::FrameCtx {
+        conn: conn.view(),
+        anim: components::Anim::default(),
+        theme: &theme,
+    };
     loop {
-        let (total_lines, height) = geometry;
+        // Every non-quit event is inert after the Agent is gone; a key, a resize,
+        // or a read-error all just repaint so the frozen frame stays coherent.
         match input.next().await {
-            Some(Ok(CtEvent::Key(key_event))) => {
-                if is_quit(&key_event) {
-                    return Ok(());
-                }
-                match map_key(&key_event) {
-                    Key::PageUp => viewport.page_up(total_lines, height),
-                    Key::PageDown => viewport.page_down(total_lines, height),
-                    _ => {}
-                }
-                geometry = draw(
-                    terminal,
-                    &screen,
-                    &viewport,
-                    &conn,
-                    components::Anim::default(),
-                    &mut cache,
-                    &theme,
-                )?;
-            }
-            // The wheel still scrolls after the Agent is gone; other mouse
-            // kinds are ignored.
-            Some(Ok(CtEvent::Mouse(mouse))) => {
-                match map_mouse(&mouse) {
-                    Some(Key::WheelUp) => viewport.scroll_up(WHEEL_LINES, total_lines, height),
-                    Some(Key::WheelDown) => viewport.scroll_down(WHEEL_LINES, total_lines, height),
-                    _ => continue,
-                }
-                geometry = draw(
-                    terminal,
-                    &screen,
-                    &viewport,
-                    &conn,
-                    components::Anim::default(),
-                    &mut cache,
-                    &theme,
-                )?;
-            }
-            Some(_) => {}
+            Some(Ok(CtEvent::Key(key_event))) if is_quit(&key_event) => return Ok(()),
+            Some(Ok(_)) => draw(terminal, &screen, &mut cache, ctx)?,
+            Some(Err(_)) => {}
             None => return Ok(()),
         }
     }
@@ -576,41 +768,45 @@ fn map_mouse(mouse: &MouseEvent) -> Option<Key> {
     }
 }
 
-/// Carries out the Effects the pure core returned, threading the Screen
-/// through the Agent retries (submit↔steer) the core asks for. `state` is
-/// the ONE mutable adapter-state carrier ([`AdapterState`], the mutable twin
-/// of [`AdapterCtx`]): the Theme state a `/theme` pick swaps, the viewport
-/// the scroll effects move, the history path the appends write through.
+/// Carries out the Effects the pure core returned (minus [`Effect::Commit`],
+/// which the loop's [`dispatch`] freezes into scrollback first), threading the
+/// Screen through the Agent retries (submit↔steer) the core asks for. `state`
+/// is the ONE mutable adapter-state carrier ([`AdapterState`], the mutable twin
+/// of [`AdapterCtx`]): the Theme state a `/theme` pick swaps and the history
+/// path the appends write through.
 async fn run_effects(
     mut screen: Screen,
     effects: Vec<Effect>,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
-    geometry: Geometry,
 ) -> Screen {
     for effect in effects {
-        screen = run_effect(screen, effect, ctx, state, geometry).await;
+        screen = run_effect(screen, effect, ctx, state).await;
     }
     screen
 }
 
 // The effect interpreter's dispatch seam: one arm per [`Effect`] family, each
 // routing to a cohesive handler so this function only integrates and never
-// operates. The families are the separable concerns - agent commands, viewport
-// motion, history persistence, and the slash-command seam - each of which owns
-// its own logic in the handler below.
+// operates. The families are the separable concerns - agent commands, history
+// persistence, and the slash-command seam - each of which owns its own logic in
+// the handler below. [`Effect::Commit`] is handled a level up in [`dispatch`]
+// (it needs the terminal), so it never reaches here.
 async fn run_effect(
     screen: Screen,
     effect: Effect,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
-    geometry: Geometry,
 ) -> Screen {
     match effect {
-        Effect::Agent(command) => run_agent_command(command, screen, ctx, state, geometry).await,
-        Effect::PinBottom | Effect::ScrollUp(_) | Effect::ScrollDown(_) => {
-            apply_viewport(&effect, screen, state, geometry)
-        }
+        Effect::Agent(command) => run_agent_command(command, screen, ctx, state).await,
+        // The terminal-owning `dispatch` freezes commits: the pre-effect ones up
+        // front, and a TRAILING one after `run_effects` for any prefix the
+        // submit/steer/info outcome hooks marked committable. A `Commit` that
+        // surfaces INSIDE this recursion (from those hooks) is a no-op here - it
+        // is re-derived and frozen by that trailing pass - so the mark never
+        // advances mid-recursion and the freeze stays atomic (ADR-0046).
+        Effect::Commit { .. } => screen,
         // Focus effects are a no-op in the ratatui adapter: there is no separate
         // focusable widget tree; the modal captures keys via the pure core's
         // pending_approval, and the composer is always the input target.
@@ -641,7 +837,6 @@ async fn run_agent_command(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
-    geometry: Geometry,
 ) -> Screen {
     let agent = ctx.agent;
     match command {
@@ -650,12 +845,12 @@ async fn run_agent_command(
             // retries as steer) and may emit MORE effects.
             let outcome = agent.submit(prompt.clone()).await.map_err(|_| Busy);
             let (core, effects) = screen.submitted(prompt, outcome);
-            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
+            Box::pin(run_effects(core, effects, ctx, state)).await
         }
         AgentCommand::Steer(text) => {
             let outcome = agent.steer(text.clone()).await.map_err(|_| Idle);
             let (core, effects) = screen.steered(text, outcome);
-            Box::pin(run_effects(core, effects, ctx, state, geometry)).await
+            Box::pin(run_effects(core, effects, ctx, state)).await
         }
         AgentCommand::Approve(id, decision) => {
             agent.approve(id, to_agent_decision(decision)).await;
@@ -666,33 +861,6 @@ async fn run_agent_command(
             screen
         }
     }
-}
-
-/// Applies a viewport-motion effect (pin / scroll) and returns the screen
-/// unchanged - the ratatui adapter's viewport lives in [`AdapterState`], not the
-/// pure core. Scroll effects clamp against the LAST draw's measure (see
-/// [`Geometry`]); the draw-time `top_offset` clamp corrects any staleness. Only
-/// the viewport-family variants reach here (guarded by the `run_effect` router).
-fn apply_viewport(
-    effect: &Effect,
-    screen: Screen,
-    state: &mut AdapterState,
-    geometry: Geometry,
-) -> Screen {
-    let (total_lines, height) = geometry;
-    match effect {
-        Effect::PinBottom => state.viewport.pin_bottom(),
-        Effect::ScrollUp(ScrollStep::Line) => {
-            state.viewport.scroll_up(WHEEL_LINES, total_lines, height)
-        }
-        Effect::ScrollUp(ScrollStep::Page) => state.viewport.page_up(total_lines, height),
-        Effect::ScrollDown(ScrollStep::Line) => {
-            state.viewport.scroll_down(WHEEL_LINES, total_lines, height)
-        }
-        Effect::ScrollDown(ScrollStep::Page) => state.viewport.page_down(total_lines, height),
-        _ => {}
-    }
-    screen
 }
 
 /// Persists a submitted prompt to the on-disk history ring and returns the
@@ -802,32 +970,38 @@ fn draw_previewed<B: Backend>(
     anim: components::Anim,
     cache: &mut components::RenderCache,
     state: &AdapterState,
-) -> anyhow::Result<Geometry> {
+) -> anyhow::Result<()> {
     let preview = theme_command::preview_name(screen.composer().selector_highlight());
     let theme = state.themes.render_theme(preview);
-    draw(terminal, screen, &state.viewport, conn, anim, cache, theme)
+    draw(
+        terminal,
+        screen,
+        cache,
+        components::FrameCtx {
+            conn: conn.view(),
+            anim,
+            theme,
+        },
+    )
 }
 
-/// Draws one frame and returns the measured viewport [`Geometry`]: the render
-/// path syncs the [`components::RenderCache`] (settled items build once, per
-/// width), sums the cached wrap-aware total, asks the pure [`Viewport`] for
-/// the clamped offset, and draws only the visible slice + scrollbar - all
-/// inside [`components::render`]; the adapter only stores the measure for the
-/// scroll effects that arrive before the next draw.
+/// Draws one inline PENDING frame (ADR-0046): the render path syncs the
+/// [`components::RenderCache`] (settled items build once, per width) and draws
+/// only the uncommitted tail (the settled items past the store's high-water
+/// mark, plus the live stream), bottom-anchored and top-clipped, with the status
+/// bar and Composer below - all inside [`components::render_pending`]. Committed
+/// history was already frozen into native scrollback by [`commit_items`]. The
+/// per-frame connection/anim/theme travel as one [`components::FrameCtx`].
 fn draw<B: Backend>(
     terminal: &mut Terminal<B>,
     screen: &Screen,
-    viewport: &Viewport,
-    conn: &components::ConnectionFacts,
-    anim: components::Anim,
     cache: &mut components::RenderCache,
-    theme: &theme::Theme,
-) -> anyhow::Result<Geometry> {
-    let mut geometry: Geometry = (0, 0);
+    ctx: components::FrameCtx<'_>,
+) -> anyhow::Result<()> {
     terminal.draw(|frame| {
-        geometry = components::render(frame, screen, conn.view(), anim, viewport, cache, theme);
+        components::render_pending(frame, screen, cache, ctx);
     })?;
-    Ok(geometry)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1239,29 +1413,17 @@ mod tests {
         events: InputEvents,
     ) -> anyhow::Result<()> {
         let screen = drained_screen();
-        let viewport = Viewport::new();
-        let mut cache = components::RenderCache::new();
+        let cache = components::RenderCache::new();
         let conn = facts();
-        // A real first draw, exactly like run_loop's hand-off: the measured
-        // geometry is what the scroll arms clamp against.
-        let geometry = draw(
-            terminal,
-            &screen,
-            &viewport,
-            &conn,
-            components::Anim::default(),
-            &mut cache,
-            theme::dark(),
-        )?;
         drain_input(
             terminal,
             stream::iter(events),
-            screen,
-            viewport,
-            geometry,
-            conn,
-            cache,
-            theme::dark().clone(),
+            FrozenFrame {
+                screen,
+                cache,
+                conn,
+                theme: theme::dark().clone(),
+            },
         )
         .await
     }
@@ -1278,76 +1440,26 @@ mod tests {
         assert!(drain(&mut terminal, vec![]).await.is_ok());
     }
 
+    // After the Agent is gone the pending region still draws its tail (native
+    // scrollback owns history, ADR-0046), and inert keys/resize/read-errors just
+    // repaint until a quit. The transcript no longer scrolls - there is no scroll
+    // state to move.
     #[tokio::test]
-    async fn drain_input_page_up_scrolls_the_tail_out_of_view() {
-        let mut terminal = test_terminal(40, 12);
-        // Pinned bottom shows the newest notice; a PageUp must scroll it out.
-        drain(&mut terminal, vec![press(KeyCode::PageUp), ctrl_press('q')])
-            .await
-            .unwrap();
-        let text = buffer_text(&terminal);
-        assert!(
-            !text.contains("notice-40"),
-            "the tail scrolled out:\n{text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drain_input_page_down_returns_to_the_tail() {
+    async fn drain_input_repaints_the_tail_and_survives_noise_until_quit() {
         let mut terminal = test_terminal(40, 12);
         drain(
             &mut terminal,
             vec![
-                press(KeyCode::PageUp),
-                press(KeyCode::PageDown),
-                ctrl_press('q'),
-            ],
-        )
-        .await
-        .unwrap();
-        assert!(buffer_text(&terminal).contains("notice-40"));
-    }
-
-    #[tokio::test]
-    async fn drain_input_the_wheel_scrolls_up_and_back_down() {
-        let mut up = test_terminal(40, 12);
-        drain(
-            &mut up,
-            vec![mouse_event(MouseEventKind::ScrollUp), ctrl_press('c')],
-        )
-        .await
-        .unwrap();
-        assert!(!buffer_text(&up).contains("notice-40"));
-
-        let mut round_trip = test_terminal(40, 12);
-        drain(
-            &mut round_trip,
-            vec![
-                mouse_event(MouseEventKind::ScrollUp),
-                mouse_event(MouseEventKind::ScrollDown),
-                ctrl_press('c'),
-            ],
-        )
-        .await
-        .unwrap();
-        assert!(buffer_text(&round_trip).contains("notice-40"));
-    }
-
-    #[tokio::test]
-    async fn drain_input_other_keys_and_events_leave_the_tail_alone() {
-        let mut terminal = test_terminal(40, 12);
-        drain(
-            &mut terminal,
-            vec![
-                press(KeyCode::Char('x')),          // not a scroll key: redraw only
-                mouse_event(MouseEventKind::Moved), // non-wheel mouse: ignored
-                Ok(CtEvent::Resize(40, 12)),        // other event kinds: ignored
+                press(KeyCode::Char('x')),          // inert key: redraw only
+                Ok(CtEvent::Resize(40, 12)),        // resize: repaint
                 Err(std::io::Error::other("read")), // read error: keep going
                 ctrl_press('q'),
             ],
         )
         .await
         .unwrap();
+        // The pending region bottom-anchors and top-clips, so the NEWEST notice
+        // is on screen even after the Agent is gone.
         assert!(buffer_text(&terminal).contains("notice-40"));
     }
 
@@ -1405,13 +1517,12 @@ mod tests {
         }
     }
 
-    /// A launch-shaped AdapterState over no themes dir: active = dark, a
-    /// fresh viewport, no history store. Tests that watch a field mutate
-    /// hold one across calls; the rest build one per call.
+    /// A launch-shaped AdapterState over no themes dir: active = dark, no
+    /// history store. Tests that watch a field mutate hold one across calls; the
+    /// rest build one per call.
     fn test_state() -> AdapterState {
         AdapterState {
             themes: ActiveTheme::launch("dark", std::path::PathBuf::from("/nonexistent/themes")).0,
-            viewport: Viewport::new(),
             history: None,
         }
     }
@@ -1457,18 +1568,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_effect_submit_records_the_user_line_pins_bottom_and_appends_history() {
+    async fn run_effect_submit_records_the_user_line_and_appends_history() {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
         let ctx = adapter_ctx(&agent);
         let hist_dir = TempDir::new().unwrap();
         let history = store(&hist_dir);
 
-        // Unpin first, so the threaded PinBottom is observable.
         let mut state = test_state();
         state.history = Some(history.clone());
-        state.viewport.scroll_up(5, 100, 20);
-        assert_eq!(state.viewport.top_offset(100, 20), 75);
 
         let screen = Screen::new(ScreenOpts::default());
         let screen = run_effect(
@@ -1476,15 +1584,13 @@ mod tests {
             Effect::Agent(AgentCommand::Submit("hello agent".into())),
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
 
         // The core recorded the accepted submit as a user line...
         assert!(has_user_line(&screen, "hello agent"));
-        // ...its threaded PinBottom re-pinned the viewport...
-        assert_eq!(state.viewport.top_offset(100, 20), 80);
-        // ...and its threaded HistoryAppend wrote through to the store.
+        // ...and its threaded HistoryAppend wrote through to the store (native
+        // scrollback follows the tail, ADR-0046 - no PinBottom).
         assert_eq!(read_history(&history), vec!["hello agent".to_string()]);
     }
 
@@ -1500,7 +1606,6 @@ mod tests {
             Effect::Agent(AgentCommand::Steer("redirect".into())),
             &ctx,
             &mut test_state(),
-            (100, 20),
         )
         .await;
 
@@ -1529,7 +1634,6 @@ mod tests {
             Effect::Agent(AgentCommand::Submit("second".into())),
             &ctx,
             &mut test_state(),
-            (100, 20),
         )
         .await;
 
@@ -1554,7 +1658,6 @@ mod tests {
                 Effect::Agent(AgentCommand::Approve("id-1".into(), Decision::Approve)),
                 &ctx,
                 &mut test_state(),
-                (100, 20),
             ),
         )
         .await
@@ -1567,79 +1670,15 @@ mod tests {
                 Effect::Agent(AgentCommand::Cancel),
                 &ctx,
                 &mut test_state(),
-                (100, 20),
             ),
         )
         .await
         .expect("cancel returns");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn run_effect_scroll_effects_move_the_viewport_against_the_last_measure() {
-        let dir = TempDir::new().unwrap();
-        let agent = start_agent(&dir, FakeLlm::script(vec![]));
-        let ctx = adapter_ctx(&agent);
-        let geometry = (100, 20); // tail top offset is 80
-        let mut state = test_state();
-
-        let mut screen = Screen::new(ScreenOpts::default());
-        screen = run_effect(
-            screen,
-            Effect::ScrollUp(ScrollStep::Line),
-            &ctx,
-            &mut state,
-            geometry,
-        )
-        .await;
-        assert_eq!(state.viewport.top_offset(100, 20), 80 - WHEEL_LINES);
-
-        screen = run_effect(
-            screen,
-            Effect::ScrollUp(ScrollStep::Page),
-            &ctx,
-            &mut state,
-            geometry,
-        )
-        .await;
-        assert_eq!(state.viewport.top_offset(100, 20), 58); // one page = height - 1
-
-        screen = run_effect(
-            screen,
-            Effect::ScrollDown(ScrollStep::Line),
-            &ctx,
-            &mut state,
-            geometry,
-        )
-        .await;
-        assert_eq!(state.viewport.top_offset(100, 20), 61);
-
-        screen = run_effect(
-            screen,
-            Effect::ScrollDown(ScrollStep::Page),
-            &ctx,
-            &mut state,
-            geometry,
-        )
-        .await;
-        assert_eq!(
-            state.viewport.top_offset(100, 20),
-            80,
-            "a full page down re-pins at the tail"
-        );
-
-        screen = run_effect(
-            screen,
-            Effect::ScrollUp(ScrollStep::Line),
-            &ctx,
-            &mut state,
-            geometry,
-        )
-        .await;
-        let _ = run_effect(screen, Effect::PinBottom, &ctx, &mut state, geometry).await;
-        assert_eq!(state.viewport.top_offset(100, 20), 80, "PinBottom re-pins");
-        // Pinned again: the tail is followed as content grows.
-        assert_eq!(state.viewport.top_offset(200, 20), 180);
-    }
+    // (The old scroll-effect executor test is retired: native scrollback owns
+    // history, so there is no `ScrollUp`/`ScrollDown`/`PinBottom` effect and no
+    // adapter-side viewport to move - ADR-0046.)
 
     #[tokio::test(flavor = "multi_thread")]
     async fn run_effect_focus_effects_are_noops_in_this_adapter() {
@@ -1649,15 +1688,12 @@ mod tests {
         let mut state = test_state();
 
         let screen = Screen::new(ScreenOpts::default());
-        let screen = run_effect(screen, Effect::FocusModal, &ctx, &mut state, (100, 20)).await;
-        let screen = run_effect(screen, Effect::FocusComposer, &ctx, &mut state, (100, 20)).await;
+        let screen = run_effect(screen, Effect::FocusModal, &ctx, &mut state).await;
+        let screen = run_effect(screen, Effect::FocusComposer, &ctx, &mut state).await;
 
+        // Focus effects change nothing in this adapter (no separate focusable
+        // widget tree).
         assert_eq!(screen.status, Status::Idle);
-        assert_eq!(
-            state.viewport.top_offset(100, 20),
-            80,
-            "the viewport never moved"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1676,7 +1712,6 @@ mod tests {
             Effect::HistoryAppend("saved".into()),
             &ctx,
             &mut state,
-            (0, 0),
         )
         .await;
         assert_eq!(read_history(&history), vec!["saved".to_string()]);
@@ -1689,7 +1724,6 @@ mod tests {
             Effect::HistoryAppend("dropped".into()),
             &ctx,
             &mut state,
-            (0, 0),
         )
         .await;
         assert_eq!(read_history(&history), vec!["saved".to_string()]);
@@ -1711,7 +1745,6 @@ mod tests {
             },
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
         assert_eq!(last_info(&screen).as_deref(), Some("/compact: no handler"));
@@ -1724,7 +1757,6 @@ mod tests {
             },
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
         assert_eq!(last_info(&screen).as_deref(), Some("/nope: no handler"));
@@ -1755,7 +1787,6 @@ mod tests {
             },
             &ctx,
             &mut test_state(),
-            (100, 20),
         )
         .await;
 
@@ -1798,7 +1829,6 @@ mod tests {
             },
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
 
@@ -1839,7 +1869,6 @@ mod tests {
             },
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
 
@@ -1890,7 +1919,6 @@ mod tests {
             },
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
         std::fs::write(
@@ -1907,7 +1935,6 @@ mod tests {
             },
             &ctx,
             &mut state,
-            (100, 20),
         )
         .await;
 
@@ -1920,6 +1947,122 @@ mod tests {
         assert!(
             !std::path::Path::new(&config_path).exists(),
             "nothing persisted"
+        );
+    }
+
+    // END-TO-END inline freeze (ADR-0046): driving `dispatch` with a fold that
+    // commits must (a) blit the committed slice into the TestBackend's native
+    // SCROLLBACK via `insert_before`, and (b) leave that item OUT of the pending
+    // region on the next draw. This is the whole point of the seam - the item
+    // moves from the live frame to frozen scrollback - and it is headless-
+    // testable because `Terminal::insert_before` works under `TestBackend`
+    // (via `append_lines`) when the viewport is `Inline`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_commit_freezes_the_slice_into_scrollback_and_drops_it_from_pending() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
+        let ctx = adapter_ctx(&agent);
+        let mut state = test_state();
+        let mut cache = components::RenderCache::new();
+
+        // An INLINE TestBackend, deliberately SHORT (a 3-row terminal with a
+        // 1-row inline viewport) so a multi-row committed slice overflows the top
+        // of the terminal buffer and lands in the backend's `scrollback()`.
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(30, 3),
+            TerminalOptions {
+                viewport: TermViewport::Inline(1),
+            },
+        )
+        .unwrap();
+
+        // A fresh Screen opens with the greeting Info line, which wraps to
+        // several rows at this narrow width - so the committed slice overflows
+        // the 3-row terminal and its top rows reach the backend's scrollback.
+        // run_started makes the whole leading prefix terminal, so the fold emits
+        // Effect::Commit.
+        let core = Screen::new(ScreenOpts::default());
+        let (core, effects) = core.apply_event(Event::run_started("r1"));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Commit { .. })),
+            "the fold emitted a Commit to freeze"
+        );
+
+        let core = dispatch(
+            &mut terminal,
+            core,
+            effects,
+            &mut Adapter {
+                ctx: &ctx,
+                state: &mut state,
+                cache: &mut cache,
+            },
+        )
+        .await
+        .expect("dispatch freezes without error");
+
+        // (a) The committed greeting landed in NATIVE SCROLLBACK (above the inline
+        // viewport), not in the live viewport buffer.
+        let scrollback: String = {
+            let sb = terminal.backend().scrollback();
+            (0..sb.area.height)
+                .map(|y| {
+                    (0..sb.area.width)
+                        .map(|x| sb.cell((x, y)).expect("cell").symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            scrollback.contains("suspenders ready"),
+            "the committed greeting froze into native scrollback:\n{scrollback}"
+        );
+
+        // The adapter advanced the high-water mark ONLY after the successful blit
+        // (transactional commit): the greeting is now committed.
+        assert!(
+            core.transcript().committed_high_water() >= 1,
+            "the mark advanced post-blit"
+        );
+
+        // (b) The committed slice has LEFT the pending region: drawing the live
+        // frame now shows the pending body WITHOUT it (it is committed, drawn from
+        // scrollback on a real TTY). Grow the inline viewport first so the body +
+        // status + composer layout has room to render.
+        terminal.backend_mut().resize(30, 8);
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 30, 6))
+            .unwrap();
+        let conn = components::ConnectionFacts {
+            base_url: "http://test".into(),
+            model: "m".into(),
+        };
+        draw(
+            &mut terminal,
+            &core,
+            &mut cache,
+            components::FrameCtx {
+                conn: conn.view(),
+                anim: components::Anim::default(),
+                theme: theme::dark(),
+            },
+        )
+        .unwrap();
+        let pending: String = {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf.cell((x, y)).expect("cell").symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !pending.contains("suspenders ready"),
+            "the committed greeting is gone from the pending region:\n{pending}"
         );
     }
 }
