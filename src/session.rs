@@ -819,9 +819,7 @@ impl Session {
             malformed_retry_budget: opts
                 .malformed_retry_budget
                 .unwrap_or(config.malformed_retry_budget),
-            skip_next_speaker: opts
-                .skip_next_speaker
-                .unwrap_or(config.skip_next_speaker),
+            skip_next_speaker: opts.skip_next_speaker.unwrap_or(config.skip_next_speaker),
             command_timeout_ms: opts.command_timeout_ms.unwrap_or(config.command_timeout_ms),
             session_dir: opts
                 .session_dir
@@ -1629,10 +1627,7 @@ mod tests {
 
     #[test]
     fn env_tool_call_style_names_the_three_arms_only() {
-        assert_eq!(
-            parse_tool_call_style("auto").unwrap(),
-            ToolCallStyle::Auto
-        );
+        assert_eq!(parse_tool_call_style("auto").unwrap(), ToolCallStyle::Auto);
         assert_eq!(
             parse_tool_call_style(" structured ").unwrap(),
             ToolCallStyle::Structured

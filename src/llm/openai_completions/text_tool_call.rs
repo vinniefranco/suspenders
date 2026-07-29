@@ -251,8 +251,7 @@ mod tests {
 
     #[test]
     fn json_in_tags_variant_is_recovered() {
-        let text =
-            "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"mix.exs\"}}</tool_call>";
+        let text = "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"mix.exs\"}}</tool_call>";
         let parse = extract_tool_calls(text).expect("markup parses");
         assert_eq!(
             parse.calls,
@@ -285,10 +284,7 @@ mod tests {
     fn a_json_looking_parameter_value_keeps_its_parsed_shape() {
         let text = "<tool_call>\n<function=set_flag>\n<parameter=enabled>\ntrue\n</parameter>\n<parameter=count>\n3\n</parameter>\n</function>\n</tool_call>";
         let parse = extract_tool_calls(text).expect("markup parses");
-        assert_eq!(
-            parse.calls[0].input,
-            json!({ "enabled": true, "count": 3 })
-        );
+        assert_eq!(parse.calls[0].input, json!({ "enabled": true, "count": 3 }));
     }
 
     #[test]

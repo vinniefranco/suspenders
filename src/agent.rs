@@ -47,8 +47,8 @@ use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
 use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
 use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
-use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
 use crate::session::Session;
+use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
 use crate::{tools, voice};
 
 mod deps;
@@ -985,7 +985,11 @@ fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
 
 /// What a Resume yields: the folded Conversation messages, the Transcript-facing
 /// [`ResumeInfo`], and the last logged Plan (held outside the Conversation).
-type Resumed = (Vec<crate::content::Message>, Option<ResumeInfo>, Option<String>);
+type Resumed = (
+    Vec<crate::content::Message>,
+    Option<ResumeInfo>,
+    Option<String>,
+);
 
 /// The governance fact a Resume restores alongside the Conversation: the last
 /// logged Plan (held outside the Conversation), computed in the single fold, so

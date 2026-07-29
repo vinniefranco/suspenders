@@ -231,7 +231,10 @@ mod tests {
         assert!(req.no_think);
         assert!(req.system.is_empty());
         assert_eq!(req.messages.len(), 2);
-        assert!(matches!(req.messages[0].role, crate::content::Role::Assistant));
+        assert!(matches!(
+            req.messages[0].role,
+            crate::content::Role::Assistant
+        ));
         assert!(
             matches!(&req.messages[0].content[0], ContentBlock::Text { text } if text == "Next, I will read the file.")
         );
@@ -243,8 +246,10 @@ mod tests {
 
     #[tokio::test]
     async fn side_query_user_verdict_ends() {
-        let mut deps =
-            deps_scripting(vec![text(r#"{"next_speaker": "user"}"#, StopReason::EndTurn)]);
+        let mut deps = deps_scripting(vec![text(
+            r#"{"next_speaker": "user"}"#,
+            StopReason::EndTurn,
+        )]);
         let reply = text("All done. Anything else?", StopReason::EndTurn);
         let verdict = check_next_speaker(&mut deps, &reply).await;
         assert_eq!(verdict, NextSpeaker::User);

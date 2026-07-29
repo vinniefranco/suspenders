@@ -110,8 +110,7 @@ impl Tool for Glob {
 // dep. A glob that produces an invalid regex is bounced back as a tool error.
 fn compile(pattern: &str) -> Result<Regex, String> {
     let regex_src = glob_to_regex(pattern);
-    Regex::new(&regex_src)
-        .map_err(|_| format!("invalid glob pattern: {pattern:?}"))
+    Regex::new(&regex_src).map_err(|_| format!("invalid glob pattern: {pattern:?}"))
 }
 
 // Glob -> regex over the whole relative path (matched with `/` separators):
@@ -439,7 +438,11 @@ mod tests {
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            run(json!({"pattern": "*.rs", "path": "../.."}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "*.rs", "path": "../.."}),
+                &ctx(tmp.path())
+            )
+            .await,
             Err("path escapes project root".into())
         );
         assert_eq!(

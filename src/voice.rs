@@ -828,9 +828,7 @@ mod tests {
         // rule ported from qwen's discipline.
         assert!(prompt.contains("'pending', 'in_progress', or 'completed'"));
         assert!(prompt.contains("exactly one todo 'in_progress' at a time"));
-        assert!(
-            prompt.contains("mark todos as completed as soon as you are done")
-        );
+        assert!(prompt.contains("mark todos as completed as soon as you are done"));
     }
 
     #[test]

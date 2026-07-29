@@ -674,7 +674,9 @@ mod tests {
         // Both channels carry a call: the structured one must win, and the
         // markup stays plain text (never re-parsed into a second ToolUse).
         let r = fold(vec![
-            delta(json!({ "content": "<tool_call>\n<function=list_files>\n</function>\n</tool_call>" })),
+            delta(
+                json!({ "content": "<tool_call>\n<function=list_files>\n</function>\n</tool_call>" }),
+            ),
             tool_fragment(json!({
                 "index": 0, "id": "call_1", "type": "function",
                 "function": { "name": "read_file", "arguments": "{\"path\": \"x\"}" }
@@ -684,9 +686,7 @@ mod tests {
         assert_eq!(
             r.content,
             vec![
-                ContentBlock::text(
-                    "<tool_call>\n<function=list_files>\n</function>\n</tool_call>"
-                ),
+                ContentBlock::text("<tool_call>\n<function=list_files>\n</function>\n</tool_call>"),
                 ContentBlock::tool_use("call_1", "read_file", json!({ "path": "x" })),
             ]
         );

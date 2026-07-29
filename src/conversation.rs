@@ -303,7 +303,11 @@ pub fn merge_user_text(messages: &mut Vec<Message>, text: impl Into<String>) {
 /// `compaction_target` over plain numbers, for callers that hold the Session
 /// facts but no Conversation:
 /// `max(context_budget - max_tokens_reserve - trunc(compaction_slack * context_budget), 0)`.
-pub fn compaction_target(context_budget: u64, max_tokens_reserve: u64, compaction_slack: f64) -> u64 {
+pub fn compaction_target(
+    context_budget: u64,
+    max_tokens_reserve: u64,
+    compaction_slack: f64,
+) -> u64 {
     let target = context_budget.saturating_sub(max_tokens_reserve);
     let slack = (context_budget as f64 * compaction_slack).trunc() as u64;
     target.saturating_sub(slack)
@@ -633,7 +637,10 @@ mod tests {
 
     #[test]
     fn compaction_target_is_live_window_minus_slack() {
-        let conv = Conversation::new("sys", ConversationOpts::new(1000, 200).compaction_slack(0.3));
+        let conv = Conversation::new(
+            "sys",
+            ConversationOpts::new(1000, 200).compaction_slack(0.3),
+        );
         assert_eq!(conv.compaction_target(), 500);
         assert_eq!(compaction_target(1000, 200, 0.3), 500);
     }
@@ -758,7 +765,8 @@ mod tests {
 
     #[test]
     fn prepare_compaction_finds_cutoff_across_runs() {
-        let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0).compaction_slack(0.0));
+        let mut conv =
+            Conversation::new("sys", ConversationOpts::new(200, 0).compaction_slack(0.0));
         for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
             conv.add_user_text(u.repeat(100));
             conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(100))]);
@@ -932,5 +940,4 @@ mod tests {
         let ops = extract_file_ops(&messages);
         assert_eq!(ops.read_files, vec!["foo.ex"]);
     }
-
 }

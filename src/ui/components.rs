@@ -3894,10 +3894,7 @@ mod tests {
             PressureLevel::Elevated,
             PressureLevel::Critical,
         ] {
-            let tokens = tokens_segment(tokens_only(TokenView {
-                estimate: 1,
-                level,
-            }));
+            let tokens = tokens_segment(tokens_only(TokenView { estimate: 1, level }));
             assert_eq!(tokens.kind(), SegmentKind::Tokens(level));
         }
     }

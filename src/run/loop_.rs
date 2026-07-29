@@ -1181,7 +1181,6 @@ mod tests {
         assert_eq!(deps.requests.lock().unwrap().len(), 1);
     }
 
-
     // ---- loop guards ------------------------------------------------------
 
     #[tokio::test]
@@ -1487,10 +1486,7 @@ mod tests {
         );
         let (outcome, deps) = run_with(&session, "list twice", deps).await;
         ok(&outcome);
-        let full: Vec<String> = crate::tools::specs()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let full: Vec<String> = crate::tools::specs().into_iter().map(|s| s.name).collect();
         let requests = deps.requests.lock().unwrap();
         // Three requests, each carrying the identical full registry - no
         // narrowing on any Pass, near the limit or not.
@@ -1577,14 +1573,24 @@ mod tests {
             .position(|m| m.role == Role::Assistant
                 && matches!(&m.content[0], ContentBlock::Text { text } if text == "Next, I will read the config."))
             .expect("the first reply is in the Conversation");
-        assert_eq!(conv.messages[announce].provenance, Some(session.model.provenance()));
+        assert_eq!(
+            conv.messages[announce].provenance,
+            Some(session.model.provenance())
+        );
         let nudge = &conv.messages[announce + 1];
         assert_eq!(nudge.role, Role::User);
-        assert!(matches!(&nudge.content[0], ContentBlock::Text { text } if text == voice::please_continue()));
-        assert_eq!(nudge.provenance, None, "the nudge is Voice-authored, not the model's");
+        assert!(
+            matches!(&nudge.content[0], ContentBlock::Text { text } if text == voice::please_continue())
+        );
+        assert_eq!(
+            nudge.provenance, None,
+            "the nudge is Voice-authored, not the model's"
+        );
 
         let lm = last_message(conv);
-        assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "Done reading it."));
+        assert!(
+            matches!(&lm.content[0], ContentBlock::Text { text } if text == "Done reading it.")
+        );
     }
 
     // A {"next_speaker":"user"} verdict ends the Run exactly as before: the
@@ -1605,10 +1611,9 @@ mod tests {
         assert_eq!(*stop, OutcomeStop::end_turn());
 
         // No "Please continue." was injected.
-        assert!(!conv.messages.iter().any(|m| m
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Text { text } if text == voice::please_continue()))));
+        assert!(!conv.messages.iter().any(|m| m.content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text == voice::please_continue())
+        )));
         let evs = events(&deps);
         assert!(!evs.iter().any(
             |e| matches!(e, Event::SteeringDelivered { text } if text == voice::please_continue())
@@ -1688,7 +1693,11 @@ mod tests {
         let session = session(root.path());
         // stop_reason EndTurn, but a tool_use block is present -> must execute.
         let end_turn_with_tool = Response {
-            content: vec![ContentBlock::tool_use("t1", "list_files", json!({"path": "."}))],
+            content: vec![ContentBlock::tool_use(
+                "t1",
+                "list_files",
+                json!({"path": "."}),
+            )],
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
             error: None,
@@ -1728,7 +1737,10 @@ mod tests {
         ok(&outcome);
         let evs = events(&deps);
         // The Approval gate asked, then the denial became the is_error result.
-        assert!(evs.iter().any(|e| matches!(e, Event::ApprovalRequest { .. })));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::ApprovalRequest { .. }))
+        );
         assert!(
             find_tool_result(&evs, "r1")
                 .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
@@ -2062,6 +2074,4 @@ mod tests {
         ok(&outcome);
         assert!(!*compacted.lock().unwrap());
     }
-
-
 }

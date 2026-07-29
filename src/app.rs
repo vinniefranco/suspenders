@@ -187,8 +187,7 @@ async fn drive(
                     if settled {
                         print_estimate(agent, &mut *out).await;
                         if agent.status().await == crate::agent::Status::Running {
-                            out("   .. agent still running; draining until it settles"
-                                .to_string());
+                            out("   .. agent still running; draining until it settles".to_string());
                             continue;
                         }
                         break;

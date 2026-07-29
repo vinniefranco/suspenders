@@ -179,7 +179,9 @@ pub fn today() -> String {
     use time::format_description::FormatItem;
     use time::macros::format_description;
     const FMT: &[FormatItem<'_>] = format_description!("[year]-[month]-[day]");
-    time::OffsetDateTime::now_utc().format(FMT).unwrap_or_default()
+    time::OffsetDateTime::now_utc()
+        .format(FMT)
+        .unwrap_or_default()
 }
 
 /// Walks `root`'s IMMEDIATE children into tree entries: directories first (each
@@ -244,10 +246,7 @@ pub fn git_snapshot(root: &Path) -> Option<GitSnapshot> {
         status.truncate(GIT_STATUS_CAP);
     }
 
-    let commits = git_lines(
-        root,
-        &["log", "--oneline", &format!("-{GIT_COMMIT_CAP}")],
-    );
+    let commits = git_lines(root, &["log", "--oneline", &format!("-{GIT_COMMIT_CAP}")]);
 
     Some(GitSnapshot {
         branch,
@@ -280,11 +279,7 @@ fn git_line(root: &Path, args: &[&str]) -> Option<String> {
 /// integration seam: it only spawns and hands the result to [`decode_output`],
 /// which owns the success/decode logic (and carries the test).
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output();
+    let out = Command::new("git").arg("-C").arg(root).args(args).output();
     decode_output(out)
 }
 
