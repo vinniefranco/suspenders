@@ -14,6 +14,7 @@
 //! / `use crossterm` (ADR-0019 invariant).
 
 pub mod command;
+pub mod completion;
 pub mod components;
 pub mod composer;
 pub mod draft;
@@ -24,7 +25,6 @@ pub mod model_command;
 pub mod picker;
 pub mod screen;
 pub mod selection;
-pub mod selector;
 pub mod slash;
 pub mod theme;
 pub mod theme_command;
@@ -784,6 +784,9 @@ fn map_key(key: &KeyEvent) -> Key {
         // Tab, which suspenders does not adopt: bare Tab stays inert).
         KeyCode::BackTab => Key::CycleApprovalMode,
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Key::CycleApprovalMode,
+        // Bare Tab accepts the highlighted `/` palette suggestion (ADR-0051
+        // System B); inert everywhere else (the Composer refuses it).
+        KeyCode::Tab => Key::Tab,
         // Any other Ctrl chord is a command, never text: since the core now
         // inserts every `Key::Char` into the Composer, letting e.g. Ctrl-X
         // through as Char('x') would type an 'x'.
@@ -1114,11 +1117,17 @@ mod tests {
     }
 
     #[test]
-    fn keys_without_a_mapping_fall_through_to_other() {
+    fn bare_tab_maps_to_the_palette_accept_key() {
+        // Bare Tab accepts the `/` palette suggestion (ADR-0051 System B);
+        // inert everywhere else because the Composer refuses it.
         assert_eq!(
             map_key(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-            Key::Other
+            Key::Tab
         );
+    }
+
+    #[test]
+    fn keys_without_a_mapping_fall_through_to_other() {
         assert_eq!(
             map_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
             Key::Other

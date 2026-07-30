@@ -67,10 +67,21 @@ pub enum SelectionOutcome {
 /// The pure selection state: the active row, the row count, and the digit
 /// quick-select buffer with its deadline. Cloneable/Eq so a `PendingApproval`
 /// holding one stays comparable in Screen tests.
+///
+/// A per-row `disabled` mask (qwen `useSelectionList.ts` `findNextValidIndex`)
+/// lets the Phase-5 model/theme dialogs carry unnavigable rows (Provider
+/// headers, greyed collapsed rows, broken themes): nav skips them in both
+/// directions and the initial active row snaps off any disabled row
+/// ([`SelectionList::with_active`]). The approval radio's [`SelectionList::new`]
+/// leaves the mask all-`false`, so its behaviour is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionList {
     active: usize,
     len: usize,
+    /// Per-row nav mask (qwen `SelectionListItem.disabled`): `disabled[i]` is
+    /// `true` for a row Up/Down skips and the initial active row snaps off.
+    /// Always `len` long. All-`false` for the approval radio.
+    disabled: Vec<bool>,
     /// The digits typed so far toward a quick-select (qwen `numberInputRef`),
     /// empty when idle.
     number_buffer: String,
@@ -80,14 +91,44 @@ pub struct SelectionList {
 }
 
 impl SelectionList {
-    /// A fresh list of `len` rows with row 0 active and no digit buffered.
+    /// A fresh list of `len` rows with row 0 active, no row disabled, and no
+    /// digit buffered - the approval radio's shape, unchanged.
     pub fn new(len: usize) -> Self {
         SelectionList {
             active: 0,
             len,
+            disabled: vec![false; len],
             number_buffer: String::new(),
             deadline: None,
         }
+    }
+
+    /// A list over a `disabled` mask (one bool per row) with the active row
+    /// snapped onto the first navigable row at or after `initial` (qwen
+    /// `computeInitialIndex`): an out-of-range `initial` clamps to 0, and a
+    /// disabled target walks DOWN to the next navigable row, wrapping if
+    /// needed. An all-disabled list keeps `initial` (clamped) - nothing is
+    /// navigable, and Enter still guards on the disabled mask.
+    pub fn with_active(disabled: Vec<bool>, initial: usize) -> Self {
+        let len = disabled.len();
+        let clamped = if initial >= len { 0 } else { initial };
+        let active = if len == 0 || !disabled[clamped] {
+            clamped
+        } else {
+            find_next_valid(clamped, Direction::Down, &disabled).unwrap_or(clamped)
+        };
+        SelectionList {
+            active,
+            len,
+            disabled,
+            number_buffer: String::new(),
+            deadline: None,
+        }
+    }
+
+    /// Whether row `i` is disabled (skipped by nav; Enter refuses it).
+    pub fn is_disabled(&self, i: usize) -> bool {
+        self.disabled.get(i).copied().unwrap_or(false)
     }
 
     /// The active row index.
@@ -117,6 +158,10 @@ impl SelectionList {
         match key {
             SelectionKey::Up => self.step(Direction::Up),
             SelectionKey::Down => self.step(Direction::Down),
+            // Enter refuses a disabled active row (qwen guards the pendingSelect
+            // on `!currentItem.disabled`); with an all-`false` mask (the
+            // approval radio) it always selects, unchanged.
+            SelectionKey::Enter if self.is_disabled(self.active) => SelectionOutcome::Ignored,
             SelectionKey::Enter => SelectionOutcome::Selected(self.active),
             SelectionKey::Escape => SelectionOutcome::Cancelled,
             SelectionKey::Digit(d) => self.digit(d, now),
@@ -145,11 +190,17 @@ impl SelectionList {
         if self.len == 0 {
             return SelectionOutcome::Ignored;
         }
-        self.active = match dir {
-            Direction::Up => (self.active + self.len - 1) % self.len,
-            Direction::Down => (self.active + 1) % self.len,
-        };
-        SelectionOutcome::Moved
+        // Walk to the next NAVIGABLE row in `dir`, skipping disabled rows and
+        // wrapping (qwen `findNextValidIndex`). An all-disabled list, or a
+        // one-navigable-row list where the step returns to itself, does not
+        // move. With an all-`false` mask this is the plain wrap.
+        match find_next_valid(self.active, dir, &self.disabled) {
+            Some(next) if next != self.active => {
+                self.active = next;
+                SelectionOutcome::Moved
+            }
+            _ => SelectionOutcome::Ignored,
+        }
     }
 
     // The 1-indexed digit quick-select (qwen `useSelectionList.ts:343-388`).
@@ -170,8 +221,9 @@ impl SelectionList {
         };
         let target = number - 1;
 
-        if target >= self.len {
-            // Out of bounds: drop the buffer, nothing moves.
+        if target >= self.len || self.is_disabled(target) {
+            // Out of bounds, or a disabled row the digit cannot land on
+            // (a header/greyed/broken row): drop the buffer, nothing moves.
             self.clear_buffer();
             return SelectionOutcome::Ignored;
         }
@@ -198,9 +250,34 @@ impl SelectionList {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Direction {
     Up,
     Down,
+}
+
+/// The next NAVIGABLE row from `current` in `direction`, wrapping, skipping
+/// disabled rows (qwen `useSelectionList.ts` `findNextValidIndex`): scans at
+/// most `len` steps and returns the first non-disabled index it lands on, or
+/// `None` when every row is disabled (or the list is empty). May return
+/// `current` itself when it is the only navigable row - the caller treats a
+/// no-move return as "nothing happened".
+fn find_next_valid(current: usize, direction: Direction, disabled: &[bool]) -> Option<usize> {
+    let len = disabled.len();
+    if len == 0 {
+        return None;
+    }
+    let mut index = current;
+    for _ in 0..len {
+        index = match direction {
+            Direction::Down => (index + 1) % len,
+            Direction::Up => (index + len - 1) % len,
+        };
+        if !disabled[index] {
+            return Some(index);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -364,5 +441,75 @@ mod tests {
     fn expire_with_no_buffer_is_ignored() {
         let mut l = list(3);
         assert_eq!(l.expire(9_999), SelectionOutcome::Ignored);
+    }
+
+    // --- disabled mask (Phase-5 dialogs, qwen findNextValidIndex) -----------
+
+    #[test]
+    fn with_active_snaps_the_initial_off_a_disabled_row_walking_down() {
+        // Row 0 disabled (a Provider header): the initial active snaps to the
+        // first navigable row below it.
+        let l = SelectionList::with_active(vec![true, false, false], 0);
+        assert_eq!(l.active(), 1);
+        // An out-of-range initial clamps to 0, then snaps off the disabled row.
+        let l = SelectionList::with_active(vec![true, false], 99);
+        assert_eq!(l.active(), 1);
+        // A navigable initial is kept as-is.
+        let l = SelectionList::with_active(vec![true, false, false], 2);
+        assert_eq!(l.active(), 2);
+    }
+
+    #[test]
+    fn navigation_skips_disabled_rows_in_both_directions_and_wraps() {
+        // [header, model, header, model, model]: nav lands only on the models.
+        let mut l = SelectionList::with_active(vec![true, false, true, false, false], 0);
+        assert_eq!(l.active(), 1, "snapped off the header");
+        assert_eq!(l.handle(SelectionKey::Down, T0), SelectionOutcome::Moved);
+        assert_eq!(l.active(), 3, "skipped the second header");
+        l.handle(SelectionKey::Down, T0);
+        assert_eq!(l.active(), 4);
+        // Down from the last navigable wraps back to the first, skipping headers.
+        l.handle(SelectionKey::Down, T0);
+        assert_eq!(l.active(), 1);
+        // Up wraps the other way, skipping the trailing/leading headers.
+        l.handle(SelectionKey::Up, T0);
+        assert_eq!(l.active(), 4);
+    }
+
+    #[test]
+    fn a_single_navigable_row_never_moves() {
+        let mut l = SelectionList::with_active(vec![true, false, true], 0);
+        assert_eq!(l.active(), 1);
+        assert_eq!(
+            l.handle(SelectionKey::Down, T0),
+            SelectionOutcome::Ignored,
+            "the only navigable row does not move"
+        );
+        assert_eq!(l.handle(SelectionKey::Up, T0), SelectionOutcome::Ignored);
+        assert_eq!(l.active(), 1);
+    }
+
+    #[test]
+    fn enter_refuses_a_disabled_active_row() {
+        // An all-disabled list keeps `initial`; Enter there is a no-op.
+        let mut l = SelectionList::with_active(vec![true, true], 0);
+        assert_eq!(l.active(), 0);
+        assert_eq!(l.handle(SelectionKey::Enter, T0), SelectionOutcome::Ignored);
+    }
+
+    #[test]
+    fn a_digit_refuses_a_disabled_target() {
+        // Row 0 disabled (header): digit '1' targets it and is ignored.
+        let mut l = SelectionList::with_active(vec![true, false, false], 0);
+        assert_eq!(
+            l.handle(SelectionKey::Digit(1), T0),
+            SelectionOutcome::Ignored
+        );
+        assert_eq!(l.active(), 1, "the digit did not move onto the header");
+        // Digit '2' targets the navigable row 1 and selects it (short list).
+        assert_eq!(
+            l.handle(SelectionKey::Digit(2), T0),
+            SelectionOutcome::Selected(1)
+        );
     }
 }

@@ -63,10 +63,11 @@
 //! cell the view paints can never drift apart.
 
 use crate::event::Event;
+use crate::ui::completion::{self, Completion, Suggestion};
 use crate::ui::draft;
 use crate::ui::history::History;
 use crate::ui::screen::{AgentCommand, Effect, Key, Status, UngatedKey};
-use crate::ui::selector::{FilteredRow, Selector, SelectorOutcome};
+use crate::ui::selection::{Millis, SelectionKey, SelectionList, SelectionOutcome};
 use crate::ui::slash;
 use crate::view_model::SelectorRow;
 
@@ -100,23 +101,29 @@ pub enum EventOutcome {
 }
 
 /// The lifecycle of a committed selector-opening command's row list
-/// (ADR-0033). `Loading` after commit while the adapter fetches; `Ready` once
-/// [`Event::SelectorReady`] delivered rows into a [`Selector`]; `Failed` on
-/// [`Event::SelectorFailed`]. Only `Ready` accepts navigation/selection - a
-/// `Loading`/`Failed` overlay swallows Enter. Private: the view exposes the
-/// lifecycle as [`OverlayStatus`], which never carries the owned [`Selector`].
+/// (ADR-0033, ADR-0051 System A). `Idle` is the NULL-OBJECT state - no command
+/// has committed a selector, so the always-present [`CommandSelector`] carries
+/// nothing drawable and every fold is a no-op; `Loading` after commit while the
+/// adapter fetches; `Ready` once [`Event::SelectorReady`] delivered rows into a
+/// [`DialogList`]; `Failed` on [`Event::SelectorFailed`]. Only `Ready` accepts
+/// navigation/selection - an `Idle`/`Loading`/`Failed` overlay swallows Enter.
+/// Private: the view exposes the lifecycle as [`OverlayStatus`], which never
+/// carries the owned [`DialogList`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SelectorStatus {
+enum DialogStatus {
+    /// No selector open (the Null-Object rest state). `command`/`generation`/
+    /// `filter_mode` on the enclosing [`CommandSelector`] are stale and unread.
+    Idle,
     Loading,
-    Ready(Selector),
+    Ready(DialogList),
     Failed(String),
 }
 
 /// The selector overlay's lifecycle as render needs it (ADR-0033): `Loading`
 /// and `Failed` draw a one-line status, `Ready` draws the rows beside it. So
-/// `Ready` carries no payload - the `rest`-filtered `rows`/`highlight` in
-/// [`OverlayView::Selector`] are the whole drawable surface, and the owned
-/// [`Selector`] never crosses the seam.
+/// `Ready` carries no payload - the `rows`/`active` in [`OverlayView::Dialog`]
+/// are the whole drawable surface, and the owned [`DialogList`] never crosses
+/// the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayStatus {
     Loading,
@@ -124,42 +131,379 @@ pub enum OverlayStatus {
     Failed(String),
 }
 
-// The owned command-selector overlay (ADR-0033): the sub-state entered when a
-// selector-opening command (`/model`) is committed. `command` is the opaque
-// command name carried back out on selection (the Composer never learns what
-// the command does); `status` is the row list's lifecycle; `generation` is the
-// activation counter value this overlay was opened with - the fill events must
-// echo it back or [`Composer::apply_event`] drops them. Private on purpose
-// - the view exposes it as [`OverlayView::Selector`], and nothing outside the
-// seam touches the state. The overlay does NOT own its filter: the draft
-// `rest` (after `/<name> `) filters the rows, consistent with the menu.
+/// Whether a committed command's DIALOG (System A) carries an editable fuzzy
+/// filter (ADR-0051). The model dialog does (`Filtered` - suspenders surfaces
+/// hundreds of catalog models, a deliberate divergence from qwen's filter-less
+/// dialog); the theme dialog does not (`Frozen` - few themes, qwen-faithful).
+/// A `Frozen` dialog swallows editing keys, so the normalized `/<name> ` draft
+/// never grows past the trailing space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogFilter {
+    /// Editable filter (the model dialog): typed chars after `/<name> ` narrow
+    /// the rows via a case-insensitive SUBSTRING match over the row label (NOT
+    /// nucleo - whole-group retention needs the header/note travel that a
+    /// substring test gives, see [`filter_rows`]).
+    Filtered,
+    /// No filter (the theme dialog): editing keys are swallowed.
+    Frozen,
+}
+
+/// A committed command's numbered `›` DIALOG rows (ADR-0051 System A): the raw
+/// [`SelectorRow`]s from the fetch, the currently VISIBLE (optionally
+/// fuzzy-filtered) rows, and a [`SelectionList`] navigating them over a
+/// disabled mask (headers/greyed/broken rows are disabled). The list is rebuilt
+/// whenever the visible set changes (a filter keystroke). `filter` is the
+/// last-applied filter string, kept so a redundant rebuild is skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogList {
+    /// The unfiltered rows from the fetch, in listing order.
+    raw: Vec<SelectorRow>,
+    /// The rows currently shown (all of `raw` when `Frozen` or the filter is
+    /// empty; a fuzzy-narrowed subset otherwise).
+    visible: Vec<SelectorRow>,
+    /// Navigation over `visible`, disabled mask = non-cursor-stop rows.
+    list: SelectionList,
+    /// Whether an editable filter narrows the rows (model) or not (theme).
+    mode: DialogFilter,
+    /// The last filter applied to produce `visible` (empty for `Frozen`).
+    filter: String,
+}
+
+impl DialogList {
+    // Builds a dialog over `raw` rows in the given filter mode, with the empty
+    // filter (every row visible) and the active row snapped onto the first
+    // navigable (cursor-stop) row.
+    fn new(raw: Vec<SelectorRow>, mode: DialogFilter) -> Self {
+        let visible = raw.clone();
+        let list = Self::list_for(&visible);
+        DialogList {
+            raw,
+            visible,
+            list,
+            mode,
+            filter: String::new(),
+        }
+    }
+
+    // A [`SelectionList`] over `visible`: a row is disabled (unnavigable) when
+    // it is not a cursor stop (headers and greyed collapsed rows), matching the
+    // Selector's old stop rules. Notes stay navigable (Enter refuses them).
+    fn list_for(visible: &[SelectorRow]) -> SelectionList {
+        let disabled: Vec<bool> = visible.iter().map(|r| !r.is_stop()).collect();
+        SelectionList::with_active(disabled, 0)
+    }
+
+    // Applies `filter` (the draft `rest`), rebuilding the visible rows and the
+    // navigation list only when it changed. A `Frozen` dialog ignores the
+    // filter entirely. Filtering keeps a group-agnostic fuzzy match over the
+    // row LABEL (the nucleo matcher, confined to completion.rs is not reused
+    // here - the dialog needs whole-row retention including headers/notes, so a
+    // simple case-insensitive substring over the visible label is used, the
+    // same test qwen's dialog filter would apply were it present).
+    fn refilter(&mut self, filter: &str) {
+        if let Some(next) = self.rebuilt_for(filter) {
+            *self = next;
+        }
+    }
+
+    // The fresh dialog `filter` narrows this to, or `None` when the rebuild is a
+    // no-op that must NOT disturb the current navigation - a `Frozen` dialog
+    // (never filters) or an unchanged filter. A single `.then` combinator over
+    // the pure [`DialogList::rebuilds_for`] predicate (Operation → the call-only
+    // recipe [`DialogList::over`]); no `if`/`match` interleaved with the call.
+    fn rebuilt_for(&self, filter: &str) -> Option<DialogList> {
+        self.rebuilds_for(filter)
+            .then(|| Self::over(self.raw.clone(), self.mode, filter))
+    }
+
+    // Whether a `refilter(filter)` rebuilds: NOT a `Frozen` dialog (which never
+    // filters) and NOT an unchanged filter (which needs no rebuild). Pure
+    // predicate.
+    fn rebuilds_for(&self, filter: &str) -> bool {
+        self.mode != DialogFilter::Frozen && filter != self.filter
+    }
+
+    // A dialog over `raw` in `mode`, narrowed to `filter` (call-only recipe):
+    // the visible rows, a fresh navigation list, the applied filter. The
+    // `filter`-carrying twin of [`DialogList::new`] (which is the empty
+    // filter).
+    fn over(raw: Vec<SelectorRow>, mode: DialogFilter, filter: &str) -> DialogList {
+        let visible = filter_rows(&raw, filter);
+        let list = Self::list_for(&visible);
+        DialogList {
+            raw,
+            visible,
+            list,
+            mode,
+            filter: filter.to_string(),
+        }
+    }
+
+    // The active (highlighted) visible row, if any.
+    fn active_row(&self) -> Option<&SelectorRow> {
+        self.visible.get(self.list.active())
+    }
+}
+
+// A group-aware-ish filter for the model DIALOG (ADR-0051 divergence): keep a
+// header when any row in its group matches, keep a matching member/collapsed
+// row, keep a group's trailing note when the group matched. A case-insensitive
+// substring test over the label - the same shape the retired Selector used,
+// minus the reveal cap (the numbered dialog scrolls instead of collapsing).
+fn filter_rows(raw: &[SelectorRow], filter: &str) -> Vec<SelectorRow> {
+    if filter.is_empty() {
+        return raw.to_vec();
+    }
+    use crate::view_model::RowRole;
+    let needle = filter.to_lowercase();
+    let hits = |row: &SelectorRow| row.label.to_lowercase().contains(&needle);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < raw.len() {
+        let end = if raw[start].role == RowRole::Header {
+            raw[start + 1..]
+                .iter()
+                .position(|r| r.role == RowRole::Header)
+                .map(|off| start + 1 + off)
+                .unwrap_or(raw.len())
+        } else {
+            start + 1
+        };
+        let group = &raw[start..end];
+        let group_hit = group.iter().any(&hits);
+        for row in group {
+            let keep = match row.role {
+                RowRole::Header | RowRole::Note => group_hit,
+                RowRole::Member | RowRole::Collapsed => hits(row),
+            };
+            if keep {
+                out.push(row.clone());
+            }
+        }
+        start = end;
+    }
+    out
+}
+
+// The owned command DIALOG overlay (ADR-0033, ADR-0051 System A), an
+// ALWAYS-PRESENT Null Object: `Idle` is the closed rest state, so the Composer
+// never juggles an `Option` and every call site is an unconditional
+// delegation (IOSP - no Option-guard-then-delegate). `command` is the opaque
+// command name carried back out on selection; `status` is the row list's
+// lifecycle; `generation` is the activation counter this overlay was opened
+// with - the fill events must echo it back or [`Composer::apply_event`] drops
+// them. Private: the view exposes it as [`OverlayView::Dialog`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandSelector {
     command: String,
-    status: SelectorStatus,
+    status: DialogStatus,
     generation: u64,
+    /// The filter mode the fill will build the [`DialogList`] with, decided at
+    /// commit time from the command (model = `Filtered`, theme = `Frozen`).
+    filter_mode: DialogFilter,
 }
 
-/// The open Composer overlay for rendering (ADR-0032/0033), one enum the
-/// adapter matches once. `Menu` is the Slash Command palette (`rest = None`):
-/// the registry filtered by the command token. `Selector` is the
-/// committed-command sub-state (`rest = Some`): the overlay `status` plus,
-/// when `Ready`, the rows filtered by the draft `rest` (a note whose group's
-/// collapsed reveal was capped carries the "· N more" count merged into its
-/// hint) and the highlighted index into that filtered view. A new overlay
-/// kind (a history search, a path-completion popup) is a new variant here
-/// plus a render arm - never a fold-root change.
+impl CommandSelector {
+    // The closed Null-Object selector: `Idle`, carrying no command. The stale
+    // `command`/`filter_mode`/`generation` are never read while `Idle`.
+    fn closed() -> Self {
+        CommandSelector {
+            command: String::new(),
+            status: DialogStatus::Idle,
+            generation: 0,
+            filter_mode: DialogFilter::Frozen,
+        }
+    }
+
+    // Opens this selector on a fresh activation: a `Loading` overlay for
+    // `command` stamped with `generation`, fetching in `filter_mode`. Replaces
+    // whatever state (Idle or a leftover) was here.
+    fn open(&mut self, command: String, generation: u64, filter_mode: DialogFilter) {
+        *self = CommandSelector {
+            command,
+            status: DialogStatus::Loading,
+            generation,
+            filter_mode,
+        };
+    }
+
+    // Returns this selector to the closed Null-Object state.
+    fn close(&mut self) {
+        *self = Self::closed();
+    }
+
+    // Whether a selector is open at all (anything but the Null-Object `Idle`) -
+    // a test observability seam over the private status.
+    #[cfg(test)]
+    fn is_open(&self) -> bool {
+        !matches!(self.status, DialogStatus::Idle)
+    }
+
+    // The open Ready dialog, if this overlay has fetched its rows.
+    fn ready(&mut self) -> Option<&mut DialogList> {
+        match &mut self.status {
+            DialogStatus::Ready(dialog) => Some(dialog),
+            _ => None,
+        }
+    }
+
+    // The open Ready dialog by shared ref (the view side).
+    fn ready_ref(&self) -> Option<&DialogList> {
+        match &self.status {
+            DialogStatus::Ready(dialog) => Some(dialog),
+            _ => None,
+        }
+    }
+
+    // Re-narrows the Ready dialog's rows to `filter` (a no-op when `Idle`,
+    // before the fetch, or for a `Frozen` dialog). Unconditional at the call
+    // site: the state-branch lives here, in the one owner.
+    fn refilter(&mut self, filter: &str) {
+        if let Some(dialog) = self.ready() {
+            dialog.refilter(filter);
+        }
+    }
+
+    // Flips a `Loading` overlay to `Ready` over a fresh dialog seeded with
+    // `filter` - but only for `generation` (the activation guard) - else a
+    // no-op. The whole generation/Loading branch lives HERE so the caller is a
+    // single unconditional call (IOSP).
+    fn fill_ready(&mut self, generation: u64, rows: Vec<SelectorRow>, filter: &str) {
+        if self.is_loading_for(generation) {
+            let mut dialog = DialogList::new(rows, self.filter_mode);
+            dialog.refilter(filter);
+            self.status = DialogStatus::Ready(dialog);
+        }
+    }
+
+    // Flips a `Loading` overlay to `Failed` - same activation guard as
+    // [`CommandSelector::fill_ready`], else a no-op.
+    fn fill_failed(&mut self, generation: u64, message: String) {
+        if self.is_loading_for(generation) {
+            self.status = DialogStatus::Failed(message);
+        }
+    }
+
+    // Whether this overlay is `Loading` for exactly `generation` - the fill
+    // guard shared by the two `fill_*` transitions (pure predicate).
+    fn is_loading_for(&self, generation: u64) -> bool {
+        matches!(self.status, DialogStatus::Loading) && self.generation == generation
+    }
+
+    // Folds a [`SelectionKey`] onto the Ready dialog's numbered rows, returning
+    // the chosen row's `SelectorChosen` effect on a pickable selection (nav and
+    // non-pick outcomes return `None`). An Idle/Loading/Failed overlay ignores
+    // it.
+    fn fold_selection(&mut self, key: SelectionKey) -> Option<Effect> {
+        let command = self.command.clone();
+        let dialog = self.ready()?;
+        match dialog.list.handle(key, NOW_UNUSED) {
+            SelectionOutcome::Selected(i) => {
+                dialog
+                    .visible
+                    .get(i)
+                    .filter(|r| r.pickable())
+                    .map(|r| Effect::SelectorChosen {
+                        command,
+                        value: r.value.clone(),
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    // Whether this is a Ready `Frozen` (theme) dialog - digits are quick-select
+    // and editing chars are swallowed.
+    fn is_ready_frozen(&self) -> bool {
+        matches!(&self.status, DialogStatus::Ready(d) if d.mode == DialogFilter::Frozen)
+    }
+
+    // The render projection for this overlay (System A), the compute-plan
+    // behind [`Composer::dialog_view`]: the command label, the drawable
+    // [`OverlayStatus`], and (only when Ready) the visible rows, active index,
+    // and the active row's detail hint. `Idle` renders as a `Loading`
+    // placeholder for `fallback_command` (a fresh `/model ` before the next
+    // fold activates the overlay) - the ONE place the Null-Object rest state
+    // maps back onto a drawable frame.
+    fn view_parts(&self, fallback_command: &str) -> DialogParts {
+        match &self.status {
+            DialogStatus::Ready(dialog) => DialogParts {
+                command: self.command.clone(),
+                status: OverlayStatus::Ready,
+                rows: dialog.visible.clone(),
+                active: dialog.list.active(),
+                detail: dialog.active_row().and_then(|r| r.hint.clone()),
+            },
+            DialogStatus::Loading => {
+                DialogParts::status(self.command.clone(), OverlayStatus::Loading)
+            }
+            DialogStatus::Failed(message) => {
+                DialogParts::status(self.command.clone(), OverlayStatus::Failed(message.clone()))
+            }
+            DialogStatus::Idle => {
+                DialogParts::status(fallback_command.to_string(), OverlayStatus::Loading)
+            }
+        }
+    }
+}
+
+// The render projection of a [`CommandSelector`] (the compute-plan / parameter
+// object behind [`Composer::dialog_view`]): the fields [`OverlayView::Dialog`]
+// draws. Built by [`CommandSelector::view_parts`] so the view fn is a call-only
+// assembler (IOSP).
+struct DialogParts {
+    command: String,
+    status: OverlayStatus,
+    rows: Vec<SelectorRow>,
+    active: usize,
+    detail: Option<String>,
+}
+
+impl DialogParts {
+    // A row-less status frame (Loading/Failed, or the Idle placeholder): no
+    // visible rows, the active index at 0, no detail.
+    fn status(command: String, status: OverlayStatus) -> Self {
+        DialogParts {
+            command,
+            status,
+            rows: Vec::new(),
+            active: 0,
+            detail: None,
+        }
+    }
+}
+
+/// The open Composer overlay for rendering (ADR-0051), one enum the adapter
+/// matches once. The TWO systems are DISTINCT variants:
+///
+/// * `Menu` - System B, the fuzzy `/` palette: color-only suggestions (no `›`,
+///   no numbers), the fuzzy match window per row for the inverted highlight,
+///   the active index and the scroll window, the query for the highlight.
+/// * `Dialog` - System A, a committed command's numbered `›` list: the overlay
+///   `status` plus, when `Ready`, the (optionally filtered) rows, the active
+///   row, and a detail string (the model context window; empty for theme).
+///
+/// A new overlay kind is a new variant here plus a render arm - never a
+/// fold-root change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayView {
     Menu {
-        rows: Vec<SelectorRow>,
-        highlight: usize,
+        suggestions: Vec<Suggestion>,
+        active: usize,
+        scroll: usize,
+        query: String,
+        /// Whether the active row is expanded (`←/→`, qwen `expandedIndex`): a
+        /// long active row (label chars `>= MAX_WIDTH`) shows collapsed with a
+        /// ` → ` affordance unless this is `true`, when it shows in full with
+        /// ` ← `.
+        expanded: bool,
     },
-    Selector {
+    Dialog {
         command: String,
         status: OverlayStatus,
         rows: Vec<SelectorRow>,
-        highlight: usize,
+        active: usize,
+        detail: Option<String>,
     },
 }
 
@@ -188,18 +532,22 @@ pub struct Composer {
     /// multi-byte input never splits or panics. Always clamped to the draft's
     /// char count.
     cursor: usize,
-    /// The highlighted command in the Slash Command menu (ADR-0032), an index
-    /// into the FILTERED rows. Only meaningful while the draft `is_slash`;
-    /// the menu itself is derived on demand ([`Composer::view`]) from the
-    /// draft (the filter) and the `&'static` registry, so this holds just the
-    /// cursor. Clamped to the filtered length as typing narrows the menu.
-    slash_cursor: usize,
-    /// The open command-selector overlay (ADR-0033), or `None` when no
-    /// selector-opening command is active. Set when a command whose
-    /// descriptor `opens_selector` is committed (to a `Loading` overlay),
-    /// folded to `Ready`/`Failed` by [`Composer::apply_event`], and cleared
-    /// on selection, Escape, or backspacing out of the sub-state.
-    selector: Option<CommandSelector>,
+    /// The fuzzy `/` palette state (ADR-0051 System B): the highlighted
+    /// suggestion + the scroll window. Only meaningful while the draft
+    /// `is_slash` and no command has committed; the suggestions themselves are
+    /// derived on demand ([`Composer::view`]) by ranking the `&'static`
+    /// registry against the draft (the query), so this holds just the cursor
+    /// and scroll. Re-clamped to the ranked length as typing narrows the list.
+    menu: Completion,
+    /// The command-selector overlay (ADR-0033), an ALWAYS-PRESENT Null Object:
+    /// `Idle` (closed) when no selector-opening command is active. Opened when
+    /// a command whose descriptor `opens_selector` is committed (to a
+    /// `Loading` overlay), folded to `Ready`/`Failed` by
+    /// [`Composer::apply_event`], and closed back to `Idle` on selection,
+    /// Escape, or backspacing out of the sub-state. Because it is never
+    /// `None`, every fold is an UNCONDITIONAL delegation (no Option-guard) -
+    /// the state-branch lives once, inside [`CommandSelector`]'s methods.
+    selector: CommandSelector,
     /// The selector activation counter: bumped each time a selector-opening
     /// command commits, stamped onto the overlay and the [`Effect::Command`]
     /// it emits. The fill events echo it back, and only a matching echo fills
@@ -219,8 +567,8 @@ impl Composer {
         Composer {
             value: String::new(),
             cursor: 0,
-            slash_cursor: 0,
-            selector: None,
+            menu: Completion::new(),
+            selector: CommandSelector::closed(),
             selector_generation: 0,
             history: History::new(history),
         }
@@ -258,15 +606,7 @@ impl Composer {
         // arms and the editing fall-through both consume - which is what lets
         // those blocks tidy sub-state eagerly; only Escape and the wheel can
         // still be refused below, and only when no sub-state ran at all.
-        if matches!(
-            key,
-            Key::PageUp
-                | Key::PageDown
-                | Key::ToggleThinking
-                | Key::ToggleTools
-                | Key::Named(_)
-                | Key::Other
-        ) {
+        if always_refused(&key) {
             return KeyOutcome::Refused(key);
         }
 
@@ -293,10 +633,10 @@ impl Composer {
                 && slash::lookup(&draft.name).is_some_and(|c| c.opens_selector);
 
             return if in_selector {
-                // `draft` is owned and its name is not needed past the
-                // sub-state dispatch: move the filter out rather than cloning
-                // it on every editing key.
-                self.selector_key(key, draft.rest.unwrap_or_default(), status)
+                // The DIALOG sub-state re-derives the `rest` filter from the
+                // draft (via `refilter_from_draft`), so nothing from `draft`
+                // crosses into the dispatch.
+                self.selector_key(key, status)
             } else {
                 self.menu_key(key, &draft.name, status)
             };
@@ -305,66 +645,85 @@ impl Composer {
         self.editing_key(key, status)
     }
 
-    // -- SELECTOR sub-state (`/model qw`, ADR-0033) --
+    // -- DIALOG sub-state (System A, `/model qw` / `/theme`, ADR-0051) --
     // Dispatched by [`Composer::handle_key`] once a selector-opening command
-    // committed; `rest` is the filter over the committed command's rows.
-    // Every key offered here is consumed: an arm below, or the editing
-    // fall-through.
-    fn selector_key(&mut self, key: Key, rest: String, status: Status) -> KeyOutcome {
-        match key {
-            // Arrow-only nav (ADR-0046): the main loop no longer mints
-            // Key::Wheel* (mouse capture is gone; native scrollback owns
-            // history), so the overlay navigates by the arrows alone.
-            Key::ArrowUp | Key::ArrowDown => {
-                if let Some(CommandSelector {
-                    status: SelectorStatus::Ready(sel),
-                    ..
-                }) = self.selector.as_mut()
-                {
-                    sel.handle_nav(key, &rest);
-                }
-                consumed(vec![])
-            }
-            Key::Enter => {
-                // Only a Ready overlay with a highlighted row resolves;
-                // Loading/Failed swallow Enter (no fetch to pick from).
-                let chosen = match self.selector.as_mut() {
-                    Some(CommandSelector {
-                        command,
-                        status: SelectorStatus::Ready(sel),
-                        ..
-                    }) => sel
-                        .handle_nav(Key::Enter, &rest)
-                        .and_then(|outcome| match outcome {
-                            SelectorOutcome::Select(value) => Some(Effect::SelectorChosen {
-                                command: command.clone(),
-                                value,
-                            }),
-                            SelectorOutcome::Cancel => None,
-                        }),
-                    _ => None,
-                };
-                match chosen {
-                    Some(effect) => {
-                        self.close_selector();
-                        consumed(vec![effect])
-                    }
-                    None => consumed(vec![]),
-                }
-            }
-            Key::Escape => {
-                // Close the overlay and empty the Composer (no Run to
-                // cancel - the overlay is a Composer state).
+    // committed; `rest` is the draft filter (applied to the model dialog's
+    // rows; the theme dialog is `Frozen` and swallows editing keys). Every key
+    // offered here is consumed. Navigation is qwen's numbered `›`
+    // [`SelectionList`] (arrows skip disabled header/greyed/broken rows,
+    // digits quick-select).
+    fn selector_key(&mut self, key: Key, status: Status) -> KeyOutcome {
+        // Keep the visible rows in step with the draft filter before folding a
+        // nav/select key (a `Frozen` theme dialog ignores it).
+        self.refilter_from_draft();
+        match self.classify_dialog_key(key) {
+            DialogKey::Nav(sel_key) => self.dialog_nav(sel_key),
+            DialogKey::Pick(sel_key) => self.dialog_pick(sel_key),
+            DialogKey::Close => {
                 self.close_selector();
                 consumed(vec![])
             }
-            // Editing keys (chars, Backspace, newline, cursor moves)
-            // fall through so `rest` keeps filtering the rows. Note:
-            // backspacing away the space (rest → None) drops us back
-            // to the COMMAND MENU next fold, and the menu block there
-            // closes this overlay so a re-activation re-fetches.
-            other => self.editing_key(other, status),
+            DialogKey::Swallow => consumed(vec![]),
+            DialogKey::Edit(other) => self.dialog_edit(other, status),
         }
+    }
+
+    // Classifies a key inside the DIALOG sub-state (System A) into its intent,
+    // reading the open dialog's flavour: arrows navigate; a digit on a `Frozen`
+    // (theme) dialog quick-selects; Enter picks; Escape closes; an editing char
+    // on a `Frozen` dialog is swallowed; everything else edits (filters a model
+    // dialog). Pure classification - no mutation.
+    fn classify_dialog_key(&self, key: Key) -> DialogKey {
+        let frozen = self.selector.is_ready_frozen();
+        match key {
+            Key::ArrowUp => DialogKey::Nav(SelectionKey::Up),
+            Key::ArrowDown => DialogKey::Nav(SelectionKey::Down),
+            Key::Char(c) if c.is_ascii_digit() && frozen => {
+                DialogKey::Pick(SelectionKey::Digit(c as u8 - b'0'))
+            }
+            Key::Enter => DialogKey::Pick(SelectionKey::Enter),
+            Key::Escape => DialogKey::Close,
+            other if frozen && is_text_edit(&other) => DialogKey::Swallow,
+            other => DialogKey::Edit(other),
+        }
+    }
+
+    // Folds a navigation key onto the open dialog (no selection possible).
+    fn dialog_nav(&mut self, sel_key: SelectionKey) -> KeyOutcome {
+        let _ = self.selector.fold_selection(sel_key);
+        consumed(vec![])
+    }
+
+    // Folds a selecting key (Enter or a quick-select digit) onto the open
+    // dialog; a pickable resolution closes the overlay and emits the effect.
+    fn dialog_pick(&mut self, sel_key: SelectionKey) -> KeyOutcome {
+        let chosen = self.selector.fold_selection(sel_key);
+        match chosen {
+            Some(effect) => {
+                self.close_selector();
+                consumed(vec![effect])
+            }
+            None => consumed(vec![]),
+        }
+    }
+
+    // An editing key inside a `Filtered` (model) dialog: edit the draft, then
+    // re-narrow the rows against the new `rest` so the next view is fresh.
+    fn dialog_edit(&mut self, key: Key, status: Status) -> KeyOutcome {
+        let outcome = self.editing_key(key, status);
+        self.refilter_from_draft();
+        outcome
+    }
+
+    // Re-narrows the open dialog's rows to the draft's `rest` filter (the
+    // shared parse→rest→refilter dance): parse the draft, take its `rest`
+    // (empty when none), and hand it to the open selector. A no-op before the
+    // fetch or for a `Frozen` dialog. The single owner of "sync the dialog to
+    // the draft filter", called by `selector_key` (before folding a nav/select
+    // key) and `dialog_edit` (after an editing key mutated the draft).
+    fn refilter_from_draft(&mut self) {
+        let rest = slash::parse(&self.value).rest.unwrap_or_default();
+        self.selector.refilter(&rest);
     }
 
     // -- COMMAND MENU sub-state (`/mod`, ADR-0032) --
@@ -377,48 +736,70 @@ impl Composer {
     // activation, re-emitting Effect::Command) and clamp the highlight to the
     // filtered rows.
     fn menu_key(&mut self, key: Key, name: &str, status: Status) -> KeyOutcome {
-        self.selector = None;
-        let rows = slash::rows(name);
-        self.slash_cursor = self.slash_cursor.min(rows.len().saturating_sub(1));
+        self.selector.close();
+        let suggestions = rank_menu(name);
+        self.menu.clamp(suggestions.len());
         match key {
             // Arrow-only nav (ADR-0046): no Key::Wheel* is minted into the
-            // Composer anymore (mouse capture removed), so the menu moves by the
-            // arrows alone.
+            // Composer anymore (mouse capture removed), so the palette moves by
+            // the arrows alone. Up/Down WRAP (qwen `useCompletion` nav).
             Key::ArrowUp => {
-                self.slash_cursor = self.slash_cursor.saturating_sub(1);
+                self.menu.up(suggestions.len());
                 consumed(vec![])
             }
             Key::ArrowDown => {
-                if self.slash_cursor + 1 < rows.len() {
-                    self.slash_cursor += 1;
-                }
+                self.menu.down(suggestions.len());
                 consumed(vec![])
             }
-            // Commit the highlighted command. An empty filtered menu
-            // means the typed token matches no command: surface an
-            // unknown-command notice, start no Run, clear the draft.
-            Key::Enter => self.commit_command(rows.into_iter().nth(self.slash_cursor)),
-            // Typing a space after a command token also commits it
-            // (the palette convention): the space is the menu→command
-            // boundary, so it commits the highlighted row rather than
-            // editing the draft. Only when a row is highlighted - a
-            // bare space on an empty menu falls through as a normal
-            // edit.
-            Key::Char(' ') if rows.get(self.slash_cursor).is_some() => {
-                self.commit_command(rows.into_iter().nth(self.slash_cursor))
+            // `←/→` toggle EXPAND of a long active row (qwen
+            // COLLAPSE_SUGGESTION / EXPAND_SUGGESTION, PrepareLabel MAX_WIDTH).
+            // Consumed ONLY when the active label is long (>= MAX_WIDTH) - a
+            // long row shows collapsed (` → `) until `→` expands it (` ← `) and
+            // `←` collapses it again. On a short active row the arrow is NOT
+            // ours: it falls through to the editing arms as a plain cursor move
+            // (qwen returns false, letting the buffer handle it).
+            Key::Right if active_label_is_long(&suggestions, self.menu.active()) => {
+                self.menu.expand();
+                consumed(vec![])
             }
-            // Escape closes the menu by clearing the draft - there is
-            // no Run to cancel: the menu is a Composer state, so
-            // leaving it empties the Composer.
+            Key::Left if active_label_is_long(&suggestions, self.menu.active()) => {
+                self.menu.collapse();
+                consumed(vec![])
+            }
+            // Commit the highlighted suggestion. An empty ranked list means the
+            // typed query matches no command: surface an unknown-command
+            // notice, start no Run, clear the draft.
+            Key::Enter => self.commit_command(self.picked_suggestion(&suggestions)),
+            // Tab accepts too (qwen `handleAutocomplete`): the same commit as
+            // Enter when a suggestion is highlighted.
+            Key::Tab if !suggestions.is_empty() => {
+                self.commit_command(self.picked_suggestion(&suggestions))
+            }
+            // Typing a space after a command token also commits it (the palette
+            // convention): the space is the query→command boundary, so it
+            // commits the highlighted row rather than editing the draft. Only
+            // when a suggestion is highlighted.
+            Key::Char(' ') if !suggestions.is_empty() => {
+                self.commit_command(self.picked_suggestion(&suggestions))
+            }
+            // Escape closes the palette by clearing the draft - there is no Run
+            // to cancel: the palette is a Composer state.
             Key::Escape => {
                 self.clear();
                 consumed(vec![])
             }
-            // Every other key (chars, Backspace, newline, cursor
-            // moves) falls through to the editing arms, so typing
-            // filters the menu live.
+            // Every other key (chars, Backspace, newline, cursor moves) falls
+            // through to the editing arms, so typing re-ranks the palette live.
             other => self.editing_key(other, status),
         }
+    }
+
+    // The suggestion under the palette cursor, if any (its canonical `value` is
+    // the command to commit). `None` when the ranked list is empty.
+    fn picked_suggestion(&self, suggestions: &[Suggestion]) -> Option<SelectorRow> {
+        suggestions
+            .get(self.menu.active())
+            .map(|s| SelectorRow::new(s.value.clone(), s.label.clone(), None))
     }
 
     // -- Editing fall-through --
@@ -552,33 +933,34 @@ impl Composer {
     /// construction - no ordering coincidence involved.
     pub fn apply_event(&mut self, event: Event) -> EventOutcome {
         match event {
-            // Flip a Loading overlay to Ready over a fresh Selector - only
-            // for the activation that requested this fill.
             Event::SelectorReady { generation, rows } => {
-                if let Some(cs) = self.selector.as_mut()
-                    && matches!(cs.status, SelectorStatus::Loading)
-                    && cs.generation == generation
-                {
-                    cs.status = SelectorStatus::Ready(Selector::new(rows));
-                }
+                self.fill_ready(generation, rows);
                 EventOutcome::Consumed(vec![])
             }
-            // The adapter could not produce the rows: flip a Loading overlay
-            // to Failed. Same staleness guard as SelectorReady.
             Event::SelectorFailed {
                 generation,
                 message,
             } => {
-                if let Some(cs) = self.selector.as_mut()
-                    && matches!(cs.status, SelectorStatus::Loading)
-                    && cs.generation == generation
-                {
-                    cs.status = SelectorStatus::Failed(message);
-                }
+                self.fill_failed(generation, message);
                 EventOutcome::Consumed(vec![])
             }
             other => EventOutcome::Refused(other),
         }
+    }
+
+    // Flips a Loading overlay to Ready over a fresh dialog - only for the
+    // activation that requested this fill (the generation guard). The dialog is
+    // seeded with the draft `rest` so a fill that lands after the user already
+    // typed narrows immediately.
+    fn fill_ready(&mut self, generation: u64, rows: Vec<SelectorRow>) {
+        let rest = slash::parse(&self.value).rest.unwrap_or_default();
+        self.selector.fill_ready(generation, rows, &rest);
+    }
+
+    // Flips a Loading overlay to Failed - same activation guard as
+    // [`Composer::fill_ready`].
+    fn fill_failed(&mut self, generation: u64, message: String) {
+        self.selector.fill_failed(generation, message);
     }
 
     /// The Submit effect succeeded: record `prompt` into the history ring
@@ -630,41 +1012,19 @@ impl Composer {
             return None;
         }
         let draft = slash::parse(&self.value);
-        let rest = draft.rest?;
-        if !slash::lookup(&draft.name).is_some_and(|c| c.opens_selector) {
+        if draft.rest.is_none() || !slash::lookup(&draft.name).is_some_and(|c| c.opens_selector) {
             return None;
         }
-        let cs = self.selector.as_ref()?;
-        let SelectorStatus::Ready(sel) = &cs.status else {
-            return None;
-        };
-        let row = sel
-            .filtered(&rest)
-            .into_iter()
-            .nth(sel.highlight(&rest))?
-            .row;
-        Some((cs.command.as_str(), row))
+        let dialog = self.selector.ready_ref()?;
+        let row = dialog.active_row()?;
+        Some((self.selector.command.as_str(), row))
     }
 
     // ---- Internals ---------------------------------------------------------
 
-    // The overlay's own copy of a filtered row: the reveal cap's truncation
-    // count, when present, joins the note's hint here ("set X_API_KEY · 266
-    // more"), so the seam stays a plain row list and the render layer draws
-    // one dimmed string.
-    fn overlay_row(f: FilteredRow<'_>) -> SelectorRow {
-        let mut row = f.row.clone();
-        if let Some(more) = f.overflow {
-            row.hint = Some(match row.hint.take() {
-                Some(hint) => format!("{hint} · {more} more"),
-                None => format!("{more} more"),
-            });
-        }
-        row
-    }
-
-    // The open overlay, derived from the draft (the one filter) and the
-    // owned selector state.
+    // The open overlay, derived from the draft (the one filter) and the owned
+    // dialog state (ADR-0051). `Dialog` (System A) once a selector-opening
+    // command committed; `Menu` (System B) while the command token is typed.
     fn overlay_view(&self) -> Option<OverlayView> {
         if !slash::is_slash(&self.value) {
             return None;
@@ -673,49 +1033,48 @@ impl Composer {
         let in_selector =
             draft.rest.is_some() && slash::lookup(&draft.name).is_some_and(|c| c.opens_selector);
         if in_selector {
-            let rest = draft.rest.unwrap_or_default();
-            let (command, status, rows, highlight) = match &self.selector {
-                Some(cs) => match &cs.status {
-                    SelectorStatus::Ready(sel) => {
-                        // The highlight is the Selector's own snapped cursor
-                        // (clamped into the filtered view, onto a cursor
-                        // stop) so what renders reversed is where the cursor
-                        // really is.
-                        let highlight = sel.highlight(&rest);
-                        (
-                            cs.command.clone(),
-                            OverlayStatus::Ready,
-                            sel.filtered(&rest)
-                                .into_iter()
-                                .map(Self::overlay_row)
-                                .collect(),
-                            highlight,
-                        )
-                    }
-                    SelectorStatus::Loading => {
-                        (cs.command.clone(), OverlayStatus::Loading, Vec::new(), 0)
-                    }
-                    SelectorStatus::Failed(message) => (
-                        cs.command.clone(),
-                        OverlayStatus::Failed(message.clone()),
-                        Vec::new(),
-                        0,
-                    ),
-                },
-                // No overlay yet (a fresh `/model ` before the next fold
-                // activates it): show a Loading placeholder for the command.
-                None => (draft.name.clone(), OverlayStatus::Loading, Vec::new(), 0),
-            };
-            Some(OverlayView::Selector {
-                command,
-                status,
-                rows,
-                highlight,
-            })
+            Some(self.dialog_view(&draft.name))
         } else {
-            let rows = slash::rows(&draft.name);
-            let highlight = self.slash_cursor.min(rows.len().saturating_sub(1));
-            Some(OverlayView::Menu { rows, highlight })
+            Some(self.menu_view(&draft.name))
+        }
+    }
+
+    // The System B palette view: the ranked suggestions, the active index +
+    // scroll window (re-clamped to the ranked length), and the query for the
+    // inverted-highlight render.
+    fn menu_view(&self, query: &str) -> OverlayView {
+        let suggestions = rank_menu(query);
+        let mut menu = self.menu.clone();
+        menu.clamp(suggestions.len());
+        OverlayView::Menu {
+            suggestions,
+            active: menu.active(),
+            scroll: menu.scroll(),
+            query: query.to_string(),
+            expanded: menu.active_expanded(),
+        }
+    }
+
+    // The System A dialog view: the overlay status plus, when Ready, the
+    // visible (filtered) rows, the active row, and a detail string. The detail
+    // is the active model row's "(current)"/context hint if any (theme carries
+    // none). The Composer stays command-agnostic - it surfaces the active
+    // row's hint, and the model command's own row-building decides what that
+    // says.
+    fn dialog_view(&self, fallback_command: &str) -> OverlayView {
+        let DialogParts {
+            command,
+            status,
+            rows,
+            active,
+            detail,
+        } = self.selector.view_parts(fallback_command);
+        OverlayView::Dialog {
+            command,
+            status,
+            rows,
+            active,
+            detail,
         }
     }
 
@@ -746,12 +1105,10 @@ impl Composer {
             self.selector_generation += 1;
             self.value = format!("/{} ", row.value);
             self.cursor = self.value.chars().count();
-            self.slash_cursor = 0;
-            self.selector = Some(CommandSelector {
-                command: row.value.clone(),
-                status: SelectorStatus::Loading,
-                generation: self.selector_generation,
-            });
+            self.menu = Completion::new();
+            let filter_mode = filter_mode_for(&row.value);
+            self.selector
+                .open(row.value.clone(), self.selector_generation, filter_mode);
             consumed(vec![Effect::Command {
                 name: row.value,
                 generation: self.selector_generation,
@@ -780,8 +1137,8 @@ impl Composer {
     fn clear(&mut self) {
         self.value = String::new();
         self.cursor = 0;
-        self.slash_cursor = 0;
-        self.selector = None;
+        self.menu = Completion::new();
+        self.selector.close();
     }
 
     // Closes the selector overlay AND clears the draft (they open together,
@@ -792,12 +1149,83 @@ impl Composer {
     }
 }
 
+// A key's intent inside the DIALOG sub-state (System A), the pure
+// classification [`Composer::classify_dialog_key`] produces so the fold is a
+// dispatch over it (IOSP): navigate, pick (Enter or a quick-select digit),
+// close, swallow (an editing char on a `Frozen` theme dialog), or edit (filter
+// a model dialog).
+enum DialogKey {
+    Nav(SelectionKey),
+    Pick(SelectionKey),
+    Close,
+    Swallow,
+    Edit(Key),
+}
+
 // A consumed key with no notice - the common case.
 fn consumed(effects: Vec<Effect>) -> KeyOutcome {
     KeyOutcome::Consumed {
         effects,
         notice: None,
     }
+}
+
+/// The digit-timeout clock the DIALOG's [`SelectionList`] never actually needs:
+/// model/theme dialogs are short (< 10 navigable rows), so every digit selects
+/// immediately and the buffered-timeout path is dead. A constant stands in for
+/// the host tick the approval radio's list gets from ui.rs.
+const NOW_UNUSED: Millis = 0;
+
+// Whether `key` inserts or removes draft TEXT (so a `Frozen` theme dialog can
+// swallow it while still letting Backspace-out and cursor moves through).
+fn is_text_edit(key: &Key) -> bool {
+    matches!(key, Key::Char(_) | Key::InsertNewline)
+}
+
+// The ALWAYS-refused rows of the routing table (pure predicate): keys the
+// Composer never folds whatever its state - page scroll, the display toggles,
+// and named/other keys. Extracted so the fold root stays an integration step.
+fn always_refused(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::PageUp
+            | Key::PageDown
+            | Key::ToggleThinking
+            | Key::ToggleTools
+            | Key::Named(_)
+            | Key::Other
+    )
+}
+
+// The DIALOG filter mode a committed command opens with (ADR-0051): the
+// `/model` dialog carries an editable fuzzy filter (suspenders surfaces
+// hundreds of catalog models - a deliberate divergence from qwen's filter-less
+// dialog); every other selector-opening command (`/theme`) is frozen-draft,
+// qwen-faithful. Keyed by name here because the two-systems policy is a
+// Composer-level decision, not something the command modules know about.
+fn filter_mode_for(command: &str) -> DialogFilter {
+    if command == "model" {
+        DialogFilter::Filtered
+    } else {
+        DialogFilter::Frozen
+    }
+}
+
+// Ranks the registry against the query token (ADR-0051 System B). No recency
+// store exists in suspenders yet, so an empty recent map + a constant clock are
+// passed - the `now` seam is honored in [`completion::rank`]'s signature for
+// when a store lands.
+fn rank_menu(query: &str) -> Vec<Suggestion> {
+    completion::rank(query, &|_| None, 0)
+}
+
+// Whether the active palette row's label is "long" (chars >= MAX_WIDTH, qwen
+// PrepareLabel): the gate for the `←/→` expand arms - a short active row lets
+// the arrows fall through to plain cursor moves (qwen returns false).
+fn active_label_is_long(suggestions: &[Suggestion], active: usize) -> bool {
+    suggestions
+        .get(active)
+        .is_some_and(|s| s.label.chars().count() >= completion::MAX_WIDTH)
 }
 
 // -- Draft editing (char-index string surgery) --
@@ -914,6 +1342,7 @@ pub fn first_visible_row(cursor_row: usize, visible: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view_model::RowRole;
 
     // =======================================================================
     // The Composer fold (state, first refusal, overlays, history).
@@ -983,14 +1412,34 @@ mod tests {
 
     // --- Slash Command menu (ADR-0032) --------------------------------------
 
-    #[test]
-    fn a_leading_slash_opens_the_menu_showing_every_command() {
-        match overlay(&slashing("/")) {
-            Some(OverlayView::Menu { rows, highlight }) => {
-                assert_eq!(rows, slash::rows(""));
-                assert_eq!(highlight, 0);
+    // The palette's suggestion VALUES (System B) for the open Menu overlay.
+    fn menu_values(c: &Composer) -> Vec<String> {
+        match overlay(c) {
+            Some(OverlayView::Menu { suggestions, .. }) => {
+                suggestions.iter().map(|s| s.value.clone()).collect()
             }
-            other => panic!("expected the menu on '/', got {other:?}"),
+            other => panic!("expected the menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_leading_slash_opens_the_palette_showing_every_command() {
+        match overlay(&slashing("/")) {
+            Some(OverlayView::Menu {
+                suggestions,
+                active,
+                ..
+            }) => {
+                assert_eq!(
+                    suggestions
+                        .iter()
+                        .map(|s| s.value.clone())
+                        .collect::<Vec<_>>(),
+                    vec!["model", "theme"]
+                );
+                assert_eq!(active, 0);
+            }
+            other => panic!("expected the palette on '/', got {other:?}"),
         }
     }
 
@@ -1001,50 +1450,40 @@ mod tests {
     }
 
     #[test]
-    fn typing_filters_the_menu_by_the_command_token() {
-        match overlay(&slashing("/mod")) {
-            Some(OverlayView::Menu { rows, .. }) => {
-                assert_eq!(rows, slash::rows("mod"));
-                assert_eq!(rows.len(), 1);
-            }
-            other => panic!("expected the filtered menu, got {other:?}"),
-        }
-
-        // A token that matches nothing leaves an empty (but open) menu.
+    fn typing_ranks_the_palette_by_the_command_token() {
+        // "/mod" prefix-matches only "model".
+        assert_eq!(menu_values(&slashing("/mod")), vec!["model"]);
+        // A token that matches nothing leaves an empty (but open) palette.
         match overlay(&slashing("/zzz")) {
-            Some(OverlayView::Menu { rows, .. }) => assert!(rows.is_empty()),
-            other => panic!("expected the open empty menu, got {other:?}"),
+            Some(OverlayView::Menu { suggestions, .. }) => assert!(suggestions.is_empty()),
+            other => panic!("expected the open empty palette, got {other:?}"),
         }
     }
 
     #[test]
-    fn up_down_move_the_menu_highlight_clamped_to_the_filtered_rows() {
-        // Two commands (model, theme): the arrows move between them and
-        // saturate at both ends - consumed either way (never a scroll for
-        // the caller).
+    fn up_down_move_the_palette_highlight_wrapping() {
+        // Two commands: the arrows move between them and WRAP (System B nav).
         let mut c = slashing("/");
         assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
         assert_eq!(menu_highlight(&c), 1);
         assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
-        assert_eq!(menu_highlight(&c), 1, "saturates at the last row");
+        assert_eq!(menu_highlight(&c), 0, "wraps to the first");
         assert_eq!(fold_consumed(&mut c, Key::ArrowUp), vec![]);
-        assert_eq!(menu_highlight(&c), 0);
-        assert_eq!(fold_consumed(&mut c, Key::ArrowUp), vec![]);
-        assert_eq!(menu_highlight(&c), 0);
+        assert_eq!(menu_highlight(&c), 1, "wraps to the last");
 
-        // Typing narrows the menu to one row: the highlight clamps onto it.
+        // Typing narrows the palette to one row: the highlight clamps onto it.
         let mut c = slashing("/");
         assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
         assert_eq!(menu_highlight(&c), 1);
         for key in [Key::Char('m'), Key::Char('o'), Key::Char('d')] {
             assert_eq!(fold_consumed(&mut c, key), vec![]);
         }
-        assert_eq!(menu_highlight(&c), 0, "clamped to the one filtered row");
+        assert_eq!(menu_highlight(&c), 0, "clamped to the one ranked row");
     }
 
     fn menu_highlight(c: &Composer) -> usize {
         match overlay(c) {
-            Some(OverlayView::Menu { highlight, .. }) => highlight,
+            Some(OverlayView::Menu { active, .. }) => active,
             other => panic!("expected the menu, got {other:?}"),
         }
     }
@@ -1069,7 +1508,7 @@ mod tests {
         assert_eq!(c.view().cursor, 7);
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Loading,
                 ..
             })
@@ -1118,7 +1557,13 @@ mod tests {
         assert_eq!(fold_consumed(&mut c, Key::Char('l')), vec![]);
         assert_eq!(c.view().draft, "/model");
         match overlay(&c) {
-            Some(OverlayView::Menu { rows, .. }) => assert_eq!(rows, slash::rows("model")),
+            Some(OverlayView::Menu { suggestions, .. }) => assert_eq!(
+                suggestions
+                    .iter()
+                    .map(|s| s.value.clone())
+                    .collect::<Vec<_>>(),
+                vec!["model"]
+            ),
             other => panic!("expected the menu, got {other:?}"),
         }
 
@@ -1188,7 +1633,7 @@ mod tests {
     // The highlighted index of a selector overlay.
     fn highlight_of(c: &Composer) -> usize {
         match overlay(c) {
-            Some(OverlayView::Selector { highlight, .. }) => highlight,
+            Some(OverlayView::Dialog { active, .. }) => active,
             other => panic!("expected a selector overlay, got {other:?}"),
         }
     }
@@ -1247,7 +1692,7 @@ mod tests {
         // Overlay is Loading for `model`.
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Loading,
                 ..
             })
@@ -1268,7 +1713,7 @@ mod tests {
         assert_eq!(c.view().draft, "/model ");
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Loading,
                 ..
             })
@@ -1281,15 +1726,16 @@ mod tests {
         let mut c = model_selector_ready(rows);
         // Ready, all rows shown (rest is "").
         match overlay(&c) {
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Ready,
                 rows,
-                highlight,
+                active,
                 command,
+                ..
             }) => {
                 assert_eq!(command, "model");
                 assert_eq!(rows.len(), 3);
-                assert_eq!(highlight, 0);
+                assert_eq!(active, 0);
             }
             other => panic!("expected Ready selector, got {other:?}"),
         }
@@ -1297,7 +1743,7 @@ mod tests {
         fold_consumed(&mut c, Key::Char('q'));
         assert_eq!(c.view().draft, "/model q");
         match overlay(&c) {
-            Some(OverlayView::Selector { rows, .. }) => {
+            Some(OverlayView::Dialog { rows, .. }) => {
                 assert_eq!(rows, vec![model_row("qwen")], "only 'qwen' contains 'q'");
             }
             other => panic!("expected filtered selector, got {other:?}"),
@@ -1305,16 +1751,13 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_reveals_note_hint_carries_the_overflow_count() {
-        // A greyed group with more matches than the reveal cap: the overlay's
-        // note row reads "set OPENROUTER_API_KEY · 3 more", so the user sees
-        // how much of the catalog the cap held back.
-        use crate::ui::selector::COLLAPSED_REVEAL_CAP;
+    fn a_model_filter_reveals_a_matching_greyed_group_with_its_trailing_note() {
+        // System A (ADR-0051): the numbered dialog scrolls instead of collapsing,
+        // so a greyed-group filter reveals every matching collapsed row and keeps
+        // the trailing note - no "· N more" cap. Typing the provider name shows
+        // its whole catalog plus the "unavailable" note.
         let mut rows = vec![SelectorRow::header("openrouter")];
-        rows.extend(
-            (0..COLLAPSED_REVEAL_CAP + 3)
-                .map(|i| SelectorRow::collapsed(format!("openrouter/m{i}"))),
-        );
+        rows.extend((0..8).map(|i| SelectorRow::collapsed(format!("openrouter/m{i}"))));
         rows.push(SelectorRow::note(
             "  unavailable",
             Some("set OPENROUTER_API_KEY".into()),
@@ -1322,12 +1765,11 @@ mod tests {
         let mut c = model_selector_ready(rows);
         press(&mut c, typed("openrouter"));
         match overlay(&c) {
-            Some(OverlayView::Selector { rows, .. }) => {
+            Some(OverlayView::Dialog { rows, .. }) => {
+                // header + 8 collapsed + note, none collapsed away.
+                assert_eq!(rows.len(), 10);
                 let note = rows.last().expect("the note trails the group");
-                assert_eq!(
-                    note.hint.as_deref(),
-                    Some("set OPENROUTER_API_KEY · 3 more")
-                );
+                assert_eq!(note.hint.as_deref(), Some("set OPENROUTER_API_KEY"));
             }
             other => panic!("expected a Ready selector, got {other:?}"),
         }
@@ -1335,8 +1777,9 @@ mod tests {
 
     #[test]
     fn arrows_move_within_the_filtered_rows_of_a_ready_overlay() {
-        // Arrow-only nav (ADR-0046): the wheel no longer reaches the Composer
-        // (mouse capture removed), so the overlay navigates by the arrows alone.
+        // Arrow-only nav (ADR-0046): the wheel no longer reaches the Composer.
+        // System A (ADR-0051, qwen `useSelectionList`) WRAPS at the ends - a
+        // divergence from the retired saturating Selector.
         let rows = vec![model_row("qwen"), model_row("llama"), model_row("gpt")];
         let mut c = model_selector_ready(rows);
         assert_eq!(
@@ -1348,9 +1791,9 @@ mod tests {
         fold_consumed(&mut c, Key::ArrowDown);
         assert_eq!(highlight_of(&c), 2);
         fold_consumed(&mut c, Key::ArrowDown);
-        assert_eq!(highlight_of(&c), 2, "saturates at the last row");
+        assert_eq!(highlight_of(&c), 0, "wraps from the last row to the first");
         fold_consumed(&mut c, Key::ArrowUp);
-        assert_eq!(highlight_of(&c), 1);
+        assert_eq!(highlight_of(&c), 2, "wraps back to the last");
     }
 
     #[test]
@@ -1393,7 +1836,7 @@ mod tests {
         deliver(&mut c, Event::selector_failed(generation, "no server"));
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Failed(_),
                 ..
             })
@@ -1402,7 +1845,7 @@ mod tests {
         assert_eq!(fold_consumed(&mut c, Key::Enter), vec![]);
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Failed(_),
                 ..
             })
@@ -1415,6 +1858,197 @@ mod tests {
         assert_eq!(fold_consumed(&mut c, Key::Escape), vec![]);
         assert_eq!(c.view().draft, "");
         assert_eq!(overlay(&c), None);
+    }
+
+    // --- the Frozen (theme) dialog (ADR-0051 System A, filter-less) ---------
+
+    // A theme (Frozen) dialog Ready with `rows` - the mirror of
+    // `model_selector_ready` but for `/theme`, which commits to a `Frozen`
+    // flavour that swallows editing keys.
+    fn theme_selector_ready(rows: Vec<SelectorRow>) -> Composer {
+        let mut c = slashing("/theme");
+        let generation = command_generation(&fold_consumed(&mut c, Key::Enter));
+        deliver(&mut c, Event::selector_ready(generation, rows));
+        c
+    }
+
+    // The visible dialog rows of a Ready overlay.
+    fn dialog_rows_of(c: &Composer) -> Vec<SelectorRow> {
+        match overlay(c) {
+            Some(OverlayView::Dialog { rows, .. }) => rows,
+            other => panic!("expected a Ready selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_typed_char_in_a_frozen_theme_dialog_is_swallowed() {
+        // Typing in a Frozen dialog must NOT grow the `/theme ` draft nor
+        // refilter the rows (qwen's filter-less dialog).
+        let mut c = theme_selector_ready(vec![model_row("dark"), model_row("light")]);
+        let before = c.clone();
+        fold_consumed(&mut c, Key::Char('d'));
+        assert_eq!(c.view().draft, "/theme ", "the draft did not grow");
+        assert_eq!(
+            dialog_rows_of(&c).len(),
+            2,
+            "the rows were not refiltered by the swallowed char"
+        );
+        assert_eq!(c, before, "a swallowed char leaves the Composer unchanged");
+    }
+
+    #[test]
+    fn a_digit_quick_selects_in_a_frozen_theme_dialog() {
+        // In a Frozen dialog a digit is a quick-select (not a filter char).
+        let mut c = theme_selector_ready(vec![model_row("dark"), model_row("light")]);
+        // '2' picks the second row.
+        assert_eq!(
+            fold_consumed(&mut c, Key::Char('2')),
+            vec![Effect::SelectorChosen {
+                command: "theme".into(),
+                value: "light".into(),
+            }]
+        );
+        assert_eq!(overlay(&c), None, "picking closed the dialog");
+    }
+
+    #[test]
+    fn backspace_and_cursor_moves_pass_through_a_frozen_theme_dialog() {
+        // Frozen swallows text INSERTION, but Backspace-out and cursor moves
+        // still work (so the user can back out of the sub-state).
+        // A cursor move (Left) is consumed and leaves the draft TEXT intact
+        // (only the cursor position changes).
+        let mut c = theme_selector_ready(vec![model_row("dark")]);
+        let cursor_before = c.view().cursor;
+        fold_consumed(&mut c, Key::Left);
+        assert_eq!(c.view().draft, "/theme ", "a cursor move never edits text");
+        assert_eq!(c.view().cursor, cursor_before - 1, "the cursor moved left");
+        // From the trailing-space cursor, Backspace removes the space, dropping
+        // back to the menu (rest goes None).
+        let mut c = theme_selector_ready(vec![model_row("dark")]);
+        fold_consumed(&mut c, Key::Backspace);
+        assert_eq!(c.view().draft, "/theme");
+        assert!(matches!(overlay(&c), Some(OverlayView::Menu { .. })));
+    }
+
+    #[test]
+    fn selector_highlight_repoints_to_the_frozen_dialogs_active_row() {
+        // The theme live-preview reads `selector_highlight` (the active row of
+        // the frozen dialog); arrowing repoints it, so the preview follows.
+        let mut c = theme_selector_ready(vec![model_row("dark"), model_row("light")]);
+        let (command, row) = c.selector_highlight().expect("a Ready theme dialog");
+        assert_eq!(command, "theme");
+        assert_eq!(row, &model_row("dark"), "the first row previews first");
+        fold_consumed(&mut c, Key::ArrowDown);
+        assert_eq!(
+            c.selector_highlight().unwrap().1,
+            &model_row("light"),
+            "arrowing repoints the preview"
+        );
+    }
+
+    // --- filter_rows travel rules (ADR-0051 group retention) ----------------
+
+    #[test]
+    fn filter_rows_travels_a_header_and_notes_when_a_member_matches() {
+        // A group whose MEMBER matches keeps its header and its trailing note,
+        // even though neither the header nor the note text contains the needle.
+        let raw = vec![
+            SelectorRow::header("openai"),
+            SelectorRow::new("gpt-4", "gpt-4", None),
+            SelectorRow::note("  note", Some("info".into())),
+        ];
+        let out = filter_rows(&raw, "gpt");
+        assert_eq!(out.len(), 3, "header + member + note all travel");
+        assert_eq!(out[0].role, RowRole::Header);
+        assert_eq!(out[2].role, RowRole::Note);
+    }
+
+    #[test]
+    fn filter_rows_keeps_header_and_notes_on_a_header_match_alone() {
+        // The header label itself matches: the whole group's header + notes are
+        // shown even if no member matches the needle.
+        let raw = vec![
+            SelectorRow::header("anthropic"),
+            SelectorRow::new("claude", "claude", None),
+            SelectorRow::note("  note", Some("info".into())),
+        ];
+        let out = filter_rows(&raw, "anthropic");
+        // header hit → group_hit true → header + note kept; the member does not
+        // contain "anthropic" so it is NOT kept (member keeps only on its own).
+        let roles: Vec<_> = out.iter().map(|r| r.role).collect();
+        assert!(roles.contains(&RowRole::Header));
+        assert!(roles.contains(&RowRole::Note));
+    }
+
+    #[test]
+    fn filter_rows_drops_a_group_that_matches_nothing() {
+        let raw = vec![
+            SelectorRow::header("openai"),
+            SelectorRow::new("gpt-4", "gpt-4", None),
+            SelectorRow::header("anthropic"),
+            SelectorRow::new("claude", "claude", None),
+        ];
+        let out = filter_rows(&raw, "claude");
+        // Only the anthropic group survives.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].label, "anthropic");
+        assert_eq!(out[1].label, "claude");
+    }
+
+    #[test]
+    fn filter_rows_reveals_a_collapsed_member_by_its_name() {
+        // A collapsed (greyed) member is revealed when its own label matches.
+        let raw = vec![
+            SelectorRow::header("openrouter"),
+            SelectorRow::collapsed("openrouter/mixtral"),
+            SelectorRow::collapsed("openrouter/llama"),
+        ];
+        let out = filter_rows(&raw, "mixtral");
+        // header travels (member matched) + the matching collapsed row; the
+        // non-matching collapsed row is dropped.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, RowRole::Header);
+        assert_eq!(out[1].label, "openrouter/mixtral");
+    }
+
+    #[test]
+    fn a_model_dialog_nav_skips_the_disabled_header_end_to_end() {
+        // End-to-end (is_stop → disabled → header-skip): the header is not a
+        // cursor stop, so ArrowDown from the first member lands on the next
+        // member, jumping the header row between the groups.
+        let rows = vec![
+            SelectorRow::header("openai"),
+            model_row("gpt-4"),
+            SelectorRow::header("anthropic"),
+            model_row("claude"),
+        ];
+        let mut c = model_selector_ready(rows);
+        // Initial active snaps onto the first navigable row (index 1, the
+        // member - index 0 is the disabled header).
+        assert_eq!(highlight_of(&c), 1, "active snaps off the header");
+        // ArrowDown from the first member skips the second header (index 2) and
+        // lands on the second member (index 3).
+        fold_consumed(&mut c, Key::ArrowDown);
+        assert_eq!(highlight_of(&c), 3, "nav skipped the disabled header");
+    }
+
+    // --- the `←/→` expand mechanic (ADR-0051 System B, qwen expandedIndex) --
+
+    #[test]
+    fn arrows_expand_a_long_active_palette_row_but_move_the_cursor_on_a_short_one() {
+        // A short active row (a command name) never expands: `←/→` fall through
+        // to plain cursor moves, so the draft cursor changes and the palette's
+        // expanded flag stays false.
+        let mut c = slashing("/m");
+        let before_cursor = c.view().cursor;
+        fold_consumed(&mut c, Key::Left);
+        assert_ne!(c.view().cursor, before_cursor, "short row: cursor moved");
+        match overlay(&c) {
+            Some(OverlayView::Menu { expanded, .. }) => {
+                assert!(!expanded, "a short active row never expands")
+            }
+            other => panic!("expected the palette, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1436,7 +2070,7 @@ mod tests {
         );
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Loading,
                 ..
             })
@@ -1490,11 +2124,9 @@ mod tests {
         // A second (stale) ready arrives - the overlay is no longer Loading.
         deliver(&mut c, Event::selector_ready(1, vec![model_row("gpt")]));
         match overlay(&c) {
-            Some(OverlayView::Selector {
-                rows, highlight, ..
-            }) => {
+            Some(OverlayView::Dialog { rows, active, .. }) => {
                 assert_eq!(rows.len(), 2, "kept the first delivery");
-                assert_eq!(highlight, 1, "cursor untouched");
+                assert_eq!(active, 1, "cursor untouched");
             }
             other => panic!("expected Ready selector, got {other:?}"),
         }
@@ -1519,7 +2151,7 @@ mod tests {
         );
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Loading,
                 ..
             })
@@ -1530,7 +2162,7 @@ mod tests {
             Event::selector_ready(second, vec![model_row("qwen")]),
         );
         match overlay(&c) {
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Ready,
                 rows,
                 ..
@@ -1550,7 +2182,7 @@ mod tests {
         deliver(&mut c, Event::selector_failed(first, "no server"));
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Loading,
                 ..
             })
@@ -1559,7 +2191,7 @@ mod tests {
         deliver(&mut c, Event::selector_failed(second, "no server"));
         assert!(matches!(
             overlay(&c),
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Failed(_),
                 ..
             })
@@ -1645,7 +2277,7 @@ mod tests {
     fn leftover_selector() -> Composer {
         let mut c = model_selector_ready(vec![model_row("qwen")]);
         fold_consumed(&mut c, Key::Backspace); // `/model ` → `/model`: menu again
-        assert!(c.selector.is_some(), "the overlay must linger for the test");
+        assert!(c.selector.is_open(), "the overlay must linger for the test");
         c
     }
 

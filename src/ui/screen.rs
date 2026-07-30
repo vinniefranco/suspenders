@@ -169,6 +169,10 @@ pub enum Key {
     /// (ADR-0050). Named (not `Char`) so the intent reads at the mapping and
     /// routing seams alike.
     CycleApprovalMode,
+    /// Bare Tab: accepts the highlighted `/` palette suggestion (ADR-0051
+    /// System B, qwen `handleAutocomplete`). Inert outside the palette (the
+    /// editing fall-through refuses it), so it never types a literal tab.
+    Tab,
     Char(char),
     /// A key the core does not act on (function keys, etc.).
     Other,
@@ -2515,7 +2519,7 @@ mod tests {
         assert_eq!(effects, vec![]);
         assert_eq!(items(&t), vec![], "never a Transcript item");
         match t.composer().view().overlay {
-            Some(OverlayView::Selector {
+            Some(OverlayView::Dialog {
                 status: OverlayStatus::Ready,
                 rows: got,
                 ..

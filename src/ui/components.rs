@@ -25,7 +25,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::approvals::ApprovalMode;
 use crate::plan::{TodoItem, TodoStatus};
-use crate::ui::composer::{self, ComposerLayout, OverlayStatus, OverlayView};
+use crate::ui::completion;
+use crate::ui::composer::{self, ComposerLayout, ComposerView, OverlayStatus, OverlayView};
 use crate::ui::lull;
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
@@ -392,34 +393,13 @@ pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ct
     let FrameCtx { conn, anim, theme } = ctx;
     let area = frame.area();
     let composer_view = t.composer().view();
-    let layout = composer::layout(
-        composer_view.draft,
-        composer_view.cursor,
-        area.width.saturating_sub(2) as usize,
-    );
-    let composer_height = capped_composer_height(&layout, area.height as usize);
-    // The sticky "Current tasks" box (ADR-0048) DERIVES from the latest committed
-    // Todo item; its zone is reserved only when the predicate says it shows, so a
-    // pending or all-completed list costs no rows.
-    let sticky = sticky_todos(
-        t.transcript().latest_todo(),
-        t.transcript().committed_high_water(),
-    );
-    let sticky_height = sticky
-        .map(|items| sticky_todos_height(items.len()))
-        // A short frame that cannot hold the sticky box PLUS the status row, the
-        // composer, and one body row drops the box entirely (ADR-0029 measure ==
-        // draw: the zone we reserve is the zone we can draw). Otherwise Layout
-        // would squeeze the sticky zone below its measured height and the box
-        // would draw a headless/borderless fragment over the composer.
-        .filter(|&h| sticky_fits(area.height as usize, h, composer_height))
-        .unwrap_or(0);
-    let chunks = frame_chunks(area, sticky_height, composer_height);
-
-    let body_area = chunks[0];
+    // Operation → Integration (IOSP): the pure [`pending_layout`] decides every
+    // Rect and whether the sticky box / overlay show; below we only issue the
+    // draw calls against that plan.
+    let plan = pending_layout(area, &composer_view, t);
     render_pending_body(
         frame,
-        body_area,
+        plan.body,
         &mut PendingBodyParams {
             screen: t,
             cache,
@@ -427,23 +407,98 @@ pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ct
         },
         theme,
     );
-
-    if let Some(items) = sticky {
-        render_sticky_todos(frame, sticky_box_area(chunks[1]), items, theme);
-    }
-
+    render_sticky_slot(frame, plan.sticky_box, plan.sticky_items, theme);
     // The status bar's position segment is a literal `Bot` in the inline model
     // (ADR-0046): native scrollback owns history and the pending body always
     // follows the tail, so there is no scroll position to report.
-    render_status_bar(frame, chunks[2], StatusBarCtx { screen: t, conn }, theme);
-    render_composer(frame, chunks[3], t, &layout, theme);
-
-    if let Some(overlay) = composer_view.overlay {
-        render_composer_popup(frame, chunks[2].y, area, &overlay, theme);
-    }
+    render_status_bar(frame, plan.status, StatusBarCtx { screen: t, conn }, theme);
+    render_composer(frame, plan.composer, t, &plan.draft, theme);
+    render_composer_popup_slot(frame, plan.popup_top, area, &composer_view.overlay, theme);
     // The Approval is rendered INLINE now (ADR-0049): the confirming ToolCall's
     // box carries the question + radio, drawn as part of the pending body above.
     // No modal overlay.
+}
+
+/// The pending region's whole geometry (the compute-plan / parameter object
+/// behind [`render_pending`]): the four zone Rects, the pre-wrapped composer
+/// [`ComposerLayout`] the composer + cursor draw from, the resolved sticky
+/// box Rect + its items (`None` when the box is dropped), and the status
+/// bar's y for the overlay anchor. Built by the pure [`pending_layout`]
+/// operation so [`render_pending`] is a call-only assembler (IOSP, ADR-0029
+/// measure == draw). Borrows `t` for the sticky items' lifetime.
+struct PendingLayout<'a> {
+    body: Rect,
+    sticky_box: Rect,
+    sticky_items: Option<&'a [TodoItem]>,
+    status: Rect,
+    composer: Rect,
+    draft: ComposerLayout,
+    popup_top: u16,
+}
+
+/// Operation (IOSP): the pending region's geometry for this frame. Wraps the
+/// draft, caps the composer zone, decides the sticky "Current tasks" box
+/// (ADR-0048) - reserved only when it fits alongside the status row, composer,
+/// and one body row (ADR-0029 measure == draw) - and splits `area` into the
+/// four zones. Pure: no frame access, no drawing.
+fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> PendingLayout<'a> {
+    let draft = composer::layout(
+        view.draft,
+        view.cursor,
+        area.width.saturating_sub(2) as usize,
+    );
+    let composer_height = capped_composer_height(&draft, area.height as usize);
+    // The sticky box DERIVES from the latest committed Todo item; a pending or
+    // all-completed list, or a frame too short to also hold the box, drops it
+    // (costs no rows). The `.filter` is the measure == draw guard: reserving a
+    // zone we cannot fully draw would paint a headless fragment over the
+    // composer.
+    let sticky_items = sticky_todos(
+        t.transcript().latest_todo(),
+        t.transcript().committed_high_water(),
+    )
+    .filter(|items| {
+        sticky_fits(
+            area.height as usize,
+            sticky_todos_height(items.len()),
+            composer_height,
+        )
+    });
+    let sticky_height = sticky_items.map_or(0, |items| sticky_todos_height(items.len()));
+    let chunks = frame_chunks(area, sticky_height, composer_height);
+    PendingLayout {
+        body: chunks[0],
+        sticky_box: sticky_box_area(chunks[1]),
+        sticky_items,
+        status: chunks[2],
+        composer: chunks[3],
+        draft,
+        popup_top: chunks[2].y,
+    }
+}
+
+/// The sticky "Current tasks" slot: draws the box when the plan reserved one
+/// (`Some` items), else nothing. The presence branch lives HERE, so
+/// [`render_pending`] calls it unconditionally (IOSP).
+fn render_sticky_slot(frame: &mut Frame, area: Rect, items: Option<&[TodoItem]>, theme: &Theme) {
+    if let Some(items) = items {
+        render_sticky_todos(frame, area, items, theme);
+    }
+}
+
+/// The Composer overlay slot: draws the popup when an overlay is open, else
+/// nothing. The presence branch lives HERE, so [`render_pending`] calls it
+/// unconditionally (IOSP).
+fn render_composer_popup_slot(
+    frame: &mut Frame,
+    popup_top: u16,
+    area: Rect,
+    overlay: &Option<OverlayView>,
+    theme: &Theme,
+) {
+    if let Some(overlay) = overlay {
+        render_composer_popup(frame, popup_top, area, overlay, theme);
+    }
 }
 
 /// The scroll-free state [`render_pending_body`] needs each frame: the Screen it
@@ -660,12 +715,15 @@ fn draw_overflow_marker(frame: &mut Frame, area: Rect, theme: &Theme) {
 }
 
 /// Computes the bounding rect for the Composer overlay popup: body rows plus
-/// top/bottom border, capped so a long list never eats the screen, positioned
-/// just above `anchor_y` and horizontally centered within `area`. Pure - no
-/// frame access. `body_len` is the number of content lines the popup will hold.
-fn popup_rect(anchor_y: u16, area: Rect, body_len: usize) -> Rect {
+/// top/bottom border, capped at `body_cap` so a long list never eats the
+/// screen, positioned just above `anchor_y` and horizontally centered within
+/// `area`. Pure - no frame access. `body_len` is the number of content lines
+/// the popup will hold; `body_cap` is the most body rows it may occupy (System
+/// A dialogs cap at [`POPUP_MAX_ROWS`] and scroll; System B is already windowed
+/// to its suggestions + `▲/▼`/counter chrome, so it caps higher).
+fn popup_rect(anchor_y: u16, area: Rect, body_len: usize, body_cap: u16) -> Rect {
     let body_rows = body_len.max(1) as u16;
-    let height = (body_rows + 2).min(POPUP_MAX_ROWS + 2).min(area.height);
+    let height = (body_rows + 2).min(body_cap + 2).min(area.height);
     let width = area.width.saturating_sub(2).max(1);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = anchor_y.saturating_sub(height);
@@ -685,68 +743,97 @@ fn selector_popup_title(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
-/// Resolves the body lines for a Selector popup given the overlay status: a
-/// loading/error status line, or the full row list when ready. Pure - no draw
-/// calls, only styled [`Line`] construction.
-fn selector_popup_lines(
-    title: &str,
-    status: &OverlayStatus,
-    rows: &[SelectorRow],
-    highlight: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+/// The body lines a status line spells: a Loading or Failed dialog draws one
+/// muted/error line. `Ready` returns `None` (the caller draws the rows). Pure.
+fn dialog_status_line(status: &OverlayStatus, title: &str, theme: &Theme) -> Option<Line<'static>> {
     match status {
-        OverlayStatus::Loading => vec![Line::styled(
+        OverlayStatus::Loading => Some(Line::styled(
             format!("loading {title}…"),
             Style::default()
                 .fg(tui_color(theme.muted))
                 .add_modifier(Modifier::ITALIC),
-        )],
-        OverlayStatus::Failed(msg) => vec![Line::styled(
+        )),
+        OverlayStatus::Failed(msg) => Some(Line::styled(
             format!("failed: {msg}"),
             Style::default()
                 .fg(tui_color(theme.error))
                 .add_modifier(Modifier::BOLD),
-        )],
-        OverlayStatus::Ready => popup_rows(rows, highlight, theme),
+        )),
+        OverlayStatus::Ready => None,
     }
 }
 
-/// Derives the popup title and body lines from the current overlay view.
-/// Pure - reads only the view and theme, emits no draw calls.
-fn popup_title_and_lines(view: &OverlayView, theme: &Theme) -> (String, Vec<Line<'static>>) {
-    match view {
-        OverlayView::Menu { rows, highlight } => {
-            ("commands".into(), popup_rows(rows, *highlight, theme))
-        }
-        OverlayView::Selector {
-            command,
-            status,
-            rows,
-            highlight,
-        } => {
-            let title = selector_popup_title(command);
-            let lines = selector_popup_lines(&title, status, rows, *highlight, theme);
-            (title, lines)
-        }
+// What one overlay draws: the box title, its body lines, and (System A only)
+// the active row the box scrolls to keep visible + the body-row cap. A pure
+// Parameter Object so the popup painter is one integration step over it (IOSP).
+struct PopupDraw {
+    title: String,
+    lines: Vec<Line<'static>>,
+    /// `Some` for System A (the box re-scrolls to this active row); `None` for
+    /// System B (already windowed).
+    scroll_active: Option<usize>,
+    body_cap: u16,
+}
+
+/// The System B palette body cap: the [`MAX_SUGGESTIONS`] window plus the three
+/// chrome rows (`▲`, `▼`, and the `(n/m)` counter) it may add.
+const MENU_BODY_CAP: u16 = MAX_SUGGESTIONS as u16 + 3;
+
+/// The System B palette's cursor state (Parameter Object): the highlighted row,
+/// the scroll-window top, and whether the active row is expanded (`←/→`).
+/// Bundled so the palette draw pipeline stays integration steps.
+#[derive(Debug, Clone, Copy)]
+struct MenuCursor {
+    active: usize,
+    scroll: usize,
+    expanded: bool,
+}
+
+// The System B (`/` palette) draw plan: the color-only suggestion rows +
+// windowing chrome; the box never re-scrolls (`scroll_active` None).
+fn menu_draw(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    inner_width: u16,
+    theme: &Theme,
+) -> PopupDraw {
+    PopupDraw {
+        title: "commands".to_string(),
+        lines: suggestion_rows(suggestions, cursor, inner_width, theme),
+        scroll_active: None,
+        body_cap: MENU_BODY_CAP,
     }
 }
 
-/// Returns the highlighted row index from an overlay view, used to scroll the
-/// list so the cursor stays visible when the popup overflows its height.
-fn popup_highlight(view: &OverlayView) -> usize {
-    match view {
-        OverlayView::Menu { highlight, .. } => *highlight,
-        OverlayView::Selector { highlight, .. } => *highlight,
+// The System A (numbered `›` dialog) draw plan: a status line, or the numbered
+// rows the box scrolls to keep the active row visible.
+fn dialog_draw(
+    command: &str,
+    status: &OverlayStatus,
+    rows: &[SelectorRow],
+    active: usize,
+    inner_width: u16,
+    theme: &Theme,
+) -> PopupDraw {
+    let title = selector_popup_title(command);
+    let lines = match dialog_status_line(status, &title, theme) {
+        Some(line) => vec![line],
+        None => dialog_rows(rows, active, inner_width, theme),
+    };
+    PopupDraw {
+        title,
+        lines,
+        scroll_active: Some(active),
+        body_cap: POPUP_MAX_ROWS,
     }
 }
 
-/// The inline Composer overlay popup (ADR-0032/0033): a compact bordered list
-/// anchored just above `anchor_y` (the status bar's row), listing the current
-/// [`OverlayView`]'s rows with the highlighted one reversed and any hint
-/// dimmed. The `Selector`'s `Loading`/`Failed` states draw a single status
-/// line instead of rows. Inline and height-bounded - never the full screen:
-/// the overlay is a Composer state, not a modal.
+/// The inline Composer overlay popup (ADR-0051): a compact bordered list
+/// anchored just above `anchor_y`. The TWO systems render distinctly - `Menu`
+/// (System B) is the fuzzy `/` palette ([`menu_draw`]), `Dialog` (System A) a
+/// committed command's numbered `›` list ([`dialog_draw`]). This is the one
+/// integration step: pick the draw plan, size the box, blit the scrolled
+/// window (IOSP). Inline and height-bounded - never the full screen.
 fn render_composer_popup(
     frame: &mut Frame,
     anchor_y: u16,
@@ -754,24 +841,478 @@ fn render_composer_popup(
     view: &OverlayView,
     theme: &Theme,
 ) {
-    let (title, lines) = popup_title_and_lines(view, theme);
-    let highlight = popup_highlight(view);
-    let popup = popup_rect(anchor_y, area, lines.len());
+    let inner_width = area.width.saturating_sub(4).max(1);
+    let plan = match view {
+        OverlayView::Menu {
+            suggestions,
+            active,
+            scroll,
+            query: _,
+            expanded,
+        } => menu_draw(
+            suggestions,
+            MenuCursor {
+                active: *active,
+                scroll: *scroll,
+                expanded: *expanded,
+            },
+            inner_width,
+            theme,
+        ),
+        OverlayView::Dialog {
+            command,
+            status,
+            rows,
+            active,
+            detail: _,
+        } => dialog_draw(command, status, rows, *active, inner_width, theme),
+    };
 
+    let popup = popup_rect(anchor_y, area, plan.lines.len(), plan.body_cap);
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(padded(&title))
+        .title(padded(&plan.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tui_color(theme.popup_border)));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // Scroll the highlighted row into view when the list overflows the box.
     let visible = inner.height as usize;
-    let top = composer::first_visible_row(highlight, visible.max(1));
-    let shown: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
+    let top = plan
+        .scroll_active
+        .map(|a| composer::first_visible_row(a, visible.max(1)))
+        .unwrap_or(0);
+    let shown: Vec<Line> = plan.lines.into_iter().skip(top).take(visible).collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }
+
+/// The System B (`/` palette) suggestion rows (qwen `SuggestionsDisplay.tsx`):
+/// color-only, NO `›` marker, NO numbers. The active row reads `text.accent`,
+/// the rest `text.secondary`; two columns (command | description) with the
+/// command column capped at half the width; the fuzzy match substring is drawn
+/// INVERTED (qwen `PrepareLabel`). Only the [`MAX_SUGGESTIONS`] window from
+/// `scroll` is emitted, framed by `▲`/`▼` when there is more above/below and a
+/// trailing `(active+1/total)` counter when the list overflows the window.
+fn suggestion_rows(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if suggestions.is_empty() {
+        return vec![no_matches_line(theme)];
+    }
+    let width = inner_width as usize;
+    let frame = suggestion_frame(suggestions, cursor.scroll, width);
+    up_arrow_line(&frame, theme)
+        .into_iter()
+        .chain(suggestion_body_lines(
+            suggestions,
+            cursor,
+            &frame,
+            width,
+            theme,
+        ))
+        .chain(down_arrow_line(&frame, theme))
+        .chain(counter_line(
+            suggestions.len(),
+            cursor.active,
+            &frame,
+            theme,
+        ))
+        .collect()
+}
+
+/// The leading `▲` scroll indicator, present only when rows are scrolled off
+/// the top (a one-branch pure row builder).
+fn up_arrow_line(frame: &SuggestionFrame, theme: &Theme) -> Option<Line<'static>> {
+    frame
+        .show_up
+        .then(|| Line::styled("▲", primary_style(theme)))
+}
+
+/// The windowed suggestion rows, each with its active flag resolved against
+/// `frame.start` (a pure row builder).
+fn suggestion_body_lines(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    frame: &SuggestionFrame,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    suggestions[frame.start..frame.end]
+        .iter()
+        .enumerate()
+        .map(|(offset, s)| {
+            let is_active = frame.start + offset == cursor.active;
+            let state = RowState {
+                active: is_active,
+                expanded: is_active && cursor.expanded,
+            };
+            suggestion_row(s, state, frame.cmd_col, width, theme)
+        })
+        .collect()
+}
+
+/// The trailing `▼` scroll indicator, present only when rows extend below the
+/// window (a one-branch pure row builder).
+fn down_arrow_line(frame: &SuggestionFrame, theme: &Theme) -> Option<Line<'static>> {
+    frame
+        .show_down
+        .then(|| Line::styled("▼", secondary_style(theme)))
+}
+
+/// The trailing `(active+1/total)` counter, present only when the list
+/// overflows the window (a one-branch pure row builder).
+fn counter_line(
+    total: usize,
+    active: usize,
+    frame: &SuggestionFrame,
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    frame
+        .show_counter
+        .then(|| Line::styled(format!("({}/{total})", active + 1), secondary_style(theme)))
+}
+
+/// The pure frame computation behind [`suggestion_rows`] (compute-plan
+/// pattern): the visible `[start, end)` window from `scroll`, the command
+/// column width, and whether the `▲`/`▼` scroll arrows and the `(n/m)` counter
+/// chrome rows apply. All the arithmetic and branching lives here so
+/// [`suggestion_rows`] is a call-only assembler folding this into `Line`s
+/// (IOSP). Assumes `suggestions` is non-empty (the caller guards).
+struct SuggestionFrame {
+    start: usize,
+    end: usize,
+    cmd_col: usize,
+    show_up: bool,
+    show_down: bool,
+    show_counter: bool,
+}
+
+fn suggestion_frame(
+    suggestions: &[completion::Suggestion],
+    scroll: usize,
+    width: usize,
+) -> SuggestionFrame {
+    let total = suggestions.len();
+    let start = scroll.min(total.saturating_sub(1));
+    let end = (start + MAX_SUGGESTIONS).min(total);
+    SuggestionFrame {
+        start,
+        end,
+        cmd_col: command_column_width(suggestions, width),
+        show_up: start > 0,
+        show_down: end < total,
+        show_counter: total > MAX_SUGGESTIONS,
+    }
+}
+
+/// The "no matches" placeholder line (muted italic) - the empty-palette body.
+fn no_matches_line(theme: &Theme) -> Line<'static> {
+    Line::styled(
+        "no matches",
+        Style::default()
+            .fg(tui_color(theme.muted))
+            .add_modifier(Modifier::ITALIC),
+    )
+}
+
+/// The command column width (qwen `commandColumnWidth`): the widest label,
+/// capped at half the popup width, floored at one column. Pure.
+fn command_column_width(suggestions: &[completion::Suggestion], width: usize) -> usize {
+    let max_label = suggestions
+        .iter()
+        .map(|s| s.label.width())
+        .max()
+        .unwrap_or(0);
+    max_label.min(width / 2).max(1)
+}
+
+/// One System B suggestion row's transient state (Parameter Object): whether it
+/// is the active (highlighted) row and whether it is currently expanded (`←/→`).
+/// Bundled so the row/label builders stay integration steps, not long
+/// parameter lists.
+#[derive(Debug, Clone, Copy)]
+struct RowState {
+    active: bool,
+    expanded: bool,
+}
+
+/// One System B suggestion row: the label (fuzzy match inverted) in the command
+/// column, padded to the boundary, then the description in the second column.
+/// The active row reads `text.accent`, the rest `text.secondary`.
+fn suggestion_row(
+    s: &completion::Suggestion,
+    state: RowState,
+    cmd_col: usize,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let text_color = if state.active {
+        accent_style(theme)
+    } else {
+        secondary_style(theme)
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = push_label_with_match(&mut spans, s, state.expanded, text_color, cmd_col);
+    if used < cmd_col {
+        used = push_cols(
+            &mut spans,
+            &" ".repeat(cmd_col - used),
+            Style::default(),
+            used,
+            width,
+        );
+    }
+    if !s.description.is_empty() {
+        used = push_cols(&mut spans, "  ", Style::default(), used, width);
+        used = push_cols(&mut spans, &s.description, text_color, used, width);
+    }
+    // The ` → `/` ← ` expand affordance (qwen SuggestionsDisplay:144-148):
+    // only on a LONG active row - collapsed shows ` → ` (press → to expand),
+    // expanded shows ` ← ` (press ← to collapse). Gray, trailing the row.
+    if state.active && label_is_long(&s.label) {
+        let indicator = if state.expanded { " ← " } else { " → " };
+        let _ = push_cols(&mut spans, indicator, secondary_style(theme), used, width);
+    }
+    Line::from(spans)
+}
+
+/// Whether a label is "long" (chars `>= MAX_WIDTH`, qwen PrepareLabel): a long
+/// row on the active line collapses to a truncated window until expanded.
+fn label_is_long(label: &str) -> bool {
+    label.chars().count() >= completion::MAX_WIDTH
+}
+
+/// Pushes a suggestion's label with its fuzzy match window drawn INVERTED (qwen
+/// `PrepareLabel`: the match substring reversed against the row color). Returns
+/// the new used-column count. The match window is `[start, end)` char indices
+/// over the label; when absent the label draws plain. When the label is long
+/// (`>= MAX_WIDTH`) and NOT `is_expanded`, it collapses to a truncated window
+/// (qwen `PrepareLabel` cases 1-3), so the row fits; `is_expanded` shows it in
+/// full.
+fn push_label_with_match(
+    spans: &mut Vec<Span<'static>>,
+    s: &completion::Suggestion,
+    is_expanded: bool,
+    color: Style,
+    width: usize,
+) -> usize {
+    let (before, matched, after) = prepare_label(&s.label, s.matched, is_expanded);
+    let mut u = push_cols(spans, &before, color, 0, width);
+    if !matched.is_empty() {
+        u = push_cols(
+            spans,
+            &matched,
+            color.add_modifier(Modifier::REVERSED),
+            u,
+            width,
+        );
+    }
+    push_cols(spans, &after, color, u, width)
+}
+
+/// The qwen `PrepareLabel` split: `(before, matched, after)` char strings over
+/// `label`, with the match window collapsed to a MAX_WIDTH-bounded window when
+/// the label is long and not expanded. Pure - no ratatui.
+///
+/// - No match (or an out-of-range window): the whole label is `before`,
+///   truncated to `MAX_WIDTH` + `...` when long and not expanded (qwen's
+///   no-match branch).
+/// - Expanded or already short (`<= MAX_WIDTH`): the full label split at the
+///   match (qwen Case 1).
+/// - Long + a match wider than MAX_WIDTH: only a truncated slice of the match
+///   (qwen Case 2).
+/// - Long + a shorter match: a window centred on the match with `...` elisions
+///   at the clipped ends (qwen Case 3).
+fn prepare_label(
+    label: &str,
+    matched: Option<(usize, usize)>,
+    is_expanded: bool,
+) -> (String, String, String) {
+    let chars: Vec<char> = label.chars().collect();
+    let len = chars.len();
+    let slice = |a: usize, b: usize| -> String { chars[a.min(len)..b.min(len)].iter().collect() };
+    let long = len > completion::MAX_WIDTH;
+
+    let hit = matched.filter(|&(m_start, m_end)| m_start < len && m_start < m_end);
+    let Some((m_start, raw_end)) = hit else {
+        // No match: plain label, truncated when long and not expanded.
+        let before = if !is_expanded && long {
+            format!("{}...", slice(0, completion::MAX_WIDTH))
+        } else {
+            label.to_string()
+        };
+        return (before, String::new(), String::new());
+    };
+    let m_end = raw_end.min(len);
+    let match_len = m_end - m_start;
+
+    if is_expanded || !long {
+        // Case 1: full label split at the match.
+        return (slice(0, m_start), slice(m_start, m_end), slice(m_end, len));
+    }
+    if match_len >= completion::MAX_WIDTH {
+        // Case 2: the match itself overflows - a truncated slice of it.
+        let cut = m_start + completion::MAX_WIDTH - 1;
+        return (
+            String::new(),
+            format!("{}...", slice(m_start, cut)),
+            String::new(),
+        );
+    }
+    // Case 3: a window centred on the match, `...`-elided at clipped ends.
+    let context = completion::MAX_WIDTH - match_len;
+    let before_space = context / 2;
+    let after_space = context - before_space;
+    let mut start = m_start.saturating_sub(before_space);
+    let mut end = m_end + after_space;
+    if m_start < before_space {
+        end += before_space - m_start; // slide window right
+    }
+    if end > len {
+        start = start.saturating_sub(end - len); // slide window left
+        end = len;
+    }
+    let mut before = slice(start, m_start);
+    let matched_str = slice(m_start, m_end);
+    let mut after = slice(m_end, end);
+    if start > 0 {
+        before = elide_prefix(&before);
+    }
+    if end < len {
+        after = elide_suffix(&after);
+    }
+    (before, matched_str, after)
+}
+
+// Replaces the first 3 chars of `s` with `...` (qwen `'...' + before.slice(3)`),
+// or `...` when shorter than 3.
+fn elide_prefix(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 3 {
+        format!("...{}", chars[3..].iter().collect::<String>())
+    } else {
+        "...".to_string()
+    }
+}
+
+// Replaces the last 3 chars of `s` with `...` (qwen `after.slice(0, -3) +
+// '...'`), or `...` when shorter than 3.
+fn elide_suffix(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 3 {
+        format!("{}...", chars[..chars.len() - 3].iter().collect::<String>())
+    } else {
+        "...".to_string()
+    }
+}
+
+/// The System A (numbered `›` dialog) rows for a committed command's list
+/// (ADR-0051): the `selection_rows` shape, but over [`SelectorRow`]s whose role
+/// decides the disabled mask (headers/greyed rows are dim + unnavigable, the
+/// active navigable row is the `›`-marked success-green one) and whose hint
+/// trails dimmed. Numbered per the row's position, matching the digit
+/// quick-select.
+fn dialog_rows(
+    rows: &[SelectorRow],
+    active: usize,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::styled(
+            "no matches",
+            Style::default()
+                .fg(tui_color(theme.muted))
+                .add_modifier(Modifier::ITALIC),
+        )];
+    }
+    let width = inner_width as usize;
+    // The number field is as wide as the widest `N.`.
+    let num_field = format!("{}.", rows.len()).width();
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let is_active = i == active && row.is_stop();
+            let navigable = row.is_stop();
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut used = 0;
+            // The 2-wide `›`/space gutter (only a navigable active row marks).
+            if is_active {
+                used = push_cols(
+                    &mut spans,
+                    SELECTION_MARKER,
+                    success_style(theme),
+                    used,
+                    width,
+                );
+                used = push_cols(&mut spans, " ", Style::default(), used, width);
+            } else {
+                used = push_cols(
+                    &mut spans,
+                    &" ".repeat(SELECTION_GUTTER_WIDTH),
+                    Style::default(),
+                    used,
+                    width,
+                );
+            }
+            // The right-aligned `N.` number (success-green when active, else
+            // secondary; a non-navigable row draws no number).
+            if navigable {
+                let num = format!("{}.", i + 1);
+                let pad = num_field.saturating_sub(num.width());
+                if pad > 0 {
+                    used = push_cols(&mut spans, &" ".repeat(pad), Style::default(), used, width);
+                }
+                let num_style = if is_active {
+                    success_style(theme)
+                } else {
+                    secondary_style(theme)
+                };
+                used = push_cols(&mut spans, &num, num_style, used, width);
+                used = push_cols(&mut spans, " ", Style::default(), used, width);
+            } else {
+                // A header/greyed row keeps the number field's width blank so
+                // its label lines up with the members below it.
+                used = push_cols(
+                    &mut spans,
+                    &" ".repeat(num_field + 1),
+                    Style::default(),
+                    used,
+                    width,
+                );
+            }
+            // The label: success-green when active, dim for header/greyed/note,
+            // else primary.
+            let label_style = match (is_active, row.role) {
+                (true, _) => success_style(theme),
+                (false, RowRole::Member) => primary_style(theme),
+                (false, _) => secondary_style(theme),
+            };
+            used = push_cols(&mut spans, &row.label, label_style, used, width);
+            // The hint trails dimmed (a "(current)" marker, a note's reason).
+            if let Some(hint) = &row.hint {
+                used = push_cols(&mut spans, "  ", Style::default(), used, width);
+                let _ = push_cols(
+                    &mut spans,
+                    hint,
+                    Style::default()
+                        .fg(tui_color(theme.muted))
+                        .add_modifier(Modifier::ITALIC),
+                    used,
+                    width,
+                );
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The most System-B suggestion rows the palette shows before it scrolls (qwen
+/// `MAX_SUGGESTIONS_TO_SHOW`); mirrors [`completion::MAX_SUGGESTIONS_TO_SHOW`].
+const MAX_SUGGESTIONS: usize = completion::MAX_SUGGESTIONS_TO_SHOW;
 
 /// The most body rows the Slash popup shows before it scrolls internally - keeps
 /// the overlay compact even against a long model list.
@@ -803,54 +1344,6 @@ const MILLIS_PER_SEC: u64 = 1_000;
 
 /// The number of priority tiers in the status-bar segment drop policy.
 const DROP_TIER_COUNT: usize = 7;
-
-/// One `Line` per [`SelectorRow`]: the label, then the hint dimmed (a note's
-/// hint may carry the reveal cap's "· N more" count, merged upstream by the
-/// Composer's overlay view); the highlighted row is reversed so it reads as
-/// the cursor. The row's role picks the label treatment - a header or note
-/// (a Provider group header, an "unavailable" note) draws dim bold, a
-/// collapsed member draws dim WITHOUT bold so it reads as a greyed model
-/// rather than a header. Only a cursor stop (a member or a note) ever draws
-/// reversed: a highlighted note is the stop anchoring a greyed group's view,
-/// while headers and collapsed rows can never hold the cursor.
-fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line<'static>> {
-    if rows.is_empty() {
-        return vec![Line::styled(
-            "no matches",
-            Style::default()
-                .fg(tui_color(theme.muted))
-                .add_modifier(Modifier::ITALIC),
-        )];
-    }
-    rows.iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let label_style = match row.role {
-                RowRole::Member => Style::default(),
-                RowRole::Collapsed => Style::default().fg(tui_color(theme.muted)),
-                RowRole::Header | RowRole::Note => Style::default()
-                    .fg(tui_color(theme.muted))
-                    .add_modifier(Modifier::BOLD),
-            };
-            let mut spans = vec![Span::styled(row.label.clone(), label_style)];
-            if let Some(hint) = &row.hint {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    hint.clone(),
-                    Style::default()
-                        .fg(tui_color(theme.muted))
-                        .add_modifier(Modifier::ITALIC),
-                ));
-            }
-            let line = Line::from(spans);
-            if i == highlight && row.is_stop() {
-                line.style(Style::default().add_modifier(Modifier::REVERSED))
-            } else {
-                line
-            }
-        })
-        .collect()
-}
 
 /// Brings the [`RenderCache`] up to date with `screen`'s Transcript at
 /// `content_width` (ADR-0046): the adapter's public door onto the cache's
@@ -3925,33 +4418,90 @@ pub fn render_composer(
     layout: &ComposerLayout,
     theme: &Theme,
 ) {
-    if area.height as usize <= COMPOSER_CHROME_ROWS || area.width < 2 {
-        return;
-    }
-    // Integration (IOSP): the pure operations shape the body lines and the cursor
-    // cell; here we only issue the draw calls.
+    // Operation → Integration (IOSP): the pure [`composer_chrome`] carries the
+    // fit decision (`None` = too small to draw), the border style, the bottom
+    // rule Rect, and the terminal-cursor cell (`None` when the Approval owns
+    // the keyboard); the slot below only issues the draw calls.
+    render_composer_slot(frame, area, composer_chrome(area, t, theme), layout, theme);
+}
+
+/// The Composer's drawable chrome (the compute-plan behind [`render_composer`]):
+/// the border style, the bottom-border Rect, and whether the terminal cursor is
+/// parked (`focused` - false while the Approval modal owns the keyboard, when a
+/// blinking composer cursor would misstate where keys go). Built by
+/// [`composer_chrome`]; the cursor CELL is layout-dependent, computed at draw
+/// time by [`composer_cursor`].
+struct ComposerChrome {
+    border: Style,
+    bottom: Rect,
+    focused: bool,
+}
+
+/// Operation (IOSP): the Composer's chrome for `area`, or `None` when the zone
+/// is too small to hold the two chrome rows plus a draft column (measure ==
+/// draw, ADR-0029). Pure: no frame access. The fit and the `focused` decision
+/// are made here so [`render_composer`] never branches.
+fn composer_chrome(area: Rect, t: &Screen, theme: &Theme) -> Option<ComposerChrome> {
+    let fits = area.height as usize > COMPOSER_CHROME_ROWS && area.width >= 2;
     let focused = t.pending_approval.is_none();
-    let border = composer_border_style(focused, theme);
+    fits.then(|| ComposerChrome {
+        border: composer_border_style(focused, theme),
+        bottom: Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
+        },
+        focused,
+    })
+}
+
+/// The Composer slot: draws the body, the bottom rule, and (when focused) parks
+/// the terminal cursor - but only when the plan says the zone fits (`Some`).
+/// The presence + focus branches live HERE so [`render_composer`] is call-only
+/// (IOSP).
+fn render_composer_slot(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Option<ComposerChrome>,
+    layout: &ComposerLayout,
+    theme: &Theme,
+) {
+    if let Some(chrome) = chrome {
+        draw_composer(frame, area, &chrome, layout, theme);
+    }
+}
+
+/// Draws a fitted Composer (call-only assembler): the body Paragraph, the
+/// bottom rule, and the terminal cursor when the chrome carries a cell.
+fn draw_composer(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: &ComposerChrome,
+    layout: &ComposerLayout,
+    theme: &Theme,
+) {
     let rule_width = area.width as usize;
-    let bottom = Rect {
-        y: area.y + area.height - 1,
-        height: 1,
-        ..area
-    };
     frame.render_widget(
         Paragraph::new(composer_body_lines(
             layout,
             area.height,
             rule_width,
-            border,
+            chrome.border,
             theme,
         )),
         area,
     );
     frame.render_widget(
-        Paragraph::new(Line::styled("─".repeat(rule_width), border)),
-        bottom,
+        Paragraph::new(Line::styled("─".repeat(rule_width), chrome.border)),
+        chrome.bottom,
     );
+    place_composer_cursor(frame, chrome.focused, layout, area);
+}
+
+/// Parks the terminal cursor at the draft cell when the chrome is `focused`,
+/// else leaves it (the Approval owns the keyboard). The focus branch lives HERE
+/// (IOSP).
+fn place_composer_cursor(frame: &mut Frame, focused: bool, layout: &ComposerLayout, area: Rect) {
     if focused {
         frame.set_cursor_position(composer_cursor(layout, area));
     }
@@ -6185,6 +6735,30 @@ mod tests {
             .add_modifier
     }
 
+    // The first char of a test-buffer cell (for gutter/marker assertions).
+    fn cell_char(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> char {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .expect("cell in test buffer")
+            .symbol()
+            .chars()
+            .next()
+            .unwrap_or(' ')
+    }
+
+    // The foreground color of a test-buffer cell (for accent/secondary checks).
+    fn cell_fg(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> Option<Color> {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .expect("cell in test buffer")
+            .style()
+            .fg
+    }
+
     /// Draws the inline PENDING transcript body (ADR-0046) for `screen` into a
     /// fresh `width`x`height` terminal, TOP-aligned so the content-assertion
     /// tests (which scan rows for known text/gutter glyphs) read a stable layout.
@@ -7443,201 +8017,322 @@ mod tests {
         })
     }
 
-    // --- render_composer_popup: the overlay variants ------------------------
+    // --- render_composer_popup: System B (`/` palette) ----------------------
+
+    fn suggestion(
+        label: &str,
+        value: &str,
+        desc: &str,
+        matched: Option<(usize, usize)>,
+    ) -> completion::Suggestion {
+        completion::Suggestion {
+            label: label.to_string(),
+            value: value.to_string(),
+            description: desc.to_string(),
+            matched,
+        }
+    }
+
+    fn palette(suggestions: Vec<completion::Suggestion>, active: usize) -> OverlayView {
+        palette_expanded(suggestions, active, false)
+    }
+
+    fn palette_expanded(
+        suggestions: Vec<completion::Suggestion>,
+        active: usize,
+        expanded: bool,
+    ) -> OverlayView {
+        OverlayView::Menu {
+            suggestions,
+            active,
+            scroll: 0,
+            query: "m".to_string(),
+            expanded,
+        }
+    }
 
     #[test]
-    fn the_menu_popup_titles_commands_and_lists_the_rows_with_hints() {
-        let view = OverlayView::Menu {
-            rows: vec![
-                SelectorRow::new("model", "/model", Some("pick the model".to_string())),
-                SelectorRow::new("clear", "/clear", None),
+    fn the_palette_lists_two_columns_command_and_description() {
+        let view = palette(
+            vec![
+                suggestion("model", "model", "pick the model", Some((0, 1))),
+                suggestion("theme", "theme", "pick the theme", None),
             ],
-            highlight: 0,
-        };
+            0,
+        );
         let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" commands "), "bordered title:\n{text}");
-        assert!(text.contains("/model"));
-        assert!(text.contains("pick the model"), "the hint rides its row");
-        assert!(text.contains("/clear"));
+        assert!(text.contains("model"));
+        assert!(text.contains("pick the model"), "description column");
+        assert!(text.contains("theme"));
+    }
+
+    // --- PrepareLabel: MAX_WIDTH collapse/expand (qwen) ---------------------
+
+    #[test]
+    fn prepare_label_leaves_a_short_label_whole() {
+        // Below MAX_WIDTH the label is untouched (no match).
+        let (before, matched, after) = prepare_label("model", None, false);
+        assert_eq!(
+            (before, matched, after),
+            ("model".into(), "".into(), "".into())
+        );
     }
 
     #[test]
-    fn the_menu_popup_reverses_the_highlighted_row() {
-        let view = OverlayView::Menu {
-            rows: vec![
-                SelectorRow::new("model", "/model", None),
-                SelectorRow::new("clear", "/clear", None),
+    fn prepare_label_splits_a_short_label_at_its_match() {
+        // A contiguous match window splits into before/matched/after (qwen
+        // Case 1 - the label already fits).
+        let (before, matched, after) = prepare_label("model", Some((0, 3)), false);
+        assert_eq!(before, "");
+        assert_eq!(matched, "mod");
+        assert_eq!(after, "el");
+    }
+
+    #[test]
+    fn prepare_label_truncates_a_long_label_until_expanded() {
+        let long: String = std::iter::repeat_n('x', completion::MAX_WIDTH + 40).collect();
+        // Collapsed: truncated to MAX_WIDTH chars + "..." (qwen no-match branch).
+        let (before, _, _) = prepare_label(&long, None, false);
+        assert_eq!(before.chars().count(), completion::MAX_WIDTH + 3);
+        assert!(before.ends_with("..."));
+        // Expanded: the full label, untouched.
+        let (before, _, _) = prepare_label(&long, None, true);
+        assert_eq!(before, long);
+    }
+
+    #[test]
+    fn prepare_label_windows_a_long_label_around_its_match_with_elisions() {
+        // A long label with a short match mid-string collapses to a window
+        // centred on the match, `...`-elided at the clipped ends (qwen Case 3).
+        let long: String = std::iter::repeat_n('x', completion::MAX_WIDTH * 2).collect();
+        let mid = completion::MAX_WIDTH; // match sits in the middle
+        let (before, matched, after) = prepare_label(&long, Some((mid, mid + 3)), false);
+        assert_eq!(matched, "xxx", "the match stays whole");
+        assert!(before.starts_with("..."), "left elision: {before:?}");
+        assert!(after.ends_with("..."), "right elision: {after:?}");
+        // The whole window fits MAX_WIDTH.
+        let total = before.chars().count() + matched.chars().count() + after.chars().count();
+        assert!(total <= completion::MAX_WIDTH, "window bounded: {total}");
+    }
+
+    #[test]
+    fn a_long_active_row_shows_the_expand_affordance() {
+        let long: String = std::iter::repeat_n('x', completion::MAX_WIDTH + 5).collect();
+        // Collapsed active long row: ` → ` affordance.
+        let collapsed = palette_expanded(vec![suggestion(&long, "cmd", "", None)], 0, false);
+        assert!(
+            buffer_text(&draw_popup(&collapsed)).contains('→'),
+            "collapsed long active row shows →"
+        );
+        // Expanded active long row: ` ← ` affordance.
+        let expanded = palette_expanded(vec![suggestion(&long, "cmd", "", None)], 0, true);
+        assert!(
+            buffer_text(&draw_popup(&expanded)).contains('←'),
+            "expanded long active row shows ←"
+        );
+        // A SHORT active row shows no affordance.
+        let short = palette_expanded(vec![suggestion("model", "model", "", None)], 0, false);
+        let text = buffer_text(&draw_popup(&short));
+        assert!(
+            !text.contains('→') && !text.contains('←'),
+            "short row: no affordance"
+        );
+    }
+
+    #[test]
+    fn the_palette_active_row_is_accent_others_secondary_no_marker() {
+        let view = palette(
+            vec![
+                suggestion("model", "model", "", None),
+                suggestion("theme", "theme", "", None),
             ],
-            highlight: 1,
-        };
+            1,
+        );
         let terminal = draw_popup(&view);
-        // Geometry: 2 body rows + borders = height 4, anchored above row 10,
-        // so the body sits at rows 7-8; the popup is inset one column and the
-        // border one more, so row text starts at x = 2.
-        assert!(row_text(&terminal, 8).contains("/clear"));
-        assert!(cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED));
-        assert!(!cell_modifier(&terminal, 2, 7).contains(Modifier::REVERSED));
+        // 2 body rows + borders = height 4, anchored above row 10 → rows 7-8,
+        // text from x = 2. System B has NO `›` marker and NO number, so the
+        // first cell IS the label's first glyph.
+        assert_eq!(
+            cell_char(&terminal, 2, 8),
+            't',
+            "no gutter before the label"
+        );
+        let accent = tui_color(theme::dark().prompt_gutter);
+        let secondary = tui_color(theme::dark().muted);
+        assert_eq!(cell_fg(&terminal, 2, 8), Some(accent), "active row accent");
+        assert_eq!(
+            cell_fg(&terminal, 2, 7),
+            Some(secondary),
+            "inactive secondary"
+        );
     }
 
     #[test]
-    fn an_empty_menu_popup_shows_no_matches() {
-        let view = OverlayView::Menu {
-            rows: vec![],
-            highlight: 0,
-        };
+    fn the_palette_match_substring_is_inverted() {
+        // "/m" matches "model" at [0,1): the leading 'm' draws REVERSED.
+        let view = palette(vec![suggestion("model", "model", "", Some((0, 1)))], 0);
+        let terminal = draw_popup(&view);
+        // One body row + borders = height 3 above row 10 → row 8, text x = 2.
+        assert!(
+            cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED),
+            "the match is inverted"
+        );
+        assert!(
+            !cell_modifier(&terminal, 3, 8).contains(Modifier::REVERSED),
+            "the rest is not"
+        );
+    }
+
+    #[test]
+    fn an_empty_palette_shows_no_matches() {
+        let view = palette(vec![], 0);
         assert!(buffer_text(&draw_popup(&view)).contains("no matches"));
     }
 
     #[test]
-    fn a_loading_selector_popup_shows_the_loading_line() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Loading,
-            rows: vec![],
-            highlight: 0,
+    fn the_palette_shows_arrows_and_a_counter_when_it_overflows() {
+        // More than MAX_SUGGESTIONS rows, scrolled one down: a ▲ above, a ▼
+        // below, and an (active/total) counter.
+        let suggestions: Vec<_> = (0..MAX_SUGGESTIONS + 3)
+            .map(|i| suggestion(&format!("cmd{i}"), &format!("cmd{i}"), "", None))
+            .collect();
+        let view = OverlayView::Menu {
+            suggestions,
+            active: 3,
+            scroll: 1,
+            query: "c".to_string(),
+            expanded: false,
         };
+        let terminal = draw_frame(40, 20, |f| {
+            render_composer_popup(f, 18, f.area(), &view, theme::dark())
+        });
+        let text = buffer_text(&terminal);
+        assert!(text.contains('▲'), "scroll-up arrow:\n{text}");
+        assert!(text.contains('▼'), "scroll-down arrow");
+        assert!(
+            text.contains(&format!("(4/{})", MAX_SUGGESTIONS + 3)),
+            "the (n/m) counter:\n{text}"
+        );
+    }
+
+    // --- render_composer_popup: System A (numbered `›` dialog) --------------
+
+    fn dialog(
+        command: &str,
+        status: OverlayStatus,
+        rows: Vec<SelectorRow>,
+        active: usize,
+    ) -> OverlayView {
+        OverlayView::Dialog {
+            command: command.to_string(),
+            status,
+            rows,
+            active,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn a_loading_dialog_shows_the_loading_line() {
+        let view = dialog("model", OverlayStatus::Loading, vec![], 0);
         let text = buffer_text(&draw_popup(&view));
-        assert!(text.contains(" models "), "selector title:\n{text}");
+        assert!(text.contains(" models "), "dialog title:\n{text}");
         assert!(text.contains("loading models…"));
     }
 
     #[test]
-    fn a_failed_selector_popup_shows_the_failure_message() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Failed("connection refused".to_string()),
-            rows: vec![],
-            highlight: 0,
-        };
+    fn a_failed_dialog_shows_the_failure_message() {
+        let view = dialog(
+            "model",
+            OverlayStatus::Failed("connection refused".to_string()),
+            vec![],
+            0,
+        );
         assert!(buffer_text(&draw_popup(&view)).contains("failed: connection refused"));
     }
 
     #[test]
-    fn a_ready_selector_popup_lists_the_model_rows() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows: vec![
+    fn a_ready_dialog_lists_numbered_rows_with_the_marker() {
+        let view = dialog(
+            "model",
+            OverlayStatus::Ready,
+            vec![
                 SelectorRow::new("a", "qwen/qwen3-30b", None),
                 SelectorRow::new("b", "meta/llama-3.1", None),
             ],
-            highlight: 0,
-        };
+            0,
+        );
         let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" models "));
+        assert!(
+            text.contains(SELECTION_MARKER),
+            "the `›` marker on the active row"
+        );
+        assert!(text.contains("1."), "numbered rows");
         assert!(text.contains("qwen/qwen3-30b"));
         assert!(text.contains("meta/llama-3.1"));
     }
 
     #[test]
-    fn a_collapsed_row_draws_muted_without_the_headers_bold() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows: vec![
+    fn a_dialog_header_row_is_dim_and_unnumbered() {
+        let view = dialog(
+            "model",
+            OverlayStatus::Ready,
+            vec![
                 SelectorRow::header("openrouter"),
-                SelectorRow::collapsed("openrouter/kimi-k2"),
+                SelectorRow::new("openrouter/kimi-k2", "openrouter/kimi-k2", None),
             ],
-            highlight: 0,
-        };
-        let terminal = draw_popup(&view);
-        // Geometry as above: 2 body rows + borders = height 4 above row 10,
-        // so the header sits at row 7 and the collapsed row at 8, text from
-        // x = 2.
-        assert!(cell_modifier(&terminal, 2, 7).contains(Modifier::BOLD));
-        assert!(
-            !cell_modifier(&terminal, 2, 8).contains(Modifier::BOLD),
-            "a collapsed member reads as a greyed model, not a header"
+            1,
         );
-        let buf = terminal.backend().buffer();
-        let header_fg = buf.cell((2u16, 7u16)).expect("header cell").style().fg;
-        let collapsed_fg = buf.cell((2u16, 8u16)).expect("collapsed cell").style().fg;
-        assert_eq!(collapsed_fg, header_fg, "both muted");
-    }
-
-    #[test]
-    fn a_highlighted_note_draws_reversed_like_the_cursor_stop_it_is() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows: vec![
-                SelectorRow::header("openrouter"),
-                SelectorRow::note("  unavailable", Some("set OPENROUTER_API_KEY".into())),
-            ],
-            highlight: 1,
-        };
         let terminal = draw_popup(&view);
-        // Geometry as above: body rows 7 (header) and 8 (note), text at x = 2.
-        assert!(
-            !cell_modifier(&terminal, 2, 7).contains(Modifier::REVERSED),
-            "the cursor can never rest on a header"
-        );
-        assert!(cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn a_capped_group_fits_the_popup_window_when_its_note_is_highlighted() {
-        use crate::ui::selector::{COLLAPSED_REVEAL_CAP, Selector};
-        use crate::view_model::RowRole;
-
-        // The reachability contract behind note-last ordering and the cap:
-        // the popup window shows POPUP_MAX_ROWS body rows ending at the
-        // highlight (composer::first_visible_row), and a fully-capped group
-        // is header + COLLAPSED_REVEAL_CAP rows + note - so the cursor
-        // resting on the trailing note pulls the whole group into view.
-        let mut rows = vec![SelectorRow::header("openrouter")];
-        rows.extend((0..300).map(|i| SelectorRow::collapsed(format!("openrouter/m{i:03}"))));
-        rows.push(SelectorRow::note(
-            "  unavailable",
-            Some("set OPENROUTER_API_KEY".into()),
-        ));
-        let s = Selector::new(rows);
-        let highlight = s.highlight("openrouter");
-        let view = s.filtered("openrouter");
+        // Body rows 7 (header) and 8 (member), inset text from x = 2. The
+        // header draws a blank gutter + blank number field, so its label sits
+        // further right; the active member (row 1) carries the `›` marker.
+        assert_ne!(cell_char(&terminal, 2, 7), '›', "the header has no marker");
         assert_eq!(
-            view[highlight].row.role,
-            RowRole::Note,
-            "snapped to the note"
+            cell_char(&terminal, 2, 8),
+            '›',
+            "the active member is marked"
         );
-        assert_eq!(view.len(), 1 + COLLAPSED_REVEAL_CAP + 1);
-        assert!(view.len() <= POPUP_MAX_ROWS as usize);
-        let top = composer::first_visible_row(highlight, POPUP_MAX_ROWS as usize);
-        assert_eq!(top, 0, "the group's header is the window's first row");
+        // The header label ("openrouter") reads dim (secondary) wherever it
+        // starts - find its first glyph on the row.
+        let header_row = row_text(&terminal, 7);
+        let col = header_row.find('o').expect("the header label") as u16;
+        let secondary = tui_color(theme::dark().muted);
+        assert_eq!(
+            cell_fg(&terminal, col, 7),
+            Some(secondary),
+            "the header is dim"
+        );
     }
 
     #[test]
-    fn the_selector_popup_titles_itself_after_its_command() {
-        // The title pluralizes the opaque command name, so /theme's selector
+    fn the_dialog_titles_itself_after_its_command() {
+        // The title pluralizes the opaque command name, so /theme's dialog
         // reads " themes " without the renderer knowing any command.
-        let view = OverlayView::Selector {
-            command: "theme".to_string(),
-            status: OverlayStatus::Loading,
-            rows: vec![],
-            highlight: 0,
-        };
+        let view = dialog("theme", OverlayStatus::Loading, vec![], 0);
         let text = buffer_text(&draw_popup(&view));
-        assert!(text.contains(" themes "), "selector title:\n{text}");
+        assert!(text.contains(" themes "), "dialog title:\n{text}");
         assert!(text.contains("loading themes…"));
     }
 
     #[test]
-    fn the_popup_scrolls_the_highlighted_row_into_view() {
-        // 20 rows against the POPUP_MAX_ROWS cap: highlighting the last row
-        // must scroll the top rows out and bring it on screen.
+    fn the_dialog_scrolls_the_active_row_into_view() {
+        // 20 rows against the POPUP_MAX_ROWS cap: an active row at the bottom
+        // scrolls the top rows out and brings it on screen.
         let rows: Vec<SelectorRow> = (0..20)
             .map(|i| SelectorRow::new(format!("m{i}"), format!("model-{i:02}"), None))
             .collect();
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows,
-            highlight: 19,
-        };
+        let view = dialog("model", OverlayStatus::Ready, rows, 19);
         let terminal = draw_frame(40, 14, |f| {
             render_composer_popup(f, 12, f.area(), &view, theme::dark())
         });
         let text = buffer_text(&terminal);
-        assert!(text.contains("model-19"), "highlight scrolled into view");
+        assert!(
+            text.contains("model-19"),
+            "the active row scrolled into view"
+        );
         assert!(!text.contains("model-00"), "the top rows scrolled out");
     }
 
@@ -8236,7 +8931,7 @@ mod tests {
     #[test]
     fn popup_rect_height_is_body_plus_two_borders() {
         let area = Rect::new(0, 0, 80, 24);
-        let r = popup_rect(10, area, 3); // 3 body rows -> height 5
+        let r = popup_rect(10, area, 3, POPUP_MAX_ROWS); // 3 body rows -> height 5
         assert_eq!(r.height, 5);
     }
 
@@ -8244,14 +8939,14 @@ mod tests {
     fn popup_rect_height_is_capped_at_popup_max_plus_two() {
         let area = Rect::new(0, 0, 80, 24);
         // 100 body rows would be POPUP_MAX_ROWS + 2 once capped.
-        let r = popup_rect(20, area, 100);
+        let r = popup_rect(20, area, 100, POPUP_MAX_ROWS);
         assert_eq!(r.height, POPUP_MAX_ROWS + 2);
     }
 
     #[test]
     fn popup_rect_is_anchored_above_anchor_y() {
         let area = Rect::new(0, 0, 80, 24);
-        let r = popup_rect(10, area, 3); // height 5, y = 10 - 5 = 5
+        let r = popup_rect(10, area, 3, POPUP_MAX_ROWS); // height 5, y = 10 - 5 = 5
         assert_eq!(r.y, 5);
     }
 

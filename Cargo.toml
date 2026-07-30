@@ -19,6 +19,11 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # `content_width` columns and the viewport never re-wraps it. Pinned to the same
 # 0.2 ratatui already resolves, so no extra copy is pulled.
 unicode-width = "0.2"
+# fuzzy `/` command palette ranking (ADR-0051, System B): pure-Rust fzf-v2-parity
+# matcher, confined to ui::completion. Returns only a score + match indices, so
+# no matcher type leaks past the pure core (ADR-0019); a prefix fallback covers
+# the empty-pattern / matcher-error paths.
+nucleo-matcher = "0.3"
 
 # LLM boundary: Anthropic wire protocol over SSE (ADR-0002)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

@@ -62,3 +62,19 @@ the same next-launch warning as the model key.
 - The theme TOML schema is a user-facing contract: adding a slot is routine
   (sparse themes keep working), renaming or removing one is a break - and the
   strict parser makes it a loud one.
+
+## Amendment (ADR-0051, Phase 5): the `/theme` DIALOG is filter-less System A
+
+`/theme` is now a System-A numbered `›` DIALOG (`ui::selection::SelectionList`),
+qwen-faithful: no free-text filter (few themes), so the dialog is `Frozen` - it
+swallows editing chars, and the normalized `/theme ` draft never grows past the
+trailing space. Navigation is arrows (wrapping, skipping disabled rows) + digit
+quick-select. A broken user file is a DISABLED note (its reason dim inline):
+reachable by the cursor, refused by Enter. qwen's theme/scope Tab toggle is
+DROPPED (suspenders is single-scope).
+
+**The live-preview firewall holds.** `preview_name` and its four tests are
+unchanged; only its INPUT repoints from `Selector::highlight` to the dialog's
+active row (`Composer::selector_highlight`). Moving the highlight still previews
+that theme live, Enter keeps + persists it, Escape reverts - the revert still
+falls out of the per-frame derivation, not a new state machine.
