@@ -3,8 +3,8 @@
 //! draws with.
 //!
 //! This is the one place semantics become terminal colors: [`DiffSide`] →
-//! color for a diff's lines, [`PressureLevel`] → color/emphasis for the status
-//! bar. Extensions and the Screen core never touch ratatui; they speak the
+//! color for a diff's lines, [`FooterItem`] → the flat footer's grey right
+//! group. Extensions and the Screen core never touch ratatui; they speak the
 //! vocabulary and this module renders it. Everything here is pure presentation
 //! of [`TranscriptItem`]s - no state, no IO. Only this module and [`crate::ui`]
 //! `use ratatui` / `use crossterm` (ADR-0019 invariant).
@@ -12,26 +12,26 @@
 use std::sync::OnceLock;
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxSet;
 
-use thousands::Separable;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::ui::composer::{self, ComposerLayout, OverlayStatus, OverlayView};
+use crate::approvals::ApprovalMode;
+use crate::plan::{TodoItem, TodoStatus};
+use crate::ui::completion;
+use crate::ui::composer::{self, ComposerLayout, ComposerView, OverlayStatus, OverlayView};
 use crate::ui::lull;
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
-use crate::ui::screen::{PressureLevel, Screen, Status};
+use crate::ui::screen::{ConfirmKind, PendingApproval, Screen, Status};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
-use crate::ui::viewport::Viewport;
 use crate::view_model::Tone;
 use crate::view_model::{DiffHunk, DiffSide, TranscriptItem};
 use crate::view_model::{RowRole, SelectorRow};
@@ -90,6 +90,75 @@ fn diff_chrome_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
+// ---------------------------------------------------------------------------
+// qwen v0.16.0 colour ROLES → suspenders Theme slots (Phase 2, ADR-0046).
+//
+// qwen-code paints its committed chrome from a handful of semantic ROLES
+// (`text.accent`, `text.secondary`, `status.success`, …). This port maps each
+// role onto a suspenders Theme slot behind ONE helper apiece, so a theme
+// reconcile is a single edit per role rather than a hunt through the render
+// body. Phase 7 (ADR-0008/0053) carved the four qwen roles that used to borrow
+// a neighbouring slot into real slots: `text.primary`→`foreground` (was the
+// terminal default), `text.accent`→`accent` (was cyan `prompt_gutter`),
+// `status.success`→`success` (was diff `added`), `status.warning`→`warning`
+// (was warm amber `marker_aid`). `text.secondary`/`ui.symbol`/`border.default`
+// still share the neutral gray `muted` slot by design.
+// ---------------------------------------------------------------------------
+
+/// qwen `text.accent` (AccentPurple `#D2A6FF`): the user `>` caret + the
+/// assistant `✦` marker. Reads the dedicated `accent` slot (Phase 7, ADR-0008),
+/// a distinct role rather than the cyan `prompt_gutter` it once borrowed.
+fn accent_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.accent))
+}
+
+/// qwen `text.secondary` (Gray): thought glyph/body, tool descriptions, retry,
+/// hints. Maps to the `muted` slot.
+fn secondary_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.muted))
+}
+
+/// qwen `status.success` (AccentGreen `#AAD94C`): the success prefix + the
+/// `✓`/`o` tool markers. Reads the dedicated `success` slot (Phase 7,
+/// ADR-0008), a distinct role rather than the diff `added` green it once borrowed.
+fn success_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.success))
+}
+
+/// qwen `status.warning` (AccentYellow `#FFD700`): the `△` warning prefix + a
+/// pending tool-group border. Reads the dedicated `warning` slot (Phase 7,
+/// ADR-0008), a distinct role rather than the warm amber `marker_aid` it once
+/// borrowed.
+fn warning_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.warning))
+}
+
+/// qwen `status.error` (AccentRed): the `✕`/`x` error prefix + marker. Maps to
+/// the `error` slot.
+fn error_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.error))
+}
+
+/// qwen `text.primary` (Foreground `#bfbdb6`): body text, info bodies, tool
+/// names. Reads the dedicated `foreground` slot (Phase 7, ADR-0008) - a real
+/// pinned colour rather than the terminal default, so body text matches
+/// QwenDark on any background.
+fn primary_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.foreground))
+}
+
+/// qwen `ui.symbol` (Gray): a shell tool's marker + a shell tool-group's border.
+/// Maps to the `muted` slot (same read as `border.default`).
+fn symbol_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.muted))
+}
+
+/// qwen `border.default` (Gray): the resting tool-group box border. Maps to the
+/// `muted` slot.
+fn border_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.muted))
+}
+
 /// The ONE mapping from a semantic markdown [`MdStyle`] to a ratatui [`Style`]
 /// (ADR-0008's move, applied to assistant markdown): [`markdown::to_lines`]
 /// speaks semantics; this is where they become the active Theme's colors.
@@ -116,71 +185,11 @@ pub fn md_style(style: MdStyle, theme: &Theme) -> Style {
     }
 }
 
-/// The ONE mapping from the semantic [`PressureLevel`] (ADR-0008) to the
-/// tokens segment's style: `Ok` reads muted, `Elevated` warns, `Critical`
-/// alarms. Segment form (fg ON a bg) because the status bar is a powerline of
-/// colored blocks - the semantics are unchanged, only the presentation moved
-/// from colored text to colored blocks.
-pub fn pressure_style(level: PressureLevel, theme: &Theme) -> Style {
-    match level {
-        PressureLevel::Critical => Style::default()
-            .fg(tui_color(theme.pressure_critical_fg))
-            .bg(tui_color(theme.pressure_critical_bg))
-            .add_modifier(Modifier::BOLD),
-        PressureLevel::Elevated => Style::default()
-            .fg(tui_color(theme.pressure_elevated_fg))
-            .bg(tui_color(theme.pressure_elevated_bg)),
-        PressureLevel::Ok => Style::default()
-            .fg(tui_color(theme.pressure_ok_fg))
-            .bg(tui_color(theme.segment_muted_bg)),
-    }
-}
-
-/// The ONE mapping from a [`SegmentKind`] to its powerline segment style
-/// (ADR-0008: this is the only place segment semantics become colors). Every
-/// segment style carries a bg - the powerline separators are drawn from the
-/// adjacent segments' bgs ([`segment_bg`]).
-pub fn segment_style(kind: SegmentKind, theme: &Theme) -> Style {
-    match kind {
-        SegmentKind::ModeIdle | SegmentKind::Position => Style::default()
-            .fg(tui_color(theme.segment_idle_fg))
-            .bg(tui_color(theme.segment_idle_bg))
-            .add_modifier(Modifier::BOLD),
-        SegmentKind::ModeRunning => Style::default()
-            .fg(tui_color(theme.segment_running_fg))
-            .bg(tui_color(theme.segment_running_bg))
-            .add_modifier(Modifier::BOLD),
-        // Model + Connection are the two connection facts, styled identically.
-        SegmentKind::Connection | SegmentKind::Model => Style::default()
-            .fg(tui_color(theme.segment_model_fg))
-            .bg(tui_color(theme.segment_model_bg)),
-        // Thinking + Tools are the two detail-on-demand toggles, styled alike.
-        SegmentKind::Thinking | SegmentKind::Tools => Style::default()
-            .fg(tui_color(theme.segment_toggle_fg))
-            .bg(tui_color(theme.segment_muted_bg)),
-        // Cost is a quiet figure: the same muted read as tokens at Ok
-        // pressure, without the pressure routing (cost carries no level).
-        SegmentKind::Cost => Style::default()
-            .fg(tui_color(theme.segment_cost_fg))
-            .bg(tui_color(theme.segment_muted_bg)),
-        // Tokens keep the single PressureLevel mapping - segment_style only
-        // routes to it, it does not restate the colors.
-        SegmentKind::Tokens(level) => pressure_style(level, theme),
-    }
-}
-
-/// A segment's background - what the powerline separator glyphs blend with.
-fn segment_bg(kind: SegmentKind, theme: &Theme) -> Color {
-    segment_style(kind, theme)
-        .bg
-        .unwrap_or_else(|| tui_color(theme.bar_bg))
-}
-
 // ---------------------------------------------------------------------------
 // Render helpers.
 // ---------------------------------------------------------------------------
 
-/// The two connection facts the status bar shows (ADR-0033): the fixed endpoint
+/// The two connection facts the footer shows (ADR-0033): the fixed endpoint
 /// and the mutable Active Model. Both are adapter-carried - the pure Screen
 /// core stays command-agnostic and holds neither. The adapter OWNS them as a
 /// [`ConnectionFacts`]; this is the borrowed form the render path takes, so
@@ -230,110 +239,465 @@ pub struct Anim {
     pub lull_seq: u64,
 }
 
-/// Renders the whole frame: the transcript viewport, the status bar, the
-/// Composer, and - when an Approval is pending - the modal on top. The
-/// [`Viewport`] holds the pure scroll state; the returned `(total_lines,
-/// height)` is the geometry the viewport was measured/drawn at, which the
-/// adapter stores for the scroll effects that execute between draws.
+/// The per-frame render context the inline pending path draws WITH: the
+/// connection facts the footer shows, the animation clocks, and the Theme
+/// this frame renders in (the live `/theme` preview or the active Theme).
+/// Bundled as ONE named-field carrier - the same style as [`PendingBodyParams`],
+/// [`FooterCtx`] and the adapter's `AdapterCtx` - so
+/// [`render_pending`] and the adapter's `draw`/`draw_previewed` take four args
+/// instead of six, and a new frame-wide input is a field, not another parameter.
+#[derive(Clone, Copy)]
+pub struct FrameCtx<'a> {
+    pub conn: ConnectionView<'a>,
+    pub anim: Anim,
+    pub theme: &'a Theme,
+}
+
+/// Splits the inline frame `area` into the three vertical zones the pending
+/// region draws into: `[pending_body, footer, composer]` (ADR-0046). There
+/// is no scroll state and no geometry return - native scrollback owns history,
+/// so the pending body is simply bottom-anchored + top-clipped in the top zone.
 ///
 /// The Composer GROWS with its draft: its height is the wrapped row count
 /// (hard newlines and width-wrapping both), capped by
-/// [`composer::max_visible_rows`] so a tall draft never starves the
-/// transcript viewport - which is expected to shrink as the Composer grows.
-/// The wrap math runs at the exact width the Composer is drawn at (the frame
-/// minus the 2-cell gutter), so the measured cursor cell is the drawn one.
-/// Splits `area` into the three vertical frame zones: `[viewport, status_bar,
-/// composer]`. `composer_rows` is the already-capped Composer row count (see
-/// [`composer::max_visible_rows`]). Pure - no frame access.
-fn frame_chunks(area: Rect, composer_rows: usize) -> std::rc::Rc<[Rect]> {
+/// [`composer::max_visible_rows`] so a tall draft never starves the pending
+/// body - which is expected to shrink as the Composer grows. The wrap math runs
+/// at the exact width the Composer is drawn at (the frame minus the 2-cell
+/// gutter), so the measured cursor cell is the drawn one. `composer_rows` is the
+/// already-capped Composer row count. Pure - no frame access.
+fn frame_chunks(area: Rect, sticky_rows: usize, composer_rows: usize) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),                       // transcript viewport
-            Constraint::Length(1),                    // status bar
+            Constraint::Min(1),                       // inline pending body (ADR-0046)
+            Constraint::Length(sticky_rows as u16),   // sticky "Current tasks" box (ADR-0048)
+            Constraint::Length(1),                    // flat footer (ADR-0053)
             Constraint::Length(composer_rows as u16), // composer (grows with the draft)
         ])
         .split(area)
 }
 
-/// The Composer's visible row count for this frame: the layout's row count
-/// capped by [`composer::max_visible_rows`] so a very tall draft never starves
-/// the transcript viewport. Pure - no frame access.
+/// The Composer's zone height for this frame: the draft's capped row count plus
+/// the two chrome rows (the top dash rule + the bottom border, ADR-0048). The
+/// draft rows are capped by [`composer::max_visible_rows`] so a very tall draft
+/// never starves the pending body. Pure - no frame access.
 fn capped_composer_height(layout: &ComposerLayout, frame_height: usize) -> usize {
-    layout
+    let draft = layout
         .rows
         .len()
-        .min(composer::max_visible_rows(frame_height))
+        .min(composer::max_visible_rows(frame_height));
+    draft + COMPOSER_CHROME_ROWS
 }
 
-pub fn render(
-    frame: &mut Frame,
-    t: &Screen,
-    conn: ConnectionView,
-    anim: Anim,
-    viewport: &Viewport,
-    cache: &mut RenderCache,
-    theme: &Theme,
-) -> (usize, usize) {
+/// Renders the inline PENDING region (ADR-0046): the uncommitted transcript
+/// tail (`cache.settled()[hw..]` plus the live reasoning tail, streaming answer,
+/// and lull row), the flat footer, the Composer, and any open overlay/approval.
+/// Committed items are NOT drawn here - they were frozen into native scrollback
+/// by [`render_committed_slice`] via the adapter's `insert_before`.
+///
+/// The transcript body is BOTTOM-ANCHORED in its zone and TOP-CLIPPED on
+/// overflow (qwen's `MaxSizedBox overflowDirection:"top"`): the newest rows
+/// always show, older rows drop off the top. There is no scroll state and no
+/// scrollbar - native scrollback owns history.
+pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ctx: FrameCtx) {
+    let FrameCtx { conn, anim, theme } = ctx;
     let area = frame.area();
-    // The Composer's one render window (ADR-0034): the draft, the char-index
-    // cursor, and the open overlay, read together.
     let composer_view = t.composer().view();
-    let layout = composer::layout(
-        composer_view.draft,
-        composer_view.cursor,
-        area.width.saturating_sub(2) as usize,
-    );
-    let composer_height = capped_composer_height(&layout, area.height as usize);
-    let chunks = frame_chunks(area, composer_height);
-
-    // The viewport renders FIRST: the status bar's position segment reads the
-    // measured geometry (and the Viewport's clamped top) from this frame, not
-    // a stale one.
-    let geometry = render_viewport(
+    // Operation → Integration (IOSP): the pure [`pending_layout`] decides every
+    // Rect and whether the sticky box / overlay show; below we only issue the
+    // draw calls against that plan.
+    let plan = pending_layout(area, &composer_view, t);
+    render_pending_body(
         frame,
-        chunks[0],
-        &mut ViewportParams {
+        plan.body,
+        &mut PendingBodyParams {
             screen: t,
-            viewport,
             cache,
             anim,
         },
         theme,
     );
-    render_status_bar(
-        frame,
-        chunks[1],
-        StatusBarCtx {
-            screen: t,
-            conn,
-            viewport,
-            geometry,
+    render_sticky_slot(frame, plan.sticky_box, plan.sticky_items, theme);
+    // The flat footer (ADR-0053): a single row, model | context% | cost on the
+    // right, the AutoAcceptIndicator or `? for shortcuts` on the left. Native
+    // scrollback owns history (ADR-0046), so there is no scroll position to report.
+    render_footer(frame, plan.status, FooterCtx { screen: t, conn }, theme);
+    render_composer(frame, plan.composer, t, &plan.draft, theme);
+    render_composer_popup_slot(frame, plan.popup_top, area, &composer_view.overlay, theme);
+    // The Approval is rendered INLINE now (ADR-0049): the confirming ToolCall's
+    // box carries the question + radio, drawn as part of the pending body above.
+    // No modal overlay.
+}
+
+/// The pending region's whole geometry (the compute-plan / parameter object
+/// behind [`render_pending`]): the four zone Rects, the pre-wrapped composer
+/// [`ComposerLayout`] the composer + cursor draw from, the resolved sticky
+/// box Rect + its items (`None` when the box is dropped), and the status
+/// bar's y for the overlay anchor. Built by the pure [`pending_layout`]
+/// operation so [`render_pending`] is a call-only assembler (IOSP, ADR-0029
+/// measure == draw). Borrows `t` for the sticky items' lifetime.
+struct PendingLayout<'a> {
+    body: Rect,
+    sticky_box: Rect,
+    sticky_items: Option<&'a [TodoItem]>,
+    status: Rect,
+    composer: Rect,
+    draft: ComposerLayout,
+    popup_top: u16,
+}
+
+/// Operation (IOSP): the pending region's geometry for this frame. Wraps the
+/// draft, caps the composer zone, decides the sticky "Current tasks" box
+/// (ADR-0048) - reserved only when it fits alongside the status row, composer,
+/// and one body row (ADR-0029 measure == draw) - and splits `area` into the
+/// four zones. Pure: no frame access, no drawing.
+fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> PendingLayout<'a> {
+    let draft = composer::layout(
+        view.draft,
+        view.cursor,
+        area.width.saturating_sub(2) as usize,
+    );
+    let composer_height = capped_composer_height(&draft, area.height as usize);
+    // The sticky box DERIVES from the latest committed Todo item; a pending or
+    // all-completed list, or a frame too short to also hold the box, drops it
+    // (costs no rows). The `.filter` is the measure == draw guard: reserving a
+    // zone we cannot fully draw would paint a headless fragment over the
+    // composer.
+    //
+    // An OPEN approval (ADR-0049) also drops the box: the approval renders inside
+    // the pending body, and the informational sticky box would starve that body
+    // (`Constraint::Min(1)`) and top-clip the "Apply this change?" question out of
+    // view. A visible approval takes priority over the sticky list, so we reserve
+    // NO sticky zone while `pending_approval.is_some()`.
+    let sticky_items = t
+        .pending_approval
+        .is_none()
+        .then(|| {
+            sticky_todos(
+                t.transcript().latest_todo(),
+                t.transcript().committed_high_water(),
+            )
+        })
+        .flatten()
+        .filter(|items| {
+            sticky_fits(
+                area.height as usize,
+                sticky_todos_height(items.len()),
+                composer_height,
+            )
+        });
+    let sticky_height = sticky_items.map_or(0, |items| sticky_todos_height(items.len()));
+    let chunks = frame_chunks(area, sticky_height, composer_height);
+    PendingLayout {
+        body: chunks[0],
+        sticky_box: sticky_box_area(chunks[1]),
+        sticky_items,
+        status: chunks[2],
+        composer: chunks[3],
+        draft,
+        popup_top: chunks[2].y,
+    }
+}
+
+/// The sticky "Current tasks" slot: draws the box when the plan reserved one
+/// (`Some` items), else nothing. The presence branch lives HERE, so
+/// [`render_pending`] calls it unconditionally (IOSP).
+fn render_sticky_slot(frame: &mut Frame, area: Rect, items: Option<&[TodoItem]>, theme: &Theme) {
+    if let Some(items) = items {
+        render_sticky_todos(frame, area, items, theme);
+    }
+}
+
+/// The Composer overlay slot: draws the popup when an overlay is open, else
+/// nothing. The presence branch lives HERE, so [`render_pending`] calls it
+/// unconditionally (IOSP).
+fn render_composer_popup_slot(
+    frame: &mut Frame,
+    popup_top: u16,
+    area: Rect,
+    overlay: &Option<OverlayView>,
+    theme: &Theme,
+) {
+    if let Some(overlay) = overlay {
+        render_composer_popup(frame, popup_top, area, overlay, theme);
+    }
+}
+
+/// The scroll-free state [`render_pending_body`] needs each frame: the Screen it
+/// reads the pending items and live snapshot from, the cache the settled tail's
+/// lines come from, and the animation counters. Bundled so the body render takes
+/// four args (the reduced SRP_PARAMS call shape).
+pub struct PendingBodyParams<'a> {
+    pub screen: &'a Screen,
+    pub cache: &'a mut RenderCache,
+    pub anim: Anim,
+}
+
+/// Draws the pending transcript body into `area`, bottom-anchored and
+/// top-clipped (ADR-0046). Returns the total wrapped-row count of the pending
+/// stack (before clipping) so the caller can label the status bar. The assembly
+/// is the pending pipeline - cache sync, the collapsed-run fold over the
+/// full items, the three live entries - but slices the settled tail from the
+/// high-water mark ([`assemble_pending`]) and anchors to the bottom instead of
+/// consulting a [`Viewport`].
+fn render_pending_body(
+    frame: &mut Frame,
+    area: Rect,
+    params: &mut PendingBodyParams<'_>,
+    theme: &Theme,
+) -> usize {
+    let hw = params.screen.transcript().committed_high_water();
+    render_pending_body_at(frame, area, params, theme, hw)
+}
+
+/// Assembles the FULL, UNCLAMPED pending body line set at content `width` and
+/// high-water mark `hw` (ADR-0046): the uncommitted settled tail `items[hw..]`
+/// through the SAME [`grouped_rows`] fold the commit blit uses (so pending and
+/// committed stay byte-identical), then the live entries newest-last (the
+/// reasoning tail, the streaming answer, the spinner). This is the PRE-CLIP line
+/// set `render_pending_body_at` anchors/clips for the live viewport, AND the exact
+/// content Ctrl-S's peek ([`Effect::PeekPending`]) blits into scrollback unclamped.
+/// Syncs the cache as a side effect (the settled tail's lines come from it); no
+/// frame access, no anchor/clip math (IOSP).
+fn pending_body_lines(
+    params: &mut PendingBodyParams<'_>,
+    theme: &Theme,
+    hw: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let t = params.screen;
+    let cache = &mut params.cache;
+    let anim = params.anim;
+
+    cache.sync(
+        t.transcript(),
+        Toggles {
+            compact: t.compact_mode,
         },
+        width,
         theme,
     );
-    render_composer(frame, chunks[2], t, &layout, theme);
 
-    // The Composer overlay (ADR-0032/0033) floats just above the status bar +
-    // Composer - an inline popup, a Composer state, not a modal. Drawn after
-    // the Composer so it sits on top; skipped entirely when none is open.
-    if let Some(overlay) = composer_view.overlay {
-        render_composer_popup(frame, chunks[1].y, area, &overlay, theme);
+    let thinking = t.transcript().streaming_thinking();
+    // Compact suppresses the live thinking tail (qwen `HistoryItemDisplay.tsx:155`
+    // gates the pending `gemini_thought` under `!compactMode` too; Phase-6 design
+    // "live thinking tail suppressed"). The spinner SUBJECT still shows below -
+    // qwen does not compact-gate the LoadingIndicator.
+    let thinking_lines = if t.compact_mode {
+        Vec::new()
+    } else {
+        live_thinking_lines(&thinking, anim.spinner, width, theme)
+    };
+
+    let items = t.transcript().items();
+    // The inline approval (ADR-0049): when an Approval is pending, it attaches to
+    // the newest live ToolCall (the confirming call, found by position - the
+    // batch runs sequentially). Its group renders with the `?` marker, warning
+    // border, and the approval block appended. `None` otherwise, so the pending
+    // body is byte-identical to the committed blit (which never carries it).
+    let approving = t.pending_approval.as_ref().and_then(|pending| {
+        newest_live_tool_index(items).map(|call_index| Approving {
+            pending,
+            call_index,
+        })
+    });
+    // FULL-CONTENT pending body (ADR-0046): the uncommitted settled tail renders
+    // through the SAME [`grouped_rows`] fold `render_committed_slice` blits with,
+    // so committed and pending are byte-identical and nothing reflows at the
+    // commit seam (qwen's `<Static>` prints history un-clamped; the ONLY overflow
+    // reduction is the bottom-anchor + top-clip the caller applies).
+    let mut lines = grouped_rows_with_approval(&GroupedRows {
+        cache,
+        items,
+        hw,
+        width,
+        theme,
+        approving: approving.as_ref(),
+    });
+
+    // While an approval is OPEN, the approval block MUST stay bottom-most so the
+    // top-clip ([`anchor_clip`]) can never eat the "Apply this change?" /
+    // "Allow execution of..." question on a short terminal: the Run is not
+    // "loading", it is waiting on the USER, so the confirming ToolCall + its
+    // approval are the salient content, not the LoadingIndicator's
+    // waiting-for-confirmation state (qwen keeps the approval the focused
+    // interactive element). Suppress every trailing LIVE row below the approval -
+    // the reasoning tail, the streaming-answer tail, and the spinner - so the
+    // approving group ends the pending body and survives the clip. These rows are
+    // pending-only overlays never present in the committed slice, so
+    // measure==draw and committed==pending identity are unaffected.
+    if approving.is_none() {
+        // The live entries follow the settled tail, newest last: the reasoning
+        // tail, then the streaming answer, then (whenever the Run is Running) the
+        // spinner line - the LoadingIndicator (ADR-0048), which keeps the lull
+        // scene as its phrase content and carries the elapsed/cancel affordance.
+        append_live(&mut lines, &thinking_lines);
+        let tail = cache.streaming_tail();
+        let receiving = if let Some((tail_lines, _)) = tail {
+            append_live(&mut lines, tail_lines);
+            true
+        } else {
+            false
+        };
+        // The rolling thought subject (Phase 6, qwen `thought?.subject ||
+        // currentLoadingPhrase`): the live reasoning head the spinner shows in
+        // place of the lull phrase while the Run reasons. Bound outside the `if`
+        // so its `String` outlives the borrow the `SpinnerState` takes.
+        let subject = t.transcript().thought_subject();
+        let spinner = if t.status == Status::Running {
+            // `subject` is the Phase-6 thought-subject seam (wins over the lull
+            // phrase when `Some`); `tokens` is left `None` to avoid per-frame
+            // jitter.
+            let state = SpinnerState {
+                subject: subject.as_deref(),
+                receiving,
+                ..SpinnerState::default()
+            };
+            spinner_line(anim, state, width, theme)
+        } else {
+            Vec::new()
+        };
+        append_live(&mut lines, &spinner);
+    }
+    lines
+}
+
+/// Draws the pending body starting AT an explicit high-water mark `hw`: it emits
+/// the uncommitted settled tail `items[hw..]` plus the live stream, bottom-
+/// anchored and top-clipped (ADR-0046). [`render_pending_body`] calls this with
+/// the store's live
+/// [`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water)
+/// (committed items are already in native scrollback); passing `0` draws the
+/// WHOLE settled transcript, which is what a headless test wants to see on a
+/// TestBackend that has no real scrollback.
+fn render_pending_body_at(
+    frame: &mut Frame,
+    area: Rect,
+    params: &mut PendingBodyParams<'_>,
+    theme: &Theme,
+    hw: usize,
+) -> usize {
+    let content_area = Rect {
+        x: area.x + CONTENT_MARGIN,
+        width: area.width.saturating_sub(2 * CONTENT_MARGIN),
+        ..area
+    };
+    // Operation (IOSP): assemble the FULL, unclamped pending body once; the draw
+    // below only anchors/clips it. Ctrl-S's peek blits this SAME line set
+    // (ADR-0046, [`pending_body_lines`]).
+    let lines = pending_body_lines(params, theme, hw, content_area.width);
+
+    // Integration (IOSP): compute the anchor/clip geometry in the pure
+    // [`anchor_clip`] operation, then only issue the draw calls.
+    let total = wrapped_count(lines.clone(), content_area.width);
+    let clip = anchor_clip(total, area, content_area);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((clip.scroll, 0)),
+        clip.content_draw,
+    );
+    if let Some(marker_draw) = clip.marker_draw {
+        draw_overflow_marker(frame, marker_draw, theme);
     }
 
-    if let Some(pending) = &t.pending_approval {
-        render_approval_modal(frame, area, &pending.command, theme);
+    clip.total_lines
+}
+
+/// Appends a LIVE entry's lines (a reasoning tail, a streaming answer, or the
+/// lull row) after the settled body, with the `marginTop:1` blank separator every
+/// item carries - but only when the entry is non-empty. The emptiness branch
+/// lives HERE so the caller does not repeat it per entry.
+fn append_live(lines: &mut Vec<Line<'static>>, entry: &[Line<'static>]) {
+    if entry.is_empty() {
+        return;
     }
-    geometry
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.extend(entry.iter().cloned());
+}
+
+/// The bottom-anchor + top-clip geometry a pending body draws at (ADR-0046),
+/// resolved from the stack's `total_lines` against the zone `area`/`content_area`.
+/// Every field is a ready-to-draw value, so [`render_pending_body_at`] holds no
+/// layout arithmetic of its own (IOSP). `marker_draw` is `Some` only when the
+/// stack overflows the zone.
+struct PendingClip {
+    /// The stack's total wrapped rows, echoed back for the caller's return value.
+    total_lines: usize,
+    /// Content Paragraph scroll offset (the top-clipped row count, saturated).
+    scroll: u16,
+    content_draw: Rect,
+    /// The `… Ctrl-S to show more` marker row, present only on overflow.
+    marker_draw: Option<Rect>,
+}
+
+/// Operation (IOSP): the pure anchor/clip math for a pending body of
+/// `total_lines` wrapped rows in a `content_area` inside the zone `area`. When the
+/// stack overflows, keep the LAST `height` rows (drop from the top, qwen's
+/// `overflowDirection:"top"`) and reserve the top row for the overflow marker; when
+/// it fits, bottom-anchor it via `pad_top`. No frame access, no side effects.
+fn anchor_clip(total_lines: usize, area: Rect, content_area: Rect) -> PendingClip {
+    let height = area.height as usize;
+    let overflowed = total_lines > height;
+
+    let (top, drawn_rows, pad_top) = if overflowed {
+        (total_lines - height + 1, height, 0)
+    } else {
+        (0, total_lines, height - total_lines)
+    };
+
+    // On overflow the top visible row is the marker, so the content starts one
+    // row down and loses that row of height.
+    let content_top_pad: u16 = if overflowed { 1 } else { 0 };
+    let draw_height = drawn_rows.saturating_sub(content_top_pad as usize) as u16;
+    let y_off = pad_top as u16 + content_top_pad;
+
+    PendingClip {
+        total_lines,
+        scroll: u16::try_from(top).unwrap_or(u16::MAX),
+        content_draw: Rect {
+            y: content_area.y + y_off,
+            height: draw_height,
+            ..content_area
+        },
+        marker_draw: overflowed.then_some(Rect {
+            y: area.y + pad_top as u16,
+            height: 1,
+            ..area
+        }),
+    }
+}
+
+/// Draws the `… Ctrl-S to show more` overflow marker (ADR-0046, qwen's
+/// `ShowMoreLines`) on the reserved top row. Ctrl-S is wired: it blits the FULL,
+/// unclamped body into scrollback as a non-committing peek ([`Effect::PeekPending`]
+/// / [`render_pending_peek`]) - the fixed inline viewport cannot grow, so the
+/// clipped rows are revealed ABOVE the live region rather than in place.
+///
+/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
+fn draw_overflow_marker(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let marker_style = Style::default()
+        .fg(tui_color(theme.muted))
+        .add_modifier(Modifier::ITALIC);
+    frame.render_widget(
+        Paragraph::new(Line::styled("… Ctrl-S to show more", marker_style)),
+        area,
+    );
 }
 
 /// Computes the bounding rect for the Composer overlay popup: body rows plus
-/// top/bottom border, capped so a long list never eats the screen, positioned
-/// just above `anchor_y` and horizontally centered within `area`. Pure - no
-/// frame access. `body_len` is the number of content lines the popup will hold.
-fn popup_rect(anchor_y: u16, area: Rect, body_len: usize) -> Rect {
+/// top/bottom border, capped at `body_cap` so a long list never eats the
+/// screen, positioned just above `anchor_y` and horizontally centered within
+/// `area`. Pure - no frame access. `body_len` is the number of content lines
+/// the popup will hold; `body_cap` is the most body rows it may occupy (System
+/// A dialogs cap at [`POPUP_MAX_ROWS`] and scroll; System B is already windowed
+/// to its suggestions + `▲/▼`/counter chrome, so it caps higher).
+fn popup_rect(anchor_y: u16, area: Rect, body_len: usize, body_cap: u16) -> Rect {
     let body_rows = body_len.max(1) as u16;
-    let height = (body_rows + 2).min(POPUP_MAX_ROWS + 2).min(area.height);
+    let height = (body_rows + 2).min(body_cap + 2).min(area.height);
     let width = area.width.saturating_sub(2).max(1);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = anchor_y.saturating_sub(height);
@@ -353,68 +717,97 @@ fn selector_popup_title(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
-/// Resolves the body lines for a Selector popup given the overlay status: a
-/// loading/error status line, or the full row list when ready. Pure - no draw
-/// calls, only styled [`Line`] construction.
-fn selector_popup_lines(
-    title: &str,
-    status: &OverlayStatus,
-    rows: &[SelectorRow],
-    highlight: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+/// The body lines a status line spells: a Loading or Failed dialog draws one
+/// muted/error line. `Ready` returns `None` (the caller draws the rows). Pure.
+fn dialog_status_line(status: &OverlayStatus, title: &str, theme: &Theme) -> Option<Line<'static>> {
     match status {
-        OverlayStatus::Loading => vec![Line::styled(
+        OverlayStatus::Loading => Some(Line::styled(
             format!("loading {title}…"),
             Style::default()
                 .fg(tui_color(theme.muted))
                 .add_modifier(Modifier::ITALIC),
-        )],
-        OverlayStatus::Failed(msg) => vec![Line::styled(
+        )),
+        OverlayStatus::Failed(msg) => Some(Line::styled(
             format!("failed: {msg}"),
             Style::default()
                 .fg(tui_color(theme.error))
                 .add_modifier(Modifier::BOLD),
-        )],
-        OverlayStatus::Ready => popup_rows(rows, highlight, theme),
+        )),
+        OverlayStatus::Ready => None,
     }
 }
 
-/// Derives the popup title and body lines from the current overlay view.
-/// Pure - reads only the view and theme, emits no draw calls.
-fn popup_title_and_lines(view: &OverlayView, theme: &Theme) -> (String, Vec<Line<'static>>) {
-    match view {
-        OverlayView::Menu { rows, highlight } => {
-            ("commands".into(), popup_rows(rows, *highlight, theme))
-        }
-        OverlayView::Selector {
-            command,
-            status,
-            rows,
-            highlight,
-        } => {
-            let title = selector_popup_title(command);
-            let lines = selector_popup_lines(&title, status, rows, *highlight, theme);
-            (title, lines)
-        }
+// What one overlay draws: the box title, its body lines, and (System A only)
+// the active row the box scrolls to keep visible + the body-row cap. A pure
+// Parameter Object so the popup painter is one integration step over it (IOSP).
+struct PopupDraw {
+    title: String,
+    lines: Vec<Line<'static>>,
+    /// `Some` for System A (the box re-scrolls to this active row); `None` for
+    /// System B (already windowed).
+    scroll_active: Option<usize>,
+    body_cap: u16,
+}
+
+/// The System B palette body cap: the [`MAX_SUGGESTIONS`] window plus the three
+/// chrome rows (`▲`, `▼`, and the `(n/m)` counter) it may add.
+const MENU_BODY_CAP: u16 = MAX_SUGGESTIONS as u16 + 3;
+
+/// The System B palette's cursor state (Parameter Object): the highlighted row,
+/// the scroll-window top, and whether the active row is expanded (`←/→`).
+/// Bundled so the palette draw pipeline stays integration steps.
+#[derive(Debug, Clone, Copy)]
+struct MenuCursor {
+    active: usize,
+    scroll: usize,
+    expanded: bool,
+}
+
+// The System B (`/` palette) draw plan: the color-only suggestion rows +
+// windowing chrome; the box never re-scrolls (`scroll_active` None).
+fn menu_draw(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    inner_width: u16,
+    theme: &Theme,
+) -> PopupDraw {
+    PopupDraw {
+        title: "commands".to_string(),
+        lines: suggestion_rows(suggestions, cursor, inner_width, theme),
+        scroll_active: None,
+        body_cap: MENU_BODY_CAP,
     }
 }
 
-/// Returns the highlighted row index from an overlay view, used to scroll the
-/// list so the cursor stays visible when the popup overflows its height.
-fn popup_highlight(view: &OverlayView) -> usize {
-    match view {
-        OverlayView::Menu { highlight, .. } => *highlight,
-        OverlayView::Selector { highlight, .. } => *highlight,
+// The System A (numbered `›` dialog) draw plan: a status line, or the numbered
+// rows the box scrolls to keep the active row visible.
+fn dialog_draw(
+    command: &str,
+    status: &OverlayStatus,
+    rows: &[SelectorRow],
+    active: usize,
+    inner_width: u16,
+    theme: &Theme,
+) -> PopupDraw {
+    let title = selector_popup_title(command);
+    let lines = match dialog_status_line(status, &title, theme) {
+        Some(line) => vec![line],
+        None => dialog_rows(rows, active, inner_width, theme),
+    };
+    PopupDraw {
+        title,
+        lines,
+        scroll_active: Some(active),
+        body_cap: POPUP_MAX_ROWS,
     }
 }
 
-/// The inline Composer overlay popup (ADR-0032/0033): a compact bordered list
-/// anchored just above `anchor_y` (the status bar's row), listing the current
-/// [`OverlayView`]'s rows with the highlighted one reversed and any hint
-/// dimmed. The `Selector`'s `Loading`/`Failed` states draw a single status
-/// line instead of rows. Inline and height-bounded - never the full screen:
-/// the overlay is a Composer state, not a modal.
+/// The inline Composer overlay popup (ADR-0051): a compact bordered list
+/// anchored just above `anchor_y`. The TWO systems render distinctly - `Menu`
+/// (System B) is the fuzzy `/` palette ([`menu_draw`]), `Dialog` (System A) a
+/// committed command's numbered `›` list ([`dialog_draw`]). This is the one
+/// integration step: pick the draw plan, size the box, blit the scrolled
+/// window (IOSP). Inline and height-bounded - never the full screen.
 fn render_composer_popup(
     frame: &mut Frame,
     anchor_y: u16,
@@ -422,38 +815,485 @@ fn render_composer_popup(
     view: &OverlayView,
     theme: &Theme,
 ) {
-    let (title, lines) = popup_title_and_lines(view, theme);
-    let highlight = popup_highlight(view);
-    let popup = popup_rect(anchor_y, area, lines.len());
+    let inner_width = area.width.saturating_sub(4).max(1);
+    let plan = match view {
+        OverlayView::Menu {
+            suggestions,
+            active,
+            scroll,
+            query: _,
+            expanded,
+        } => menu_draw(
+            suggestions,
+            MenuCursor {
+                active: *active,
+                scroll: *scroll,
+                expanded: *expanded,
+            },
+            inner_width,
+            theme,
+        ),
+        OverlayView::Dialog {
+            command,
+            status,
+            rows,
+            active,
+            detail: _,
+        } => dialog_draw(command, status, rows, *active, inner_width, theme),
+    };
 
+    let popup = popup_rect(anchor_y, area, plan.lines.len(), plan.body_cap);
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(padded(&title))
+        .title(padded(&plan.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tui_color(theme.popup_border)));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // Scroll the highlighted row into view when the list overflows the box.
     let visible = inner.height as usize;
-    let top = composer::first_visible_row(highlight, visible.max(1));
-    let shown: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
+    let top = plan
+        .scroll_active
+        .map(|a| composer::first_visible_row(a, visible.max(1)))
+        .unwrap_or(0);
+    let shown: Vec<Line> = plan.lines.into_iter().skip(top).take(visible).collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }
+
+/// The System B (`/` palette) suggestion rows (qwen `SuggestionsDisplay.tsx`):
+/// color-only, NO `›` marker, NO numbers. The active row reads `text.accent`,
+/// the rest `text.secondary`; two columns (command | description) with the
+/// command column capped at half the width; the fuzzy match substring is drawn
+/// INVERTED (qwen `PrepareLabel`). Only the [`MAX_SUGGESTIONS`] window from
+/// `scroll` is emitted, framed by `▲`/`▼` when there is more above/below and a
+/// trailing `(active+1/total)` counter when the list overflows the window.
+fn suggestion_rows(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if suggestions.is_empty() {
+        return vec![no_matches_line(theme)];
+    }
+    let width = inner_width as usize;
+    let frame = suggestion_frame(suggestions, cursor.scroll, width);
+    up_arrow_line(&frame, theme)
+        .into_iter()
+        .chain(suggestion_body_lines(
+            suggestions,
+            cursor,
+            &frame,
+            width,
+            theme,
+        ))
+        .chain(down_arrow_line(&frame, theme))
+        .chain(counter_line(
+            suggestions.len(),
+            cursor.active,
+            &frame,
+            theme,
+        ))
+        .collect()
+}
+
+/// The leading `▲` scroll indicator, present only when rows are scrolled off
+/// the top (a one-branch pure row builder).
+fn up_arrow_line(frame: &SuggestionFrame, theme: &Theme) -> Option<Line<'static>> {
+    frame
+        .show_up
+        .then(|| Line::styled("▲", primary_style(theme)))
+}
+
+/// The windowed suggestion rows, each with its active flag resolved against
+/// `frame.start` (a pure row builder).
+fn suggestion_body_lines(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    frame: &SuggestionFrame,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    suggestions[frame.start..frame.end]
+        .iter()
+        .enumerate()
+        .map(|(offset, s)| {
+            let is_active = frame.start + offset == cursor.active;
+            let state = RowState {
+                active: is_active,
+                expanded: is_active && cursor.expanded,
+            };
+            suggestion_row(s, state, frame.cmd_col, width, theme)
+        })
+        .collect()
+}
+
+/// The trailing `▼` scroll indicator, present only when rows extend below the
+/// window (a one-branch pure row builder).
+fn down_arrow_line(frame: &SuggestionFrame, theme: &Theme) -> Option<Line<'static>> {
+    frame
+        .show_down
+        .then(|| Line::styled("▼", secondary_style(theme)))
+}
+
+/// The trailing `(active+1/total)` counter, present only when the list
+/// overflows the window (a one-branch pure row builder).
+fn counter_line(
+    total: usize,
+    active: usize,
+    frame: &SuggestionFrame,
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    frame
+        .show_counter
+        .then(|| Line::styled(format!("({}/{total})", active + 1), secondary_style(theme)))
+}
+
+/// The pure frame computation behind [`suggestion_rows`] (compute-plan
+/// pattern): the visible `[start, end)` window from `scroll`, the command
+/// column width, and whether the `▲`/`▼` scroll arrows and the `(n/m)` counter
+/// chrome rows apply. All the arithmetic and branching lives here so
+/// [`suggestion_rows`] is a call-only assembler folding this into `Line`s
+/// (IOSP). Assumes `suggestions` is non-empty (the caller guards).
+struct SuggestionFrame {
+    start: usize,
+    end: usize,
+    cmd_col: usize,
+    show_up: bool,
+    show_down: bool,
+    show_counter: bool,
+}
+
+fn suggestion_frame(
+    suggestions: &[completion::Suggestion],
+    scroll: usize,
+    width: usize,
+) -> SuggestionFrame {
+    let total = suggestions.len();
+    let start = scroll.min(total.saturating_sub(1));
+    let end = (start + MAX_SUGGESTIONS).min(total);
+    SuggestionFrame {
+        start,
+        end,
+        cmd_col: command_column_width(suggestions, width),
+        show_up: start > 0,
+        show_down: end < total,
+        show_counter: total > MAX_SUGGESTIONS,
+    }
+}
+
+/// The "no matches" placeholder line (muted italic) - the empty-palette body.
+fn no_matches_line(theme: &Theme) -> Line<'static> {
+    Line::styled(
+        "no matches",
+        Style::default()
+            .fg(tui_color(theme.muted))
+            .add_modifier(Modifier::ITALIC),
+    )
+}
+
+/// The command column width (qwen `commandColumnWidth`): the widest label,
+/// capped at half the popup width, floored at one column. Pure.
+fn command_column_width(suggestions: &[completion::Suggestion], width: usize) -> usize {
+    let max_label = suggestions
+        .iter()
+        .map(|s| s.label.width())
+        .max()
+        .unwrap_or(0);
+    max_label.min(width / 2).max(1)
+}
+
+/// One System B suggestion row's transient state (Parameter Object): whether it
+/// is the active (highlighted) row and whether it is currently expanded (`←/→`).
+/// Bundled so the row/label builders stay integration steps, not long
+/// parameter lists.
+#[derive(Debug, Clone, Copy)]
+struct RowState {
+    active: bool,
+    expanded: bool,
+}
+
+/// One System B suggestion row: the label (fuzzy match inverted) in the command
+/// column, padded to the boundary, then the description in the second column.
+/// The active row reads `text.accent`, the rest `text.secondary`.
+fn suggestion_row(
+    s: &completion::Suggestion,
+    state: RowState,
+    cmd_col: usize,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let text_color = if state.active {
+        accent_style(theme)
+    } else {
+        secondary_style(theme)
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = push_label_with_match(&mut spans, s, state.expanded, text_color, cmd_col);
+    if used < cmd_col {
+        used = push_cols(
+            &mut spans,
+            &" ".repeat(cmd_col - used),
+            Style::default(),
+            used,
+            width,
+        );
+    }
+    if !s.description.is_empty() {
+        used = push_cols(&mut spans, "  ", Style::default(), used, width);
+        used = push_cols(&mut spans, &s.description, text_color, used, width);
+    }
+    // The ` → `/` ← ` expand affordance (qwen SuggestionsDisplay:144-148):
+    // only on a LONG active row - collapsed shows ` → ` (press → to expand),
+    // expanded shows ` ← ` (press ← to collapse). Gray, trailing the row.
+    if state.active && label_is_long(&s.label) {
+        let indicator = if state.expanded { " ← " } else { " → " };
+        let _ = push_cols(&mut spans, indicator, secondary_style(theme), used, width);
+    }
+    Line::from(spans)
+}
+
+/// Whether a label is "long" (chars `>= MAX_WIDTH`, qwen PrepareLabel): a long
+/// row on the active line collapses to a truncated window until expanded.
+fn label_is_long(label: &str) -> bool {
+    label.chars().count() >= completion::MAX_WIDTH
+}
+
+/// Pushes a suggestion's label with its fuzzy match window drawn INVERTED (qwen
+/// `PrepareLabel`: the match substring reversed against the row color). Returns
+/// the new used-column count. The match window is `[start, end)` char indices
+/// over the label; when absent the label draws plain. When the label is long
+/// (`>= MAX_WIDTH`) and NOT `is_expanded`, it collapses to a truncated window
+/// (qwen `PrepareLabel` cases 1-3), so the row fits; `is_expanded` shows it in
+/// full.
+fn push_label_with_match(
+    spans: &mut Vec<Span<'static>>,
+    s: &completion::Suggestion,
+    is_expanded: bool,
+    color: Style,
+    width: usize,
+) -> usize {
+    let (before, matched, after) = prepare_label(&s.label, s.matched, is_expanded);
+    let mut u = push_cols(spans, &before, color, 0, width);
+    if !matched.is_empty() {
+        u = push_cols(
+            spans,
+            &matched,
+            color.add_modifier(Modifier::REVERSED),
+            u,
+            width,
+        );
+    }
+    push_cols(spans, &after, color, u, width)
+}
+
+/// The qwen `PrepareLabel` split: `(before, matched, after)` char strings over
+/// `label`, with the match window collapsed to a MAX_WIDTH-bounded window when
+/// the label is long and not expanded. Pure - no ratatui.
+///
+/// - No match (or an out-of-range window): the whole label is `before`,
+///   truncated to `MAX_WIDTH` + `...` when long and not expanded (qwen's
+///   no-match branch).
+/// - Expanded or already short (`<= MAX_WIDTH`): the full label split at the
+///   match (qwen Case 1).
+/// - Long + a match wider than MAX_WIDTH: only a truncated slice of the match
+///   (qwen Case 2).
+/// - Long + a shorter match: a window centred on the match with `...` elisions
+///   at the clipped ends (qwen Case 3).
+fn prepare_label(
+    label: &str,
+    matched: Option<(usize, usize)>,
+    is_expanded: bool,
+) -> (String, String, String) {
+    let chars: Vec<char> = label.chars().collect();
+    let len = chars.len();
+    let slice = |a: usize, b: usize| -> String { chars[a.min(len)..b.min(len)].iter().collect() };
+    let long = len > completion::MAX_WIDTH;
+
+    let hit = matched.filter(|&(m_start, m_end)| m_start < len && m_start < m_end);
+    let Some((m_start, raw_end)) = hit else {
+        // No match: plain label, truncated when long and not expanded.
+        let before = if !is_expanded && long {
+            format!("{}...", slice(0, completion::MAX_WIDTH))
+        } else {
+            label.to_string()
+        };
+        return (before, String::new(), String::new());
+    };
+    let m_end = raw_end.min(len);
+    let match_len = m_end - m_start;
+
+    if is_expanded || !long {
+        // Case 1: full label split at the match.
+        return (slice(0, m_start), slice(m_start, m_end), slice(m_end, len));
+    }
+    if match_len >= completion::MAX_WIDTH {
+        // Case 2: the match itself overflows - a truncated slice of it.
+        let cut = m_start + completion::MAX_WIDTH - 1;
+        return (
+            String::new(),
+            format!("{}...", slice(m_start, cut)),
+            String::new(),
+        );
+    }
+    // Case 3: a window centred on the match, `...`-elided at clipped ends.
+    let context = completion::MAX_WIDTH - match_len;
+    let before_space = context / 2;
+    let after_space = context - before_space;
+    let mut start = m_start.saturating_sub(before_space);
+    let mut end = m_end + after_space;
+    if m_start < before_space {
+        end += before_space - m_start; // slide window right
+    }
+    if end > len {
+        start = start.saturating_sub(end - len); // slide window left
+        end = len;
+    }
+    let mut before = slice(start, m_start);
+    let matched_str = slice(m_start, m_end);
+    let mut after = slice(m_end, end);
+    if start > 0 {
+        before = elide_prefix(&before);
+    }
+    if end < len {
+        after = elide_suffix(&after);
+    }
+    (before, matched_str, after)
+}
+
+// Replaces the first 3 chars of `s` with `...` (qwen `'...' + before.slice(3)`),
+// or `...` when shorter than 3.
+fn elide_prefix(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 3 {
+        format!("...{}", chars[3..].iter().collect::<String>())
+    } else {
+        "...".to_string()
+    }
+}
+
+// Replaces the last 3 chars of `s` with `...` (qwen `after.slice(0, -3) +
+// '...'`), or `...` when shorter than 3.
+fn elide_suffix(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 3 {
+        format!("{}...", chars[..chars.len() - 3].iter().collect::<String>())
+    } else {
+        "...".to_string()
+    }
+}
+
+/// The System A (numbered `›` dialog) rows for a committed command's list
+/// (ADR-0051): the `selection_rows` shape, but over [`SelectorRow`]s whose role
+/// decides the disabled mask (headers/greyed rows are dim + unnavigable, the
+/// active navigable row is the `›`-marked success-green one) and whose hint
+/// trails dimmed. Numbered per the row's position, matching the digit
+/// quick-select.
+fn dialog_rows(
+    rows: &[SelectorRow],
+    active: usize,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::styled(
+            "no matches",
+            Style::default()
+                .fg(tui_color(theme.muted))
+                .add_modifier(Modifier::ITALIC),
+        )];
+    }
+    let width = inner_width as usize;
+    // The number field is as wide as the widest `N.`.
+    let num_field = format!("{}.", rows.len()).width();
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let is_active = i == active && row.is_stop();
+            let navigable = row.is_stop();
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut used = 0;
+            // The 2-wide `›`/space gutter (only a navigable active row marks).
+            if is_active {
+                used = push_cols(
+                    &mut spans,
+                    SELECTION_MARKER,
+                    success_style(theme),
+                    used,
+                    width,
+                );
+                used = push_cols(&mut spans, " ", Style::default(), used, width);
+            } else {
+                used = push_cols(
+                    &mut spans,
+                    &" ".repeat(SELECTION_GUTTER_WIDTH),
+                    Style::default(),
+                    used,
+                    width,
+                );
+            }
+            // The right-aligned `N.` number (success-green when active, else
+            // secondary; a non-navigable row draws no number).
+            if navigable {
+                let num = format!("{}.", i + 1);
+                let pad = num_field.saturating_sub(num.width());
+                if pad > 0 {
+                    used = push_cols(&mut spans, &" ".repeat(pad), Style::default(), used, width);
+                }
+                let num_style = if is_active {
+                    success_style(theme)
+                } else {
+                    secondary_style(theme)
+                };
+                used = push_cols(&mut spans, &num, num_style, used, width);
+                used = push_cols(&mut spans, " ", Style::default(), used, width);
+            } else {
+                // A header/greyed row keeps the number field's width blank so
+                // its label lines up with the members below it.
+                used = push_cols(
+                    &mut spans,
+                    &" ".repeat(num_field + 1),
+                    Style::default(),
+                    used,
+                    width,
+                );
+            }
+            // The label: success-green when active, dim for header/greyed/note,
+            // else primary.
+            let label_style = match (is_active, row.role) {
+                (true, _) => success_style(theme),
+                (false, RowRole::Member) => primary_style(theme),
+                (false, _) => secondary_style(theme),
+            };
+            used = push_cols(&mut spans, &row.label, label_style, used, width);
+            // The hint trails dimmed (a "(current)" marker, a note's reason).
+            if let Some(hint) = &row.hint {
+                used = push_cols(&mut spans, "  ", Style::default(), used, width);
+                let _ = push_cols(
+                    &mut spans,
+                    hint,
+                    Style::default()
+                        .fg(tui_color(theme.muted))
+                        .add_modifier(Modifier::ITALIC),
+                    used,
+                    width,
+                );
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The most System-B suggestion rows the palette shows before it scrolls (qwen
+/// `MAX_SUGGESTIONS_TO_SHOW`); mirrors [`completion::MAX_SUGGESTIONS_TO_SHOW`].
+const MAX_SUGGESTIONS: usize = completion::MAX_SUGGESTIONS_TO_SHOW;
 
 /// The most body rows the Slash popup shows before it scrolls internally - keeps
 /// the overlay compact even against a long model list.
 const POPUP_MAX_ROWS: u16 = 8;
 
-/// Padding (columns) added to a command's character count to size the modal width.
-const APPROVAL_MODAL_PADDING: u16 = 8;
-
-/// The minimum guaranteed modal width in columns. Wide enough to read the
-/// keybinding line (`[y]es / [n]o / [a]lways`).
+/// The minimum guaranteed Session Picker width in columns.
 const MODAL_MIN_WIDTH: u16 = 44;
-
-/// The maximum height (rows) of the Approval modal including borders.
-const APPROVAL_MODAL_HEIGHT: u16 = 8;
 
 /// The minimum content width (columns) of the Session Picker popup, including its
 /// horizontal padding (+4 for the two border columns plus two inner padding cols).
@@ -476,252 +1316,165 @@ const COST_HIDDEN: f64 = 0.0;
 /// tick is `TICK_MS` ms) into an elapsed-seconds figure for the lull timer.
 const MILLIS_PER_SEC: u64 = 1_000;
 
-/// The number of priority tiers in the status-bar segment drop policy.
-const DROP_TIER_COUNT: usize = 6;
-
-/// The total horizontal side margin (columns) reserved outside the Approval
-/// modal: two columns each side so the modal never bleeds to the terminal edge.
-const APPROVAL_MODAL_SIDE_MARGIN: u16 = 4;
-
-/// One `Line` per [`SelectorRow`]: the label, then the hint dimmed (a note's
-/// hint may carry the reveal cap's "· N more" count, merged upstream by the
-/// Composer's overlay view); the highlighted row is reversed so it reads as
-/// the cursor. The row's role picks the label treatment - a header or note
-/// (a Provider group header, an "unavailable" note) draws dim bold, a
-/// collapsed member draws dim WITHOUT bold so it reads as a greyed model
-/// rather than a header. Only a cursor stop (a member or a note) ever draws
-/// reversed: a highlighted note is the stop anchoring a greyed group's view,
-/// while headers and collapsed rows can never hold the cursor.
-fn popup_rows(rows: &[SelectorRow], highlight: usize, theme: &Theme) -> Vec<Line<'static>> {
-    if rows.is_empty() {
-        return vec![Line::styled(
-            "no matches",
-            Style::default()
-                .fg(tui_color(theme.muted))
-                .add_modifier(Modifier::ITALIC),
-        )];
-    }
-    rows.iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let label_style = match row.role {
-                RowRole::Member => Style::default(),
-                RowRole::Collapsed => Style::default().fg(tui_color(theme.muted)),
-                RowRole::Header | RowRole::Note => Style::default()
-                    .fg(tui_color(theme.muted))
-                    .add_modifier(Modifier::BOLD),
-            };
-            let mut spans = vec![Span::styled(row.label.clone(), label_style)];
-            if let Some(hint) = &row.hint {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    hint.clone(),
-                    Style::default()
-                        .fg(tui_color(theme.muted))
-                        .add_modifier(Modifier::ITALIC),
-                ));
-            }
-            let line = Line::from(spans);
-            if i == highlight && row.is_stop() {
-                line.style(Style::default().add_modifier(Modifier::REVERSED))
-            } else {
-                line
-            }
-        })
-        .collect()
-}
-
-/// The scroll state and cache the viewport render needs each frame. Bundled so
-/// [`render_viewport`] takes four args instead of six (SRP_PARAMS fix): `frame`,
-/// `area`, `params`, and `theme` is the reduced call shape.
-pub struct ViewportParams<'a> {
-    pub screen: &'a Screen,
-    pub viewport: &'a Viewport,
-    pub cache: &'a mut RenderCache,
-    pub anim: Anim,
-}
-
-/// The transcript viewport: the message list, oldest first, plus any in-flight
-/// streaming Thinking/text, scrolled to the [`Viewport`]'s clamped top offset
-/// and overlaid with a scrollbar when the content overflows. Returns the
-/// measured geometry `(total wrapped lines, viewport height)`.
-///
-/// Per-frame cost is O(visible), not O(session): settled items' lines and
-/// wrapped counts come from the [`RenderCache`] (built once per item, per
-/// width), the total comes from summing the cached counts, and only the items
-/// intersecting the visible window ([`visible_window`]) are handed to the
-/// `Paragraph` - with a scroll offset RELATIVE to that slice. Measuring and
-/// drawing still agree exactly: each item was measured with the same
-/// `Wrap { trim: false }` at the same width it is drawn at, and ratatui wraps
-/// each `Line` independently, so per-item counts sum to the whole.
-pub fn render_viewport(
-    frame: &mut Frame,
-    area: Rect,
-    params: &mut ViewportParams<'_>,
+/// Brings the [`RenderCache`] up to date with `screen`'s Transcript at
+/// `content_width` (ADR-0046): the adapter's public door onto the cache's
+/// (crate-private) sync, so [`commit_items`](crate::ui::commit_items) can sync
+/// at the SAME content width the committed slice draws at (frame width minus
+/// the two `CONTENT_MARGIN` columns) before measuring and blitting - keeping
+/// measure == draw
+/// (ADR-0029). The [`Toggles`] mirror the Screen's Ctrl+O compact flag.
+pub fn sync_commit_cache(
+    cache: &mut RenderCache,
+    screen: &Screen,
+    content_width: u16,
     theme: &Theme,
-) -> (usize, usize) {
-    let t = params.screen;
-    let viewport = params.viewport;
-    let cache = &mut params.cache;
-    let anim = params.anim;
-    // The rightmost column is ALWAYS the scrollbar gutter, occupied or not:
-    // reserving it only when the scrollbar shows would make the wrap width
-    // depend on the line count and the line count on the wrap width.
-    let text_area = Rect {
-        width: area.width.saturating_sub(1),
-        ..area
-    };
-    // The leftmost LANE_GUTTER columns are ALWAYS reserved for the run-lane
-    // spine / user caret (ADR-0040), occupied or not - the same unconditional
-    // reservation as the scrollbar column, and for the same reason: content
-    // wraps in the narrower `content_area`, so the wrap width never depends on
-    // whether a given row carries a spine. Everything below (`cache.sync`, the
-    // live tail's `wrapped_count`) MUST measure at `content_area.width` so
-    // measuring and drawing agree exactly (ADR-0029, the load-bearing gutter
-    // invariant).
-    let content_area = Rect {
-        x: text_area.x + LANE_GUTTER,
-        width: text_area.width.saturating_sub(LANE_GUTTER),
-        ..text_area
-    };
+) {
     cache.sync(
-        t.transcript(),
+        screen.transcript(),
         Toggles {
-            thinking_expanded: t.thinking_expanded,
-            tools_expanded: t.tools_expanded,
+            compact: screen.compact_mode,
         },
-        content_area.width,
+        content_width,
         theme,
     );
+}
 
-    // The live streaming snapshot renders below the settled items: the
-    // animated `✦ Thinking` header + a rolling reasoning tail (rebuilt each
-    // frame - the tail's window is non-monotonic so it is NOT cached; a few
-    // lines are cheap) and the streaming markdown (cached - see
-    // [`RenderCache::sync`]). `streaming_thinking()` stays whole in the store;
-    // the last-N windowing is a display policy, so it lives here (ADR-0029).
-    let thinking = t.transcript().streaming_thinking();
-    let thinking_lines = live_thinking_lines(&thinking, anim.spinner, content_area.width, theme);
-
-    // One (lines, wrapped-count, gutter-kind) entry per window "item": every
-    // KEPT settled message, then the live tail - a single indexing shared by the
-    // window selection, the slice assembly, and the per-visual-row gutter mapping
-    // below. The lane is DERIVED here at render time (ADR-0040), never stored and
-    // never in the RenderCache key: `lane_gutters` walks the settled items in
-    // order, and both live entries (the reasoning tail, the streaming answer)
-    // hang off the running Run's lane, so they take the spine. The lane is dense
-    // - no per-item blank separator - so the spine stays continuous.
-    let items = t.transcript().items();
-    let lane = lane_gutters(items);
-    // A collapsed run reads tidy: the LAST thought becomes a header, and beneath
-    // it only the last few actions show as a rolling window - older low-signal
-    // machinery (list/read) is suppressed, while code/diff Blocks and errors
-    // always break out. Ctrl-T reveals every thought; Ctrl-O every action.
-    let fold = run_fold(
-        items,
-        t.thinking_expanded,
-        t.tools_expanded,
-        MACHINERY_WINDOW,
+/// The total wrapped height (visual rows) the committed slice `[hw, hw + count)`
+/// draws to at `width` (ADR-0046): the wrapped-row count of the SAME
+/// [`grouped_rows`] fold the pending body and [`render_committed_slice`] draw, so
+/// the box borders + `marginTop:1` separators + gaps are counted (measure ==
+/// draw, ADR-0029). A tall commit overflows into native scrollback, never
+/// clamped. `slice.items` must be bounded to `hw + count`; `content_width` is the
+/// width the cache was synced at (the frame width minus the two [`CONTENT_MARGIN`]
+/// columns).
+pub fn commit_slice_height(slice: &CommittedSlice<'_>, content_width: u16) -> u16 {
+    let lines = grouped_rows(
+        slice.cache,
+        slice.items,
+        slice.hw,
+        content_width,
+        slice.theme,
     );
-    // The fold's synthetic lines (a thought header carrying the LAST thought's
-    // text at the FIRST thought's slot, or a `⋯ N earlier actions` count),
-    // owned here so the assembly below can borrow them.
-    let synthetic = fold_synthetic_lines(&fold, items, content_area.width, theme);
-    // Apply the fold: kept items contribute their cached lines, Header/Elided
-    // their synthetic line, Drops nothing - the per-item branch structure lives
-    // in `assemble_settled` so it stays off `render_viewport`'s complexity.
-    let (mut item_lines, mut counts, mut gutters) =
-        assemble_settled(cache, &fold, &synthetic, &lane, content_area.width);
-    if !thinking_lines.is_empty() {
-        counts.push(wrapped_count(thinking_lines.clone(), content_area.width));
-        item_lines.push(&thinking_lines);
-        gutters.push(GutterKind::Spine);
-    }
-    // Captured once so the lull gate below can test `is_none()` without a
-    // second borrow of `cache` (streaming_tail borrows it immutably).
-    let tail = cache.streaming_tail();
-    if let Some((lines, wrapped)) = tail {
-        counts.push(wrapped);
-        item_lines.push(lines);
-        gutters.push(GutterKind::Spine);
-    }
-    // The lull "waiting" row is the third live entry, mutually exclusive with
-    // the two above BY CONSTRUCTION: it draws only when the Run runs and
-    // NEITHER a reasoning tail nor a streaming answer is on screen. Declared
-    // in this scope so the `&lull_lines` reference `item_lines` holds outlives
-    // the draw, exactly like `thinking_lines`. `push_live_entry` folds the
-    // emptiness branch out of this body so appending the row does not raise
-    // `render_viewport`'s complexity past its baseline (the settle window and
-    // the gate already keep the row empty when it must not show).
-    let lull_lines = if lull_visible(t.status, thinking_lines.is_empty(), tail.is_some()) {
-        live_lull_lines(anim, content_area.width, theme)
-    } else {
-        Vec::new()
+    u16::try_from(wrapped_count(lines, content_width)).unwrap_or(u16::MAX)
+}
+
+/// The committed slice `[hw, hw + count)` to freeze into scrollback (ADR-0046):
+/// the cache to draw from, the item list (BOUNDED to `hw + count` by the caller so
+/// [`grouped_rows`] stops a tool group at the slice edge), and the ACTIVE `theme`
+/// the frozen rows bake. Bundled so [`render_committed_slice`] and
+/// [`commit_slice_height`] take a single source arg. `count` is retained for the
+/// caller's bookkeeping; the fold stops at `items.len()`.
+pub struct CommittedSlice<'a> {
+    pub cache: &'a RenderCache,
+    pub items: &'a [TranscriptItem],
+    pub hw: usize,
+    pub count: usize,
+    pub theme: &'a Theme,
+}
+
+/// Blits the committed slice `[hw, hw + count)` into `buf` (ADR-0046, the inline
+/// `insert_before` seam): the SAME [`grouped_rows`] fold the pending body draws -
+/// prose items with baked prefixes, tool runs boxed, `marginTop:1` separators -
+/// so a committed item is byte-identical to the live one before it froze. The
+/// content sits [`CONTENT_MARGIN`] columns in (matching qwen `marginLeft:2`); the
+/// caller sizes `buf` to [`commit_slice_height`], and a slice taller than the
+/// terminal scrolls whole into native scrollback (no clamp, qwen `<Static>`).
+pub fn render_committed_slice(buf: &mut Buffer, slice: &CommittedSlice<'_>) {
+    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
+    let lines = grouped_rows(
+        slice.cache,
+        slice.items,
+        slice.hw,
+        content_width,
+        slice.theme,
+    );
+    blit_body_lines(buf, lines);
+}
+
+/// Renders an already-assembled body line set into `buf`'s content column
+/// ([`CONTENT_MARGIN`] columns in, matching qwen `marginLeft:2`), sized to its own
+/// wrapped height so a stack taller than `buf` scrolls whole into native
+/// scrollback (no clamp, qwen `<Static>`). The ONE `insert_before` blit shared by
+/// the committed freeze ([`render_committed_slice`]) and the Ctrl-S peek
+/// ([`render_pending_peek`]) - both hand it their `grouped_rows` output, so the
+/// content-column geometry + wrap live in one place.
+fn blit_body_lines(buf: &mut Buffer, lines: Vec<Line<'static>>) {
+    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
+    let height = wrapped_count(lines.clone(), content_width) as u16;
+    let content_area = Rect {
+        x: buf.area.x + CONTENT_MARGIN,
+        y: buf.area.y,
+        width: content_width,
+        height,
     };
-    push_live_entry(
-        &lull_lines,
-        &mut item_lines,
-        &mut counts,
-        &mut gutters,
-        content_area.width,
-    );
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(content_area, buf);
+}
 
-    // The ONE per-visual-row mapping both the content and the gutter consume:
-    // expanding the per-item kinds over each item's wrapped rows yields a flat
-    // `RowGutter` per content row, in the same order the Paragraph lays rows
-    // out. Slicing it by the absolute `top` offset is exactly the content's
-    // `scroll`, so the gutter and the content can never desync (M3).
-    let row_gutters = expand_gutters(&gutters, &counts);
+/// The Ctrl-S peek (ADR-0046, [`Effect::PeekPending`]): the whole pending body
+/// blitted UNCLAMPED into scrollback so the user can read the rows the live
+/// viewport top-clips away. Bundles the mutable cache the body's settled tail
+/// draws from, the `Screen` the pending items + live snapshot come from, the
+/// animation counters (so the reasoning/spinner match the live frame), and the
+/// ACTIVE theme the frozen rows bake. It renders at the LIVE high-water mark
+/// ([`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water),
+/// the same `hw` the live draw uses), so the peek is the live stack plus its
+/// clipped-off top, never the already-committed prefix (which is in scrollback).
+///
+/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
+pub struct PendingPeek<'a> {
+    pub cache: &'a mut RenderCache,
+    pub screen: &'a Screen,
+    pub anim: Anim,
+    pub theme: &'a Theme,
+}
 
-    let total_lines: usize = counts.iter().sum();
-    let height = area.height as usize;
-    let top = viewport.top_offset(total_lines, height);
-    let (range, offset) = visible_window(&counts, top, height);
-    let visible: Vec<Line> = item_lines[range.clone()]
-        .iter()
-        .flat_map(|lines| lines.iter().cloned())
-        .collect();
-    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
-    // The pure window math speaks usize; saturate only here, at the ratatui
-    // boundary. The relative offset is bounded by ONE item's wrapped rows
-    // (the item straddling the window top), never the session's. Content draws
-    // into `content_area` (the gutter carved off the left); the gutter glyphs
-    // are painted into the reserved columns per VISUAL row, so soft-wrapped
-    // continuations keep their spine.
-    let scroll = u16::try_from(offset).unwrap_or(u16::MAX);
-    frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
-    paint_gutter(
-        frame,
-        text_area,
-        &GutterCtx {
-            row_gutters: &row_gutters,
-            top,
-            height,
-        },
-        theme,
-    );
-
-    if total_lines > height {
-        let mut state = ScrollbarState::new(total_lines)
-            .position(top)
-            .viewport_content_length(height);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area,
-            &mut state,
-        );
+impl PendingPeek<'_> {
+    /// The full, unclamped pending body lines at content `width` and the live
+    /// high-water mark. Syncs the cache as a side effect (the settled tail draws
+    /// from it), exactly as the live body does.
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let hw = self.screen.transcript().committed_high_water();
+        let mut params = PendingBodyParams {
+            screen: self.screen,
+            cache: self.cache,
+            anim: self.anim,
+        };
+        pending_body_lines(&mut params, self.theme, hw, width)
     }
-    (total_lines, height)
+}
+
+/// The total wrapped height the Ctrl-S peek blits at `content_width` (ADR-0046):
+/// the wrapped-row count of the FULL, unclamped pending body. `0` means the body
+/// is empty and the adapter has nothing to peek. Mirrors [`commit_slice_height`].
+pub fn pending_peek_height(peek: &mut PendingPeek<'_>, content_width: u16) -> u16 {
+    let lines = peek.lines(content_width);
+    u16::try_from(wrapped_count(lines, content_width)).unwrap_or(u16::MAX)
+}
+
+/// Blits the FULL, UNCLAMPED pending body into `buf` (ADR-0046, the Ctrl-S peek's
+/// `insert_before` seam): the SAME line set the live body draws, but WITHOUT the
+/// `anchor_clip` top-clip, so every row the live viewport hides lands in
+/// scrollback for the user to scroll up to. The content sits `CONTENT_MARGIN`
+/// columns in (matching the live body + committed blit); the caller sizes `buf` to
+/// [`pending_peek_height`]. A PEEK, not a commit: the caller does NOT advance the
+/// high-water mark, so the same body redraws (clipped) in the live viewport next
+/// frame. Mirrors [`render_committed_slice`].
+pub fn render_pending_peek(buf: &mut Buffer, peek: &mut PendingPeek<'_>) {
+    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
+    let lines = peek.lines(content_width);
+    blit_body_lines(buf, lines);
 }
 
 /// The rolling reasoning tail shown while a Run streams: an animated
 /// `✦ Thinking ⠋` header (the braille [`SPINNER`] advanced by the adapter's
-/// tick - motion lives HERE at the brain, not the status bar, ADR-0040), then
+/// tick - motion lives HERE at the reasoning header, not the status bar), then
 /// the last [`THINKING_TAIL_ROWS`] VISUAL rows of the reasoning, indented two
 /// columns under the header as a sub-block. Empty when nothing is streaming.
 ///
 /// Bounded by VISUAL rows, not source rows: one long unwrapped reasoning line
-/// soft-wraps to many rows, which would let the "short tail" (Decision A) grow
+/// soft-wraps to many rows, which would let the short reasoning tail grow
 /// to fill the viewport. Each source row is truncated (with an `…` marker) to
 /// the content width so it occupies exactly one visual row and the tail is a
 /// hard `THINKING_TAIL_ROWS` cap - truncation, not re-wrapping, so this never
@@ -760,71 +1513,379 @@ fn live_thinking_lines(
     out
 }
 
-/// The lull "waiting" row shown while a Run runs but nothing streams: an
-/// elapsed timer (left, fixed-width so the animation column never jitters) then
-/// the current [`lull`] scene frame, indented two columns under the running
-/// lane like the reasoning tail. Empty until the lull passes the settle window
-/// (so a brief token gap never flashes a scene) and empty whenever output is
-/// streaming (the caller gates on that - see [`render_viewport`]).
-///
-/// `width` is the `content_area` width this draws in (the same measured==drawn
-/// width the rest of the viewport uses, ADR-0029). The row is truncated to that
-/// width so it stays exactly one visual row and cannot desync the lane spine.
-/// Appends one live entry (a reasoning tail, a streaming answer, or the lull
-/// row) to the render window as a single lane-spine item - but only when it
-/// carries lines. Borrows `lines` for as long as `item_lines` holds the
-/// reference, so the caller must keep the backing `Vec` alive until the draw.
-/// The emptiness branch lives HERE so appending a live entry does not raise
-/// [`render_viewport`]'s cyclomatic complexity.
-fn push_live_entry<'a>(
-    lines: &'a [Line<'static>],
-    item_lines: &mut Vec<&'a [Line<'static>]>,
-    counts: &mut Vec<usize>,
-    gutters: &mut Vec<GutterKind>,
-    width: u16,
-) {
-    if lines.is_empty() {
-        return;
+// The lull "waiting" row (`lull_visible`/`live_lull_lines`) was folded into
+// [`spinner_line`] (ADR-0048): the LoadingIndicator shows whenever the Run is
+// Running and keeps the lull scene as its phrase content, so the separate quiet-
+// only row is gone. The lull clock + scenes ([`lull`]) still drive the phrase.
+
+/// The `k` (thousand) grouping unit `format_token_count` divides by.
+const TOKEN_K: u64 = 1_000;
+/// The `m` (million) grouping unit: at/above it, `format_token_count` renders
+/// `N.Nm` (qwen `value >= 1_000_000 -> (value/1_000_000).toFixed(1) + "m"`).
+const TOKEN_M: u64 = 1_000_000;
+/// The threshold at/above which `format_token_count` drops the decimal (`Nk`),
+/// and below which it shows one decimal (`N.Nk`).
+const TOKEN_K_DECIMAL_LIMIT: u64 = 10_000;
+/// The hundredths divisor used to round a token count to one decimal `k`: `count
+/// / 100` rounded, then `/ 10`, matches JS `(count/1000).toFixed(1)`.
+const TOKEN_HUNDREDTHS: f64 = 100.0;
+/// The tenths divisor completing the one-decimal `k` rounding.
+const TOKEN_TENTHS: f64 = 10.0;
+
+/// A compact token count (qwen `formatTokenCount`, statusLinePresets.ts:217): the
+/// bare number under 1000, `N.Nk` (one decimal, rounded) from 1000 to 9999, `Nk`
+/// (floored) from 10000 to 999999, and `N.Nm` (one decimal, rounded) at 1000000
+/// and above (qwen `2_400_000 -> "2.4m"`). Used by the spinner's `↑ 1.2k tokens`
+/// figure.
+fn format_token_count(count: u64) -> String {
+    if count < TOKEN_K {
+        return count.to_string();
     }
-    counts.push(wrapped_count(lines.to_vec(), width));
-    item_lines.push(lines);
-    gutters.push(GutterKind::Spine);
+    if count < TOKEN_K_DECIMAL_LIMIT {
+        // One decimal, ROUNDED (qwen's `.toFixed(1)` rounds 9999 -> "10.0k").
+        let tenths = (count as f64 / TOKEN_HUNDREDTHS).round() / TOKEN_TENTHS;
+        return format!("{tenths:.1}k");
+    }
+    if count < TOKEN_M {
+        return format!("{}k", count / TOKEN_K);
+    }
+    // One decimal, ROUNDED (qwen `(value / 1_000_000).toFixed(1)`).
+    let tenths = (count as f64 / (TOKEN_M as f64 / TOKEN_TENTHS)).round() / TOKEN_TENTHS;
+    format!("{tenths:.1}m")
 }
 
-/// Whether the lull "waiting" row should draw this frame: the Run is Running
-/// and NEITHER live entry (the reasoning tail, the streaming answer) is on
-/// screen. The one gate, matching [`Screen::has_live_stream`] by construction
-/// (`thinking_empty == streaming_thinking().is_empty()` and `tail_present ==
-/// !streaming_text().is_empty()`) so the row and the adapter's lull clock never
-/// disagree. Pulled out of [`render_viewport`] so the multi-clause boolean and
-/// its emptiness branch stay off that function's cyclomatic complexity.
-fn lull_visible(status: Status, thinking_empty: bool, tail_present: bool) -> bool {
-    status == Status::Running && thinking_empty && !tail_present
+/// The in-flight facts the spinner line renders WITH (a Parameter Object so
+/// [`spinner_line`] stays within the SRP param ceiling): the optional thought
+/// `subject` (Phase-6 seam - wins over the lull phrase when `Some`, matching qwen
+/// `thought?.subject || currentLoadingPhrase`), the optional live token `count`
+/// (Phase-6 seam - shipped `None` to avoid per-frame jitter), and whether the
+/// stream is `receiving` (streaming text non-empty - picks the `↑`/`↓` arrow).
+#[derive(Debug, Clone, Copy, Default)]
+struct SpinnerState<'a> {
+    subject: Option<&'a str>,
+    tokens: Option<u64>,
+    receiving: bool,
 }
 
-fn live_lull_lines(anim: Anim, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    let Some(glyph) = lull::frame(anim.quiet_ticks, anim.lull_seq) else {
+/// The running spinner line (qwen `LoadingIndicator.tsx`, ADR-0041/0048): a
+/// braille [`SPINNER`] frame, the phrase (the current lull scene content - a
+/// deliberate divergence from qwen's `usePhraseCycler`, kept for the whimsy; the
+/// [`SpinnerState::subject`] wins when `Some`), then the cancel group
+/// `(<elapsed> [· <arrow> <tokens> tokens] · esc to cancel)` in secondary.
+/// paddingLeft 2. Every produced row is truncated to `width` so it stays one
+/// visual row (measure==draw, ADR-0029). Empty when the lull is still settling
+/// (no phrase yet).
+fn spinner_line(
+    anim: Anim,
+    state: SpinnerState<'_>,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    // The phrase is the current lull scene; while the lull settles there is no
+    // scene yet, so the spinner line waits too (the lull row's settle window).
+    let Some(phrase) = state
+        .subject
+        .or_else(|| lull::frame(anim.quiet_ticks, anim.lull_seq))
+    else {
         return vec![];
     };
-    // Ticks -> seconds via the adapter's tick cadence (the one place ticks
-    // become real time, a display decision - the pure `lull` clock stays in
-    // ticks). TICK_MS is the adapter's frame interval.
+    let glyph = SPINNER[(anim.spinner as usize) % SPINNER.len()];
     let secs = anim.quiet_ticks.saturating_mul(crate::ui::TICK_MS) / MILLIS_PER_SEC;
-    // A fixed-width timer field keeps the animation anchored as the label grows
-    // ("7s" -> "2m 03s"). 7 cols holds up to "59m 59s"; longer just shifts.
-    let timer = format!("{:<7}", lull::format_elapsed(secs));
+    let elapsed = lull::format_elapsed(secs);
+    let arrow = if state.receiving { "↓" } else { "↑" };
+    let tokens_part = state
+        .tokens
+        .map(|n| format!(" · {arrow} {} tokens", format_token_count(n)))
+        .unwrap_or_default();
+    let cancel = format!("({elapsed}{tokens_part} · esc to cancel)");
+
     let style = Style::default()
         .fg(tui_color(theme.lull))
         .add_modifier(Modifier::ITALIC);
-    // Two-column indent (like the reasoning tail's sub-block), then timer, a
-    // gap, and the scene. Truncated as a whole to one visual row.
-    let text = format!("  {timer} {glyph}");
-    let budget = width as usize;
-    vec![Line::styled(truncate_visual(&text, budget), style)]
+    let secondary = secondary_style(theme);
+    // paddingLeft 2, then `<glyph> <phrase>  <cancel>` - built span-by-span so the
+    // cancel group reads secondary while the phrase reads the lull colour, then
+    // truncated as a whole to one visual row.
+    let text = format!("  {glyph} {phrase}  {cancel}");
+    // The phrase+glyph fit first; if the whole line overflows, truncate it (the
+    // rare narrow case) - the common case is well within width.
+    if text.chars().count() <= width as usize {
+        return vec![Line::from(vec![
+            Span::styled(format!("  {glyph} {phrase}  "), style),
+            Span::styled(cancel, secondary),
+        ])];
+    }
+    vec![Line::styled(truncate_visual(&text, width as usize), style)]
+}
+
+// ---------------------------------------------------------------------------
+// The sticky "Current tasks" box (qwen `StickyTodoList.tsx` + `todoSnapshot.ts`,
+// ADR-0048). A LIVE overlay (uncached, pending-only, never in grouped_rows/the
+// committed slice - like the lull row): it DERIVES from the Transcript's latest
+// `Todo` item, so it and the committed inline copy read one source of truth.
+// ---------------------------------------------------------------------------
+
+/// The most sticky-todo rows shown before the overflow line (qwen
+/// `STICKY_TODO_MAX_VISIBLE_ITEMS = 5`, todoSnapshot.ts:29).
+const STICKY_TODO_MAX_VISIBLE: usize = 5;
+
+/// The status-priority order the sticky box lists items in (qwen
+/// `STICKY_TODO_STATUS_PRIORITY`, todoSnapshot.ts:32): in_progress first, then
+/// pending, then completed - a stable sort keyed by the ORIGINAL index breaks
+/// ties, so the number label stays the item's real position.
+fn sticky_status_priority(status: TodoStatus) -> u8 {
+    match status {
+        TodoStatus::InProgress => 0,
+        TodoStatus::Pending => 1,
+        TodoStatus::Completed => 2,
+    }
+}
+
+/// The sticky box's items in display order (qwen `getOrderedStickyTodos`): a
+/// STABLE sort by status priority, each paired with its ORIGINAL index so the
+/// number label (`index + 1`) survives the reorder. Pure.
+fn ordered_sticky_todos(items: &[TodoItem]) -> Vec<(usize, &TodoItem)> {
+    let mut ordered: Vec<(usize, &TodoItem)> = items.iter().enumerate().collect();
+    // `sort_by_key` is stable, so equal-priority items keep their original order
+    // (the index tie-break qwen spells out explicitly).
+    ordered.sort_by_key(|(_, item)| sticky_status_priority(item.status));
+    ordered
+}
+
+/// Whether the sticky "Current tasks" box shows this frame, and the items it
+/// draws (qwen `getStickyTodos`, todoSnapshot.ts:120, ADR-0048): the latest
+/// `Todo`'s items show iff the list is NON-EMPTY, NOT all-completed, AND the
+/// item has COMMITTED (`latest_index < high_water`). The high-water gate
+/// collapses qwen's pending/recent guards onto the ADR-0046 commit fact: while
+/// the todo is still pending it renders inline above the composer, so the sticky
+/// box would double it; once it commits to scrollback the inline copy scrolls
+/// away and the sticky box takes over. Pure - a testable predicate, no frame.
+fn sticky_todos(latest: Option<(usize, &[TodoItem])>, high_water: usize) -> Option<&[TodoItem]> {
+    let (index, items) = latest?;
+    let non_empty = !items.is_empty();
+    let all_completed = non_empty && items.iter().all(|i| i.status == TodoStatus::Completed);
+    let committed = index < high_water;
+    (non_empty && !all_completed && committed).then_some(items)
+}
+
+/// The vertical rows the sticky box occupies for `visible` shown items and
+/// `overflowed` (whether an overflow line is needed): a rounded top + bottom
+/// border (2), the `Current tasks` header (1), the visible rows (capped at
+/// [`STICKY_TODO_MAX_VISIBLE`]), and one overflow row when hidden items remain.
+/// Pure - the exact height `frame_chunks` reserves so measure==draw (ADR-0029).
+fn sticky_todos_height(count: usize) -> usize {
+    let visible = count.min(STICKY_TODO_MAX_VISIBLE);
+    let overflow = usize::from(count > STICKY_TODO_MAX_VISIBLE);
+    2 + 1 + visible + overflow
+}
+
+/// The minimum body height the pending region keeps when the sticky box shows:
+/// one row (`Constraint::Min(1)`) so the live tail never fully collapses.
+const STICKY_MIN_BODY_ROWS: usize = 1;
+
+/// Whether a `sticky_height`-row "Current tasks" box fits this frame alongside
+/// the status row (1), the composer, and at least one body row. Pure predicate -
+/// the show/hide guard so a short terminal drops the box rather than letting
+/// Layout squeeze its zone below the measured height (ADR-0029 measure==draw).
+fn sticky_fits(frame_height: usize, sticky_height: usize, composer_height: usize) -> bool {
+    let reserved = sticky_height
+        .saturating_add(1) // status bar
+        .saturating_add(composer_height)
+        .saturating_add(STICKY_MIN_BODY_ROWS);
+    reserved <= frame_height
+}
+
+/// The sticky box's draw rect inside its zone: the zone inset by the marginX 2
+/// gutter (qwen `marginX={2}`) so the box aligns under the [`CONTENT_MARGIN`]
+/// pending body. Pure.
+fn sticky_box_area(zone: Rect) -> Rect {
+    Rect {
+        x: zone.x + CONTENT_MARGIN,
+        width: zone.width.saturating_sub(2 * CONTENT_MARGIN),
+        ..zone
+    }
+}
+
+/// The sticky "Current tasks" box's lines (qwen `StickyTodoList.tsx`), a rounded
+/// box marginX 2 paddingX 1: a GREY bold `Current tasks` header (secondary, NOT
+/// accent), then up to [`STICKY_TODO_MAX_VISIBLE`] rows in priority order - each
+/// a `N.` number label (the ORIGINAL index+1, secondary), the status glyph
+/// (in_progress green else primary), and the content truncated-end (completed
+/// crossed-out) - then a secondary `... and N more` overflow row. Every row is
+/// funneled through [`box_row`] to exactly the inner width so the box corners
+/// align (measure==draw, ADR-0029). `width` is the FULL box width (the frame
+/// less the marginX gutter the caller applied).
+fn render_sticky_todos(frame: &mut Frame, area: Rect, items: &[TodoItem], theme: &Theme) {
+    // Integration (IOSP): the pure line-builder shapes every row; here we only
+    // issue the draw call.
+    let inner = (area.width as usize).saturating_sub(2); // the two `│` columns
+    let mut lines = sticky_todos_lines(items, inner, theme);
+    // Clamp to the zone height: if Layout shrank the sticky zone (a short frame),
+    // draw only what fits rather than letting the Paragraph over-draw the rows
+    // below (ADR-0029 measure==draw - the show/hide guard should keep these equal,
+    // but the clamp holds even if the zone is ever squeezed).
+    lines.truncate(area.height as usize);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The 2-column glyph column width every sticky row reserves for its status
+/// glyph (qwen `<Box width={2}>`): the 1-cell circle plus one clear cell.
+const STICKY_GLYPH_COL: usize = 2;
+
+/// The pure column arithmetic for a sticky box (qwen `StickyTodoList` layout
+/// math), lifted out of [`sticky_todos_lines`] so that Integration folds
+/// pre-computed columns instead of interleaving arithmetic with `box_row` calls
+/// (IOSP: an Operation returns a value; the Integration only calls). `visible` is
+/// the shown-row count (capped at [`STICKY_TODO_MAX_VISIBLE`]), `hidden` the
+/// overflow, `num_col`/`content_col` the two content columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StickyColumns {
+    visible: usize,
+    hidden: usize,
+    num_col: usize,
+    content_col: usize,
+}
+
+/// Operation (IOSP): the sticky box's column arithmetic for `ordered` rows at box
+/// `inner` width. Pure value - no calls beyond the leaf width helper.
+fn sticky_columns(ordered: &[(usize, &TodoItem)], inner: usize) -> StickyColumns {
+    let visible = ordered.len().min(STICKY_TODO_MAX_VISIBLE);
+    let hidden = ordered.len() - visible;
+    let num_col = sticky_number_col(&ordered[..visible]);
+    // The content column: inner width less the number and glyph columns (qwen
+    // truncates the content, never wraps it).
+    let content_col = inner.saturating_sub(num_col + STICKY_GLYPH_COL).max(1);
+    StickyColumns {
+        visible,
+        hidden,
+        num_col,
+        content_col,
+    }
+}
+
+/// Operation (IOSP): the un-boxed spans of every sticky content row (header,
+/// then the priority-ordered task rows, then the `... and N more` overflow row)
+/// in draw order. Returns pre-computed span vectors so [`sticky_todos_lines`]
+/// only folds them through [`box_row`] - the split that keeps that Integration
+/// call-only (no interleaved arithmetic). Pure.
+fn sticky_rows(
+    ordered: &[(usize, &TodoItem)],
+    cols: StickyColumns,
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
+    // The header: GREY bold (qwen `text.secondary` bold), inside the box.
+    let mut rows = vec![vec![Span::styled(
+        "Current tasks",
+        secondary_style(theme).add_modifier(Modifier::BOLD),
+    )]];
+    rows.extend(
+        ordered[..cols.visible].iter().map(|(orig, item)| {
+            sticky_row_spans(*orig, item, cols.num_col, cols.content_col, theme)
+        }),
+    );
+    if cols.hidden > 0 {
+        rows.push(sticky_overflow_spans(
+            cols.hidden,
+            cols.num_col,
+            cols.content_col,
+            theme,
+        ));
+    }
+    rows
+}
+
+/// Integration (IOSP): the sticky box's lines for `items` at box `inner` width -
+/// the rounded top border, the pre-computed content rows ([`sticky_rows`], using
+/// the pre-computed [`sticky_columns`]), and the bottom border. Every content row
+/// is funneled through [`box_row`] to exactly `inner + 2` columns (measure==draw,
+/// ADR-0029). No arithmetic here - it only calls. Pure - no frame.
+fn sticky_todos_lines(items: &[TodoItem], inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let border = border_style(theme);
+    let ordered = ordered_sticky_todos(items);
+    let cols = sticky_columns(&ordered, inner);
+
+    let mut lines = vec![box_top(inner, border)];
+    lines.extend(
+        sticky_rows(&ordered, cols, theme)
+            .iter()
+            .map(|spans| box_row(spans, inner, border)),
+    );
+    lines.push(box_bottom(inner, border));
+    lines
+}
+
+/// The rounded top border row `╭───╮` at `inner` interior width. Leaf.
+fn box_top(inner: usize, border: Style) -> Line<'static> {
+    Line::styled(format!("╭{}╮", "─".repeat(inner)), border)
+}
+
+/// The rounded bottom border row `╰───╯` at `inner` interior width. Leaf.
+fn box_bottom(inner: usize, border: Style) -> Line<'static> {
+    Line::styled(format!("╰{}╯", "─".repeat(inner)), border)
+}
+
+/// The number-column width for the shown rows (qwen `numberColumnWidth`): the
+/// widest `N.` label plus one clear column, so the glyph column always aligns.
+fn sticky_number_col(shown: &[(usize, &TodoItem)]) -> usize {
+    shown
+        .iter()
+        .map(|(orig, _)| format!("{}.", orig + 1).chars().count())
+        .max()
+        .unwrap_or(2)
+        + 1
+}
+
+/// The overflow row's spans (qwen `... and {{count}} more`): hung under the
+/// content column (past the number + glyph columns), secondary.
+fn sticky_overflow_spans(
+    hidden: usize,
+    num_col: usize,
+    content_col: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    vec![
+        Span::raw(" ".repeat(num_col + STICKY_GLYPH_COL)),
+        Span::styled(
+            truncate_visual(&format!("... and {hidden} more"), content_col),
+            secondary_style(theme),
+        ),
+    ]
+}
+
+/// The spans for one sticky-todo row: the `N.` number label (original index+1,
+/// secondary) padded to `num_col`, the status glyph (in_progress green else
+/// primary) in a 2-wide column, and the content truncated to `content_col`
+/// (completed crossed-out). qwen `StickyTodoList` `TodoItemRow`.
+fn sticky_row_spans(
+    orig_index: usize,
+    item: &TodoItem,
+    num_col: usize,
+    content_col: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let item_style = if item.status == TodoStatus::InProgress {
+        success_style(theme)
+    } else {
+        primary_style(theme)
+    };
+    let content_style = if item.status == TodoStatus::Completed {
+        item_style.add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        item_style
+    };
+    let label = format!("{}.", orig_index + 1);
+    let label = format!("{label:<num_col$}");
+    vec![
+        Span::styled(label, secondary_style(theme)),
+        Span::styled(format!("{} ", item.status.glyph()), item_style),
+        Span::styled(truncate_visual(&item.content, content_col), content_style),
+    ]
 }
 
 /// Truncates `text` to at most `width` display columns, replacing the trimmed
 /// tail with a single `…` so an over-long reasoning line stays one visual row.
+/// Char-based (like the rest of this module) - a truncated row is always `<=
+/// width` chars, so the viewport's `Wrap` never breaks it onto a second row.
 /// Char-based (like the rest of this module) - a truncated row is always `<=
 /// width` chars, so the viewport's `Wrap` never breaks it onto a second row.
 fn truncate_visual(text: &str, width: usize) -> String {
@@ -885,373 +1946,341 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Renders `content` as styled lines that hang at `indent` columns: the content
-/// is word-wrapped to `content_width - indent` and EVERY resulting visual row
-/// (the first and every continuation) is prefixed with `indent` spaces. This
-/// gives a block indent that ratatui's own `Wrap` cannot (it has no hanging
-/// indent), and because each produced Line is `<= content_width` chars the
-/// viewport never re-wraps it - so `wrapped_count` equals the rendered rows
-/// (measure==draw, ADR-0029). Used by the indented machinery/marker arms.
-fn indented_lines(
-    content: &str,
-    indent: usize,
-    content_width: u16,
-    style: Style,
-) -> Vec<Line<'static>> {
-    let inner = (content_width as usize).saturating_sub(indent).max(1);
-    let pad = " ".repeat(indent);
-    wrap_words(content, inner)
-        .into_iter()
-        .map(|seg| Line::styled(format!("{pad}{seg}"), style))
-        .collect()
+/// The content side margin (columns): qwen `HistoryItemDisplay` wraps every item
+/// in `marginLeft:2, marginRight:2` (HistoryItemDisplay.tsx:64), so content is
+/// the frame width minus a 2-col left AND 2-col right margin. `pub(crate)` so the
+/// adapter sizes the committed-slice content width (ADR-0046) at the same margin
+/// the pending region uses.
+pub(crate) const CONTENT_MARGIN: u16 = 2;
+
+/// The blank `marginTop:1` separator row between committed items (qwen
+/// `HistoryItemDisplay.tsx:64`; continuation types get `marginTop:0`). Emitted at
+/// assembly by [`grouped_rows`], never cached.
+fn separator_row() -> Line<'static> {
+    Line::default()
 }
 
-/// The reserved left-gutter width (columns): the run-lane spine / user caret
-/// plane (ADR-0040). Two columns - a glyph and a trailing space - so content
-/// sits one clear column off the spine. Carved unconditionally off the text
-/// area so the content wrap width never depends on lane membership.
-const LANE_GUTTER: u16 = 2;
-
-/// What the reserved left gutter draws beside one transcript item's rows
-/// (ADR-0040). Derived at render time from the item sequence, never stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GutterKind {
-    /// Before the first `User` item - the opening greeting/notices sit at the
-    /// margin with no spine.
-    Blank,
-    /// A `User` prompt: the `› ` caret breaks to the margin on the item's first
-    /// visual row, blank on any wrapped continuation.
-    User,
-    /// Everything the agent emits inside a Run: the dim `│ ` spine on every
-    /// visual row, so the whole run reads as one object.
-    Spine,
-}
-
-/// Derives the per-item lane gutter for the settled items, in order (ADR-0040):
-/// a `User` item opens a lane and every item after it hangs off that lane until
-/// the next `User`; the region before the first `User` is spineless. The lane is
-/// the user REQUEST, not the Run - harness-produced work injects no `User` item,
-/// so it correctly stays on the prior request's spine. Pure over the item
-/// sequence, so it is asserted without a frame; the two live entries (reasoning
-/// tail, streaming answer) are appended as `Spine` by the caller.
-fn lane_gutters(items: &[TranscriptItem]) -> Vec<GutterKind> {
-    let mut in_lane = false;
-    items
-        .iter()
-        .map(|item| match item {
-            TranscriptItem::User { .. } => {
-                in_lane = true;
-                GutterKind::User
-            }
-            _ if in_lane => GutterKind::Spine,
-            _ => GutterKind::Blank,
-        })
-        .collect()
-}
-
-/// What one VISUAL content row draws in the reserved gutter (ADR-0040): the
-/// user's `› ` caret, the dim `│ ` lane spine, or nothing. This is the flat
-/// per-row mapping [`expand_gutters`] produces and both the content and the
-/// gutter index by, so they can never desync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowGutter {
-    /// A `User` prompt's first visual row - the caret at the margin.
-    Caret,
-    /// An in-lane row - the dim spine.
-    Spine,
-    /// A user continuation, a pre-lane row, or an item's trailing separator row.
-    Blank,
-}
-
-impl RowGutter {
-    /// The glyph this row paints into the [`LANE_GUTTER`] columns.
-    fn glyph(self) -> &'static str {
-        match self {
-            RowGutter::Caret => "› ",
-            RowGutter::Spine => "│ ",
-            RowGutter::Blank => "  ",
-        }
-    }
-}
-
-/// Expands the per-item lane `gutters` over each item's `counts` wrapped rows
-/// into one [`RowGutter`] per VISUAL content row, in Paragraph layout order -
-/// the single mapping the content and the gutter share (M3). A `User` item's
-/// caret shows only on its first row; a `Spine` item spines every row (the lane
-/// is dense - no per-item blank separator - so the spine stays continuous).
-fn expand_gutters(gutters: &[GutterKind], counts: &[usize]) -> Vec<RowGutter> {
-    let mut rows = Vec::with_capacity(counts.iter().sum());
-    for (i, &n) in counts.iter().enumerate() {
-        for row in 0..n {
-            let cell = match gutters[i] {
-                GutterKind::User if row == 0 => RowGutter::Caret,
-                GutterKind::User => RowGutter::Blank,
-                GutterKind::Spine => RowGutter::Spine,
-                GutterKind::Blank => RowGutter::Blank,
-            };
-            rows.push(cell);
-        }
-    }
-    rows
-}
-
-/// How many of a run's most recent low-signal actions (list/read-style tool
-/// one-liners) the collapsed view keeps as a rolling window; older ones are
-/// suppressed. Errors and Diffs are never windowed - they break out.
-const MACHINERY_WINDOW: usize = 4;
-
-/// What the collapsed render does with one settled item ([`run_fold`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FoldAction {
-    /// Render the item from its cached lines.
-    Keep,
-    /// Suppress it (a non-last thought, or an action older than the window).
-    Drop,
-    /// Render a synthetic one-line thought header here (the FIRST thought's slot)
-    /// carrying the text of the lane's LAST thought (the index).
-    Header(usize),
-    /// Render a `⋯ N earlier actions` count here (the FIRST windowed-out action's
-    /// slot), so a fold never silently hides work; the rest of the run `Drop`s.
-    Elided(usize),
-}
-
-/// Folds a collapsed run to a tidy shape (ADR-0040): per lane (a `User`-opened
-/// request), the reasoning collapses to a single header - the LAST thought's
-/// text rendered at the FIRST thought's slot, with the intervening thoughts
-/// dropped - and the low-signal machinery (paired/one-line tool results and
-/// calls) becomes a rolling window of the last `window` items, older ones
-/// dropped. Errors, [`Diff`]s, assistant text, markers and prompts always Keep
-/// (they break out). `thinking_expanded` (Ctrl-T) disables the thought fold;
-/// `tools_expanded` (Ctrl-O) disables the machinery window.
-///
-/// [`Diff`]: TranscriptItem::Diff
-fn run_fold(
+/// Folds the settled items `[hw..]` into the flat committed body every render
+/// path draws (ADR-0046 + the render-time tool-group ADR): a non-tool item passes
+/// through as its cached lines; a MAXIMAL contiguous run of tool items
+/// (ToolCall/ToolResult/Diff) is boxed by [`render_tool_group`]; a blank
+/// [`separator_row`] sits between items (qwen `marginTop:1`). BOTH the pending
+/// body and [`render_committed_slice`] call this, so committed == pending is
+/// byte-identical. `items` is the FULL item list; only `[hw..]` is emitted (the
+/// prefix is already frozen into scrollback). `width` is the content width the
+/// cache was synced at.
+fn grouped_rows(
+    cache: &RenderCache,
     items: &[TranscriptItem],
-    thinking_expanded: bool,
-    tools_expanded: bool,
-    window: usize,
-) -> Vec<FoldAction> {
-    let mut fold = vec![FoldAction::Keep; items.len()];
-    // Lanes are delimited by `User` items; the region before the first is its
-    // own (greeting) lane. Fold each independently.
-    let mut start = 0;
-    let fold_lane = |fold: &mut Vec<FoldAction>, range: std::ops::Range<usize>| {
-        let mut thoughts = Vec::new();
-        let mut machinery = Vec::new();
-        for i in range {
-            match &items[i] {
-                TranscriptItem::Thinking { .. } => thoughts.push(i),
-                // Low-signal machinery: a merged tool result or a bare call.
-                // Errors and Diffs are NOT here - they always break out.
-                TranscriptItem::ToolResult {
-                    is_error: false, ..
-                }
-                | TranscriptItem::ToolCall { .. } => machinery.push(i),
-                _ => {}
-            }
-        }
-        if !thinking_expanded
-            && let (Some(&first), Some(&last)) = (thoughts.first(), thoughts.last())
-        {
-            fold[first] = FoldAction::Header(last);
-            for &t in &thoughts {
-                if t != first {
-                    fold[t] = FoldAction::Drop;
-                }
-            }
-        }
-        if !tools_expanded && machinery.len() > window {
-            let dropped = &machinery[..machinery.len() - window];
-            // A count marker at the first windowed-out slot, the rest suppressed.
-            fold[dropped[0]] = FoldAction::Elided(dropped.len());
-            for &m in &dropped[1..] {
-                fold[m] = FoldAction::Drop;
-            }
-        }
-    };
-    for (i, item) in items.iter().enumerate() {
-        if matches!(item, TranscriptItem::User { .. }) && i > start {
-            fold_lane(&mut fold, start..i);
-            start = i;
-        }
-    }
-    fold_lane(&mut fold, start..items.len());
-    fold
-}
-
-/// The synthetic line each [`FoldAction`] contributes, indexed to match the
-/// items: `Header(last)` builds the collapsed thought header from the LAST
-/// thought's text at the FIRST thought's slot; `Elided(n)` builds the
-/// `⋯ N earlier actions` count; every other action contributes `None` (its own
-/// cached lines are used). Split out of `render_viewport` so the fold's branch
-/// structure does not inflate that function's complexity.
-fn fold_synthetic_lines(
-    fold: &[FoldAction],
-    items: &[TranscriptItem],
+    hw: usize,
     width: u16,
     theme: &Theme,
-) -> Vec<Option<Vec<Line<'static>>>> {
-    fold.iter()
-        .map(|f| match f {
-            FoldAction::Header(last) => match &items[*last] {
-                TranscriptItem::Thinking { text } => {
-                    Some(vec![collapsed_thought_line(text, width, theme)])
-                }
-                _ => None,
-            },
-            FoldAction::Elided(n) => Some(vec![elided_actions_line(*n, theme)]),
-            _ => None,
-        })
-        .collect()
+) -> Vec<Line<'static>> {
+    grouped_rows_with_approval(&GroupedRows {
+        cache,
+        items,
+        hw,
+        width,
+        theme,
+        approving: None,
+    })
 }
 
-/// Applies the collapsed-run [`run_fold`] to the cached settled items,
-/// producing the parallel `(lines, wrapped-count, gutter-kind)` the viewport's
-/// window math and gutter mapping consume. A `Keep` contributes the item's
-/// cached lines and count; a `Header`/`Elided` its synthetic line (re-measured
-/// at `width`); a `Drop` nothing. Borrows the cached and synthetic lines, so the
-/// returned slices live as long as both. Split out of `render_viewport` to keep
-/// the fold's branch structure off that function's complexity.
-fn assemble_settled<'a>(
+/// The confirming context for the inline approval (ADR-0049): the pending
+/// Approval and the item index of the confirming ToolCall (the newest live one).
+/// A Parameter Object so the confirming state threads through the group render
+/// as one borrow rather than two loose args. `None` at every committed / test
+/// call site - the confirming call never commits (it has no result), so a frozen
+/// slice never carries it.
+struct Approving<'a> {
+    pending: &'a PendingApproval,
+    /// The index into `items` of the confirming ToolCall.
+    call_index: usize,
+}
+
+/// The full input to the grouped-rows fold (a Parameter Object): the cache, the
+/// item list + high-water mark, the content width, the theme, and the optional
+/// inline approval. Bundled so [`grouped_rows_with_approval`] takes one borrow.
+struct GroupedRows<'a> {
     cache: &'a RenderCache,
-    fold: &[FoldAction],
-    synthetic: &'a [Option<Vec<Line<'static>>>],
-    lane: &[GutterKind],
+    items: &'a [TranscriptItem],
+    hw: usize,
     width: u16,
-) -> (Vec<&'a [Line<'static>]>, Vec<usize>, Vec<GutterKind>) {
-    let mut item_lines: Vec<&[Line<'static>]> = Vec::new();
-    let mut counts: Vec<usize> = Vec::new();
-    let mut gutters: Vec<GutterKind> = Vec::new();
-    for (i, (cached, wrapped)) in cache.settled().enumerate() {
-        match fold[i] {
-            FoldAction::Drop => continue,
-            FoldAction::Keep => {
-                item_lines.push(cached);
-                counts.push(wrapped);
-            }
-            FoldAction::Header(_) | FoldAction::Elided(_) => {
-                let syn = synthetic[i].as_deref().unwrap_or(cached);
-                counts.push(wrapped_count(syn.to_vec(), width));
-                item_lines.push(syn);
-            }
+    theme: &'a Theme,
+    approving: Option<&'a Approving<'a>>,
+}
+
+/// [`grouped_rows`] with an optional inline approval (ADR-0049): when `approving`
+/// names a confirming ToolCall inside a tool group, that group renders with a
+/// `warning` border, a `?` marker on the confirming call, and the approval block
+/// (question + radio) appended inside its box.
+fn grouped_rows_with_approval(spec: &GroupedRows<'_>) -> Vec<Line<'static>> {
+    let &GroupedRows {
+        cache,
+        items,
+        hw,
+        width,
+        theme,
+        approving,
+    } = spec;
+    // Integration (IOSP): the pure fold below decides the segments; here we only
+    // render each and interleave the `marginTop:1` separators.
+    let cached: Vec<&[Line<'static>]> = cache.settled().map(|(lines, _)| lines).collect();
+    let ctx = GroupCtx {
+        items,
+        cached: &cached,
+        width,
+        theme,
+        approving,
+    };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (n, segment) in group_segments(items, hw).into_iter().enumerate() {
+        if n > 0 {
+            out.push(separator_row());
         }
-        gutters.push(lane[i]);
+        out.extend(render_segment(segment, &ctx));
     }
-    (item_lines, counts, gutters)
-}
-
-/// The collapsed one-line thought (the fold header and the settled collapsed
-/// form): `✦ thought: …` truncated to a single VISUAL row at the content
-/// `width` so a long paragraph never wraps to fill the viewport.
-fn collapsed_thought_line(text: &str, width: u16, theme: &Theme) -> Line<'static> {
-    const PREFIX: &str = "✦ thought: ";
-    let style = thinking_style(theme);
-    let budget = (width as usize)
-        .saturating_sub(PREFIX.chars().count())
-        .max(1);
-    Line::styled(
-        format!("{PREFIX}{}", truncate_visual(first_line(text), budget)),
-        style,
-    )
-}
-
-/// The dim italic style settled Thinking (and its live tail) draws in.
-fn thinking_style(theme: &Theme) -> Style {
-    Style::default()
-        .fg(tui_color(theme.thinking))
-        .add_modifier(Modifier::ITALIC)
-}
-
-/// A settled Thinking item's lines: collapsed (default) is the one-line
-/// [`collapsed_thought_line`]; expanded (Ctrl-T) is the `✦ thought:` header then
-/// the full text, all dim italic. Split out of `message_lines` so its toggle
-/// branch does not inflate that fold's complexity (the `✦` family unifies with
-/// the live tail's header; `✦` is width-1, unlike the width-2 `🧠` that shifted
-/// the spine in real terminals).
-fn settled_thinking_lines(
-    text: &str,
-    thinking_expanded: bool,
-    content_width: u16,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    if !thinking_expanded {
-        return vec![collapsed_thought_line(text, content_width, theme)];
-    }
-    let style = thinking_style(theme);
-    let mut out = vec![Line::styled("✦ thought:", style)];
-    out.extend(
-        text_rows(text)
-            .into_iter()
-            .map(|row| Line::styled(row, style)),
-    );
     out
 }
 
-/// The `⋯ N earlier actions` count that stands in for a run of windowed-out
-/// low-signal machinery, indented under the thought header like the tool work,
-/// so a fold never silently hides what the agent did (Ctrl-O reveals it all).
-fn elided_actions_line(n: usize, theme: &Theme) -> Line<'static> {
-    Line::styled(
-        format!("  ⋯ {n} earlier actions · ^O expand"),
-        machinery_style(theme),
+/// The invariant render context threaded through the tool-group fold (a
+/// Parameter Object): the item list, their cached inner lines, the box width,
+/// the active theme, and the optional inline approval. Bundled so the group
+/// render functions take one borrow instead of five loose args - the segment
+/// index is the only per-call variable.
+struct GroupCtx<'a> {
+    items: &'a [TranscriptItem],
+    cached: &'a [&'a [Line<'static>]],
+    width: u16,
+    theme: &'a Theme,
+    approving: Option<&'a Approving<'a>>,
+}
+
+/// One render segment of the settled tail (ADR-0047): either a single non-tool
+/// item drawn from its cached lines, or a maximal contiguous run of tool items
+/// boxed together. A range `[start, end)` into the item list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    /// A single non-tool item at this index (passes through as cached lines).
+    Item(usize),
+    /// A `[start, end)` run of tool items (rendered as one box).
+    ToolGroup(usize, usize),
+}
+
+/// Operation (IOSP): segments the settled tail `[hw..]` into passthrough items
+/// and maximal tool-runs (ADR-0047). Pure over the item sequence - no cache, no
+/// draw - so the grouping rule is asserted without a frame.
+fn group_segments(items: &[TranscriptItem], hw: usize) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut i = hw;
+    while i < items.len() {
+        if is_tool_item(&items[i]) {
+            let start = i;
+            while i < items.len() && is_tool_item(&items[i]) {
+                i += 1;
+            }
+            out.push(Segment::ToolGroup(start, i));
+        } else {
+            out.push(Segment::Item(i));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Renders one [`Segment`] to its lines: a passthrough item's cached lines, or the
+/// boxed tool run ([`render_tool_group`]).
+fn render_segment(segment: Segment, ctx: &GroupCtx<'_>) -> Vec<Line<'static>> {
+    match segment {
+        Segment::Item(i) => ctx.cached.get(i).map(|l| l.to_vec()).unwrap_or_default(),
+        Segment::ToolGroup(start, end) => {
+            // The confirming call (if any) falls in THIS group iff its index is
+            // inside `[start, end)`; its group-local offset drives the marker
+            // flip + approval block.
+            let confirming = ctx
+                .approving
+                .filter(|a| (start..end).contains(&a.call_index))
+                .map(|a| (a.call_index - start, a.pending));
+            render_tool_group(
+                &ctx.items[start..end],
+                &ctx.cached[start..end],
+                ctx.width,
+                ctx.theme,
+                confirming,
+            )
+        }
+    }
+}
+
+/// Draws a contiguous tool run as ONE rounded box (qwen `ToolGroupMessage`,
+/// borderStyle:"round"): a top border, each tool's cached INNER lines wrapped with
+/// `│` side borders + padded to the full box width, a blank `gap:1` row between
+/// tools, then a bottom border. `borderColor` precedence (ToolGroupMessage.tsx
+/// :325): a shell tool → `ui.symbol`; else `border.default` (a settled group is
+/// never pending). Every boxed row is funneled through [`box_row`] and padded to
+/// exactly `width` (the box-rigidity invariant, ADR-0029).
+fn render_tool_group(
+    items: &[TranscriptItem],
+    cached: &[&[Line<'static>]],
+    width: u16,
+    theme: &Theme,
+    confirming: Option<(usize, &PendingApproval)>,
+) -> Vec<Line<'static>> {
+    // Integration (IOSP): the border colour + the inner body rows are computed in
+    // the operations below; here we only stack the top border, the body, and the
+    // bottom border.
+    let inner = (width as usize).saturating_sub(2); // the two `│` border columns
+    let border = group_border_style(items, confirming.is_some(), theme);
+    let body = BoxBody {
+        items,
+        cached,
+        inner,
+        border,
+        theme,
+        confirming,
+    };
+    let mut out = vec![Line::styled(format!("╭{}╮", "─".repeat(inner)), border)];
+    out.extend(box_body_rows(&body));
+    out.push(Line::styled(format!("╰{}╯", "─".repeat(inner)), border));
+    out
+}
+
+/// The boxed-body render context (a Parameter Object for [`box_body_rows`]): the
+/// tool items, their cached inner lines, the inner width, the border style, the
+/// theme, and the optional confirming `(group-local index, pending)`. Bundled so
+/// the body render takes one borrow.
+struct BoxBody<'a> {
+    items: &'a [TranscriptItem],
+    cached: &'a [&'a [Line<'static>]],
+    inner: usize,
+    border: Style,
+    theme: &'a Theme,
+    confirming: Option<(usize, &'a PendingApproval)>,
+}
+
+/// The border colour a tool group wears (qwen ToolGroupMessage.tsx:325, with the
+/// Phase-4 warning branch): the precedence is shell → `ui.symbol` (grey) >
+/// confirming → `status.warning` > `border.default`. A confirming group (one
+/// holding a ToolCall awaiting an Approval decision) reads warning UNLESS a shell
+/// tool in the group already claims the symbol colour - qwen's shell precedence
+/// wins, so `run_command` (a shell tool) keeps its grey border even mid-approval.
+fn group_border_style(items: &[TranscriptItem], confirming: bool, theme: &Theme) -> Style {
+    if items.iter().any(is_group_shell) {
+        symbol_style(theme)
+    } else if confirming {
+        warning_style(theme)
+    } else {
+        border_style(theme)
+    }
+}
+
+/// Operation (IOSP): the boxed body rows for a tool run - each tool's inner lines
+/// wrapped with side borders, a bordered `gap:1` blank row between tools. Cached
+/// lines drive every tool EXCEPT the confirming one (ADR-0049): that call is
+/// re-rendered fresh so its marker flips `⊷`→`?`, and the approval block
+/// (question + radio) is appended after it. Every row is funneled through
+/// [`box_row`] to the exact inner width (ADR-0029).
+fn box_body_rows(body: &BoxBody<'_>) -> Vec<Line<'static>> {
+    let BoxBody {
+        items,
+        cached,
+        inner,
+        border,
+        theme,
+        confirming,
+    } = *body;
+    let mut out = Vec::new();
+    for (t, lines) in cached.iter().enumerate() {
+        if t > 0 {
+            out.push(box_row(&[], inner, border));
+        }
+        // The confirming call re-renders with a `?` marker + the approval block
+        // appended, instead of drawing from the cache (which knows nothing of
+        // the pending Approval - keeping committed==pending byte-identity).
+        if let Some((idx, pending)) = confirming
+            && idx == t
+        {
+            let fresh = confirming_inner_lines(&items[t], pending, inner as u16, theme);
+            out.extend(fresh.iter().map(|line| box_row(&line.spans, inner, border)));
+            continue;
+        }
+        out.extend(lines.iter().map(|line| box_row(&line.spans, inner, border)));
+    }
+    out
+}
+
+/// One boxed content row: the `│` left border, the row's spans (truncated so the
+/// row never exceeds the inner width), a pad to exactly `inner` columns, then the
+/// `│` right border. The rigidity workhorse - every boxed row is exactly
+/// `inner + 2` columns so the right border always aligns (ADR-0029). qwen adds a
+/// `paddingX:1` inside the border; that pad is the first/last inner column here.
+fn box_row(spans: &[Span<'static>], inner: usize, border: Style) -> Line<'static> {
+    let mut out = vec![Span::styled("│", border)];
+    // paddingX:1 left.
+    let mut used = 0;
+    used = push_cols(&mut out, " ", Style::default(), used, inner);
+    for span in spans {
+        used = push_cols(&mut out, &span.content, span.style, used, inner);
+    }
+    if used < inner {
+        out.push(Span::raw(" ".repeat(inner - used)));
+    }
+    out.push(Span::styled("│", border));
+    Line::from(out)
+}
+
+/// The index of the newest live ToolCall (ADR-0049): the last
+/// `TranscriptItem::ToolCall` still awaiting its result (a ToolResult supersedes
+/// the call, so any surviving ToolCall item is unresolved). The confirming
+/// Approval attaches here. `None` when no call is live.
+fn newest_live_tool_index(items: &[TranscriptItem]) -> Option<usize> {
+    items
+        .iter()
+        .rposition(|item| matches!(item, TranscriptItem::ToolCall { .. }))
+}
+
+/// Whether an item is a shell tool call/result (drives the group's border colour).
+fn is_group_shell(item: &TranscriptItem) -> bool {
+    match item {
+        TranscriptItem::ToolCall { name, .. } | TranscriptItem::ToolResult { name, .. } => {
+            is_shell_tool(name)
+        }
+        _ => false,
+    }
+}
+
+/// The grey style settled Thinking draws in (qwen `ThinkMessage`
+/// `text.secondary`). No italic - qwen thoughts read as plain grey markdown.
+fn thinking_style(theme: &Theme) -> Style {
+    secondary_style(theme)
+}
+
+/// A settled Thinking item's lines (qwen `ThinkMessage`, ConversationMessages.tsx
+/// :250): the grey `✦` U+2726 marker + grey markdown body, hung under the 2-col
+/// prefix. qwen has NO per-thought collapse - a thought either shows in full or
+/// is hidden entirely by compact mode (the show/hide decision is the caller's,
+/// ADR-0052), so this always renders the full grey body.
+fn settled_thinking_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    prefixed_markdown_lines(
+        "✦",
+        thinking_style(theme),
+        markdown_lines(text, theme)
+            .into_iter()
+            .map(|line| recolor_line(line, thinking_style(theme)))
+            .collect(),
     )
 }
 
-/// The gutter paint parameters: the precomputed per-row gutter mapping, the
-/// window position (`top`, `height`), and the frame area the gutter occupies.
-/// Bundled so [`paint_gutter`] takes a single context arg instead of four
-/// positional params (SRP_PARAMS fix).
-struct GutterCtx<'a> {
-    row_gutters: &'a [RowGutter],
-    top: usize,
-    height: usize,
-}
-
-/// Paints the reserved left gutter per VISUAL row over the visible window: the
-/// user caret in the prompt color, the lane spine in the dim `lane_spine` slot.
-/// Consumes the flat [`RowGutter`] mapping the content shares, sliced by the
-/// absolute `top` offset - the SAME slice the content Paragraph scrolls to - so
-/// a gutter glyph lands on exactly the row its item occupies at any scroll
-/// position, soft-wrapped continuations included (M3). Draws nothing outside the
-/// item rows (a short transcript leaves the lower gutter clear).
-/// Resolves the paint style for one gutter cell: `Some(style)` when the cell
-/// should be painted (Caret or Spine), `None` for Blank (the reserved columns
-/// stay clear - nothing to paint).
-fn gutter_cell_style(cell: RowGutter, caret: Style, spine: Style) -> Option<Style> {
-    match cell {
-        RowGutter::Blank => None,
-        RowGutter::Caret => Some(caret),
-        RowGutter::Spine => Some(spine),
-    }
-}
-
-fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: &Theme) {
-    let caret = Style::default()
-        .fg(tui_color(theme.prompt_gutter))
-        .add_modifier(Modifier::BOLD);
-    let spine = Style::default().fg(tui_color(theme.lane_spine));
-
-    for (screen_row, cell) in ctx
-        .row_gutters
-        .iter()
-        .skip(ctx.top)
-        .take(ctx.height)
-        .enumerate()
-    {
-        let Some(style) = gutter_cell_style(*cell, caret, spine) else {
-            continue;
-        };
-        let y = text_area.y + screen_row as u16;
-        frame.render_widget(
-            Paragraph::new(Line::styled(cell.glyph(), style)),
-            Rect {
-                x: text_area.x,
-                y,
-                width: LANE_GUTTER,
-                height: 1,
-            },
-        );
-    }
+/// Overrides every span's fg with `style`'s colour while keeping modifiers, so a
+/// Thinking body reads uniformly grey (qwen colours the whole `ThinkMessage`
+/// markdown `text.secondary`).
+fn recolor_line(line: Line<'static>, style: Style) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, s.style.patch(style)))
+            .collect::<Vec<_>>(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,14 +2296,14 @@ fn paint_gutter(frame: &mut Frame, text_area: Rect, ctx: &GutterCtx<'_>, theme: 
 // intersecting the window.
 // ---------------------------------------------------------------------------
 
-/// The two detail-on-demand display toggles the settled lines are built with:
-/// Ctrl-T (Thinking) and Ctrl-O (tool Blocks). Carried as named fields - never
-/// a position-coupled pair of bools, the same rule as [`ConnectionFacts`] -
-/// because two adjacent `bool` parameters swap without a type error.
+/// The single detail-on-demand display toggle the settled lines are built with:
+/// compact mode (Ctrl+O, qwen `compactMode`, ADR-0052). `compact == true` hides
+/// settled Thinking items entirely and folds tool result bodies to their header
+/// rows. Named field (not a bare `bool` parameter) so the cache key reads at
+/// every call site and a future second display fact has an obvious home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Toggles {
-    pub(crate) thinking_expanded: bool,
-    pub(crate) tools_expanded: bool,
+    pub(crate) compact: bool,
 }
 
 pub use render_cache::RenderCache;
@@ -1292,10 +2321,10 @@ mod render_cache {
     use crate::ui::theme::{self, Theme};
     use crate::ui::transcript::Transcript;
 
-    /// Per-item render state for the transcript viewport, owned by the
-    /// adapter's run loop and threaded through [`super::render`]. Holds
-    /// ratatui [`Line`]s, so it lives HERE, not in the pure modules
-    /// (ADR-0019).
+    /// Per-item render state for the inline pending body and the committed-slice
+    /// blit (ADR-0046), owned by the adapter's run loop and threaded through
+    /// [`super::render_pending`] and [`super::render_committed_slice`]. Holds
+    /// ratatui [`Line`]s, so it lives HERE, not in the pure modules (ADR-0019).
     pub struct RenderCache {
         /// The text width everything below was built/measured at.
         width: u16,
@@ -1324,7 +2353,7 @@ mod render_cache {
     }
 
     /// One settled item's built lines and its wrapped row count at the
-    /// cache's width - the numbers [`super::visible_window`] does its
+    /// cache's width - the numbers the pending body does its
     /// prefix-sum math over.
     struct CachedItem {
         lines: Vec<Line<'static>>,
@@ -1380,17 +2409,11 @@ mod render_cache {
                 self.revision = t.revision();
             }
             for item in &t.items()[self.items.len()..] {
-                let lines = message_lines(
-                    item,
-                    toggles.thinking_expanded,
-                    toggles.tools_expanded,
-                    width,
-                    theme,
-                );
-                // No per-item blank separator: the lane stays DENSE with one
-                // continuous spine (a blank row breaks the spine into segments
-                // and burns vertical real estate - the two-planes coloring, not
-                // whitespace, separates the run's parts).
+                let lines = message_lines(item, toggles.compact, width, theme);
+                // Per-item separators are added at assembly (`grouped_rows`
+                // interleaves a blank `separator_row`, qwen `marginTop:1`), not
+                // baked into each cached item - so the cache holds only the
+                // item's own body lines (ADR-0046).
                 let wrapped = wrapped_count(lines.clone(), width);
                 self.items.push(CachedItem { lines, wrapped });
             }
@@ -1496,7 +2519,7 @@ mod render_cache {
             cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 2);
             assert_eq!(line_text(&cache.items[0].lines[0]), "sentinel");
-            assert_eq!(line_text(&cache.items[1].lines[0]), "appended");
+            assert_eq!(line_text(&cache.items[1].lines[0]), "● appended");
         }
 
         #[test]
@@ -1506,13 +2529,13 @@ mod render_cache {
             // The delivered steering removes its pending marker - a structural
             // edit that bumps the store's revision - so the cache rebuilds
             // from scratch: the sentinel is gone and the promoted user line is
-            // seen. The `› ` caret now lives in the reserved lane gutter
-            // (ADR-0040), so the cached User line is the bare prompt text.
+            // seen. The `>` caret prefix is baked into the cached User line now
+            // (ADR-0046 qwen chrome), so the cached first span is `> check`.
             let mut cache = seeded_cache(&t);
             t.steering_delivered("check");
             cache.sync(&t, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 1);
-            assert_eq!(line_text(&cache.items[0].lines[0]), "check");
+            assert_eq!(line_text(&cache.items[0].lines[0]), "> check");
         }
 
         #[test]
@@ -1533,7 +2556,7 @@ mod render_cache {
             assert_eq!(t.revision(), shorter.revision());
             cache.sync(&shorter, Toggles::default(), 80, theme::dark());
             assert_eq!(cache.items.len(), 1);
-            assert_eq!(line_text(&cache.items[0].lines[0]), "replacement");
+            assert_eq!(line_text(&cache.items[0].lines[0]), "● replacement");
         }
 
         #[test]
@@ -1601,216 +2624,651 @@ fn wrapped_count(lines: Vec<Line<'static>>, width: u16) -> usize {
         .line_count(width)
 }
 
-/// The visible window over per-item wrapped row counts, pure: given the
-/// clamped top offset and the viewport height, the range of items whose rows
-/// intersect `[top, top + height)` and the scroll offset RELATIVE to the
-/// range's first row. Rendering only this slice (scrolled by the relative
-/// offset) draws exactly what rendering everything (scrolled by `top`) would.
-fn visible_window(counts: &[usize], top: usize, height: usize) -> (std::ops::Range<usize>, usize) {
-    // Walk to the first item whose rows reach past `top` (prefix sums).
-    let mut start = counts.len();
-    let mut before = 0;
-    for (i, &count) in counts.iter().enumerate() {
-        if before + count > top {
-            start = i;
-            break;
-        }
-        before += count;
-    }
-    // `top` beyond the content (degenerate; the caller clamps) selects nothing.
-    let offset = top.saturating_sub(before);
-    // Extend until the slice covers the window's bottom row (or runs out).
-    let mut end = start;
-    let mut covered = 0;
-    while end < counts.len() && covered < offset + height {
-        covered += counts[end];
-        end += 1;
-    }
-    (start..end, offset)
-}
-
-/// The backgrounded "machinery" style for tool-call lines: dim DarkGray, NOT
-/// italic (italic stays reserved for Thinking/Info so those remain
-/// distinguishable). Paired with a two-space indent + "⋯" gutter, it makes
-/// tool machinery recede so the conversation owns the foreground.
-fn machinery_style(theme: &Theme) -> Style {
-    Style::default().fg(tui_color(theme.machinery))
-}
-
 /// The lines one Transcript item renders as. `Diff` is the first-class rich item
 /// of the semantic display vocabulary (ADR-0008): a titled diff whose lines take
 /// a semantic tint from their [`DiffSide`]'s Theme slots and a syntect foreground.
-/// `thinking_expanded` (Ctrl-T, the core's `Transcript::thinking_expanded`)
-/// picks the collapsed one-liner or the full text for settled `Thinking` items;
-/// `tools_expanded` (Ctrl-O, the core's `Transcript::tools_expanded`) does the
-/// same for a multi-line `Diff` body - the same detail-on-demand rule applied to
-/// the machinery plane. `content_width`
-/// is the `content_area` width the lines draw in - the collapsed Thinking
-/// one-liner truncates to it so it stays one visual row (a long newline-free
-/// thought otherwise soft-wraps to many).
+/// `compact` (Ctrl+O, qwen `compactMode`, the core's `Screen::compact_mode`) hides
+/// settled `Thinking` items ENTIRELY and folds a tool RESULT body (a multi-line
+/// `Diff`, or a `Todo` checklist) to its header row - keeping the transcript terse
+/// (ADR-0052). `content_width` is the `content_area` width the lines draw in.
 fn message_lines(
     item: &TranscriptItem,
-    thinking_expanded: bool,
-    tools_expanded: bool,
+    compact: bool,
     content_width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    // Detail-on-demand collapse (Ctrl-O), keyed on the SEMANTIC fold predicate
-    // (Stage 2 review C2 / S1): any item with a foldable body collapses to its
-    // `fold_title` one-liner, so the fold rule is NOT gated inside a per-variant
-    // match arm - a future non-Diff foldable item folds the same way. The
-    // affordance is a fixed `· ^O expand`, NOT a line count: a Diff's title
-    // already carries its `(+A −R)` magnitude, and the body is display-capped
-    // upstream, so a raw line count would misreport what was elided.
-    if !tools_expanded
-        && item.has_foldable_body()
-        && let Some(title) = item.fold_title()
-    {
-        return vec![Line::styled(
-            format!("  ⋯ {title} · ^O expand"),
-            machinery_style(theme),
-        )];
-    }
-
     match item {
-        // User prompts: bare rows at the content margin. The `› ` caret (first
-        // visual row) and continuation blanks now live in the RESERVED lane
-        // gutter (ADR-0040 - the user's voice breaks the spine to the margin),
-        // painted per-visual-row by `paint_gutter`, so `message_lines` no longer
-        // prepends a gutter of its own. Multi-line input renders as many rows.
-        TranscriptItem::User { text } => text_rows(text).into_iter().map(Line::from).collect(),
-        // Assistant text is markdown: the pure ui::markdown fold produces
-        // semantic lines and [`md_style`] runs them into colors here.
-        // Width-wrapping is left to the viewport Paragraph's Wrap.
-        TranscriptItem::Assistant { text } => markdown_lines(text, theme),
-        // Settled Thinking: collapsed is the one-line form; expanded (Ctrl-T)
-        // is a header row then the full text. Delegated so the toggle branch
-        // does not add to this fold's complexity.
+        // User prompt (qwen `UserMessage`, ConversationMessages.tsx:186): the
+        // `>` U+003E caret + text both `text.accent`, hanging under a 2-col
+        // prefix (`stringWidth(">")+1`). Multi-line input renders as many rows.
+        TranscriptItem::User { text } => prefixed_text_lines(
+            ">",
+            accent_style(theme),
+            text,
+            accent_style(theme),
+            content_width,
+        ),
+        // Assistant markdown (qwen `AssistantMessage`, ConversationMessages.tsx
+        // :210): the `✦` U+2726 marker `text.accent` on row 0, the full markdown
+        // body hanging under a 2-col prefix.
+        TranscriptItem::Assistant { text } => {
+            prefixed_markdown_lines("✦", accent_style(theme), markdown_lines(text, theme))
+        }
+        // Settled Thinking (qwen `ThinkMessage`, ConversationMessages.tsx:250):
+        // the same `✦` U+2726 marker but `text.secondary` (grey) for BOTH glyph
+        // and body. Compact mode HIDES it entirely (qwen `!compactMode`, ADR-0052:
+        // show/hide, never a collapsed one-liner); otherwise the full grey body.
         TranscriptItem::Thinking { text } => {
-            settled_thinking_lines(text, thinking_expanded, content_width, theme)
-        }
-        // Tool-call machinery recedes into a dim, indented background gutter so
-        // the conversation (assistant prose, user text) owns the foreground:
-        // DarkGray (not italic - italic stays reserved for Thinking/Info), a
-        // two-space block indent (wrapped continuations stay at column 2 -
-        // [`indented_lines`]), and a quiet "⋯" glyph in place of the loud "⚙".
-        TranscriptItem::ToolCall { name, summary, .. } => indented_lines(
-            &format!("⋯ {}", join_summary(name, summary)),
-            2,
-            content_width,
-            machinery_style(theme),
-        ),
-        // A merged one-liner (Stage 3): a paired call+result reads
-        // `⋯ name  <key_arg> · <result>`; an unpaired result (no live call, so
-        // no arg) keeps the older `⋯ name → result` shape.
-        TranscriptItem::ToolResult {
-            name,
-            summary,
-            is_error: false,
-            key_arg,
-        } => indented_lines(
-            &format!("⋯ {}", join_merged(name, key_arg.as_deref(), summary)),
-            2,
-            content_width,
-            machinery_style(theme),
-        ),
-        // Errors are the exception that belongs in the foreground: they keep
-        // red + bold and the ⚙ gutter, share the two-space indent, and ALWAYS
-        // carry a `✗` failed-marker so they can't be missed (the two-planes
-        // design leans on this - red+bold alone is weaker for scanning and
-        // colorblind users). The merged `key_arg` is kept so the failing
-        // path/command stays visible. The one exception: when the `summary`
-        // already begins with a status glyph - a extension badge like `✗ exit 1`
-        // (or `✓`) - the line injects none of its own, so a badge never doubles
-        // up its glyph.
-        TranscriptItem::ToolResult {
-            name,
-            summary,
-            is_error: true,
-            key_arg,
-        } => {
-            let glyph = if starts_with_status_glyph(summary) {
-                ""
+            if compact {
+                Vec::new()
             } else {
-                "✗ "
-            };
-            indented_lines(
-                &format!("⚙ {} {glyph}{summary}", join_arg(name, key_arg.as_deref())),
-                2,
-                content_width,
-                Style::default()
-                    .fg(tui_color(theme.error))
-                    .add_modifier(Modifier::BOLD),
-            )
+                settled_thinking_lines(text, theme)
+            }
         }
-        // A foldable Diff reaches here only EXPANDED (Ctrl-O on) or when it has
-        // no foldable body (empty) - the collapse is handled once at the top of
-        // this fn. Expanded: the title, then each hunk's header and its code
-        // lines as a full-width added/removed tint band with the syntect
-        // foreground layered over it (ADR-0008), indented under the gutter.
-        TranscriptItem::Diff {
-            title,
-            lang,
-            hunks,
-            elided,
-        } => {
-            let mut out = diff_lines(title, lang.as_deref(), hunks, content_width, theme);
-            out.extend(diff_elided_tail(*elided, content_width, theme));
-            out
+        // Tool items render INSIDE the group box (qwen `ToolGroupMessage`); their
+        // INNER content is built here at the box's inner width and wrapped with
+        // borders at assembly by [`grouped_rows`]. Reached only via that path.
+        // Under compact the RESULT body folds to the header row (qwen
+        // `!compactMode || forceShowResult`).
+        TranscriptItem::ToolCall { .. }
+        | TranscriptItem::ToolResult { .. }
+        | TranscriptItem::Diff { .. }
+        | TranscriptItem::Todo { .. } => {
+            tool_inner_lines(item, compact, tool_inner_width(content_width), theme)
         }
-        // The quiet plane: adapter Info news and the tinted harness marker
-        // plane (ADR-0040) share one shape - italic text rows. Info wears the
-        // muted color; a Marker tints by TONE alone (never by text, the glyph
-        // and wording were authored upstream). One arm, so the fold rule for
-        // "a plain italic line" lives in one place.
-        // Adapter Info news sits flush at the margin (the greeting, notices).
-        TranscriptItem::Info { text } => {
-            let style = marker_style(item, theme).add_modifier(Modifier::ITALIC);
-            text_rows(text)
-                .into_iter()
-                .map(|row| Line::styled(row, style))
-                .collect()
-        }
-        // A harness Marker (governing/housekeeping) indents two columns under the
-        // thought header, like the tool work - it is part of the run's body, not
-        // a foreground line. Wrapped continuations stay at column 2 too
-        // ([`indented_lines`]). Tinted by TONE alone (the glyph/wording are
-        // authored upstream, never sniffed here).
-        TranscriptItem::Marker { text, .. } => {
-            let style = marker_style(item, theme).add_modifier(Modifier::ITALIC);
-            text_rows(text)
-                .into_iter()
-                .flat_map(|row| indented_lines(&row, 2, content_width, style))
-                .collect()
+        // Info/notification (qwen `InfoMessage`, StatusMessages.tsx:64): the `●`
+        // U+25CF prefix `text.primary`, body `text.primary`, hanging under a
+        // 2-col prefix. A Marker tints its prefix + body by TONE alone.
+        TranscriptItem::Info { text } => prefixed_text_lines(
+            "●",
+            primary_style(theme),
+            text,
+            primary_style(theme),
+            content_width,
+        ),
+        // A harness Marker: the prefix glyph + tint chosen by the marker's
+        // [`Tone`] (qwen StatusMessages set - Constrain reads the `△` warning
+        // status, everything else the `●` info status). Tone alone decides,
+        // never the text.
+        TranscriptItem::Marker { .. } => {
+            let (glyph, style) = marker_prefix_and_style(item, theme);
+            prefixed_text_lines(glyph, style, marker_text(item), style, content_width)
         }
     }
 }
 
-/// The color an Info or Marker line draws in (ADR-0040): a Marker reads its
-/// [`Tone`]'s own Theme slot (Steering the prompt gutter, Plain the muted
-/// fallback); an Info line is always muted. Tone alone decides the tint, never
-/// the text.
-fn marker_style(item: &TranscriptItem, theme: &Theme) -> Style {
-    let color = match item {
-        TranscriptItem::Marker {
-            tone: Tone::Housekeeping,
-            ..
-        } => theme.marker_housekeeping,
-        TranscriptItem::Marker {
-            tone: Tone::Aid, ..
-        } => theme.marker_aid,
+/// The plain text an Info/Marker item carries (both are text rows, no markdown).
+fn marker_text(item: &TranscriptItem) -> &str {
+    match item {
+        TranscriptItem::Info { text } | TranscriptItem::Marker { text, .. } => text,
+        _ => "",
+    }
+}
+
+/// The 2-column prefix width every single-glyph committed prefix hangs under
+/// (qwen `getPrefixWidth = stringWidth(prefix) + 1`, ConversationMessages.tsx:90
+/// / StatusMessages.tsx:44): one glyph column plus one clear column so the body
+/// never touches the marker. All Phase-2 prefixes (`>`,`✦`,`●`) are width-1.
+const PREFIX_WIDTH: usize = 2;
+
+/// Lines for a prefixed PLAIN-TEXT item (qwen `PrefixedTextMessage`): the `glyph`
+/// in `prefix_style` on row 0, then the wrapping text in `text_style` hung under
+/// the [`PREFIX_WIDTH`] prefix column. Every produced [`Line`] is `<= content_width`
+/// columns (the body wrapped to `content_width - PREFIX_WIDTH`, both prefix and
+/// continuation padded to the prefix column), so the viewport's `Wrap` never
+/// re-breaks it (measure==draw, ADR-0029).
+fn prefixed_text_lines(
+    glyph: &str,
+    prefix_style: Style,
+    text: &str,
+    text_style: Style,
+    content_width: u16,
+) -> Vec<Line<'static>> {
+    let inner = (content_width as usize).saturating_sub(PREFIX_WIDTH).max(1);
+    let pad = " ".repeat(PREFIX_WIDTH);
+    let mut out = Vec::new();
+    let mut first = true;
+    for source in text_rows(text) {
+        for seg in wrap_words(&source, inner) {
+            let lead = if first {
+                Span::styled(format!("{glyph} "), prefix_style)
+            } else {
+                Span::raw(pad.clone())
+            };
+            out.push(Line::from(vec![lead, Span::styled(seg, text_style)]));
+            first = false;
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(format!("{glyph} "), prefix_style)));
+    }
+    out
+}
+
+/// Lines for a prefixed MARKDOWN item (qwen `PrefixedMarkdownMessage`): the
+/// `glyph` in `prefix_style` on the first body row, every row (row 0 and each
+/// continuation) hung under the [`PREFIX_WIDTH`] prefix column. The markdown
+/// `body` is already styled; this only prepends the marker/indent column. Because
+/// the body was built at the reduced width by the cache, the prefixed lines stay
+/// `<= content_width` (measure==draw, ADR-0029).
+fn prefixed_markdown_lines(
+    glyph: &str,
+    prefix_style: Style,
+    body: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let pad = " ".repeat(PREFIX_WIDTH);
+    let mut first = true;
+    body.into_iter()
+        .map(|line| {
+            let lead = if first {
+                Span::styled(format!("{glyph} "), prefix_style)
+            } else {
+                Span::raw(pad.clone())
+            };
+            first = false;
+            let mut spans = vec![lead];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tool-group box (qwen `ToolGroupMessage`/`ToolMessage`, ADR "tool groups at
+// render time"). A maximal contiguous run of ToolCall/ToolResult/tool-Diff items
+// renders as ONE rounded box. Each item's INNER content is built here at the
+// box's inner width; [`render_tool_group`] wraps a contiguous run with borders +
+// gaps at assembly. Borders/box are uncached (cheap); the Diff syntect stays
+// cached per-item (its inner lines are what the cache holds).
+// ---------------------------------------------------------------------------
+
+/// The 3-wide status-marker gutter every tool row and result body indents under
+/// (qwen `STATUS_INDICATOR_WIDTH = 3`, ToolStatusIndicator.tsx:17).
+const STATUS_INDICATOR_WIDTH: usize = 3;
+
+/// The rounded-box overhead subtracted from the box width to get the inner
+/// content width: 1 border + 1 `paddingX` on each side (qwen `ToolMessage`
+/// `paddingX={1}` inside a `borderStyle:"round"` box, ToolMessage.tsx:665). Four
+/// columns total.
+const BOX_CHROME: usize = 4;
+
+/// The inner content width tool items build at: the box width less the border +
+/// padding chrome ([`BOX_CHROME`]), floored at 1.
+fn tool_inner_width(content_width: u16) -> u16 {
+    content_width.saturating_sub(BOX_CHROME as u16).max(1)
+}
+
+/// Whether an item belongs to a tool group (grouped into the box at render):
+/// ToolCall, ToolResult, a tool Diff, or a Todo list. The ONE membership
+/// predicate the grouping fold ([`group_segments`]) keys on. A `Todo` is a
+/// tool item so it renders INSIDE the same rounded box as the `todo_write` it
+/// stands in for (ADR-0047/0048), the identity every consumer relies on:
+/// committed and pending draw byte-identically down the same box path.
+fn is_tool_item(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::ToolCall { .. }
+            | TranscriptItem::ToolResult { .. }
+            | TranscriptItem::Diff { .. }
+            | TranscriptItem::Todo { .. }
+    )
+}
+
+/// The INNER box content one tool item renders as (no borders): a status-marker
+/// header row (`marker + bold name + dim desc`, truncate-end) for a call/result,
+/// or an indented result body (the diff, indented under the marker column) for a
+/// Diff. Every produced [`Line`] is `<= inner_width` columns so the box wrapper
+/// never re-breaks it (measure==draw, ADR-0029). `compact` (Ctrl+O, qwen
+/// `compactMode`) folds a tool RESULT body (the `Diff` body, the `Todo`
+/// checklist) to its header row, keeping the transcript terse (ADR-0052).
+fn tool_inner_lines(
+    item: &TranscriptItem,
+    compact: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    match item {
+        TranscriptItem::ToolCall { name, summary, .. } => vec![tool_header_row(
+            tool_marker(ToolMarker::Executing, name, theme),
+            name,
+            summary,
+            inner_width,
+            theme,
+        )],
+        TranscriptItem::ToolResult {
+            name,
+            summary,
+            is_error,
+            key_arg,
+        } => {
+            let marker = if *is_error {
+                ToolMarker::Error
+            } else {
+                ToolMarker::Success
+            };
+            let desc = tool_desc(key_arg.as_deref(), summary);
+            vec![tool_header_row(
+                tool_marker(marker, name, theme),
+                name,
+                &desc,
+                inner_width,
+                theme,
+            )]
+        }
+        // A Diff renders its title header row then, unless folded by compact, its
+        // body indented under the marker column (delegated so the fold branch does
+        // not add to this dispatch's logic).
+        TranscriptItem::Diff { .. } => tool_diff_lines(item, compact, inner_width, theme),
+        // A Todo renders a clean `✓ todo_write` header (no key_arg, so the raw
+        // JSON args are gone STRUCTURALLY) then the circle checklist indented
+        // under the marker column - folded away to the header under compact.
+        TranscriptItem::Todo { items } => tool_todo_lines(items, compact, inner_width, theme),
+        _ => Vec::new(),
+    }
+}
+
+/// The confirming ToolCall's inner box lines (ADR-0049): its header row with the
+/// `?` (Confirming) marker in place of `⊷`, then the inline approval block
+/// (gap + question + radio). The confirming item is always a `ToolCall` (the
+/// newest live one); a defensive non-call falls back to its plain inner lines
+/// plus the block so a future gated shape never renders empty.
+fn confirming_inner_lines(
+    item: &TranscriptItem,
+    pending: &PendingApproval,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut rows = match item {
+        TranscriptItem::ToolCall { name, summary, .. } => vec![tool_header_row(
+            tool_marker(ToolMarker::Confirming, name, theme),
+            name,
+            summary,
+            inner_width,
+            theme,
+        )],
+        // Defensive: any other confirming shape keeps its normal inner lines.
+        other => tool_inner_lines(other, false, inner_width, theme),
+    };
+    rows.extend(approval_block_rows(pending, inner_width, theme));
+    rows
+}
+
+/// A Todo tool item's inner box lines (ADR-0048, qwen `TodoDisplay`/`TodoItemRow`):
+/// a clean `✓ todo_write` header row with an EMPTY description - the Presenter
+/// dropped the raw JSON args when it swapped the Tool Result for a [`Todo`], so
+/// there is nothing to leak - then one circle-glyph row per item indented under
+/// the 3-wide marker column. The glyph is [`crate::plan::TodoStatus::glyph`]
+/// (`○ ◐ ●`); in_progress reads `success_style` (green), completed reads
+/// `primary_style` + [`Modifier::CROSSED_OUT`] (qwen colours completed
+/// Foreground, NOT green - only in_progress is green), everything else
+/// `primary_style`. Content word-wraps to `inner_width - STATUS_INDICATOR_WIDTH`
+/// so every produced row is `<= inner_width` columns (measure==draw, ADR-0029).
+///
+/// [`Todo`]: TranscriptItem::Todo
+fn tool_todo_lines(
+    items: &[TodoItem],
+    compact: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut out = vec![tool_header_row(
+        tool_marker(ToolMarker::Success, "todo_write", theme),
+        "todo_write",
+        "",
+        inner_width,
+        theme,
+    )];
+    // Compact folds the checklist body away (qwen `!compactMode`), keeping only
+    // the header row (ADR-0052).
+    if compact {
+        return out;
+    }
+    let content_width = inner_width
+        .saturating_sub(STATUS_INDICATOR_WIDTH as u16)
+        .max(1) as usize;
+    for item in items {
+        out.extend(todo_item_rows(item, content_width, theme));
+    }
+    out
+}
+
+/// The wrapped rows for ONE todo item (ADR-0048): the status glyph in its
+/// 3-wide gutter on the first row, the content word-wrapped under it, every row
+/// hung at [`STATUS_INDICATOR_WIDTH`] so the glyph column stays clear. The
+/// in_progress-green / completed-strikethrough treatment is applied HERE (the
+/// pure [`TodoStatus`] carries only the glyph, ADR-0019).
+fn todo_item_rows(item: &TodoItem, content_width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let style = match item.status {
+        TodoStatus::InProgress => success_style(theme),
+        TodoStatus::Completed => primary_style(theme).add_modifier(Modifier::CROSSED_OUT),
+        TodoStatus::Pending => primary_style(theme),
+    };
+    let gutter = " ".repeat(STATUS_INDICATOR_WIDTH);
+    let mut out = Vec::new();
+    for (row, seg) in wrap_words(&item.content, content_width)
+        .into_iter()
+        .enumerate()
+    {
+        let lead = if row == 0 {
+            // The glyph occupies 1 column of the 3-wide gutter, then one clear
+            // column so the content never touches it (the ToolStatusIndicator
+            // shape, STATUS_INDICATOR_WIDTH=3).
+            Span::styled(format!("{}  ", item.status.glyph()), style)
+        } else {
+            Span::raw(gutter.clone())
+        };
+        out.push(Line::from(vec![lead, Span::styled(seg, style)]));
+    }
+    out
+}
+
+/// A Diff tool item's inner box lines: the folded one-liner (compact on a
+/// foldable body), or the `diff` header row + the diff body (each row indented
+/// under the marker column) + the elided tail. Split out of [`tool_inner_lines`]
+/// so its fold branch stays off that dispatch. Panics on a non-Diff item.
+fn tool_diff_lines(
+    item: &TranscriptItem,
+    compact: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let TranscriptItem::Diff {
+        title,
+        lang,
+        hunks,
+        elided,
+    } = item
+    else {
+        return Vec::new();
+    };
+    if compact && item.has_foldable_body() {
+        return vec![tool_diff_fold_row(title, inner_width, theme)];
+    }
+    let body_width = inner_width
+        .saturating_sub(STATUS_INDICATOR_WIDTH as u16)
+        .max(1);
+    let mut out = vec![tool_header_row(
+        tool_marker(ToolMarker::Success, "diff", theme),
+        "diff",
+        title,
+        inner_width,
+        theme,
+    )];
+    out.extend(indent_box_body(diff_lines(
+        lang.as_deref(),
+        hunks,
+        body_width,
+        theme,
+    )));
+    out.extend(indent_box_body(diff_elided_tail(
+        *elided, body_width, theme,
+    )));
+    out
+}
+
+/// Indents every row of a diff/result body under the 3-wide marker column (qwen
+/// `paddingLeft:STATUS_INDICATOR_WIDTH`), so the body sits inside the box under
+/// its tool header. Pure.
+fn indent_box_body(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let indent = " ".repeat(STATUS_INDICATOR_WIDTH);
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::raw(indent.clone()));
+            line
+        })
+        .collect()
+}
+
+/// One tool row (qwen `ToolInfo`, ToolMessage.tsx): the 3-wide status marker,
+/// then the bold `name` (`text.primary`) + a space + the dim `desc`
+/// (`text.secondary`), the WHOLE line truncate-end at `inner_width` (never wraps,
+/// `…` at the edge). Funneled through [`push_cols`] so the row is exactly one
+/// visual line `<= inner_width` columns (measure==draw, ADR-0029).
+fn tool_header_row(
+    marker: Span<'static>,
+    name: &str,
+    desc: &str,
+    inner_width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let width = inner_width as usize;
+    let mut spans = vec![marker];
+    // The marker is 1 glyph in a 3-wide gutter: pad to STATUS_INDICATOR_WIDTH.
+    let mut used = STATUS_INDICATOR_WIDTH.min(width);
+    if used > 1 {
+        spans.push(Span::raw(" ".repeat(used - 1)));
+    }
+    used = push_cols(
+        &mut spans,
+        name,
+        primary_style(theme).add_modifier(Modifier::BOLD),
+        used,
+        width,
+    );
+    if !desc.is_empty() {
+        used = push_cols(&mut spans, " ", secondary_style(theme), used, width);
+        let _ = push_cols(&mut spans, desc, secondary_style(theme), used, width);
+    }
+    Line::from(spans)
+}
+
+/// The `›` U+203A active-row marker (qwen `BaseSelectionList`), success-green
+/// when the row is active. It sits in a 2-wide gutter (the marker + a trailing
+/// space, or two spaces when inactive).
+const SELECTION_MARKER: &str = "›";
+/// The width of the selection gutter (marker + one space).
+const SELECTION_GUTTER_WIDTH: usize = 2;
+
+/// The numbered radio rows of a [`SelectionList`] (ADR-0049, qwen
+/// `BaseSelectionList.tsx`): each row is `‹gutter›N. label`, where the gutter
+/// carries the `›` marker (success-green) on the active row else two spaces, the
+/// `N.` number is right-aligned in a fixed field (`showNumbers`) and turns
+/// success-green on the active row (with the marker + label) else secondary, and
+/// the label reads success-green when active else primary. Every row is truncate-end at
+/// `inner_width` so the box wrapper never re-breaks it (measure==draw, ADR-0029).
+/// `active` is the highlighted 0-based row.
+fn selection_rows(
+    items: &[&str],
+    active: usize,
+    show_numbers: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let width = inner_width as usize;
+    // The number field is as wide as the widest `N.` (e.g. `9.` = 2, `12.` = 3).
+    let num_field = if show_numbers {
+        format!("{}.", items.len()).width()
+    } else {
+        0
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let is_active = i == active;
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut used = 0;
+            // The 2-wide `›`/space gutter.
+            if is_active {
+                used = push_cols(
+                    &mut spans,
+                    SELECTION_MARKER,
+                    success_style(theme),
+                    used,
+                    width,
+                );
+                used = push_cols(&mut spans, " ", Style::default(), used, width);
+            } else {
+                used = push_cols(
+                    &mut spans,
+                    &" ".repeat(SELECTION_GUTTER_WIDTH),
+                    Style::default(),
+                    used,
+                    width,
+                );
+            }
+            // The right-aligned `N.` number field: qwen turns the number
+            // `status.success` (green) together with the marker + label on the
+            // active row (`BaseSelectionList.tsx:113-118`), else `text.secondary`.
+            if show_numbers {
+                let num = format!("{}.", i + 1);
+                let pad = num_field.saturating_sub(num.width());
+                if pad > 0 {
+                    used = push_cols(&mut spans, &" ".repeat(pad), Style::default(), used, width);
+                }
+                let num_style = if is_active {
+                    success_style(theme)
+                } else {
+                    secondary_style(theme)
+                };
+                used = push_cols(&mut spans, &num, num_style, used, width);
+                used = push_cols(&mut spans, " ", Style::default(), used, width);
+            }
+            // The label: success-green when active, else primary.
+            let label_style = if is_active {
+                success_style(theme)
+            } else {
+                primary_style(theme)
+            };
+            let _ = push_cols(&mut spans, label, label_style, used, width);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The verbatim Approval options in order (ADR-0049, qwen exec/info sets): once /
+/// always-in-project / no-suggest. The single `Always allow in this project`
+/// (the qwen no-`{{action}}` fallback) collapses BOTH qwen always-variants onto
+/// suspenders' one session-scoped ApproveAlways (ADR-0005). Row indices match
+/// `screen::decision_for_option` (0 Approve / 1 ApproveAlways / 2 Deny).
+const APPROVAL_OPTIONS: [&str; 3] = [
+    "Yes, allow once",
+    "Always allow in this project",
+    "No, suggest changes (esc)",
+];
+
+/// The Approval question line (ADR-0049, qwen verbatim): `Exec` reads `Allow
+/// execution of: '{command}'?`, `Info` reads `Do you want to proceed?`.
+fn approval_question(kind: ConfirmKind, command: &str) -> String {
+    match kind {
+        ConfirmKind::Exec => format!("Allow execution of: '{command}'?"),
+        ConfirmKind::Info => "Do you want to proceed?".to_string(),
+    }
+}
+
+/// The inline approval block's inner rows (ADR-0049), appended after the
+/// confirming ToolCall's header INSIDE its box: a blank gap row (qwen
+/// `marginBottom:1`), the question line (`primary`, truncate-end), then the
+/// numbered radio rows driven by the pending [`SelectionList`]. Every row is
+/// `<= inner_width` columns (measure==draw, ADR-0029) so [`box_row`] never
+/// re-breaks it.
+fn approval_block_rows(
+    pending: &PendingApproval,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let width = inner_width as usize;
+    let mut rows = vec![Line::from(Vec::<Span<'static>>::new())];
+    let question = approval_question(pending.kind, &pending.command);
+    let mut spans = Vec::new();
+    let _ = push_cols(&mut spans, &question, primary_style(theme), 0, width);
+    rows.push(Line::from(spans));
+    rows.extend(selection_rows(
+        &APPROVAL_OPTIONS,
+        pending.selection.active(),
+        true,
+        inner_width,
+        theme,
+    ));
+    rows
+}
+
+/// A folded Diff's one-line row inside the box: the marker gutter, the title, and
+/// the `· ^O expand` affordance, truncate-end at `inner_width`.
+fn tool_diff_fold_row(title: &str, inner_width: u16, theme: &Theme) -> Line<'static> {
+    let width = inner_width as usize;
+    let mut spans = vec![Span::raw(" ".repeat(STATUS_INDICATOR_WIDTH.min(width)))];
+    let used = push_cols(
+        &mut spans,
+        &format!("{title} · ^O expand"),
+        secondary_style(theme),
+        STATUS_INDICATOR_WIDTH.min(width),
+        width,
+    );
+    let _ = used;
+    Line::from(spans)
+}
+
+/// The tool status the marker glyph reflects (qwen `TOOL_STATUS`, constants.ts:22
+/// — the 0.16.0 ASCII set). CONFIRMING/CANCELED/PENDING are Phase-4 states not
+/// reachable from a settled Transcript item.
+#[derive(Debug, Clone, Copy)]
+enum ToolMarker {
+    /// A pending/live `ToolCall`: `⊷` U+22B7 (EXECUTING).
+    Executing,
+    /// A `ToolCall` awaiting an Approval decision (ADR-0049): `?` U+003F in
+    /// `status.warning`. Replaces the executing marker on the confirming call
+    /// while the inline approval block holds the keyboard.
+    Confirming,
+    /// A successful `ToolResult`: `✓` U+2713 (SUCCESS).
+    Success,
+    /// A failed `ToolResult`: `x` U+0078 (ERROR), bold. NOT main's `✗`.
+    Error,
+}
+
+/// The styled status-marker glyph (qwen `ToolStatusIndicator`, width 3): SUCCESS
+/// `✓`/EXECUTING `⊷` in `status.success`; ERROR `x` bold in `status.error`. A
+/// shell tool's marker reads `ui.symbol` (grey), else `status.success`. The
+/// glyph occupies 1 column; the caller pads the 3-wide gutter.
+fn tool_marker(marker: ToolMarker, name: &str, theme: &Theme) -> Span<'static> {
+    let shell = is_shell_tool(name);
+    match marker {
+        ToolMarker::Success => {
+            let style = if shell {
+                symbol_style(theme)
+            } else {
+                success_style(theme)
+            };
+            Span::styled("✓", style)
+        }
+        ToolMarker::Executing => {
+            let style = if shell {
+                symbol_style(theme)
+            } else {
+                success_style(theme)
+            };
+            Span::styled("⊷", style)
+        }
+        ToolMarker::Confirming => Span::styled("?", warning_style(theme)),
+        ToolMarker::Error => Span::styled("x", error_style(theme).add_modifier(Modifier::BOLD)),
+    }
+}
+
+/// Whether a tool name is a shell command (qwen `SHELL_COMMAND_NAME`/`SHELL_NAME`)
+/// - shell tools border their group + colour their marker with `ui.symbol` (grey).
+fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "run_command" | "shell" | "Shell")
+}
+
+/// A Marker's prefix glyph + style, chosen by its [`Tone`] (qwen `StatusMessages`
+/// set): a Constrain marker (the loop-detector's run-close - a guard on the model)
+/// reads the `△` U+25B3 warning status; a Steering marker the `●` info glyph in
+/// the accent (the user's own voice reaching a running Run); everything else the
+/// `●` info glyph, secondary/muted. Tone alone decides, never the text.
+fn marker_prefix_and_style(item: &TranscriptItem, theme: &Theme) -> (&'static str, Style) {
+    match item {
         TranscriptItem::Marker {
             tone: Tone::Constrain,
             ..
-        } => theme.marker_constrain,
+        } => ("△", warning_style(theme)),
         TranscriptItem::Marker {
             tone: Tone::Steering,
             ..
-        } => theme.prompt_gutter,
-        // A Plain marker and an Info line both read muted.
-        _ => theme.muted,
-    };
-    Style::default().fg(tui_color(color))
+        } => ("●", accent_style(theme)),
+        // Housekeeping/Aid/Plain all read the quiet `●` info glyph, secondary.
+        _ => ("●", secondary_style(theme)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1873,7 +3331,7 @@ fn highlight_code(
     Some(out)
 }
 
-/// The inset prefix a bare code block indents under (ADR-0040 Decision E): two
+/// The inset prefix a bare code block indents under: two
 /// columns, wearing the code background so the block reads as one solid inset
 /// surface rather than a boxed one.
 const CODE_INSET: &str = "  ";
@@ -1910,7 +3368,7 @@ fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         let block = &md_lines[i..end];
         let texts: Vec<String> = block.iter().map(md_line_text).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        // Bare, inset code block (ADR-0040 Decision E): a blank row above and
+        // Bare, inset code block: a blank row above and
         // below frames the block, and each code row insets under
         // [`CODE_INSET`]; no box, no line-number gutter - the syntect fg over
         // our code bg carries it. The inset prefix wears the code bg so the
@@ -1999,11 +3457,6 @@ fn normalize_diff_text(text: &str) -> String {
 // into the core's text. The same syntect machinery highlights markdown fences.
 // ---------------------------------------------------------------------------
 
-/// The two-column indent a diff hangs under, matching the tool machinery plane:
-/// the tint band starts AFTER this gutter, so the run-lane spine and this indent
-/// stay untinted and the band reads as GitHub's content-area stripe.
-const DIFF_INDENT: usize = 2;
-
 /// The marker glyph a diff line's [`DiffSide`] draws (ADR-0008): the adapter
 /// adds it, so the change still reads on a non-truecolor terminal and when the
 /// tint is subtle. Two cells wide, so the code text aligns across the sides.
@@ -2038,55 +3491,99 @@ fn diff_tint(side: DiffSide, theme: &Theme) -> Option<Color> {
 /// padded to `content_width` with a bg-filled span, so the stripe reaches the
 /// right edge like GitHub's.
 fn diff_lines(
-    title: &str,
     lang: Option<&str>,
     hunks: &[DiffHunk],
     content_width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
+    // Integration (IOSP): the gutter width + each hunk's rows come from the
+    // operations below; here we only join the hunk blocks with the `═` separator.
     let width = content_width as usize;
-    let mut out = vec![Line::styled(
-        truncate_cols(&format!("  ⋯ {title}"), width),
-        machinery_style(theme),
-    )];
-    for hunk in hunks {
-        out.extend(diff_hunk_lines(hunk, lang, width, theme));
+    let gutter_width = diff_gutter_width(hunks);
+    let separator = Line::styled("═".repeat(width), diff_chrome_style(theme));
+    let blocks: Vec<Vec<Line<'static>>> = hunks
+        .iter()
+        .map(|hunk| hunk_code_lines(hunk, lang, gutter_width, width, theme))
+        .collect();
+    join_blocks(blocks, separator)
+}
+
+/// Joins row `blocks` with a `separator` row between each (never before the first
+/// or after the last) - the flatten-with-separator the diff hunk rule needs
+/// without a branch inside the fold (qwen `═` U+2550 hunk rule, DiffRenderer.tsx
+/// :272). Pure.
+fn join_blocks(blocks: Vec<Vec<Line<'static>>>, separator: Line<'static>) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (i, block) in blocks.into_iter().enumerate() {
+        if i > 0 {
+            out.push(separator.clone());
+        }
+        out.extend(block);
     }
     out
 }
 
-/// One hunk's rows: its optional `@@ … @@` header (muted-italic chrome, no
-/// marker or tint) followed by its tinted, highlighted code lines
-/// ([`hunk_code_lines`]).
-fn diff_hunk_lines(
-    hunk: &DiffHunk,
-    lang: Option<&str>,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = hunk
-        .header
-        .iter()
-        .map(|header| {
-            Line::styled(
-                truncate_cols(&format!("  {header}"), width),
-                diff_chrome_style(theme),
-            )
-        })
-        .collect();
-    out.extend(hunk_code_lines(hunk, lang, width, theme));
-    out
+/// The line-number gutter width (columns) a diff draws: the digit count of the
+/// largest line number any hunk reaches, floored at 1 (qwen DiffRenderer.tsx
+/// :213-218). Parsed from each hunk's `@@ -old,_ +new,_ @@` header and the line
+/// count that follows, so no core change is needed (render-side `@@` parse).
+fn diff_gutter_width(hunks: &[DiffHunk]) -> usize {
+    let mut max = 1u32;
+    for hunk in hunks {
+        let (old_start, new_start) = parse_hunk_header(hunk.header.as_deref());
+        let (mut old_n, mut new_n) = (old_start, new_start);
+        for line in &hunk.lines {
+            match line.side {
+                DiffSide::Context => {
+                    max = max.max(new_n);
+                    old_n += 1;
+                    new_n += 1;
+                }
+                DiffSide::Added => {
+                    max = max.max(new_n);
+                    new_n += 1;
+                }
+                DiffSide::Removed => {
+                    max = max.max(old_n);
+                    old_n += 1;
+                }
+            }
+        }
+    }
+    max.to_string().len().max(1)
 }
 
-/// The muted `… N more lines` tail a display-capped diff ends with, or nothing
-/// when the cap elided nothing (`elided == 0`). Kept out of [`diff_lines`] so
-/// that function stays a pure sequence of extends (IOSP integration-only).
+/// Parses the `(old_start, new_start)` 1-based line numbers from a `@@ -a,b +c,d
+/// @@` unified-diff header (qwen `hunkHeaderRegex`, DiffRenderer.tsx:29). A `None`
+/// header (a created file) starts both at 1.
+fn parse_hunk_header(header: Option<&str>) -> (u32, u32) {
+    let Some(header) = header else {
+        return (1, 1);
+    };
+    // `@@ -old[,n] +new[,n] @@` — take the first number after `-` and after `+`.
+    let field = |marker: char| -> u32 {
+        header
+            .split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split([',', ' ']).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1)
+    };
+    (field('-'), field('+'))
+}
+
+/// The muted `... last N lines hidden ...` tail a display-capped diff ends with,
+/// or nothing when the cap elided nothing (`elided == 0`). Worded to match qwen's
+/// overflow banner (DiffRenderer `MaxSizedBox` → `... N lines hidden ...`).
 fn diff_elided_tail(elided: usize, content_width: u16, theme: &Theme) -> Vec<Line<'static>> {
     if elided == 0 {
         return Vec::new();
     }
     vec![Line::styled(
-        truncate_cols(&format!("  … {elided} more lines"), content_width as usize),
+        truncate_cols(
+            &format!("... last {elided} lines hidden ..."),
+            content_width as usize,
+        ),
         diff_chrome_style(theme),
     )]
 }
@@ -2108,15 +3605,25 @@ fn diff_elided_tail(elided: usize, content_width: u16, theme: &Theme) -> Vec<Lin
 fn hunk_code_lines(
     hunk: &DiffHunk,
     lang: Option<&str>,
+    gutter_width: usize,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    // Normalize each line's text ONCE, in file order, and reuse it for both the
-    // image the highlighter sees and the row the renderer draws.
-    let texts: Vec<String> = hunk
+    // The 1-based line numbers each row draws in the gutter, parsed from the
+    // hunk header (render-side, no core change - qwen DiffRenderer.tsx:279-301).
+    let numbers = hunk_line_numbers(hunk);
+    // Normalize each line's text ONCE, in file order, then strip the common
+    // leading indentation shared by every displayable line (qwen DiffRenderer.tsx
+    // :225-241) so a deeply-nested edit still reads.
+    let raw: Vec<String> = hunk
         .lines
         .iter()
         .map(|l| normalize_diff_text(&l.text))
+        .collect();
+    let strip = common_indent(&raw);
+    let texts: Vec<String> = raw
+        .iter()
+        .map(|t| t.chars().skip(strip).collect())
         .collect();
 
     // The two images, in file order: added/context feed the after pass, and
@@ -2163,9 +3670,59 @@ fn hunk_code_lines(
                 fg
             }
         };
-        out.push(diff_code_row(line.side, text, fragments, width, theme));
+        let gutter = diff_gutter_cell(numbers[out.len()], gutter_width);
+        out.push(diff_code_row(
+            line.side, &gutter, text, fragments, width, theme,
+        ));
     }
     out
+}
+
+/// The per-row 1-based line numbers a hunk draws in its gutter, in display order:
+/// a Context/Added row shows its NEW line number, a Removed row its OLD one (qwen
+/// DiffRenderer.tsx:279-301). Parsed from the hunk header start numbers.
+fn hunk_line_numbers(hunk: &DiffHunk) -> Vec<u32> {
+    let (mut old_n, mut new_n) = parse_hunk_header(hunk.header.as_deref());
+    hunk.lines
+        .iter()
+        .map(|line| match line.side {
+            DiffSide::Context => {
+                let n = new_n;
+                old_n += 1;
+                new_n += 1;
+                n
+            }
+            DiffSide::Added => {
+                let n = new_n;
+                new_n += 1;
+                n
+            }
+            DiffSide::Removed => {
+                let n = old_n;
+                old_n += 1;
+                n
+            }
+        })
+        .collect()
+}
+
+/// The common leading-space count shared by every non-blank line (qwen strips it
+/// per hunk so a deeply-indented edit still reads at the box edge). A hunk of
+/// only blank lines strips nothing.
+fn common_indent(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .filter(|l| l.chars().any(|c| !c.is_whitespace()))
+        .map(|l| l.chars().take_while(|c| *c == ' ').count())
+        .min()
+        .unwrap_or(0)
+}
+
+/// One diff line-number gutter cell: the number right-aligned in `gutter_width`
+/// columns plus a trailing space, the muted-italic diff chrome. The single place
+/// the gutter's alignment lives.
+fn diff_gutter_cell(number: u32, gutter_width: usize) -> String {
+    format!("{number:>gutter_width$} ")
 }
 
 /// One diff code row as a full-width tint band: the untinted [`DIFF_INDENT`]
@@ -2178,6 +3735,7 @@ fn hunk_code_lines(
 /// shatters across rows (ADR-0029).
 fn diff_code_row(
     side: DiffSide,
+    gutter: &str,
     text: &str,
     fragments: Option<Vec<CodeFragment>>,
     width: usize,
@@ -2192,11 +3750,10 @@ fn diff_code_row(
         s
     };
 
-    let indent = DIFF_INDENT.min(width);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // The indent/spine gutter stays untinted so the band starts at the marker.
-    spans.push(Span::raw(" ".repeat(indent)));
-    let mut used = indent;
+    // The line-number gutter (qwen DiffRenderer): the number tinted `text.secondary`
+    // over the side's diff background, so the band starts at the gutter's left edge.
+    let mut used = push_cols(&mut spans, gutter, band(secondary_style(theme)), 0, width);
 
     // The marker glyph carries the SEMANTIC fg over the tint.
     used = push_cols(&mut spans, diff_marker(side), band(semantic), used, width);
@@ -2296,135 +3853,137 @@ fn push_cols(
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// How many source rows of the live reasoning the rolling tail shows under the
-/// `✦ Thinking` header (ADR-0040 Decision A: the short tail). Tunable.
+/// `✦ Thinking` header (the short reasoning tail). Tunable.
 const THINKING_TAIL_ROWS: usize = 3;
 
 // ---------------------------------------------------------------------------
-// The powerline status bar.
+// The flat footer (ADR-0053, qwen `Footer.tsx`): ONE row, space-between,
+// `paddingX:2`, no powerline triangles, no block backgrounds. Replaces the
+// powerline status bar (retiring ADR-0046's `status_bar` and the ADR-0008/0040
+// segment palette).
 // ---------------------------------------------------------------------------
 
-/// Powerline separators (Nerd Font): right-pointing after left-side segments,
-/// left-pointing before right-side segments. Drawn fg = the segment's bg over
-/// bg = the neighbor's bg - the standard powerline triangle technique.
-const SEP_RIGHT: &str = "\u{e0b0}"; //
-const SEP_LEFT: &str = "\u{e0b2}"; //
+/// The horizontal inset the footer row wears on each side (qwen `paddingX:2`).
+const FOOTER_PADDING_X: usize = 2;
 
-/// The Agent's mode as the status bar conveys it - the semantic distinction
-/// the leftmost block draws. Carries no spinner frame: the animation glyph is
-/// a drawing concern the painter injects, not part of what the bar *means*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModeState {
-    /// The Agent is idle - no Run running.
-    Idle,
-    /// The Agent is running a Run.
-    Running,
-}
+/// The ` | ` separator qwen joins the right-group items with (`text.secondary`),
+/// emitted BETWEEN items only - no leading separator (qwen `index > 0`).
+const FOOTER_SEP: &str = " | ";
 
-/// One status bar segment's MEANING, ratatui-free (ADR-0019). The pure
-/// assembly ([`status_bar`]) emits these carrying only the display state they
-/// convey - no colors (that is [`segment_style`], ADR-0008), no glyphs, no
-/// padding, no label formatting (all [`StatusSegment::paint`]'s job). This is
-/// the testable seam: the semantics of the bar can be asserted without drawing
-/// a frame.
+// Note: qwen's `isNarrowWidth` (< 80) switches the footer to a two-line column;
+// suspenders instead stays ONE row and sheds right items (cost → model), a
+// documented divergence (ADR-0046 fixed a 1-row footer zone, ADR-0053). The shed
+// is width-driven (see [`Footer::fit`]), so there is no narrow-threshold const.
+
+/// One right-group footer item's MEANING, ratatui-free (ADR-0019). The pure
+/// assembly ([`footer`]) emits these carrying only the display state they
+/// convey - no colours (that is [`render_footer`], ADR-0008), no separators.
+/// The testable seam: the footer's contents can be asserted without a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusSegment {
-    /// The Agent's mode. Idle vs. Running is the semantic decision; the
-    /// spinner frame the running block animates is supplied at paint time.
-    Mode(ModeState),
-    /// The brand + endpoint the Session connects to.
-    Connection {
-        /// The model connection's base URL.
-        base_url: String,
-    },
-    /// The Active Model this Session talks to (ADR-0033). Mutable - a `/model`
-    /// pick changes it - so the bar shows the one connection fact this feature
-    /// makes variable, beside the fixed endpoint.
+pub enum FooterItem {
+    /// The Active Model (qwen keeps model/cost out of its footer; suspenders
+    /// keeps them as the load-bearing local-first facts, Option B, ADR-0053).
+    /// Rendered `text.secondary` like the whole right group.
     Model {
         /// The Active Model identifier.
         model: String,
     },
-    /// The Ctrl-T Thinking-expansion state. Carries the boolean meaning; the
-    /// `▾`/`▸` marker is chosen by the painter. Always assembled so the toggle
-    /// has feedback even when no Thinking items are on screen.
-    Thinking {
-        /// Whether settled Thinking items are currently expanded.
-        expanded: bool,
+    /// The context-usage figure (qwen `ContextUsageDisplay`, ADR-0048): the
+    /// flat `NN.N% used` / `NN.N% context used` label (the pure
+    /// [`context_percent_label`] rule) and whether usage is over the budget (the
+    /// painter reads `error` when so, else `text.secondary`). Assembled only when
+    /// a budget exists.
+    Context {
+        /// The flat `context_percent_label` figure (no block padding).
+        label: String,
+        /// Whether the Conversation is over its context budget.
+        over_limit: bool,
     },
-    /// The Ctrl-O tool-Block-expansion state. Carries the boolean meaning; the
-    /// `▾`/`▸` marker is chosen by the painter. Always assembled - the twin of
-    /// `Thinking` - so the toggle has feedback even when no Blocks are on
-    /// screen.
-    Tools {
-        /// Whether settled tool Blocks are currently expanded.
-        expanded: bool,
-    },
-    /// The Session's cumulative dollar cost (ADR-0037: Catalog pricing,
-    /// surfaced display-side). Carries the pre-formatted label (the pure
-    /// [`cost_label`] rule) so the segment stays `Eq`; assembled only when the
-    /// total is positive - an unpriced local Session never shows it.
+    /// The Session's cumulative dollar cost (ADR-0037), the pre-formatted
+    /// [`cost_label`] total. Assembled only when the total is positive.
     Cost {
         /// The [`cost_label`]-formatted total, e.g. `$0.42` or `<$0.01`.
         label: String,
     },
-    /// Carries the [`PressureLevel`] verbatim so the Critical-renders-red rule
-    /// (ADR-0008) is a semantic fact the painter merely routes to a color.
-    Tokens {
-        /// The token estimate for the Conversation.
-        estimate: u64,
-        /// How close to the budget the Conversation sits.
-        level: PressureLevel,
-    },
-    /// The viewport scroll position label (`Bot`/`Top`/`NN%`), already derived
-    /// from this frame's geometry by [`scroll_position_label`].
-    Position {
-        /// The vim-ruler style position label.
-        label: String,
-    },
 }
 
-impl StatusSegment {
-    /// The painter's [`SegmentKind`] for this segment - the key into
-    /// [`segment_style`] (ADR-0008). Pure classification, no ratatui: it just
-    /// carries the [`PressureLevel`] through for the Tokens segment so the
-    /// single pressure→color mapping (Critical renders red) still decides the
-    /// style, now provably fed the right level.
-    fn kind(&self) -> SegmentKind {
+impl FooterItem {
+    /// This item's display text (no separator, no padding). Semantics-in,
+    /// text-out - the seam ADR-0019 wants.
+    fn text(&self) -> String {
         match self {
-            StatusSegment::Mode(ModeState::Idle) => SegmentKind::ModeIdle,
-            StatusSegment::Mode(ModeState::Running) => SegmentKind::ModeRunning,
-            StatusSegment::Connection { .. } => SegmentKind::Connection,
-            StatusSegment::Model { .. } => SegmentKind::Model,
-            StatusSegment::Thinking { .. } => SegmentKind::Thinking,
-            StatusSegment::Tools { .. } => SegmentKind::Tools,
-            StatusSegment::Cost { .. } => SegmentKind::Cost,
-            StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
-            StatusSegment::Position { .. } => SegmentKind::Position,
+            FooterItem::Model { model } => format!("model {model}"),
+            FooterItem::Context { label, .. } => label.clone(),
+            FooterItem::Cost { label } => label.clone(),
         }
     }
 
-    /// The columns this segment occupies once painted, ratatui-free. Kept in
-    /// lockstep with [`StatusSegment::paint`] so the pure fit policy
-    /// ([`StatusBar::fit`]) measures exactly what the painter will draw. The
-    /// mode dot and `▾`/`▸` marker are each one column, so the width does not
-    /// depend on the mode the painter later chooses. Exhaustive so a new
-    /// segment kind is a compile error here as well as in the painter.
+    /// The columns this item occupies once painted, ratatui-free. Kept in
+    /// lockstep with [`FooterItem::text`] so the fit policy measures what the
+    /// painter draws.
     fn cells(&self) -> usize {
-        self.paint().chars().count()
+        self.text().chars().count()
     }
 }
 
-/// The Tokens segment's display text: `~{estimate} tokens` (grouped with
-/// thousands separators).
-fn tokens_label(estimate: u64) -> String {
-    let estimate = estimate.separate_with_commas();
-    format!(" ~{estimate} tokens ")
+/// The footer's left content (qwen `leftBottomContent`): the AutoAcceptIndicator
+/// when the Approval mode is not Default, else the `? for shortcuts` hint.
+/// Ratatui-free - the painter picks the per-mode colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterLeft {
+    /// The AutoAcceptIndicator (qwen `AutoAcceptIndicator.tsx`, ADR-0050): the
+    /// mode's label + the ` (shift + tab to cycle)` hint. Never `Default` (that
+    /// falls to [`FooterLeft::Shortcuts`], matching qwen rendering nothing).
+    AutoAccept(ApprovalMode),
+    /// The resting `? for shortcuts` hint (qwen's fallthrough), `text.secondary`.
+    Shortcuts,
 }
 
-/// The Cost segment's display text (ADR-0037: the Session's cumulative
+/// The ratio at/above which the context figure reads `>100` (qwen `>1`).
+const CONTEXT_FULL_RATIO: f64 = 1.0;
+/// The percent scaling applied to the usage ratio for display.
+const CONTEXT_PERCENT_SCALE: f64 = 100.0;
+/// The terminal width below which the context label shortens to `% used` (qwen's
+/// `terminalWidth < 100` rule).
+const CONTEXT_NARROW_WIDTH: usize = 100;
+
+/// The context-usage figure (qwen `ContextUsageDisplay` / `formatPercentageUsed`,
+/// ADR-0048): `percentage = tokens / budget`; `>1 → ">100"` else `(p*100)` to one
+/// decimal, then the label - `% used` when the terminal is narrower than
+/// [`CONTEXT_NARROW_WIDTH`] else `% context used` (the leading `%` is part of the
+/// label). FLAT - no block padding (the powerline wrapper is retired, ADR-0053);
+/// the footer joins items with ` | ` instead. A zero (or missing) budget has no
+/// figure to show.
+fn context_percent_label(tokens: u64, budget: u64, width: usize) -> Option<String> {
+    if budget == 0 {
+        return None;
+    }
+    let ratio = tokens as f64 / budget as f64;
+    let figure = if ratio > CONTEXT_FULL_RATIO {
+        ">100".to_string()
+    } else {
+        format!("{:.1}", ratio * CONTEXT_PERCENT_SCALE)
+    };
+    let label = if width < CONTEXT_NARROW_WIDTH {
+        "% used"
+    } else {
+        "% context used"
+    };
+    Some(format!("{figure}{label}"))
+}
+
+/// Whether the context usage is over the budget (qwen `isOverLimit`): the figure
+/// reads `error` rather than secondary. Separated from the label so the painter
+/// routes the colour without re-deriving the ratio.
+fn context_over_limit(tokens: u64, budget: u64) -> bool {
+    budget > 0 && tokens > budget
+}
+
+/// The Cost item's display text (ADR-0037: the Session's cumulative
 /// Catalog-priced total, in dollars). Two decimals from a cent up; a flat
 /// `<$0.01` below that - a sub-cent figure would render `$0.00` and read as
-/// free. Only prices a positive total: the assembly hides the segment
-/// entirely at zero, so this never formats one.
+/// free. Only prices a positive total: the assembly hides the item entirely at
+/// zero, so this never formats one.
 pub fn cost_label(total: f64) -> String {
     if total < COST_SUB_CENT {
         "<$0.01".to_string()
@@ -2433,330 +3992,299 @@ pub fn cost_label(total: f64) -> String {
     }
 }
 
-/// The status bar's assembled MEANING: an ordered left group (mode, then
-/// connection) and right group (thinking, tools, tokens, position), already
-/// fitted to the terminal width. Pure and ratatui-free - this is what the new
-/// colocated tests assert against without drawing a frame.
+/// The footer's assembled MEANING (ADR-0053): the left content and the ordered
+/// ` | `-joined right group (model, context%, cost), already fitted to the
+/// terminal width. Pure and ratatui-free - what the colocated tests assert
+/// against without drawing a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusBar {
-    /// Left-anchored segments, highest priority first.
-    pub left: Vec<StatusSegment>,
-    /// Right-anchored segments, in display order.
-    pub right: Vec<StatusSegment>,
+pub struct Footer {
+    /// The left content (AutoAcceptIndicator or the shortcuts hint).
+    pub left: FooterLeft,
+    /// The right group, in display order (model, context%, cost), post-fit.
+    pub right: Vec<FooterItem>,
 }
 
-impl StatusBar {
-    /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then model, then tools, then thinking, then cost, then
-    /// tokens - mode and position survive longest. Connection (the endpoint)
-    /// drops BEFORE model: the endpoint is a fixed, knowable fact, while the
-    /// model is what the user actively changes via `/model`, so the model
-    /// earns the scarcer columns. Tools drops before thinking (both are the
-    /// same detail-on-demand class; thinking is the older, more-referenced
-    /// affordance). Cost drops before tokens: tokens carry the pressure level
-    /// the operator steers by. Which segments to show at a given width is a
-    /// SEMANTIC decision, so it lives here in the pure layer; the width
-    /// arithmetic reads each segment's own [`StatusSegment::cells`]. Simple on
-    /// purpose: a partially-truncated segment would garble the powerline
-    /// blocks.
-    fn fit(mut self, width: usize) -> StatusBar {
-        let drop_order: [fn(&StatusSegment) -> bool; DROP_TIER_COUNT] = [
-            |s| matches!(s, StatusSegment::Connection { .. }),
-            |s| matches!(s, StatusSegment::Model { .. }),
-            |s| matches!(s, StatusSegment::Tools { .. }),
-            |s| matches!(s, StatusSegment::Thinking { .. }),
-            |s| matches!(s, StatusSegment::Cost { .. }),
-            |s| matches!(s, StatusSegment::Tokens { .. }),
+impl Footer {
+    /// Drops right-group items until the footer fits `width`, lowest-value
+    /// first: cost, then model - context% NEVER drops (it is qwen's sole footer
+    /// figure and the one the operator steers by). Which items show at a given
+    /// width is a SEMANTIC decision, so it lives here in the pure layer; the
+    /// arithmetic reads each item's own [`FooterItem::cells`] plus the left
+    /// content, the ` | ` joins, and the two-side padding. This is the narrow
+    /// "shed, don't wrap" divergence from qwen's two-line stack (ADR-0053).
+    fn fit(mut self, width: usize, left_cells: usize) -> Footer {
+        let drop_order: [fn(&FooterItem) -> bool; FOOTER_DROP_TIER_COUNT] = [
+            |i| matches!(i, FooterItem::Cost { .. }),
+            |i| matches!(i, FooterItem::Model { .. }),
         ];
         for dropped in drop_order {
-            if self.cells() <= width {
+            if self.cells(left_cells) <= width {
                 break;
             }
-            self.left.retain(|s| !dropped(s));
-            self.right.retain(|s| !dropped(s));
+            self.right.retain(|i| !dropped(i));
         }
         self
     }
 
-    /// The columns the segments occupy: their painted widths plus one
-    /// powerline separator glyph per segment (left segments each trail one,
-    /// right segments each lead with one).
-    fn cells(&self) -> usize {
-        let text: usize = self
-            .left
-            .iter()
-            .chain(&self.right)
-            .map(StatusSegment::cells)
-            .sum();
-        text + self.left.len() + self.right.len()
+    /// The columns the footer occupies: the two-side padding, the left content,
+    /// a gap of at least one cell, and the right group (item texts + one ` | `
+    /// join between each pair).
+    fn cells(&self, left_cells: usize) -> usize {
+        FOOTER_PADDING_X * 2 + left_cells + FOOTER_MIN_GAP + self.right_cells()
+    }
+
+    /// The right group's painted width: the item texts plus one ` | ` separator
+    /// between each adjacent pair (no leading separator).
+    fn right_cells(&self) -> usize {
+        let text: usize = self.right.iter().map(FooterItem::cells).sum();
+        let joins = self.right.len().saturating_sub(1) * FOOTER_SEP.chars().count();
+        text + joins
     }
 }
 
-/// The token facts the status bar's Tokens segment needs: the `estimate` it
-/// draws and the [`PressureLevel`] that colors it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenView {
-    pub estimate: u64,
-    pub level: PressureLevel,
-}
-
-/// The figures the bar's right side draws beside the toggles: the token facts
-/// (`None` before any estimate exists) and the Session's cumulative dollar
-/// cost (ADR-0037). A `session_cost` of 0.0 hides the cost segment entirely -
-/// an unpriced local Session shows exactly the bar it always did. One struct,
-/// like [`TokenView`] before it, so the `status_bar` arg COUNT stays at 8 (the
-/// Stage 3 review's binding precondition against growing the
-/// already-suppressed signature).
+/// The figures the footer's right side draws: the token estimate (`None` before
+/// any estimate exists) the context figure measures against the budget, the
+/// Session's cumulative dollar cost (ADR-0037; `0.0` hides the Cost item), and
+/// the context budget for the `% used` figure (ADR-0048).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FigureView {
-    pub tokens: Option<TokenView>,
+    /// The token estimate the context figure divides by the budget. The
+    /// powerline's per-`PressureLevel` block colour retired with it (ADR-0053);
+    /// the flat footer routes context colour off `over_limit` alone, so only the
+    /// count survives.
+    pub tokens: Option<u64>,
     pub session_cost: f64,
+    /// The Conversation's context budget (the model's usable window). `None`
+    /// before any estimate/budget arrives; a zero budget shows no figure.
+    pub context_budget: Option<u64>,
 }
 
-/// All display facts for one status bar assembly, bundled to keep [`status_bar`]
-/// within the 5-param SRP_PARAMS ceiling. Each field is an independent semantic
-/// fact the bar renders; the struct is the boundary between the caller's state
-/// and the pure assembly logic.
-pub(crate) struct StatusBarView<'a> {
-    pub(crate) status: Status,
+/// All display facts for one footer assembly, bundled to keep [`footer`] within
+/// the param ceiling. Each field is an independent semantic fact the footer
+/// renders.
+pub(crate) struct FooterView<'a> {
     pub(crate) conn: ConnectionView<'a>,
-    pub(crate) toggles: Toggles,
     pub(crate) figures: FigureView,
-    pub(crate) position: String,
+    /// The current Approval mode (ADR-0050), for the left AutoAcceptIndicator.
+    /// `Default` shows the shortcuts hint instead.
+    pub(crate) approval_mode: ApprovalMode,
 }
 
-/// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
-/// ordered semantic segments the bar conveys, fitted to `width`. `view.figures`
-/// carries the token facts (`None` when no estimate exists yet) and the
-/// Session cost (segment hidden at zero). No colors, glyphs, or label
-/// strings are decided here - that is the painter's job
-/// ([`render_status_bar`]) - so every rule this expresses (segment order, the
-/// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
-/// tokens-absent-until-estimate and cost-hidden-at-zero rules) is a semantic
-/// fact assertable without a frame.
-pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
-    let StatusBarView {
-        status,
+/// Assembles the footer's MEANING, pure and ratatui-free (ADR-0019, ADR-0053):
+/// the left content and the ordered right group (model, context%, cost), fitted
+/// to `width`. No colours, glyphs, or separators are decided here - that is the
+/// painter's job ([`render_footer`]) - so every rule (item order, the shed/drop
+/// policy, the model-always / cost-hidden-at-zero / context-needs-a-budget
+/// rules, the Default-mode-shows-shortcuts rule) is assertable without a frame.
+pub(crate) fn footer(width: usize, view: FooterView<'_>) -> Footer {
+    let FooterView {
         conn,
-        toggles,
         figures,
-        position,
+        approval_mode,
     } = view;
-    let mode = match status {
-        Status::Idle => ModeState::Idle,
-        Status::Running => ModeState::Running,
-    };
-    let left = vec![
-        StatusSegment::Mode(mode),
-        StatusSegment::Connection {
-            base_url: conn.base_url.to_string(),
-        },
-        StatusSegment::Model {
-            model: conn.model.to_string(),
-        },
-    ];
 
-    let mut right = vec![
-        StatusSegment::Thinking {
-            expanded: toggles.thinking_expanded,
-        },
-        StatusSegment::Tools {
-            expanded: toggles.tools_expanded,
-        },
-    ];
-    if let Some(TokenView { estimate, level }) = figures.tokens {
-        right.push(StatusSegment::Tokens { estimate, level });
+    let left = if approval_mode == ApprovalMode::Default {
+        FooterLeft::Shortcuts
+    } else {
+        FooterLeft::AutoAccept(approval_mode)
+    };
+
+    let mut right = vec![FooterItem::Model {
+        model: conn.model.to_string(),
+    }];
+    // The context-usage figure (qwen `ContextUsageDisplay`, ADR-0048): shown once
+    // a budget exists. The label's `% used` / `% context used` form depends on the
+    // terminal `width` (qwen's <100-column rule).
+    if let Some(estimate) = figures.tokens
+        && let Some(budget) = figures.context_budget
+        && let Some(label) = context_percent_label(estimate, budget, width)
+    {
+        right.push(FooterItem::Context {
+            label,
+            over_limit: context_over_limit(estimate, budget),
+        });
     }
-    // The cost segment exists only once a priced Response landed: at zero the
-    // Session has spent nothing meterable and the bar stays as it always was.
+    // The cost item exists only once a priced Response landed: at zero the
+    // Session has spent nothing meterable and the footer omits it.
     if figures.session_cost > COST_HIDDEN {
-        right.push(StatusSegment::Cost {
+        right.push(FooterItem::Cost {
             label: cost_label(figures.session_cost),
         });
     }
-    right.push(StatusSegment::Position { label: position });
 
-    StatusBar { left, right }.fit(width)
+    Footer { left, right }.fit(width, footer_left_cells(left))
 }
 
-/// The semantic kind of one status bar segment. The painter classifies each
-/// [`StatusSegment`] into a kind ([`StatusSegment::kind`]); [`segment_style`]
-/// is the single place kinds become colors (ADR-0008).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentKind {
-    /// Agent idle - calm green mode block.
-    ModeIdle,
-    /// Agent running - yellow mode block with the animated spinner.
-    ModeRunning,
-    /// `suspenders · <base_url>` - the brand + endpoint, lowest priority.
-    Connection,
-    /// `model · <id>` - the Active Model (ADR-0033), styled like the endpoint
-    /// since both are connection facts.
-    Model,
-    /// The Ctrl-T thinking-expansion state (`▾`/`▸`). Always visible so the
-    /// toggle has feedback even when no Thinking items are on screen.
-    Thinking,
-    /// The Ctrl-O tool-Block-expansion state (`▾`/`▸`). Always visible so the
-    /// toggle has feedback even when no Blocks are on screen - the twin of
-    /// `Thinking`.
-    Tools,
-    /// The Session's cumulative dollar cost (ADR-0037) - a quiet figure like
-    /// tokens at `Ok` pressure. Present only once a priced Response landed.
-    Cost,
-    /// The `~N tokens` estimate, colored by its [`PressureLevel`].
-    Tokens(PressureLevel),
-    /// The viewport scroll position (`Bot`/`Top`/`NN%`) - the bold accent.
-    Position,
-}
-
-impl StatusSegment {
-    /// Paints this segment into its display text (padding included). The ONLY
-    /// place the drawing details live: the mode dot, the `▾`/`▸` Thinking
-    /// marker, the `~N tokens` label, and the block padding. Semantics-in,
-    /// terminal-text-out - the seam ADR-0019 wants. No spinner: the running
-    /// animation moved to the `✦ Thinking` brain header (ADR-0040); the mode
-    /// block is now a static dot (`●` running, pulsing color; `○` idle).
-    fn paint(&self) -> String {
-        match self {
-            StatusSegment::Mode(ModeState::Running) => " ● ".to_string(),
-            StatusSegment::Mode(ModeState::Idle) => " ○ ".to_string(),
-            StatusSegment::Connection { base_url } => padded(&format!("suspenders · {base_url}")),
-            StatusSegment::Model { model } => padded(&format!("model · {model}")),
-            StatusSegment::Thinking { expanded } => {
-                let marker = if *expanded { "▾" } else { "▸" };
-                padded(&format!("{marker} thinking"))
-            }
-            StatusSegment::Tools { expanded } => {
-                let marker = if *expanded { "▾" } else { "▸" };
-                padded(&format!("{marker} tools"))
-            }
-            StatusSegment::Cost { label } => padded(label),
-            StatusSegment::Tokens { estimate, .. } => tokens_label(*estimate),
-            StatusSegment::Position { label } => padded(label),
-        }
+/// The AutoAcceptIndicator's mode label (qwen `AutoAcceptIndicator.tsx` verbatim,
+/// ADR-0050): `plan mode` / `auto-accept edits` / `auto mode (classifier-
+/// evaluated)` / `YOLO mode`. `Default` has no label (it never renders as an
+/// indicator); it maps to the empty string defensively so the function is total.
+fn approval_mode_label(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Plan => "plan mode",
+        ApprovalMode::AutoEdit => "auto-accept edits",
+        ApprovalMode::Auto => "auto mode (classifier-evaluated)",
+        ApprovalMode::Yolo => "YOLO mode",
+        ApprovalMode::Default => "",
     }
 }
 
-/// The bottom status bar, powerline style: left segments (mode, connection)
-/// fading into the base bg, right segments (thinking, tokens, position)
-/// growing out of it, each block joined by triangle separators. `geometry` is
-/// the `(total_lines, height)` the viewport was measured at THIS frame - the
-/// position segment must agree with what is actually drawn above it.
-///
-/// A thin painter over the pure [`status_bar`] assembly: the semantics (which
-/// segments, in what order, at what [`PressureLevel`]) are decided there; this
-/// runs each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
-/// and [`segment_style`].
-/// Screen-state bundle for [`render_status_bar`], so the painter stays within
-/// the 5-param SRP_PARAMS ceiling without changing the public `render` signature.
-pub(crate) struct StatusBarCtx<'a> {
-    pub(crate) screen: &'a Screen,
-    pub(crate) conn: ConnectionView<'a>,
-    pub(crate) viewport: &'a Viewport,
-    pub(crate) geometry: (usize, usize),
+/// The AutoAcceptIndicator's per-mode label colour (qwen `AutoAcceptIndicator`):
+/// plan → success, auto-edit/auto → warning, yolo → error. Default never renders
+/// as an indicator, so it borrows the neutral secondary defensively.
+fn approval_mode_style(mode: ApprovalMode, theme: &Theme) -> Style {
+    match mode {
+        ApprovalMode::Plan => success_style(theme),
+        ApprovalMode::AutoEdit | ApprovalMode::Auto => warning_style(theme),
+        ApprovalMode::Yolo => error_style(theme),
+        ApprovalMode::Default => secondary_style(theme),
+    }
 }
 
-pub(crate) fn render_status_bar(
-    frame: &mut Frame,
-    area: Rect,
-    ctx: StatusBarCtx<'_>,
-    theme: &Theme,
-) {
-    let StatusBarCtx {
-        screen: t,
-        conn,
-        viewport,
-        geometry,
-    } = ctx;
-    let (total_lines, height) = geometry;
-    let position = scroll_position_label(
-        viewport.top_offset(total_lines, height),
-        total_lines,
-        height,
-    );
-    let bar = status_bar(
-        area.width as usize,
-        StatusBarView {
-            status: t.status,
+/// The AutoAcceptIndicator's cycle hint (qwen ` (shift + tab to cycle)`), carried
+/// with a leading space so it reads as one phrase across the colour boundary.
+const CYCLE_HINT: &str = " (shift + tab to cycle)";
+
+/// The resting left hint (qwen `? for shortcuts`).
+const SHORTCUTS_HINT: &str = "? for shortcuts";
+
+/// The left content's painted width (ratatui-free), so the pure [`Footer::fit`]
+/// measures the same cells the painter draws.
+fn footer_left_cells(left: FooterLeft) -> usize {
+    match left {
+        FooterLeft::AutoAccept(mode) => {
+            approval_mode_label(mode).chars().count() + CYCLE_HINT.chars().count()
+        }
+        FooterLeft::Shortcuts => SHORTCUTS_HINT.chars().count(),
+    }
+}
+
+/// The number of shed tiers in the footer's right-group drop policy.
+const FOOTER_DROP_TIER_COUNT: usize = 2;
+
+/// The minimum gap the footer reserves between the left content and the right
+/// group (qwen's space-between never lets them touch).
+const FOOTER_MIN_GAP: usize = 1;
+
+/// Screen-state bundle for [`render_footer`], so the painter stays within the
+/// param ceiling.
+pub(crate) struct FooterCtx<'a> {
+    pub(crate) screen: &'a Screen,
+    pub(crate) conn: ConnectionView<'a>,
+}
+
+/// The flat bottom footer (ADR-0053, qwen `Footer.tsx`): ONE row, hand-rolled
+/// space-between with a [`FOOTER_PADDING_X`] inset on each side and NO background
+/// fill. A thin painter over the pure [`footer`] assembly (which items, in what
+/// order): the left content wears its per-mode colour, the right group is
+/// ` | `-joined in `text.secondary` (context% goes `error` when over-limit).
+pub(crate) fn render_footer(frame: &mut Frame, area: Rect, ctx: FooterCtx<'_>, theme: &Theme) {
+    let FooterCtx { screen: t, conn } = ctx;
+    let width = area.width as usize;
+    let bar = footer(
+        width,
+        FooterView {
             conn,
-            toggles: Toggles {
-                thinking_expanded: t.thinking_expanded,
-                tools_expanded: t.tools_expanded,
-            },
             figures: FigureView {
-                tokens: t.token_estimate.map(|estimate| TokenView {
-                    estimate,
-                    level: t.pressure_level,
-                }),
+                tokens: t.token_estimate,
                 session_cost: t.session_cost,
+                context_budget: t.context_budget,
             },
-            position,
+            approval_mode: t.approval_mode,
         },
     );
 
-    let bar_bg = tui_color(theme.bar_bg);
+    // Left content: the AutoAcceptIndicator (mode label + hint) or the shortcuts
+    // hint. The hint is always `text.secondary` (qwen); the mode label wears its
+    // per-mode colour.
+    let mut left_spans: Vec<Span> = Vec::new();
+    match bar.left {
+        FooterLeft::AutoAccept(mode) => {
+            left_spans.push(Span::styled(
+                approval_mode_label(mode).to_string(),
+                approval_mode_style(mode, theme),
+            ));
+            left_spans.push(Span::styled(CYCLE_HINT.to_string(), secondary_style(theme)));
+        }
+        FooterLeft::Shortcuts => {
+            left_spans.push(Span::styled(
+                SHORTCUTS_HINT.to_string(),
+                secondary_style(theme),
+            ));
+        }
+    }
+
+    // Right group: ` | `-joined in `text.secondary`, no leading separator; the
+    // context% item goes `error` when over the budget (qwen's inner colour).
+    let mut right_spans: Vec<Span> = Vec::new();
+    for (i, item) in bar.right.iter().enumerate() {
+        if i > 0 {
+            right_spans.push(Span::styled(FOOTER_SEP, secondary_style(theme)));
+        }
+        let style = match item {
+            FooterItem::Context {
+                over_limit: true, ..
+            } => error_style(theme),
+            _ => secondary_style(theme),
+        };
+        right_spans.push(Span::styled(item.text(), style));
+    }
+
+    // Hand-rolled space-between (qwen `justifyContent:"space-between"`): pad the
+    // gap between the inset left and right groups so the right group sits flush
+    // against the right inset.
+    let left_cells: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_cells: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let content = FOOTER_PADDING_X * 2 + left_cells + right_cells;
+    let gap = width.saturating_sub(content).max(FOOTER_MIN_GAP);
+
     let mut spans: Vec<Span> = Vec::new();
-    for (i, segment) in bar.left.iter().enumerate() {
-        let kind = segment.kind();
-        spans.push(Span::styled(segment.paint(), segment_style(kind, theme)));
-        // The separator wears THIS segment's bg over the NEXT one's (the base
-        // bg after the last segment) - that is what draws the triangle.
-        let next_bg = bar
-            .left
-            .get(i + 1)
-            .map(|s| segment_bg(s.kind(), theme))
-            .unwrap_or(bar_bg);
-        spans.push(Span::styled(
-            SEP_RIGHT,
-            Style::default().fg(segment_bg(kind, theme)).bg(next_bg),
-        ));
-    }
-    let gap = (area.width as usize).saturating_sub(bar.cells());
-    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(bar_bg)));
-    let mut prev_bg = bar_bg;
-    for segment in &bar.right {
-        let kind = segment.kind();
-        spans.push(Span::styled(
-            SEP_LEFT,
-            Style::default().fg(segment_bg(kind, theme)).bg(prev_bg),
-        ));
-        spans.push(Span::styled(segment.paint(), segment_style(kind, theme)));
-        prev_bg = segment_bg(kind, theme);
-    }
+    spans.push(Span::raw(" ".repeat(FOOTER_PADDING_X)));
+    spans.append(&mut left_spans);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.append(&mut right_spans);
+    spans.push(Span::raw(" ".repeat(FOOTER_PADDING_X)));
 
-    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
-    frame.render_widget(bar, area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The position segment's label, vim-ruler style: `Bot` at the tail, `Top` at
-/// the top of overflowing content, otherwise the percentage of the scroll
-/// range. Content that FITS the viewport is `Bot`, not `Top`: the tail is
-/// visible, which is what a pinned reader cares about - and it keeps the
-/// label stable as a fresh session grows past one page.
-fn scroll_position_label(top: usize, total_lines: usize, height: usize) -> String {
-    let max_top = total_lines.saturating_sub(height);
-    if top >= max_top {
-        // Also covers max_top == 0 (content fits, or empty/degenerate
-        // geometry) - no division by zero below.
-        "Bot".to_string()
-    } else if top == 0 {
-        "Top".to_string()
+/// The two-row chrome the Composer wears above and below its draft (ADR-0048,
+/// qwen `InputPrompt`): a top dash rule and a bottom single-border row. The
+/// composer zone is grown by exactly this so the draft never loses a row to the
+/// chrome, and the cursor y-offset accounts for the top rule (the correctness-
+/// critical +1 unit-tested by `composer_cursor_sits_below_the_top_rule`).
+const COMPOSER_CHROME_ROWS: usize = 2;
+
+/// The Composer placeholder shown when the draft is empty (qwen `InputPrompt`):
+/// TWO leading spaces then the hint. The first glyph draws `REVERSED` (a resting
+/// block cursor), the rest secondary.
+const COMPOSER_PLACEHOLDER: &str = "  Type your message or @path/to/file";
+
+/// The Composer's border colour (qwen `borderColor`): `border.focused`
+/// (link-blue) when the Composer owns the keyboard, else `border.default`
+/// (grey). The Composer is unfocused exactly while the Approval modal holds the
+/// keyboard (Phase-4 seam: mode variants of the prompt come later).
+fn composer_border_style(focused: bool, theme: &Theme) -> Style {
+    if focused {
+        Style::default().fg(tui_color(theme.link))
     } else {
-        format!("{}%", top * 100 / max_top)
+        border_style(theme)
     }
 }
 
-/// The Composer: the draft, pre-wrapped by the pure [`composer::layout`]
+/// The Composer: a top dash rule, the draft, then a bottom border (ADR-0048,
+/// qwen `InputPrompt`). The draft is pre-wrapped by the pure [`composer::layout`]
 /// (char-based, so the cursor cell below is exact - `Paragraph`'s word-wrap
-/// points can't be queried). The FIRST row keeps the "› " gutter; every
-/// continuation row - hard-newline and wrapped alike - indents 2 spaces to
-/// align under it, mirroring how submitted multi-line User prompts render.
+/// points can't be queried). The FIRST row wears the `> ` prompt in
+/// `accent_style`; every continuation row - hard-newline and wrapped alike -
+/// indents 2 spaces to align under it. An empty draft shows the placeholder.
 ///
 /// When the draft is taller than the box, the Composer scrolls internally
-/// ([`composer::first_visible_row`]) so the cursor row stays visible, near
-/// the bottom like a terminal. The REAL terminal cursor is placed at the
-/// cursor's cell - except while the Approval modal owns the keyboard, when a
-/// blinking composer cursor would misstate where keys go.
+/// ([`composer::first_visible_row`]) so the cursor row stays visible, near the
+/// bottom like a terminal. The REAL terminal cursor is placed at the cursor's
+/// cell (shifted DOWN one row by the top rule) - except while the Approval modal
+/// owns the keyboard, when a blinking composer cursor would misstate where keys
+/// go.
 pub fn render_composer(
     frame: &mut Frame,
     area: Rect,
@@ -2764,89 +4292,166 @@ pub fn render_composer(
     layout: &ComposerLayout,
     theme: &Theme,
 ) {
-    let visible = area.height as usize;
-    if visible == 0 || area.width < 2 {
-        return;
-    }
-    let top = composer::first_visible_row(layout.cursor_row, visible);
-    let gutter = Style::default()
-        .fg(tui_color(theme.prompt_gutter))
-        .add_modifier(Modifier::BOLD);
-    let lines: Vec<Line> = layout
-        .rows
-        .iter()
-        .enumerate()
-        .skip(top)
-        .take(visible)
-        .map(|(i, row)| {
-            let prefix = if i == 0 { "› " } else { "  " };
-            Line::from(vec![Span::styled(prefix, gutter), Span::raw(row.clone())])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+    // Operation → Integration (IOSP): the pure [`composer_chrome`] carries the
+    // fit decision (`None` = too small to draw), the border style, the bottom
+    // rule Rect, and the terminal-cursor cell (`None` when the Approval owns
+    // the keyboard); the slot below only issues the draw calls.
+    render_composer_slot(frame, area, composer_chrome(area, t, theme), layout, theme);
+}
 
-    if t.pending_approval.is_none() {
-        // `cursor_col < width` by the layout contract, so the cell is always
-        // inside the Composer's rect; `top <= cursor_row` by construction.
-        frame.set_cursor_position((
-            area.x + 2 + layout.cursor_col as u16,
-            area.y + (layout.cursor_row - top) as u16,
-        ));
+/// The Composer's drawable chrome (the compute-plan behind [`render_composer`]):
+/// the border style, the bottom-border Rect, and whether the terminal cursor is
+/// parked (`focused` - false while the Approval modal owns the keyboard, when a
+/// blinking composer cursor would misstate where keys go). Built by
+/// [`composer_chrome`]; the cursor CELL is layout-dependent, computed at draw
+/// time by [`composer_cursor`].
+struct ComposerChrome {
+    border: Style,
+    bottom: Rect,
+    focused: bool,
+}
+
+/// Operation (IOSP): the Composer's chrome for `area`, or `None` when the zone
+/// is too small to hold the two chrome rows plus a draft column (measure ==
+/// draw, ADR-0029). Pure: no frame access. The fit and the `focused` decision
+/// are made here so [`render_composer`] never branches.
+fn composer_chrome(area: Rect, t: &Screen, theme: &Theme) -> Option<ComposerChrome> {
+    let fits = area.height as usize > COMPOSER_CHROME_ROWS && area.width >= 2;
+    let focused = t.pending_approval.is_none();
+    fits.then(|| ComposerChrome {
+        border: composer_border_style(focused, theme),
+        bottom: Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
+        },
+        focused,
+    })
+}
+
+/// The Composer slot: draws the body, the bottom rule, and (when focused) parks
+/// the terminal cursor - but only when the plan says the zone fits (`Some`).
+/// The presence + focus branches live HERE so [`render_composer`] is call-only
+/// (IOSP).
+fn render_composer_slot(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Option<ComposerChrome>,
+    layout: &ComposerLayout,
+    theme: &Theme,
+) {
+    if let Some(chrome) = chrome {
+        draw_composer(frame, area, &chrome, layout, theme);
     }
 }
 
-/// The Approval modal for a run_command Tool Call: `y` approves, `n` denies,
-/// `a` approves-always. Key handling lives in the Screen core; this draws it.
-/// The accents ride existing slots: the command reads as code, and the
-/// yes/no pair takes the added/removed polarity (approve adds the run,
-/// deny removes it); always is the link-blue accent.
-pub fn render_approval_modal(frame: &mut Frame, area: Rect, command: &str, theme: &Theme) {
-    let width = (command.chars().count() as u16 + APPROVAL_MODAL_PADDING)
-        .max(MODAL_MIN_WIDTH)
-        .min(area.width.saturating_sub(APPROVAL_MODAL_SIDE_MARGIN));
-    let height = APPROVAL_MODAL_HEIGHT.min(area.height.saturating_sub(2));
-    let modal = centered_rect(width, height, area);
+/// Draws a fitted Composer (call-only assembler): the body Paragraph, the
+/// bottom rule, and the terminal cursor when the chrome carries a cell.
+fn draw_composer(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: &ComposerChrome,
+    layout: &ComposerLayout,
+    theme: &Theme,
+) {
+    let rule_width = area.width as usize;
+    frame.render_widget(
+        Paragraph::new(composer_body_lines(
+            layout,
+            area.height,
+            rule_width,
+            chrome.border,
+            theme,
+        )),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("─".repeat(rule_width), chrome.border)),
+        chrome.bottom,
+    );
+    place_composer_cursor(frame, chrome.focused, layout, area);
+}
 
-    frame.render_widget(Clear, modal);
-    let block = Block::default().title("Approval").borders(Borders::ALL);
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+/// Parks the terminal cursor at the draft cell when the chrome is `focused`,
+/// else leaves it (the Approval owns the keyboard). The focus branch lives HERE
+/// (IOSP).
+fn place_composer_cursor(frame: &mut Frame, focused: bool, layout: &ComposerLayout, area: Rect) {
+    if focused {
+        frame.set_cursor_position(composer_cursor(layout, area));
+    }
+}
 
-    let body = Paragraph::new(vec![
-        Line::styled(
-            "Run command?",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            command.to_string(),
-            Style::default().fg(tui_color(theme.code)),
-        ),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                "[y]es",
-                Style::default()
-                    .fg(tui_color(theme.added))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" / "),
-            Span::styled(
-                "[n]o",
-                Style::default()
-                    .fg(tui_color(theme.removed))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" / "),
-            Span::styled(
-                "[a]lways",
-                Style::default()
-                    .fg(tui_color(theme.link))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+/// Operation (IOSP): the Composer's body lines - the top dash rule (qwen's
+/// hand-drawn `─`×`rule_width`; the `top_right_label` seam is deferred, no
+/// session-name concept yet) then the draft rows (the `> ` prompt on row 0,
+/// 2-space indent on continuations) or the placeholder when empty. The bottom
+/// border is a separate draw (a different rect), so it is not in this list.
+/// `zone_height` is the full composer zone height; the draft window is it less
+/// the two chrome rows. Pure.
+fn composer_body_lines(
+    layout: &ComposerLayout,
+    zone_height: u16,
+    rule_width: usize,
+    border: Style,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled("─".repeat(rule_width), border)];
+    if composer_is_empty(layout) {
+        lines.push(composer_placeholder_line(theme));
+        return lines;
+    }
+    let visible = zone_height as usize - COMPOSER_CHROME_ROWS;
+    let top = composer::first_visible_row(layout.cursor_row, visible);
+    let prompt = accent_style(theme).add_modifier(Modifier::BOLD);
+    lines.extend(
+        layout
+            .rows
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .map(|(i, row)| {
+                let prefix = if i == 0 { "> " } else { "  " };
+                Line::from(vec![Span::styled(prefix, prompt), Span::raw(row.clone())])
+            }),
+    );
+    lines
+}
+
+/// Operation (IOSP): the real terminal cursor cell for the draft cursor - the
+/// `> ` prompt shifts it right by [`PROMPT_GUTTER_COLS`], and the top dash rule
+/// shifts it DOWN one row (the correctness-critical `+1`, Risk #1). `cursor_col <
+/// width` by the layout contract, so the cell is always inside `area`. Pure.
+fn composer_cursor(layout: &ComposerLayout, area: Rect) -> (u16, u16) {
+    let visible = area.height as usize - COMPOSER_CHROME_ROWS;
+    let top = composer::first_visible_row(layout.cursor_row, visible);
+    (
+        area.x + PROMPT_GUTTER_COLS as u16 + layout.cursor_col as u16,
+        area.y + 1 + (layout.cursor_row - top) as u16,
+    )
+}
+
+/// The width of the `> ` prompt gutter every draft row hangs under.
+const PROMPT_GUTTER_COLS: usize = 2;
+
+/// Whether the Composer draft is empty (one blank row, cursor at the origin) -
+/// the placeholder condition. Pure over the layout.
+fn composer_is_empty(layout: &ComposerLayout) -> bool {
+    layout.cursor_row == 0 && layout.cursor_col == 0 && layout.rows.iter().all(|r| r.is_empty())
+}
+
+/// The placeholder line (qwen `InputPrompt`): the two-space-lead hint in
+/// secondary, its FIRST glyph `REVERSED` so a resting block cursor sits where
+/// typing begins.
+fn composer_placeholder_line(theme: &Theme) -> Line<'static> {
+    let secondary = secondary_style(theme);
+    let mut chars = COMPOSER_PLACEHOLDER.chars();
+    let first: String = chars.by_ref().take(1).collect();
+    let rest: String = chars.collect();
+    Line::from(vec![
+        Span::styled(first, secondary.add_modifier(Modifier::REVERSED)),
+        Span::styled(rest, secondary),
     ])
-    .wrap(Wrap { trim: false });
-    frame.render_widget(body, inner);
 }
 
 /// Computes the bounding rect for the Session Picker modal: derives the needed
@@ -2910,49 +4515,23 @@ pub fn render_picker(frame: &mut Frame, picker: &Picker, theme: &Theme) {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-fn join_summary(name: &str, summary: &str) -> String {
-    if summary.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name} {summary}")
-    }
-}
-
 // Normalizes a `key_arg` for rendering: an absent OR empty arg both read as "no
 // arg". The ONE place the display treats emptiness (the source rule lives in the
-// core's `key_arg`, but a recovered call summary can still be empty), so both
-// join helpers below share it.
+// core's `key_arg`, but a recovered call summary can still be empty).
 fn present_arg(key_arg: Option<&str>) -> Option<&str> {
     key_arg.filter(|a| !a.is_empty())
 }
 
-// Whether a Tool Result summary already opens with a status glyph - a extension
-// badge like `✗ exit 1` or `✓ exit 0`. The error line uses this to avoid
-// doubling the `✗` it otherwise injects.
-fn starts_with_status_glyph(summary: &str) -> bool {
-    summary.starts_with('✗') || summary.starts_with('✓')
-}
-
-// The name plus its merged `key_arg`, if any: `name  arg` (two spaces set the
-// arg off) or bare `name`. Shared by the success and error result lines.
-fn join_arg(name: &str, key_arg: Option<&str>) -> String {
+/// A tool result row's dim `description` (qwen `ToolInfo` description, shown after
+/// the bold name): the salient `key_arg` and the result summary joined `arg ·
+/// result`, dropping to bare `result` when there is no arg. The tool NAME is NOT
+/// repeated here - `tool_header_row` draws it bold ahead of this.
+fn tool_desc(key_arg: Option<&str>, summary: &str) -> String {
     match present_arg(key_arg) {
-        Some(arg) => format!("{name}  {arg}"),
-        None => name.to_string(),
+        Some(arg) if summary.is_empty() => arg.to_string(),
+        Some(arg) => format!("{arg} · {summary}"),
+        None => summary.to_string(),
     }
-}
-
-// The merged success one-liner body: `name  arg · result`, dropping to
-// `name → result` when there is no arg (an unpaired result).
-fn join_merged(name: &str, key_arg: Option<&str>, summary: &str) -> String {
-    match present_arg(key_arg) {
-        Some(arg) => format!("{name}  {arg} · {summary}"),
-        None => format!("{name} → {summary}"),
-    }
-}
-
-fn first_line(text: &str) -> &str {
-    text.split('\n').next().unwrap_or("")
 }
 
 /// Wraps `label` in a single space on each side: `" {label} "`. The ONE
@@ -3080,68 +4659,139 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The lull "waiting" row: the render gate and the row builder.
+    // The spinner line / LoadingIndicator (ADR-0048): the running spinner that
+    // subsumed the old lull "waiting" row - it keeps the lull scene as its
+    // phrase content and carries the elapsed + esc-to-cancel affordance.
     // -----------------------------------------------------------------------
 
-    // The gate draws the lull ONLY when the Run is Running and NEITHER live
-    // entry is on screen. Each of the three clauses must be able to veto it.
-    #[test]
-    fn lull_visible_only_when_running_and_no_live_entry() {
-        // Running, no thinking tail, no streaming answer => the lull shows.
-        assert!(lull_visible(Status::Running, true, false));
-        // A running Run but the reasoning tail is on screen => no lull.
-        assert!(!lull_visible(Status::Running, false, false));
-        // A running Run but the streaming answer is on screen => no lull.
-        assert!(!lull_visible(Status::Running, true, true));
-        // Not running (idle) => no lull, even with both live entries clear.
-        assert!(!lull_visible(Status::Idle, true, false));
+    fn spinner_text(lines: &[Line<'static>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
 
-    // Inside the settle window `lull::frame` is None, so the row builder yields
-    // nothing - a brief token gap never flashes a scene.
+    // format_token_count (qwen formatTokenCount): bare under 1000, N.Nk rounded
+    // 1000..9999, Nk floored 10000..999999, N.Nm rounded at 1000000+.
     #[test]
-    fn live_lull_lines_is_empty_within_the_settle_window() {
-        let lines = live_lull_lines(Anim::default(), 40, theme::dark());
-        assert!(
-            lines.is_empty(),
-            "quiet_ticks 0 < SETTLE_TICKS: no lull row yet"
-        );
+    fn format_token_count_matches_qwens_k_thresholds() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(847), "847");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1000), "1.0k");
+        assert_eq!(format_token_count(5400), "5.4k");
+        assert_eq!(format_token_count(9999), "10.0k");
+        assert_eq!(format_token_count(10000), "10k");
+        assert_eq!(format_token_count(100000), "100k");
+        assert_eq!(format_token_count(999999), "999k");
+        // The megatoken branch (qwen `2_400_000 -> "2.4m"`): one decimal, rounded.
+        assert_eq!(format_token_count(1_000_000), "1.0m");
+        assert_eq!(format_token_count(1_200_000), "1.2m");
+        assert_eq!(format_token_count(2_400_000), "2.4m");
+        assert_eq!(format_token_count(2_450_000), "2.5m");
     }
 
-    // At the settle close the row appears: exactly ONE line (the single-row
-    // invariant), carrying the timer that opens at "5s" (SETTLE_TICKS * TICK_MS
-    // = 50 * 100ms = 5s).
+    // While the lull settles (`quiet_ticks` under SETTLE_TICKS) there is no
+    // phrase yet, so the spinner waits - unless a subject overrides.
     #[test]
-    fn live_lull_lines_opens_one_row_with_the_five_second_timer() {
+    fn spinner_line_is_empty_within_the_settle_window_without_a_subject() {
+        let lines = spinner_line(Anim::default(), SpinnerState::default(), 60, theme::dark());
+        assert!(lines.is_empty(), "no phrase yet, no spinner row");
+    }
+
+    // At the settle close the spinner shows one row carrying the phrase, the
+    // elapsed timer (opens at 5s), and `esc to cancel`. No token figure when
+    // `tokens` is None.
+    #[test]
+    fn spinner_line_shows_phrase_elapsed_and_esc_to_cancel() {
         let anim = Anim {
             quiet_ticks: lull::SETTLE_TICKS,
             ..Default::default()
         };
-        let lines = live_lull_lines(anim, 40, theme::dark());
-        assert_eq!(lines.len(), 1, "the lull is a single row");
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("5s"), "the timer opens at 5s: {text:?}");
-        assert!(!text.trim().is_empty(), "the row carries the scene glyph");
+        let lines = spinner_line(anim, SpinnerState::default(), 80, theme::dark());
+        assert_eq!(lines.len(), 1, "one visual row");
+        let text = spinner_text(&lines);
+        assert!(text.contains("5s"), "elapsed opens at 5s: {text:?}");
+        assert!(
+            text.contains("esc to cancel"),
+            "cancel affordance: {text:?}"
+        );
+        assert!(
+            !text.contains("tokens"),
+            "no token figure when None: {text:?}"
+        );
     }
 
-    // The single-row invariant holds no matter how long the wait: a huge
-    // `quiet_ticks` still yields one line, truncated to the width passed so it
-    // can never desync the lane spine (ADR-0029).
+    // The subject wins over the lull phrase (the Phase-6 thought-subject seam,
+    // qwen `thought?.subject || currentLoadingPhrase`) and shows even inside the
+    // settle window.
     #[test]
-    fn live_lull_lines_stays_one_truncated_row_for_a_long_wait() {
-        let width = 20u16;
+    fn spinner_line_subject_wins_over_the_lull_phrase() {
+        let lines = spinner_line(
+            Anim::default(),
+            SpinnerState {
+                subject: Some("Refactoring the parser"),
+                ..SpinnerState::default()
+            },
+            80,
+            theme::dark(),
+        );
+        assert!(spinner_text(&lines).contains("Refactoring the parser"));
+    }
+
+    // The token figure shows with the arrow: `↑` when NOT receiving (sending),
+    // `↓` while streaming text arrives; the count is formatTokenCount'd.
+    #[test]
+    fn spinner_line_shows_the_arrow_and_token_figure_when_present() {
         let anim = Anim {
-            quiet_ticks: lull::SETTLE_TICKS + 100_000,
+            quiet_ticks: lull::SETTLE_TICKS,
             ..Default::default()
         };
-        let lines = live_lull_lines(anim, width, theme::dark());
-        assert_eq!(lines.len(), 1, "still exactly one row");
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.chars().count() <= width as usize,
-            "the row is truncated to the width passed: {} chars",
-            text.chars().count()
+        let sending = spinner_line(
+            anim,
+            SpinnerState {
+                tokens: Some(1234),
+                ..SpinnerState::default()
+            },
+            80,
+            theme::dark(),
         );
+        let text = spinner_text(&sending);
+        assert!(text.contains("↑ 1.2k tokens"), "sending arrow up: {text:?}");
+
+        let receiving = spinner_line(
+            anim,
+            SpinnerState {
+                tokens: Some(1234),
+                receiving: true,
+                ..SpinnerState::default()
+            },
+            80,
+            theme::dark(),
+        );
+        assert!(
+            spinner_text(&receiving).contains("↓ 1.2k tokens"),
+            "receiving arrow down"
+        );
+    }
+
+    // A narrow width truncates the whole line to one visual row (measure==draw,
+    // ADR-0029).
+    #[test]
+    fn spinner_line_truncates_to_one_row_at_a_narrow_width() {
+        let width = 24u16;
+        let anim = Anim {
+            quiet_ticks: lull::SETTLE_TICKS,
+            ..Default::default()
+        };
+        let lines = spinner_line(
+            anim,
+            SpinnerState {
+                subject: Some("a very long thought subject that overflows"),
+                ..SpinnerState::default()
+            },
+            width,
+            theme::dark(),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(line_text(&lines[0]).chars().count() <= width as usize);
     }
 
     // -----------------------------------------------------------------------
@@ -3204,74 +4854,6 @@ mod tests {
     }
 
     #[test]
-    fn dark_pressure_styles_pin_the_legacy_palette() {
-        let t = theme::dark();
-        assert_eq!(
-            pressure_style(PressureLevel::Critical, t),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(
-            pressure_style(PressureLevel::Elevated, t),
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        );
-        assert_eq!(
-            pressure_style(PressureLevel::Ok, t),
-            Style::default().fg(Color::Gray).bg(Color::Rgb(40, 44, 58))
-        );
-    }
-
-    #[test]
-    fn dark_segment_styles_pin_the_legacy_palette() {
-        let t = theme::dark();
-        let bold = |fg, bg| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
-        let plain = |fg, bg| Style::default().fg(fg).bg(bg);
-        assert_eq!(
-            segment_style(SegmentKind::ModeIdle, t),
-            bold(Color::Black, Color::Green)
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Position, t),
-            bold(Color::Black, Color::Green)
-        );
-        assert_eq!(
-            segment_style(SegmentKind::ModeRunning, t),
-            bold(Color::Black, Color::Yellow)
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Connection, t),
-            plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Model, t),
-            plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Thinking, t),
-            plain(Color::DarkGray, Color::Rgb(40, 44, 58))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Tools, t),
-            plain(Color::DarkGray, Color::Rgb(40, 44, 58))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Cost, t),
-            plain(Color::Gray, Color::Rgb(40, 44, 58))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Tokens(PressureLevel::Critical), t),
-            pressure_style(PressureLevel::Critical, t)
-        );
-        // The ex-constants, now slots: the code, bar, and quiet-segment
-        // backgrounds keep their exact legacy values under dark.
-        assert_eq!(tui_color(t.code_block_bg), Color::Rgb(25, 25, 35));
-        assert_eq!(tui_color(t.bar_bg), Color::Rgb(30, 30, 40));
-        assert_eq!(tui_color(t.segment_muted_bg), Color::Rgb(40, 44, 58));
-    }
-
-    #[test]
     fn a_non_default_theme_recolors_the_mappings() {
         let t = themed("[colors]\nadded = \"#123456\"\nheading = \"magenta\"\n");
         assert_eq!(
@@ -3302,7 +4884,7 @@ mod tests {
     }
 
     /// A bare code block insets each row under [`CODE_INSET`] and frames the
-    /// block with a blank row above and below (ADR-0040 Decision E). This finds
+    /// block with a blank row above and below. This finds
     /// the row whose code text (after the inset) matches `code`, and returns its
     /// spans WITHOUT the leading inset span - what the assertions below care
     /// about.
@@ -3516,48 +5098,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The scroll-position label.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn scroll_position_label_is_bot_at_the_tail() {
-        // top == max_top (100 - 20 = 80): the tail is on screen.
-        assert_eq!(scroll_position_label(80, 100, 20), "Bot");
-    }
-
-    #[test]
-    fn scroll_position_label_is_top_at_the_top_of_overflowing_content() {
-        assert_eq!(scroll_position_label(0, 100, 20), "Top");
-    }
-
-    #[test]
-    fn scroll_position_label_is_the_percentage_of_the_scroll_range() {
-        // max_top = 80; vim-ruler style: 0% at the top, 100% at the tail.
-        assert_eq!(scroll_position_label(40, 100, 20), "50%");
-        assert_eq!(scroll_position_label(8, 100, 20), "10%");
-        assert_eq!(scroll_position_label(79, 100, 20), "98%");
-    }
-
-    #[test]
-    fn scroll_position_label_shows_bot_when_the_content_fits() {
-        // The tail is visible, so a pinned reader sees `Bot` - and the label
-        // does not flap Top→Bot as a fresh session grows past one page.
-        assert_eq!(scroll_position_label(0, 5, 20), "Bot");
-        assert_eq!(scroll_position_label(0, 20, 20), "Bot");
-        assert_eq!(scroll_position_label(0, 0, 20), "Bot");
-    }
-
-    #[test]
-    fn scroll_position_label_survives_zero_heights() {
-        // Degenerate geometry (zero-height viewport) must not divide by zero.
-        assert_eq!(scroll_position_label(0, 0, 0), "Bot");
-        assert_eq!(scroll_position_label(100, 100, 0), "Bot");
-        assert_eq!(scroll_position_label(0, 100, 0), "Top");
-        assert_eq!(scroll_position_label(50, 100, 0), "50%");
-    }
-
-    // -----------------------------------------------------------------------
-    // The powerline segment assembly.
+    // The flat footer assembly (ADR-0053).
     // -----------------------------------------------------------------------
 
     /// A [`FigureView`] with no token estimate and a zero (hidden) cost.
@@ -3565,496 +5106,365 @@ mod tests {
         FigureView {
             tokens: None,
             session_cost: 0.0,
+            context_budget: None,
         }
     }
 
-    /// A [`FigureView`] carrying only the token facts, cost hidden.
-    fn tokens_only(tokens: TokenView) -> FigureView {
+    /// A [`FigureView`] carrying only the token estimate, cost hidden.
+    fn tokens_only(estimate: u64) -> FigureView {
         FigureView {
-            tokens: Some(tokens),
+            tokens: Some(estimate),
             session_cost: 0.0,
+            context_budget: None,
         }
     }
 
-    /// Assembles the SEMANTIC bar at `width` with everything present: running,
-    /// tokens known at `Ok` pressure, a priced Session total. Returns the pure
-    /// [`StatusBar`] - no drawing, no frame.
-    fn bar_at(width: usize) -> StatusBar {
-        status_bar(
+    /// The pure footer assembly at `width` with the default fixtures (idle-ish,
+    /// tokens present with a budget, a positive cost) - the frame-free seam the
+    /// footer tests assert against.
+    fn footer_at(width: usize) -> Footer {
+        footer(
             width,
-            StatusBarView {
-                status: Status::Running,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "http://localhost:8080",
-                    model: "qwen/model",
+                    model: "qwen3-coder",
                 },
-                toggles: Toggles::default(),
                 figures: FigureView {
-                    tokens: Some(TokenView {
-                        estimate: 1200,
-                        level: PressureLevel::Ok,
-                    }),
+                    tokens: Some(2500),
                     session_cost: 0.42,
+                    context_budget: Some(10_000),
                 },
-                position: "Bot".to_string(),
+                approval_mode: ApprovalMode::Default,
             },
         )
     }
 
-    /// The painter's [`SegmentKind`] for each assembled segment - what routes
-    /// into [`segment_style`]. Asserting on kinds proves the right meaning
-    /// reaches the color mapping without drawing.
-    fn kinds(segments: &[StatusSegment]) -> Vec<SegmentKind> {
-        segments.iter().map(StatusSegment::kind).collect()
-    }
-
-    #[test]
-    fn a_wide_bar_keeps_every_segment_in_order() {
-        let bar = bar_at(200);
-        assert_eq!(
-            kinds(&bar.left),
-            vec![
-                SegmentKind::ModeRunning,
-                SegmentKind::Connection,
-                SegmentKind::Model,
-            ]
-        );
-        assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Thinking,
-                SegmentKind::Tools,
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Cost,
-                SegmentKind::Position,
-            ]
-        );
-        assert!(bar.cells() <= 200);
-    }
-
-    #[test]
-    fn a_narrow_bar_drops_the_connection_then_the_model_segment() {
-        // At 70 cols the endpoint drops first (lowest value), then the model -
-        // both connection facts leave before mode/position/tokens/cost.
-        let bar = bar_at(70);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Thinking,
-                SegmentKind::Tools,
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Cost,
-                SegmentKind::Position,
-            ]
-        );
-    }
-
-    #[test]
-    fn a_narrower_bar_drops_thinking_then_cost_then_tokens() {
-        // At 45 cols both toggles are gone but the figures survive - cost
-        // outlives thinking in the drop order.
-        let bar = bar_at(45);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Cost,
-                SegmentKind::Position,
-            ]
-        );
-
-        // At 30 cost drops next; tokens survive it (they carry the pressure
-        // level the operator steers by). The threshold sits lower than it once
-        // did because the mode block is now a 3-col dot, not a spelled word.
-        let bar = bar_at(30);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Position
-            ]
-        );
-
-        let bar = bar_at(20);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
-    }
-
-    #[test]
-    fn mode_and_position_survive_even_when_nothing_fits() {
-        // Dropping stops at the last two; a sub-minimal width never panics.
-        let bar = bar_at(1);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
-    }
-
-    /// Builds a wide idle bar at width 200 with the given toggles and no
-    /// figures. Shared by the thinking and tools toggle tests to avoid
-    /// near-identical closure bodies (DUPLICATE fix).
-    fn idle_wide_bar(toggles: Toggles) -> StatusBar {
-        status_bar(
+    /// The footer at `width` with a given approval mode (default fixtures else).
+    fn footer_with_mode(mode: ApprovalMode) -> Footer {
+        footer(
             200,
-            StatusBarView {
-                status: Status::Idle,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "http://localhost:8080",
-                    model: "qwen/model",
+                    model: "qwen3-coder",
                 },
-                toggles,
                 figures: no_figures(),
-                position: "Bot".to_string(),
+                approval_mode: mode,
             },
         )
     }
 
     #[test]
-    fn the_thinking_segment_carries_the_ctrl_t_state() {
-        // The MEANING (expanded true/false) is a semantic fact; the ▾/▸ marker
-        // it paints to is a drawing detail asserted separately below.
-        let find_thinking = |expanded: bool| {
-            idle_wide_bar(Toggles {
-                thinking_expanded: expanded,
-                tools_expanded: false,
-            })
-            .right
-            .into_iter()
-            .find(|s| matches!(s, StatusSegment::Thinking { .. }))
-            .expect("thinking segment is always assembled")
-        };
+    fn a_wide_footer_shows_model_then_context_then_cost_in_order() {
+        let bar = footer_at(200);
+        assert_eq!(bar.left, FooterLeft::Shortcuts);
         assert_eq!(
-            find_thinking(true),
-            StatusSegment::Thinking { expanded: true }
-        );
-        assert_eq!(
-            find_thinking(false),
-            StatusSegment::Thinking { expanded: false }
-        );
-    }
-
-    #[test]
-    fn the_thinking_marker_paints_from_its_state() {
-        assert_eq!(
-            StatusSegment::Thinking { expanded: true }.paint(),
-            " ▾ thinking "
-        );
-        assert_eq!(
-            StatusSegment::Thinking { expanded: false }.paint(),
-            " ▸ thinking "
-        );
-    }
-
-    #[test]
-    fn the_tools_segment_carries_the_ctrl_o_state() {
-        // The twin of the thinking segment for the machinery plane: the MEANING
-        // (expanded true/false) is the semantic fact; the ▾/▸ marker is a
-        // drawing detail asserted separately below.
-        let find_tools = |expanded: bool| {
-            idle_wide_bar(Toggles {
-                thinking_expanded: false,
-                tools_expanded: expanded,
-            })
-            .right
-            .into_iter()
-            .find(|s| matches!(s, StatusSegment::Tools { .. }))
-            .expect("tools segment is always assembled")
-        };
-        assert_eq!(find_tools(true), StatusSegment::Tools { expanded: true });
-        assert_eq!(find_tools(false), StatusSegment::Tools { expanded: false });
-    }
-
-    #[test]
-    fn the_tools_marker_paints_from_its_state() {
-        assert_eq!(StatusSegment::Tools { expanded: true }.paint(), " ▾ tools ");
-        assert_eq!(
-            StatusSegment::Tools { expanded: false }.paint(),
-            " ▸ tools "
-        );
-    }
-
-    #[test]
-    fn the_tokens_segment_is_absent_until_an_estimate_exists() {
-        let bar = idle_wide_bar(Toggles::default());
-        assert_eq!(
-            kinds(&bar.right),
+            bar.right,
             vec![
-                SegmentKind::Thinking,
-                SegmentKind::Tools,
-                SegmentKind::Position
+                FooterItem::Model {
+                    model: "qwen3-coder".into()
+                },
+                FooterItem::Context {
+                    label: "25.0% context used".into(),
+                    over_limit: false,
+                },
+                FooterItem::Cost {
+                    label: "$0.42".into(),
+                },
             ]
         );
     }
 
-    // --- the cost segment (ADR-0037: surfacing the priced Session total) ---
+    #[test]
+    fn a_narrow_footer_sheds_cost_then_model_keeping_context() {
+        // Cost drops first, then model; context% survives longest (qwen's sole
+        // figure). Widths chosen against the fixture: left `? for shortcuts` (15),
+        // right `model qwen3-coder` (17) + `25.0% used` (10) + `$0.42` (5), each
+        // ` | ` join (3), padding (4), min gap (1). Full = 4+15+1+(17+10+5+6)=58.
+        let full = footer_at(60);
+        assert_eq!(
+            full.right,
+            vec![
+                FooterItem::Model {
+                    model: "qwen3-coder".into()
+                },
+                FooterItem::Context {
+                    label: "25.0% used".into(),
+                    over_limit: false,
+                },
+                FooterItem::Cost {
+                    label: "$0.42".into(),
+                },
+            ]
+        );
+
+        // Tighter (52): cost sheds (drops to 50), model + context survive.
+        let no_cost = footer_at(52);
+        assert_eq!(
+            no_cost.right,
+            vec![
+                FooterItem::Model {
+                    model: "qwen3-coder".into()
+                },
+                FooterItem::Context {
+                    label: "25.0% used".into(),
+                    over_limit: false,
+                },
+            ]
+        );
+
+        // Tightest: model sheds too, context% NEVER drops.
+        let context_only = footer_at(20);
+        assert_eq!(
+            context_only.right,
+            vec![FooterItem::Context {
+                label: "25.0% used".into(),
+                over_limit: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_footer_joins_the_right_group_with_a_grey_pipe_no_leading_sep() {
+        // No powerline separators anywhere; the ` | ` join is the ONLY chrome
+        // between items and there is none before the first.
+        let bar = footer_at(200);
+        assert!(!FOOTER_SEP.contains('\u{e0b0}'));
+        assert!(!FOOTER_SEP.contains('\u{e0b2}'));
+        assert_eq!(FOOTER_SEP, " | ");
+        // right_cells = texts + one join per adjacent pair.
+        let texts: usize = bar.right.iter().map(FooterItem::cells).sum();
+        assert_eq!(
+            bar.right_cells(),
+            texts + (bar.right.len() - 1) * FOOTER_SEP.chars().count()
+        );
+    }
+
+    #[test]
+    fn default_mode_shows_the_shortcuts_hint() {
+        let bar = footer_with_mode(ApprovalMode::Default);
+        assert_eq!(bar.left, FooterLeft::Shortcuts);
+    }
+
+    #[test]
+    fn each_non_default_mode_shows_the_autoaccept_label_and_hint() {
+        for mode in [
+            ApprovalMode::Plan,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::Auto,
+            ApprovalMode::Yolo,
+        ] {
+            let bar = footer_with_mode(mode);
+            assert_eq!(bar.left, FooterLeft::AutoAccept(mode), "{mode:?}");
+            assert!(!approval_mode_label(mode).is_empty(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_autoaccept_labels_match_qwen_verbatim() {
+        assert_eq!(approval_mode_label(ApprovalMode::Plan), "plan mode");
+        assert_eq!(
+            approval_mode_label(ApprovalMode::AutoEdit),
+            "auto-accept edits"
+        );
+        assert_eq!(
+            approval_mode_label(ApprovalMode::Auto),
+            "auto mode (classifier-evaluated)"
+        );
+        assert_eq!(approval_mode_label(ApprovalMode::Yolo), "YOLO mode");
+        assert_eq!(approval_mode_label(ApprovalMode::Default), "");
+        assert_eq!(CYCLE_HINT, " (shift + tab to cycle)");
+        assert_eq!(SHORTCUTS_HINT, "? for shortcuts");
+    }
+
+    #[test]
+    fn the_autoaccept_label_colour_matches_the_mode() {
+        // plan → success, auto-edit/auto → warning, yolo → error (qwen).
+        let theme = theme::dark();
+        assert_eq!(
+            approval_mode_style(ApprovalMode::Plan, theme).fg,
+            success_style(theme).fg
+        );
+        assert_eq!(
+            approval_mode_style(ApprovalMode::AutoEdit, theme).fg,
+            warning_style(theme).fg
+        );
+        assert_eq!(
+            approval_mode_style(ApprovalMode::Auto, theme).fg,
+            warning_style(theme).fg
+        );
+        assert_eq!(
+            approval_mode_style(ApprovalMode::Yolo, theme).fg,
+            error_style(theme).fg
+        );
+    }
+
+    #[test]
+    fn the_cost_item_is_absent_at_zero_and_present_when_priced() {
+        let zero = footer(
+            200,
+            FooterView {
+                conn: ConnectionView {
+                    base_url: "u",
+                    model: "m",
+                },
+                figures: no_figures(),
+                approval_mode: ApprovalMode::Default,
+            },
+        );
+        assert!(
+            !zero
+                .right
+                .iter()
+                .any(|i| matches!(i, FooterItem::Cost { .. }))
+        );
+
+        let priced = footer(
+            200,
+            FooterView {
+                conn: ConnectionView {
+                    base_url: "u",
+                    model: "m",
+                },
+                figures: FigureView {
+                    tokens: None,
+                    session_cost: 0.42,
+                    context_budget: None,
+                },
+                approval_mode: ApprovalMode::Default,
+            },
+        );
+        assert_eq!(
+            priced
+                .right
+                .iter()
+                .find(|i| matches!(i, FooterItem::Cost { .. })),
+            Some(&FooterItem::Cost {
+                label: "$0.42".into()
+            })
+        );
+    }
 
     #[test]
     fn cost_label_shows_two_decimals_and_a_sub_cent_floor() {
-        // A cent and up: plain two decimals.
         assert_eq!(cost_label(0.42), "$0.42");
         assert_eq!(cost_label(0.01), "$0.01");
         assert_eq!(cost_label(12.3), "$12.30");
         assert_eq!(cost_label(1234.567), "$1234.57");
-        // Sub-cent: never "$0.00" - a priced Session must not read as free.
         assert_eq!(cost_label(0.0099), "<$0.01");
         assert_eq!(cost_label(0.0001), "<$0.01");
     }
 
     #[test]
-    fn a_zero_cost_session_shows_no_cost_segment() {
-        // The local-only invariant: zero total means the segment is absent
-        // entirely, not shown as $0.00 - the bar is exactly the old bar.
-        let bar = status_bar(
-            200,
-            StatusBarView {
-                status: Status::Idle,
+    fn context_percent_label_formats_the_ratio_flat_and_labels_by_width() {
+        // FLAT now (no block padding, ADR-0053): the leading `%` is part of the
+        // label; `% used` under 100 cols, `% context used` at/above.
+        assert_eq!(
+            context_percent_label(2500, 10_000, 80).as_deref(),
+            Some("25.0% used")
+        );
+        assert_eq!(
+            context_percent_label(2500, 10_000, 120).as_deref(),
+            Some("25.0% context used")
+        );
+        assert_eq!(
+            context_percent_label(15_000, 10_000, 120).as_deref(),
+            Some(">100% context used")
+        );
+        assert_eq!(context_percent_label(2500, 0, 80), None);
+    }
+
+    #[test]
+    fn context_over_limit_flags_usage_past_the_budget() {
+        assert!(!context_over_limit(2500, 10_000));
+        assert!(!context_over_limit(10_000, 10_000));
+        assert!(context_over_limit(10_001, 10_000));
+        assert!(!context_over_limit(1, 0));
+    }
+
+    #[test]
+    fn the_footer_carries_a_context_item_only_when_a_budget_exists() {
+        let with_budget = footer(
+            120,
+            FooterView {
                 conn: ConnectionView {
-                    base_url: "http://localhost:8080",
-                    model: "qwen/model",
+                    base_url: "u",
+                    model: "m",
                 },
-                toggles: Toggles::default(),
-                figures: tokens_only(TokenView {
-                    estimate: 1200,
-                    level: PressureLevel::Ok,
-                }),
-                position: "Bot".to_string(),
+                figures: FigureView {
+                    tokens: Some(2500),
+                    session_cost: 0.0,
+                    context_budget: Some(10_000),
+                },
+                approval_mode: ApprovalMode::Default,
+            },
+        );
+        assert_eq!(
+            with_budget
+                .right
+                .iter()
+                .find(|i| matches!(i, FooterItem::Context { .. })),
+            Some(&FooterItem::Context {
+                label: "25.0% context used".into(),
+                over_limit: false,
+            })
+        );
+
+        let no_budget = footer(
+            120,
+            FooterView {
+                conn: ConnectionView {
+                    base_url: "u",
+                    model: "m",
+                },
+                figures: tokens_only(2500),
+                approval_mode: ApprovalMode::Default,
             },
         );
         assert!(
-            !kinds(&bar.right).contains(&SegmentKind::Cost),
-            "zero cost must hide the segment"
+            !no_budget
+                .right
+                .iter()
+                .any(|i| matches!(i, FooterItem::Context { .. }))
         );
     }
 
     #[test]
-    fn a_positive_cost_assembles_the_labelled_segment() {
-        let bar = bar_at(200);
-        let cost = bar
-            .right
-            .iter()
-            .find(|s| matches!(s, StatusSegment::Cost { .. }))
-            .expect("cost segment present once a priced Response landed");
-        assert_eq!(
-            *cost,
-            StatusSegment::Cost {
-                label: "$0.42".into()
-            }
-        );
-        assert_eq!(cost.paint(), " $0.42 ");
-        assert_eq!(cost.cells(), " $0.42 ".chars().count());
-    }
-
-    /// Assembles a wide bar with the given `figures` and returns the tokens
-    /// segment. Shared by the pressure-level tests so the bar-build and segment
-    /// search chains do not repeat (DUPLICATE fix).
-    fn tokens_segment(figures: FigureView) -> StatusSegment {
-        status_bar(
-            200,
-            StatusBarView {
-                status: Status::Running,
+    fn an_over_budget_context_item_flags_over_limit() {
+        let bar = footer(
+            120,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "u",
-                    model: "qwen/model",
+                    model: "m",
                 },
-                toggles: Toggles::default(),
-                figures,
-                position: "Bot".to_string(),
+                figures: FigureView {
+                    tokens: Some(15_000),
+                    session_cost: 0.0,
+                    context_budget: Some(10_000),
+                },
+                approval_mode: ApprovalMode::Default,
             },
-        )
-        .right
-        .into_iter()
-        .find(|s| matches!(s, StatusSegment::Tokens { .. }))
-        .expect("tokens segment present when an estimate exists")
-    }
-
-    #[test]
-    fn critical_pressure_yields_a_tokens_segment_carrying_that_level() {
-        // The "Critical Context Pressure renders red" rule, asserted headless:
-        // the semantic segment carries PressureLevel::Critical, and its kind
-        // routes exactly that level into segment_style (which maps it to red).
-        let tokens = tokens_segment(tokens_only(TokenView {
-            estimate: 99000,
-            level: PressureLevel::Critical,
-        }));
-        assert_eq!(
-            tokens,
-            StatusSegment::Tokens {
-                estimate: 99000,
-                level: PressureLevel::Critical,
-            }
         );
-        assert_eq!(tokens.kind(), SegmentKind::Tokens(PressureLevel::Critical));
+        assert_eq!(
+            bar.right
+                .iter()
+                .find(|i| matches!(i, FooterItem::Context { .. })),
+            Some(&FooterItem::Context {
+                label: ">100% context used".into(),
+                over_limit: true,
+            })
+        );
     }
 
     #[test]
-    fn every_pressure_level_flows_through_the_tokens_segment_unchanged() {
-        for level in [
-            PressureLevel::Ok,
-            PressureLevel::Elevated,
-            PressureLevel::Critical,
-        ] {
-            let tokens = tokens_segment(tokens_only(TokenView { estimate: 1, level }));
-            assert_eq!(tokens.kind(), SegmentKind::Tokens(level));
-        }
-    }
-
-    #[test]
-    fn the_mode_segment_carries_idle_vs_running_not_the_spinner_frame() {
-        // The semantic distinction is Idle vs. Running; the animation frame is
-        // a drawing input the assembly never sees.
-        let mode = |status| {
-            status_bar(
-                200,
-                StatusBarView {
-                    status,
-                    conn: ConnectionView {
-                        base_url: "u",
-                        model: "qwen/model",
-                    },
-                    toggles: Toggles::default(),
-                    figures: no_figures(),
-                    position: "Bot".to_string(),
-                },
-            )
-            .left
-            .into_iter()
-            .next()
-            .unwrap()
+    fn a_footer_item_cells_match_its_text() {
+        let item = FooterItem::Model {
+            model: "qwen3-coder".into(),
         };
-        assert_eq!(mode(Status::Idle), StatusSegment::Mode(ModeState::Idle));
-        assert_eq!(
-            mode(Status::Running),
-            StatusSegment::Mode(ModeState::Running)
-        );
-    }
-
-    #[test]
-    fn the_mode_segment_paints_a_static_dot_no_spinner() {
-        // The running animation moved to the `✦ Thinking` brain header
-        // (ADR-0040); the mode block is now a static dot, and cells() agrees
-        // with paint() in both modes (the drift invariant).
-        for mode in [ModeState::Running, ModeState::Idle] {
-            let seg = StatusSegment::Mode(mode);
-            assert_eq!(
-                seg.cells(),
-                seg.paint().chars().count(),
-                "{seg:?} cells() disagrees with painted width"
-            );
-        }
-        assert_eq!(StatusSegment::Mode(ModeState::Running).paint(), " ● ");
-        assert_eq!(StatusSegment::Mode(ModeState::Idle).paint(), " ○ ");
-    }
-
-    #[test]
-    fn the_tokens_segment_paints_the_estimate_grouped() {
-        assert_eq!(
-            StatusSegment::Tokens {
-                estimate: 1200,
-                level: PressureLevel::Ok,
-            }
-            .paint(),
-            " ~1,200 tokens "
-        );
-    }
-
-    #[test]
-    fn the_tokens_segment_cells_match_its_paint() {
-        // The load-bearing fit invariant: cells() must equal the painted width,
-        // or the bar over/underflows.
-        let seg = StatusSegment::Tokens {
-            estimate: 1200,
-            level: PressureLevel::Ok,
-        };
-        assert_eq!(
-            seg.cells(),
-            seg.paint().chars().count(),
-            "{seg:?} cells() disagrees with painted width"
-        );
-    }
-
-    #[test]
-    fn painted_width_matches_the_fit_measurement() {
-        // The pure fit policy measures StatusSegment::cells; the painter draws
-        // StatusSegment::paint. If they drift, the bar over/underflows. Assert
-        // they agree for every segment the running-with-tokens bar assembles.
-        let bar = bar_at(200);
-        for segment in bar.left.iter().chain(&bar.right) {
-            assert_eq!(
-                segment.cells(),
-                segment.paint().chars().count(),
-                "{segment:?} cells() disagrees with painted width"
-            );
-        }
-    }
-
-    #[test]
-    fn every_segment_style_carries_a_bg_for_the_separators() {
-        // The powerline triangles are fg-over-neighbor-bg; a segment without
-        // a bg would render a hole in the bar.
-        for kind in [
-            SegmentKind::ModeIdle,
-            SegmentKind::ModeRunning,
-            SegmentKind::Connection,
-            SegmentKind::Model,
-            SegmentKind::Thinking,
-            SegmentKind::Tools,
-            SegmentKind::Cost,
-            SegmentKind::Tokens(PressureLevel::Ok),
-            SegmentKind::Tokens(PressureLevel::Elevated),
-            SegmentKind::Tokens(PressureLevel::Critical),
-            SegmentKind::Position,
-        ] {
-            assert!(
-                segment_style(kind, theme::dark()).bg.is_some(),
-                "{kind:?} has no bg"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // The visible-window math (per-item wrapped counts → slice + offset).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn visible_window_at_offset_zero_starts_at_the_first_item() {
-        // Items of 3+4+5 rows, window of 6: items 0 and 1 cover rows 0..7.
-        assert_eq!(visible_window(&[3, 4, 5], 0, 6), (0..2, 0));
-    }
-
-    #[test]
-    fn visible_window_at_the_tail_reaches_the_last_item() {
-        // total 12, height 5 → clamped top 7: row 7 is item 2's first row.
-        assert_eq!(visible_window(&[3, 4, 5], 7, 5), (2..3, 0));
-    }
-
-    #[test]
-    fn visible_window_keeps_an_item_straddling_the_top_boundary() {
-        // top 5 lands inside item 1 (rows 3..7): the slice starts there and
-        // the offset is relative to ITS first row, not the session's.
-        assert_eq!(visible_window(&[3, 4, 5], 5, 4), (1..3, 2));
-    }
-
-    #[test]
-    fn visible_window_inside_a_single_huge_item_selects_just_it() {
-        assert_eq!(visible_window(&[1000], 500, 20), (0..1, 500));
-    }
-
-    #[test]
-    fn visible_window_of_an_empty_transcript_is_empty() {
-        assert_eq!(visible_window(&[], 0, 20), (0..0, 0));
-    }
-
-    #[test]
-    fn visible_window_taller_than_the_content_takes_everything() {
-        assert_eq!(visible_window(&[3, 4, 5], 0, 100), (0..3, 0));
-    }
-
-    #[test]
-    fn visible_window_survives_an_offset_past_the_content() {
-        // The caller clamps `top`; a degenerate overshoot selects nothing
-        // rather than panicking or underflowing.
-        assert_eq!(visible_window(&[3, 4], 50, 10), (2..2, 43));
+        assert_eq!(item.cells(), item.text().chars().count());
+        assert_eq!(item.text(), "model qwen3-coder");
     }
 
     // -----------------------------------------------------------------------
@@ -4079,9 +5489,9 @@ mod tests {
     #[test]
     fn cache_sync_builds_one_entry_per_settled_item_with_its_wrapped_count() {
         let mut t = fresh_transcript();
-        // The `› ` caret now lives in the reserved lane gutter (ADR-0040), so
-        // the cached User line is the bare 16-char word. At width 10 it wraps
-        // to 2 rows (10 + 6).
+        // The `>` caret prefix is baked into the cached User line (ADR-0046 qwen
+        // chrome), so the 16-char word hangs under the 2-col prefix and wraps at
+        // the reduced width (10 - 2 = 8) to 2 rows.
         t.user("0123456789012345");
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 10, theme::dark());
@@ -4104,34 +5514,29 @@ mod tests {
     }
 
     #[test]
-    fn cache_sync_rebuilds_when_the_thinking_toggle_flips() {
+    fn cache_sync_rebuilds_when_compact_hides_a_thought() {
+        // Compact mode (Ctrl+O) HIDES a settled Thinking item entirely (qwen
+        // `!compactMode`, ADR-0052); the default shows the full grey body.
         let mut t = fresh_transcript();
         t.push(TranscriptItem::Thinking {
             text: "line one\nline two".to_string(),
         });
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // Collapsed one-liner, dense (no per-item blank separator).
-        assert_eq!(cache.settled().next().unwrap().0.len(), 1);
-        cache.sync(
-            &t,
-            Toggles {
-                thinking_expanded: true,
-                ..Toggles::default()
-            },
-            80,
-            theme::dark(),
-        );
-        // Header + both rows, dense (no per-item blank separator).
-        assert_eq!(cache.settled().next().unwrap().0.len(), 3);
+        // Default (compact=false): the grey `✦`-prefixed markdown body (two
+        // source rows → two rows).
+        assert_eq!(cache.settled().next().unwrap().0.len(), 2);
+        cache.sync(&t, Toggles { compact: true }, 80, theme::dark());
+        // Compact: the thought is hidden entirely - zero lines.
+        assert_eq!(cache.settled().next().unwrap().0.len(), 0);
     }
 
     #[test]
-    fn cache_sync_rebuilds_when_the_tools_toggle_flips() {
-        // The Ctrl-O twin of the thinking-toggle test: a multi-line Diff folds
-        // to a single title line when collapsed and to the full body when
-        // expanded, and flipping the toggle clears the cache so the change
-        // takes effect. The lane is dense now - no per-item blank separator.
+    fn cache_sync_rebuilds_when_compact_folds_a_tool_body() {
+        // Compact folds a multi-line Diff to a single title line (qwen
+        // `!compactMode || forceShowResult`); the default shows the full body.
+        // Flipping the toggle clears the cache so the change takes effect.
+        // Separators are added at assembly, not baked per item.
         let mut t = fresh_transcript();
         t.push(diff_item(
             "edit_file src/foo.rs",
@@ -4141,27 +5546,20 @@ mod tests {
             ],
         ));
         let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // Collapsed one-liner, dense (no per-item blank separator).
+        cache.sync(&t, Toggles { compact: true }, 80, theme::dark());
+        // Compact: one fold row (3-wide marker gutter + title + affordance).
         let collapsed = cache.settled().next().unwrap().0;
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
-            line_text(&collapsed[0]),
-            "  ⋯ edit_file src/foo.rs · ^O expand"
+            line_text(&collapsed[0]).trim_start(),
+            "edit_file src/foo.rs · ^O expand"
         );
-        cache.sync(
-            &t,
-            Toggles {
-                tools_expanded: true,
-                ..Toggles::default()
-            },
-            80,
-            theme::dark(),
-        );
-        // Title row + both body rows, dense (no per-item blank separator).
+        // The default (compact=false) shows the full body.
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
+        // The tool header row + both diff body rows.
         let expanded = cache.settled().next().unwrap().0;
         assert_eq!(expanded.len(), 3);
-        assert_eq!(line_text(&expanded[0]), "  ⋯ edit_file src/foo.rs");
+        assert!(line_text(&expanded[0]).contains("edit_file src/foo.rs"));
     }
 
     /// Every fg across the cache's first settled item, in order: each line's
@@ -4181,16 +5579,17 @@ mod tests {
     fn cache_sync_rebuilds_when_the_theme_changes() {
         // Cached lines BAKE their colors, so a Theme swap (Stage C's live
         // preview) must clear the cache: after syncing with a Theme that
-        // recolors `muted`, the settled info line carries the new color.
+        // recolors `muted`, the settled thought (grey = muted) carries the new
+        // color. A Marker's `●` prefix reads its tone slot (Plain = muted).
         let mut t = fresh_transcript();
-        t.info("a notice");
+        t.marker("a marker", Tone::Plain);
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
-        assert_eq!(settled_span_fgs(&cache)[0], Some(Color::DarkGray));
+        assert_eq!(settled_span_fgs(&cache)[1], Some(Color::DarkGray));
 
         let recolored = themed("[colors]\nmuted = \"#ff00ff\"\n");
         cache.sync(&t, Toggles::default(), 80, &recolored);
-        assert_eq!(settled_span_fgs(&cache)[0], Some(Color::Rgb(255, 0, 255)));
+        assert_eq!(settled_span_fgs(&cache)[1], Some(Color::Rgb(255, 0, 255)));
     }
 
     #[test]
@@ -4225,103 +5624,87 @@ mod tests {
             is_error: false,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
+        // The INNER box content (qwen `ToolInfo`): the 3-wide `✓` marker gutter,
+        // the bold name, then the dim `arg · result` description.
+        let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            line_text(&lines[0]),
-            "  ⋯ read_file  src/foo.rs · 340 lines"
-        );
+        assert_eq!(line_text(&lines[0]), "✓  read_file src/foo.rs · 340 lines");
     }
 
     #[test]
-    fn an_unpaired_result_keeps_the_arrow_shape() {
-        // No key_arg (governor-injected result): the older `name → result` form.
+    fn an_unpaired_result_shows_only_the_summary() {
+        // No key_arg (governor-injected result): the description is the bare
+        // summary (no arg to set off).
         let item = TranscriptItem::ToolResult {
             name: "run_command".to_string(),
             summary: "injected".to_string(),
             is_error: false,
             key_arg: None,
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
-        assert_eq!(line_text(&lines[0]), "  ⋯ run_command → injected");
+        let lines = message_lines(&item, false, 80, theme::dark());
+        assert_eq!(line_text(&lines[0]), "✓  run_command injected");
     }
 
     #[test]
-    fn a_failing_merged_result_keeps_the_arg_and_shows_a_single_badge_glyph() {
-        // The summary already carries the extension badge `✗ exit 1`; the error
-        // line injects no glyph of its own, so there is a SINGLE `✗`, not `✗ ✗`.
+    fn a_failing_result_shows_the_error_marker() {
+        // A failed result reads the `x` U+0078 ERROR marker (0.16.0 ASCII, NOT
+        // `✗`), then the name + `arg · summary` description.
         let item = TranscriptItem::ToolResult {
             name: "run_command".to_string(),
-            summary: "✗ exit 1".to_string(),
+            summary: "exit 1".to_string(),
             is_error: true,
             key_arg: Some("cargo test".to_string()),
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
-        assert_eq!(line_text(&lines[0]), "  ⚙ run_command  cargo test ✗ exit 1");
+        let lines = message_lines(&item, false, 80, theme::dark());
+        assert_eq!(line_text(&lines[0]), "x  run_command cargo test · exit 1");
     }
 
     #[test]
-    fn a_failing_result_without_a_badge_gets_an_injected_error_glyph() {
-        // A tool whose summary carries no glyph (no badge extension): the line
-        // injects a leading `✗` so the failure is never missed - the ⚙ gutter,
-        // the arg, then `✗ {summary}`, all red+bold.
+    fn a_failing_result_without_an_arg_shows_the_bare_summary() {
         let item = TranscriptItem::ToolResult {
             name: "edit_file".to_string(),
             summary: "old_str not found".to_string(),
             is_error: true,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
+        let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(
             line_text(&lines[0]),
-            "  ⚙ edit_file  src/foo.rs ✗ old_str not found"
+            "x  edit_file src/foo.rs · old_str not found"
         );
     }
 
+    // A Marker's prefix glyph + tint are chosen by its Tone (qwen StatusMessages
+    // set): a Constrain marker reads the `△` warning, everything else the `●` info
+    // glyph. Identical text under two tones tints differently, proving the adapter
+    // never sniffs the line.
     #[test]
-    fn a_summary_already_starting_with_a_status_glyph_is_not_doubled() {
-        // Guard the `✓`/`✗` prefix check: a badge that opens with EITHER glyph
-        // suppresses the injected `✗`, so neither doubles up.
-        for badge in ["✗ exit 137", "✓ exit 0"] {
-            let item = TranscriptItem::ToolResult {
-                name: "run_command".to_string(),
-                summary: badge.to_string(),
-                is_error: true,
-                key_arg: None,
-            };
-            let lines = message_lines(&item, false, false, 80, theme::dark());
-            assert_eq!(line_text(&lines[0]), format!("  ⚙ run_command {badge}"));
-        }
-    }
-
-    // The tinted marker plane (ADR-0040): each Tone renders in its OWN Theme
-    // slot, tinted by tone alone - identical text under two tones tints
-    // differently, proving the adapter never sniffs the line.
-    #[test]
-    fn a_marker_tints_by_its_tone_slot_not_its_text() {
+    fn a_marker_tints_by_its_tone_not_its_text() {
         let theme = theme::dark();
-        for (tone, expected) in [
-            (Tone::Housekeeping, theme.marker_housekeeping),
-            (Tone::Aid, theme.marker_aid),
-            (Tone::Constrain, theme.marker_constrain),
-            (Tone::Steering, theme.prompt_gutter),
-            (Tone::Plain, theme.muted),
+        for (tone, glyph, expected) in [
+            (Tone::Housekeeping, "● ", theme.muted),
+            (Tone::Aid, "● ", theme.muted),
+            (Tone::Constrain, "△ ", theme.warning),
+            (Tone::Steering, "● ", theme.accent),
+            (Tone::Plain, "● ", theme.muted),
         ] {
             let item = TranscriptItem::Marker {
                 // Same text for every tone: the tint cannot be coming from it.
                 text: "harness marker".to_string(),
                 tone,
             };
-            let lines = message_lines(&item, false, false, 80, theme);
+            let lines = message_lines(&item, false, 80, theme);
             assert_eq!(lines.len(), 1);
-            // A Marker indents two columns under the thought header (ADR-0040);
-            // the whole styled line (indent + text) carries the tone color.
-            // `Line::styled` puts the style on the Line, which the spans inherit.
-            assert_eq!(line_text(&lines[0]), "  harness marker", "{tone:?}");
-            assert_eq!(lines[0].style.fg, Some(tui_color(expected)), "{tone:?}");
-            assert!(
-                lines[0].style.add_modifier.contains(Modifier::ITALIC),
-                "{tone:?} marker should read as the quiet plane (italic)"
+            assert_eq!(
+                line_text(&lines[0]),
+                format!("{glyph}harness marker"),
+                "{tone:?}"
+            );
+            // The prefix span carries the tone color.
+            assert_eq!(
+                lines[0].spans[0].style.fg,
+                Some(tui_color(expected)),
+                "{tone:?}"
             );
         }
     }
@@ -4358,15 +5741,16 @@ mod tests {
                 DiffLine::new(DiffSide::Removed, "old"),
             ],
         );
-        // Collapsed (tools_expanded = false): one title line with the affordance.
-        let collapsed = message_lines(&diff, false, false, 80, theme::dark());
+        // Compact (folds the body): one fold row (3-wide marker gutter + the
+        // title and the `· ^O expand` affordance).
+        let collapsed = message_lines(&diff, true, 80, theme::dark());
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
-            line_text(&collapsed[0]),
-            "  ⋯ edit_file src/foo.rs (+1 -1) · ^O expand"
+            line_text(&collapsed[0]).trim_start(),
+            "edit_file src/foo.rs (+1 -1) · ^O expand"
         );
-        // Expanded: title + both body rows.
-        let expanded = message_lines(&diff, false, true, 80, theme::dark());
+        // Default (compact=false): the tool header row + both body rows.
+        let expanded = message_lines(&diff, false, 80, theme::dark());
         assert_eq!(expanded.len(), 3);
     }
 
@@ -4389,24 +5773,37 @@ mod tests {
         }
     }
 
+    // The rendered diff code rows for `item` (bypassing the tool box): the
+    // line-number-gutter + marker + code rows [`diff_lines`] produces, the direct
+    // seam these diff-internals tests inspect (the box only adds an outer 3-col
+    // indent). Panics on a non-Diff item.
+    fn diff_rows_of(item: &TranscriptItem, width: u16) -> Vec<Line<'static>> {
+        match item {
+            TranscriptItem::Diff { lang, hunks, .. } => {
+                diff_lines(lang.as_deref(), hunks, width, theme::dark())
+            }
+            _ => panic!("not a Diff item"),
+        }
+    }
+
     // A created-file Diff (one all-added hunk, `header: None`) of `content` in
-    // `lang`, expanded so `message_lines` renders every code row.
+    // `lang`, rendered to its code rows.
     fn created_diff_rows(lang: &str, content: &[&str], width: u16) -> Vec<Line<'static>> {
         let lines = content
             .iter()
             .map(|t| DiffLine::new(DiffSide::Added, *t))
             .collect();
         let item = diff_of(Some(lang), None, lines);
-        message_lines(&item, false, true, width, theme::dark())
+        diff_rows_of(&item, width)
     }
 
     // The distinct syntect foregrounds of a diff code row: the fgs AFTER the
-    // marker glyph, dropping the trailing full-width pad (bg only, no fg). Used
-    // to compare the color a line's code was highlighted with.
+    // line-number gutter + marker glyph, dropping the trailing full-width pad (bg
+    // only, no fg). Used to compare the color a line's code was highlighted with.
     fn code_fgs(row: &Line<'static>) -> Vec<Color> {
         row.spans
             .iter()
-            .skip(2) // the untinted indent + the marker glyph
+            .skip(2) // the line-number gutter + the marker glyph
             .filter_map(|s| s.style.fg)
             .collect()
     }
@@ -4429,14 +5826,14 @@ mod tests {
             ],
             80,
         );
-        // rows[0] is the title; the 4 comment lines are rows[1..=4].
-        let comment_fg = code_fgs(&rows[1]);
+        // The 4 comment lines are rows[0..=3]; row[4] is the trailing code line.
+        let comment_fg = code_fgs(&rows[0]);
         assert!(
             comment_fg.iter().all(|c| matches!(c, Color::Rgb(..))),
             "the comment's first line is syntect-colored: {comment_fg:?}"
         );
         let first = comment_fg[0];
-        for row in &rows[1..=4] {
+        for row in &rows[0..=3] {
             for fg in code_fgs(row) {
                 assert_eq!(
                     fg,
@@ -4449,7 +5846,7 @@ mod tests {
         }
         // The trailing code line, by contrast, is NOT the comment color - proof
         // the comment actually closed and highlighting resumed.
-        let code_fg = code_fgs(&rows[5]);
+        let code_fg = code_fgs(&rows[4]);
         assert!(
             code_fg.iter().any(|c| *c != first),
             "the `const x = 1;` line is not the comment color: {code_fg:?}"
@@ -4469,9 +5866,10 @@ mod tests {
                 DiffLine::new(DiffSide::Added, "kept();"),
             ],
         );
-        let rows = message_lines(&item, false, true, 80, theme::dark());
-        // rows: title, header, removed, added.
-        let removed = &rows[2];
+        let rows = diff_rows_of(&item, 80);
+        // rows: removed, added (the `@@` header is parsed for line numbers, not
+        // drawn as a row).
+        let removed = &rows[0];
         assert_eq!(removed.spans[1].content.as_ref(), "- ");
         // The removed comment carried a syntect fg (before-image highlighted).
         assert!(
@@ -4489,14 +5887,15 @@ mod tests {
         // to the content width and carries the added_bg, and the marker glyph +
         // code carry that same bg over their fg.
         let rows = created_diff_rows("rs", &["let x = 1;"], 40);
-        let row = &rows[1];
+        let row = &rows[0];
         let added_bg = Some(tui_color(theme::dark().added_bg));
-        // The marker glyph carries the tint and the semantic (green) fg.
+        // The marker glyph (after the line-number gutter) carries the tint and the
+        // semantic (green) fg.
         assert_eq!(row.spans[1].content.as_ref(), "+ ");
         assert_eq!(row.spans[1].style.bg, added_bg);
         assert_eq!(row.spans[1].style.fg, Some(tui_color(theme::dark().added)));
-        // Every span past the untinted indent carries the tint (band-wide).
-        for span in row.spans.iter().skip(1) {
+        // Every span (gutter, marker, code, pad) carries the tint (band-wide).
+        for span in &row.spans {
             assert_eq!(span.style.bg, added_bg, "band span keeps the tint");
         }
         // The row fills the width exactly, in DISPLAY COLUMNS (indent + marker +
@@ -4515,9 +5914,10 @@ mod tests {
             None,
             vec![DiffLine::new(DiffSide::Context, "let x = 1;")],
         );
-        let rows = message_lines(&item, false, true, 40, theme::dark());
-        let ctx = &rows[1];
-        // The context marker is two blanks and NO span carries a background.
+        let rows = diff_rows_of(&item, 40);
+        let ctx = &rows[0];
+        // The context marker (after the gutter) is two blanks and NO span carries
+        // a background.
         assert_eq!(ctx.spans[1].content.as_ref(), "  ");
         for span in &ctx.spans {
             assert_eq!(span.style.bg, None, "context is untinted");
@@ -4533,9 +5933,10 @@ mod tests {
             None,
             vec![DiffLine::new(DiffSide::Added, "just text")],
         );
-        let rows = message_lines(&item, false, true, 40, theme::dark());
-        let row = &rows[1];
-        // The code span carries the semantic added fg (green), not a syntect Rgb.
+        let rows = diff_rows_of(&item, 40);
+        let row = &rows[0];
+        // The code span (after gutter + marker) carries the semantic added fg
+        // (green), not a syntect Rgb.
         let code = &row.spans[2];
         assert_eq!(code.content.as_ref(), "just text");
         assert_eq!(code.style.fg, Some(tui_color(theme::dark().added)));
@@ -4543,13 +5944,9 @@ mod tests {
 
     #[test]
     fn the_elided_tail_renders_as_a_muted_count() {
-        let mut item = diff_of(None, None, vec![DiffLine::new(DiffSide::Added, "a")]);
-        if let TranscriptItem::Diff { elided, .. } = &mut item {
-            *elided = 40;
-        }
-        let rows = message_lines(&item, false, true, 40, theme::dark());
-        let tail = rows.last().unwrap();
-        assert_eq!(line_text(tail).trim_end(), "  … 40 more lines");
+        let tail_rows = diff_elided_tail(40, 40, theme::dark());
+        let tail = &tail_rows[0];
+        assert_eq!(line_text(tail).trim_end(), "... last 40 lines hidden ...");
         assert_eq!(tail.style, diff_chrome_style(theme::dark()));
     }
 
@@ -4572,9 +5969,9 @@ mod tests {
                 DiffLine::new(DiffSide::Added, "let x = 5;"),
             ],
         );
-        let rows = message_lines(&item, false, true, 80, theme::dark());
-        // rows: title, header, then the 6 code rows in file order.
-        let code = &rows[2..];
+        let rows = diff_rows_of(&item, 80);
+        // rows: the 6 code rows in file order (no title/header row).
+        let code = &rows[..];
         assert_eq!(code.len(), 6);
         // The `let` keyword is fragment 0 of every code row; its fg is the syntect
         // keyword color, identical on every line iff the two passes stayed aligned.
@@ -4616,9 +6013,9 @@ mod tests {
                 DiffLine::new(DiffSide::Removed, "fn also() {}"),
             ],
         );
-        let rows = message_lines(&item, false, true, 80, theme::dark());
+        let rows = diff_rows_of(&item, 80);
         let removed_bg = Some(tui_color(theme::dark().removed_bg));
-        for row in &rows[2..] {
+        for row in &rows[..] {
             assert_eq!(row.spans[1].content.as_ref(), "- ");
             assert_eq!(row.spans.last().unwrap().style.bg, removed_bg);
             assert!(
@@ -4633,13 +6030,15 @@ mod tests {
     fn a_tab_in_a_diff_line_expands_through_the_full_row() {
         // The tab→two-spaces normalization survives the whole render path, not
         // just the unit: a `\t`-indented code line draws with the tab expanded.
+        // A tab becomes two spaces; the common leading indentation (here the whole
+        // tab) is then stripped per-hunk (qwen DiffRenderer), so the code reads at
+        // the box edge. The key invariant: no raw tab survives the render path.
         let rows = created_diff_rows("rs", &["\tlet x = 1;"], 80);
-        let row = &rows[1];
-        // indent (2) + marker (2) then the code, tab expanded to two spaces.
+        let row = &rows[0];
         let text = line_text(row);
         assert!(
-            text.starts_with("  +   let x = 1;"),
-            "tab expanded in the rendered row: {text:?}"
+            text.starts_with("1 + let x = 1;"),
+            "tab expanded + common indent stripped: {text:?}"
         );
         assert!(!text.contains('\t'), "no raw tab survives: {text:?}");
     }
@@ -4651,7 +6050,7 @@ mod tests {
         // soft-wraps). Width 20, a 40-char line.
         let long = "x".repeat(40);
         let rows = created_diff_rows("rs", &[&long], 20);
-        let row = &rows[1];
+        let row = &rows[0];
         assert_eq!(
             row_display_width(row),
             20,
@@ -4671,7 +6070,7 @@ mod tests {
         for width in [12u16, 20, 41] {
             // Each CJK ideograph is two columns; mix in ASCII and an emoji.
             let rows = created_diff_rows("txt", &["語 = 実装 ✨ done"], width);
-            let row = &rows[1];
+            let row = &rows[0];
             assert!(
                 row_display_width(row) <= width as usize,
                 "row is within {width} columns: got {} for {:?}",
@@ -4692,72 +6091,54 @@ mod tests {
         row.spans.iter().map(|s| s.content.width()).sum()
     }
 
-    // The Stage 2 review's deferred scroll test: an unpinned viewport stores an
-    // absolute top offset, so flipping Ctrl-O and back - which changes the total
-    // line count while expanded but restores it when collapsed - leaves the
-    // clamped draw-time offset exactly where it was.
     #[test]
-    fn a_ctrl_o_round_trip_leaves_the_viewport_position_stable() {
-        use crate::ui::viewport::Viewport;
-
-        let mut t = fresh_transcript();
-        // Enough prose above the fold that the COLLAPSED content already
-        // overflows the viewport (the lane is dense now - no per-item blank
-        // separators - so more rows are needed to overflow), then a tall
-        // foldable block so expand/collapse changes the total wrapped-line count.
-        // Overflow-while-collapsed is what makes `scroll_up` truly unpin, which
-        // is the precondition for the stationary-across-expand invariant.
-        for i in 0..16 {
-            t.info(format!("prose line {i}"));
-        }
-        t.push(diff_item(
-            "edit_file big.rs",
-            (0..30)
-                .map(|i| DiffLine::new(DiffSide::Added, format!("line {i}")))
-                .collect(),
-        ));
-
-        let width = 80u16;
-        let height = 10usize;
-
-        let mut cache = RenderCache::new();
-
-        let total_lines = |cache: &mut RenderCache, t: &Transcript, tools: bool| -> usize {
-            cache.sync(
-                t,
-                Toggles {
-                    tools_expanded: tools,
-                    ..Toggles::default()
-                },
-                width,
-                theme::dark(),
-            );
-            cache.settled().map(|(_, wrapped)| wrapped).sum()
-        };
-
-        // Collapsed: scroll up a few lines to an absolute offset (unpins).
-        let collapsed_total = total_lines(&mut cache, &t, false);
-        let mut vp = Viewport::new();
-        vp.scroll_up(5, collapsed_total, height);
-        let collapsed_top = vp.top_offset(collapsed_total, height);
-
-        // Expand: the total grows, but the stored absolute offset is stationary.
-        let expanded_total = total_lines(&mut cache, &t, true);
-        assert!(expanded_total > collapsed_total, "expanding adds body rows");
-        let expanded_top = vp.top_offset(expanded_total, height);
+    fn parse_hunk_header_reads_the_old_and_new_start_line_numbers() {
+        // The MEDIUM-risk data path (Phase 2 risk #2): the `@@ -old,_ +new,_ @@`
+        // header is parsed render-side for the two 1-based start numbers.
+        assert_eq!(parse_hunk_header(Some("@@ -12,4 +30,5 @@")), (12, 30));
+        // A single-line hunk omits the count (`@@ -a +b @@`); the starts still parse.
+        assert_eq!(parse_hunk_header(Some("@@ -7 +9 @@")), (7, 9));
+        // A trailing section label after the second `@@` does not confuse the
+        // parse: the STARTS are `-1`/`+1` (the `,3`/`,4` are line counts, not starts).
         assert_eq!(
-            expanded_top, collapsed_top,
-            "an unpinned viewport is stationary across the expand"
+            parse_hunk_header(Some("@@ -1,3 +1,4 @@ fn main() {")),
+            (1, 1)
         );
-
-        // Collapse again: the total returns, and so does the drawn offset.
-        let collapsed_again_total = total_lines(&mut cache, &t, false);
-        let collapsed_again_top = vp.top_offset(collapsed_again_total, height);
+        // Distinct non-1 starts survive a trailing label too.
         assert_eq!(
-            collapsed_top, collapsed_again_top,
-            "a Ctrl-O round trip returns the viewport to the same position"
+            parse_hunk_header(Some("@@ -40,3 +52,4 @@ impl Foo {")),
+            (40, 52)
         );
+        // A created file carries no header; both sides start at line 1.
+        assert_eq!(parse_hunk_header(None), (1, 1));
+        // A malformed header falls back to (1, 1) rather than panicking.
+        assert_eq!(parse_hunk_header(Some("not a header")), (1, 1));
     }
+
+    #[test]
+    fn hunk_line_numbers_advances_each_side_by_line_kind() {
+        // The exact per-row gutter numbers a mixed hunk draws (qwen DiffRenderer
+        // :279-301): a context row shows its NEW number and advances BOTH sides; an
+        // added row shows NEW and advances new only; a removed row shows OLD and
+        // advances old only. Header `@@ -10,_ +20,_ @@` starts old at 10, new at 20.
+        let hunk = DiffHunk {
+            header: Some("@@ -10,3 +20,4 @@".to_string()),
+            lines: vec![
+                DiffLine::new(DiffSide::Context, "ctx a"), // old 10 / new 20 -> shows 20
+                DiffLine::new(DiffSide::Removed, "gone"),  // old 11          -> shows 11
+                DiffLine::new(DiffSide::Added, "new one"), // new 21          -> shows 21
+                DiffLine::new(DiffSide::Added, "new two"), // new 22          -> shows 22
+                DiffLine::new(DiffSide::Context, "ctx b"), // old 12 / new 23 -> shows 23
+            ],
+        };
+        // Context: 20 (new). Removed: 11 (old, new stays 21). Added: 21, 22 (new).
+        // Context: 23 (new; old is now 12).
+        assert_eq!(hunk_line_numbers(&hunk), vec![20, 11, 21, 22, 23]);
+    }
+
+    // (The Ctrl-O viewport-stability test is retired: there is no adapter-side
+    // viewport now - native scrollback owns history, ADR-0046. Ctrl-O's effect
+    // on the cached line counts is still covered by the cache toggle tests.)
 
     #[test]
     fn per_item_wrapped_counts_sum_to_the_whole_paragraph_measure() {
@@ -4779,16 +6160,11 @@ mod tests {
         for width in [10u16, 24, 80] {
             let per_item: usize = items
                 .iter()
-                .map(|item| {
-                    wrapped_count(
-                        message_lines(item, false, false, width, theme::dark()),
-                        width,
-                    )
-                })
+                .map(|item| wrapped_count(message_lines(item, false, width, theme::dark()), width))
                 .sum();
             let whole: Vec<Line> = items
                 .iter()
-                .flat_map(|item| message_lines(item, false, false, width, theme::dark()))
+                .flat_map(|item| message_lines(item, false, width, theme::dark()))
                 .collect();
             assert_eq!(per_item, wrapped_count(whole, width), "width {width}");
         }
@@ -4847,38 +6223,1371 @@ mod tests {
             .add_modifier
     }
 
-    /// Draws one viewport frame with default animation and the dark theme into a
-    /// fresh `width`x`height` terminal. Covers the overwhelmingly common test shape:
-    /// fresh viewport, fresh cache, default anim. Returns the terminal for inspection.
+    // The first char of a test-buffer cell (for gutter/marker assertions).
+    fn cell_char(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> char {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .expect("cell in test buffer")
+            .symbol()
+            .chars()
+            .next()
+            .unwrap_or(' ')
+    }
+
+    // The foreground color of a test-buffer cell (for accent/secondary checks).
+    fn cell_fg(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> Option<Color> {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .expect("cell in test buffer")
+            .style()
+            .fg
+    }
+
+    /// Draws the inline PENDING transcript body (ADR-0046) for `screen` into a
+    /// fresh `width`x`height` terminal, TOP-aligned so the content-assertion
+    /// tests (which scan rows for known text/gutter glyphs) read a stable layout.
+    /// Uses [`render_pending_body_at`] directly (no status bar / composer) over
+    /// the whole area; the pending body draws the uncommitted settled tail plus
+    /// the live stream. Fresh cache, default anim, dark theme - the
+    /// overwhelmingly common test shape.
+    ///
+    /// Top-aligned: when the content FITS, [`render_pending_body`] bottom-anchors,
+    /// so we draw into a body zone exactly as tall as the content when it fits,
+    /// and the full area when it overflows (top-clipped, newest kept).
     fn draw_viewport(width: u16, height: u16, screen: &Screen) -> Terminal<TestBackend> {
         let mut cache = RenderCache::new();
         draw_frame(width, height, |f| {
-            render_viewport(
+            let area = f.area();
+            // Measure the pending stack once to decide the zone height: a fitting
+            // stack draws in a zone its own height (so it top-aligns), an
+            // overflowing one uses the full area (top-clipped).
+            let total = pending_body_height(screen, &mut cache, area.width, theme::dark());
+            let zone_h = (total as u16).min(area.height).max(1);
+            let zone = Rect {
+                height: zone_h,
+                ..area
+            };
+            // hw = 0: draw the WHOLE settled transcript (committed items live in
+            // scrollback on a real TTY, but a headless content test wants them).
+            render_pending_body_at(
                 f,
-                f.area(),
-                &mut ViewportParams {
+                zone,
+                &mut PendingBodyParams {
                     screen,
-                    viewport: &Viewport::new(),
                     cache: &mut cache,
                     anim: Anim::default(),
                 },
                 theme::dark(),
+                0,
             );
         })
     }
 
-    /// Draws one viewport frame with a caller-supplied [`ViewportParams`], for
-    /// tests that need to inspect the measured geometry or control scroll state.
-    fn draw_viewport_with(
+    /// The pending stack's total wrapped rows for `screen` at `width` (test
+    /// helper): mirrors [`render_pending_body`]'s measurement so `draw_viewport`
+    /// can top-align a fitting stack.
+    fn pending_body_height(
+        screen: &Screen,
+        cache: &mut RenderCache,
         width: u16,
-        height: u16,
-        params: &mut ViewportParams<'_>,
-    ) -> (Terminal<TestBackend>, (usize, usize)) {
-        let mut geometry = (0usize, 0usize);
-        let terminal = draw_frame(width, height, |f| {
-            geometry = render_viewport(f, f.area(), params, theme::dark());
+        theme: &Theme,
+    ) -> usize {
+        let content_width = width.saturating_sub(2 * CONTENT_MARGIN);
+        cache.sync(
+            screen.transcript(),
+            Toggles {
+                compact: screen.compact_mode,
+            },
+            content_width,
+            theme,
+        );
+        let items = screen.transcript().items();
+        // hw = 0: measure the WHOLE settled transcript (the test helper draws it
+        // all top-aligned) through the SAME grouped fold the body draws (ADR-0046),
+        // including the inline approval block when one is open (ADR-0049).
+        let approving = screen.pending_approval.as_ref().and_then(|pending| {
+            newest_live_tool_index(items).map(|call_index| Approving {
+                pending,
+                call_index,
+            })
         });
-        (terminal, geometry)
+        let mut lines = grouped_rows_with_approval(&GroupedRows {
+            cache,
+            items,
+            hw: 0,
+            width: content_width,
+            theme,
+            approving: approving.as_ref(),
+        });
+        // Add the live stream rows the body would append. Compact suppresses the
+        // live thinking tail (matching `render_pending_body_at`).
+        let thinking = screen.transcript().streaming_thinking();
+        let thinking_lines = if screen.compact_mode {
+            Vec::new()
+        } else {
+            live_thinking_lines(&thinking, 0, content_width, theme)
+        };
+        append_live(&mut lines, &thinking_lines);
+        if let Some((tail, _)) = cache.streaming_tail() {
+            append_live(&mut lines, tail);
+        }
+        wrapped_count(lines, content_width)
+    }
+
+    // --- render_committed_slice (ADR-0046, the inline `insert_before` seam) ---
+
+    /// A whole [`Buffer`] as newline-joined rows of symbols.
+    fn commit_buffer_text(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Blits `[hw, hw + count)` of `cache` into `buf` under the dark theme - the
+    /// one place these tests spell the [`CommittedSlice`] bundle, so each case
+    /// reads as the `(hw, count)` window it exercises.
+    fn blit_slice(
+        buf: &mut Buffer,
+        cache: &RenderCache,
+        items: &[TranscriptItem],
+        hw: usize,
+        count: usize,
+    ) {
+        render_committed_slice(
+            buf,
+            &CommittedSlice {
+                cache,
+                items,
+                hw,
+                count,
+                theme: theme::dark(),
+            },
+        );
+    }
+
+    /// The committed-slice height at the dark theme + content width (test helper):
+    /// the new [`commit_slice_height`] shape that folds the SAME grouped rows the
+    /// blit draws. `content_width` is the frame width minus both margins.
+    fn slice_height(
+        cache: &RenderCache,
+        items: &[TranscriptItem],
+        hw: usize,
+        count: usize,
+        content_width: u16,
+    ) -> u16 {
+        commit_slice_height(
+            &CommittedSlice {
+                cache,
+                items,
+                hw,
+                count,
+                theme: theme::dark(),
+            },
+            content_width,
+        )
+    }
+
+    // A committed slice blits each item's cached content through the grouped fold,
+    // 2-col margin in (qwen `marginLeft:2`). Golden against the exact rows the
+    // pending body draws for the same items (see the seam-identity test).
+    #[test]
+    fn render_committed_slice_blits_prefixed_content() {
+        // Author a tiny run directly on a bare store: an info line, a User
+        // prompt, then one agent answer line.
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.info("opening");
+        t.user("do a thing");
+        t.push(TranscriptItem::Assistant {
+            text: "sure".into(),
+        });
+
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let count = items.len();
+
+        // Sync the cache at the SAME content width the slice draws at.
+        let width: u16 = 40;
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), content_width, theme::dark());
+
+        let height = slice_height(&cache, &items, 0, count, content_width);
+        assert!(height >= 3, "info + user + answer are at least 3 rows");
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        blit_slice(&mut buf, &cache, &items, 0, count);
+
+        let text = commit_buffer_text(&buf);
+        // The content landed with its qwen prefixes, 2-col margin in.
+        assert!(text.contains("● opening"), "info prefix drawn:\n{text}");
+        assert!(text.contains("> do a thing"), "user caret drawn:\n{text}");
+        assert!(text.contains("✦ sure"), "assistant marker drawn:\n{text}");
+    }
+
+    // MEASURE == DRAW (ADR-0029/0046): `commit_slice_height` (what the adapter
+    // sizes the `insert_before` buffer to) must equal the number of NON-BLANK
+    // rows `render_committed_slice` actually writes into an OVERSIZED buffer. If
+    // measure and draw drifted (a width mismatch, a wrap discrepancy), the freeze
+    // would clip content or leave a gap; this pins them together. `Screen::demo`
+    // exercises every item kind (thoughts, machinery, markers, an error,
+    // wrapping assistant text, code) so the agreement holds across them all.
+    #[test]
+    fn commit_slice_height_agrees_with_the_rows_render_committed_slice_writes() {
+        let screen = Screen::demo();
+        let width: u16 = 100;
+        let count = screen.transcript().items().len();
+
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut cache = RenderCache::new();
+        cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            content_width,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+
+        let measured = slice_height(&cache, &items, 0, count, content_width);
+        assert!(measured > 0, "the demo run has content");
+
+        // Draw into a buffer TALLER than the measurement, then count the rows
+        // that actually got content. A blank row past the content proves nothing
+        // overflowed the measured height; a blank row WITHIN it would mean the
+        // draw under-filled what it measured.
+        let oversized = measured + 5;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, oversized));
+        blit_slice(&mut buf, &cache, &items, 0, count);
+
+        let text = commit_buffer_text(&buf);
+        let non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
+        // The demo has interior blank rows (code fences, spacing), so compare the
+        // LAST non-blank row's index + 1 against the measured height: the draw
+        // occupies exactly `[0, measured)` and writes nothing at/after `measured`.
+        let last_non_blank = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+            .map(|(i, _)| i)
+            .max()
+            .expect("some content drew");
+        assert!(
+            (last_non_blank as u16) < measured,
+            "draw wrote past the measured height ({last_non_blank} >= {measured})"
+        );
+        assert!(
+            non_blank > 0 && non_blank <= measured as usize,
+            "non-blank rows ({non_blank}) fit within the measured height ({measured})"
+        );
+        // No content leaked into the oversized tail rows `[measured, oversized)`.
+        for y in measured..oversized {
+            let row = row_symbols(&buf, y);
+            assert!(
+                row.trim().is_empty(),
+                "row {y} past the measured height must be blank: {row:?}"
+            );
+        }
+    }
+
+    /// One buffer row as its concatenated symbols (test helper for the
+    /// measure==draw agreement check).
+    fn row_symbols(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
+            .collect()
+    }
+
+    // The committed slice honors the high-water offset: committing only the tail
+    // `[hw, hw + count)` draws that tail and nothing before it.
+    #[test]
+    fn render_committed_slice_draws_only_the_requested_range() {
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.info("EARLIER");
+        t.info("LATER");
+
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let width: u16 = 40;
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), content_width, theme::dark());
+
+        // Skip EARLIER (hw = 1), commit only LATER (count = 1).
+        let hw = items.len() - 1;
+        let height = slice_height(&cache, &items, hw, 1, content_width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
+        blit_slice(&mut buf, &cache, &items, hw, 1);
+
+        let text = commit_buffer_text(&buf);
+        assert!(text.contains("LATER"), "the requested tail drew:\n{text}");
+        assert!(
+            !text.contains("EARLIER"),
+            "items before the high-water mark are not redrawn:\n{text}"
+        );
+    }
+
+    // THE identity guarantee (ADR-0046): the committed slice for a whole run,
+    // and the pending body's rendering of that SAME prefix, produce the
+    // IDENTICAL rows - gutter and content - so nothing reflows when an item
+    // crosses the commit seam. This is the property `run_fold`'s retirement buys:
+    // both paths read the SAME cache lines (no collapse, no window) and paint the
+    // SAME two-plane gutter. Uses `Screen::demo()` so the run has thoughts,
+    // machinery, markers, an error, closing text and code - every item kind.
+    #[test]
+    fn the_committed_slice_equals_the_pending_body_for_the_same_prefix() {
+        let screen = Screen::demo();
+        let width: u16 = 100;
+        let count = screen.transcript().items().len();
+
+        // (a) The committed slice `[0, count)` blitted into a bare buffer.
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut commit_cache = RenderCache::new();
+        commit_cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            content_width,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+        let height = slice_height(&commit_cache, &items, 0, count, content_width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        blit_slice(&mut buf, &commit_cache, &items, 0, count);
+        let committed = commit_buffer_text(&buf);
+
+        // (b) The pending body (hw = 0) drawn TOP-aligned into a zone exactly as
+        // tall as the content, so the two are directly comparable row-for-row.
+        let terminal = draw_viewport(width, height, &screen);
+        let pending: String = (0..height)
+            .map(|y| row_text(&terminal, y).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let committed_trimmed: String = committed
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed_trimmed, pending,
+            "committed and pending must render the same prefix identically (no seam reflow)"
+        );
+    }
+
+    // The identity holds UNDER COMPACT too (ADR-0052): with compact on, both the
+    // committed blit and the pending body hide thoughts + fold tool bodies through
+    // the SAME `message_lines` compact branch, so a RedrawScrollback re-blit at the
+    // new compact matches the pending region cell-for-cell (no split-brain in what
+    // each path chooses to draw).
+    #[test]
+    fn the_committed_slice_equals_the_pending_body_under_compact() {
+        // A compact Screen (Ctrl+O flipped on). `demo()` carries thoughts + a tool
+        // run, so compact actually changes the rows both paths emit.
+        let (screen, _) = Screen::demo().handle_key(crate::ui::screen::Key::ToggleCompact);
+        assert!(screen.compact_mode, "the demo screen is now compact");
+        let width: u16 = 100;
+        let count = screen.transcript().items().len();
+
+        // (a) The committed slice `[0, count)` at compact = true.
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut commit_cache = RenderCache::new();
+        commit_cache.sync(
+            screen.transcript(),
+            Toggles { compact: true },
+            content_width,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+        let height = slice_height(&commit_cache, &items, 0, count, content_width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
+        blit_slice(&mut buf, &commit_cache, &items, 0, count);
+        let committed = commit_buffer_text(&buf);
+
+        // (b) The pending body (which reads `screen.compact_mode`) over the same
+        // prefix, top-aligned.
+        let terminal = draw_viewport(width, height.max(1), &screen);
+        let pending: String = (0..height.max(1))
+            .map(|y| row_text(&terminal, y).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let committed_trimmed: String = committed
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed_trimmed, pending,
+            "committed and pending must match under compact (no seam reflow)"
+        );
+        // Compact genuinely hid the thoughts: the demo's reasoning text is gone.
+        assert!(
+            !committed_trimmed.contains("The user wants me to evaluate"),
+            "compact hid the settled thoughts:\n{committed_trimmed}"
+        );
+    }
+
+    // --- tool-group box (ADR-0047): grouping fold + border rigidity ----------
+
+    /// A store carrying an assistant line, a two-tool run (a call + a result),
+    /// then another assistant line - the shape the grouping fold boxes in the
+    /// middle only.
+    fn store_with_a_tool_run() -> crate::ui::transcript::Transcript {
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.user("do it");
+        t.push(TranscriptItem::Assistant {
+            text: "on it".into(),
+        });
+        t.push(TranscriptItem::ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            summary: "src/foo.rs".into(),
+        });
+        t.push(TranscriptItem::ToolResult {
+            name: "read_file".into(),
+            summary: "340 lines".into(),
+            is_error: false,
+            key_arg: Some("src/foo.rs".into()),
+        });
+        t.push(TranscriptItem::Assistant {
+            text: "done".into(),
+        });
+        t
+    }
+
+    #[test]
+    fn a_contiguous_tool_run_renders_as_one_rounded_box() {
+        // The grouping fold (ADR-0047): the two tool items between the assistant
+        // lines are ONE box - a single top border, a single bottom border.
+        let t = store_with_a_tool_run();
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let width: u16 = 60;
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), content_width, theme::dark());
+        let lines = grouped_rows(&cache, &items, 0, content_width, theme::dark());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            text.iter().filter(|r| r.starts_with('╭')).count(),
+            1,
+            "exactly one box top: {text:?}"
+        );
+        assert_eq!(
+            text.iter().filter(|r| r.starts_with('╰')).count(),
+            1,
+            "exactly one box bottom: {text:?}"
+        );
+        // The two tool rows are inside the border (start with `│`), the assistant
+        // lines are not.
+        assert!(
+            text.iter()
+                .any(|r| r.contains("read_file") && r.starts_with('│'))
+        );
+        assert!(text.iter().any(|r| r.starts_with("✦ done")));
+    }
+
+    // --- Todo render (ADR-0048, the committed defect fix) --------------------
+
+    fn todo(content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            status,
+        }
+    }
+
+    fn todo_item(items: Vec<TodoItem>) -> TranscriptItem {
+        TranscriptItem::Todo { items }
+    }
+
+    // The span carrying `needle` (used to assert its style).
+    fn span_with<'a>(line: &'a Line<'static>, needle: &str) -> &'a Span<'static> {
+        line.spans
+            .iter()
+            .find(|s| s.content.contains(needle))
+            .unwrap_or_else(|| panic!("no span contains {needle:?} in {:?}", line_text(line)))
+    }
+
+    #[test]
+    fn tool_todo_lines_draws_a_clean_header_then_the_circle_list() {
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![
+            todo("read the file", Completed),
+            todo("edit the file", InProgress),
+            todo("build", Pending),
+        ];
+        let lines = tool_todo_lines(&items, false, 40, theme::dark());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+
+        // A clean `✓ todo_write` header with NO raw JSON args (the key_arg is
+        // gone structurally - a Todo carries no summary).
+        assert_eq!(text[0], "✓  todo_write");
+        assert!(
+            !text.iter().any(|r| r.contains('{') || r.contains("status")),
+            "no raw JSON args leak: {text:?}"
+        );
+        // The circle glyphs, in order, one row per item.
+        assert!(text[1].starts_with("● "), "completed circle: {:?}", text[1]);
+        assert!(text[1].contains("read the file"));
+        assert!(
+            text[2].starts_with("◐ "),
+            "in_progress circle: {:?}",
+            text[2]
+        );
+        assert!(text[3].starts_with("○ "), "pending circle: {:?}", text[3]);
+    }
+
+    #[test]
+    fn tool_todo_lines_folds_to_header_only_under_compact() {
+        // Compact (Ctrl+O) folds the checklist body away (qwen `!compactMode`,
+        // ADR-0052): the header stays, the circle rows are gone. This pins the
+        // one display-hide branch of `tool_todo_lines` (compact=true), where the
+        // non-compact tests above exercise compact=false's full list.
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![
+            todo("read the file", Completed),
+            todo("edit the file", InProgress),
+            todo("build", Pending),
+        ];
+        let lines = tool_todo_lines(&items, true, 40, theme::dark());
+        assert_eq!(lines.len(), 1, "only the header row survives under compact");
+        assert_eq!(line_text(&lines[0]), "✓  todo_write");
+    }
+
+    #[test]
+    fn tool_todo_lines_colours_in_progress_green_and_strikes_completed() {
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![
+            todo("done item", Completed),
+            todo("active item", InProgress),
+            todo("later item", Pending),
+        ];
+        let lines = tool_todo_lines(&items, false, 40, theme::dark());
+
+        // in_progress reads success (green); completed is CROSSED_OUT and NOT
+        // green (qwen colours completed Foreground); pending is plain.
+        let done = span_with(&lines[1], "done item");
+        assert!(
+            done.style.add_modifier.contains(Modifier::CROSSED_OUT),
+            "completed is struck through"
+        );
+        assert_eq!(
+            done.style.fg,
+            primary_style(theme::dark()).fg,
+            "completed is Foreground, not green"
+        );
+
+        let active = span_with(&lines[2], "active item");
+        assert_eq!(active.style.fg, success_style(theme::dark()).fg);
+        assert!(!active.style.add_modifier.contains(Modifier::CROSSED_OUT));
+
+        let later = span_with(&lines[3], "later item");
+        assert_eq!(later.style.fg, primary_style(theme::dark()).fg);
+        assert!(!later.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn tool_todo_lines_wraps_long_content_and_every_row_fits_the_inner_width() {
+        // Long content word-wraps under the 3-wide gutter; no produced row
+        // exceeds the inner width (measure==draw, ADR-0029).
+        let inner: u16 = 24;
+        let items = vec![todo(
+            "a rather long todo item that must wrap onto several rows",
+            TodoStatus::Pending,
+        )];
+        let lines = tool_todo_lines(&items, false, inner, theme::dark());
+        assert!(lines.len() > 2, "the long item wrapped: {}", lines.len());
+        for line in &lines {
+            assert!(
+                line_text(line).width() <= inner as usize,
+                "row exceeds inner width: {:?}",
+                line_text(line)
+            );
+        }
+    }
+
+    /// The `(symbol, fg, bg, add_modifier)` cells of the box rows of `buf`,
+    /// starting at the first `╭` row and spanning `box_rows` rows - so a committed
+    /// blit (box at row 0) and a pending render (box after a committed prefix +
+    /// separator) can be aligned on the box and compared window-for-window.
+    fn box_cells(buf: &Buffer, box_rows: u16) -> Vec<(String, Color, Color, Modifier)> {
+        let top = (0..buf.area.height)
+            .find(|&y| buf.cell((CONTENT_MARGIN, y)).map(|c| c.symbol()) == Some("╭"))
+            .expect("a box top row");
+        (top..top + box_rows)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let cell = buf.cell((x, y)).expect("cell in area");
+                let style = cell.style();
+                (
+                    cell.symbol().to_string(),
+                    style.fg.unwrap_or(Color::Reset),
+                    style.bg.unwrap_or(Color::Reset),
+                    style.add_modifier,
+                )
+            })
+            .collect()
+    }
+
+    // The committed==pending identity (ADR-0046/0048): a Todo item flows the SAME
+    // message_lines -> cache -> grouped_rows path, so its committed BLIT is
+    // cell-for-cell identical to its pending render - same glyphs AND same styling
+    // (fg/bg/modifier), so nothing reflows or recolours at the commit seam. The
+    // committed side goes through the REAL blit (`render_committed_slice`) at a
+    // NON-ZERO high-water (an `info` line committed first, so the Todo box is at
+    // row 0 of the slice); the pending side draws the WHOLE transcript from hw=0
+    // (info + separator + Todo box) as the pending body does. Two distinct draw
+    // paths over distinct windows, aligned on the box top and compared cell-for-
+    // cell - not a self-comparison of one `grouped_rows` call.
+    #[test]
+    fn a_todo_renders_cell_for_cell_identically_committed_and_pending() {
+        use TodoStatus::{Completed, InProgress, Pending};
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.info("a committed prefix line"); // index 0, committed (hw = 1)
+        t.push(todo_item(vec![
+            todo("read", Completed),
+            todo("edit", InProgress),
+            todo("ship", Pending),
+        ]));
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let width: u16 = 50;
+        let height: u16 = 12;
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), content_width, theme::dark());
+
+        // The Todo box's own height (border + header + 3 circle rows = 5), so the
+        // aligned window spans exactly the box on both sides.
+        let box_rows = grouped_rows(&cache, &items, 1, content_width, theme::dark()).len() as u16;
+
+        // Committed: the REAL blit of the Todo slice [1, 2) at high-water 1.
+        let mut committed = Buffer::empty(Rect::new(0, 0, width, height));
+        render_committed_slice(
+            &mut committed,
+            &CommittedSlice {
+                cache: &cache,
+                items: &items,
+                hw: 1,
+                count: 1,
+                theme: theme::dark(),
+            },
+        );
+
+        // Pending: the WHOLE transcript (info + separator + Todo) drawn as the
+        // pending body draws it (grouped_rows from hw=0 + the margin-inset
+        // Paragraph). The Todo box lands below the committed prefix, so we align on
+        // the box top.
+        let mut pending = Buffer::empty(Rect::new(0, 0, width, height));
+        let lines = grouped_rows(&cache, &items, 0, content_width, theme::dark());
+        let content_area = Rect {
+            x: CONTENT_MARGIN,
+            y: 0,
+            width: content_width,
+            height,
+        };
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(content_area, &mut pending);
+
+        // Cell-for-cell over the box window: symbol AND fg/bg/modifier match.
+        assert_eq!(
+            box_cells(&committed, box_rows),
+            box_cells(&pending, box_rows),
+            "committed blit diverged from the pending render:\ncommitted:\n{}\npending:\n{}",
+            commit_buffer_text(&committed),
+            commit_buffer_text(&pending),
+        );
+
+        // And the box wraps the circle list: one rounded box, the header + three
+        // circle rows inside the border.
+        let text = commit_buffer_text(&committed);
+        assert_eq!(text.matches('╭').count(), 1, "one box:\n{text}");
+        assert!(text.contains("todo_write"), "clean header:\n{text}");
+        assert!(text.contains("●  read"), "completed glyph:\n{text}");
+        assert!(text.contains("◐  edit"), "in_progress glyph:\n{text}");
+        assert!(text.contains("○  ship"), "pending glyph:\n{text}");
+    }
+
+    // --- sticky "Current tasks" box (ADR-0048) -------------------------------
+
+    #[test]
+    fn ordered_sticky_todos_sorts_by_priority_stable_and_keeps_original_index() {
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![
+            todo("a-completed", Completed),   // 0
+            todo("b-pending", Pending),       // 1
+            todo("c-inprogress", InProgress), // 2
+            todo("d-pending", Pending),       // 3
+        ];
+        let ordered = ordered_sticky_todos(&items);
+        let seq: Vec<(usize, &str)> = ordered
+            .iter()
+            .map(|(i, item)| (*i, item.content.as_str()))
+            .collect();
+        // in_progress first, then pending (stable: index 1 before 3), then completed.
+        assert_eq!(
+            seq,
+            vec![
+                (2, "c-inprogress"),
+                (1, "b-pending"),
+                (3, "d-pending"),
+                (0, "a-completed"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sticky_todos_shows_only_a_committed_non_empty_incomplete_list() {
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![todo("read", InProgress), todo("edit", Pending)];
+
+        // Non-empty, incomplete, committed (index 2 < high_water 3): shows.
+        assert_eq!(sticky_todos(Some((2, &items)), 3), Some(items.as_slice()));
+
+        // Still pending (index 3 >= high_water 3, not yet committed): the inline
+        // copy is on screen, so the sticky box defers.
+        assert_eq!(sticky_todos(Some((3, &items)), 3), None);
+
+        // No todo at all: nothing.
+        assert_eq!(sticky_todos(None, 3), None);
+
+        // Empty list: nothing.
+        let empty: Vec<TodoItem> = vec![];
+        assert_eq!(sticky_todos(Some((0, &empty)), 3), None);
+
+        // All completed: the run is done, so the box hides.
+        let done = vec![todo("read", Completed), todo("edit", Completed)];
+        assert_eq!(sticky_todos(Some((0, &done)), 3), None);
+    }
+
+    #[test]
+    fn sticky_todos_height_caps_at_five_and_adds_an_overflow_row() {
+        // borders(2) + header(1) + visible + overflow?1.
+        assert_eq!(sticky_todos_height(0), 3);
+        assert_eq!(sticky_todos_height(3), 6);
+        assert_eq!(sticky_todos_height(5), 8);
+        // Six items: five shown + one overflow row.
+        assert_eq!(sticky_todos_height(6), 9);
+    }
+
+    #[test]
+    fn render_sticky_todos_draws_the_header_glyphs_and_overflow_and_fits_width() {
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![
+            todo("one", InProgress),
+            todo("two", Pending),
+            todo("three", Pending),
+            todo("four", Pending),
+            todo("five", Pending),
+            todo("six", Completed),
+        ];
+        let width: u16 = 40;
+        let height = sticky_todos_height(items.len()) as u16;
+        let terminal = draw_frame(width, height, |f| {
+            render_sticky_todos(f, Rect::new(0, 0, width, height), &items, theme::dark());
+        });
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Current tasks"), "header present:\n{text}");
+        assert!(text.contains("◐"), "in_progress glyph present:\n{text}");
+        assert!(text.contains("○"), "pending glyph present:\n{text}");
+        // Six items > cap 5, so exactly one item is hidden with the overflow row.
+        assert!(text.contains("... and 1 more"), "overflow row:\n{text}");
+        // The rounded box corners are drawn.
+        assert!(
+            text.contains('╭') && text.contains('╰'),
+            "box borders:\n{text}"
+        );
+        // Every drawn row is exactly `width` cells (the box never overflows -
+        // measure==draw, ADR-0029): the TestBackend rows are width-padded, so
+        // asserting the buffer drew without panicking on an oversize line suffices
+        // here; the box_row funnel guarantees the width.
+    }
+
+    #[test]
+    fn sticky_fits_drops_the_box_when_the_frame_cannot_hold_it_plus_composer() {
+        // sticky(6) + status(1) + composer(3) + body(1) = 11.
+        assert!(sticky_fits(11, 6, 3));
+        assert!(sticky_fits(20, 6, 3));
+        // One row short: no room for the body -> hide.
+        assert!(!sticky_fits(10, 6, 3));
+        // A very short frame with any composer hides the box.
+        assert!(!sticky_fits(4, 6, 3));
+    }
+
+    #[test]
+    fn render_sticky_todos_clamps_its_lines_to_a_squeezed_zone_without_panicking() {
+        use TodoStatus::{InProgress, Pending};
+        let items = vec![
+            todo("one", InProgress),
+            todo("two", Pending),
+            todo("three", Pending),
+        ];
+        let full = sticky_todos_height(items.len()) as u16; // 6
+        let width: u16 = 30;
+        // Draw into a zone SHORTER than the measured box height: the clamp keeps
+        // the draw within the zone (no over-draw, no panic).
+        let squeezed = full - 3;
+        let terminal = draw_frame(width, squeezed, |f| {
+            render_sticky_todos(f, Rect::new(0, 0, width, squeezed), &items, theme::dark());
+        });
+        let text = buffer_text(&terminal);
+        // The top of the box still draws; the truncated tail simply drops.
+        assert!(text.contains("Current tasks"), "header present:\n{text}");
+        assert_eq!(
+            text.lines().count(),
+            squeezed as usize,
+            "drew exactly the zone height, no over-draw:\n{text}"
+        );
+    }
+
+    // --- group_segments: the pure boundary fold (ADR-0047) -------------------
+
+    // The item constructors the pure `group_segments` tests route through, so the
+    // `TranscriptItem` literals stay in one place. No frame, no cache.
+    fn assistant(text: &str) -> TranscriptItem {
+        TranscriptItem::Assistant { text: text.into() }
+    }
+    fn tool_call(name: &str) -> TranscriptItem {
+        TranscriptItem::ToolCall {
+            id: "id".into(),
+            name: name.into(),
+            summary: "arg".into(),
+        }
+    }
+    fn tool_result(name: &str) -> TranscriptItem {
+        TranscriptItem::ToolResult {
+            name: name.into(),
+            summary: "ok".into(),
+            is_error: false,
+            key_arg: None,
+        }
+    }
+    fn info(text: &str) -> TranscriptItem {
+        TranscriptItem::Info { text: text.into() }
+    }
+
+    #[test]
+    fn group_segments_boxes_maximal_tool_runs_between_prose() {
+        // A single lone tool item is one group; the surrounding prose passes
+        // through. A run at the START (index 0) and one at the very END both box.
+        let items = [
+            tool_call("read_file"),     // 0  (run at slice start)
+            assistant("prose"),         // 1
+            tool_call("run_command"),   // 2  (run at the very end)
+            tool_result("run_command"), // 3
+        ];
+        assert_eq!(
+            group_segments(&items, 0),
+            vec![
+                Segment::ToolGroup(0, 1),
+                Segment::Item(1),
+                Segment::ToolGroup(2, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_segments_splits_a_run_around_a_mid_batch_info() {
+        // The ADR-0047 behavior pinned: an `Info` interleaved between two tool
+        // results (a mid-batch extension error / standing approval) SPLITS the run
+        // into two tool groups with the Info as its own singleton between them.
+        let items = [
+            assistant("on it"),         // 0
+            tool_call("edit_file"),     // 1
+            tool_result("edit_file"),   // 2
+            info("auto-approved"),      // 3  (splits the batch)
+            tool_result("run_command"), // 4
+            assistant("done"),          // 5
+        ];
+        assert_eq!(
+            group_segments(&items, 0),
+            vec![
+                Segment::Item(0),
+                Segment::ToolGroup(1, 3),
+                Segment::Item(3),
+                Segment::ToolGroup(4, 5),
+                Segment::Item(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_segments_keeps_a_diff_inside_the_tool_run() {
+        // A `Diff` is a tool item, so it stays in the surrounding run's box rather
+        // than breaking it (the diff renders inside the group box).
+        let items = [
+            tool_call("edit_file"),
+            diff_item("edit_file foo", vec![DiffLine::new(DiffSide::Added, "a")]),
+            tool_result("edit_file"),
+        ];
+        assert_eq!(group_segments(&items, 0), vec![Segment::ToolGroup(0, 3)]);
+    }
+
+    #[test]
+    fn group_segments_groups_an_orphaned_result_like_any_tool_item() {
+        // An orphaned `ToolResult` (no preceding call - e.g. after a supersede
+        // moved the result to the tail) is still a tool item and boxes normally.
+        let items = [tool_result("read_file")];
+        assert_eq!(group_segments(&items, 0), vec![Segment::ToolGroup(0, 1)]);
+    }
+
+    #[test]
+    fn group_segments_only_emits_the_settled_tail_from_the_high_water_mark() {
+        // The fold starts at `hw`: items below the high-water mark are frozen into
+        // scrollback and never re-emitted.
+        let items = [
+            assistant("frozen"),      // 0  (below hw)
+            tool_call("read_file"),   // 1
+            tool_result("read_file"), // 2
+        ];
+        assert_eq!(group_segments(&items, 1), vec![Segment::ToolGroup(1, 3)]);
+    }
+
+    // The box-rigidity assertion (ADR-0029, the HIGH risk): EVERY row `grouped_rows`
+    // produces for this store - borders, tool rows, the gap, a boxed diff's rows - is
+    // EXACTLY `width` display columns (so the right `│`/`╮`/`╯` corners always align in
+    // one column) AND stays ONE visual row (the viewport's own `Wrap` agrees).
+    fn assert_every_box_row_is_exactly_width(
+        t: &crate::ui::transcript::Transcript,
+        toggles: Toggles,
+        widths: &[u16],
+    ) {
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        for &width in widths {
+            let mut cache = RenderCache::new();
+            cache.sync(t, toggles, width, theme::dark());
+            let lines = grouped_rows(&cache, &items, 0, width, theme::dark());
+            for line in &lines {
+                let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+                assert_eq!(
+                    w,
+                    width as usize,
+                    "box row not exactly {width} cols (right border misaligned): {:?}",
+                    line_text(line)
+                );
+                assert_eq!(
+                    wrapped_count(vec![line.clone()], width),
+                    1,
+                    "box row is not one visual row at {width}: {:?}",
+                    line_text(line)
+                );
+            }
+        }
+    }
+
+    // A single-`ToolResult` transcript with the given name/desc - the shared
+    // builder the box-rigidity goldens route through, so the `ToolResult { … }`
+    // literal lives in one place (and a Diff/multi-tool case builds its own).
+    fn store_with_one_result(name: &str, summary: String) -> crate::ui::transcript::Transcript {
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.push(TranscriptItem::ToolResult {
+            name: name.into(),
+            summary,
+            is_error: false,
+            key_arg: Some(name.into()),
+        });
+        t
+    }
+
+    #[test]
+    fn every_boxed_row_is_exactly_the_box_width_the_right_border_aligns() {
+        // A long tool description (truncate-end) must not spill the right border.
+        let t = store_with_one_result("run_command", "a very long description ".repeat(10));
+        assert_every_box_row_is_exactly_width(&t, Toggles::default(), &[30, 50, 72]);
+    }
+
+    #[test]
+    fn a_cjk_and_emoji_tool_header_keeps_the_box_rigid() {
+        // Widths are DISPLAY COLUMNS, not char counts: a CJK+emoji tool name and
+        // description (each ideograph 2 cols, the emoji 2 cols) must still pad/
+        // truncate to exactly the box width - the char-count trap the review flagged.
+        let t = store_with_one_result("你好🎉世界", "説明 ".repeat(12));
+        assert_every_box_row_is_exactly_width(&t, Toggles::default(), &[20, 33, 50]);
+    }
+
+    #[test]
+    fn a_boxed_diff_with_a_wide_glyph_line_keeps_the_box_rigid() {
+        // A tool group whose result is a Diff: the diff renders INSIDE the box
+        // (tools_expanded), so every diff-in-box row - including a wide-glyph diff
+        // line - must be exactly the box width, not just the header/border rows.
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.push(TranscriptItem::Diff {
+            title: "edit_file 世界.rs".into(),
+            lang: Some("txt".into()),
+            hunks: vec![DiffHunk {
+                header: Some("@@ -1,2 +1,2 @@".into()),
+                lines: vec![
+                    DiffLine::new(DiffSide::Context, "let 語 = 実装; // 説明"),
+                    DiffLine::new(DiffSide::Added, "let x = 1; 🎉"),
+                    DiffLine::new(DiffSide::Removed, "let x = 0;"),
+                ],
+            }],
+            elided: 0,
+        });
+        // Not compact: the diff body shows in full.
+        let expanded = Toggles::default();
+        assert_every_box_row_is_exactly_width(&t, expanded, &[24, 40, 60]);
+    }
+
+    #[test]
+    fn a_multi_tool_box_pads_its_gap_row_to_the_width() {
+        // Two tools in one box exercise the `gap:1` blank row between them; the gap
+        // row (and every other row) must still be exactly the box width.
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.push(TranscriptItem::ToolResult {
+            name: "read_file".into(),
+            summary: "340 lines".into(),
+            is_error: false,
+            key_arg: Some("src/foo.rs".into()),
+        });
+        t.push(TranscriptItem::ToolResult {
+            name: "run_command".into(),
+            summary: "ok".into(),
+            is_error: false,
+            key_arg: Some("cargo build".into()),
+        });
+        assert_every_box_row_is_exactly_width(&t, Toggles::default(), &[30, 50, 72]);
+    }
+
+    #[test]
+    fn a_tool_name_on_the_inner_width_boundary_keeps_the_box_rigid() {
+        // A name+desc whose display width lands EXACTLY on the inner-width boundary
+        // (no truncation, no leftover pad): the edge case between "fits" and "spills".
+        // At width 30 the inner content width is 30 - BOX_CHROME(4) = 26; the header
+        // is a 3-col marker + name + space + desc, so name+desc filling 23 cols lands
+        // the header exactly on the inner width.
+        let inner = 30usize - BOX_CHROME;
+        let budget = inner - STATUS_INDICATOR_WIDTH; // marker column
+        let name = "n".repeat(8);
+        let desc = "d".repeat(budget - name.len() - 1); // -1 for the space
+        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+        t.push(TranscriptItem::ToolResult {
+            name,
+            summary: desc,
+            is_error: false,
+            key_arg: None,
+        });
+        assert_every_box_row_is_exactly_width(&t, Toggles::default(), &[30]);
+    }
+
+    /// Renders `store_with_a_tool_run` through BOTH the committed path (a
+    /// `blit_slice` into a bare buffer) and the pending path (the SAME
+    /// `grouped_rows` fold, drawn `CONTENT_MARGIN` in, top-aligned) into two
+    /// same-size buffers, so a caller can compare them glyph- and cell-wise.
+    fn committed_and_pending_tool_group_buffers() -> (Buffer, Buffer, u16, u16) {
+        let t = store_with_a_tool_run();
+        let items: Vec<TranscriptItem> = t.items().to_vec();
+        let count = items.len();
+        let width: u16 = 60;
+        let content_width = width - 2 * CONTENT_MARGIN;
+
+        let mut cache = RenderCache::new();
+        cache.sync(&t, Toggles::default(), content_width, theme::dark());
+
+        // (a) The committed slice `[0, count)` blitted into a bare buffer.
+        let height = slice_height(&cache, &items, 0, count, content_width);
+        let mut committed_buf = Buffer::empty(Rect::new(0, 0, width, height));
+        blit_slice(&mut committed_buf, &cache, &items, 0, count);
+
+        // (b) The pending body's line assembly (`grouped_rows`, the SAME fold),
+        // drawn CONTENT_MARGIN in and top-aligned into a same-size buffer.
+        let lines = grouped_rows(&cache, &items, 0, content_width, theme::dark());
+        let mut pending_buf = Buffer::empty(Rect::new(0, 0, width, height));
+        Paragraph::new(lines).wrap(Wrap { trim: false }).render(
+            Rect::new(CONTENT_MARGIN, 0, content_width, height),
+            &mut pending_buf,
+        );
+
+        (committed_buf, pending_buf, width, height)
+    }
+
+    #[test]
+    fn a_committed_tool_group_is_byte_and_style_identical_to_the_pending_one() {
+        // The committed==pending identity (ADR-0046) over a tool GROUP: BOTH
+        // paths assemble the settled tail through the SAME `grouped_rows` fold,
+        // so a group is identical live vs frozen - and the guarantee is a STYLE
+        // identity, not just a glyph one. Assert (a) the glyph text matches
+        // byte-for-byte, then (b) every cell's symbol AND full style (fg/bg/
+        // modifier) matches, so a colour/modifier-only divergence still fails.
+        let (committed_buf, pending_buf, width, height) =
+            committed_and_pending_tool_group_buffers();
+
+        assert_eq!(
+            commit_buffer_text(&committed_buf),
+            commit_buffer_text(&pending_buf),
+            "committed and pending render the tool group identically"
+        );
+
+        for y in 0..height {
+            for x in 0..width {
+                let c = committed_buf.cell((x, y)).expect("committed cell");
+                let p = pending_buf.cell((x, y)).expect("pending cell");
+                assert_eq!(
+                    (c.symbol(), c.style().fg, c.style().bg, c.modifier),
+                    (p.symbol(), p.style().fg, p.style().bg, p.modifier),
+                    "committed vs pending diverge at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    // The fg colour of an item's FIRST span (the prefix glyph): the role a Phase-2
+    // committed prefix wears. Asserted against the style HELPERS (not raw hexes) so
+    // the Phase-7 slot remap moves in lockstep.
+    fn first_span_fg(item: &TranscriptItem) -> Option<Color> {
+        message_lines(item, false, 40, theme::dark())[0].spans[0]
+            .style
+            .fg
+    }
+
+    #[test]
+    fn each_committed_prefix_wears_its_colour_role() {
+        let theme = theme::dark();
+        // User `>` and Assistant `✦` are both `text.accent` (accent_style).
+        assert_eq!(
+            first_span_fg(&TranscriptItem::User { text: "hi".into() }),
+            accent_style(theme).fg
+        );
+        assert_eq!(
+            first_span_fg(&TranscriptItem::Assistant { text: "hi".into() }),
+            accent_style(theme).fg
+        );
+        // Info `●` is `text.primary` (primary_style - the `foreground` slot, ADR-0008).
+        assert_eq!(
+            first_span_fg(&TranscriptItem::Info {
+                text: "note".into()
+            }),
+            primary_style(theme).fg
+        );
+        // Settled Thinking `✦` is grey `text.secondary` (thinking/secondary_style).
+        assert_eq!(
+            first_span_fg(&TranscriptItem::Thinking {
+                text: "pondering".into()
+            }),
+            secondary_style(theme).fg
+        );
+        // And the roles are genuinely distinct where the slots differ: accent != grey.
+        assert_ne!(accent_style(theme).fg, secondary_style(theme).fg);
+    }
+
+    #[test]
+    fn the_phase_7_role_helpers_read_their_dedicated_slots() {
+        // Phase 7 (ADR-0008/0053) carved four qwen roles into real slots; each
+        // helper now reads its OWN slot, no longer a borrowed neighbour. Pinned
+        // against the slot value (a hex the theme drift test also guards), so a
+        // regression to the old borrow surfaces here.
+        let theme = theme::dark();
+        assert_eq!(accent_style(theme).fg, Some(tui_color(theme.accent)));
+        assert_eq!(success_style(theme).fg, Some(tui_color(theme.success)));
+        assert_eq!(warning_style(theme).fg, Some(tui_color(theme.warning)));
+        assert_eq!(primary_style(theme).fg, Some(tui_color(theme.foreground)));
+        // Purple accent, lime success, gold warning, real foreground - the
+        // QwenDark hexes, and distinct from the slots they used to borrow.
+        assert_eq!(accent_style(theme).fg, Some(Color::Rgb(0xD2, 0xA6, 0xFF)));
+        assert_eq!(success_style(theme).fg, Some(Color::Rgb(0xAA, 0xD9, 0x4C)));
+        assert_eq!(warning_style(theme).fg, Some(Color::Rgb(0xFF, 0xD7, 0x00)));
+        assert_eq!(primary_style(theme).fg, Some(Color::Rgb(0xbf, 0xbd, 0xb6)));
+        assert_ne!(accent_style(theme).fg, Some(tui_color(theme.prompt_gutter)));
+        assert_ne!(success_style(theme).fg, Some(tui_color(theme.added)));
+        assert_ne!(warning_style(theme).fg, Some(tui_color(theme.marker_aid)));
+    }
+
+    // --- render_pending (ADR-0046): bottom-anchor + top-clip -----------------
+
+    /// Draws one full inline pending frame (transcript body + status +
+    /// composer) for the given screen into a fresh `width`x`height` terminal.
+    fn draw_pending(width: u16, height: u16, screen: &Screen) -> Terminal<TestBackend> {
+        let mut cache = RenderCache::new();
+        let conn = ConnectionFacts {
+            base_url: "http://test".into(),
+            model: "m".into(),
+        };
+        draw_frame(width, height, |f| {
+            render_pending(
+                f,
+                screen,
+                &mut cache,
+                FrameCtx {
+                    conn: conn.view(),
+                    anim: Anim::default(),
+                    theme: theme::dark(),
+                },
+            );
+        })
+    }
+
+    // --- composer chrome (ADR-0048): top rule, prompt, bottom border, cursor --
+
+    // The correctness-critical +1 (Risk #1): the draft sits BELOW the top dash
+    // rule, so the terminal cursor y is the zone top plus one rule row plus the
+    // cursor row offset. A one-line draft at column 3 lands at y = zone.y + 1.
+    #[test]
+    fn composer_cursor_sits_one_row_below_the_top_rule() {
+        // A zone of height 4 (top rule + 1 draft row + bottom border + spare):
+        // "abc" with the cursor after it.
+        let layout = composer::layout("abc", 3, 40);
+        assert_eq!(layout.cursor_row, 0);
+        let zone = Rect::new(0, 5, 40, 4);
+        let screen = Screen::new(ScreenOpts::default());
+        let mut terminal = draw_frame(40, 12, |f| {
+            render_composer(f, zone, &screen, &layout, theme::dark());
+        });
+        let cursor = terminal.get_cursor_position().expect("cursor placed");
+        // x: zone.x + 2 (the `> ` prompt) + cursor_col(3) = 5.
+        assert_eq!(cursor.x, 5, "cursor x past the `> ` prompt");
+        // y: zone.y(5) + 1 (top rule) + cursor_row(0) = 6.
+        assert_eq!(cursor.y, 6, "cursor y is one row below the top rule");
+    }
+
+    #[test]
+    fn composer_draws_the_top_rule_prompt_and_bottom_border() {
+        let layout = composer::layout("hello", 5, 40);
+        let zone = Rect::new(0, 0, 40, 4);
+        let screen = Screen::new(ScreenOpts::default());
+        let terminal = draw_frame(40, 4, |f| {
+            render_composer(f, zone, &screen, &layout, theme::dark());
+        });
+        // Row 0 is the full-width top dash rule.
+        assert_eq!(row_text(&terminal, 0), "─".repeat(40));
+        // Row 1 is the draft under the `> ` prompt.
+        assert!(row_text(&terminal, 1).starts_with("> hello"));
+        // The last row is the bottom border.
+        assert_eq!(row_text(&terminal, 3), "─".repeat(40));
+    }
+
+    #[test]
+    fn composer_shows_the_placeholder_when_the_draft_is_empty() {
+        let layout = composer::layout("", 0, 40);
+        assert!(composer_is_empty(&layout));
+        let zone = Rect::new(0, 0, 40, 4);
+        let screen = Screen::new(ScreenOpts::default());
+        let terminal = draw_frame(40, 4, |f| {
+            render_composer(f, zone, &screen, &layout, theme::dark());
+        });
+        assert!(
+            row_text(&terminal, 1).contains("Type your message or @path/to/file"),
+            "placeholder row: {:?}",
+            row_text(&terminal, 1)
+        );
+    }
+
+    // The zone height accounts for the two chrome rows on top of the draft rows
+    // (Risk #1: the +2 must match `render_composer`'s reservations exactly).
+    #[test]
+    fn capped_composer_height_reserves_the_two_chrome_rows() {
+        let one_line = composer::layout("hi", 2, 40);
+        assert_eq!(one_line.rows.len(), 1);
+        // 1 draft row + 2 chrome = 3.
+        assert_eq!(capped_composer_height(&one_line, 30), 3);
+    }
+
+    // A short pending stack is anchored to the BOTTOM of its zone: the top rows
+    // of the body zone are blank and the content sits just above the status bar.
+    #[test]
+    fn render_pending_bottom_anchors_a_short_stack() {
+        // A fresh screen: only the greeting Info line is pending.
+        let screen = Screen::new(ScreenOpts::default());
+        let terminal = draw_pending(60, 12, &screen);
+
+        // The greeting wraps to a few rows and anchors to the BOTTOM of the
+        // body zone, so the top rows are blank and the content sits low. Find
+        // the first non-blank body row: it must be past the top of the zone.
+        let first_content = (0..10)
+            .find(|&y| !row_text(&terminal, y).trim().is_empty())
+            .expect("some content drew");
+        assert!(
+            first_content > 0,
+            "the top of the body zone is blank (bottom-anchored); first content at row {first_content}"
+        );
+        // The greeting text is present in the drawn body.
+        assert!(
+            buffer_text(&terminal).contains("suspenders ready"),
+            "the greeting drew in the body"
+        );
+    }
+
+    // An overflowing pending stack is top-clipped: the NEWEST rows survive and
+    // the oldest drop off the top (qwen's overflowDirection:"top"), with the
+    // `… Ctrl-S to show more` marker on the top row.
+    #[test]
+    fn render_pending_top_clips_an_overflowing_stack() {
+        // Many notice lines overflow a short terminal.
+        let screen = Screen::new(ScreenOpts {
+            notices: (1..=40).map(|i| format!("notice-{i:02}")).collect(),
+            ..ScreenOpts::default()
+        });
+        let terminal = draw_pending(40, 10, &screen);
+        let text = buffer_text(&terminal);
+
+        // The newest notice is on screen; the oldest scrolled off the top.
+        assert!(text.contains("notice-40"), "newest kept:\n{text}");
+        assert!(
+            !text.contains("notice-01"),
+            "oldest clipped off the top:\n{text}"
+        );
+        // The overflow marker is on the top row of the body zone (ADR-0046).
+        assert!(
+            text.contains("Ctrl-S to show more"),
+            "the overflow marker draws:\n{text}"
+        );
+    }
+
+    // 4-zone starvation (Risk #1): a frame so short that a VISIBLE sticky box +
+    // the status row + the composer cannot all fit leaves the body `Min(1)` with
+    // no room. `frame_chunks` must still return four rects that tile the area
+    // without over-running it, and Layout keeps at least the `Min(1)` body at the
+    // expense of the fixed zones - the layout never panics or produces an
+    // off-frame rect.
+    #[test]
+    fn frame_chunks_starved_by_a_sticky_box_never_over_runs_the_frame() {
+        // A 6-row frame with a 6-row sticky box + 1 status + 3 composer wants 10
+        // rows: the fixed zones alone exceed the frame, so Layout must shrink them.
+        let area = Rect::new(0, 0, 40, 6);
+        let chunks = frame_chunks(area, 6, 3);
+        assert_eq!(chunks.len(), 4);
+        // Every zone stays inside the frame (no off-frame y/height).
+        for zone in chunks.iter() {
+            assert!(
+                zone.y >= area.y && zone.bottom() <= area.bottom(),
+                "zone {zone:?} ran off the frame {area:?}"
+            );
+        }
+        // The zones tile the frame top-to-bottom with no gap or overlap.
+        assert_eq!(chunks[0].y, area.y);
+        assert_eq!(chunks[0].bottom(), chunks[1].y);
+        assert_eq!(chunks[1].bottom(), chunks[2].y);
+        assert_eq!(chunks[2].bottom(), chunks[3].y);
+        assert_eq!(chunks[3].bottom(), area.bottom());
+        // The body keeps at least its `Min(1)` row (Layout honours Min over the
+        // Length zones when starved).
+        assert!(chunks[0].height >= 1, "the body kept >= 1 row: {chunks:?}");
+    }
+
+    // The full 4-zone render at tiny heights must never panic (the composer's
+    // `area.height - COMPOSER_CHROME_ROWS` underflow is the trap) and must keep
+    // any placed cursor ON the frame. Sweeps the smallest heights where the fixed
+    // zones fight the body.
+    #[test]
+    fn render_pending_at_tiny_heights_never_panics_and_keeps_the_cursor_on_frame() {
+        let screen = Screen::new(ScreenOpts {
+            notices: (1..=6).map(|i| format!("notice-{i}")).collect(),
+            ..ScreenOpts::default()
+        });
+        for height in 1..=8 {
+            let mut terminal = draw_pending(40, height, &screen);
+            // If a cursor was placed, it must be within the frame bounds.
+            if let Ok(pos) = terminal.get_cursor_position() {
+                assert!(
+                    pos.x < 40 && pos.y < height,
+                    "cursor {pos:?} off a {height}-row frame"
+                );
+            }
+        }
     }
 
     /// Draws a composer overlay popup on a 40x12 test terminal with the standard
@@ -4890,205 +7599,326 @@ mod tests {
         })
     }
 
-    // --- render_composer_popup: the overlay variants ------------------------
+    // --- render_composer_popup: System B (`/` palette) ----------------------
+
+    fn suggestion(
+        label: &str,
+        value: &str,
+        desc: &str,
+        matched: Option<(usize, usize)>,
+    ) -> completion::Suggestion {
+        completion::Suggestion {
+            label: label.to_string(),
+            value: value.to_string(),
+            description: desc.to_string(),
+            matched,
+        }
+    }
+
+    fn palette(suggestions: Vec<completion::Suggestion>, active: usize) -> OverlayView {
+        palette_expanded(suggestions, active, false)
+    }
+
+    fn palette_expanded(
+        suggestions: Vec<completion::Suggestion>,
+        active: usize,
+        expanded: bool,
+    ) -> OverlayView {
+        OverlayView::Menu {
+            suggestions,
+            active,
+            scroll: 0,
+            query: "m".to_string(),
+            expanded,
+        }
+    }
 
     #[test]
-    fn the_menu_popup_titles_commands_and_lists_the_rows_with_hints() {
-        let view = OverlayView::Menu {
-            rows: vec![
-                SelectorRow::new("model", "/model", Some("pick the model".to_string())),
-                SelectorRow::new("clear", "/clear", None),
+    fn the_palette_lists_two_columns_command_and_description() {
+        let view = palette(
+            vec![
+                suggestion("model", "model", "pick the model", Some((0, 1))),
+                suggestion("theme", "theme", "pick the theme", None),
             ],
-            highlight: 0,
-        };
+            0,
+        );
         let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" commands "), "bordered title:\n{text}");
-        assert!(text.contains("/model"));
-        assert!(text.contains("pick the model"), "the hint rides its row");
-        assert!(text.contains("/clear"));
+        assert!(text.contains("model"));
+        assert!(text.contains("pick the model"), "description column");
+        assert!(text.contains("theme"));
+    }
+
+    // --- PrepareLabel: MAX_WIDTH collapse/expand (qwen) ---------------------
+
+    #[test]
+    fn prepare_label_leaves_a_short_label_whole() {
+        // Below MAX_WIDTH the label is untouched (no match).
+        let (before, matched, after) = prepare_label("model", None, false);
+        assert_eq!(
+            (before, matched, after),
+            ("model".into(), "".into(), "".into())
+        );
     }
 
     #[test]
-    fn the_menu_popup_reverses_the_highlighted_row() {
-        let view = OverlayView::Menu {
-            rows: vec![
-                SelectorRow::new("model", "/model", None),
-                SelectorRow::new("clear", "/clear", None),
+    fn prepare_label_splits_a_short_label_at_its_match() {
+        // A contiguous match window splits into before/matched/after (qwen
+        // Case 1 - the label already fits).
+        let (before, matched, after) = prepare_label("model", Some((0, 3)), false);
+        assert_eq!(before, "");
+        assert_eq!(matched, "mod");
+        assert_eq!(after, "el");
+    }
+
+    #[test]
+    fn prepare_label_truncates_a_long_label_until_expanded() {
+        let long: String = std::iter::repeat_n('x', completion::MAX_WIDTH + 40).collect();
+        // Collapsed: truncated to MAX_WIDTH chars + "..." (qwen no-match branch).
+        let (before, _, _) = prepare_label(&long, None, false);
+        assert_eq!(before.chars().count(), completion::MAX_WIDTH + 3);
+        assert!(before.ends_with("..."));
+        // Expanded: the full label, untouched.
+        let (before, _, _) = prepare_label(&long, None, true);
+        assert_eq!(before, long);
+    }
+
+    #[test]
+    fn prepare_label_windows_a_long_label_around_its_match_with_elisions() {
+        // A long label with a short match mid-string collapses to a window
+        // centred on the match, `...`-elided at the clipped ends (qwen Case 3).
+        let long: String = std::iter::repeat_n('x', completion::MAX_WIDTH * 2).collect();
+        let mid = completion::MAX_WIDTH; // match sits in the middle
+        let (before, matched, after) = prepare_label(&long, Some((mid, mid + 3)), false);
+        assert_eq!(matched, "xxx", "the match stays whole");
+        assert!(before.starts_with("..."), "left elision: {before:?}");
+        assert!(after.ends_with("..."), "right elision: {after:?}");
+        // The whole window fits MAX_WIDTH.
+        let total = before.chars().count() + matched.chars().count() + after.chars().count();
+        assert!(total <= completion::MAX_WIDTH, "window bounded: {total}");
+    }
+
+    #[test]
+    fn a_long_active_row_shows_the_expand_affordance() {
+        let long: String = std::iter::repeat_n('x', completion::MAX_WIDTH + 5).collect();
+        // Collapsed active long row: ` → ` affordance.
+        let collapsed = palette_expanded(vec![suggestion(&long, "cmd", "", None)], 0, false);
+        assert!(
+            buffer_text(&draw_popup(&collapsed)).contains('→'),
+            "collapsed long active row shows →"
+        );
+        // Expanded active long row: ` ← ` affordance.
+        let expanded = palette_expanded(vec![suggestion(&long, "cmd", "", None)], 0, true);
+        assert!(
+            buffer_text(&draw_popup(&expanded)).contains('←'),
+            "expanded long active row shows ←"
+        );
+        // A SHORT active row shows no affordance.
+        let short = palette_expanded(vec![suggestion("model", "model", "", None)], 0, false);
+        let text = buffer_text(&draw_popup(&short));
+        assert!(
+            !text.contains('→') && !text.contains('←'),
+            "short row: no affordance"
+        );
+    }
+
+    #[test]
+    fn the_palette_active_row_is_accent_others_secondary_no_marker() {
+        let view = palette(
+            vec![
+                suggestion("model", "model", "", None),
+                suggestion("theme", "theme", "", None),
             ],
-            highlight: 1,
-        };
+            1,
+        );
         let terminal = draw_popup(&view);
-        // Geometry: 2 body rows + borders = height 4, anchored above row 10,
-        // so the body sits at rows 7-8; the popup is inset one column and the
-        // border one more, so row text starts at x = 2.
-        assert!(row_text(&terminal, 8).contains("/clear"));
-        assert!(cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED));
-        assert!(!cell_modifier(&terminal, 2, 7).contains(Modifier::REVERSED));
+        // 2 body rows + borders = height 4, anchored above row 10 → rows 7-8,
+        // text from x = 2. System B has NO `›` marker and NO number, so the
+        // first cell IS the label's first glyph.
+        assert_eq!(
+            cell_char(&terminal, 2, 8),
+            't',
+            "no gutter before the label"
+        );
+        let accent = tui_color(theme::dark().accent);
+        let secondary = tui_color(theme::dark().muted);
+        assert_eq!(cell_fg(&terminal, 2, 8), Some(accent), "active row accent");
+        assert_eq!(
+            cell_fg(&terminal, 2, 7),
+            Some(secondary),
+            "inactive secondary"
+        );
     }
 
     #[test]
-    fn an_empty_menu_popup_shows_no_matches() {
-        let view = OverlayView::Menu {
-            rows: vec![],
-            highlight: 0,
-        };
+    fn the_palette_match_substring_is_inverted() {
+        // "/m" matches "model" at [0,1): the leading 'm' draws REVERSED.
+        let view = palette(vec![suggestion("model", "model", "", Some((0, 1)))], 0);
+        let terminal = draw_popup(&view);
+        // One body row + borders = height 3 above row 10 → row 8, text x = 2.
+        assert!(
+            cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED),
+            "the match is inverted"
+        );
+        assert!(
+            !cell_modifier(&terminal, 3, 8).contains(Modifier::REVERSED),
+            "the rest is not"
+        );
+    }
+
+    #[test]
+    fn an_empty_palette_shows_no_matches() {
+        let view = palette(vec![], 0);
         assert!(buffer_text(&draw_popup(&view)).contains("no matches"));
     }
 
     #[test]
-    fn a_loading_selector_popup_shows_the_loading_line() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Loading,
-            rows: vec![],
-            highlight: 0,
+    fn the_palette_shows_arrows_and_a_counter_when_it_overflows() {
+        // More than MAX_SUGGESTIONS rows, scrolled one down: a ▲ above, a ▼
+        // below, and an (active/total) counter.
+        let suggestions: Vec<_> = (0..MAX_SUGGESTIONS + 3)
+            .map(|i| suggestion(&format!("cmd{i}"), &format!("cmd{i}"), "", None))
+            .collect();
+        let view = OverlayView::Menu {
+            suggestions,
+            active: 3,
+            scroll: 1,
+            query: "c".to_string(),
+            expanded: false,
         };
+        let terminal = draw_frame(40, 20, |f| {
+            render_composer_popup(f, 18, f.area(), &view, theme::dark())
+        });
+        let text = buffer_text(&terminal);
+        assert!(text.contains('▲'), "scroll-up arrow:\n{text}");
+        assert!(text.contains('▼'), "scroll-down arrow");
+        assert!(
+            text.contains(&format!("(4/{})", MAX_SUGGESTIONS + 3)),
+            "the (n/m) counter:\n{text}"
+        );
+    }
+
+    // --- render_composer_popup: System A (numbered `›` dialog) --------------
+
+    fn dialog(
+        command: &str,
+        status: OverlayStatus,
+        rows: Vec<SelectorRow>,
+        active: usize,
+    ) -> OverlayView {
+        OverlayView::Dialog {
+            command: command.to_string(),
+            status,
+            rows,
+            active,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn a_loading_dialog_shows_the_loading_line() {
+        let view = dialog("model", OverlayStatus::Loading, vec![], 0);
         let text = buffer_text(&draw_popup(&view));
-        assert!(text.contains(" models "), "selector title:\n{text}");
+        assert!(text.contains(" models "), "dialog title:\n{text}");
         assert!(text.contains("loading models…"));
     }
 
     #[test]
-    fn a_failed_selector_popup_shows_the_failure_message() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Failed("connection refused".to_string()),
-            rows: vec![],
-            highlight: 0,
-        };
+    fn a_failed_dialog_shows_the_failure_message() {
+        let view = dialog(
+            "model",
+            OverlayStatus::Failed("connection refused".to_string()),
+            vec![],
+            0,
+        );
         assert!(buffer_text(&draw_popup(&view)).contains("failed: connection refused"));
     }
 
     #[test]
-    fn a_ready_selector_popup_lists_the_model_rows() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows: vec![
+    fn a_ready_dialog_lists_numbered_rows_with_the_marker() {
+        let view = dialog(
+            "model",
+            OverlayStatus::Ready,
+            vec![
                 SelectorRow::new("a", "qwen/qwen3-30b", None),
                 SelectorRow::new("b", "meta/llama-3.1", None),
             ],
-            highlight: 0,
-        };
+            0,
+        );
         let text = buffer_text(&draw_popup(&view));
         assert!(text.contains(" models "));
+        assert!(
+            text.contains(SELECTION_MARKER),
+            "the `›` marker on the active row"
+        );
+        assert!(text.contains("1."), "numbered rows");
         assert!(text.contains("qwen/qwen3-30b"));
         assert!(text.contains("meta/llama-3.1"));
     }
 
     #[test]
-    fn a_collapsed_row_draws_muted_without_the_headers_bold() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows: vec![
+    fn a_dialog_header_row_is_dim_and_unnumbered() {
+        let view = dialog(
+            "model",
+            OverlayStatus::Ready,
+            vec![
                 SelectorRow::header("openrouter"),
-                SelectorRow::collapsed("openrouter/kimi-k2"),
+                SelectorRow::new("openrouter/kimi-k2", "openrouter/kimi-k2", None),
             ],
-            highlight: 0,
-        };
-        let terminal = draw_popup(&view);
-        // Geometry as above: 2 body rows + borders = height 4 above row 10,
-        // so the header sits at row 7 and the collapsed row at 8, text from
-        // x = 2.
-        assert!(cell_modifier(&terminal, 2, 7).contains(Modifier::BOLD));
-        assert!(
-            !cell_modifier(&terminal, 2, 8).contains(Modifier::BOLD),
-            "a collapsed member reads as a greyed model, not a header"
+            1,
         );
-        let buf = terminal.backend().buffer();
-        let header_fg = buf.cell((2u16, 7u16)).expect("header cell").style().fg;
-        let collapsed_fg = buf.cell((2u16, 8u16)).expect("collapsed cell").style().fg;
-        assert_eq!(collapsed_fg, header_fg, "both muted");
-    }
-
-    #[test]
-    fn a_highlighted_note_draws_reversed_like_the_cursor_stop_it_is() {
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows: vec![
-                SelectorRow::header("openrouter"),
-                SelectorRow::note("  unavailable", Some("set OPENROUTER_API_KEY".into())),
-            ],
-            highlight: 1,
-        };
         let terminal = draw_popup(&view);
-        // Geometry as above: body rows 7 (header) and 8 (note), text at x = 2.
-        assert!(
-            !cell_modifier(&terminal, 2, 7).contains(Modifier::REVERSED),
-            "the cursor can never rest on a header"
-        );
-        assert!(cell_modifier(&terminal, 2, 8).contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn a_capped_group_fits_the_popup_window_when_its_note_is_highlighted() {
-        use crate::ui::selector::{COLLAPSED_REVEAL_CAP, Selector};
-        use crate::view_model::RowRole;
-
-        // The reachability contract behind note-last ordering and the cap:
-        // the popup window shows POPUP_MAX_ROWS body rows ending at the
-        // highlight (composer::first_visible_row), and a fully-capped group
-        // is header + COLLAPSED_REVEAL_CAP rows + note - so the cursor
-        // resting on the trailing note pulls the whole group into view.
-        let mut rows = vec![SelectorRow::header("openrouter")];
-        rows.extend((0..300).map(|i| SelectorRow::collapsed(format!("openrouter/m{i:03}"))));
-        rows.push(SelectorRow::note(
-            "  unavailable",
-            Some("set OPENROUTER_API_KEY".into()),
-        ));
-        let s = Selector::new(rows);
-        let highlight = s.highlight("openrouter");
-        let view = s.filtered("openrouter");
+        // Body rows 7 (header) and 8 (member), inset text from x = 2. The
+        // header draws a blank gutter + blank number field, so its label sits
+        // further right; the active member (row 1) carries the `›` marker.
+        assert_ne!(cell_char(&terminal, 2, 7), '›', "the header has no marker");
         assert_eq!(
-            view[highlight].row.role,
-            RowRole::Note,
-            "snapped to the note"
+            cell_char(&terminal, 2, 8),
+            '›',
+            "the active member is marked"
         );
-        assert_eq!(view.len(), 1 + COLLAPSED_REVEAL_CAP + 1);
-        assert!(view.len() <= POPUP_MAX_ROWS as usize);
-        let top = composer::first_visible_row(highlight, POPUP_MAX_ROWS as usize);
-        assert_eq!(top, 0, "the group's header is the window's first row");
+        // The header label ("openrouter") reads dim (secondary) wherever it
+        // starts - find its first glyph on the row.
+        let header_row = row_text(&terminal, 7);
+        let col = header_row.find('o').expect("the header label") as u16;
+        let secondary = tui_color(theme::dark().muted);
+        assert_eq!(
+            cell_fg(&terminal, col, 7),
+            Some(secondary),
+            "the header is dim"
+        );
     }
 
     #[test]
-    fn the_selector_popup_titles_itself_after_its_command() {
-        // The title pluralizes the opaque command name, so /theme's selector
+    fn the_dialog_titles_itself_after_its_command() {
+        // The title pluralizes the opaque command name, so /theme's dialog
         // reads " themes " without the renderer knowing any command.
-        let view = OverlayView::Selector {
-            command: "theme".to_string(),
-            status: OverlayStatus::Loading,
-            rows: vec![],
-            highlight: 0,
-        };
+        let view = dialog("theme", OverlayStatus::Loading, vec![], 0);
         let text = buffer_text(&draw_popup(&view));
-        assert!(text.contains(" themes "), "selector title:\n{text}");
+        assert!(text.contains(" themes "), "dialog title:\n{text}");
         assert!(text.contains("loading themes…"));
     }
 
     #[test]
-    fn the_popup_scrolls_the_highlighted_row_into_view() {
-        // 20 rows against the POPUP_MAX_ROWS cap: highlighting the last row
-        // must scroll the top rows out and bring it on screen.
+    fn the_dialog_scrolls_the_active_row_into_view() {
+        // 20 rows against the POPUP_MAX_ROWS cap: an active row at the bottom
+        // scrolls the top rows out and brings it on screen.
         let rows: Vec<SelectorRow> = (0..20)
             .map(|i| SelectorRow::new(format!("m{i}"), format!("model-{i:02}"), None))
             .collect();
-        let view = OverlayView::Selector {
-            command: "model".to_string(),
-            status: OverlayStatus::Ready,
-            rows,
-            highlight: 19,
-        };
+        let view = dialog("model", OverlayStatus::Ready, rows, 19);
         let terminal = draw_frame(40, 14, |f| {
             render_composer_popup(f, 12, f.area(), &view, theme::dark())
         });
         let text = buffer_text(&terminal);
-        assert!(text.contains("model-19"), "highlight scrolled into view");
+        assert!(
+            text.contains("model-19"),
+            "the active row scrolled into view"
+        );
         assert!(!text.contains("model-00"), "the top rows scrolled out");
     }
 
-    // --- render_viewport: geometry, the scrollbar gutter, streaming ---------
+    // --- pending body: layout, margins, streaming ---------------------------
 
     fn screen_with_notices(notices: Vec<String>) -> Screen {
         Screen::new(ScreenOpts {
@@ -5120,8 +7950,8 @@ mod tests {
         let terminal = draw_viewport(100, 70, &screen);
         let mut out = String::from("\n");
         for y in 0..70 {
-            // Bracket the leftmost 2 gutter columns so the spine / caret / blank
-            // is unambiguous, then the content.
+            // Bracket the leftmost 2 margin columns (qwen `marginLeft:2`,
+            // ADR-0046) so the left margin is unambiguous, then the content.
             let row = row_text(&terminal, y);
             let split = row.char_indices().nth(2).map_or(row.len(), |(i, _)| i);
             let (gutter, rest) = row.split_at(split);
@@ -5131,18 +7961,18 @@ mod tests {
     }
 
     // The non-interactive smoke for the `diff-demo` binary: the seeded
-    // `Screen::demo_diffs()` renders through the real viewport path (the same
-    // `render_viewport` a live frame uses) without panicking, in BOTH fold
-    // states - collapsed (each diff a fold-title one-liner, the app's default)
-    // and expanded (Ctrl-O / the binary's `o` key: the code rows and the elided
-    // tail). The binary only adds the terminal lifecycle on top of this render.
+    // `Screen::demo_diffs()` renders through the real pending-body path (the same
+    // one a live inline frame uses) without panicking, in BOTH diff-fold states -
+    // the default EXPANDED body (qwen `!compactMode`, the app's default) and the
+    // compact fold (Ctrl+O / the binary's `o` key: each diff a fold-title
+    // one-liner). The binary only adds the terminal lifecycle on top of this.
     #[test]
     fn the_diff_demo_screen_renders_its_diffs_without_panicking() {
-        // Collapsed (default): the lane opens and each diff shows its fold title.
-        let collapsed = buffer_text(&draw_viewport(100, 70, &Screen::demo_diffs()));
+        // Default (compact=false): the titles AND the code rows / elided tail.
+        let expanded = buffer_text(&draw_viewport(100, 70, &Screen::demo_diffs()));
         assert!(
-            collapsed.contains("clean up the tokenizer"),
-            "the request:\n{collapsed}"
+            expanded.contains("clean up the tokenizer"),
+            "the request:\n{expanded}"
         );
         for title in [
             "edit_file src/lexer.rs",
@@ -5150,12 +7980,8 @@ mod tests {
             "package.json",
             "src/generated.js",
         ] {
-            assert!(collapsed.contains(title), "the {title} title:\n{collapsed}");
+            assert!(expanded.contains(title), "the {title} title:\n{expanded}");
         }
-
-        // Expanded (Ctrl-O): the code rows and the capped diff's elision tail.
-        let (expanded_screen, _) = Screen::demo_diffs().handle_key(Key::ToggleTools);
-        let expanded = buffer_text(&draw_viewport(100, 70, &expanded_screen));
         assert!(
             expanded.contains("split_whitespace"),
             "the rust hunk body:\n{expanded}"
@@ -5165,119 +7991,148 @@ mod tests {
             "the jsdoc body:\n{expanded}"
         );
         assert!(
-            expanded.contains("37 more lines"),
+            expanded.contains("37 lines hidden"),
             "the elided tail:\n{expanded}"
         );
-    }
 
-    #[test]
-    fn the_demo_render_matches_the_confirmed_collapsed_run_shape() {
-        // The demo is the living spec (ADR-0040): pin the load-bearing rows of
-        // the confirmed collapsed-run shape so a regression trips here, not only
-        // in a manual dump. Rows are `(gutter, content)` where gutter is the
-        // leftmost LANE_GUTTER columns.
-        let terminal = draw_viewport(100, 70, &Screen::demo());
-        let split = |y: u16| -> (String, String) {
-            let row = row_text(&terminal, y);
-            let at = row.char_indices().nth(2).map_or(row.len(), |(i, _)| i);
-            let (g, r) = row.split_at(at);
-            (g.to_string(), r.trim_end().to_string())
-        };
-        // The user prompt breaks to the caret at the margin.
-        assert_eq!(split(2), ("› ".into(), "evaluate this project".into()));
-        // Assistant text is flush under the spine.
-        assert_eq!(split(3).0, "│ ");
-        assert!(split(3).1.starts_with("I'll evaluate this project"));
-        // The lane's thoughts fold to ONE header - the LAST thought's text -
-        // flush under the spine.
-        assert_eq!(
-            split(5),
-            (
-                "│ ".into(),
-                "✦ thought: Let me check the build health and test coverage.".into()
-            )
-        );
-        // The windowed-out machinery collapses to a `⋯ N earlier actions` count,
-        // indented two columns.
-        assert_eq!(
-            split(6),
-            ("│ ".into(), "  ⋯ 6 earlier actions · ^O expand".into())
-        );
-        // A governing marker indents two columns; its wrapped continuation stays
-        // indented (task 1: the wrap-indent fix).
-        assert_eq!(split(7).0, "│ ");
-        assert!(split(7).1.starts_with("  » [reading file after file"));
-        assert_eq!(split(8).0, "│ ");
+        // Compact (Ctrl+O): the diff bodies fold away to their fold titles - the
+        // code rows are gone, but the titles stay.
+        let (compact_screen, _) = Screen::demo_diffs().handle_key(Key::ToggleCompact);
+        let folded = buffer_text(&draw_viewport(100, 70, &compact_screen));
         assert!(
-            split(8).1.starts_with("  instead;"),
-            "wrapped marker stays indented: {:?}",
-            split(8).1
+            folded.contains("edit_file src/lexer.rs"),
+            "the fold title stays:\n{folded}"
         );
-        // The error tool result breaks out (always shown), indented two columns,
-        // with the ⚙ gutter.
-        assert_eq!(split(14).0, "│ ");
-        assert!(split(14).1.starts_with("  ⚙ run_command"));
-        assert!(split(14).1.contains("command denied"));
-        // Assistant text after the tools is flush again.
-        assert_eq!(split(15).0, "│ ");
-        assert!(split(15).1.starts_with("The project is a well-structured"));
-        // Code breaks out, inset two columns, under the spine.
-        assert_eq!(split(18).0, "│ ");
-        assert!(split(18).1.contains("fn tokenize"));
+        assert!(
+            !folded.contains("split_whitespace"),
+            "the rust hunk body folds away under compact:\n{folded}"
+        );
+    }
+
+    /// The whole demo run rendered through the FULL committed slice (no top-clip,
+    /// qwen `<Static>`), as newline-joined rows - the golden-shape seam these
+    /// tests inspect without the pending body's overflow clip.
+    fn demo_committed_text(width: u16) -> String {
+        let screen = Screen::demo();
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut cache = RenderCache::new();
+        cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            content_width,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+        let count = items.len();
+        let height = slice_height(&cache, &items, 0, count, content_width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
+        blit_slice(&mut buf, &cache, &items, 0, count);
+        commit_buffer_text(&buf)
     }
 
     #[test]
-    fn the_collapsed_lane_spine_is_dense_and_continuous() {
-        // The lane has NO per-item blank separator: every content row of the
-        // run (from the first assistant line through the last) carries the `│`
-        // spine, with no bare gap rows breaking it into segments.
-        let terminal = draw_viewport(100, 70, &Screen::demo());
-        // Rows 3..=24 are the agent's run (assistant, folded thought, machinery,
-        // markers, error, closing assistant + code). Every one starts with the
-        // spine - no blank separator rows interleave the machinery.
-        for y in 3..=14u16 {
-            let row = row_text(&terminal, y);
-            assert!(
-                row.starts_with('│'),
-                "row {y} broke the dense spine: {row:?}"
+    fn the_demo_render_matches_the_confirmed_full_content_run_shape() {
+        // The demo is the living spec (ADR-0046 + qwen v0.16.0 chrome): the
+        // committed slice renders each item in FULL. Pin the load-bearing qwen
+        // prefixes so a reskin regression trips here, not only in a manual dump.
+        let text = demo_committed_text(100);
+        // The user prompt wears the `>` caret; the assistant the `✦` marker.
+        assert!(
+            text.contains("> evaluate this project"),
+            "user caret:\n{text}"
+        );
+        assert!(
+            text.contains("✦ I'll evaluate this project"),
+            "assistant marker:\n{text}"
+        );
+        // The first thought shows (grey `✦`, one-line collapsed).
+        assert!(
+            text.contains("✦ The user wants me to evaluate"),
+            "the first thought shows:\n{text}"
+        );
+        // Tool work is inside a rounded box (qwen `ToolGroupMessage`).
+        assert!(
+            text.contains('╭') && text.contains('╰'),
+            "tool box:\n{text}"
+        );
+        assert!(text.contains("list_files"), "a tool row:\n{text}");
+        // The error tool result reads the `x` ERROR marker.
+        assert!(
+            text.contains("run_command") && text.contains("command denied"),
+            "the error result:\n{text}"
+        );
+        // Assistant closing text + code fence.
+        assert!(
+            text.contains("The project is a well-structured"),
+            "closing text:\n{text}"
+        );
+        assert!(text.contains("fn tokenize"), "code fence:\n{text}");
+    }
+
+    #[test]
+    fn committed_content_stays_within_the_left_margin() {
+        // qwen `marginLeft:2`: every non-blank committed demo row draws two columns
+        // in - no content touches column 0/1 (the retired lane spine is gone,
+        // ADR-0046). Rendered through the full committed slice so the pending
+        // body's overflow marker (which sits at column 0) never confounds it.
+        for (y, row) in demo_committed_text(100).lines().enumerate() {
+            if row.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<char> = row.chars().collect();
+            assert_eq!(
+                (cols[0], cols[1]),
+                (' ', ' '),
+                "row {y} bled into the 2-col left margin: {row:?}"
             );
         }
     }
 
-    #[test]
-    fn the_viewport_draws_the_transcript_and_returns_the_measured_geometry() {
-        let screen = screen_with_notices(vec!["a launch notice".to_string()]);
+    /// Draws the inline pending body with a caller-supplied [`Anim`] (for the
+    /// lull-row test) TOP-aligned, like [`draw_viewport`].
+    fn draw_viewport_anim(
+        width: u16,
+        height: u16,
+        screen: &Screen,
+        anim: Anim,
+    ) -> Terminal<TestBackend> {
         let mut cache = RenderCache::new();
-        let viewport = Viewport::new();
-        let (terminal, geometry) = draw_viewport_with(
-            80,
-            20,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
+        draw_frame(width, height, |f| {
+            let area = f.area();
+            let total = pending_body_height(screen, &mut cache, area.width, theme::dark());
+            let zone_h = (total as u16).min(area.height).max(1);
+            let zone = Rect {
+                height: zone_h,
+                ..area
+            };
+            render_pending_body_at(
+                f,
+                zone,
+                &mut PendingBodyParams {
+                    screen,
+                    cache: &mut cache,
+                    anim,
+                },
+                theme::dark(),
+                0,
+            );
+        })
+    }
+
+    #[test]
+    fn the_pending_body_draws_the_transcript() {
+        let screen = screen_with_notices(vec!["a launch notice".to_string()]);
+        let terminal = draw_viewport(80, 20, &screen);
         let text = buffer_text(&terminal);
         assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
         assert!(text.contains("a launch notice"));
-        let (total_lines, height) = geometry;
-        assert_eq!(height, 20, "height is the drawn area's");
-        assert!(total_lines > 0 && total_lines <= height, "content fits");
-        // Fitting content draws no scrollbar, but the gutter column is still
-        // reserved: the rightmost column stays empty.
-        for y in 0..20 {
-            let row = row_text(&terminal, y);
-            assert_eq!(row.chars().last(), Some(' '), "row {y}: {row:?}");
-        }
     }
 
-    // The lull row draws through the full render path: a Running Run with
-    // nothing streaming, quiet past the settle window, paints the timer into the
-    // buffer as a third live entry under the running lane.
+    // The spinner line draws through the pending render path (ADR-0048): a
+    // Running Run with nothing streaming, quiet past the settle window, paints
+    // the elapsed timer + `esc to cancel` into the buffer as a live entry.
     #[test]
-    fn the_viewport_draws_the_lull_row_when_running_and_quiet() {
+    fn the_pending_body_draws_the_spinner_line_when_running() {
         let (screen, _) = screen_with_notices(vec!["a launch notice".to_string()])
             .apply_event(Event::run_started("r1"));
         assert!(
@@ -5289,212 +8144,30 @@ mod tests {
             lull_seq: 0,
             ..Default::default()
         };
-        let mut cache = RenderCache::new();
-        let viewport = Viewport::new();
-        let (terminal, _) = draw_viewport_with(
-            80,
-            20,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim,
-            },
-        );
+        let terminal = draw_viewport_anim(80, 20, &screen, anim);
         let text = buffer_text(&terminal);
-        assert!(text.contains("5s"), "the lull timer opens at 5s:\n{text}");
+        assert!(text.contains("5s"), "the elapsed opens at 5s:\n{text}");
+        assert!(
+            text.contains("esc to cancel"),
+            "the cancel affordance:\n{text}"
+        );
     }
 
+    // An overflowing pending body top-clips (ADR-0046): the tail (newest) is on
+    // screen and the top is dropped. There is no scrollbar - native scrollback
+    // owns history.
     #[test]
-    fn an_overflowing_transcript_pins_the_tail_and_draws_the_scrollbar() {
+    fn an_overflowing_pending_body_top_clips_and_keeps_the_tail() {
         let notices: Vec<String> = (0..30).map(|i| format!("notice line {i:02}")).collect();
         let screen = screen_with_notices(notices);
-        let viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let (terminal, geometry) = draw_viewport_with(
-            40,
-            8,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
-        let (total_lines, height) = geometry;
-        assert!(total_lines > height, "the content overflows");
+        let terminal = draw_viewport(40, 8, &screen);
         let text = buffer_text(&terminal);
-        // A fresh viewport is pinned: the tail is on screen, the top is not.
+        // The tail is on screen, the top is clipped.
         assert!(text.contains("notice line 29"));
         assert!(!text.contains("notice line 00"));
-        // The reserved gutter now carries scrollbar glyphs.
-        let gutter: Vec<char> = (0..8)
-            .filter_map(|y| row_text(&terminal, y).chars().last())
-            .collect();
-        assert!(
-            gutter.iter().any(|c| *c != ' '),
-            "scrollbar in the gutter: {gutter:?}"
-        );
     }
 
-    #[test]
-    fn lane_gutters_derives_the_spine_from_user_boundaries() {
-        // Before the first User the region is spineless (Blank); a User opens a
-        // lane (User caret) and every item until the next User hangs off it
-        // (Spine). A second User opens a fresh lane. The lane is the request,
-        // not the Run - agent items with no intervening User stay on the spine.
-        let items = vec![
-            TranscriptItem::Info {
-                text: "greeting".into(),
-            },
-            TranscriptItem::User {
-                text: "first".into(),
-            },
-            TranscriptItem::Thinking { text: "hm".into() },
-            TranscriptItem::Assistant {
-                text: "answer".into(),
-            },
-            TranscriptItem::User {
-                text: "second".into(),
-            },
-            TranscriptItem::Assistant {
-                text: "reply".into(),
-            },
-        ];
-        assert_eq!(
-            lane_gutters(&items),
-            vec![
-                GutterKind::Blank,
-                GutterKind::User,
-                GutterKind::Spine,
-                GutterKind::Spine,
-                GutterKind::User,
-                GutterKind::Spine,
-            ]
-        );
-    }
-
-    // ---- run_fold: the rolling-window collapsed run (ADR-0040) -----------
-
-    fn thought(t: &str) -> TranscriptItem {
-        TranscriptItem::Thinking { text: t.into() }
-    }
-    fn tool(name: &str) -> TranscriptItem {
-        TranscriptItem::ToolResult {
-            name: name.into(),
-            summary: "ok".into(),
-            is_error: false,
-            key_arg: None,
-        }
-    }
-    fn tool_err() -> TranscriptItem {
-        TranscriptItem::ToolResult {
-            name: "run".into(),
-            summary: "✗ boom".into(),
-            is_error: true,
-            key_arg: None,
-        }
-    }
-
-    #[test]
-    fn run_fold_headers_the_last_thought_at_the_first_thoughts_slot() {
-        // Collapsed default: the LAST thought's text renders as a header at the
-        // FIRST thought's slot; the intervening thoughts drop.
-        let items = vec![
-            TranscriptItem::User { text: "go".into() },
-            thought("first"),
-            thought("middle"),
-            thought("LAST"),
-        ];
-        let fold = run_fold(&items, false, false, MACHINERY_WINDOW);
-        // index 3 is the last thought; the header lands at index 1 (first slot).
-        assert_eq!(fold[1], FoldAction::Header(3));
-        assert_eq!(fold[2], FoldAction::Drop);
-        assert_eq!(fold[3], FoldAction::Drop);
-    }
-
-    #[test]
-    fn run_fold_windows_machinery_and_elides_the_rest_with_a_count() {
-        // With window=2 and 5 machinery items, the last 2 Keep; the earlier 3
-        // collapse to an `Elided(3)` count at the first windowed-out slot.
-        let mut items = vec![TranscriptItem::User { text: "go".into() }];
-        for i in 0..5 {
-            items.push(tool(&format!("t{i}")));
-        }
-        let fold = run_fold(&items, false, false, 2);
-        assert_eq!(fold[1], FoldAction::Elided(3)); // first windowed-out slot
-        assert_eq!(fold[2], FoldAction::Drop);
-        assert_eq!(fold[3], FoldAction::Drop);
-        assert_eq!(fold[4], FoldAction::Keep); // last two survive the window
-        assert_eq!(fold[5], FoldAction::Keep);
-    }
-
-    #[test]
-    fn run_fold_keeps_errors_assistant_markers_and_diffs() {
-        // Errors, assistant text, markers and Diffs always Keep - they break
-        // out of the fold regardless of the window.
-        let items = vec![
-            TranscriptItem::User { text: "go".into() },
-            tool_err(),
-            TranscriptItem::Assistant {
-                text: "answer".into(),
-            },
-            TranscriptItem::Marker {
-                text: "» nudge".into(),
-                tone: Tone::Aid,
-            },
-            diff_item("diff", vec![]),
-        ];
-        let fold = run_fold(&items, false, false, 0);
-        for (i, action) in fold.iter().enumerate().skip(1) {
-            assert_eq!(*action, FoldAction::Keep, "item {i} must break out");
-        }
-    }
-
-    #[test]
-    fn ctrl_t_disables_the_thought_fold() {
-        let items = vec![
-            TranscriptItem::User { text: "go".into() },
-            thought("first"),
-            thought("last"),
-        ];
-        // thinking_expanded = true: every thought Keeps, no header.
-        let fold = run_fold(&items, true, false, MACHINERY_WINDOW);
-        assert_eq!(fold[1], FoldAction::Keep);
-        assert_eq!(fold[2], FoldAction::Keep);
-    }
-
-    #[test]
-    fn ctrl_o_disables_the_machinery_window() {
-        let mut items = vec![TranscriptItem::User { text: "go".into() }];
-        for i in 0..5 {
-            items.push(tool(&format!("t{i}")));
-        }
-        // tools_expanded = true: every action Keeps, no Elided count.
-        let fold = run_fold(&items, false, true, 2);
-        for (i, action) in fold.iter().enumerate().skip(1) {
-            assert_eq!(*action, FoldAction::Keep, "action {i} must show");
-        }
-    }
-
-    #[test]
-    fn run_fold_folds_each_lane_independently() {
-        // Two User-opened lanes: the second lane's thoughts fold on their own,
-        // not merged with the first lane's.
-        let items = vec![
-            TranscriptItem::User { text: "one".into() },
-            thought("a1"),
-            thought("a2"),
-            TranscriptItem::User { text: "two".into() },
-            thought("b1"),
-            thought("b2"),
-        ];
-        let fold = run_fold(&items, false, false, MACHINERY_WINDOW);
-        assert_eq!(fold[1], FoldAction::Header(2)); // lane one: last is a2 (idx 2)
-        assert_eq!(fold[4], FoldAction::Header(5)); // lane two: last is b2 (idx 5)
-    }
-
-    // ---- wrap_words / indented_lines: the hanging block indent (task 1) ----
+    // ---- wrap_words: the greedy word wrap ----------------------------------
 
     #[test]
     fn wrap_words_greedily_wraps_on_spaces_within_width() {
@@ -5518,146 +8191,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn indented_lines_prefixes_every_wrapped_row_at_the_indent() {
-        // A long machinery line wraps; EVERY resulting row (first + continuation)
-        // is prefixed with the 2-space block indent and stays <= content width.
-        let style = Style::default();
-        let content = "⋯ list_files docs/adr with a very long trailing summary here";
-        let width = 20u16;
-        let lines = indented_lines(content, 2, width, style);
-        assert!(lines.len() > 1, "the long line wrapped");
-        for line in &lines {
-            let text = line
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>();
-            assert!(text.starts_with("  "), "row not indented: {text:?}");
-            assert!(
-                text.chars().count() <= width as usize,
-                "row over content width: {text:?}"
-            );
-        }
-    }
+    // ---- settled Thinking: the full grey body (qwen `ThinkMessage`) ---------
 
     #[test]
-    fn a_wrapped_marker_continuation_lands_at_column_two_in_the_render() {
-        // Task 1 acceptance: a long marker soft-wraps and its continuation must
-        // sit at column 2 (block indent), not fall back to column 0. Render the
-        // real path and inspect the marker's second visual row.
-        let long = "reading file after file fills your context dispatch \
-                    a focused search instead and let a helper report back with just \
-                    the answer you actually need to keep moving";
-        let screen = screen_with_notices(vec![]);
-        let (screen, _) = screen.submitted("go", Ok(()));
-        let (screen, _) = screen.apply_event(Event::compaction_progress(long));
-        let terminal = draw_viewport(60, 20, &screen);
-        // The marker's FIRST row carries the compaction glyph `⟨`; its
-        // continuation is the next row.
-        let marker_y = (0..20)
-            .find(|&y| row_text(&terminal, y).contains('⟨'))
-            .expect("the marker row");
-        let cont = row_text(&terminal, marker_y + 1);
-        // Columns are per-cell symbols. Column 0 is the spine `│`, column 1 the
-        // trailing gutter space; the content area begins at column LANE_GUTTER.
-        // The marker's own 2-space block indent means the content-area columns 0
-        // and 1 are blank on the continuation - it is NOT flush at the margin.
-        let cols: Vec<char> = cont.chars().collect();
-        assert_eq!(cols[0], '│', "the continuation keeps the spine");
-        let g = LANE_GUTTER as usize;
-        assert_eq!(
-            (cols[g], cols[g + 1]),
-            (' ', ' '),
-            "marker continuation not block-indented (content cols 0-1 not blank): {cont:?}"
-        );
-        // ...and real content follows the indent (not a fully blank row).
-        assert!(
-            cols[g + 2] != ' ',
-            "the continuation should carry text after the indent: {cont:?}"
-        );
-    }
-
-    // ---- collapsed_thought_line: one-row truncation ------------------------
-
-    #[test]
-    fn collapsed_thought_line_truncates_to_one_visual_row() {
-        let long = "z".repeat(400);
-        let line = collapsed_thought_line(&long, 40, theme::dark());
-        let text = line
+    fn settled_thinking_prefixes_the_first_body_row_with_the_grey_marker() {
+        // qwen has no collapsed one-liner (ADR-0052): a shown thought renders its
+        // full grey markdown body, the `✦` marker hung on the first row.
+        let lines = settled_thinking_lines("one\ntwo\nthree", theme::dark());
+        let text = lines[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        assert!(text.starts_with("✦ thought: "));
-        assert!(
-            text.chars().count() <= 40,
-            "one row: {}",
-            text.chars().count()
-        );
-        assert!(text.ends_with('…'), "truncated: {text:?}");
+        assert!(text.starts_with("✦ one"), "grey thought marker: {text:?}");
     }
 
     #[test]
-    fn collapsed_thought_line_takes_the_first_source_line_only() {
-        let line = collapsed_thought_line("one\ntwo\nthree", 60, theme::dark());
-        let text = line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert_eq!(text, "✦ thought: one");
+    fn settled_thinking_renders_every_source_row() {
+        // The full body: three source lines render as three (or more) rows, not a
+        // single collapsed line.
+        let lines = settled_thinking_lines("one\ntwo\nthree", theme::dark());
+        assert!(
+            lines.len() >= 3,
+            "the full body keeps every source row: {}",
+            lines.len()
+        );
     }
 
     #[test]
     fn the_reserved_gutter_forces_wrapping_at_the_reduced_content_width() {
-        // RED-1 (ADR-0029): the lane gutter is carved off the left, so content
-        // wraps in the narrower `content_area` and is DRAWN two columns in. This
-        // pins the reservation with a notice sized to wrap ONLY at the reduced
-        // width - it fits the text area but overflows the content area:
-        //
-        //   area.width 40 → text_area 39 (scrollbar col) → content 37 (gutter).
-        //   A 38-char word fits in 39 but must wrap in 37.
-        //
-        // Two facts both DEPEND on the 2-col reservation, so deleting LANE_GUTTER
-        // from the wrap width (measuring/drawing at 39) breaks both: the word
-        // (1) draws starting at column LANE_GUTTER, not column 0, and (2) wraps
-        // to a second row instead of fitting on one. A single 38-char token has
-        // no break point, so it wraps only because the width shrank.
-        let word = "x".repeat(38);
+        // RED-1 (ADR-0029): the 2-col left+right margins (qwen `marginLeft:2,
+        // marginRight:2`) are carved off, so content wraps in the narrower
+        // `content_area` and is DRAWN two columns in. A 39-char word fits in the
+        // full 40 cols but must wrap at the reduced content width.
+        let word = "x".repeat(39);
         let screen = Screen::new(ScreenOpts {
             notices: vec![word.clone()],
             ..ScreenOpts::default()
         });
+        let terminal = draw_viewport(40, 20, &screen);
+        // A local cache synced at the same content width the body drew at, for
+        // the wrapped-count assertion below.
         let mut cache = RenderCache::new();
-        let viewport = Viewport::new();
-        let (terminal, _) = draw_viewport_with(
-            40,
-            20,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
+        cache.sync(
+            screen.transcript(),
+            Toggles::default(),
+            40 - 2 * CONTENT_MARGIN,
+            theme::dark(),
         );
 
-        // (1) The notice is drawn two columns in: the first row carrying the
-        // word begins with exactly LANE_GUTTER blank gutter cells (the notice is
-        // pre-lane, so the gutter is blank, not a spine), then the x's.
+        // (1) The notice is drawn CONTENT_MARGIN columns in (qwen `marginLeft:2`):
+        // the first row carrying the word begins with the `●` info prefix two
+        // columns in from the frame edge.
         let word_row = (0..20)
             .map(|y| row_text(&terminal, y))
             .find(|r| r.contains('x'))
             .expect("the notice row");
         let indent = word_row.chars().take_while(|c| *c == ' ').count();
         assert_eq!(
-            indent, LANE_GUTTER as usize,
-            "content draws at the reserved gutter offset, not column 0: {word_row:?}"
+            indent, CONTENT_MARGIN as usize,
+            "content draws at the 2-col margin, not column 0: {word_row:?}"
         );
 
-        // (2) The 38-char word wrapped to exactly 2 visual content rows, which
-        // happens ONLY at the reduced 37-col width (the lane is dense - no
-        // trailing separator). At the un-reserved 39 cols it would be one row.
+        // (2) The 39-char word wrapped to more than one visual content row, which
+        // happens ONLY at the reduced content width (frame 40 − two 2-col margins
+        // − the 2-col info prefix = 34). At the full 40 cols it would be one row.
         let word_rows: usize = cache
             .settled()
             .find_map(|(lines, wrapped)| {
@@ -5667,17 +8265,16 @@ mod tests {
                     .then_some(wrapped)
             })
             .expect("the notice's cached entry");
-        assert_eq!(
-            word_rows, 2,
-            "the word wrapped to 2 rows at the reduced width, got {word_rows}"
+        assert!(
+            word_rows >= 2,
+            "the word wrapped at the reduced width, got {word_rows}"
         );
     }
 
     #[test]
-    fn a_user_prompt_breaks_to_the_caret_and_the_agent_run_hangs_off_the_spine() {
-        // The greeting (pre-lane) is spineless; a User prompt shows the `›`
-        // caret at the margin; the agent's answer in that run shows the `│`
-        // spine. Column 0 carries the gutter glyph.
+    fn a_user_prompt_shows_the_caret_prefix_and_the_agent_the_marker() {
+        // qwen chrome: the greeting reads `●`; a User prompt the `>` caret; the
+        // agent's answer the `✦` marker. All baked into the content, 2-col margin.
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("do the thing", Ok(()));
         let (screen, _) = screen.apply_event(Event::message_start(1));
@@ -5686,41 +8283,21 @@ mod tests {
             StopReason::EndTurn,
         ));
         let terminal = draw_viewport(40, 20, &screen);
-        // Gather the first column of every row and the text, to find each line.
-        let mut saw_caret_on_user = false;
-        let mut saw_spine_on_answer = false;
-        let mut saw_blank_on_greeting = false;
-        for y in 0..20 {
-            let row = row_text(&terminal, y);
-            let first = row.chars().next();
-            if row.contains("do the thing") {
-                saw_caret_on_user = first == Some('›');
-            }
-            if row.contains("done") {
-                saw_spine_on_answer = first == Some('│');
-            }
-            if row.contains("suspenders ready") {
-                saw_blank_on_greeting = first == Some(' ');
-            }
-        }
-        assert!(saw_caret_on_user, "user prompt caret at the margin");
-        assert!(saw_spine_on_answer, "agent answer hangs off the spine");
-        assert!(saw_blank_on_greeting, "the greeting is spineless");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("> do the thing"),
+            "user caret prefix:\n{text}"
+        );
+        assert!(text.contains("✦ done"), "assistant marker prefix:\n{text}");
+        assert!(text.contains("● suspenders ready"), "info prefix:\n{text}");
     }
 
     #[test]
-    fn the_spine_stays_aligned_with_the_answer_when_scrolled_mid_item() {
-        // M3: at a NONZERO scroll offset, with a multi-row agent answer
-        // straddling the viewport top, every visible answer row must still carry
-        // the `│` spine and every non-answer row must not. This exercises the
-        // `skip(top)` slice of the flat row mapping - the path a `top == 0`
-        // test never reaches. A desync (gutter indexed differently from content)
-        // would land the spine on the wrong rows and trip an assertion below.
+    fn the_pending_body_top_clips_to_the_newest_rows() {
+        // ADR-0046 inline top-clip: a tall agent answer that OVERFLOWS the pending
+        // body keeps the NEWEST rows and drops the oldest.
         let screen = screen_with_notices(vec![]);
         let (screen, _) = screen.submitted("the question", Ok(()));
-        // A tall answer: many SHORT paragraphs (each one visual row at width 40,
-        // so no soft-wrap) each carrying a unique "ANSWER" marker, so every
-        // answer row is identifiable and none is a marker-less continuation.
         let answer = (0..14)
             .map(|i| format!("ANSWER-{i}"))
             .collect::<Vec<_>>()
@@ -5731,64 +8308,19 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        // Measure the geometry once, then scroll up so the top lands mid-answer.
-        let mut viewport = Viewport::new();
-        let mut cache = RenderCache::new();
-        let (_, (total, height)) = draw_viewport_with(
-            40,
-            10,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
-        assert!(total > height, "the answer overflows the viewport");
-        viewport.scroll_up(4, total, height); // unpin, land 4 rows above the tail
-
-        let (terminal, _) = draw_viewport_with(
-            40,
-            10,
-            &mut ViewportParams {
-                screen: &screen,
-                viewport: &viewport,
-                cache: &mut cache,
-                anim: Anim::default(),
-            },
-        );
-        // Every visible answer row must still carry the spine in column 0 at
-        // this nonzero scroll. A desync (the gutter sliced differently from the
-        // content) would land the spine off the answer rows and drop one here.
-        // Answer paragraphs are short single-row lines, so an "ANSWER" row is
-        // never a marker-less soft-wrap continuation.
-        let mut answer_rows_seen = 0;
-        for y in 0..10 {
-            let row = row_text(&terminal, y);
-            if row.contains("ANSWER") {
-                answer_rows_seen += 1;
-                assert_eq!(
-                    row.chars().next(),
-                    Some('│'),
-                    "answer row {y} lost its spine at this scroll: {row:?}"
-                );
-            }
-        }
-        assert!(answer_rows_seen >= 2, "several answer rows must be visible");
-        // The scroll actually happened (we are not pinned at the tail): the
-        // last answer paragraph is off-screen below.
-        assert!(
-            !buffer_text(&terminal).contains("ANSWER-13"),
-            "the viewport scrolled up off the tail"
-        );
+        // A short body zone forces the top-clip.
+        let terminal = draw_viewport(40, 10, &screen);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ANSWER-13"), "the tail (newest) is kept");
+        assert!(!text.contains("ANSWER-0"), "the oldest clipped off the top");
     }
 
     /// Vinnie's `evaluate this project` shape (~60 cols): a User prompt, a long
-    /// settled thought that would wrap, a wrapping in-lane marker, and a tool
+    /// settled thought that would wrap, a wrapping marker, and a tool
     /// call. Returns the rendered terminal.
     fn evaluate_project_screen(width: u16, height: u16) -> Terminal<TestBackend> {
         // A long Compaction marker (`⟨ compaction: ... → summary ⟩`) that soft-
-        // wraps at 60 cols, standing in for the wrapping in-lane marker this
+        // wraps at 60 cols, standing in for the wrapping marker this
         // shape exercises.
         let status = "reading the manifest and the entry point and every other file \
                      that could plausibly appear so the marker wraps across several \
@@ -5798,7 +8330,7 @@ mod tests {
         let screen = screen_with_thinking("evaluate this project", thinking);
         // Settle the thought (empty final content → thinking materializes).
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-        // A wrapping in-lane Housekeeping marker (the `⟨ compaction: ... ⟩` line).
+        // A wrapping Housekeeping marker (the `⟨ compaction: ... ⟩` line).
         let (screen, _) = screen.apply_event(Event::compaction_progress(status));
         let (screen, _) = screen.apply_event(Event::tool_call(
             "id1",
@@ -5808,93 +8340,97 @@ mod tests {
         draw_viewport(width, height, &screen)
     }
 
+    // A 400-`z` reasoning line (far wider than any terminal) must land as EXACTLY
+    // one visual row ending in the `…` truncation marker - the "folds/truncates,
+    // never balloons" guarantee both the settled and the streaming path make. Pins
+    // that the z-carrying rows are a single truncated row.
+    fn assert_z_line_folds_to_one_truncated_row(terminal: &Terminal<TestBackend>, height: u16) {
+        let z_rows: Vec<String> = (0..height)
+            .map(|y| row_text(terminal, y))
+            .filter(|r| r.contains('z'))
+            .collect();
+        assert_eq!(
+            z_rows.len(),
+            1,
+            "the long line stays one visual row: {z_rows:?}"
+        );
+        assert!(z_rows[0].contains('…'), "it is truncated: {:?}", z_rows[0]);
+    }
+
     #[test]
-    fn a_long_settled_thought_collapses_to_one_visual_row() {
-        // Symptom 1: a long newline-free thought must fold to ONE visual row,
-        // not soft-wrap to many. The collapsed line truncates to the content
-        // width with a trailing `…`.
+    fn compact_mode_hides_a_settled_thought_entirely() {
+        // qwen has NO collapsed one-liner for a settled thought (ADR-0052): it
+        // either shows in full or, under compact mode (Ctrl+O), is HIDDEN
+        // entirely. A long thought shows its z's when NOT compact...
         let long = "z".repeat(400);
         let screen = screen_with_thinking("q", long);
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-        let terminal = draw_viewport(60, 20, &screen);
-        // Exactly one row carries the collapsed thought, and it is truncated.
-        let thought_rows: Vec<String> = (0..20)
-            .map(|y| row_text(&terminal, y))
-            .filter(|r| r.contains("thought:"))
-            .collect();
-        assert_eq!(
-            thought_rows.len(),
-            1,
-            "the thought folds to one row: {thought_rows:?}"
-        );
+        let shown = draw_viewport(60, 20, &screen);
         assert!(
-            thought_rows[0].contains('…'),
-            "truncated: {:?}",
-            thought_rows[0]
+            (0..20).any(|y| row_text(&shown, y).contains('z')),
+            "the settled thought shows in full when not compact"
         );
-        // The z's did not spill onto a second row.
-        let z_rows = (0..20)
-            .filter(|&y| row_text(&terminal, y).contains('z'))
-            .count();
-        assert_eq!(z_rows, 1, "the long thought did not wrap to more rows");
+
+        // ...and vanishes under compact mode.
+        let (screen, _) = screen.handle_key(crate::ui::screen::Key::ToggleCompact);
+        let hidden = draw_viewport(60, 20, &screen);
+        assert!(
+            (0..20).all(|y| !row_text(&hidden, y).contains('z')),
+            "compact mode hides the settled thought entirely"
+        );
     }
 
     #[test]
     fn settled_thinking_uses_the_star_glyph_not_the_brain_emoji() {
         // Symptom 3: settled thinking unifies on the `✦` family with the live
-        // tail, and drops the width-2 `🧠` emoji.
-        let collapsed = message_lines(
-            &TranscriptItem::Thinking {
-                text: "a short thought".into(),
-            },
-            false,
-            false,
-            80,
-            theme::dark(),
-        );
-        assert_eq!(line_text(&collapsed[0]), "✦ thought: a short thought");
-        assert!(!line_text(&collapsed[0]).contains('🧠'));
-
-        let expanded = message_lines(
+        // tail, and drops the width-2 `🧠` emoji. Shown (compact=false) the grey
+        // `✦` marker prefixes the first markdown body row.
+        let shown = message_lines(
             &TranscriptItem::Thinking {
                 text: "line one\nline two".into(),
             },
-            true,
             false,
             80,
             theme::dark(),
         );
-        assert_eq!(line_text(&expanded[0]), "✦ thought:");
-        assert!(!line_text(&expanded[0]).contains('🧠'));
+        assert!(line_text(&shown[0]).starts_with("✦ line one"));
+        assert!(!line_text(&shown[0]).contains('🧠'));
+
+        // Compact (Ctrl+O) HIDES the thought entirely (qwen `!compactMode`,
+        // ADR-0052): no rows at all.
+        let hidden = message_lines(
+            &TranscriptItem::Thinking {
+                text: "a short thought".into(),
+            },
+            true,
+            80,
+            theme::dark(),
+        );
+        assert!(hidden.is_empty());
     }
 
     #[test]
-    fn every_in_lane_visual_row_keeps_its_spine_in_the_evaluate_shape() {
-        // Symptom 2, TestBackend reproduction: the `evaluate this project` shape
-        // at 60 cols - a wrapped thought, a wrapped machinery marker, a tool call.
-        // In TestBackend EVERY in-lane visual row (including soft-wrapped
-        // continuations of the marker and the machinery line) keeps its `│`
-        // spine at column 0 and its content stays inside content_area. So the
-        // screenshot's column-0 fallback does NOT reproduce here - it is a
-        // terminal glyph-width artifact (the width-2 `🧠` emoji, now `✦`), not a
-        // gutter/content desync. If a real desync regressed expand_gutters, an
-        // in-lane content row would lose its spine and trip this.
+    fn the_evaluate_shape_renders_its_content_within_the_margins() {
+        // The `evaluate this project` shape at 60 cols - a wrapped thought, a
+        // wrapped marker, a tool call - all draw two columns in (qwen `marginLeft:
+        // 2`) and never touch column 0 (the retired lane spine is gone, ADR-0046).
         let terminal = evaluate_project_screen(60, 24);
+        let mut saw_content = false;
         for y in 0..24 {
             let row = row_text(&terminal, y);
-            let first = row.chars().next();
-            // Rows carrying agent content (the thought, the `⟨ compaction …`
-            // marker and its wrapped body, the `⋯` machinery) are all in-lane
-            // and must start with the spine.
-            let is_agent_content = row.contains("thought:")
-                || row.contains('⟨')
-                || row.contains('⋯')
-                || row.contains("compaction:")
-                || row.contains("every other file");
-            if is_agent_content {
-                assert_eq!(first, Some('│'), "row {y} lost its spine: {row:?}");
+            if row.trim().is_empty() {
+                continue;
             }
+            saw_content = true;
+            // No content column 0/1 (the 2-col left margin stays clear).
+            let cols: Vec<char> = row.chars().collect();
+            assert_eq!(
+                (cols[0], cols[1]),
+                (' ', ' '),
+                "row {y} bled into the left margin: {row:?}"
+            );
         }
+        assert!(saw_content, "the shape drew content");
     }
 
     #[test]
@@ -5909,7 +8445,7 @@ mod tests {
         ));
         let terminal = draw_viewport(80, 20, &screen);
         let text = buffer_text(&terminal);
-        // Live reasoning is content, not a metric (ADR-0040): the animated
+        // Live reasoning is content, not a metric: the animated
         // `✦ Thinking` header sits above the reasoning tail, and the reasoning
         // text itself is shown - not a token count.
         assert!(text.contains("✦ Thinking"), "the header:\n{text}");
@@ -5918,6 +8454,43 @@ mod tests {
             "the reasoning tail:\n{text}"
         );
         assert!(!text.contains("tokens)"));
+    }
+
+    #[test]
+    fn compact_suppresses_the_live_thinking_tail_but_keeps_the_spinner_subject() {
+        // qwen gates the pending `gemini_thought` under `!compactMode`
+        // (`HistoryItemDisplay.tsx:155`) but does NOT compact-gate the
+        // LoadingIndicator. So under compact the animated `✦ Thinking` tail is
+        // ABSENT while the spinner SUBJECT (the thought-subject seam,
+        // `thought?.subject || currentLoadingPhrase`) is still PRESENT.
+        // RunStarted puts the Run into Running so the spinner (LoadingIndicator)
+        // draws - the seam the subject fills; then stream a thought.
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.apply_event(Event::run_started("r1"));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("pondering".to_string()),
+            vec![ContentBlock::Thinking {
+                text: "weighing the tradeoffs".to_string(),
+            }],
+        ));
+        assert_eq!(screen.status, Status::Running, "the Run is Running");
+        let (screen, _) = screen.handle_key(crate::ui::screen::Key::ToggleCompact);
+        assert!(screen.compact_mode, "toggled into compact");
+
+        let terminal = draw_viewport(80, 20, &screen);
+        let text = buffer_text(&terminal);
+        // The live thinking tail's animated header is gone under compact.
+        assert!(
+            !text.contains("✦ Thinking"),
+            "the live thinking tail must be suppressed under compact:\n{text}"
+        );
+        // ...but the spinner still shows, and its subject is the live reasoning
+        // head (the last non-empty line fallback), not a lull phrase.
+        assert!(
+            text.contains("weighing the tradeoffs"),
+            "the spinner subject line stays present under compact:\n{text}"
+        );
     }
 
     #[test]
@@ -5956,16 +8529,7 @@ mod tests {
         let terminal = draw_viewport(40, 20, &screen);
         // Exactly one row carries the reasoning z's, and it ends in the `…`
         // truncation marker - the long line did not balloon into many rows.
-        let z_rows: Vec<String> = (0..20)
-            .map(|y| row_text(&terminal, y))
-            .filter(|r| r.contains('z'))
-            .collect();
-        assert_eq!(
-            z_rows.len(),
-            1,
-            "the long line stays one visual row: {z_rows:?}"
-        );
-        assert!(z_rows[0].contains('…'), "it is truncated: {:?}", z_rows[0]);
+        assert_z_line_folds_to_one_truncated_row(&terminal, 20);
     }
 
     #[test]
@@ -5997,38 +8561,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // gutter_cell_style: the Blank -> None, Caret/Spine -> Some mapping; the
-    // returned style is the concrete one the painter supplies (not a default).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn gutter_cell_style_blank_returns_none() {
-        let caret = Style::default().fg(Color::Green);
-        let spine = Style::default().fg(Color::Blue);
-        assert_eq!(gutter_cell_style(RowGutter::Blank, caret, spine), None);
-    }
-
-    #[test]
-    fn gutter_cell_style_caret_returns_caret_style() {
-        let caret = Style::default().fg(Color::Green);
-        let spine = Style::default().fg(Color::Blue);
-        assert_eq!(
-            gutter_cell_style(RowGutter::Caret, caret, spine),
-            Some(caret)
-        );
-    }
-
-    #[test]
-    fn gutter_cell_style_spine_returns_spine_style() {
-        let caret = Style::default().fg(Color::Green);
-        let spine = Style::default().fg(Color::Blue);
-        assert_eq!(
-            gutter_cell_style(RowGutter::Spine, caret, spine),
-            Some(spine)
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // popup_rect: the popup geometry is the only pure math that was tangled
     // into render_composer_popup; tested here at the calculation level.
     // -----------------------------------------------------------------------
@@ -6036,7 +8568,7 @@ mod tests {
     #[test]
     fn popup_rect_height_is_body_plus_two_borders() {
         let area = Rect::new(0, 0, 80, 24);
-        let r = popup_rect(10, area, 3); // 3 body rows -> height 5
+        let r = popup_rect(10, area, 3, POPUP_MAX_ROWS); // 3 body rows -> height 5
         assert_eq!(r.height, 5);
     }
 
@@ -6044,14 +8576,549 @@ mod tests {
     fn popup_rect_height_is_capped_at_popup_max_plus_two() {
         let area = Rect::new(0, 0, 80, 24);
         // 100 body rows would be POPUP_MAX_ROWS + 2 once capped.
-        let r = popup_rect(20, area, 100);
+        let r = popup_rect(20, area, 100, POPUP_MAX_ROWS);
         assert_eq!(r.height, POPUP_MAX_ROWS + 2);
     }
 
     #[test]
     fn popup_rect_is_anchored_above_anchor_y() {
         let area = Rect::new(0, 0, 80, 24);
-        let r = popup_rect(10, area, 3); // height 5, y = 10 - 5 = 5
+        let r = popup_rect(10, area, 3, POPUP_MAX_ROWS); // height 5, y = 10 - 5 = 5
         assert_eq!(r.y, 5);
+    }
+
+    // --- inline approval (ADR-0049) ----------------------------------------
+
+    // A Screen with a live ToolCall `name`(input) gated by a pending Approval,
+    // built through the real event path so the confirming call + pending state
+    // are exactly what production produces.
+    fn screen_confirming(name: &str, input: serde_json::Value, command: &str) -> Screen {
+        let screen = Screen::new(ScreenOpts::default());
+        let (screen, _) = screen.apply_event(Event::run_started("r1"));
+        let (screen, _) = screen.apply_event(Event::tool_call("t1", name, input));
+        let (screen, _) =
+            screen.apply_event(Event::approval_request("approval-0", command.to_string()));
+        screen
+    }
+
+    // A Screen carrying a COMMITTED Todo list (so the sticky "Current tasks" box
+    // would show) AND an open approval on a live `run_command` ToolCall. The Todo
+    // rides in through the real event path (a `todo_write` result with the todos
+    // artifact, promoted by the registered todo Extension), is frozen with
+    // `mark_committed`, then a second Run opens the confirming call + approval.
+    fn screen_committed_todo_then_confirming() -> Screen {
+        let opts = ScreenOpts {
+            extensions: crate::extensions::configured(&["todo".to_string()]),
+            ..ScreenOpts::default()
+        };
+        let screen = Screen::new(opts);
+        let todos = serde_json::json!({
+            "todos": [
+                {"content": "read the file", "status": "in_progress"},
+                {"content": "edit the file", "status": "pending"},
+            ]
+        });
+        let (s, _) = screen.apply_event(Event::run_started("r1"));
+        let (s, _) = s.apply_event(Event::tool_call("todo-call", "todo_write", todos));
+        // The todos artifact rides the result so the todo Extension promotes it
+        // to a first-class Todo item (ADR-0048).
+        let mut artifacts = std::collections::HashMap::new();
+        artifacts.insert(
+            "todos".to_string(),
+            serde_json::json!({
+                "items": [
+                    {"content": "read the file", "status": "in_progress"},
+                    {"content": "edit the file", "status": "pending"},
+                ]
+            }),
+        );
+        let (mut s, _) = s.apply_event(Event::ToolResult {
+            id: "todo-call".into(),
+            name: "todo_write".into(),
+            content: "ok".into(),
+            is_error: false,
+            artifacts,
+        });
+        // Confirm a Todo item landed and freeze the whole prefix (commit it into
+        // scrollback), so `latest_todo` reads a COMMITTED list -> sticky reserves.
+        assert!(
+            s.transcript().latest_todo().is_some(),
+            "the todo Extension promoted a Todo item"
+        );
+        s.mark_committed(s.transcript().committable_upto());
+        assert!(
+            s.transcript().latest_todo().map(|(i, _)| i)
+                < Some(s.transcript().committed_high_water()),
+            "the Todo is committed (index below the high-water mark)"
+        );
+        // Now a second, live run_command gated on an open approval.
+        let (s, _) = s.apply_event(Event::tool_call(
+            "t1",
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+        ));
+        let (s, _) = s.apply_event(Event::approval_request(
+            "approval-0",
+            "cargo test".to_string(),
+        ));
+        s
+    }
+
+    // BUG 2 (live-vet): with a committed Todo present, the sticky "Current tasks"
+    // box must NOT hide the open approval. The approval renders inside the pending
+    // body; reserving the sticky zone starves that body (Min(1)) and top-clips the
+    // question out of view. The fix drops the sticky box while an approval is open
+    // -- a visible approval wins over the informational list.
+    #[test]
+    fn an_open_approval_drops_the_sticky_box_so_the_question_stays_visible() {
+        let screen = screen_committed_todo_then_confirming();
+        // A full pending frame (render_pending -> pending_layout): the sticky box
+        // WOULD show here (committed, non-empty, incomplete list) if not for the
+        // open approval.
+        let terminal = draw_pending(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Allow execution of: 'cargo test'?"),
+            "the approval question is visible:\n{text}"
+        );
+        assert!(
+            text.contains("Yes, allow once"),
+            "the first radio option is visible:\n{text}"
+        );
+        assert!(
+            !text.contains("Current tasks"),
+            "the sticky box is dropped while the approval is open:\n{text}"
+        );
+    }
+
+    // The pending_layout-level guard: an open approval reserves NO sticky zone
+    // (`sticky_items` is None), even though `latest_todo` would otherwise qualify.
+    #[test]
+    fn pending_layout_reserves_no_sticky_zone_while_an_approval_is_open() {
+        let screen = screen_committed_todo_then_confirming();
+        // Sanity: the committed list DOES qualify for a sticky box on its own.
+        assert!(
+            sticky_todos(
+                screen.transcript().latest_todo(),
+                screen.transcript().committed_high_water(),
+            )
+            .is_some(),
+            "the committed Todo would reserve a sticky box absent an approval"
+        );
+        // But with the approval open, pending_layout drops it.
+        let view = screen.composer().view();
+        let plan = pending_layout(Rect::new(0, 0, 60, 24), &view, &screen);
+        assert!(
+            plan.sticky_items.is_none(),
+            "an open approval yields no sticky zone"
+        );
+        assert_eq!(
+            plan.sticky_box.height, 0,
+            "the sticky zone reserves zero rows"
+        );
+    }
+
+    // A Screen carrying a COMMITTED Todo list (so the sticky "Current tasks" box
+    // would show) with NO approval open - the regression counterpart to
+    // [`screen_committed_todo_then_confirming`]. Same committed-Todo setup, minus
+    // the second confirming Run: the Run has SETTLED (message_end), so the sticky
+    // box is the only thing driving the frame.
+    fn screen_committed_todo_no_approval() -> Screen {
+        let opts = ScreenOpts {
+            extensions: crate::extensions::configured(&["todo".to_string()]),
+            ..ScreenOpts::default()
+        };
+        let screen = Screen::new(opts);
+        let todos = serde_json::json!({
+            "todos": [
+                {"content": "read the file", "status": "in_progress"},
+                {"content": "edit the file", "status": "pending"},
+            ]
+        });
+        let (s, _) = screen.apply_event(Event::run_started("r1"));
+        let (s, _) = s.apply_event(Event::tool_call("todo-call", "todo_write", todos));
+        let mut artifacts = std::collections::HashMap::new();
+        artifacts.insert(
+            "todos".to_string(),
+            serde_json::json!({
+                "items": [
+                    {"content": "read the file", "status": "in_progress"},
+                    {"content": "edit the file", "status": "pending"},
+                ]
+            }),
+        );
+        let (mut s, _) = s.apply_event(Event::ToolResult {
+            id: "todo-call".into(),
+            name: "todo_write".into(),
+            content: "ok".into(),
+            is_error: false,
+            artifacts,
+        });
+        s.mark_committed(s.transcript().committable_upto());
+        s
+    }
+
+    // The MEDIUM finding: on a SHORT terminal the pending body TOP-clips (last N
+    // rows kept, [`anchor_clip`]). Before the fix the spinner/tails were appended
+    // BELOW the inline approval block, so the top-clip ate the "Allow execution
+    // of..." question first - the user could not see what they were approving. The
+    // fix suppresses every trailing LIVE row while an approval is open, so the
+    // approval block is the BOTTOM-most content and survives the clip. This test
+    // renders the real production frame ([`draw_pending`]) with a live spinner
+    // anim on a short terminal and asserts BOTH the question and the first radio
+    // option survive, and that the spinner's cancel affordance is gone (the
+    // approval block owns the bottom).
+    #[test]
+    fn short_terminal_keeps_the_approval_question_visible() {
+        let screen = screen_confirming(
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+            "cargo test",
+        );
+        // The FULL, unclamped confirming body: the approval box must be bottom-
+        // most, so the LAST non-blank row is its `╰` border, NOT a spinner row.
+        // This is what makes the top-clip keep the question. (Anim past the lull
+        // settle window, so a spinner WOULD render absent the suppression.)
+        let anim = Anim {
+            quiet_ticks: lull::SETTLE_TICKS + 4,
+            ..Anim::default()
+        };
+        let mut cache = RenderCache::new();
+        let mut params = PendingBodyParams {
+            screen: &screen,
+            cache: &mut cache,
+            anim,
+        };
+        let body = pending_body_lines(&mut params, theme::dark(), 0, 56);
+        let last_non_blank = body
+            .iter()
+            .rev()
+            .map(line_text)
+            .find(|t| !t.trim().is_empty())
+            .unwrap_or_default();
+        assert!(
+            last_non_blank.trim_start().starts_with('╰'),
+            "the approval box is bottom-most (last row is its border), not a \
+             spinner row: {last_non_blank:?}"
+        );
+        assert!(
+            !body.iter().any(|l| line_text(l).contains("esc to cancel")),
+            "the spinner is suppressed while the approval is open"
+        );
+
+        // And on a SHORT real frame the top-clip therefore keeps the question and
+        // the first option (they ride at the bottom of the pending body).
+        let terminal = draw_pending(60, 14, &screen);
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Allow execution of: 'cargo test'?"),
+            "the approval question survives top-clip on a short terminal:\n{text}"
+        );
+        assert!(
+            text.contains("Yes, allow once"),
+            "the first radio option is visible:\n{text}"
+        );
+    }
+
+    // Fix-1 regression guard: dropping the sticky box (BUG 2) and suppressing the
+    // trailing live rows (this finding) both key off `pending_approval.is_some()`.
+    // With NO approval open, a committed Todo must STILL render the sticky
+    // "Current tasks" box - the approval-only guards did not over-suppress.
+    #[test]
+    fn no_approval_still_renders_the_sticky_current_tasks_box() {
+        let screen = screen_committed_todo_no_approval();
+        // Sanity: the committed, non-empty, incomplete list qualifies for a box.
+        assert!(
+            sticky_todos(
+                screen.transcript().latest_todo(),
+                screen.transcript().committed_high_water(),
+            )
+            .is_some(),
+            "the committed Todo qualifies for a sticky box"
+        );
+        let terminal = draw_pending(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Current tasks"),
+            "the sticky box renders when no approval is open:\n{text}"
+        );
+    }
+
+    // The measure-level counterpart to the short-terminal test: an OPEN approval
+    // suppresses the spinner/lull row from the pending body, while an equivalent
+    // Running-but-no-approval frame KEEPS it. Driven at [`pending_body_lines`] with
+    // `quiet_ticks` past the lull settle window so the spinner has a phrase to draw
+    // (default anim is still settling, so it would be empty regardless).
+    #[test]
+    fn an_open_approval_suppresses_the_spinner_row_that_a_bare_run_keeps() {
+        let width: u16 = 60;
+        // A settled lull (quiet_ticks past SETTLE_TICKS) so the spinner has a scene.
+        let anim = Anim {
+            quiet_ticks: 60,
+            ..Anim::default()
+        };
+        let has_cancel =
+            |lines: &[Line<'static>]| lines.iter().any(|l| line_text(l).contains("esc to cancel"));
+
+        // Approval OPEN (Running, gated run_command): the spinner is suppressed.
+        let confirming = screen_confirming(
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+            "cargo test",
+        );
+        let mut cache = RenderCache::new();
+        let mut params = PendingBodyParams {
+            screen: &confirming,
+            cache: &mut cache,
+            anim,
+        };
+        let under_approval = pending_body_lines(&mut params, theme::dark(), 0, width);
+        assert!(
+            !has_cancel(&under_approval),
+            "the spinner is suppressed while an approval is open"
+        );
+
+        // Running, NO approval: the same anim now DOES render the spinner row.
+        let running = Screen::new(ScreenOpts::default());
+        let (running, _) = running.apply_event(Event::run_started("r1"));
+        assert_eq!(running.status, Status::Running);
+        assert!(running.pending_approval.is_none());
+        let mut cache = RenderCache::new();
+        let mut params = PendingBodyParams {
+            screen: &running,
+            cache: &mut cache,
+            anim,
+        };
+        let bare_run = pending_body_lines(&mut params, theme::dark(), 0, width);
+        assert!(
+            has_cancel(&bare_run),
+            "the spinner renders on an equivalent Running frame with no approval"
+        );
+    }
+
+    // selection_rows: the active row wears the `›` marker + green label; inactive
+    // rows show two gutter spaces; numbers are 1-indexed `N.`.
+    #[test]
+    fn selection_rows_marks_the_active_row_and_numbers_the_options() {
+        let items = ["Yes, allow once", "Always", "No"];
+        let rows = selection_rows(&items, 1, true, 40, theme::dark());
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        };
+        assert!(text(&rows[0]).contains("1. Yes, allow once"));
+        // Row 1 is active: the `›` marker leads.
+        assert!(text(&rows[1]).starts_with("›"));
+        assert!(text(&rows[1]).contains("2. Always"));
+        // Row 0 is inactive: no marker, two leading spaces.
+        assert!(text(&rows[0]).starts_with("  "));
+
+        // The `N.` number turns success-green on the ACTIVE row (qwen
+        // `BaseSelectionList.tsx:113-118`) and secondary elsewhere. Find the span
+        // that carries the trailing `.` of the number.
+        let theme = theme::dark();
+        let number_span = |l: &Line| {
+            l.spans
+                .iter()
+                .find(|s| s.content.ends_with('.'))
+                .expect("a number span")
+                .style
+        };
+        assert_eq!(
+            number_span(&rows[1]).fg,
+            success_style(theme).fg,
+            "active-row number is success-green"
+        );
+        assert_eq!(
+            number_span(&rows[0]).fg,
+            secondary_style(theme).fg,
+            "inactive-row number is secondary"
+        );
+    }
+
+    // Render-buffer proof (P2) that the `›` marker lands on the ACTIVE option
+    // row and the inactive rows carry two gutter spaces - not just via a direct
+    // `selection_rows` call but through the real `draw_viewport` inline block.
+    // The default active row is option 0 (`Yes, allow once`).
+    #[test]
+    fn drawn_inline_approval_marks_only_the_active_option_row() {
+        let screen = screen_confirming(
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+            "cargo test",
+        );
+        let terminal = draw_viewport(60, 24, &screen);
+        // Exactly one active row, so exactly one `›` marker in the whole block.
+        let full = buffer_text(&terminal);
+        assert_eq!(
+            full.matches('›').count(),
+            1,
+            "one active marker only\n{full}"
+        );
+
+        // Locate each option row and inspect its gutter directly in the buffer.
+        let row_of = |needle: &str| {
+            (0..24)
+                .map(|y| row_text(&terminal, y))
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("row for {needle:?} not found\n{full}"))
+        };
+        // The active row (option 0) leads with the `›` marker (inside its box,
+        // so after the border cell + padding); assert the marker is present and
+        // the number `1.` follows.
+        let active = row_of("Yes, allow once");
+        assert!(
+            active.contains('›'),
+            "active row shows the marker: {active:?}"
+        );
+        assert!(active.contains("1."), "active row is numbered: {active:?}");
+        // The inactive rows carry NO marker - two gutter spaces stand where the
+        // `›` would be, ahead of their number.
+        let inactive_always = row_of("Always allow in this project");
+        let inactive_deny = row_of("No, suggest changes (esc)");
+        assert!(!inactive_always.contains('›'), "{inactive_always:?}");
+        assert!(!inactive_deny.contains('›'), "{inactive_deny:?}");
+        assert!(inactive_always.contains("2."), "{inactive_always:?}");
+        assert!(inactive_deny.contains("3."), "{inactive_deny:?}");
+    }
+
+    // The inline block appends the question + all three verbatim options, and the
+    // exec question embeds the command.
+    #[test]
+    fn inline_exec_approval_renders_the_question_and_all_three_options() {
+        let screen = screen_confirming(
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+            "cargo test",
+        );
+        let terminal = draw_viewport(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Allow execution of: 'cargo test'?"), "{text}");
+        assert!(text.contains("Yes, allow once"));
+        assert!(text.contains("Always allow in this project"));
+        assert!(text.contains("No, suggest changes (esc)"));
+    }
+
+    // A web_fetch (Info) approval reads the generic proceed question.
+    #[test]
+    fn inline_info_approval_renders_the_proceed_question() {
+        let screen = screen_confirming(
+            "web_fetch",
+            serde_json::json!({"url": "https://x"}),
+            "https://x",
+        );
+        let terminal = draw_viewport(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Do you want to proceed?"), "{text}");
+    }
+
+    // The confirming call's marker is `?` (warning), not the executing `⊷`.
+    #[test]
+    fn the_confirming_call_wears_the_question_marker() {
+        let screen = screen_confirming(
+            "web_fetch",
+            serde_json::json!({"url": "https://x"}),
+            "https://x",
+        );
+        let terminal = draw_viewport(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("?"), "the confirming marker shows");
+        assert!(!text.contains("⊷"), "the executing marker is gone");
+    }
+
+    // A non-shell confirming group (web_fetch) borders warning-yellow; a shell
+    // one (run_command) keeps the grey symbol border (shell precedence).
+    #[test]
+    fn group_border_precedence_is_shell_then_confirming_then_default() {
+        let call = |name: &str| TranscriptItem::ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            summary: String::new(),
+        };
+        let theme = theme::dark();
+        // Default: a non-shell, non-confirming group.
+        assert_eq!(
+            group_border_style(&[call("web_fetch")], false, theme),
+            border_style(theme)
+        );
+        // Confirming, non-shell: warning wins.
+        assert_eq!(
+            group_border_style(&[call("web_fetch")], true, theme),
+            warning_style(theme)
+        );
+        // Shell always wins, even confirming.
+        assert_eq!(
+            group_border_style(&[call("run_command")], true, theme),
+            symbol_style(theme)
+        );
+    }
+
+    // ADR-0029 rigidity: every rendered approval row is exactly the box inner
+    // width (the box wrapper padded it to `inner`), so the right border aligns.
+    #[test]
+    fn inline_approval_rows_respect_the_box_inner_width() {
+        let screen = screen_confirming(
+            "web_fetch",
+            serde_json::json!({"url": "https://x"}),
+            "https://x",
+        );
+        let width = 50u16;
+        let terminal = draw_viewport(width, 24, &screen);
+        // The boxed rows carry the `│` border at both edges of the content zone.
+        // Every row that has a left `│` must have a right `│` at the same column,
+        // proving the width is rigid (measure==draw).
+        let _ = width;
+        let rows = terminal.backend().buffer().area.height;
+        // Every boxed row must place its two `│` borders at the SAME two columns
+        // (the box is rigid: measure==draw, ADR-0029). Collect the (left,right)
+        // border columns of each bordered row and assert they all agree.
+        let mut border_cols: Option<(usize, usize)> = None;
+        for y in 0..rows {
+            let row: Vec<char> = row_text(&terminal, y).chars().collect();
+            let left = row.iter().position(|&c| c == '│');
+            let right = row.iter().rposition(|&c| c == '│');
+            if let (Some(l), Some(r)) = (left, right)
+                && l != r
+            {
+                match border_cols {
+                    None => border_cols = Some((l, r)),
+                    Some((el, er)) => assert_eq!(
+                        (l, r),
+                        (el, er),
+                        "row {y} borders at ({l},{r}) not the rigid ({el},{er})"
+                    ),
+                }
+            }
+        }
+        assert!(border_cols.is_some(), "the approval box drew bordered rows");
+    }
+
+    // committed==pending identity (ADR-0049): once the Approval resolves and the
+    // ToolResult supersedes the call, the committed slice carries NO approval
+    // rows - the question/options are gone.
+    #[test]
+    fn a_resolved_approval_commits_with_no_approval_rows() {
+        let screen = screen_confirming(
+            "web_fetch",
+            serde_json::json!({"url": "https://x"}),
+            "https://x",
+        );
+        // Resolve + supersede the call with its result.
+        let (screen, _) = screen.apply_event(Event::approval_resolved("approval-0", true));
+        let (screen, _) = screen.apply_event(Event::tool_result(
+            "t1",
+            "web_fetch",
+            "ok",
+            false,
+            std::collections::HashMap::new(),
+        ));
+        assert_eq!(screen.pending_approval, None);
+        let terminal = draw_viewport(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("Do you want to proceed?"), "{text}");
+        assert!(!text.contains("Yes, allow once"), "{text}");
+        assert!(!text.contains("?"), "no confirming marker after resolve");
     }
 }

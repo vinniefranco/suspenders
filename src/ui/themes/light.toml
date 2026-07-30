@@ -17,6 +17,13 @@ context = "#6e7781"
 muted = "#6e7781"
 machinery = "#8c959f"
 error = "#cf222e"
+# The qwen text + status roles (Phase 7, ADR-0008), light-polarity: a dark
+# foreground, a deep purple accent, a dark green success, a dark gold warning -
+# readable on the light ground rather than QwenDark's bright hues.
+foreground = "#24292f"
+accent = "#8839ef"
+success = "#1a7f37"
+warning = "#9a6700"
 thinking = "#6e7781"
 thinking_header = "#6e7781"
 lull = "#8839ef"
@@ -43,20 +50,3 @@ code_block_bg = "#eff1f5"
 
 # Chrome.
 popup_border = "#0969da"
-
-# The powerline status bar.
-bar_bg = "#e7ebf0"
-segment_muted_bg = "#d6dce4"
-segment_idle_fg = "#ffffff"
-segment_idle_bg = "#1a7f37"
-segment_running_fg = "#24292f"
-segment_running_bg = "#eac54f"
-segment_model_fg = "#3f4a5c"
-segment_model_bg = "#c3ccd8"
-segment_toggle_fg = "#57606a"
-segment_cost_fg = "#57606a"
-pressure_ok_fg = "#57606a"
-pressure_elevated_fg = "#24292f"
-pressure_elevated_bg = "#eac54f"
-pressure_critical_fg = "#ffffff"
-pressure_critical_bg = "#cf222e"

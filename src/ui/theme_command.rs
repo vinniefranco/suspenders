@@ -152,11 +152,14 @@ pub(super) fn choose(
         return screen;
     };
     if let Err(reason) = themes.apply(&name) {
-        return screen.info(format!("theme → {name} (not applied: {reason})"));
+        // Info line's Commit re-derived by dispatch's trailing freeze (ADR-0046).
+        return screen
+            .info(format!("theme → {name} (not applied: {reason})"))
+            .0;
     }
     let persist = SessionConfig::persist_theme(&ctx.config_path, &name);
     let env_shadowed = std::env::var("SUSPENDERS_THEME").is_ok();
-    screen.info(applied_line(&name, env_shadowed, &persist))
+    screen.info(applied_line(&name, env_shadowed, &persist)).0
 }
 
 #[cfg(test)]

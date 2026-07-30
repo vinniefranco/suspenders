@@ -46,25 +46,24 @@ pub enum RowRole {
     /// An annotation that travels with its group's header (an "unavailable"
     /// note); on its own with no header before it (a broken theme in the
     /// `/theme` list), it is its own group and filters on its own label. A
-    /// cursor stop that Enter refuses: landing on a group's trailing note
-    /// anchors the popup window - which ends at the highlight - so the whole
-    /// group above it scrolls into view.
+    /// cursor STOP that Enter refuses (so its terse reason is reachable), but
+    /// never a pick.
     Note,
     /// A pickable row - the only role Enter resolves.
     Member,
     /// A greyed, unpickable member (a credential-less built-in's Catalog
-    /// model): hidden at the empty filter, revealed when its label matches,
-    /// at most a per-group reveal cap (see
-    /// [`crate::ui::selector::COLLAPSED_REVEAL_CAP`]). Not a stop.
+    /// model): shown greyed in the numbered `›` dialog (ADR-0051 System A), an
+    /// editable model filter reveals it when its label matches. Not a stop -
+    /// nav skips it, Enter refuses it.
     Collapsed,
 }
 
-/// One row in a [`crate::ui::selector::Selector`]: `value` is what a
-/// [`crate::ui::selector::SelectorOutcome::Select`] returns, `label` is shown
-/// and filtered on, and `hint` is optional secondary text (a command's help, a
+/// One row in a committed command's numbered `›` dialog (ADR-0051 System A,
+/// [`crate::ui::selection`]): `value` is what a selection resolves to, `label`
+/// is shown and filtered on, and `hint` is optional secondary text (a
 /// "(current)" marker, a note's terse reason) that never affects filtering.
-/// `role` places the row in its group and decides stop-ness and pickability -
-/// see [`RowRole`].
+/// `role` places the row in its group and decides stop-ness (nav) and
+/// pickability (Enter) - see [`RowRole`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectorRow {
     pub value: String,
@@ -194,6 +193,12 @@ pub struct DiffHunk {
 ///   unknown), the tagged hunks, and the count of lines elided by the display
 ///   cap. The adapter renders the marker glyph, the added/removed background
 ///   tint, and the syntect foreground.
+/// * `Todo { items }` - a first-class task list (ADR-0048): the model's
+///   `todo_write` items in order, the SAME [`crate::plan::TodoItem`] vocabulary
+///   the Run-loop's Plan fold reads. The Todo display extension's Presenter swaps
+///   a successful `todo_write` Tool Result for this item, so the committed render
+///   draws the circle list (`○ ◐ ●`) instead of the raw JSON args. Pure - the
+///   glyph/colour treatment lives in `ui/components` (ADR-0019).
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
 ///   plane (the greeting, launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
@@ -241,6 +246,13 @@ pub enum TranscriptItem {
         /// Lines the display cap elided, rendered as a muted `… N more lines`
         /// tail; `0` when nothing was cut.
         elided: usize,
+    },
+    /// A first-class task list (ADR-0048): the model's `todo_write` items in
+    /// order, held as the pure [`crate::plan::TodoItem`] vocabulary. The Todo
+    /// display extension's Presenter emits this in place of a successful
+    /// `todo_write` Tool Result; the adapter draws the circle list.
+    Todo {
+        items: Vec<crate::plan::TodoItem>,
     },
     Info {
         text: String,

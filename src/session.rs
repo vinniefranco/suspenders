@@ -250,7 +250,12 @@ impl SessionConfig {
             // The next-speaker check runs by default (ADR-0043): a no-tool-call
             // Pass consults it before ending the Run.
             skip_next_speaker: false,
-            extensions: vec!["diff".into(), "run_command".into(), "condense".into()],
+            extensions: vec![
+                "diff".into(),
+                "run_command".into(),
+                "condense".into(),
+                "todo".into(),
+            ],
             session_dir: default_session_dir(),
         }
     }
@@ -1360,6 +1365,20 @@ mod tests {
         // it off so the loop/agent tests don't fire a side-query on every reply.
         assert!(!SessionConfig::base().skip_next_speaker);
         assert!(SessionConfig::test_defaults().skip_next_speaker);
+    }
+
+    // The silent-regression guard for the todo-render defect (ADR-0048): the
+    // shipped default MUST enlist the `todo` extension, else `todo_write` dumps
+    // raw JSON (the Presenter never runs). `base()` IS the shipped default (there
+    // is no `Default` impl; the app builds from `base()` overlaid by config).
+    #[test]
+    fn the_shipped_default_config_enlists_the_todo_extension() {
+        assert!(
+            SessionConfig::base()
+                .extensions
+                .contains(&"todo".to_string()),
+            "the shipped default must register the todo extension (risk #5)"
+        );
     }
 
     #[test]

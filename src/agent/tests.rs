@@ -9,6 +9,7 @@
 // observes the Run parked mid-`complete`, then releases (or aborts) it.
 // ===========================================================================
 use super::*;
+use crate::approvals::ApprovalMode;
 use crate::content::{ContentBlock, Message, Role, Usage};
 use crate::llm::model::Api;
 use crate::llm::response::{Response, StopReason as RStop};
@@ -521,6 +522,82 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
     recv_match(&mut rx, is_run_finished).await;
 }
 
+// ---- approval mode cycle (ADR-0050) -----------------------------------
+
+// CycleApprovalMode folds the pure Approvals mode and broadcasts the new mode
+// so the Screen mirror updates. One press from the Default start lands on
+// AutoEdit (the qwen APPROVAL_MODES order: plan → default → auto-edit → …).
+#[tokio::test(flavor = "multi_thread")]
+async fn cycle_approval_mode_folds_and_broadcasts_the_new_mode() {
+    let (_dir, agent, mut rx) = harness(vec![Entry::just(text_end("hi"))]);
+
+    agent.cycle_approval_mode().await;
+    recv_match(&mut rx, |e| {
+        matches!(
+            e,
+            Event::ApprovalModeChanged {
+                mode: ApprovalMode::AutoEdit
+            }
+        )
+    })
+    .await;
+
+    // A second press advances to Auto (auto-edit → auto).
+    agent.cycle_approval_mode().await;
+    recv_match(&mut rx, |e| {
+        matches!(
+            e,
+            Event::ApprovalModeChanged {
+                mode: ApprovalMode::Auto
+            }
+        )
+    })
+    .await;
+}
+
+// In Yolo mode every gated run_command auto-approves with NO ApprovalRequest and
+// NO modal - it runs straight through. Cycling Default → AutoEdit → Auto → Yolo
+// is three presses.
+#[tokio::test(flavor = "multi_thread")]
+async fn yolo_mode_auto_runs_a_gated_command_without_a_modal() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "y1",
+            "run_command",
+            json!({ "command": "echo yolo" }),
+        )),
+        Entry::just(text_end("done")),
+    ]);
+
+    // Default → AutoEdit → Auto → Yolo.
+    for _ in 0..3 {
+        agent.cycle_approval_mode().await;
+    }
+    recv_match(&mut rx, |e| {
+        matches!(
+            e,
+            Event::ApprovalModeChanged {
+                mode: ApprovalMode::Yolo
+            }
+        )
+    })
+    .await;
+
+    agent.submit("run it").await.unwrap();
+
+    // The gated command runs with no ApprovalRequest: the ToolResult arrives
+    // directly. (A raced ApprovalRequest would fail this by never matching.)
+    let result = recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "y1"),
+    )
+    .await;
+    if let Event::ToolResult { content, .. } = result {
+        assert!(content.contains("yolo"));
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
 // ---- steering ---------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -904,7 +981,7 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     first.submit("do Y").await.unwrap();
     recv_match(&mut rx, is_run_finished).await;
 
-    assert_eq!(first.plan().await.as_deref(), Some("[~] do Y"));
+    assert_eq!(first.plan().await.as_deref(), Some("◐ do Y"));
     drop(first);
 
     let path = log::latest(&session_dir).expect("a log file");
@@ -915,7 +992,7 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     )
     .expect("resumes");
 
-    assert_eq!(resumed.plan().await.as_deref(), Some("[~] do Y"));
+    assert_eq!(resumed.plan().await.as_deref(), Some("◐ do Y"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

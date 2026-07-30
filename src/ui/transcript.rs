@@ -39,6 +39,7 @@
 //! Steering marker and the extension-failure line.
 
 mod streaming;
+mod thought;
 
 use std::collections::HashMap;
 
@@ -88,6 +89,15 @@ pub struct Transcript {
     streaming: Streaming,
     /// The configured Extensions whose pure `present` runs on every append.
     extensions: Vec<Registered>,
+    /// How many leading items the adapter has already frozen into native
+    /// scrollback (ADR-0046, the inline `insert_before` seam). A monotonic
+    /// high-water mark into [`Transcript::items`]: everything below it has been
+    /// committed and is never redrawn; everything at/above it is still the
+    /// pending region. Advanced by [`Transcript::mark_committed`], never
+    /// regressed - and it moves neither `items` nor `revision`, so it is not a
+    /// structural edit (it enrolls in the prefix-or-bump property test with a
+    /// "neither" expectation).
+    committed: usize,
 }
 
 impl Transcript {
@@ -99,6 +109,7 @@ impl Transcript {
             revision: 0,
             streaming: Streaming::idle(),
             extensions,
+            committed: 0,
         }
     }
 
@@ -168,7 +179,7 @@ impl Transcript {
         self.push(TranscriptItem::Info { text: text.into() });
     }
 
-    /// Appends a harness marker in the tinted plane (ADR-0040): the caller
+    /// Appends a harness marker: the caller
     /// authors both the text (glyph included) and the [`Tone`] at the firing
     /// site; the store only records the pair. An APPEND - never bumps the
     /// revision. The Steering pending marker takes the same path through
@@ -186,7 +197,7 @@ impl Transcript {
     /// (path/command/pattern by tool name), falling back to the raw
     /// `key=value` summary only when no arg stands out. Appends; never bumps.
     pub fn tool_call(&mut self, id: String, name: String, input: &Value) {
-        let summary = key_arg(&name, input).unwrap_or_else(|| summarize_input(input));
+        let summary = call_summary(&name, input);
         self.append(
             TranscriptItem::ToolCall { id, name, summary },
             &HashMap::new(),
@@ -225,8 +236,8 @@ impl Transcript {
         });
     }
 
-    /// Appends the pending-Steering marker (ADR-0040: a [`Tone::Steering`]
-    /// marker, the user's own voice in the plane). Its text is authored HERE
+    /// Appends the pending-Steering marker (a [`Tone::Steering`]
+    /// marker, the user's own voice). Its text is authored HERE
     /// so [`Transcript::steering_delivered`]'s removal-by-equality can never
     /// desync from it.
     pub fn steering_queued(&mut self, text: &str) {
@@ -279,9 +290,116 @@ impl Transcript {
         self.streaming.text()
     }
 
+    /// The latest task list on screen (ADR-0048): the items of the newest
+    /// [`TranscriptItem::Todo`] in the history, or `&[]` when none has landed.
+    /// The sticky "Current tasks" box DERIVES from this (qwen
+    /// `findLatestTodoSnapshot`) rather than a parallel Agent→view Plan channel -
+    /// the Todo item IS the single source of truth the committed render and the
+    /// sticky box both read, so the two can never disagree. Also returns the
+    /// item's index (its position in [`Transcript::items`]) so the caller can
+    /// gate the sticky box against the high-water mark (show only once the inline
+    /// copy has committed, avoiding a double-render). `None` when no Todo exists.
+    pub fn latest_todo(&self) -> Option<(usize, &[crate::plan::TodoItem])> {
+        self.items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, item)| match item {
+                TranscriptItem::Todo { items } => Some((i, items.as_slice())),
+                _ => None,
+            })
+    }
+
     /// The in-flight Thinking text, from the latest streaming snapshot.
     pub fn streaming_thinking(&self) -> String {
         self.streaming.thinking()
+    }
+
+    /// The rolling thought SUBJECT for the running spinner (qwen
+    /// `LoadingIndicator.tsx:72` `thought?.subject || currentLoadingPhrase`): the
+    /// short head of the live reasoning the spinner shows in place of the lull
+    /// phrase. A pure read over the streaming snapshot, SPINNER-ONLY - the
+    /// committed history keeps the raw Thinking text verbatim.
+    ///
+    /// Three fallbacks, in order (the divergence recorded in ADR-0046): (1) the
+    /// bold subject qwen's `parseThought` parses from the FIRST `**…**`
+    /// pair, when the reasoning emits one; else (2) the last non-empty line of the
+    /// streaming reasoning (the live head - suspenders' reasoning streams do NOT
+    /// reliably emit `**bold**` subjects); else (3) `None`, so the spinner falls
+    /// back to the lull phrase.
+    ///
+    /// Clear-timing is FREE: [`streaming_thinking`](Self::streaming_thinking)
+    /// empties between messages (subject → `None` automatically), and the spinner
+    /// only renders while the Run is Running, so it vanishes at Idle with no
+    /// manual reset. The parse itself lives in the `thought` child module (a
+    /// pure text concern, split from the store's history-invariant duty).
+    pub fn thought_subject(&self) -> Option<String> {
+        thought::thought_subject_of(&self.streaming.thinking())
+    }
+
+    /// Whether flipping compact mode would CHANGE what the frozen scrollback
+    /// shows (qwen `compactToggleHasVisualEffect`, `mergeCompactToolGroups.ts`):
+    /// `true` iff any COMMITTED item is one compact hides or reveals - a
+    /// [`TranscriptItem::Thinking`] (compact hides it entirely) or a tool-group
+    /// member (`ToolCall`/`ToolResult`/`Diff`/`Todo`, whose result BODY compact
+    /// hides). A transcript of only User/Assistant/Info/Marker items has nothing
+    /// compact touches, so the Ctrl+O handler skips the expensive scrollback
+    /// redraw (ADR-0052) - a plain chat toggles with no flicker.
+    ///
+    /// Committed-only on purpose: the pending region redraws every frame at the
+    /// new compact for free, so only the FROZEN prefix `[0, committed_high_water)`
+    /// needs the [`crate::ui::screen::Effect::RedrawScrollback`] re-blit. Pure -
+    /// no ratatui, a testable predicate.
+    pub fn compact_toggle_has_visual_effect(&self) -> bool {
+        self.items[..self.committed]
+            .iter()
+            .any(compact_hides_or_reveals)
+    }
+
+    // ---- The Commit seam (ADR-0046) ----------------------------------------
+
+    /// How many leading items have been frozen into native scrollback - the
+    /// monotonic high-water mark the inline adapter's `insert_before` seam
+    /// keeps. Items `[0, committed_high_water())` are committed and never
+    /// redrawn; the pending region is `items()[committed_high_water()..]`.
+    // qual:allow(dry, boilerplate) reason: "the `committed` mark is the pure
+    // core's own state; making the field pub would let the adapter regress it and
+    // break committed immutability (ADR-0046). The read stays behind this getter,
+    // the same encapsulation boundary as `items`/`revision`."
+    pub fn committed_high_water(&self) -> usize {
+        self.committed
+    }
+
+    /// How far the pending region may be committed right now: the count of
+    /// leading items that are FINAL and in order, stopping at the first
+    /// non-terminal one (a live [`TranscriptItem::ToolCall`] awaiting its
+    /// result, or a [`Tone::Steering`] marker awaiting delivery). Clamped to
+    /// never fall below the high-water mark, so the seam only ever advances.
+    ///
+    /// `User`/`Info`/`ToolResult`/`Assistant`/`Thinking`/`Diff` are terminal:
+    /// the live stream lives in [`Streaming`], never in `items`, so any settled
+    /// `Assistant`/`Thinking` is final. A `ToolCall` is the boundary - a later
+    /// `ToolResult` supersedes it (a structural edit that would rewrite frozen
+    /// scrollback). A `Tone::Steering` marker is non-terminal - delivery removes
+    /// it - so it must never be committed.
+    pub fn committable_upto(&self) -> usize {
+        self.items
+            .iter()
+            .take_while(|it| item_terminal(it))
+            .count()
+            .max(self.committed)
+    }
+
+    /// Advances the high-water mark by `n` committed items (the adapter has
+    /// frozen them into scrollback). Monotonic: it never regresses, and it
+    /// mutates neither `items` nor `revision` - committing is not a structural
+    /// edit, so the RenderCache contract is untouched.
+    // qual:allow(dry, boilerplate) reason: "not a plain setter - it CLAMPS
+    // (saturating add, capped at len) to keep the mark monotonic and in-bounds,
+    // the load-bearing half of the transactional commit seam (ADR-0046). The
+    // field must stay private so this clamp cannot be bypassed."
+    pub fn mark_committed(&mut self, n: usize) {
+        self.committed = self.committed.saturating_add(n).min(self.items.len());
     }
 
     // ---- Internals ----------------------------------------------------------
@@ -343,6 +461,38 @@ fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
 }
 
+// Whether an item is one compact mode hides or reveals (qwen: a Thinking item,
+// hidden entirely, or a tool-group member, whose result body is hidden). A
+// User/Assistant/Info/Marker item is untouched by compact, so a transcript of
+// only those toggles with no visual effect. Pure - the predicate behind
+// [`Transcript::compact_toggle_has_visual_effect`].
+fn compact_hides_or_reveals(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Thinking { .. }
+            | TranscriptItem::ToolCall { .. }
+            | TranscriptItem::ToolResult { .. }
+            | TranscriptItem::Diff { .. }
+            | TranscriptItem::Todo { .. }
+    )
+}
+
+// Whether a settled item is FINAL - safe to freeze into native scrollback
+// (ADR-0046). A `ToolCall` awaits its result (a later `ToolResult` supersedes
+// it), and a `Tone::Steering` marker awaits delivery (which removes it); both
+// are structural edits that would rewrite frozen output, so neither commits.
+// Everything else is terminal.
+fn item_terminal(item: &TranscriptItem) -> bool {
+    !matches!(
+        item,
+        TranscriptItem::ToolCall { .. }
+            | TranscriptItem::Marker {
+                tone: Tone::Steering,
+                ..
+            }
+    )
+}
+
 // The fail-open Extension report (ADR-0007) - sourced once, so the store's own
 // Presentment failures and the Run's `extension_error` events read identically.
 fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> String {
@@ -353,6 +503,23 @@ fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> Strin
 const SUMMARY_WIDTH: usize = 100;
 /// Maximum display width for a single field value inside a summary line.
 const VALUE_WIDTH: usize = 60;
+
+// The Tool Call / merged-result summary for a Tool Call input map. Special-cases
+// `todo_write`: its `todos` array is rendered as the BODY of a
+// [`TranscriptItem::Todo`] (the circle list), so the call/result summary is
+// deliberately empty (qwen shows no description on a TodoWrite header). This is
+// the STRUCTURAL fix for the raw-JSON leak: without it, both [`key_arg`] and its
+// [`summarize_input`] fallback JSON-format the `todos` array, so an in-flight
+// `todo_write` call OR a schema-passing-but-semantically-malformed one that
+// drops all items (no Todo artifact → the Tool Result passes through) would show
+// `todos=[{"content"...}]` in its summary. Every other tool defers to the
+// salient-arg pick with its `key=value` fallback.
+fn call_summary(name: &str, input: &Value) -> String {
+    if name == "todo_write" {
+        return String::new();
+    }
+    key_arg(name, input).unwrap_or_else(|| summarize_input(input))
+}
 
 // The single salient input arg for a merged one-liner, picked by tool: the
 // `path` for read/edit/write, the `command` for run_command, the `pattern`/
@@ -627,6 +794,41 @@ mod tests {
         );
     }
 
+    // The raw-JSON leak fix (P0): a `todo_write` NEVER shows its `todos` array in
+    // a summary - not the in-flight call, not a schema-passing-but-semantically-
+    // malformed result that drops all items (no Todo artifact, so the Tool Result
+    // passes through). Both paths draw their summary from `call_summary`, which is
+    // empty for `todo_write` (the list is the Todo body, not a description).
+    #[test]
+    fn todo_write_never_leaks_raw_json_in_any_summary() {
+        // The salient-arg pick and its fallback BOTH JSON-format the array; the
+        // structural fix is a clean empty summary.
+        let malformed = json!({"todos": [{"content": "", "status": "bogus"}]});
+        assert_eq!(call_summary("todo_write", &malformed), "");
+        // The raw pick DOES carry the JSON (this is what would have leaked).
+        assert!(key_arg("mystery", &malformed).unwrap().contains("content"));
+
+        // (b) The in-flight call reads a bare `todo_write` (empty summary).
+        let mut t = fresh();
+        t.tool_call("t1".into(), "todo_write".into(), &malformed);
+        assert_eq!(t.items(), vec![tool_call_item("t1", "todo_write", "")]);
+
+        // (a) A malformed result that passes through (no Todo artifact) recovers
+        // the call's clean summary as its key_arg - no `todos=[...]` anywhere.
+        t.tool_result(
+            "t1",
+            "todo_write".into(),
+            "Recorded.",
+            false,
+            &HashMap::new(),
+        );
+        let rendered = format!("{:?}", t.items());
+        assert!(
+            !rendered.contains("todos") && !rendered.contains("content:"),
+            "todo_write summary leaked raw JSON: {rendered}"
+        );
+    }
+
     #[test]
     fn a_live_tool_call_line_reads_name_then_key_arg_not_key_equals_value() {
         let mut t = fresh();
@@ -818,6 +1020,86 @@ mod tests {
         // Delivered with no matching marker removes nothing: no bump.
         t.steering_delivered("never queued");
         assert_eq!(t.revision(), 1);
+    }
+
+    // --- the Commit seam (ADR-0046) --------------------------------------------
+
+    // Leading terminal items commit; a live ToolCall is the boundary and
+    // everything from it on stays pending.
+    #[test]
+    fn committable_stops_at_the_first_live_tool_call() {
+        let mut t = fresh();
+        t.user("do a thing");
+        t.push(assistant("on it"));
+        t.tool_call("t1".into(), "read_file".into(), &json!({"path": "a.rs"}));
+        t.push(info("news after the call"));
+        // Two leading terminals (User, Assistant); the ToolCall blocks the rest.
+        assert_eq!(t.committable_upto(), 2);
+    }
+
+    // A Tone::Steering marker is non-terminal (delivery removes it) and blocks
+    // the commit; a plain marker is terminal and commits.
+    #[test]
+    fn committable_treats_a_steering_marker_as_non_terminal() {
+        let mut t = fresh();
+        t.info("a");
+        t.marker("housekeeping", Tone::Housekeeping);
+        t.steering_queued("steer me");
+        t.info("b");
+        // Info, Marker(Housekeeping) commit; the Steering marker is the boundary.
+        assert_eq!(t.committable_upto(), 2);
+    }
+
+    // Delivery promotes the pending Steering marker to a terminal User item, so
+    // the whole prefix becomes committable.
+    #[test]
+    fn committable_advances_once_steering_is_delivered() {
+        let mut t = fresh();
+        t.info("a");
+        t.steering_queued("steer me");
+        assert_eq!(t.committable_upto(), 1);
+        t.steering_delivered("steer me");
+        // Now Info, User - both terminal.
+        assert_eq!(t.committable_upto(), 2);
+    }
+
+    // mark_committed is monotonic, clamps to the item count, and moves neither
+    // the items nor the revision.
+    #[test]
+    fn mark_committed_is_monotonic_and_clamped() {
+        let mut t = fresh();
+        t.info("a");
+        t.info("b");
+        let rev = t.revision();
+        let items = t.items().to_vec();
+
+        assert_eq!(t.committed_high_water(), 0);
+        t.mark_committed(1);
+        assert_eq!(t.committed_high_water(), 1);
+        // Advances, never regresses.
+        t.mark_committed(1);
+        assert_eq!(t.committed_high_water(), 2);
+        // Clamps to the item count - an over-advance cannot outrun the items.
+        t.mark_committed(10);
+        assert_eq!(t.committed_high_water(), 2);
+
+        // Committing is not a structural edit.
+        assert_eq!(t.revision(), rev);
+        assert_eq!(t.items(), items.as_slice());
+    }
+
+    // committable_upto never falls below the high-water mark, even when the
+    // pending front becomes non-terminal after a commit.
+    #[test]
+    fn committable_never_regresses_below_the_high_water_mark() {
+        let mut t = fresh();
+        t.info("a");
+        t.info("b");
+        t.mark_committed(2);
+        // A live ToolCall now leads the pending region, but the two already
+        // committed items keep committable at the high-water mark.
+        t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}));
+        assert_eq!(t.committable_upto(), 2);
     }
 
     // --- presentment -----------------------------------------------------------
@@ -1012,6 +1294,12 @@ mod tests {
                 "extension_failure",
                 Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
             ),
+            // mark_committed moves neither items nor revision (ADR-0046): it is
+            // enrolled with a "neither" expectation - the prefix half of the
+            // property holds vacuously (items are identical), and it must not
+            // bump. Runs after a couple of appends so there is something to
+            // commit.
+            ("mark_committed", Box::new(|t| t.mark_committed(1))),
             ("message_start (again)", Box::new(|t| t.message_start())),
             (
                 "message_update (again)",
@@ -1048,7 +1336,86 @@ mod tests {
         assert_eq!(bumps, 2, "steering_delivered and tool_result each bumped");
     }
 
-    // --- marker plane (ADR-0040) -------------------------------------------------
+    // COMMITTED IMMUTABILITY (ADR-0046): once the high-water mark covers a
+    // prefix, NO verb may ever change an item in `items[0..committed]`. Frozen
+    // scrollback is written once and never redrawn, so a structural edit that
+    // touched a committed item would silently diverge the live pending region
+    // from what is already on screen. The Screen never marks a non-terminal item
+    // committed (a `ToolCall`/`Steering` marker is excluded by `committable_upto`
+    // and is the only thing structural verbs remove), so this holds - but it is a
+    // load-bearing invariant, so pin it as a property over every verb.
+    #[test]
+    fn no_committed_item_is_ever_removed_or_changed_by_any_verb() {
+        type Step = (&'static str, Box<dyn FnOnce(&mut Transcript)>);
+        // The same verb list as the revision property, minus the ones that
+        // append a NON-terminal item the mark would (correctly) never cover; each
+        // runs against a transcript whose committed prefix is exactly its
+        // terminal leading items.
+        let steps: Vec<Step> = vec![
+            ("info", Box::new(|t| t.info("news"))),
+            ("user", Box::new(|t| t.user("hello"))),
+            ("push", Box::new(|t| t.push(diff_item("edit_file")))),
+            ("message_start", Box::new(|t| t.message_start())),
+            (
+                "message_end",
+                Box::new(|t| t.message_end(&[text_block("done")])),
+            ),
+            (
+                "steering_queued",
+                Box::new(|t| t.steering_queued("steer me")),
+            ),
+            (
+                "steering_delivered",
+                Box::new(|t| t.steering_delivered("steer me")),
+            ),
+            (
+                "tool_call",
+                Box::new(|t| t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}))),
+            ),
+            (
+                "tool_result",
+                Box::new(|t| t.tool_result("t1", "grep".into(), "hit", false, &HashMap::new())),
+            ),
+            (
+                "extension_failure",
+                Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
+            ),
+            (
+                "close",
+                Box::new(|t| t.close(Some("turn cancelled".into()))),
+            ),
+            ("discard_streaming", Box::new(|t| t.discard_streaming())),
+        ];
+
+        for (name, step) in steps {
+            let mut t = fresh();
+            // Seed a couple of appends and commit everything terminal, so the
+            // committed prefix is non-empty before the verb under test runs.
+            t.info("committed A");
+            t.user("committed B");
+            let committed = t.committable_upto();
+            t.mark_committed(committed);
+            let frozen = t.items()[..committed].to_vec();
+            assert!(!frozen.is_empty(), "{name}: seeded a committed prefix");
+
+            step(&mut t);
+
+            // The committed prefix is byte-for-byte identical after the verb: no
+            // reorder, no supersede, no removal ever touches frozen items.
+            assert_eq!(
+                &t.items()[..committed],
+                &frozen[..],
+                "{name} changed a COMMITTED item - frozen scrollback would diverge"
+            );
+            // And the mark itself never regresses.
+            assert!(
+                t.committed_high_water() >= committed,
+                "{name} regressed the high-water mark"
+            );
+        }
+    }
+
+    // --- markers -----------------------------------------------------------------
 
     // A marker APPENDS with its carried tone and never bumps the revision - it
     // is an ordinary append, not a structural edit.
@@ -1065,6 +1432,117 @@ mod tests {
             ]
         );
         assert_eq!(t.revision(), 0);
+    }
+
+    // --- latest_todo (ADR-0048: the sticky box's single source of truth) ---------
+
+    fn todo_item(contents: &[&str]) -> TranscriptItem {
+        TranscriptItem::Todo {
+            items: contents
+                .iter()
+                .map(|c| crate::plan::TodoItem {
+                    content: (*c).into(),
+                    status: crate::plan::TodoStatus::Pending,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn latest_todo_returns_the_newest_todo_with_its_index() {
+        let mut t = fresh();
+        assert_eq!(t.latest_todo(), None, "no todo yet");
+
+        t.user("do it");
+        t.push(todo_item(&["read", "edit"]));
+        t.push(info("working"));
+        // A later todo_write supersedes the earlier list (a fresh append, not a
+        // structural edit) - latest_todo returns the NEWEST one and its index.
+        t.push(todo_item(&["read", "edit", "ship"]));
+
+        let (idx, items) = t.latest_todo().expect("a todo is on screen");
+        assert_eq!(idx, 3, "the newest todo item's index");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].content, "ship");
+    }
+
+    // --- compact_toggle_has_visual_effect (ADR-0052) -----------------------------
+
+    // An empty transcript, and one of only User/Info items, has nothing compact
+    // hides in the COMMITTED prefix -> no visual effect (the Ctrl+O handler skips
+    // the scrollback redraw).
+    #[test]
+    fn compact_toggle_is_inert_for_an_empty_or_plain_committed_prefix() {
+        let mut t = fresh();
+        assert!(!t.compact_toggle_has_visual_effect(), "empty");
+
+        t.info("a");
+        t.user("hi");
+        t.push(assistant("an answer"));
+        t.mark_committed(t.committable_upto());
+        assert!(
+            !t.compact_toggle_has_visual_effect(),
+            "only plain items committed (Info / User / Assistant are not compact-affected)"
+        );
+    }
+
+    // A committed Thinking / tool-group member DOES change under compact, so the
+    // predicate is true once one is frozen.
+    #[test]
+    fn compact_toggle_has_effect_for_committed_thinking_or_tool_items() {
+        for item in [
+            thinking("hmm"),
+            tool_call_item("id1", "grep", "hit"),
+            tool_result_item("grep", "hit", false),
+            diff_item("edit_file"),
+            todo_item(&["read"]),
+        ] {
+            let mut t = fresh();
+            t.push(item);
+            // A bare `ToolCall` is not terminal (`committable_upto` stops at it),
+            // so force the mark past it - the predicate reads `items[..committed]`
+            // regardless of terminality, and a committed ToolCall header is
+            // compact-affected (it is a tool-group member the predicate lists).
+            t.mark_committed(t.committable_upto().max(1));
+            assert!(
+                t.compact_toggle_has_visual_effect(),
+                "a committed compact-affected item has a visual effect"
+            );
+        }
+    }
+
+    // The predicate reads the COMMITTED prefix only: a Thinking item still in the
+    // pending region (uncommitted) has no scrollback effect - the pending body
+    // redraws at the new compact for free.
+    #[test]
+    fn compact_toggle_ignores_uncommitted_items() {
+        let mut t = fresh();
+        t.push(thinking("pending thought"));
+        // Nothing committed yet.
+        assert_eq!(t.committed_high_water(), 0);
+        assert!(
+            !t.compact_toggle_has_visual_effect(),
+            "an uncommitted Thinking item does not need a scrollback redraw"
+        );
+    }
+
+    // --- thought_subject (the spinner's rolling reasoning head) ------------------
+    // The pure parse ladder is tested in the `thought` child module; here we pin
+    // only the store read that threads the streaming snapshot through it.
+
+    // The store read threads the streaming snapshot through: subject shows
+    // mid-message, then empties to None between messages (clear-timing is free).
+    #[test]
+    fn thought_subject_reads_the_live_snapshot_and_clears_between_messages() {
+        let mut t = fresh();
+        assert_eq!(t.thought_subject(), None, "idle: no reasoning");
+        t.message_start();
+        t.message_update(vec![thinking_block("**Planning** the next move")]);
+        assert_eq!(t.thought_subject(), Some("Planning".to_string()));
+        // Settling the message empties the streaming snapshot; a new message
+        // starts from nothing, so the subject clears with no manual reset.
+        t.message_end(&[text_block("done")]);
+        assert_eq!(t.thought_subject(), None);
     }
 
     // --- item vocabulary ---------------------------------------------------------

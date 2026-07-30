@@ -106,3 +106,20 @@ What survives unchanged: the Active Model as mutable Agent state beside the
 fixed Session facts, change-on-next-Run semantics, no mid-stream swap, the
 no-op on re-selection, and the sticky sparse write of the `model` key (now
 scoped) with its env-shadow warning.
+
+## Amendment (ADR-0051, Phase 5): the `/model` DIALOG is System A + a filter
+
+The one-widget convergence with `/theme` is superseded: `/model` is now a
+System-A numbered `›` DIALOG (`ui::selection::SelectionList`), not the retired
+group-aware `Selector`. Provider HEADER rows survive (richer than qwen's per-row
+`[authType]` badge for suspenders' N providers); headers and greyed catalog rows
+are disabled (skipped by nav, dim in render); switch is on Enter only (no live
+switch), matching the change-on-next-Run rule above. `model_rows`, `pick`, and
+`applied_line` are unchanged.
+
+**The `/model` dialog KEEPS an editable fuzzy filter (deliberate divergence from
+qwen's filter-less dialog).** Suspenders surfaces hundreds of catalog models, so
+typing after `/model ` narrows the rows (a case-insensitive whole-row filter that
+retains matching groups' headers and notes). This is the only filtered dialog;
+`/theme` stays frozen-draft. Navigation now WRAPS (qwen `useSelectionList`) where
+the retired selector saturated.

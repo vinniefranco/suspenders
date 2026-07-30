@@ -7,20 +7,18 @@
 //!
 //! ## The registry is the extension seam
 //!
-//! [`COMMANDS`] is a `&'static` slice of descriptors. Adding `/theme` later is
-//! one more entry, not a new widget: the menu, filter, and generic selector
-//! ([`crate::ui::selector`]) are untouched. Today it holds exactly one entry,
-//! `/model`.
+//! [`COMMANDS`] is a `&'static` slice of descriptors. Adding a command later is
+//! one more entry, not a new widget: the fuzzy `/` palette
+//! ([`crate::ui::completion`], ADR-0051 System B) ranks the registry, and a
+//! selector-opening command's numbered `›` dialog ([`crate::ui::selection`],
+//! System A) reuses the shared list.
 //!
 //! ## Parsing a slash draft
 //!
 //! A slash draft is `/name[ rest]`: the FIRST space separates the command token
 //! (`name`) from an optional remainder (`rest`). [`parse`] splits it; [`lookup`]
-//! resolves a name to a descriptor; [`rows`] runs the (optionally
-//! token-filtered) registry into [`SelectorRow`]s so the menu renders through
-//! the generic selector.
-
-use crate::view_model::SelectorRow;
+//! resolves a name to a descriptor. The palette ranking lives in
+//! [`crate::ui::completion::rank`], reading this registry (name + `alt_names`).
 
 /// One command descriptor: the name typed after `/` and the one-line help the
 /// menu shows. The Effect the command produces is NOT here - the pure core
@@ -45,6 +43,16 @@ pub struct SlashCommand {
     /// English grammar: the painter looks it up instead of conjugating the
     /// command name.
     pub list_title: &'static str,
+    /// Alternate names the fuzzy `/` palette also matches against (qwen
+    /// `SlashCommand.altNames`): the name and each alt name are ranked, and
+    /// the best of them names the command in the suggestion list. Empty for a
+    /// command with no aliases.
+    pub alt_names: &'static [&'static str],
+    /// A static ranking nudge (qwen `SlashCommand.completionPriority`): a
+    /// higher value floats the command up the palette within a strength tier,
+    /// ABOVE recency (qwen `compareRankedCommandMatches`, useSlashCompletion.ts
+    /// 240-248). `0` for a command with no priority (the default).
+    pub completion_priority: i32,
 }
 
 /// The available Slash Commands (ADR-0032's `&'static` registry); `/compact`,
@@ -55,12 +63,16 @@ pub const COMMANDS: &[SlashCommand] = &[
         help: "choose the model for this session",
         opens_selector: true,
         list_title: "models",
+        alt_names: &[],
+        completion_priority: 0,
     },
     SlashCommand {
         name: "theme",
         help: "choose the theme for this session",
         opens_selector: true,
         list_title: "themes",
+        alt_names: &[],
+        completion_priority: 0,
     },
 ];
 
@@ -102,19 +114,6 @@ pub fn parse(draft: &str) -> SlashDraft {
 /// The descriptor whose name matches `name` exactly, if any.
 pub fn lookup(name: &str) -> Option<&'static SlashCommand> {
     COMMANDS.iter().find(|c| c.name == name)
-}
-
-/// The registry as [`SelectorRow`]s (value = label = name, hint = help),
-/// keeping only commands whose name contains `filter` (case-insensitive
-/// substring) so the menu narrows as the command token is typed. An empty
-/// filter yields every command.
-pub fn rows(filter: &str) -> Vec<SelectorRow> {
-    let needle = filter.to_lowercase();
-    COMMANDS
-        .iter()
-        .filter(|c| c.name.to_lowercase().contains(&needle))
-        .map(|c| SelectorRow::new(c.name, c.name, Some(c.help.to_string())))
-        .collect()
 }
 
 #[cfg(test)]
@@ -243,27 +242,15 @@ mod tests {
         );
     }
 
-    // --- rows --------------------------------------------------------------
+    // --- alt_names ---------------------------------------------------------
 
     #[test]
-    fn rows_empty_filter_yields_every_command() {
-        let rows = rows("");
-        assert_eq!(rows.len(), COMMANDS.len());
-        assert_eq!(
-            rows[0],
-            SelectorRow::new(
-                "model",
-                "model",
-                Some("choose the model for this session".into())
-            )
-        );
-    }
-
-    #[test]
-    fn rows_filter_is_case_insensitive_substring_on_the_name() {
-        assert_eq!(rows("mod").len(), 1);
-        assert_eq!(rows("MODEL").len(), 1);
-        assert_eq!(rows("ode").len(), 1, "substring, not just prefix");
-        assert!(rows("zzz").is_empty());
+    fn every_command_declares_its_alt_names_slice() {
+        // The palette ranking (ADR-0051) reads name + alt_names; a missing
+        // slice would be a compile error, so this just pins the current empty
+        // aliases so a future alias addition is a deliberate change.
+        for c in COMMANDS {
+            assert!(c.alt_names.is_empty(), "/{} has no aliases yet", c.name);
+        }
     }
 }

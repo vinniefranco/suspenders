@@ -157,11 +157,14 @@ fn pick(current: &str, value: String) -> Option<String> {
 async fn apply_pick(screen: Screen, ctx: &AdapterCtx<'_>, pick: Option<String>) -> Screen {
     let Some(scoped) = pick else { return screen };
     if let Err(reason) = ctx.agent.set_model(scoped.clone()).await {
-        return screen.info(format!("model → {scoped} (not applied: {reason})"));
+        // Info line's Commit re-derived by dispatch's trailing freeze (ADR-0046).
+        return screen
+            .info(format!("model → {scoped} (not applied: {reason})"))
+            .0;
     }
     let persist = SessionConfig::persist_model(&ctx.config_path, &scoped);
     let env_shadowed = std::env::var("SUSPENDERS_MODEL").is_ok();
-    screen.info(applied_line(&scoped, env_shadowed, &persist))
+    screen.info(applied_line(&scoped, env_shadowed, &persist)).0
 }
 
 #[cfg(test)]

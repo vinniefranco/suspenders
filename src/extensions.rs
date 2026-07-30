@@ -31,6 +31,7 @@
 pub mod condense;
 pub mod diff;
 pub mod run_command;
+pub mod todo;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -272,9 +273,10 @@ pub fn normalize(entry: impl Into<ExtensionSpec>) -> ExtensionSpec {
 /// implementation ([`build`]); an unknown name is skipped (it cannot be
 /// registered, so it has no effect and cannot fail a stage). This is the
 /// production registry: the shipped config resolves
-/// `["diff", "run_command", "condense"]` into the Diff extension, the
-/// run_command exit-badge extension, and the condense noise-collapse extension,
-/// so the live app runs the Run/Presentment pipeline with all three.
+/// `["diff", "run_command", "condense", "todo"]` into the Diff extension, the
+/// run_command exit-badge extension, the condense noise-collapse extension, and
+/// the Todo display extension (ADR-0048), so the live app runs the
+/// Run/Presentment pipeline with all four.
 pub fn configured(names: &[String]) -> Vec<Registered> {
     names
         .iter()
@@ -285,8 +287,9 @@ pub fn configured(names: &[String]) -> Vec<Registered> {
 /// Builds the [`Registered`] extension for one normalized spec, or `None` if
 /// the name has no registered implementation. Maps each name to the role(s) it
 /// composes: `diff` is Middleware + Presenter, `run_command` is Middleware +
-/// Presenter, `condense` is Middleware-only. The concrete structs are ZSTs, so
-/// boxing one twice as two trait objects is free.
+/// Presenter, `condense` is Middleware-only, `todo` is Middleware + Presenter.
+/// The concrete structs are ZSTs, so boxing one twice as two trait objects is
+/// free.
 fn build(spec: &ExtensionSpec) -> Option<Registered> {
     match spec.name.as_str() {
         "diff" => Some(
@@ -302,6 +305,11 @@ fn build(spec: &ExtensionSpec) -> Option<Registered> {
         "condense" => Some(
             Registered::new("condense", spec.opts.clone())
                 .with_middleware(Box::new(condense::Condense)),
+        ),
+        "todo" => Some(
+            Registered::new("todo", spec.opts.clone())
+                .with_middleware(Box::new(todo::Todo))
+                .with_presenter(Box::new(todo::Todo)),
         ),
         _ => None,
     }
