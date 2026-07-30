@@ -62,7 +62,7 @@
 //! by the edit fold and the layout math, so the cell the user edits and the
 //! cell the view paints can never drift apart.
 
-use crate::event::Event;
+use crate::event::{Event, FileSuggestion};
 use crate::ui::completion::{self, Completion, Suggestion};
 use crate::ui::draft;
 use crate::ui::history::History;
@@ -473,6 +473,152 @@ impl DialogParts {
     }
 }
 
+/// The `@path` file picker's overlay state (Phase C2, qwen `useAtCompletion`),
+/// an ALWAYS-PRESENT Null Object like [`CommandSelector`]: `Closed` is the rest
+/// state, so the Composer never juggles an `Option` and the fill/nav are
+/// unconditional delegations. Opened lazily from the draft (the AT context is
+/// draft-derived, not committed), it stores the async-fetched rows guarded by
+/// `generation` + `query`, and navigates them with a reused [`Completion`].
+///
+/// Unlike the selector (opened once on commit), the AT fetch fires PER
+/// KEYSTROKE: each pattern change bumps `generation` and emits a fresh
+/// [`Effect::FileSearch`], and only a [`Event::FileSearchReady`] echoing the
+/// live generation AND query is folded (a stale keystroke's result is dropped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtFiles {
+    /// The last-fetched suggestions and the query they were fetched for. `None`
+    /// until the first fill lands (the popup shows "searching…" until then).
+    fetched: Option<AtFetched>,
+    /// The highlight + scroll window over the fetched rows (reused palette nav).
+    nav: Completion,
+    /// The AT activation counter, bumped on each pattern change; stamped on the
+    /// emitted [`Effect::FileSearch`] and echoed by the fill.
+    generation: u64,
+    /// The pattern the last [`Effect::FileSearch`] was emitted for, so a
+    /// no-change keystroke (a cursor move that leaves the pattern intact) does
+    /// not re-fetch, and the fill's query guard has something to match against.
+    requested_query: Option<String>,
+    /// Whether the user dismissed the popup with Esc (keeping the draft). Reset
+    /// when the pattern next changes, so typing re-opens it.
+    dismissed: bool,
+}
+
+/// The rows a [`Event::FileSearchReady`] delivered and the query they answer,
+/// stored so a later fill for a DIFFERENT query is dropped by the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtFetched {
+    query: String,
+    suggestions: Vec<Suggestion>,
+}
+
+impl AtFiles {
+    // The closed rest state: no fetch, fresh nav, generation 0, nothing
+    // requested or dismissed.
+    fn closed() -> Self {
+        AtFiles {
+            fetched: None,
+            nav: Completion::new(),
+            generation: 0,
+            requested_query: None,
+            dismissed: false,
+        }
+    }
+
+    // Returns to the closed rest state (accept, or leaving the AT context).
+    fn close(&mut self) {
+        *self = Self::closed();
+    }
+
+    // The suggestions to render for the live `query`: the fetched rows when they
+    // answer exactly this query, else an empty list (a stale/absent fetch shows
+    // as "searching…"). Never renders rows fetched for a different pattern.
+    fn suggestions_for(&self, query: &str) -> &[Suggestion] {
+        match &self.fetched {
+            Some(f) if f.query == query => &f.suggestions,
+            _ => &[],
+        }
+    }
+
+    // Whether a fetch for `query` is still outstanding (no rows for it yet), so
+    // the view shows a subtle "searching…" line instead of an empty list.
+    fn is_loading_for(&self, query: &str) -> bool {
+        !matches!(&self.fetched, Some(f) if f.query == query)
+    }
+
+    // Re-clamps the nav to the fetched-row count for `query` and returns that
+    // count (the shared "sync the highlight to the visible rows" step, so the
+    // nav never dangles past a shrunk list). Ties `nav` to `fetched`.
+    fn clamp_nav(&mut self, query: &str) -> usize {
+        let len = self.suggestions_for(query).len();
+        self.nav.clamp(len);
+        len
+    }
+
+    // Moves the highlight up/down over the fetched rows for `query` (wraps, qwen
+    // `useCompletion` nav).
+    fn nav_up(&mut self, query: &str) {
+        let len = self.suggestions_for(query).len();
+        self.nav.up(len);
+    }
+    fn nav_down(&mut self, query: &str) {
+        let len = self.suggestions_for(query).len();
+        self.nav.down(len);
+    }
+
+    // The highlighted suggestion for `query`, if any - the accept target.
+    fn highlighted(&self, query: &str) -> Option<&Suggestion> {
+        self.suggestions_for(query).get(self.nav.active())
+    }
+
+    // The highlight index + scroll window for the view (re-clamped to the rows).
+    fn view_cursor(&self, query: &str) -> (usize, usize) {
+        let mut nav = self.nav.clone();
+        nav.clamp(self.suggestions_for(query).len());
+        (nav.active(), nav.scroll())
+    }
+
+    // Opens a fresh search for `query`: bump the activation counter, record the
+    // requested pattern (so a later fill's guard matches), un-dismiss the popup
+    // (a pattern change re-opens it), and return the new generation to stamp on
+    // the emitted effect. The single owner of the generation/requested/dismissed
+    // trio, so those flag fields connect to the rest of the struct (cohesion).
+    fn request(&mut self, query: String) -> u64 {
+        self.generation += 1;
+        self.requested_query = Some(query);
+        self.dismissed = false;
+        self.generation
+    }
+
+    // Whether a search for `query` has NOT been requested yet (the entry-search
+    // guard: emit one the first time an AT context opens on this pattern).
+    fn needs_request(&self, query: &str) -> bool {
+        self.requested_query.as_deref() != Some(query)
+    }
+
+    // Marks the popup dismissed (Esc): closed until the pattern next changes.
+    fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
+
+    // Whether the popup was dismissed (Esc) and not yet re-opened by a pattern
+    // change.
+    fn is_dismissed(&self) -> bool {
+        self.dismissed
+    }
+
+    // Folds a delivered fill: store the rows only when its `generation` AND
+    // `query` match the live activation (the staleness guard), then re-clamp the
+    // nav to the new row count. A stale fill is a no-op.
+    fn fill(&mut self, generation: u64, query: String, suggestions: Vec<Suggestion>) {
+        if generation != self.generation || self.requested_query.as_deref() != Some(&query) {
+            return;
+        }
+        let len = suggestions.len();
+        self.fetched = Some(AtFetched { query, suggestions });
+        self.nav.clamp(len);
+    }
+}
+
 /// The open Composer overlay for rendering (ADR-0051), one enum the adapter
 /// matches once. The TWO systems are DISTINCT variants:
 ///
@@ -504,6 +650,20 @@ pub enum OverlayView {
         rows: Vec<SelectorRow>,
         active: usize,
         detail: Option<String>,
+    },
+    /// The `@path` file picker (Phase C2, qwen `useAtCompletion`): a fuzzy,
+    /// color-only file list rendered like `Menu` (no numbers) but sourced from
+    /// the async project walk, not the static registry. Carries the fetched
+    /// [`Suggestion`]s (repo-relative path labels with the fuzzy highlight
+    /// window, the escaped path as `value`), the active index + scroll window,
+    /// the `query` for the highlight, and whether the async fetch is still in
+    /// flight with nothing to show yet (`loading` - a subtle "searching…" row).
+    AtFiles {
+        suggestions: Vec<Suggestion>,
+        active: usize,
+        scroll: usize,
+        query: String,
+        loading: bool,
     },
 }
 
@@ -558,6 +718,12 @@ pub struct Composer {
     /// [`crate::ui::history`]; navigated from the Up/Down arms of
     /// [`Composer::handle_key`] and appended to by [`Composer::submitted_ok`].
     history: History,
+    /// The `@path` file-picker overlay (Phase C2, qwen `useAtCompletion`), an
+    /// ALWAYS-PRESENT Null Object like `selector`. Opened lazily whenever the
+    /// draft+cursor sit in an AT context ([`at_context`]); holds the async
+    /// file-search rows (generation+query guarded), navigated by its own
+    /// [`Completion`]. AT takes precedence over the slash overlays.
+    at_files: AtFiles,
 }
 
 impl Composer {
@@ -571,6 +737,7 @@ impl Composer {
             selector: CommandSelector::closed(),
             selector_generation: 0,
             history: History::new(history),
+            at_files: AtFiles::closed(),
         }
     }
 
@@ -610,6 +777,54 @@ impl Composer {
             return KeyOutcome::Refused(key);
         }
 
+        // `@path` file completion (Phase C2, qwen `useAtCompletion`): an `@`
+        // before the cursor (before an unescaped space) on the current line
+        // opens the file picker, WHATEVER else the draft is - AT takes
+        // PRECEDENCE over SLASH (qwen checks AT first), so `@` after a
+        // `/command ` still triggers the file search. Checked before the slash
+        // fork for exactly that reason. When the popup is not dismissed, arrows
+        // navigate it and Enter/Tab accept; every other key falls through to
+        // editing so typing re-filters (and re-emits the search).
+        if let Some(at) = at_context(&self.value, self.cursor) {
+            return self.at_key(key, at, status);
+        }
+        // The cursor left every AT context (a space, a newline, or backspaced
+        // past the `@`): drop any open picker so a later `@` re-opens fresh.
+        self.at_files.close();
+
+        // Not in an AT context YET: fold the key through the slash/editing
+        // arms, then re-detect AT on the POST-edit draft (qwen derives the AT
+        // mode from the updated buffer). Typing the `@` itself, or moving the
+        // cursor INTO an existing `@token`, opens a fresh context whose initial
+        // search must fire on THIS keypress - so weave that entry search in.
+        let outcome = self.handle_key_non_at(key, status);
+        self.open_at_after_edit(outcome)
+    }
+
+    // Emits the AT entry search if the POST-edit draft newly sits in an AT
+    // context whose pattern hasn't been requested yet (typing `@`, or a cursor
+    // move into an `@token`). A no-op when there is no AT context, or when the
+    // live pattern was already requested (the AT fork above already handles
+    // in-context keystrokes). Woven onto `outcome` so the opening keypress
+    // carries both its own effects and the fresh `Effect::FileSearch`.
+    fn open_at_after_edit(&mut self, outcome: KeyOutcome) -> KeyOutcome {
+        let Some(at) = at_context(&self.value, self.cursor) else {
+            return outcome;
+        };
+        if self.at_files.is_dismissed() || !self.at_files.needs_request(&at.query) {
+            return outcome;
+        }
+        let search = self.request_file_search(at.query);
+        let KeyOutcome::Consumed { effects, .. } = search else {
+            return outcome;
+        };
+        prepend_effects(effects, outcome)
+    }
+
+    // The slash/editing dispatch, reached only when the draft is NOT (yet) in an
+    // AT context. Split from [`Composer::handle_key`] so the AT re-detection can
+    // wrap it (the entry-search weave above).
+    fn handle_key_non_at(&mut self, key: Key, status: Status) -> KeyOutcome {
         // Slash Command overlay (ADR-0032/0033): a leading `/` opens the popup
         // whatever the Agent is doing (Idle or Running) - a slash draft is
         // NEVER a prompt or Steering. The draft parses into `(name, rest)`;
@@ -643,6 +858,121 @@ impl Composer {
         }
 
         self.editing_key(key, status)
+    }
+
+    // -- AT file completion sub-state (Phase C2, qwen `useAtCompletion`) --
+    // Dispatched by [`Composer::handle_key`] whenever the draft+cursor sit in an
+    // `@path` context; `at` is the detected context (the `@`..pattern span and
+    // the pattern). Navigation is the reused palette [`Completion`]; Enter/Tab
+    // accept the highlighted path, Esc dismisses (keeping the draft), every
+    // editing key falls through so typing re-filters. After an editing key
+    // changes the pattern, a fresh [`Effect::FileSearch`] is emitted (the
+    // per-keystroke analog of the selector's one-shot fetch).
+    fn at_key(&mut self, key: Key, at: AtContext, status: Status) -> KeyOutcome {
+        // A dismissed popup (Esc) stays closed until the pattern changes: while
+        // dismissed, keys edit normally (no nav, no re-open) - only a pattern
+        // change below clears the flag and re-emits the search.
+        if self.at_files.is_dismissed() {
+            return self.at_edit(key, &at, status);
+        }
+        // Ensure a search is outstanding for the live pattern: the FIRST time an
+        // AT context opens (typing `@`, or moving the cursor into an existing
+        // `@token`) no fetch has fired yet, so emit one now (qwen's
+        // enabled-effect that searches the pattern on entry). Once requested,
+        // `requested_query == query`, so this is a no-op on nav/accept keys.
+        let mut effects = Vec::new();
+        if self.at_files.needs_request(&at.query)
+            && let KeyOutcome::Consumed { effects: e, .. } =
+                self.request_file_search(at.query.clone())
+        {
+            effects = e;
+        }
+        let len = self.at_files.clamp_nav(&at.query);
+        // Fold nav/accept/dismiss/edit; then prepend any entry-fetch effect so a
+        // freshly-opened popup requests its rows even on this first keypress.
+        let outcome = self.at_key_inner(key, &at, len, status);
+        prepend_effects(effects, outcome)
+    }
+
+    // The AT key dispatch proper (nav / accept / dismiss / edit), split from
+    // [`Composer::at_key`] so the entry-fetch effect can be woven in around it.
+    // `len` is the fetched-row count for the pattern (0 disables accept).
+    fn at_key_inner(&mut self, key: Key, at: &AtContext, len: usize, status: Status) -> KeyOutcome {
+        match key {
+            // Arrow-only nav over the fetched rows (wraps, qwen `useCompletion`).
+            Key::ArrowUp => {
+                self.at_files.nav_up(&at.query);
+                consumed(vec![])
+            }
+            Key::ArrowDown => {
+                self.at_files.nav_down(&at.query);
+                consumed(vec![])
+            }
+            // Enter / Tab accept the highlighted path (qwen `handleAutocomplete`
+            // / the Enter path). With no rows there is nothing to accept: fall
+            // through so Enter still submits/steers a draft that merely contains
+            // an unmatched `@token`.
+            Key::Enter | Key::Tab if len > 0 => self.at_accept(at),
+            // Esc dismisses the popup but KEEPS the draft (unlike the slash menu,
+            // which clears): the `@token` stays typed, the popup just closes.
+            Key::Escape => {
+                self.at_files.dismiss();
+                consumed(vec![])
+            }
+            // Everything else edits, then (if the pattern moved) re-searches.
+            other => self.at_edit(other, at, status),
+        }
+    }
+
+    // An editing key inside an AT context: edit the draft, then - if the pattern
+    // changed - request a fresh file search (bumping the generation) and un-dismiss
+    // the popup. A cursor move that leaves the pattern intact requests nothing.
+    fn at_edit(&mut self, key: Key, before: &AtContext, status: Status) -> KeyOutcome {
+        let outcome = self.editing_key(key, status);
+        // Re-detect after the edit: the cursor may have left the AT context
+        // entirely (backspaced past `@`, typed a space), in which case close.
+        match at_context(&self.value, self.cursor) {
+            // A pattern CHANGE re-searches (and `request_file_search` clears any
+            // dismissal, so typing after Esc re-opens the popup). A dismissed
+            // popup that sees no pattern change - a bare cursor move - stays
+            // dismissed: Esc sticks until the pattern actually moves.
+            Some(after) if after.query != before.query => self.request_file_search(after.query),
+            Some(_) => outcome, // same pattern (a cursor move): no re-fetch.
+            None => {
+                self.at_files.close();
+                outcome
+            }
+        }
+    }
+
+    // Bumps the AT generation and emits an [`Effect::FileSearch`] for `query`,
+    // recording it as the requested pattern (so the fill's guard matches) and
+    // clearing the dismissed flag (a pattern change re-opens the popup). Returns
+    // the effect as a consumed outcome - the sole AT effect the composer emits.
+    fn request_file_search(&mut self, query: String) -> KeyOutcome {
+        let generation = self.at_files.request(query.clone());
+        consumed(vec![Effect::FileSearch { query, generation }])
+    }
+
+    // Accepts the highlighted AT path: replace the `@`+pattern span (from the
+    // `@` through `completion_end`) with `@<escaped-path>` and a trailing space,
+    // placing the cursor after the space. Escaping the path's spaces (qwen
+    // `escapePath`) keeps [`at_context`]'s unescaped-space rule round-tripping;
+    // the trailing space naturally ends the AT context, so the popup closes.
+    fn at_accept(&mut self, at: &AtContext) -> KeyOutcome {
+        let Some(row) = self.at_files.highlighted(&at.query).cloned() else {
+            return consumed(vec![]);
+        };
+        let chars: Vec<char> = self.value.chars().collect();
+        let before: String = chars[..at.at].iter().collect();
+        let after: String = chars[at.end..].iter().collect();
+        // `row.value` is already the escaped path (the adapter escaped it); build
+        // `<before>@<escaped> <after>` and drop the cursor just after the space.
+        let inserted = format!("@{} ", row.value);
+        self.value = format!("{before}{inserted}{after}");
+        self.cursor = before.chars().count() + inserted.chars().count();
+        self.at_files.close();
+        consumed(vec![])
     }
 
     // -- DIALOG sub-state (System A, `/model qw` / `/theme`, ADR-0051) --
@@ -944,6 +1274,14 @@ impl Composer {
                 self.fill_failed(generation, message);
                 EventOutcome::Consumed(vec![])
             }
+            Event::FileSearchReady {
+                generation,
+                query,
+                suggestions,
+            } => {
+                self.fill_file_search(generation, query, suggestions);
+                EventOutcome::Consumed(vec![])
+            }
             other => EventOutcome::Refused(other),
         }
     }
@@ -961,6 +1299,20 @@ impl Composer {
     // [`Composer::fill_ready`].
     fn fill_failed(&mut self, generation: u64, message: String) {
         self.selector.fill_failed(generation, message);
+    }
+
+    // Folds an AT file-search result into the picker overlay (Phase C2): map the
+    // wire [`FileSuggestion`]s into render [`Suggestion`]s and hand them to the
+    // guarded [`AtFiles::fill`], which drops a delivery whose generation OR query
+    // no longer matches the live activation (a stale keystroke's result).
+    fn fill_file_search(
+        &mut self,
+        generation: u64,
+        query: String,
+        suggestions: Vec<FileSuggestion>,
+    ) {
+        let rows = suggestions.into_iter().map(to_file_suggestion).collect();
+        self.at_files.fill(generation, query, rows);
     }
 
     /// The Submit effect succeeded: record `prompt` into the history ring
@@ -1026,6 +1378,15 @@ impl Composer {
     // dialog state (ADR-0051). `Dialog` (System A) once a selector-opening
     // command committed; `Menu` (System B) while the command token is typed.
     fn overlay_view(&self) -> Option<OverlayView> {
+        // AT takes precedence over SLASH (qwen checks AT first): an `@path`
+        // context in the draft draws the file picker even after a `/command `.
+        // A dismissed picker (Esc, draft kept) shows no overlay until the
+        // pattern next changes.
+        if let Some(at) = at_context(&self.value, self.cursor)
+            && !self.at_files.is_dismissed()
+        {
+            return Some(self.at_view(&at));
+        }
         if !slash::is_slash(&self.value) {
             return None;
         }
@@ -1036,6 +1397,24 @@ impl Composer {
             Some(self.dialog_view(&draft.name))
         } else {
             Some(self.menu_view(&draft.name))
+        }
+    }
+
+    // The `@path` file picker's render view (Phase C2): the fetched suggestions
+    // for the live pattern (empty until the guarded fill lands), the active
+    // index + scroll window (re-clamped), the pattern for the fuzzy highlight,
+    // and whether a fetch for this pattern is still outstanding (the subtle
+    // "searching…" line). Drawn like `Menu` (color-only, no numbers) but sourced
+    // from the async walk.
+    fn at_view(&self, at: &AtContext) -> OverlayView {
+        let suggestions = self.at_files.suggestions_for(&at.query).to_vec();
+        let (active, scroll) = self.at_files.view_cursor(&at.query);
+        OverlayView::AtFiles {
+            suggestions,
+            active,
+            scroll,
+            query: at.query.clone(),
+            loading: self.at_files.is_loading_for(&at.query),
         }
     }
 
@@ -1139,6 +1518,7 @@ impl Composer {
         self.cursor = 0;
         self.menu = Completion::new();
         self.selector.close();
+        self.at_files.close();
     }
 
     // Closes the selector overlay AND clears the draft (they open together,
@@ -1170,6 +1550,23 @@ fn consumed(effects: Vec<Effect>) -> KeyOutcome {
     }
 }
 
+// Prepends `head` effects onto an `outcome`, preserving its notice (the AT
+// entry-fetch weaves its `Effect::FileSearch` in front of the inner fold's
+// effects). A refusal never carries effects, so it passes through unchanged -
+// but the AT fold never refuses (every key in an AT context is consumed).
+fn prepend_effects(mut head: Vec<Effect>, outcome: KeyOutcome) -> KeyOutcome {
+    match outcome {
+        KeyOutcome::Consumed { mut effects, notice } => {
+            head.append(&mut effects);
+            KeyOutcome::Consumed {
+                effects: head,
+                notice,
+            }
+        }
+        KeyOutcome::Refused(key) => KeyOutcome::Refused(key),
+    }
+}
+
 /// The digit-timeout clock the DIALOG's [`SelectionList`] never actually needs:
 /// model/theme dialogs are short (< 10 navigable rows), so every digit selects
 /// immediately and the buffered-timeout path is dead. A constant stands in for
@@ -1181,6 +1578,101 @@ const NOW_UNUSED: Millis = 0;
 fn is_text_edit(key: &Key) -> bool {
     matches!(key, Key::Char(_) | Key::InsertNewline)
 }
+
+// -- AT file completion detection (Phase C2, qwen `useCommandCompletion`) --
+
+/// An open `@path` completion context, detected from the draft + cursor by
+/// [`at_context`] (qwen `useCommandCompletion` CompletionMode.AT). All indices
+/// are CHAR indices into the whole draft `value` (not the line), so the accept
+/// path can splice `value` directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtContext {
+    /// The char index of the `@` sigil in `value`.
+    at: usize,
+    /// The char index just after `@` where the pattern begins (qwen
+    /// `completionStart`).
+    start: usize,
+    /// The char index of the pattern's end - the next UNESCAPED space or EOL
+    /// (qwen `completionEnd`).
+    end: usize,
+    /// The pattern `value[start..end]` (qwen `partialPath`), backslash escapes
+    /// included so the round-trip holds.
+    query: String,
+}
+
+/// Detects an `@path` completion context at `cursor` in `value` (qwen
+/// `useCommandCompletion`, lines 86-131, ported verbatim into char space).
+///
+/// Scans BACKWARD from `cursor-1` over the CURRENT logical line (the draft is
+/// multi-line; qwen scans `buffer.lines[cursorRow]`): an UNESCAPED space (an
+/// even count of immediately-preceding backslashes) breaks the scan with no AT
+/// context; an `@` opens AT mode, its pattern running FORWARD from just after
+/// the `@` to the next unescaped space (same even-backslash rule) or the line
+/// end. Returns `None` when no `@` precedes the cursor on this line before an
+/// unescaped space. AT takes precedence over SLASH (the caller checks this
+/// first), so `@` after a `/command ` still triggers the file search.
+fn at_context(value: &str, cursor: usize) -> Option<AtContext> {
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    // The current logical line's [line_start, line_end) char bounds (scan is
+    // confined to it, like qwen's per-row buffer).
+    let line_start = chars[..cursor]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let line_end = chars[cursor..]
+        .iter()
+        .position(|&c| c == '\n')
+        .map(|off| cursor + off)
+        .unwrap_or(chars.len());
+
+    // Backward from cursor-1 to the line start (qwen `i = cursorCol - 1`).
+    let mut i = cursor;
+    while i > line_start {
+        i -= 1;
+        match chars[i] {
+            ' ' if is_unescaped_space(&chars, i) => return None,
+            '@' => {
+                let start = i + 1;
+                // Forward from the cursor to the next unescaped space or EOL
+                // (qwen scans from `cursorCol` forward for `end`).
+                let end = (cursor..line_end)
+                    .find(|&j| chars[j] == ' ' && is_unescaped_space(&chars, j))
+                    .unwrap_or(line_end);
+                let query: String = chars[start..end].iter().collect();
+                return Some(AtContext {
+                    at: i,
+                    start,
+                    end,
+                    query,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// Whether the space at char index `i` is UNESCAPED: an EVEN count of
+// consecutive backslashes immediately before it (qwen's backslash-parity rule,
+// shared by the backward-break and forward-end scans).
+fn is_unescaped_space(chars: &[char], i: usize) -> bool {
+    let mut backslashes = 0;
+    let mut j = i;
+    while j > 0 && chars[j - 1] == '\\' {
+        backslashes += 1;
+        j -= 1;
+    }
+    backslashes % 2 == 0
+}
+
+// NOTE: the AT path VALUE arrives already space-escaped from the adapter's file
+// search (qwen `useAtCompletion` maps `value: escapePath(p)` at fetch time and
+// `handleAutocomplete` inserts it verbatim). So [`Composer::at_accept`] splices
+// `row.value` as-is - the escaping lives beside the walk in
+// [`crate::ui::file_search`], not here - and the escaped `\ ` round-trips
+// through [`at_context`]'s unescaped-space rule.
 
 // The ALWAYS-refused rows of the routing table (pure predicate): keys the
 // Composer never folds whatever its state - page scroll, the display toggles,
@@ -1212,6 +1704,19 @@ fn filter_mode_for(command: &str) -> DialogFilter {
 // when a store lands.
 fn rank_menu(query: &str) -> Vec<Suggestion> {
     completion::rank(query, &|_| None, 0)
+}
+
+// Maps a wire [`FileSuggestion`] (the async AT fill) into a render
+// [`Suggestion`]: the repo-relative path is the `label` (highlighted against
+// the query via `matched`), the escaped path is the `value` inserted on accept.
+// No description (a file path needs none).
+fn to_file_suggestion(s: FileSuggestion) -> Suggestion {
+    Suggestion {
+        label: s.label,
+        value: s.value,
+        description: String::new(),
+        matched: s.matched,
+    }
 }
 
 // Whether the active palette row's label is "long" (chars >= MAX_WIDTH, qwen
@@ -2619,6 +3124,257 @@ mod tests {
         assert_eq!(c.view().cursor, 2); // "long line", col 2
         fold_consumed(&mut c, Key::ArrowDown);
         assert_eq!(c.view().cursor, 12); // back down: "ab" clamps col 2 → 2
+    }
+
+    // =======================================================================
+    // AT file completion (Phase C2, qwen `useAtCompletion`).
+    // =======================================================================
+
+    // --- the pure detection (`at_context`) ---------------------------------
+
+    #[test]
+    fn at_detects_a_bare_sigil_with_an_empty_pattern() {
+        // "@" with the cursor after it: AT mode, empty query, span [0, 1).
+        let at = at_context("@", 1).expect("in AT mode");
+        assert_eq!((at.at, at.start, at.end), (0, 1, 1));
+        assert_eq!(at.query, "");
+    }
+
+    #[test]
+    fn at_detects_a_partial_path_forward_to_the_end_of_line() {
+        // "@src/ma" cursor at end: query is everything after the `@`.
+        let at = at_context("@src/ma", 7).expect("in AT mode");
+        assert_eq!(at.query, "src/ma");
+        assert_eq!((at.at, at.start, at.end), (0, 1, 7));
+    }
+
+    #[test]
+    fn at_runs_the_pattern_to_the_next_unescaped_space() {
+        // "@a b" cursor after 'a': the unescaped space ends the pattern at it.
+        let at = at_context("@a b", 2).expect("in AT mode");
+        assert_eq!(at.query, "a");
+        assert_eq!(at.end, 2, "pattern ends at the space");
+    }
+
+    #[test]
+    fn at_treats_an_escaped_space_as_part_of_the_pattern() {
+        // "@my\\ notes" - the backslash-escaped space is inside the pattern.
+        let at = at_context("@my\\ notes", 10).expect("in AT mode");
+        assert_eq!(at.query, "my\\ notes");
+    }
+
+    #[test]
+    fn an_unescaped_space_before_the_cursor_breaks_the_at_scan() {
+        // "hi @a there" cursor at the very end: the space after "@a" is
+        // unescaped, so scanning back from the end hits it first - no AT.
+        assert_eq!(at_context("hi @a there", 11), None);
+    }
+
+    #[test]
+    fn no_at_before_the_cursor_is_no_context() {
+        assert_eq!(at_context("fix the bug", 11), None);
+        assert_eq!(at_context("", 0), None);
+    }
+
+    #[test]
+    fn at_is_cursor_relative_not_line_anchored() {
+        // "email me @ foo" - a mid-message `@` still triggers (unlike `/`).
+        let at = at_context("see @src/x", 10).expect("in AT mode");
+        assert_eq!(at.query, "src/x");
+        assert_eq!(at.at, 4);
+    }
+
+    #[test]
+    fn at_scans_only_the_current_line() {
+        // A `@` on a PREVIOUS line does not leak into the current line's scan.
+        assert_eq!(at_context("@old\nnow", 8), None);
+        // But a `@` on the current (second) line is found.
+        let at = at_context("first\n@b", 8).expect("in AT mode");
+        assert_eq!(at.query, "b");
+        assert_eq!(at.at, 6);
+    }
+
+    #[test]
+    fn at_beats_slash_after_a_command() {
+        // "/model @sr" - AT takes precedence, so the `@` opens the file picker
+        // even though the draft leads with a slash command.
+        let at = at_context("/model @sr", 10).expect("AT beats slash");
+        assert_eq!(at.query, "sr");
+    }
+
+    // --- the composer fold (emit FileSearch, guarded fill, accept, dismiss) -
+
+    // The open AT overlay's suggestion values, or panics.
+    fn at_values(c: &Composer) -> Vec<String> {
+        match overlay(c) {
+            Some(OverlayView::AtFiles { suggestions, .. }) => {
+                suggestions.iter().map(|s| s.value.clone()).collect()
+            }
+            other => panic!("expected the AT picker, got {other:?}"),
+        }
+    }
+
+    // A FileSuggestion whose label is the path and value the (already-escaped)
+    // path to insert.
+    fn file(label: &str, value: &str) -> FileSuggestion {
+        FileSuggestion {
+            label: label.to_string(),
+            value: value.to_string(),
+            matched: None,
+        }
+    }
+
+    // The most recent Effect::FileSearch (query, generation) a fold emitted, or
+    // panics - a helper for the emit-on-keystroke assertions.
+    fn last_file_search(effects: &[Effect]) -> (String, u64) {
+        effects
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Effect::FileSearch { query, generation } => Some((query.clone(), *generation)),
+                _ => None,
+            })
+            .expect("a FileSearch effect")
+    }
+
+    #[test]
+    fn typing_an_at_opens_the_picker_and_emits_a_file_search() {
+        let mut c = fresh();
+        // Typing '@' opens the AT context and fires the initial empty search.
+        let effects = fold_consumed(&mut c, Key::Char('@'));
+        let (query, generation) = last_file_search(&effects);
+        assert_eq!(query, "", "the initial search is the empty pattern");
+        assert_eq!(generation, 1);
+        // The overlay is open, loading (no fill yet).
+        match overlay(&c) {
+            Some(OverlayView::AtFiles { loading, .. }) => assert!(loading, "loading until filled"),
+            other => panic!("expected the AT picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_at_keystroke_bumps_the_generation_and_re_searches() {
+        let mut c = fresh();
+        let g0 = last_file_search(&fold_consumed(&mut c, Key::Char('@'))).1;
+        let (q1, g1) = last_file_search(&fold_consumed(&mut c, Key::Char('s')));
+        assert_eq!(q1, "s");
+        assert!(g1 > g0, "the generation bumps per pattern change");
+    }
+
+    #[test]
+    fn a_guarded_fill_lands_only_for_the_live_generation_and_query() {
+        let mut c = fresh();
+        let (_, search_gen) = last_file_search(&fold_consumed(&mut c, Key::Char('@')));
+        // A fill echoing the live (generation, query="") lands.
+        deliver(
+            &mut c,
+            Event::file_search_ready(search_gen, "", vec![file("src/main.rs", "src/main.rs")]),
+        );
+        assert_eq!(at_values(&c), vec!["src/main.rs"]);
+        // A stale fill (wrong generation) is dropped - the rows do not change.
+        deliver(
+            &mut c,
+            Event::file_search_ready(search_gen + 99, "", vec![file("nope.rs", "nope.rs")]),
+        );
+        assert_eq!(at_values(&c), vec!["src/main.rs"], "stale generation dropped");
+        // A fill for a DIFFERENT query is dropped too.
+        deliver(
+            &mut c,
+            Event::file_search_ready(search_gen, "other", vec![file("other.rs", "other.rs")]),
+        );
+        assert_eq!(at_values(&c), vec!["src/main.rs"], "stale query dropped");
+    }
+
+    #[test]
+    fn enter_accepts_the_highlighted_path_escaped_with_a_trailing_space() {
+        let mut c = fresh();
+        let (_, search_gen) = last_file_search(&fold_consumed(&mut c, Key::Char('@')));
+        // The adapter delivers an already-escaped value for a spaced path.
+        deliver(
+            &mut c,
+            Event::file_search_ready(search_gen, "", vec![file("my notes.md", "my\\ notes.md")]),
+        );
+        fold_consumed(&mut c, Key::Enter);
+        // The `@` span is replaced with `@<escaped> ` and the popup closes.
+        assert_eq!(c.view().draft, "@my\\ notes.md ");
+        assert_eq!(c.view().cursor, "@my\\ notes.md ".chars().count());
+        assert_eq!(overlay(&c), None, "the picker closes on accept");
+    }
+
+    #[test]
+    fn accept_replaces_only_the_at_span_in_a_larger_message() {
+        let mut c = with_draft("see @co", 7);
+        // Prime a fill for the "co" pattern (the live query at cursor 7).
+        let (_, search_gen) = last_file_search(&fold_consumed(&mut c, Key::Char('m')));
+        deliver(
+            &mut c,
+            Event::file_search_ready(search_gen, "com", vec![file("src/composer.rs", "src/composer.rs")]),
+        );
+        fold_consumed(&mut c, Key::Tab);
+        assert_eq!(c.view().draft, "see @src/composer.rs ");
+    }
+
+    #[test]
+    fn esc_dismisses_the_picker_but_keeps_the_draft() {
+        let mut c = fresh();
+        fold_consumed(&mut c, Key::Char('@'));
+        fold_consumed(&mut c, Key::Char('x'));
+        assert!(matches!(overlay(&c), Some(OverlayView::AtFiles { .. })));
+        // Esc closes the popup without clearing the `@x` draft (unlike slash).
+        fold_consumed(&mut c, Key::Escape);
+        assert_eq!(c.view().draft, "@x", "the draft survives the dismiss");
+        assert_eq!(overlay(&c), None, "the picker is dismissed");
+        // Typing re-opens it (the pattern changed).
+        fold_consumed(&mut c, Key::Char('y'));
+        assert!(matches!(overlay(&c), Some(OverlayView::AtFiles { .. })));
+    }
+
+    #[test]
+    fn a_dismissed_picker_stays_closed_across_a_bare_cursor_move() {
+        // Esc must STICK: a cursor move that leaves the pattern unchanged does
+        // not re-open a dismissed popup (only a real pattern change does).
+        let mut c = fresh();
+        fold_consumed(&mut c, Key::Char('@'));
+        fold_consumed(&mut c, Key::Char('x'));
+        fold_consumed(&mut c, Key::Escape);
+        assert_eq!(overlay(&c), None, "dismissed");
+        // A bare cursor move (pattern still "x") keeps it dismissed.
+        fold_consumed(&mut c, Key::Left);
+        assert_eq!(
+            overlay(&c),
+            None,
+            "a cursor move does not re-open a dismissed picker"
+        );
+        assert_eq!(c.view().draft, "@x", "the draft is untouched");
+    }
+
+    #[test]
+    fn arrows_navigate_the_at_suggestions() {
+        let mut c = fresh();
+        let (_, search_gen) = last_file_search(&fold_consumed(&mut c, Key::Char('@')));
+        deliver(
+            &mut c,
+            Event::file_search_ready(
+                search_gen,
+                "",
+                vec![file("a.rs", "a.rs"), file("b.rs", "b.rs")],
+            ),
+        );
+        // Down moves the highlight; accepting picks the second row.
+        fold_consumed(&mut c, Key::ArrowDown);
+        fold_consumed(&mut c, Key::Enter);
+        assert_eq!(c.view().draft, "@b.rs ");
+    }
+
+    #[test]
+    fn at_beats_slash_in_the_fold_too() {
+        // A draft leading with `/` but with an `@` before the cursor folds
+        // through the AT path, not the slash menu.
+        let mut c = with_draft("/model ", 7);
+        let effects = fold_consumed(&mut c, Key::Char('@'));
+        // The `@` opened an AT search (slash would not emit a FileSearch).
+        assert_eq!(last_file_search(&effects).0, "");
+        assert!(matches!(overlay(&c), Some(OverlayView::AtFiles { .. })));
     }
 
     // =======================================================================

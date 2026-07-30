@@ -16,8 +16,8 @@
 //!   that shows something delegates one store verb. The store holds the
 //!   history's invariants (appends never bump the revision, Tool Result
 //!   pairing by id, Presentment on every append); this fold holds the
-//!   choreography - which event means which verb - and the Voice: the
-//!   greeting, stop reasons, cancellation notes, and wave lines are authored
+//!   choreography - which event means which verb - and the Voice: the startup
+//!   Header, stop reasons, cancellation notes, and wave lines are authored
 //!   HERE and recorded through the store.
 //! * Enter submits when idle and STEERS when running (the Composer never
 //!   locks). The submit/steer race at the Run boundary is retried the other
@@ -44,8 +44,32 @@ use crate::ui::transcript::Transcript;
 use crate::view_model::Tone;
 use crate::view_model::{DiffHunk, DiffLine, DiffSide, TranscriptItem};
 
-/// The greeting line a fresh Screen opens its Transcript with.
-const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-O toggles compact mode, Ctrl-C quits";
+/// The brand title the startup [`TranscriptItem::Header`] shows, bold in the
+/// accent colour after the `>_` prompt glyph (qwen `Header` `>_ Qwen Code`).
+const HEADER_TITLE: &str = "suspenders";
+
+/// The startup tips (qwen `Tips`): a small faithful registry, each accurate to
+/// suspenders' real keybindings (Enter submits, Esc cancels a running turn,
+/// Ctrl-O toggles compact mode, Ctrl-C quits). A fresh Screen shows one, picked
+/// deterministically by [`pick_startup_tip`] (the pure core has no RNG/clock).
+const STARTUP_TIPS: &[&str] = &[
+    "Type / to see all available commands.",
+    "Use @path/to/file to add files as context.",
+    "Press Esc to cancel a running turn.",
+    "Press Ctrl-O to toggle compact mode; Ctrl-C to quit.",
+];
+
+/// Picks a startup tip deterministically from [`STARTUP_TIPS`] by `seed`: the
+/// pure core has no RNG or wall clock (ADR-0019), so the adapter injects a seed
+/// (the prompt-history length at launch) and this indexes into the registry.
+/// Never panics - the registry is non-empty and the modulo keeps the index in
+/// range; the guard is defensive should the registry ever be emptied.
+fn pick_startup_tip(seed: usize) -> &'static str {
+    if STARTUP_TIPS.is_empty() {
+        return "Type / to see all available commands.";
+    }
+    STARTUP_TIPS[seed % STARTUP_TIPS.len()]
+}
 
 /// The initial cumulative session cost before any priced response arrives.
 const INITIAL_SESSION_COST: f64 = 0.0;
@@ -272,6 +296,16 @@ pub enum Effect {
     /// interprets it (e.g. `/model` swaps the Active Model and persists); the
     /// pure core neither knows nor cares. Phase 4b implements the arm.
     SelectorChosen { command: String, value: String },
+    /// A `@path` AT pattern changed and needs a fresh file search (Phase C2,
+    /// qwen `useAtCompletion`). The composer emits one per AT keystroke: the
+    /// adapter walks the (cached, gitignore-aware) project tree, ranks it
+    /// against `query`, caps it, and posts the rows back as
+    /// [`Event::FileSearchReady`](crate::event::Event::FileSearchReady) through
+    /// `ctx.selector_tx`. `generation` is the composer's AT activation counter,
+    /// echoed on the fill so a stale keystroke's result can never overwrite a
+    /// newer one - the per-keystroke analog of the selector's one-shot
+    /// [`Effect::Command`]. The core does not walk or rank (ADR-0019).
+    FileSearch { query: String, generation: u64 },
     /// Re-sync the render cache to the new compact mode and repaint the live
     /// viewport after a Ctrl+O toggle (ADR-0052, the degraded fallback for qwen's
     /// `refreshStatic`). This is the DEGRADED behaviour, not the faithful replay:
@@ -350,6 +384,14 @@ pub struct Screen {
     /// Note the inversion from the retired flags: they showed FULL when
     /// `expanded == true`; this shows full when `compact_mode == false`.
     pub compact_mode: bool,
+    /// The keyboard-shortcuts Help overlay (qwen `Help`, the `?` affordance the
+    /// footer's `? for shortcuts` hint promises). When `true` the bordered panel
+    /// draws in the pending region and holds the keyboard like the Approval modal:
+    /// [`Screen::handle_help_key`] swallows every key with no effect except the
+    /// closers (`Esc`, `?`, `q`). Opened by `?` on an EMPTY draft (a non-empty
+    /// draft keeps `?` typeable) - the interception sits above the Composer's
+    /// first refusal, mirroring the `pending_approval` gate. Default `false`.
+    pub help_open: bool,
 }
 
 /// The options a fresh Screen is opened with (baud's `new/1` keyword opts).
@@ -361,8 +403,27 @@ pub struct ScreenOpts {
     pub history: Vec<String>,
     /// Launch-time info lines the adapter authors (context-file skips today):
     /// news from before the event loop existed, recorded right after the
-    /// greeting so it is visible without ever entering the Conversation.
+    /// startup Header so it is visible without ever entering the Conversation.
     pub notices: Vec<String>,
+    /// The startup Header facts (qwen `AppHeader`): the crate `version`, the
+    /// launch Model's scoped `model` id, and the tilde-abbreviated working
+    /// directory `cwd`. Empty by default (tests that don't care about the banner
+    /// open with a bare Header); the `ui` adapter fills them at launch.
+    pub header: HeaderFacts,
+}
+
+/// The facts the startup [`TranscriptItem::Header`] shows (qwen `AppHeader`):
+/// the crate version, the launch Model's scoped id, and the working directory.
+/// A value object so [`ScreenOpts`] threads them as one named-field carrier and
+/// a new banner field is a field, not another opt. `tip_seed` picks the startup
+/// tip deterministically (the pure core has no RNG/clock, ADR-0019) - the
+/// adapter injects the prompt-history length.
+#[derive(Default)]
+pub struct HeaderFacts {
+    pub version: String,
+    pub model: String,
+    pub cwd: String,
+    pub tip_seed: usize,
 }
 
 // ---- diff-demo fixtures (Screen::demo_diffs) ----------------------------
@@ -483,12 +544,26 @@ fn capped_diff() -> TranscriptItem {
 }
 
 impl Screen {
-    /// A fresh Screen, opened with the greeting info line and idle status.
+    /// A fresh Screen, opened with the startup Header banner and idle status.
     pub fn new(opts: ScreenOpts) -> Self {
-        // The greeting is this fold's Voice: the store opens empty and
-        // records what its owner authors.
+        // The startup banner is this fold's Voice (qwen `AppHeader`): the store
+        // opens empty and records what its owner authors. The title is fixed
+        // (`suspenders`); the version/model/cwd ride in on the opts, and the tip
+        // is picked deterministically from the seed.
+        let HeaderFacts {
+            version,
+            model,
+            cwd,
+            tip_seed,
+        } = opts.header;
         let mut transcript = Transcript::new(opts.extensions);
-        transcript.info(GREETING);
+        transcript.header(
+            HEADER_TITLE,
+            version,
+            model,
+            cwd,
+            pick_startup_tip(tip_seed),
+        );
         for notice in opts.notices {
             transcript.info(notice);
         }
@@ -504,6 +579,7 @@ impl Screen {
             session_cost: INITIAL_SESSION_COST,
             composer: Composer::new(opts.history),
             compact_mode: false,
+            help_open: false,
         }
     }
 
@@ -681,13 +757,15 @@ impl Screen {
                 self.apply_settlement(event)
             }
 
-            // The selector fills are the Composer's own (ADR-0034): they are
-            // consumed by `self.composer.apply_event` at the top of this fold
-            // (line 304) and never reach this dispatch. Listed explicitly, with
-            // no wildcard, so the match stays EXHAUSTIVE over the Event
-            // vocabulary - a future variant is a compile error here, not a
-            // silent fallthrough.
-            Event::SelectorReady { .. } | Event::SelectorFailed { .. } => (self, vec![]),
+            // The selector fills and the AT file-search fill are the Composer's
+            // own (ADR-0034): they are consumed by `self.composer.apply_event`
+            // at the top of this fold and never reach this dispatch. Listed
+            // explicitly, with no wildcard, so the match stays EXHAUSTIVE over
+            // the Event vocabulary - a future variant is a compile error here,
+            // not a silent fallthrough.
+            Event::SelectorReady { .. }
+            | Event::SelectorFailed { .. }
+            | Event::FileSearchReady { .. } => (self, vec![]),
         };
         screen.with_commit(effects)
     }
@@ -980,6 +1058,24 @@ impl Screen {
             return self.handle_approval_key(key);
         }
 
+        // The Help overlay (qwen `Help`) gates like the Approval modal (Approval
+        // wins if somehow both, hence its gate above): while it is open it holds
+        // the keyboard, so no stray key leaks to the Composer/Agent behind it.
+        if self.help_open {
+            return self.handle_help_key(key);
+        }
+
+        // `?` on an EMPTY draft opens the Help overlay (the footer's `? for
+        // shortcuts` promise); on a NON-empty draft it stays a typed char (users
+        // write `?` in prompts), so this interception sits ABOVE the Composer's
+        // first refusal and defers to it whenever the draft is not empty. No Run
+        // state changes and the overlay is a modal, so it wants `FocusModal` like
+        // an Approval (the adapter draws it as an overlay).
+        if key == Key::Char('?') && self.composer.view().draft.is_empty() {
+            self.help_open = true;
+            return (self, vec![Effect::FocusModal]);
+        }
+
         // The Composer gets first refusal (ADR-0034): every key the modal did
         // not swallow is offered to it - the UngatedKey minted here is the
         // gate's receipt, and this is its ONLY production mint - and only a
@@ -1099,6 +1195,23 @@ impl Screen {
             SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
                 (self, vec![])
             }
+        }
+    }
+
+    // The Help-overlay key gate (qwen `Help` `useKeypress`): while the panel is up
+    // it holds the keyboard like the Approval modal - `Esc` closes it, and `?`/`q`
+    // are the same convenience closers qwen offers; EVERY other key is swallowed
+    // with no effect, so nothing leaks to the Composer/Agent behind the overlay.
+    // Closing hands focus back to the composer (the modal counterpart of the
+    // Approval's `FocusModal`).
+    fn handle_help_key(mut self, key: Key) -> (Self, Vec<Effect>) {
+        match key {
+            Key::Escape | Key::Char('?') | Key::Char('q') => {
+                self.help_open = false;
+                (self, vec![Effect::FocusComposer])
+            }
+            // Every other key is swallowed with no effect while Help is open.
+            _ => (self, vec![]),
         }
     }
 
@@ -1407,7 +1520,7 @@ mod tests {
     // Drops a trailing [`Effect::Commit`] (ADR-0046) so a fold's OWN effects
     // can be asserted without threading the commit-seam count through every
     // pre-existing effect test. A fresh Screen opens with an uncommitted
-    // greeting, so the first public fold exit legitimately appends a
+    // header, so the first public fold exit legitimately appends a
     // `Commit { count }`; the seam has its own dedicated tests below, and these
     // orthogonal assertions strip it. Only ever drops from the END (the seam
     // appends there) and only a Commit, so a mislaid effect still fails.
@@ -1466,7 +1579,7 @@ mod tests {
         t
     }
 
-    // items/1: everything after the greeting line.
+    // items/1: everything after the header line.
     fn items(t: &Screen) -> Vec<TranscriptItem> {
         t.transcript().items().iter().skip(1).cloned().collect()
     }
@@ -1516,18 +1629,34 @@ mod tests {
     // --- new/1 -------------------------------------------------------------
 
     #[test]
-    fn new_opens_with_greeting_and_idle_status() {
+    fn new_opens_with_the_startup_header_and_idle_status() {
         let t = fresh_opts(ScreenOpts {
             context_budget: Some(32_000),
+            header: HeaderFacts {
+                version: "1.2.3".into(),
+                model: "openrouter/qwen3-coder".into(),
+                cwd: "/home/dev/proj".into(),
+                tip_seed: 0,
+            },
             ..Default::default()
         });
         assert_eq!(t.transcript().items().len(), 1);
         match &t.transcript().items()[0] {
-            TranscriptItem::Info { text } => {
-                assert!(text.contains("suspenders ready"));
-                assert!(text.contains("Ctrl-O toggles compact mode"));
+            TranscriptItem::Header {
+                title,
+                version,
+                model,
+                cwd,
+                tip,
+            } => {
+                assert_eq!(title, "suspenders");
+                assert_eq!(version, "1.2.3");
+                assert_eq!(model, "openrouter/qwen3-coder");
+                assert_eq!(cwd, "/home/dev/proj");
+                // Seed 0 picks the first registry tip.
+                assert_eq!(tip, STARTUP_TIPS[0]);
             }
-            other => panic!("expected greeting info, got {other:?}"),
+            other => panic!("expected startup header, got {other:?}"),
         }
         assert_eq!(t.status, Status::Idle);
         assert_eq!(t.context_budget, Some(32_000));
@@ -1538,8 +1667,17 @@ mod tests {
         );
     }
 
+    // The tip is picked deterministically from the injected seed (the pure core
+    // has no RNG/clock): the seed wraps the registry by modulo.
     #[test]
-    fn new_records_launch_notices_after_the_greeting() {
+    fn startup_tip_is_seed_indexed_into_the_registry() {
+        for seed in 0..(STARTUP_TIPS.len() * 2) {
+            assert_eq!(pick_startup_tip(seed), STARTUP_TIPS[seed % STARTUP_TIPS.len()]);
+        }
+    }
+
+    #[test]
+    fn new_records_launch_notices_after_the_header() {
         let t = fresh_opts(ScreenOpts {
             notices: vec![
                 "context file .suspenders/SYSTEM.md exists but could not be read \
@@ -1622,7 +1760,7 @@ mod tests {
             t.transcript().streaming_text().is_empty()
                 && t.transcript().streaming_thinking().is_empty()
         );
-        // No PinBottom (ADR-0046); the greeting may still commit here.
+        // No PinBottom (ADR-0046); the header may still commit here.
         assert_eq!(sans_commit(effects), vec![]);
     }
 
@@ -2049,7 +2187,7 @@ mod tests {
         let a = approval();
         let t = with_pending_approval(fresh(), &a);
 
-        // Stale id: nothing happens (the greeting's Commit is orthogonal).
+        // Stale id: nothing happens (the header's Commit is orthogonal).
         let (t, effects) = t.apply_event(Event::approval_resolved("some-other-ref", true));
         assert_eq!(sans_commit(effects), vec![]);
         assert_eq!(t.pending_approval, Some(a.clone()));
@@ -2074,7 +2212,7 @@ mod tests {
         assert_eq!(items(&t), vec![user("fix the bug")]);
         assert_eq!(t.composer().view().draft, "");
         // The on-disk HistoryAppend, then the commit seam (ADR-0046): submitted
-        // now routes through `with_commit`, so the terminal greeting + the new
+        // now routes through `with_commit`, so the terminal header + the new
         // User line freeze on THIS exit (count 2), not the next event.
         assert_eq!(
             sans_commit(effects.clone()),
@@ -2109,7 +2247,7 @@ mod tests {
     #[test]
     fn steering_events_delegate_and_land_in_the_store() {
         let (t, effects) = fresh().apply_event(Event::steering_queued("check the README"));
-        // The greeting commits on this first fold; the Steering marker itself
+        // The header commits on this first fold; the Steering marker itself
         // is non-terminal, so it stays pending (ADR-0046). No PinBottom.
         assert_eq!(sans_commit(effects), vec![]);
 
@@ -2161,7 +2299,7 @@ mod tests {
         assert_eq!(t.composer().view().draft, "");
         // steered_ok adds no terminal item of its own, but routes through the
         // commit seam (ADR-0046) for uniformity: it freezes the still-pending
-        // greeting, so the exit carries a Commit. No effect of its own beyond it.
+        // header, so the exit carries a Commit. No effect of its own beyond it.
         assert_eq!(sans_commit(effects), vec![]);
     }
 
@@ -2243,7 +2381,7 @@ mod tests {
     }
 
     // A fold that leaves a live ToolCall at the pending front commits only the
-    // terminal items BEFORE it - here just the greeting - and never the call.
+    // terminal items BEFORE it - here just the header - and never the call.
     #[test]
     fn a_pending_tool_call_blocks_the_commit_after_it() {
         let (_t, effects) = fresh().apply_event(Event::tool_call(
@@ -2251,7 +2389,7 @@ mod tests {
             "read_file",
             serde_json::json!({"path": "src/main.rs"}),
         ));
-        // Greeting commits (1); the ToolCall stays pending.
+        // Header commits (1); the ToolCall stays pending.
         assert_eq!(commit_count(&effects), Some(1));
     }
 
@@ -2280,12 +2418,12 @@ mod tests {
     // with the approval gone.
     #[test]
     fn a_confirming_tool_call_blocks_commit_until_the_approval_resolves() {
-        // Greeting commits; the gated ToolCall stays pending.
-        let (t, greeting) = fold_and_commit(
+        // Header commits; the gated ToolCall stays pending.
+        let (t, header) = fold_and_commit(
             fresh(),
             Event::tool_call("t1", "run_command", serde_json::json!({"command": "ls"})),
         );
-        assert_eq!(greeting, Some(1));
+        assert_eq!(header, Some(1));
 
         // The Approval opens on the live call: still non-terminal, nothing new
         // commits, and the approval lives on `pending_approval` (never an item).
@@ -2325,7 +2463,7 @@ mod tests {
     // and the next fold exit commits it.
     #[test]
     fn a_tool_result_merge_lets_the_run_commit() {
-        // First fold commits the greeting; the call stays pending.
+        // First fold commits the header; the call stays pending.
         let (t, first) = fold_and_commit(
             fresh(),
             Event::tool_call(
@@ -2336,7 +2474,7 @@ mod tests {
         );
         assert_eq!(first, Some(1));
         // The result supersedes the call: the merged ToolResult is terminal, so
-        // it now commits (count 1 - the greeting was already committed).
+        // it now commits (count 1 - the header was already committed).
         let (_t, second) = fold_and_commit(
             t,
             Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
@@ -2357,7 +2495,7 @@ mod tests {
                 vec![text_block("Done.")],
             ),
         );
-        // The greeting committed on the first fold; the streaming snapshot is
+        // The header committed on the first fold; the streaming snapshot is
         // not an item, so message_end is what settles the terminal answer.
         let (_t, count) = fold_and_commit(
             t,
@@ -2371,10 +2509,10 @@ mod tests {
     // marker (it is non-terminal).
     #[test]
     fn steering_delivery_commits_the_promoted_user_line() {
-        // Only the greeting commits on queue; the marker stays pending.
+        // Only the header commits on queue; the marker stays pending.
         let (t, queued) = fold_and_commit(fresh(), Event::steering_queued("check the README"));
         assert_eq!(queued, Some(1));
-        // The promoted User line commits (count 1 - the greeting was already
+        // The promoted User line commits (count 1 - the header was already
         // committed).
         let (_t, delivered) = fold_and_commit(t, Event::steering_delivered("check the README"));
         assert_eq!(delivered, Some(1));
@@ -2389,7 +2527,7 @@ mod tests {
     fn the_pure_fold_does_not_advance_the_high_water_mark() {
         let t = fresh();
         assert_eq!(t.transcript().committed_high_water(), 0);
-        // The greeting is committable; the fold emits Commit { 1 } but must leave
+        // The header is committable; the fold emits Commit { 1 } but must leave
         // the mark at 0 (the adapter has not blitted yet).
         let (t, first) = t.apply_event(Event::run_started("r1"));
         assert_eq!(commit_count(&first), Some(1));
@@ -2398,7 +2536,7 @@ mod tests {
             0,
             "the pure fold must not move the mark - the adapter does, post-blit"
         );
-        // A second fold, still no adapter: the same greeting is STILL uncommitted,
+        // A second fold, still no adapter: the same header is STILL uncommitted,
         // so it re-emits Commit { 1 } rather than dropping the count to zero.
         let (t, second) = t.apply_event(Event::message_start(1));
         assert_eq!(commit_count(&second), Some(1));
@@ -2411,7 +2549,7 @@ mod tests {
     // batch. The emitted count covers all newly-committable leading items.
     #[test]
     fn one_fold_can_commit_a_batch_of_newly_terminal_items() {
-        // Greeting + two tool calls in flight; the greeting commits, both calls
+        // Header + two tool calls in flight; the header commits, both calls
         // stay pending (the first blocks the second).
         let (t, _) = fold_and_commit(
             fresh(),
@@ -2491,9 +2629,9 @@ mod tests {
     // nothing terminal ahead of it) emits no Commit at all.
     #[test]
     fn a_fold_that_only_adds_a_pending_tool_call_commits_nothing_new() {
-        // Commit the greeting first (via the adapter stand-in).
-        let (t, greeting) = fold_and_commit(fresh(), Event::run_started("r1"));
-        assert_eq!(greeting, Some(1));
+        // Commit the header first (via the adapter stand-in).
+        let (t, header) = fold_and_commit(fresh(), Event::run_started("r1"));
+        assert_eq!(header, Some(1));
         // Now the only uncommitted item added is a live ToolCall: nothing new is
         // terminal, so no Commit is emitted.
         let (_t, none) = fold_and_commit(
@@ -2720,7 +2858,7 @@ mod tests {
     fn info_appends_one_adapter_authored_line() {
         let (t, effects) = fresh().info("resume: 2 turns replayed with drift");
         assert_eq!(items(&t), vec![info("resume: 2 turns replayed with drift")]);
-        // The info line routes through the commit seam (ADR-0046): the greeting
+        // The info line routes through the commit seam (ADR-0046): the header
         // and the new info line are both terminal, so the exit emits a Commit.
         assert_eq!(commit_count(&effects), Some(2));
     }
@@ -2738,7 +2876,7 @@ mod tests {
         assert_eq!(items(&t), vec![]);
 
         let (_t, effects) = t.handle_key(Key::Other);
-        // The greeting was still uncommitted (the selector fill returned via
+        // The header was still uncommitted (the selector fill returned via
         // the Composer without a fold exit), so this no-op key commits it.
         assert_eq!(sans_commit(effects), vec![]);
     }
@@ -2776,15 +2914,15 @@ mod tests {
         assert!(!fresh().compact_mode);
     }
 
-    // A plain-chat transcript (only the greeting Info line committed, nothing
+    // A plain-chat transcript (only the startup Header committed, nothing
     // compact-affected) flips compact with NO RedrawScrollback - the predicate is
     // false, so no expensive scrollback redraw is minted.
     #[test]
     fn toggle_compact_flips_without_redraw_when_nothing_committed_is_affected() {
         let (t, effects) = fresh().handle_key(Key::ToggleCompact);
         assert!(t.compact_mode);
-        // Only the greeting Info line exists; no committed Thinking/tool item, so
-        // no RedrawScrollback. (The greeting's own Commit may ride along.)
+        // Only the startup Header exists; no committed Thinking/tool item, so no
+        // RedrawScrollback. (The Header's own Commit may ride along.)
         assert!(
             !effects
                 .iter()
@@ -2891,6 +3029,78 @@ mod tests {
             t.pending_approval, pending_before,
             "the peek does not resolve or disturb the open approval"
         );
+    }
+
+    // --- the Help overlay (qwen `Help`, the `?` affordance) ------------------
+
+    #[test]
+    fn help_starts_closed() {
+        assert!(!fresh().help_open);
+    }
+
+    // `?` on an EMPTY draft opens the Help overlay and focuses it like a modal
+    // (`FocusModal`), consuming the key so no `?` lands in the draft.
+    #[test]
+    fn question_mark_on_empty_draft_opens_help() {
+        let (t, effects) = fresh().handle_key(Key::Char('?'));
+        assert!(t.help_open, "? opens Help on an empty draft");
+        assert_eq!(t.composer().view().draft, "", "the ? was not typed");
+        assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
+    }
+
+    // `?` on a NON-empty draft stays a typed char (the interception defers to the
+    // Composer's first refusal), so Help does NOT open and the draft gains a `?`.
+    #[test]
+    fn question_mark_on_non_empty_draft_types_normally() {
+        let t = press(fresh(), typed("fix"));
+        let (t, _effects) = t.handle_key(Key::Char('?'));
+        assert!(!t.help_open, "? does not open Help while the draft is non-empty");
+        assert_eq!(t.composer().view().draft, "fix?", "the ? typed into the draft");
+    }
+
+    // Esc closes the open Help overlay and hands focus back to the composer.
+    #[test]
+    fn escape_closes_help() {
+        let t = press(fresh(), vec![Key::Char('?')]);
+        assert!(t.help_open);
+        let (t, effects) = t.handle_key(Key::Escape);
+        assert!(!t.help_open, "Esc closes the Help overlay");
+        assert_eq!(sans_commit(effects), vec![Effect::FocusComposer]);
+    }
+
+    // `?` and `q` are convenience closers too (qwen `Help`), also refocusing.
+    #[test]
+    fn question_mark_or_q_also_close_help() {
+        for closer in [Key::Char('?'), Key::Char('q')] {
+            let t = press(fresh(), vec![Key::Char('?')]);
+            let (t, effects) = t.handle_key(closer.clone());
+            assert!(!t.help_open, "{closer:?} closes the Help overlay");
+            assert_eq!(sans_commit(effects), vec![Effect::FocusComposer]);
+        }
+    }
+
+    // While Help is open it holds the keyboard like the Approval modal: every
+    // non-closer key is swallowed with NO effect and NO leak to the Composer, so
+    // the draft stays empty and nothing runs.
+    #[test]
+    fn help_swallows_every_non_closer_key() {
+        for key in [Key::Char('x'), Key::Enter, Key::ArrowUp, Key::Tab] {
+            let t = press(fresh(), vec![Key::Char('?')]);
+            let (next, effects) = t.handle_key(key.clone());
+            assert!(next.help_open, "{key:?} leaves Help open");
+            assert!(effects.is_empty(), "{key:?} produces no effect while Help is open");
+            assert_eq!(next.composer().view().draft, "", "{key:?} did not leak to the draft");
+        }
+    }
+
+    // The Approval gate wins if both could apply: an open Approval routes to its
+    // own handler, so `?` never opens Help behind a pending Approval.
+    #[test]
+    fn approval_gate_wins_over_help() {
+        let t = with_pending_approval(fresh(), &approval());
+        let (t, _effects) = t.handle_key(Key::Char('?'));
+        assert!(!t.help_open, "an open Approval keeps ? from opening Help");
+        assert!(t.pending_approval.is_some());
     }
 
     // --- the Approval gate vs the Composer ----------------------------------

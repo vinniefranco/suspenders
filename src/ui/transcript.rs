@@ -33,10 +33,10 @@
 //!   verb must be added to it and its expected-bumps guard revisited - the
 //!   test cannot notice a verb it was never told about.
 //!
-//! Voice strings stay with the Screen (the greeting, stop reasons, wave
-//! lines, nudges - recorded through [`Transcript::info`]); the store authors
-//! only the two lines its own invariants require verbatim: the pending
-//! Steering marker and the extension-failure line.
+//! Voice strings stay with the Screen (the startup Header, stop reasons, wave
+//! lines, nudges - recorded through [`Transcript::header`]/[`Transcript::info`]);
+//! the store authors only the two lines its own invariants require verbatim: the
+//! pending Steering marker and the extension-failure line.
 
 mod streaming;
 mod thought;
@@ -101,8 +101,8 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// An empty Transcript. The caller authors any opening line (the greeting
-    /// is the Screen's Voice, recorded through [`Transcript::info`]).
+    /// An empty Transcript. The caller authors any opening line (the startup
+    /// Header is the Screen's Voice, recorded through [`Transcript::header`]).
     pub fn new(extensions: Vec<Registered>) -> Self {
         Transcript {
             items: Vec::new(),
@@ -177,6 +177,28 @@ impl Transcript {
     /// Screen); the store only records it.
     pub fn info(&mut self, text: impl Into<String>) {
         self.push(TranscriptItem::Info { text: text.into() });
+    }
+
+    /// Appends the startup [`TranscriptItem::Header`] banner (qwen `AppHeader`):
+    /// the brand title + version, the scoped Model id, the working directory, and
+    /// the deterministically-picked startup tip. The caller authors the facts
+    /// (they are the Screen's Voice, drawn from the launch Model + cwd); the store
+    /// only records them. An APPEND - never bumps the revision.
+    pub fn header(
+        &mut self,
+        title: impl Into<String>,
+        version: impl Into<String>,
+        model: impl Into<String>,
+        cwd: impl Into<String>,
+        tip: impl Into<String>,
+    ) {
+        self.push(TranscriptItem::Header {
+            title: title.into(),
+            version: version.into(),
+            model: model.into(),
+            cwd: cwd.into(),
+            tip: tip.into(),
+        });
     }
 
     /// Appends a harness marker: the caller
@@ -1260,6 +1282,10 @@ mod tests {
         let steps: Vec<Step> = vec![
             ("info", Box::new(|t| t.info("news"))),
             (
+                "header",
+                Box::new(|t| t.header("suspenders", "0.1.0", "p/m", "~/x", "tip")),
+            ),
+            (
                 "marker",
                 Box::new(|t| t.marker("✂ evicted 3 stale results", Tone::Housekeeping)),
             ),
@@ -1353,6 +1379,10 @@ mod tests {
         // terminal leading items.
         let steps: Vec<Step> = vec![
             ("info", Box::new(|t| t.info("news"))),
+            (
+                "header",
+                Box::new(|t| t.header("suspenders", "0.1.0", "p/m", "~/x", "tip")),
+            ),
             ("user", Box::new(|t| t.user("hello"))),
             ("push", Box::new(|t| t.push(diff_item("edit_file")))),
             ("message_start", Box::new(|t| t.message_start())),

@@ -18,6 +18,7 @@ pub mod completion;
 pub mod components;
 pub mod composer;
 pub mod draft;
+pub mod file_search;
 pub mod history;
 pub mod lull;
 pub mod markdown;
@@ -90,7 +91,7 @@ pub(crate) const TICK_MS: u64 = 100;
 ///
 /// `launch_notices` are info lines from before the terminal existed (a
 /// context-file skip at load, the theme fallback); the Screen records them
-/// right after the greeting. `themes` is the launch-resolved Theme state
+/// right after the header. `themes` is the launch-resolved Theme state
 /// (ADR-0038): the active Theme every frame draws with, swappable by
 /// `/theme`.
 pub async fn run(
@@ -224,8 +225,16 @@ pub(crate) struct AdapterCtx<'a> {
     /// The loop's own event injection channel: a `/model` fetch runs in a
     /// spawned task (never blocking the select loop, ADR-0011) and posts its
     /// SelectorReady/SelectorFailed here, where the loop folds it like an Agent
-    /// event.
+    /// event. The `@path` file search reuses the SAME channel, posting
+    /// FileSearchReady.
     pub(crate) selector_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    /// The project root the `@path` file search walks (Phase C2). Read once at
+    /// launch (the pure core stays IO-free, ADR-0019); handed to each spawned
+    /// search task.
+    pub(crate) root: std::path::PathBuf,
+    /// A short-TTL cache of the walked project tree (Phase C2), shared across the
+    /// spawned `@path` search tasks so a keystroke burst walks the tree once.
+    pub(crate) walk_cache: file_search::WalkCache,
 }
 
 /// The adapter-side MUTABLE state the [`Effect`] handlers act on - the
@@ -274,6 +283,9 @@ async fn run_loop(
         agent: &agent,
         config_path: default_config_path(),
         selector_tx,
+        // The `@path` file search walks the Session's project root (Phase C2).
+        root: std::path::PathBuf::from(&session.root),
+        walk_cache: file_search::WalkCache::new(),
     };
 
     // Persistent prompt history (up/down recall ACROSS Sessions). The store
@@ -285,12 +297,26 @@ async fn run_loop(
         .map(read_history)
         .unwrap_or_default();
 
+    // The startup Header facts (qwen `AppHeader`): the crate version, the launch
+    // Model's scoped id, and the working directory. The cwd is read once here at
+    // the edge (ADR-0019 keeps the pure core IO-free); the tip is picked
+    // deterministically from the prompt-history length seed.
+    let header = screen::HeaderFacts {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model: session.model.scoped_id(),
+        cwd: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        tip_seed: history.len(),
+    };
+
     let mut screen = Some(Screen::new(ScreenOpts {
         context_budget: Some(session.context_budget_for(&session.model)),
         compaction_slack: session.compaction_slack,
         extensions: crate::extensions::configured(&session.extensions),
         history,
         notices: launch_notices,
+        header,
     }));
 
     // The mutable adapter state the Effect handlers thread as one carrier:
@@ -322,15 +348,15 @@ async fn run_loop(
     // milliseconds since launch, advanced by the tick (no background timer).
     let started = std::time::Instant::now();
 
-    // First frame, in three beats (ADR-0046). qwen commits the greeting/header to
-    // Static scrollback UP FRONT; we mirror that so frame 1 shows greeting-in-
-    // scrollback + composer + status, not a bare greeting waiting on a keypress.
+    // First frame, in three beats (ADR-0046). qwen commits the startup header to
+    // Static scrollback UP FRONT; we mirror that so frame 1 shows header-in-
+    // scrollback + composer + status, not a bare header waiting on a keypress.
     //
-    // The launch notices (the GREETING Info line plus any pre-terminal info
+    // The launch notices (the startup Header banner plus any pre-terminal info
     // lines) are terminal, so `committable_upto()` already covers them while the
     // high-water mark sits at 0 - the exact prefix a fold would freeze. But the
     // fold-driven commit only runs on the FIRST event (key/agent/tick), so
-    // without this the initial pending draw would paint the greeting still
+    // without this the initial pending draw would paint the header still
     // UNCOMMITTED in the pending region, and the composer/status would not
     // settle until that first keypress triggered the deferred commit.
     //
@@ -339,7 +365,7 @@ async fn run_loop(
     // the inline viewport area, (2) run the startup commit through `dispatch` -
     // whose trailing-freeze block blits precisely the committable notices into
     // native scrollback and advances the high-water mark - then (3) redraw a
-    // clean pending region (composer + status) with the greeting now frozen
+    // clean pending region (composer + status) with the header now frozen
     // above it. Passing an EMPTY effect vector routes solely through dispatch's
     // `committable_upto - committed_high_water` trailing commit; no `Commit`
     // effect is minted outside `with_commit`.
@@ -1026,6 +1052,20 @@ async fn run_effect(
             command: cmd,
             value,
         } => command::choose(screen, ctx, state, &cmd, value).await,
+        // A `@path` AT pattern changed (Phase C2, qwen `useAtCompletion`): spawn
+        // the file search off the loop (like `/model`'s fetch) and let it post
+        // FileSearchReady back through `ctx.selector_tx`. Fire-and-forget - the
+        // screen is untouched; the fill lands later via the selector_rx arm.
+        Effect::FileSearch { query, generation } => {
+            file_search::spawn(
+                ctx.walk_cache.clone(),
+                ctx.root.clone(),
+                ctx.selector_tx.clone(),
+                query,
+                generation,
+            );
+            screen
+        }
     }
 }
 
@@ -1762,6 +1802,8 @@ mod tests {
             agent,
             config_path: "/nonexistent/config.json".into(),
             selector_tx,
+            root: std::path::PathBuf::from("/nonexistent/root"),
+            walk_cache: file_search::WalkCache::new(),
         }
     }
 
@@ -2069,6 +2111,8 @@ mod tests {
             agent: &agent,
             config_path: "/nonexistent/config.json".into(),
             selector_tx,
+            root: std::path::PathBuf::from("/nonexistent/root"),
+            walk_cache: file_search::WalkCache::new(),
         };
 
         let _ = run_effect(
@@ -2110,6 +2154,8 @@ mod tests {
             agent: &agent,
             config_path: config_path.clone(),
             selector_tx,
+            root: std::path::PathBuf::from("/nonexistent/root"),
+            walk_cache: file_search::WalkCache::new(),
         };
         let mut state = test_state();
 
@@ -2150,6 +2196,8 @@ mod tests {
             agent: &agent,
             config_path: config_path.clone(),
             selector_tx,
+            root: std::path::PathBuf::from("/nonexistent/root"),
+            walk_cache: file_search::WalkCache::new(),
         };
         let mut state = test_state();
 
@@ -2165,7 +2213,7 @@ mod tests {
         .await;
 
         // No swap, no write, no info line (ADR-0038, matching /model): the
-        // Transcript's last info is still the greeting, untouched.
+        // Transcript's last info is still the header, untouched.
         assert_eq!(state.themes.active(), theme::dark());
         assert_eq!(
             last_info(&screen),
@@ -2189,6 +2237,8 @@ mod tests {
             agent: &agent,
             config_path: config_path.clone(),
             selector_tx,
+            root: std::path::PathBuf::from("/nonexistent/root"),
+            walk_cache: file_search::WalkCache::new(),
         };
 
         // A valid theme at open time, broken before the pick lands: Enter
@@ -2268,7 +2318,7 @@ mod tests {
         )
         .unwrap();
 
-        // A fresh Screen opens with the greeting Info line, which wraps to
+        // A fresh Screen opens with the startup Header banner, which spans
         // several rows at this narrow width - so the committed slice overflows
         // the 3-row terminal and its top rows reach the backend's scrollback.
         // run_started makes the whole leading prefix terminal, so the fold emits
@@ -2293,7 +2343,7 @@ mod tests {
         .await
         .expect("dispatch freezes without error");
 
-        // (a) The committed greeting landed in NATIVE SCROLLBACK (above the inline
+        // (a) The committed header landed in NATIVE SCROLLBACK (above the inline
         // viewport), not in the live viewport buffer.
         let scrollback: String = {
             let sb = terminal.backend().scrollback();
@@ -2307,12 +2357,12 @@ mod tests {
                 .join("\n")
         };
         assert!(
-            scrollback.contains("suspenders ready"),
-            "the committed greeting froze into native scrollback:\n{scrollback}"
+            scrollback.contains(">_ suspenders"),
+            "the committed header froze into native scrollback:\n{scrollback}"
         );
 
         // The adapter advanced the high-water mark ONLY after the successful blit
-        // (transactional commit): the greeting is now committed.
+        // (transactional commit): the header is now committed.
         assert!(
             core.transcript().committed_high_water() >= 1,
             "the mark advanced post-blit"
@@ -2353,21 +2403,21 @@ mod tests {
                 .join("\n")
         };
         assert!(
-            !pending.contains("suspenders ready"),
-            "the committed greeting is gone from the pending region:\n{pending}"
+            !pending.contains(">_ suspenders"),
+            "the committed header is gone from the pending region:\n{pending}"
         );
     }
 
-    // FIRST-FRAME bug (ADR-0046): on startup the greeting must be committed to
+    // FIRST-FRAME bug (ADR-0046): on startup the header must be committed to
     // native scrollback UP FRONT, so frame 1 already shows the composer +
     // status - WITHOUT any keypress. This mirrors `run_loop`'s three-beat first
     // frame (draw to establish the inline viewport, startup `dispatch` with an
     // EMPTY effect vector whose trailing-freeze flushes the committable notices,
     // then a clean pending redraw). Before the fix the initial draw painted the
-    // greeting still uncommitted and the composer/status only appeared after the
+    // header still uncommitted and the composer/status only appeared after the
     // first key triggered the deferred commit.
     #[tokio::test(flavor = "multi_thread")]
-    async fn startup_commits_greeting_and_frame_one_shows_composer_and_status() {
+    async fn startup_commits_header_and_frame_one_shows_composer_and_status() {
         let dir = TempDir::new().unwrap();
         let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
         let ctx = adapter_ctx(&agent);
@@ -2375,7 +2425,7 @@ mod tests {
         let mut cache = components::RenderCache::new();
 
         // An INLINE TestBackend that is SHORT (a small terminal with a 5-row
-        // inline viewport) so the committed greeting overflows the top of the
+        // inline viewport) so the committed header overflows the top of the
         // terminal buffer and lands in the backend's scrollback, while the
         // viewport still fits the status bar + composer chrome.
         let mut terminal = Terminal::with_options(
@@ -2392,8 +2442,8 @@ mod tests {
         };
         let anim = components::Anim::default();
 
-        // A launch Screen: the GREETING Info line (terminal, hence committable)
-        // with the high-water mark at 0.
+        // A launch Screen: the startup Header banner (terminal, hence
+        // committable) with the high-water mark at 0.
         let mut screen = Some(Screen::new(ScreenOpts::default()));
         assert_eq!(
             screen.as_ref().unwrap().transcript().committed_high_water(),
@@ -2401,7 +2451,7 @@ mod tests {
             "nothing committed before the startup pass"
         );
         let committable = screen.as_ref().unwrap().transcript().committable_upto();
-        assert!(committable >= 1, "the greeting is committable at launch");
+        assert!(committable >= 1, "the header is committable at launch");
 
         // Beat 1: establish the inline viewport.
         draw_previewed(
@@ -2445,14 +2495,14 @@ mod tests {
         let core = screen.as_ref().unwrap();
 
         // The startup pass advanced the high-water mark past the notices - the
-        // greeting is now committed, with NO simulated keypress.
+        // header is now committed, with NO simulated keypress.
         assert_eq!(
             core.transcript().committed_high_water(),
             committable,
             "the startup commit advanced the mark past the committable notices"
         );
 
-        // (a) The greeting froze into NATIVE SCROLLBACK.
+        // (a) The header froze into NATIVE SCROLLBACK.
         let scrollback: String = {
             let sb = terminal.backend().scrollback();
             (0..sb.area.height)
@@ -2465,8 +2515,8 @@ mod tests {
                 .join("\n")
         };
         assert!(
-            scrollback.contains("suspenders ready"),
-            "frame 1: the greeting is in scrollback:\n{scrollback}"
+            scrollback.contains(">_ suspenders"),
+            "frame 1: the header is in scrollback:\n{scrollback}"
         );
 
         // (b) The live viewport already shows the composer placeholder AND footer
@@ -2480,10 +2530,10 @@ mod tests {
             viewport.contains("model m") && viewport.contains("? for shortcuts"),
             "frame 1: the flat footer (model fact + shortcuts hint) is drawn:\n{viewport}"
         );
-        // The greeting is NOT re-drawn in the pending region (it is committed).
+        // The header is NOT re-drawn in the pending region (it is committed).
         assert!(
-            !viewport.contains("suspenders ready"),
-            "frame 1: the committed greeting is gone from the pending region:\n{viewport}"
+            !viewport.contains(">_ suspenders"),
+            "frame 1: the committed header is gone from the pending region:\n{viewport}"
         );
     }
 
@@ -2513,7 +2563,7 @@ mod tests {
         // First settle the transcript so the peek is the ONLY thing dispatch can
         // do: a live (un-resulted) `run_command` tool call is NON-terminal, so
         // `committable_upto` stops before it and dispatch's trailing commit is a
-        // no-op - isolating the peek's effect on the mark. The greeting + call are
+        // no-op - isolating the peek's effect on the mark. The header + call are
         // committed up front so the pending body is a stable, live tool group.
         let core = Screen::new(ScreenOpts::default());
         let (core, _) = core.apply_event(Event::run_started("r1"));
@@ -2522,7 +2572,7 @@ mod tests {
             "run_command",
             serde_json::json!({"command": "echo peek-me"}),
         ));
-        // Freeze everything committable (the greeting), leaving the live call
+        // Freeze everything committable (the header), leaving the live call
         // pending. Do it through dispatch so the mark reflects real adapter state.
         let prime = core.transcript().committable_upto();
         let core = dispatch(

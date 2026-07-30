@@ -199,8 +199,15 @@ pub struct DiffHunk {
 ///   a successful `todo_write` Tool Result for this item, so the committed render
 ///   draws the circle list (`○ ◐ ●`) instead of the raw JSON args. Pure - the
 ///   glyph/colour treatment lives in `ui/components` (ADR-0019).
+/// * `Header { title, version, model, cwd, tip }` - the startup banner (qwen
+///   `AppHeader`): the ASCII wordmark logo + a bordered info panel (title +
+///   version, the scoped model id with a `(/model to change)` hint, the
+///   tilde-abbreviated working directory) and the `Tips:` line below it. The
+///   adapter draws the logo (theme accent), the single-border box, and the tip;
+///   the core carries only the facts. Recorded ONCE, as the first item a fresh
+///   Screen opens with.
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
-///   plane (the greeting, launch notices, the extension-failure line).
+///   plane (launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
 ///   plane (ADR-0040): compaction, result-cap cuts, the loop-detector close,
 ///   Steering. The [`Tone`] tints it in the adapter; the store only carries
@@ -253,6 +260,27 @@ pub enum TranscriptItem {
     /// `todo_write` Tool Result; the adapter draws the circle list.
     Todo {
         items: Vec<crate::plan::TodoItem>,
+    },
+    /// The startup banner (qwen `AppHeader` = `Header` + `Tips`): the ASCII
+    /// wordmark logo the adapter draws in the theme accent, a single-border info
+    /// panel, and a `Tips:` line below. The core carries only the facts; every
+    /// glyph, colour, border, and the width gate that hides the logo on a narrow
+    /// terminal live in the adapter (ADR-0019). Recorded once, as the first item
+    /// a fresh Screen opens with.
+    Header {
+        /// The brand title (`suspenders`), shown bold in the accent colour with
+        /// the `>_` prompt glyph, followed by ` (v<version>)` in secondary.
+        title: String,
+        /// The crate version (`CARGO_PKG_VERSION`), rendered as ` (v…)`.
+        version: String,
+        /// The active Model's scoped id (`provider/model-id`), shown in
+        /// secondary with a ` (/model to change)` hint when it fits.
+        model: String,
+        /// The working directory, tilde-abbreviated and shortened to fit.
+        cwd: String,
+        /// The startup tip shown on the `Tips:` line (picked deterministically -
+        /// the pure core has no RNG/clock).
+        tip: String,
     },
     Info {
         text: String,
