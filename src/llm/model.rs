@@ -40,8 +40,10 @@ pub struct Model {
     pub api: Api,
     /// The model's context window in tokens.
     pub context_window: u64,
-    /// The model's output cap in tokens - the wire `max_tokens` and the
-    /// Eviction reserve.
+    /// The wire `max_tokens` (the model's output cap): the reported ceiling
+    /// clamped to leave prompt room inside the window ([`wire_output_cap`]), so
+    /// `input + max_tokens` always fits. The per-Run reply reserve for the
+    /// Compaction math derives from this in turn.
     pub max_tokens: u64,
     /// The Catalog's flat rates in dollars per million tokens. `None` for
     /// Models the Catalog cannot price: custom Providers and catalog misses.
@@ -123,7 +125,7 @@ pub fn resolve(
         .ok_or_else(|| format!("unknown provider {provider_id:?} in model {scoped:?}"))?;
 
     let known = catalog::model(provider_id, model_id);
-    let (context_window, max_tokens) = match known {
+    let (context_window, catalog_max_tokens) = match known {
         Some(known) => (known.context_window, known.max_tokens),
         None => (
             provider.context_window.unwrap_or(fallback_window),
@@ -136,10 +138,24 @@ pub fn resolve(
         id: model_id.to_string(),
         api: provider.api,
         context_window,
-        max_tokens,
+        max_tokens: wire_output_cap(catalog_max_tokens, context_window),
         pricing: known.and_then(|k| k.cost),
         reasoning: known.is_some_and(|k| k.reasoning),
     })
+}
+
+/// The wire `max_tokens` (the Model's output cap): the reported ceiling, clamped
+/// to leave prompt room inside the context window. A request spends
+/// `input + max_tokens` tokens against the window, so a Provider that reports an
+/// output cap equal to (or near) its window - some do, e.g. OpenRouter's
+/// `gpt-oss-120b` lists `max_tokens == context_window` - would make the endpoint
+/// 400 the moment the prompt is non-empty. Half the window is reserved for the
+/// output, leaving the other half for the prompt; a cap already below that (the
+/// common case, e.g. 8K out of 128K) is untouched. The tighter per-Run reply
+/// reserve for the Compaction math still derives from this via
+/// [`crate::session::Session::reply_reserve_for`].
+fn wire_output_cap(reported: u64, context_window: u64) -> u64 {
+    reported.min(context_window / 2)
 }
 
 #[cfg(test)]
@@ -241,6 +257,25 @@ mod tests {
         assert_eq!(model.max_tokens, 4_000);
         assert_eq!(model.pricing, None);
         assert!(!model.reasoning);
+    }
+
+    #[test]
+    fn the_wire_output_cap_leaves_prompt_room_inside_the_window() {
+        // Halved only when the reported ceiling would not leave prompt room.
+        assert_eq!(wire_output_cap(131_072, 131_072), 65_536); // cap == window
+        assert_eq!(wire_output_cap(100_000, 128_000), 64_000); // cap over half
+        assert_eq!(wire_output_cap(8_000, 128_000), 8_000); // modest cap untouched
+    }
+
+    #[test]
+    fn a_catalog_model_whose_output_cap_equals_its_window_is_clamped() {
+        // OpenRouter reports gpt-oss-120b with max_tokens == context_window; the
+        // resolved wire cap leaves half the window for the prompt, so the
+        // endpoint no longer 400s on a non-empty prompt.
+        let providers = catalog::builtin_providers();
+        let model = resolve("openrouter/openai/gpt-oss-120b", &providers, 64_000, 8_000).unwrap();
+        assert_eq!(model.context_window, 131_072);
+        assert_eq!(model.max_tokens, 65_536);
     }
 
     // ---- cost ----

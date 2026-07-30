@@ -292,7 +292,10 @@ impl AgentHandle {
         // `reset_run_state`).
         let mut conversation = Conversation::new(
             system_prompt,
-            ConversationOpts::new(session.context_budget_for(&model), model.max_tokens)
+            ConversationOpts::new(
+                session.context_budget_for(&model),
+                session.reply_reserve_for(&model),
+            )
                 .overhead_chars(overhead)
                 .compaction_slack(session.compaction_slack)
                 .compaction_keep(session.compaction_keep),
@@ -856,12 +859,13 @@ fn reset_run_state(state: &mut AgentState) {
     state.cancel_flag = false;
     state.run_provenance = state.model.provenance();
     // The captured Model's budget figures land at Run start (ADR-0037): the
-    // Context Budget from its window (config may cap it), the Eviction reserve
-    // from its output cap. The Run task clones this Conversation, so an
+    // Context Budget from its window (config may cap it), the reply reserve
+    // from its output cap clamped to leave a live window. The Run task clones
+    // this Conversation, so an
     // in-flight Run keeps the figures it captured, and a switch to a smaller
     // window lands here as ordinary pressure on the next Run.
     state.conversation.context_budget = state.session.context_budget_for(&state.model);
-    state.conversation.max_tokens_reserve = state.model.max_tokens;
+    state.conversation.max_tokens_reserve = state.session.reply_reserve_for(&state.model);
 }
 
 fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {

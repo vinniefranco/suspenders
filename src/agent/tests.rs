@@ -1328,10 +1328,10 @@ async fn list_models_discovers_each_custom_provider_live() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn set_model_rejects_a_pick_that_cannot_fit_and_keeps_the_active_model() {
-    // The per-Model budget check at the swap (ADR-0037): with a 2_000 global
-    // cap, a pick synthesized at the config max_tokens knob (8_000) cannot
-    // fit - it is rejected with the reason, and nothing changes.
+async fn set_model_rejects_an_unresolvable_pick_and_keeps_the_active_model() {
+    // A `/model` swap to an id whose Provider is not in the Session's set is
+    // rejected with the reason, and nothing changes - the rejected swap is
+    // inert (ADR-0033 amendment).
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_string_lossy().into_owned();
     let session_dir = dir.path().join("sessions").to_string_lossy().into_owned();
@@ -1356,11 +1356,10 @@ async fn set_model_rejects_a_pick_that_cannot_fit_and_keeps_the_active_model() {
     let before = agent.active_model().await;
 
     let err = agent
-        .set_model("local/way-too-big".into())
+        .set_model("nonesuch/way-too-big".into())
         .await
         .unwrap_err();
-    assert!(err.contains("leave room"), "error was: {err}");
-    assert!(err.contains("local/way-too-big"), "error was: {err}");
+    assert!(err.contains("nonesuch"), "error was: {err}");
     assert_eq!(agent.active_model().await, before);
 }
 

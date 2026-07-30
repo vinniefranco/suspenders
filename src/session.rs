@@ -18,9 +18,11 @@
 //! * the Context Budget, the reply reserve, and the Result Cap are NOT
 //!   fixed facts (ADR-0037): they derive from the Model each Run captures,
 //!   through [`Session::context_budget_for`] and [`Session::tool_ctx`]
-//! * a Model's output cap must leave room in its effective budget - checked
-//!   here at launch for the launch Model and by the Agent at a `/model` swap
-//!   for the picked Model ([`Session::validate_model_budget`])
+//! * a Model's reply reserve is its (already window-clamped) output cap
+//!   clamped again to half the effective budget ([`Session::reply_reserve_for`]),
+//!   so the budget math always leaves a live window; the one budget check at a
+//!   `/model` swap is that the Compaction
+//!   Keep fits below the trigger ([`Session::validate_model_budget`])
 //!
 //! The Provider set (ADR-0037) resolves here too: custom Providers from the
 //! config `providers` table, built-ins from the generated Catalog with each one's
@@ -865,30 +867,35 @@ impl Session {
         }
     }
 
-    /// Checks the per-Model budget invariants for `model` (ADR-0037): its
-    /// output cap must leave room in its effective Context Budget, and the
-    /// Compaction Keep must sit below the compaction trigger at those figures.
-    /// Run at launch for the launch Model and by the Agent at a `/model` swap
-    /// for the picked Model, so a pick that cannot fit is rejected with the
-    /// reason instead of exploding on a later Run.
+    /// The reply reserve for `model` (ADR-0037): the slice of the effective
+    /// Context Budget held back for the Model's reply, from which the live
+    /// window and Compaction figures derive. It is the Model's wire output cap
+    /// (already clamped at resolution to leave prompt room in the window),
+    /// clamped AGAIN to half the effective Context Budget so it can never
+    /// swallow the whole budget when the config caps the budget below the
+    /// window. A live window - and therefore a usable `/model` switch - always
+    /// survives.
+    pub fn reply_reserve_for(&self, model: &Model) -> u64 {
+        let budget = self.context_budget_for(model);
+        model.max_tokens.min(budget / 2)
+    }
+
+    /// Checks the per-Model budget invariant for `model` (ADR-0037): the
+    /// Compaction Keep must sit below the compaction trigger at that Model's
+    /// clamped reserve ([`reply_reserve_for`]). Run at launch for the launch
+    /// Model and by the Agent at a `/model` swap for the picked Model, so a
+    /// pick whose Compaction Keep cannot fit is rejected with the reason
+    /// instead of exploding on a later Run.
     pub fn validate_model_budget(&self, model: &Model) -> Result<(), String> {
         let budget = self.context_budget_for(model);
-        if model.max_tokens >= budget {
-            return Err(format!(
-                "model {}: :max_tokens ({}) must leave room in the Context Budget ({})",
-                model.scoped_id(),
-                model.max_tokens,
-                budget
-            ));
-        }
+        let reserve = self.reply_reserve_for(model);
 
         // Fire high, keep low: the Compaction Keep amount must sit below the
         // trigger. Comparing in u64 matches the old f64 check: the trigger is
         // integral, so trunc(keep) < trigger iff keep < trigger.
         let keep_amount =
-            conversation::compaction_keep_amount(budget, model.max_tokens, self.compaction_keep);
-        let trigger =
-            conversation::compaction_target(budget, model.max_tokens, self.compaction_slack);
+            conversation::compaction_keep_amount(budget, reserve, self.compaction_keep);
+        let trigger = conversation::compaction_target(budget, reserve, self.compaction_slack);
         if keep_amount >= trigger {
             return Err(format!(
                 "model {}: :compaction_keep is too high - the Compaction Keep must sit below the compaction trigger (fire high, keep low)",
@@ -911,7 +918,7 @@ impl Session {
             root: std::path::PathBuf::from(&self.root),
             result_cap: crate::tools::shaping::cap_for(
                 self.context_budget_for(model),
-                model.max_tokens,
+                self.reply_reserve_for(model),
             ),
             command_timeout_ms: self.command_timeout_ms,
         }
@@ -1462,24 +1469,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_model_budget_rejects_a_model_whose_cap_cannot_fit() {
-        // The `/model` swap check (ADR-0037): the Session's max_tokens knob
-        // (8_000) synthesizes a pick that cannot fit a 2_000 budget cap.
-        let session = Session::build(
-            SessionOpts {
-                context_budget: Some(2_000),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap();
-        let picked = session.resolve_model("local/another-model").unwrap();
-        let err = session.validate_model_budget(&picked).unwrap_err();
-        assert!(err.contains("local/another-model"), "error was: {err}");
-        assert!(err.contains("leave room"), "error was: {err}");
+    fn reply_reserve_clamps_the_output_cap_to_half_the_budget() {
+        // The reply reserve halves a wire cap that equals the budget so a live
+        // window survives (ADR-0037). (The wire cap itself is halved earlier, at
+        // model resolution; this is the second, budget-side clamp.)
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let full = model_with_cap(64_000); // cap == the 64K window
+        assert_eq!(session.reply_reserve_for(&full), 32_000);
 
-        // The launch Model itself passes the same check.
+        // A modest cap is left untouched - only degenerate caps clamp.
+        let modest = model_with_cap(1_000);
+        assert_eq!(session.reply_reserve_for(&modest), 1_000);
+    }
+
+    #[test]
+    fn validate_model_budget_accepts_a_cap_that_matches_the_window() {
+        // An output cap that matches the window leaves no room past it, yet the
+        // clamped reserve (reply_reserve_for) keeps a live window, so the pick
+        // validates and lands as ordinary budget pressure.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let picked = model_with_cap(64_000); // cap == the 64K window
+        assert_eq!(session.validate_model_budget(&picked), Ok(()));
+
+        // The launch Model passes the same check.
         assert_eq!(session.validate_model_budget(&session.model), Ok(()));
     }
 
@@ -1499,20 +1511,6 @@ mod tests {
             ctx.result_cap,
             shaping::cap_for(5_000, session.model.max_tokens)
         );
-    }
-
-    #[test]
-    fn max_tokens_must_leave_room_in_budget() {
-        let err = Session::build(
-            SessionOpts {
-                context_budget: Some(1_000),
-                model: Some(test_model()),
-                ..opts()
-            },
-            &cfg(),
-        )
-        .unwrap_err();
-        assert!(err.0.contains("leave room"), "error was: {err}");
     }
 
     #[test]
