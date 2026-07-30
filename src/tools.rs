@@ -20,13 +20,9 @@ pub mod write_file;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::Value;
 
-/// A Tool Result: the content that enters the Conversation and whether it was
-/// an error. Mirrors baud's `Baud.Tools.result/0`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResult {
-    pub content: String,
-    pub is_error: bool,
-}
+/// Re-exported so existing `crate::tools::ToolResult` references keep resolving;
+/// the type itself now lives with the Tool contract in [`crate::tool`].
+pub use crate::tool::ToolResult;
 
 // The registry builder, in prompt order. The todo_write Tool leads so a small
 // model sees it first and records its task list early (CONTEXT.md: Plan). The
@@ -90,7 +86,7 @@ pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
 /// tool's JSON Schema before dispatch; an unknown tool name and an `Err` return
 /// both come back as `is_error` results.
 pub async fn execute(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
-    ctx.registry.execute(name, input, ctx).await
+    ctx.registry().execute(name, input, ctx).await
 }
 
 #[cfg(test)]

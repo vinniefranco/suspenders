@@ -16,8 +16,7 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
-use crate::tools::ToolResult;
+use crate::tool::{Tool, ToolCtx, ToolResult, ToolSpec, validate};
 
 /// The tool set plus the revealed-deferred name set. A `Box<dyn Tool>` is not
 /// `Debug`, so the [`Debug`] impl below is hand-written (tool count + names)

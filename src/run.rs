@@ -37,6 +37,12 @@ use crate::session::Session;
 pub struct Capture {
     pub model: Model,
     pub llm: Arc<dyn Llm>,
+    /// The tool-initiated Approval seam (F1, ADR-0055), built by the host that
+    /// owns the effect channel (the Agent builds a tx-backed `AgentApprover`).
+    /// The Run assembles it into the Tool [`crate::tool::caps::Capabilities`]
+    /// alongside the registry it builds itself. `Arc<dyn Approver>` is Send+Sync,
+    /// so the [`Capture`] stays `Send` for the `tokio::spawn` at the Agent.
+    pub approver: Arc<dyn crate::tool::caps::Approver>,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -61,9 +67,19 @@ pub async fn run(
         crate::tools::tools(),
     ));
 
+    // The Tool Capability Context (F1, ADR-0055): the registry the Run built plus
+    // the effect seams a Tool Call reaches its host through. P1b carries the
+    // registry (concrete, Run-scoped state) and the Approver (the host's
+    // tx-backed handle, threaded through the Capture). The other three
+    // capabilities land in their consuming phases.
+    let caps = crate::tool::caps::Capabilities {
+        registry,
+        approver: Arc::clone(&capture.approver),
+    };
+
     // The Tool ctx: the Session's Root and timeout, the Result Cap derived from
-    // this Run's captured Model (ADR-0037), and the Run's Tool Registry.
-    let tool_ctx = session.tool_ctx(&capture.model, registry);
+    // this Run's captured Model (ADR-0037), and the Run's Capabilities.
+    let tool_ctx = session.tool_ctx(&capture.model, caps);
 
     loop_::run(
         conversation,

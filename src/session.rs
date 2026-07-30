@@ -913,11 +913,7 @@ impl Session {
     /// The ctx every Tool Call executes with: the Project Root, the Result
     /// Cap derived from `model` - the one the Run captured (ADR-0037) - and
     /// the command timeout.
-    pub fn tool_ctx(
-        &self,
-        model: &Model,
-        registry: std::sync::Arc<crate::tool_registry::ToolRegistry>,
-    ) -> ToolCtx {
+    pub fn tool_ctx(&self, model: &Model, caps: crate::tool::caps::Capabilities) -> ToolCtx {
         ToolCtx {
             root: std::path::PathBuf::from(&self.root),
             result_cap: crate::tools::shaping::cap_for(
@@ -925,7 +921,7 @@ impl Session {
                 self.reply_reserve_for(model),
             ),
             command_timeout_ms: self.command_timeout_ms,
-            registry,
+            caps,
         }
     }
 }
@@ -1511,7 +1507,7 @@ mod tests {
             &cfg(),
         )
         .unwrap();
-        let ctx = session.tool_ctx(&session.model, crate::tool_registry::test_registry());
+        let ctx = session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test());
         assert_eq!(
             ctx.result_cap,
             shaping::cap_for(5_000, session.model.max_tokens)
@@ -1799,7 +1795,7 @@ mod tests {
             &cfg(),
         )
         .unwrap();
-        let ctx = session.tool_ctx(&session.model, crate::tool_registry::test_registry());
+        let ctx = session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test());
         assert_eq!(ctx.root, std::path::PathBuf::from("/tmp"));
         assert_eq!(
             ctx.result_cap,

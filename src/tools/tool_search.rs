@@ -118,7 +118,7 @@ impl Tool for ToolSearch {
             HARD_MAX_RESULTS,
         ) as usize;
 
-        let registry = &ctx.registry;
+        let registry = ctx.registry();
 
         // Mode 1: exact lookup via `select:Name1,Name2`. Dedupe so the same tool
         // isn't returned twice when the model writes the same name twice. Cap at
@@ -590,7 +590,7 @@ mod tests {
             root: std::path::PathBuf::from("/tmp"),
             result_cap: 100_000,
             command_timeout_ms: 120_000,
-            registry,
+            caps: crate::tool::caps::Capabilities::for_test_with_registry(registry),
         }
     }
 

@@ -20,7 +20,9 @@
 
 use std::path::PathBuf;
 
+pub mod caps;
 pub mod path;
+pub mod registry;
 
 /// A tool's spec in Anthropic tool format: a name, a description, and a JSON
 /// Schema `input_schema` (an open edge, so it stays a `serde_json::Value`).
@@ -32,6 +34,17 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+}
+
+/// A Tool Result: the content that enters the Conversation and whether it was
+/// an error. Mirrors baud's `Baud.Tools.result/0`. Lives with the Tool
+/// authoring contract (it is what a Tool's `run` ultimately becomes), so the
+/// Registry can dispatch to a result without depending on the concrete tool
+/// set - which keeps the tool -> tool_registry -> tools module graph acyclic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
 }
 
 /// The authoring contract a Suspenders tool implements (baud's `Baud.Tool`
@@ -72,28 +85,41 @@ pub trait Tool: Send + Sync {
 }
 
 /// The ctx every Tool Call executes with: the Session's Project Root, the
-/// Result Cap, the command timeout, and the [`ToolRegistry`] the Run built
-/// once at its start. `tool_search` reaches through the registry to reveal
-/// deferred tools; every other tool ignores it.
+/// Result Cap, the command timeout, and the [`caps::Capabilities`] carrier - the
+/// Run-scoped [`ToolRegistry`] plus the `dyn` effect seams a tool reaches its
+/// host through (F1, ADR-0055). `tool_search` reaches through the registry to
+/// reveal deferred tools; every other tool ignores it. The [`ToolRegistry`] is
+/// not `Debug`-derivable, but [`caps::Capabilities`] hand-writes its own `Debug`,
+/// so this stays on `#[derive(Debug)]`.
 #[derive(Clone, Debug)]
 pub struct ToolCtx {
     pub root: PathBuf,
     pub result_cap: usize,
     pub command_timeout_ms: u64,
-    pub registry: std::sync::Arc<crate::tool_registry::ToolRegistry>,
+    pub caps: caps::Capabilities,
+}
+
+impl ToolCtx {
+    /// The Run-scoped Tool Registry, read through the carrier. The three
+    /// registry-reading tools (`tool_search`, the Tools dispatch, the Loop's wire
+    /// list) go through this accessor rather than the carrier field, so the field
+    /// path stays an internal detail of the carrier.
+    pub fn registry(&self) -> &std::sync::Arc<crate::tool_registry::ToolRegistry> {
+        &self.caps.registry
+    }
 }
 
 #[cfg(test)]
 impl ToolCtx {
-    /// A ctx over the full built-in tool registry, for tests. The single test
-    /// construction site, so a future ctx field (F1) touches one place rather
-    /// than every tool test helper.
+    /// A ctx over the full built-in tool registry and a denying Approver, for
+    /// tests. The single test construction site, so a future ctx field touches
+    /// one place rather than every tool test helper.
     pub fn for_test(root: PathBuf, result_cap: usize) -> ToolCtx {
         ToolCtx {
             root,
             result_cap,
             command_timeout_ms: 120_000,
-            registry: crate::tool_registry::test_registry(),
+            caps: caps::Capabilities::for_test(),
         }
     }
 }

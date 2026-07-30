@@ -75,7 +75,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
 }
 
 pub(super) fn tool_ctx(session: &Session) -> ToolCtx {
-    session.tool_ctx(&session.model, crate::tool_registry::test_registry())
+    session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test())
 }
 
 // Response builders mirroring baud's text_result / tool_use_result.

@@ -257,7 +257,8 @@ async fn build_request<D: RunDeps>(
             // uses the BASE `tools::specs()` instead - reveals add token cost on
             // demand that the one-time estimate does not pre-count, matching
             // qwen. Don't "fix" that to read this list.)
-            let request = LlmRequest::new(req.system, req.messages, state.tool_ctx.registry.specs());
+            let request =
+                LlmRequest::new(req.system, req.messages, state.tool_ctx.registry().specs());
             Ok((request, conversation))
         }
         Err(_) => {

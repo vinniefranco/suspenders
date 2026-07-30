@@ -77,6 +77,12 @@ impl AgentDeps {
         crate::run::Capture {
             model: self.model.clone(),
             llm: Arc::clone(&self.llm),
+            // The tool-initiated Approval seam (F1, ADR-0055): a tx-backed handle
+            // over this Agent's mpsc. The Run assembles it into the Tool
+            // Capabilities; the Agent owns the channel, so it builds the handle.
+            approver: Arc::new(AgentApprover {
+                tx: self.tx.clone(),
+            }),
         }
     }
 
@@ -209,5 +215,51 @@ impl RunDeps for AgentDeps {
                 Err(reason) => Err(CompactError(reason)),
             }
         }
+    }
+}
+
+/// The tx-backed [`Approver`]: the Agent's fulfilment of the tool-initiated
+/// Approval seam (F1, ADR-0055). It relays an Approval over the same mpsc the
+/// [`AgentDeps::request_approval`] batch gate uses and awaits the same reply
+/// oneshot - so a tool-initiated Approval and a gate Approval reach the Agent
+/// identically. Built by [`AgentDeps::capture`] and carried on the Run's
+/// [`crate::run::Capture`] into the Tool [`crate::tool::caps::Capabilities`].
+///
+/// Why kept without a consumer yet: P1b wires this into the Capabilities carrier
+/// to prove the whole seam with a live wire, but no tool consumes the Approver in
+/// P1b - the batch gate still drives approval through [`RunDeps::request_approval`].
+/// The two share the exact request path; a later phase collapses the duplication
+/// once a tool initiates its own Approval.
+struct AgentApprover {
+    tx: mpsc::UnboundedSender<Msg>,
+}
+
+#[async_trait::async_trait]
+impl crate::tool::caps::Approver for AgentApprover {
+    async fn approve(&self, id: String, command: String) -> bool {
+        // A near-verbatim lift of `AgentDeps::request_approval`: ask the Agent to
+        // relay this Approval (it consults the Standing Approvals and emits either
+        // `approval_request` or, on an auto-approve, `approval_auto` - the caller
+        // cannot tell the difference), await the decision it forwards, then emit
+        // `approval_resolved`, the same on both paths.
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::RequestApproval {
+                id: id.clone(),
+                command,
+                reply,
+            }))
+            .is_err()
+        {
+            return false;
+        }
+        // No timeout - the user decides. A cancel aborts this task, so a pending
+        // Approval dies with it.
+        let approved = rx.await.unwrap_or(false);
+        let _ = tx.send(Msg::Run(RunMsg::Emit(Event::approval_resolved(
+            id, approved,
+        ))));
+        approved
     }
 }

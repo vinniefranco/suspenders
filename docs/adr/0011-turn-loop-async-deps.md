@@ -12,6 +12,8 @@ The loop owns zero I/O and zero process concerns. All policy and effects arrive 
 
 Boundary with Extensions: `RunDeps` methods are infrastructure - control-bearing and fail-**loud** (a panicking Dep fails the Run honestly). Extensions remain the fail-open, tool-scoped extension unit (ADR-0007).
 
+Boundary with tool-initiated effects (ADR-0055): `RunDeps` is the *loop-owned* effect channel - effects the Loop drives at control points, over `&mut D`. Effects a Tool Call initiates while it runs (approve, ask, side-query, spawn) reach the host through `Capabilities` on the `ToolCtx` instead, as `Arc<dyn>` seams (a Tool Call has neither the `&mut D` nor a control point). Both channels terminate at the same Agent mpsc. The tool-initiated Approval path (`Approver::approve`) and the batch gate's `RunDeps::request_approval` presently duplicate the same request path; that transient duplication collapses once a tool initiates its own Approval.
+
 Considered and rejected:
 
 - **An explicit state-machine / enum-of-states design.** The states are fake - the loop runs forward and never branches on "which state am I in" - and encoding them pushes policy back into the loop.
