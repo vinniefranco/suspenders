@@ -569,6 +569,11 @@ struct AgentState {
     // tools, built once in `init_agent`. Threaded into each Run's Capture (via
     // AgentDeps) so every Run's registry shares it.
     session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+    // The subagent definitions (P4/F4, ADR-0061): the built-in registry, built
+    // once in `init_agent`. Held by the `agent` tool (on `session_tools`) for its
+    // dynamic schema/description AND threaded into each Run's Capture (via
+    // AgentDeps) so the Run's DirectSubagentSpawner resolves a def by name.
+    subagents: Arc<crate::subagents::SubagentRegistry>,
 }
 
 /// The raw Session pieces `start` resolves synchronously and hands to the async
@@ -653,10 +658,21 @@ async fn init_agent(init: AgentInit) -> AgentState {
         ));
     }
 
+    // The subagent registry (P4/F4, ADR-0061): the built-in defs, built once
+    // here. The `agent` tool holds it (for its dynamic schema/description, the
+    // way the `skill` tool holds a SkillManager) AND each Run's Capture threads
+    // it into the DirectSubagentSpawner.
+    let subagents = Arc::new(crate::subagents::SubagentRegistry::new(
+        crate::subagents::builtins(),
+    ));
+
     let mut all = tools::tools();
     all.extend(adapters);
     all.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
         &skill_manager,
+    ))));
+    all.push(Box::new(crate::tools::agent::AgentTool::new(Arc::clone(
+        &subagents,
     ))));
     let session_tools: Arc<[Box<dyn crate::tool::Tool>]> = all.into();
 
@@ -727,6 +743,7 @@ async fn init_agent(init: AgentInit) -> AgentState {
         self_tx,
         mcp,
         session_tools,
+        subagents,
     }
 }
 
@@ -1072,6 +1089,8 @@ fn spawn_run(state: &mut AgentState) {
         state.session.tool_call_style,
         state.compaction.clone(),
         Arc::clone(&state.session_tools),
+        Arc::clone(&state.subagents),
+        state.session.clone(),
     );
     let conversation = state.conversation.clone();
     let session = state.session.clone();

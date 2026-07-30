@@ -5,6 +5,7 @@
 //! a tool can never crash the Run. [`run`] adds Shaping on top - the
 //! extension-free dispatch path.
 
+pub mod agent;
 pub mod ask_user_question;
 pub mod edit_file;
 pub mod glob;

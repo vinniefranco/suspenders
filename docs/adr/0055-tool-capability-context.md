@@ -61,15 +61,14 @@ web_fetch consumes it live: it fetches, caps the content at 100 000 chars, wraps
 
 `Questioner` is the third capability to land (P2a, `ask_user_question`), and it lands like the Approver, NOT like SideQuery - the CONTRAST that completes the picture. A question is an Agent-relayed, USER-owned decision: the Agent broadcasts the request (opening the modal) and forwards the reply the user gives. So its real impl, `AgentQuestioner`, is tx-backed over the Agent mpsc (a `RunMsg::AskQuestion` and a reply oneshot), a near-twin of `AgentApprover` - where SideQuery, an Llm-owned effect, bypassed the mpsc entirely. The one place it DIVERGES from the Approver is that there is no auto/standing path: `ask_question` is unconditionally the pending leg (every question opens a modal), so the Agent holds a plain `question_replies` map with none of the `Approvals` fold beside it (see ADR-0057). Its degraded impl is `DecliningQuestioner`, which returns the VERBATIM qwen non-interactive string - symmetric with `DenyingApprover`/`DenyingSideQuery` as the headless posture. Threaded from the Agent to the Run through the `Capture` snapshot, exactly like the Approver.
 
-## Deferral policy
+## SubagentSpawner LANDED, DIRECT like SideQuery (P4/F4, ADR-0061)
 
-The carrier plus `Approver` land in P1b; `SideQuery` lands in P2b; `Questioner` lands in P2a (above). The remaining capability (SubagentSpawner) lands in the phase that consumes it, NOT now. Building it now would mean a non-functional stub impl, because its `RunMsg` variant does not exist yet - dead code against the quality floor. Its trait signature is recorded here as the contract that phase implements:
+`SubagentSpawner` is the FOURTH and final capability, landed in P4/F4 (the `agent` tool). It lands like `SideQuery`, NOT like the Approver: a foreground subagent is a child Run driven INLINE off the captured Llm (a self-contained re-entrant driver, `run_child`), and it touches no Agent/Conversation state - no checkpoint, no next-speaker, no Conversation mutation on the parent. So there is no round-trip and no `RunMsg` variant: its real impl, `DirectSubagentSpawner` (`crate::run::subagent`), resolves a subagent definition and drives the child Run to settlement over the captured `Arc<dyn Llm>`, exactly as `LlmSideQuery` calls the boundary directly. Its degraded impl, `UnavailableSubagentSpawner`, is symmetric with `DenyingApprover`/`DenyingSideQuery`/`DecliningQuestioner` as the headless posture AND doubles as the RECURSION GUARD: a child Run's own `subagents` capability is this degraded impl, so a subagent cannot spawn a subagent (see ADR-0061). Threaded from the Agent to the Run through the `Capture` snapshot, like the Approver/Questioner.
+
+One contract amendment over the recorded signature: `SubagentRequest` gains a `subagent_type: String` field. qwen's `agent` tool routes by a `subagent_type` param among the available subagent definitions, so the spawner resolves a def by name rather than running one fixed child; `model: Option<Model>` stays as the F4 per-subagent seam (Opus-main / Qwen-scout), now paired with the def's own `SubagentModel` (Inherit / Scoped). The landed trait:
 
 ```rust
-// P4/F4 - SubagentSpawner. The `model` field is the F4 per-subagent seam
-// (Opus-main / Qwen-scout): a subagent may run a different Model than the Run
-// that spawned it.
-struct SubagentRequest { prompt: String, model: Option<Model> }
+struct SubagentRequest { subagent_type: String, prompt: String, model: Option<Model> }
 struct SubagentResult { terminate_reason: String, result: String }
 #[async_trait]
 trait SubagentSpawner: Send + Sync {
@@ -77,9 +76,13 @@ trait SubagentSpawner: Send + Sync {
 }
 ```
 
+## Deferral policy (discharged)
+
+The carrier plus `Approver` land in P1b; `SideQuery` lands in P2b; `Questioner` lands in P2a; `SubagentSpawner` lands in P4/F4 (above). Every capability has now landed with its consumer, so the deferral policy this ADR opened with is fully discharged - nothing remains recorded-as-contract-only.
+
 Considered and rejected:
 
-- **Adding all four capabilities up front with stub degraded impls.** A capability with no consumer yet (SubagentSpawner) would be dead code (no `RunMsg` variant, no consumer), and a stub that only ever returns the degraded answer is untested behavior against the quality floor. Each lands with its consumer instead: `Approver` in P1b (its wire already existed), `SideQuery` in P2b (web_fetch consumes it), `Questioner` in P2a (`ask_user_question` consumes it), and the signature recorded above gives the remaining phase its contract without the dead code.
+- **Adding all four capabilities up front with stub degraded impls.** A capability with no consumer yet (SubagentSpawner, before P4) would have been dead code (no consumer), and a stub that only ever returns the degraded answer is untested behavior against the quality floor. Each landed with its consumer instead: `Approver` in P1b (its wire already existed), `SideQuery` in P2b (web_fetch consumes it), `Questioner` in P2a (`ask_user_question` consumes it), and `SubagentSpawner` in P4/F4 (the `agent` tool consumes it) - the recorded signature gave P4 its contract without the interim dead code.
 - **Routing `SideQuery` through the Agent like `Approver`.** A side-query touches no Agent-owned state (no Standing Approvals, no modal, no Conversation mutation), so an mpsc round-trip and a `RunMsg` variant would be ceremony around a completion the Run already captured. `LlmSideQuery` calls the captured Llm boundary directly instead - the effect terminates at the Llm, not the Agent (see the P2b section).
 - **A second `dyn RunDeps` instead of a separate `Capabilities` carrier.** `RunDeps` is loop-owned `&mut D` at control points; a Tool Call has neither the `&mut D` nor a control point. The two channels are genuinely different shapes; merging them would force `RunDeps` to be `dyn` (losing its RPITIT static dispatch) for no gain.
 - **A `dyn` registry on `Capabilities`.** The registry is state, not an effect; making it `dyn` would hide a concrete type behind a seam that buys nothing.

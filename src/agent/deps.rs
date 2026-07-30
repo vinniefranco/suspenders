@@ -51,6 +51,16 @@ pub(crate) struct AgentDeps {
     /// the Agent discovered at startup. Threaded into each Run's [`Capture`] so
     /// the Run's registry shares it (fresh reveal state per Run).
     session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+    /// The subagent definitions (P4/F4, ADR-0061): the built-in registry the
+    /// Agent built once at startup. Threaded into each Run's [`Capture`] so the
+    /// Run's `DirectSubagentSpawner` can resolve a subagent def by name.
+    subagents: Arc<crate::subagents::SubagentRegistry>,
+    /// The parent [`Session`] the child Run derives its Root/timeout/budget knobs
+    /// from (P4/F4, ADR-0061). Cloned once at Run spawn.
+    session: crate::session::Session,
+    /// The child Run's turn bound (qwen's per-subagent run cap): the Session's
+    /// own `run_limit`, so a subagent runs the same bound a top-level Run does.
+    subagent_run_limit: usize,
 }
 
 impl AgentDeps {
@@ -69,7 +79,10 @@ impl AgentDeps {
         tool_call_style: ToolCallStyle,
         compaction: Compaction,
         session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+        subagents: Arc<crate::subagents::SubagentRegistry>,
+        session: crate::session::Session,
     ) -> Self {
+        let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
             tx,
             llm,
@@ -79,6 +92,9 @@ impl AgentDeps {
             tool_call_style,
             compaction,
             session_tools,
+            subagents,
+            session,
+            subagent_run_limit,
         }
     }
 
@@ -105,6 +121,25 @@ impl AgentDeps {
             // The Session-stable tool set (F8, ADR-0056): the Run's registry
             // shares it via `with_shared`, so MCP tools ride every Run.
             tools: Arc::clone(&self.session_tools),
+            // The Subagent seam (P4/F4, ADR-0061): the DIRECT (Llm-boundary,
+            // non-mpsc) DirectSubagentSpawner, built here from the Agent-owned
+            // handles (the Llm, the captured Model, the Session's request
+            // settings, the parent Session, the subagent registry). A `Scoped`
+            // subagent Model resolves through the Session's own `resolve_model`,
+            // so no separate Provider slice is threaded. Like the SideQuery, it
+            // wires straight to the captured Llm - a foreground subagent touches
+            // no Agent/Conversation state - so the Agent builds it here rather
+            // than as a tx-backed handle.
+            subagents: Arc::new(crate::run::subagent::DirectSubagentSpawner {
+                llm: Arc::clone(&self.llm),
+                parent_model: self.model.clone(),
+                temperature: self.temperature,
+                thinking_budget: self.thinking_budget,
+                tool_call_style: self.tool_call_style,
+                session: self.session.clone(),
+                registry: Arc::clone(&self.subagents),
+                subagent_run_limit: self.subagent_run_limit,
+            }),
         }
     }
 

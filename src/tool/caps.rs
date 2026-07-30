@@ -51,23 +51,17 @@
 //! with NO Standing-Approval / auto path - every question opens a modal): its
 //! real impl ([`crate::agent::deps::AgentQuestioner`]) relays a
 //! [`crate::agent::RunMsg::AskQuestion`] and awaits the user's picks, and its
-//! degraded impl is [`DecliningQuestioner`]. The
-//! remaining capability (SubagentSpawner) lands in the phase that consumes it,
-//! because its `RunMsg` variant does not exist yet and a stub impl would be dead
-//! code against the quality floor. Its trait signature is recorded here (and in
-//! ADR-0055) as the contract that phase implements - text only, no trait code:
-//!
-//! ```text
-//! // P4/F4 - SubagentSpawner. Spawns a child Run and awaits its settlement. The
-//! // `model` field is the F4 per-subagent seam (Opus-main / Qwen-scout): a
-//! // subagent may run a different Model than the Run that spawned it.
-//! struct SubagentRequest { prompt: String, model: Option<Model> }
-//! struct SubagentResult { terminate_reason: String, result: String }
-//! #[async_trait]
-//! trait SubagentSpawner: Send + Sync {
-//!     async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, String>;
-//! }
-//! ```
+//! degraded impl is [`DecliningQuestioner`]. P4/F4 lands [`SubagentSpawner`],
+//! the fourth capability and the SECOND wired DIRECT to the [`Llm`] boundary
+//! (like [`SideQuery`], not the Agent mpsc): a foreground subagent is a child
+//! Run driven inline off the captured Llm, touching no Agent/Conversation state,
+//! so no round-trip is needed. Its real impl
+//! ([`crate::run::subagent::DirectSubagentSpawner`]) resolves a subagent
+//! definition and drives a child Run to settlement; its degraded impl is
+//! [`UnavailableSubagentSpawner`], which is ALSO the recursion guard - a child
+//! Run's own subagents capability is degraded, so a subagent cannot spawn a
+//! subagent (ADR-0061). Every recorded-signature capability has now landed; the
+//! deferral policy this module opened with is fully discharged.
 
 use std::sync::Arc;
 
@@ -82,9 +76,8 @@ use crate::tool_registry::ToolRegistry;
 /// bumps and the ToolCtx stays cheap to clone per Tool Call.
 ///
 /// P1b carries the registry and the [`Approver`]; P2b adds the [`SideQuery`];
-/// P2a adds the [`Questioner`]. The remaining effect capability (SubagentSpawner)
-/// lands in the phase that consumes it - its signature is recorded in this
-/// module's docs and in ADR-0055.
+/// P2a adds the [`Questioner`]; P4/F4 adds the [`SubagentSpawner`]. Every effect
+/// capability has now landed - the carrier is complete.
 #[derive(Clone)]
 pub struct Capabilities {
     /// The Tool Registry the Run built once at its start (F3): concrete, because
@@ -112,8 +105,16 @@ pub struct Capabilities {
     /// like the Approver (its real impl lives in the Agent which owns the mpsc),
     /// but with NO Standing-Approval / auto path - every question opens a modal.
     pub questioner: Arc<dyn Questioner>,
-    // P4: subagents (see ADR-0055; not added now - it lands in its consuming
-    // phase so no field is dead code).
+    /// The Subagent effect seam (P4/F4, ADR-0061): the `agent` tool spawns a
+    /// child Run and awaits its settlement through this. `dyn` and, like the
+    /// SideQuery, wired DIRECT to the [`Llm`] boundary rather than the Agent mpsc
+    /// (a foreground subagent touches no Agent/Conversation state), so its real
+    /// impl ([`crate::run::subagent::DirectSubagentSpawner`]) drives the child
+    /// Run inline off the captured Llm. The degraded impl
+    /// ([`UnavailableSubagentSpawner`]) is ALSO the recursion guard: a child
+    /// Run's own subagents capability is degraded, so a subagent cannot spawn a
+    /// subagent.
+    pub subagents: Arc<dyn SubagentSpawner>,
 }
 
 impl std::fmt::Debug for Capabilities {
@@ -127,6 +128,7 @@ impl std::fmt::Debug for Capabilities {
             .field("approver", &"<dyn>")
             .field("side_query", &"<dyn>")
             .field("questioner", &"<dyn>")
+            .field("subagents", &"<dyn>")
             .finish()
     }
 }
@@ -279,6 +281,76 @@ impl Questioner for DecliningQuestioner {
     }
 }
 
+/// One subagent launch as the `agent` tool assembles it (P4/F4, ADR-0061).
+/// `subagent_type` names the subagent definition to run (the one contract
+/// amendment over the recorded signature - qwen's `agent` tool routes by a
+/// `subagent_type` param, so the spawner resolves the def by name rather than
+/// running a single fixed child). `prompt` is the task the child Run opens on.
+/// `model` is the F4 per-subagent seam (Opus-main / Qwen-scout): an explicit
+/// Model override for this launch, or `None` to defer to the def's own model
+/// choice (Inherit -> the parent's Model). The SAME shared `Arc<dyn Llm>`
+/// (Dispatcher) routes whichever Model to its Provider, so no per-subagent Llm
+/// is ever built.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentRequest {
+    pub subagent_type: String,
+    pub prompt: String,
+    pub model: Option<Model>,
+}
+
+/// A settled subagent's result (P4/F4, ADR-0061), the child Run's outcome mapped
+/// to qwen's `AgentTerminateMode` vocabulary. `terminate_reason` is `"GOAL"`
+/// (the child completed), `"MAX_TURNS"` (it hit its turn bound), or `"ERROR"`
+/// (it failed or exhausted its budget) - TIMEOUT/CANCELLED are deferred with the
+/// background path (ADR-0061). `result` is the child's last assistant text (the
+/// answer it relays to the parent), with any trailing Voice close marker
+/// stripped so the parent never sees Suspenders' internal marker as the
+/// subagent's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentResult {
+    pub terminate_reason: String,
+    pub result: String,
+}
+
+/// The Subagent effect: the `agent` tool spawns a child Run and awaits its
+/// settlement (qwen's `AgentTool` launching an `AgentHeadless`). Wired DIRECT to
+/// the [`Llm`](crate::llm::Llm) boundary like [`SideQuery`], not the Agent mpsc:
+/// a foreground subagent drives a child Run inline off the captured Llm and
+/// touches no Agent/Conversation state, so it needs no round-trip. `dyn` all the
+/// same, so the degraded posture can answer a host with no subagent channel -
+/// which is also the recursion guard (a child Run's own subagents capability is
+/// degraded).
+///
+/// Object-safe and `async_trait`-boxed for the same reason as the other `dyn`
+/// seams (RPITIT is not object-safe; see ADR-0055/ADR-0061).
+#[async_trait::async_trait]
+pub trait SubagentSpawner: Send + Sync {
+    /// Spawns the subagent and awaits its settlement, yielding the
+    /// [`SubagentResult`], or an `Err` describing why it could not launch (an
+    /// unknown subagent type, an unresolvable Model) - the `agent` tool folds the
+    /// `Err` into its own error result.
+    async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, String>;
+}
+
+/// The degraded [`SubagentSpawner`]: a host with no subagent channel (a headless
+/// run, a test) cannot spawn one, so every spawn is an `Err`. It is ALSO the
+/// recursion guard (ADR-0061): a child Run's Capabilities carry this degraded
+/// impl, so a subagent that tried to spawn a subagent gets the same `Err` a
+/// headless host would - a subagent cannot recurse.
+///
+/// Mirrors [`DenyingApprover`]/[`DenyingSideQuery`]/[`DecliningQuestioner`] as
+/// the headless/test posture (ADR-0019): the degraded impl returns the safe
+/// answer - here a plain failure the tool folds into its own error result -
+/// rather than panicking or silently succeeding.
+pub struct UnavailableSubagentSpawner;
+
+#[async_trait::async_trait]
+impl SubagentSpawner for UnavailableSubagentSpawner {
+    async fn spawn(&self, _request: SubagentRequest) -> Result<SubagentResult, String> {
+        Err("subagents are unavailable in this environment".into())
+    }
+}
+
 #[cfg(test)]
 impl Capabilities {
     /// Capabilities over the full built-in registry and a denying Approver, for
@@ -292,6 +364,7 @@ impl Capabilities {
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
         }
     }
 
@@ -306,6 +379,7 @@ impl Capabilities {
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
         }
     }
 
@@ -320,6 +394,7 @@ impl Capabilities {
             approver: Arc::new(DenyingApprover),
             side_query,
             questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
         }
     }
 
@@ -335,6 +410,23 @@ impl Capabilities {
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner,
+            subagents: Arc::new(UnavailableSubagentSpawner),
+        }
+    }
+
+    /// Capabilities over a caller-supplied [`SubagentSpawner`] (and the full
+    /// built-in registry + denying Approver/SideQuery/Questioner), for the
+    /// `agent`-tool tests that inject a scripted spawner and assert what it
+    /// received/returned. The single subagents construction site, so a future
+    /// consumer touches one place.
+    pub fn for_test_with_subagents(subagents: Arc<dyn SubagentSpawner>) -> Self {
+        Capabilities {
+            registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
+            approver: Arc::new(DenyingApprover),
+            side_query: Arc::new(DenyingSideQuery),
+            questioner: Arc::new(DecliningQuestioner),
+            subagents,
         }
     }
 
@@ -350,6 +442,7 @@ impl Capabilities {
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
         }
     }
 }
@@ -401,6 +494,7 @@ mod tests {
             approver: Arc::new(FakeApprover { answer: true }),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
         };
         // The seam is proven with a live wire: the decision travels back through
         // the `Arc<dyn Approver>` the carrier holds.
@@ -454,6 +548,7 @@ mod tests {
             approver: Arc::new(FakeApprover { answer: false }),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
         };
         let cloned = caps.clone();
         // The clone shares the same handles (Arc), and both print with the
@@ -464,7 +559,59 @@ mod tests {
         assert!(rendered.contains("approver"));
         assert!(rendered.contains("side_query"));
         assert!(rendered.contains("questioner"));
+        assert!(rendered.contains("subagents"));
         assert!(rendered.contains("<dyn>"));
+    }
+
+    /// A fake real [`SubagentSpawner`] that answers with a fixed result. Proves
+    /// `Capabilities` holds a real answer behind `Arc<dyn SubagentSpawner>`
+    /// without wiring a child Run.
+    struct FakeSpawner {
+        result: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SubagentSpawner for FakeSpawner {
+        async fn spawn(&self, _request: SubagentRequest) -> Result<SubagentResult, String> {
+            Ok(SubagentResult {
+                terminate_reason: "GOAL".into(),
+                result: self.result.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_subagent_spawner_errs() {
+        let spawner = UnavailableSubagentSpawner;
+        let err = spawner
+            .spawn(SubagentRequest {
+                subagent_type: "general-purpose".into(),
+                prompt: "do a thing".into(),
+                model: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, "subagents are unavailable in this environment");
+    }
+
+    #[tokio::test]
+    async fn a_real_subagent_spawner_returns_its_injected_result() {
+        let caps = Capabilities::for_test_with_subagents(Arc::new(FakeSpawner {
+            result: "the findings".into(),
+        }));
+        // The seam is proven with a live wire: the result travels back through
+        // the `Arc<dyn SubagentSpawner>` the carrier holds.
+        let out = caps
+            .subagents
+            .spawn(SubagentRequest {
+                subagent_type: "general-purpose".into(),
+                prompt: "investigate".into(),
+                model: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.terminate_reason, "GOAL");
+        assert_eq!(out.result, "the findings");
     }
 
     /// A fake real [`Questioner`] that answers with fixed picks. Proves
