@@ -3,8 +3,8 @@
 //! draws with.
 //!
 //! This is the one place semantics become terminal colors: [`DiffSide`] →
-//! color for a diff's lines, [`PressureLevel`] → color/emphasis for the status
-//! bar. Extensions and the Screen core never touch ratatui; they speak the
+//! color for a diff's lines, [`FooterItem`] → the flat footer's grey right
+//! group. Extensions and the Screen core never touch ratatui; they speak the
 //! vocabulary and this module renders it. Everything here is pure presentation
 //! of [`TranscriptItem`]s - no state, no IO. Only this module and [`crate::ui`]
 //! `use ratatui` / `use crossterm` (ADR-0019 invariant).
@@ -20,7 +20,6 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxSet;
 
-use thousands::Separable;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::approvals::ApprovalMode;
@@ -30,7 +29,7 @@ use crate::ui::composer::{self, ComposerLayout, ComposerView, OverlayStatus, Ove
 use crate::ui::lull;
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
-use crate::ui::screen::{ConfirmKind, PendingApproval, PressureLevel, Screen, Status};
+use crate::ui::screen::{ConfirmKind, PendingApproval, Screen, Status};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
 use crate::view_model::Tone;
@@ -96,20 +95,21 @@ fn diff_chrome_style(theme: &Theme) -> Style {
 //
 // qwen-code paints its committed chrome from a handful of semantic ROLES
 // (`text.accent`, `text.secondary`, `status.success`, …). This port maps each
-// role onto an existing suspenders slot behind ONE helper apiece, so Phase 7's
-// full theme reconcile is a single edit per role rather than a hunt through the
-// render body. PHASE 7 GAPS (no clean slot yet, stopgapped here): `text.primary`
-// (qwen Foreground) has no distinct suspenders foreground slot - it reads the
-// terminal default (`Style::default()`); `status.warning` (a warning FG) has no
-// warning slot - it borrows the warm amber `marker_aid` slot; a
-// distinct success FG borrows `added` (diff green). These three are flagged so
-// Phase 7 can carve real slots.
+// role onto a suspenders Theme slot behind ONE helper apiece, so a theme
+// reconcile is a single edit per role rather than a hunt through the render
+// body. Phase 7 (ADR-0008/0053) carved the four qwen roles that used to borrow
+// a neighbouring slot into real slots: `text.primary`→`foreground` (was the
+// terminal default), `text.accent`→`accent` (was cyan `prompt_gutter`),
+// `status.success`→`success` (was diff `added`), `status.warning`→`warning`
+// (was warm amber `marker_aid`). `text.secondary`/`ui.symbol`/`border.default`
+// still share the neutral gray `muted` slot by design.
 // ---------------------------------------------------------------------------
 
-/// qwen `text.accent` (AccentPurple): the user caret + assistant marker. Maps to
-/// the cyan `prompt_gutter` slot today (qwen purple lands in Phase 7).
+/// qwen `text.accent` (AccentPurple `#D2A6FF`): the user `>` caret + the
+/// assistant `✦` marker. Reads the dedicated `accent` slot (Phase 7, ADR-0008),
+/// a distinct role rather than the cyan `prompt_gutter` it once borrowed.
 fn accent_style(theme: &Theme) -> Style {
-    Style::default().fg(tui_color(theme.prompt_gutter))
+    Style::default().fg(tui_color(theme.accent))
 }
 
 /// qwen `text.secondary` (Gray): thought glyph/body, tool descriptions, retry,
@@ -118,18 +118,19 @@ fn secondary_style(theme: &Theme) -> Style {
     Style::default().fg(tui_color(theme.muted))
 }
 
-/// qwen `status.success` (AccentGreen): success prefix + the `✓`/`o` tool
-/// markers. No distinct success FG slot yet (Phase 7 gap) - borrows the diff
-/// `added` green.
+/// qwen `status.success` (AccentGreen `#AAD94C`): the success prefix + the
+/// `✓`/`o` tool markers. Reads the dedicated `success` slot (Phase 7,
+/// ADR-0008), a distinct role rather than the diff `added` green it once borrowed.
 fn success_style(theme: &Theme) -> Style {
-    Style::default().fg(tui_color(theme.added))
+    Style::default().fg(tui_color(theme.success))
 }
 
-/// qwen `status.warning` (AccentYellow): the `△` warning prefix + a pending
-/// tool-group border. No warning FG slot yet (Phase 7 gap) - borrows the warm
-/// amber `marker_aid` slot.
+/// qwen `status.warning` (AccentYellow `#FFD700`): the `△` warning prefix + a
+/// pending tool-group border. Reads the dedicated `warning` slot (Phase 7,
+/// ADR-0008), a distinct role rather than the warm amber `marker_aid` it once
+/// borrowed.
 fn warning_style(theme: &Theme) -> Style {
-    Style::default().fg(tui_color(theme.marker_aid))
+    Style::default().fg(tui_color(theme.warning))
 }
 
 /// qwen `status.error` (AccentRed): the `✕`/`x` error prefix + marker. Maps to
@@ -138,10 +139,12 @@ fn error_style(theme: &Theme) -> Style {
     Style::default().fg(tui_color(theme.error))
 }
 
-/// qwen `text.primary` (Foreground): info bodies, tool names. No distinct
-/// suspenders foreground slot yet (Phase 7 gap) - reads the terminal default.
-fn primary_style(_theme: &Theme) -> Style {
-    Style::default()
+/// qwen `text.primary` (Foreground `#bfbdb6`): body text, info bodies, tool
+/// names. Reads the dedicated `foreground` slot (Phase 7, ADR-0008) - a real
+/// pinned colour rather than the terminal default, so body text matches
+/// QwenDark on any background.
+fn primary_style(theme: &Theme) -> Style {
+    Style::default().fg(tui_color(theme.foreground))
 }
 
 /// qwen `ui.symbol` (Gray): a shell tool's marker + a shell tool-group's border.
@@ -182,104 +185,11 @@ pub fn md_style(style: MdStyle, theme: &Theme) -> Style {
     }
 }
 
-/// The ONE mapping from the semantic [`PressureLevel`] (ADR-0008) to the
-/// tokens segment's style: `Ok` reads muted, `Elevated` warns, `Critical`
-/// alarms. Segment form (fg ON a bg) because the status bar is a powerline of
-/// colored blocks - the semantics are unchanged, only the presentation moved
-/// from colored text to colored blocks.
-pub fn pressure_style(level: PressureLevel, theme: &Theme) -> Style {
-    match level {
-        PressureLevel::Critical => Style::default()
-            .fg(tui_color(theme.pressure_critical_fg))
-            .bg(tui_color(theme.pressure_critical_bg))
-            .add_modifier(Modifier::BOLD),
-        PressureLevel::Elevated => Style::default()
-            .fg(tui_color(theme.pressure_elevated_fg))
-            .bg(tui_color(theme.pressure_elevated_bg)),
-        PressureLevel::Ok => Style::default()
-            .fg(tui_color(theme.pressure_ok_fg))
-            .bg(tui_color(theme.segment_muted_bg)),
-    }
-}
-
-/// The ONE mapping from a [`SegmentKind`] to its powerline segment style
-/// (ADR-0008: this is the only place segment semantics become colors). Every
-/// segment style carries a bg - the powerline separators are drawn from the
-/// adjacent segments' bgs ([`segment_bg`]).
-pub fn segment_style(kind: SegmentKind, theme: &Theme) -> Style {
-    match kind {
-        SegmentKind::ModeIdle | SegmentKind::Position => Style::default()
-            .fg(tui_color(theme.segment_idle_fg))
-            .bg(tui_color(theme.segment_idle_bg))
-            .add_modifier(Modifier::BOLD),
-        SegmentKind::ModeRunning => Style::default()
-            .fg(tui_color(theme.segment_running_fg))
-            .bg(tui_color(theme.segment_running_bg))
-            .add_modifier(Modifier::BOLD),
-        // Model + Connection are the two connection facts, styled identically.
-        SegmentKind::Connection | SegmentKind::Model => Style::default()
-            .fg(tui_color(theme.segment_model_fg))
-            .bg(tui_color(theme.segment_model_bg)),
-        // Compact is the detail-on-demand toggle (qwen `compactMode`, ADR-0052).
-        SegmentKind::Compact => Style::default()
-            .fg(tui_color(theme.segment_toggle_fg))
-            .bg(tui_color(theme.segment_muted_bg)),
-        // Cost is a quiet figure: the same muted read as tokens at Ok
-        // pressure, without the pressure routing (cost carries no level).
-        SegmentKind::Cost => Style::default()
-            .fg(tui_color(theme.segment_cost_fg))
-            .bg(tui_color(theme.segment_muted_bg)),
-        // Tokens keep the single PressureLevel mapping - segment_style only
-        // routes to it, it does not restate the colors.
-        SegmentKind::Tokens(level) => pressure_style(level, theme),
-        // Context usage: quiet like a low-emphasis figure, or `error` fg when
-        // over the budget (qwen `isOverLimit ? status.error : text.secondary`).
-        SegmentKind::Context { over_limit } => {
-            let fg = if over_limit {
-                theme.error
-            } else {
-                theme.segment_cost_fg
-            };
-            Style::default()
-                .fg(tui_color(fg))
-                .bg(tui_color(theme.segment_muted_bg))
-        }
-        // The AutoAcceptIndicator label (ADR-0050, qwen `AutoAcceptIndicator`):
-        // the mode's semantic colour (plan → success, auto-edit/auto → warning,
-        // yolo → error) as a foreground over the quiet muted segment bg, bold
-        // so the mode reads at a glance. Default never renders (it is filtered
-        // out before assembly), so it borrows the neutral cost fg here.
-        SegmentKind::ApprovalMode(mode) => {
-            let fg = match mode {
-                ApprovalMode::Plan => theme.added,
-                ApprovalMode::AutoEdit | ApprovalMode::Auto => theme.marker_aid,
-                ApprovalMode::Yolo => theme.error,
-                ApprovalMode::Default => theme.segment_cost_fg,
-            };
-            Style::default()
-                .fg(tui_color(fg))
-                .bg(tui_color(theme.segment_muted_bg))
-                .add_modifier(Modifier::BOLD)
-        }
-        // The cycle hint reads the quiet secondary colour on the same muted bg.
-        SegmentKind::ApprovalModeHint => Style::default()
-            .fg(tui_color(theme.muted))
-            .bg(tui_color(theme.segment_muted_bg)),
-    }
-}
-
-/// A segment's background - what the powerline separator glyphs blend with.
-fn segment_bg(kind: SegmentKind, theme: &Theme) -> Color {
-    segment_style(kind, theme)
-        .bg
-        .unwrap_or_else(|| tui_color(theme.bar_bg))
-}
-
 // ---------------------------------------------------------------------------
 // Render helpers.
 // ---------------------------------------------------------------------------
 
-/// The two connection facts the status bar shows (ADR-0033): the fixed endpoint
+/// The two connection facts the footer shows (ADR-0033): the fixed endpoint
 /// and the mutable Active Model. Both are adapter-carried - the pure Screen
 /// core stays command-agnostic and holds neither. The adapter OWNS them as a
 /// [`ConnectionFacts`]; this is the borrowed form the render path takes, so
@@ -330,10 +240,10 @@ pub struct Anim {
 }
 
 /// The per-frame render context the inline pending path draws WITH: the
-/// connection facts the status bar shows, the animation clocks, and the Theme
+/// connection facts the footer shows, the animation clocks, and the Theme
 /// this frame renders in (the live `/theme` preview or the active Theme).
 /// Bundled as ONE named-field carrier - the same style as [`PendingBodyParams`],
-/// [`StatusBarCtx`] and the adapter's `AdapterCtx` - so
+/// [`FooterCtx`] and the adapter's `AdapterCtx` - so
 /// [`render_pending`] and the adapter's `draw`/`draw_previewed` take four args
 /// instead of six, and a new frame-wide input is a field, not another parameter.
 #[derive(Clone, Copy)]
@@ -344,7 +254,7 @@ pub struct FrameCtx<'a> {
 }
 
 /// Splits the inline frame `area` into the three vertical zones the pending
-/// region draws into: `[pending_body, status_bar, composer]` (ADR-0046). There
+/// region draws into: `[pending_body, footer, composer]` (ADR-0046). There
 /// is no scroll state and no geometry return - native scrollback owns history,
 /// so the pending body is simply bottom-anchored + top-clipped in the top zone.
 ///
@@ -361,7 +271,7 @@ fn frame_chunks(area: Rect, sticky_rows: usize, composer_rows: usize) -> std::rc
         .constraints([
             Constraint::Min(1),                       // inline pending body (ADR-0046)
             Constraint::Length(sticky_rows as u16),   // sticky "Current tasks" box (ADR-0048)
-            Constraint::Length(1),                    // status bar
+            Constraint::Length(1),                    // flat footer (ADR-0053)
             Constraint::Length(composer_rows as u16), // composer (grows with the draft)
         ])
         .split(area)
@@ -381,7 +291,7 @@ fn capped_composer_height(layout: &ComposerLayout, frame_height: usize) -> usize
 
 /// Renders the inline PENDING region (ADR-0046): the uncommitted transcript
 /// tail (`cache.settled()[hw..]` plus the live reasoning tail, streaming answer,
-/// and lull row), the status bar, the Composer, and any open overlay/approval.
+/// and lull row), the flat footer, the Composer, and any open overlay/approval.
 /// Committed items are NOT drawn here - they were frozen into native scrollback
 /// by [`render_committed_slice`] via the adapter's `insert_before`.
 ///
@@ -408,10 +318,10 @@ pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ct
         theme,
     );
     render_sticky_slot(frame, plan.sticky_box, plan.sticky_items, theme);
-    // The status bar's position segment is a literal `Bot` in the inline model
-    // (ADR-0046): native scrollback owns history and the pending body always
-    // follows the tail, so there is no scroll position to report.
-    render_status_bar(frame, plan.status, StatusBarCtx { screen: t, conn }, theme);
+    // The flat footer (ADR-0053): a single row, model | context% | cost on the
+    // right, the AutoAcceptIndicator or `? for shortcuts` on the left. Native
+    // scrollback owns history (ADR-0046), so there is no scroll position to report.
+    render_footer(frame, plan.status, FooterCtx { screen: t, conn }, theme);
     render_composer(frame, plan.composer, t, &plan.draft, theme);
     render_composer_popup_slot(frame, plan.popup_top, area, &composer_view.overlay, theme);
     // The Approval is rendered INLINE now (ADR-0049): the confirming ToolCall's
@@ -1405,9 +1315,6 @@ const COST_HIDDEN: f64 = 0.0;
 /// The milliseconds-per-second divisor used when converting `quiet_ticks` (each
 /// tick is `TICK_MS` ms) into an elapsed-seconds figure for the lull timer.
 const MILLIS_PER_SEC: u64 = 1_000;
-
-/// The number of priority tiers in the status-bar segment drop policy.
-const DROP_TIER_COUNT: usize = 6;
 
 /// Brings the [`RenderCache`] up to date with `screen`'s Transcript at
 /// `content_width` (ADR-0046): the adapter's public door onto the cache's
@@ -3950,133 +3857,86 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const THINKING_TAIL_ROWS: usize = 3;
 
 // ---------------------------------------------------------------------------
-// The powerline status bar.
+// The flat footer (ADR-0053, qwen `Footer.tsx`): ONE row, space-between,
+// `paddingX:2`, no powerline triangles, no block backgrounds. Replaces the
+// powerline status bar (retiring ADR-0046's `status_bar` and the ADR-0008/0040
+// segment palette).
 // ---------------------------------------------------------------------------
 
-/// Powerline separators (Nerd Font): right-pointing after left-side segments,
-/// left-pointing before right-side segments. Drawn fg = the segment's bg over
-/// bg = the neighbor's bg - the standard powerline triangle technique.
-const SEP_RIGHT: &str = "\u{e0b0}"; //
-const SEP_LEFT: &str = "\u{e0b2}"; //
+/// The horizontal inset the footer row wears on each side (qwen `paddingX:2`).
+const FOOTER_PADDING_X: usize = 2;
 
-/// The Agent's mode as the status bar conveys it - the semantic distinction
-/// the leftmost block draws. Carries no spinner frame: the animation glyph is
-/// a drawing concern the painter injects, not part of what the bar *means*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModeState {
-    /// The Agent is idle - no Run running.
-    Idle,
-    /// The Agent is running a Run.
-    Running,
-}
+/// The ` | ` separator qwen joins the right-group items with (`text.secondary`),
+/// emitted BETWEEN items only - no leading separator (qwen `index > 0`).
+const FOOTER_SEP: &str = " | ";
 
-/// One status bar segment's MEANING, ratatui-free (ADR-0019). The pure
-/// assembly ([`status_bar`]) emits these carrying only the display state they
-/// convey - no colors (that is [`segment_style`], ADR-0008), no glyphs, no
-/// padding, no label formatting (all [`StatusSegment::paint`]'s job). This is
-/// the testable seam: the semantics of the bar can be asserted without drawing
-/// a frame.
+// Note: qwen's `isNarrowWidth` (< 80) switches the footer to a two-line column;
+// suspenders instead stays ONE row and sheds right items (cost → model), a
+// documented divergence (ADR-0046 fixed a 1-row footer zone, ADR-0053). The shed
+// is width-driven (see [`Footer::fit`]), so there is no narrow-threshold const.
+
+/// One right-group footer item's MEANING, ratatui-free (ADR-0019). The pure
+/// assembly ([`footer`]) emits these carrying only the display state they
+/// convey - no colours (that is [`render_footer`], ADR-0008), no separators.
+/// The testable seam: the footer's contents can be asserted without a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusSegment {
-    /// The Agent's mode. Idle vs. Running is the semantic decision; the
-    /// spinner frame the running block animates is supplied at paint time.
-    Mode(ModeState),
-    /// The brand + endpoint the Session connects to.
-    Connection {
-        /// The model connection's base URL.
-        base_url: String,
-    },
-    /// The Active Model this Session talks to (ADR-0033). Mutable - a `/model`
-    /// pick changes it - so the bar shows the one connection fact this feature
-    /// makes variable, beside the fixed endpoint.
+pub enum FooterItem {
+    /// The Active Model (qwen keeps model/cost out of its footer; suspenders
+    /// keeps them as the load-bearing local-first facts, Option B, ADR-0053).
+    /// Rendered `text.secondary` like the whole right group.
     Model {
         /// The Active Model identifier.
         model: String,
     },
-    /// The Ctrl+O compact-mode state (qwen `compactMode`, ADR-0052). Carries the
-    /// boolean meaning; the `▾`/`▸` marker is chosen by the painter. Always
-    /// assembled so the toggle has feedback even when nothing compact-affected is
-    /// on screen.
-    Compact {
-        /// Whether compact mode is currently on (thinking + tool bodies hidden).
-        compact: bool,
-    },
-    /// The Session's cumulative dollar cost (ADR-0037: Catalog pricing,
-    /// surfaced display-side). Carries the pre-formatted label (the pure
-    /// [`cost_label`] rule) so the segment stays `Eq`; assembled only when the
-    /// total is positive - an unpriced local Session never shows it.
-    Cost {
-        /// The [`cost_label`]-formatted total, e.g. `$0.42` or `<$0.01`.
-        label: String,
-    },
-    /// Carries the [`PressureLevel`] verbatim so the Critical-renders-red rule
-    /// (ADR-0008) is a semantic fact the painter merely routes to a color.
-    Tokens {
-        /// The token estimate for the Conversation.
-        estimate: u64,
-        /// How close to the budget the Conversation sits.
-        level: PressureLevel,
-    },
     /// The context-usage figure (qwen `ContextUsageDisplay`, ADR-0048): the
-    /// pre-formatted `NN.N% context used` label (the pure `context_percent_label`
-    /// rule, so the segment stays `Eq`) and whether usage is over the budget (the
-    /// painter reads `error` when so). Assembled only when a budget exists.
+    /// flat `NN.N% used` / `NN.N% context used` label (the pure
+    /// [`context_percent_label`] rule) and whether usage is over the budget (the
+    /// painter reads `error` when so, else `text.secondary`). Assembled only when
+    /// a budget exists.
     Context {
-        /// The `context_percent_label`-formatted figure, block-padded.
+        /// The flat `context_percent_label` figure (no block padding).
         label: String,
         /// Whether the Conversation is over its context budget.
         over_limit: bool,
     },
-    /// The position marker - a literal `Bot` (ADR-0046). With native scrollback
-    /// owning history, the inline pending region always follows the tail, so
-    /// there is no scroll position to report; the segment is a unit.
-    Position,
-    /// The AutoAcceptIndicator label (ADR-0050, qwen `AutoAcceptIndicator.tsx`):
-    /// the current Approval mode's name, coloured by mode (plan green, auto-edit
-    /// /auto yellow, yolo red). Assembled only when the mode is not `Default`
-    /// (qwen renders nothing for Default). Carries the [`ApprovalMode`] so the
-    /// painter picks the label + colour.
-    ApprovalMode(ApprovalMode),
-    /// The AutoAcceptIndicator's secondary ` (shift + tab to cycle)` hint, in
-    /// `text.secondary` (a distinct colour from the mode label, hence a separate
-    /// segment). Assembled beside [`StatusSegment::ApprovalMode`], same non-Default
-    /// gate.
-    ApprovalModeHint,
+    /// The Session's cumulative dollar cost (ADR-0037), the pre-formatted
+    /// [`cost_label`] total. Assembled only when the total is positive.
+    Cost {
+        /// The [`cost_label`]-formatted total, e.g. `$0.42` or `<$0.01`.
+        label: String,
+    },
 }
 
-impl StatusSegment {
-    /// The painter's [`SegmentKind`] for this segment - the key into
-    /// [`segment_style`] (ADR-0008). Pure classification, no ratatui: it just
-    /// carries the [`PressureLevel`] through for the Tokens segment so the
-    /// single pressure→color mapping (Critical renders red) still decides the
-    /// style, now provably fed the right level.
-    fn kind(&self) -> SegmentKind {
+impl FooterItem {
+    /// This item's display text (no separator, no padding). Semantics-in,
+    /// text-out - the seam ADR-0019 wants.
+    fn text(&self) -> String {
         match self {
-            StatusSegment::Mode(ModeState::Idle) => SegmentKind::ModeIdle,
-            StatusSegment::Mode(ModeState::Running) => SegmentKind::ModeRunning,
-            StatusSegment::Connection { .. } => SegmentKind::Connection,
-            StatusSegment::Model { .. } => SegmentKind::Model,
-            StatusSegment::Compact { .. } => SegmentKind::Compact,
-            StatusSegment::Cost { .. } => SegmentKind::Cost,
-            StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
-            StatusSegment::Context { over_limit, .. } => SegmentKind::Context {
-                over_limit: *over_limit,
-            },
-            StatusSegment::Position => SegmentKind::Position,
-            StatusSegment::ApprovalMode(mode) => SegmentKind::ApprovalMode(*mode),
-            StatusSegment::ApprovalModeHint => SegmentKind::ApprovalModeHint,
+            FooterItem::Model { model } => format!("model {model}"),
+            FooterItem::Context { label, .. } => label.clone(),
+            FooterItem::Cost { label } => label.clone(),
         }
     }
 
-    /// The columns this segment occupies once painted, ratatui-free. Kept in
-    /// lockstep with [`StatusSegment::paint`] so the pure fit policy
-    /// ([`StatusBar::fit`]) measures exactly what the painter will draw. The
-    /// mode dot and `▾`/`▸` marker are each one column, so the width does not
-    /// depend on the mode the painter later chooses. Exhaustive so a new
-    /// segment kind is a compile error here as well as in the painter.
+    /// The columns this item occupies once painted, ratatui-free. Kept in
+    /// lockstep with [`FooterItem::text`] so the fit policy measures what the
+    /// painter draws.
     fn cells(&self) -> usize {
-        self.paint().chars().count()
+        self.text().chars().count()
     }
+}
+
+/// The footer's left content (qwen `leftBottomContent`): the AutoAcceptIndicator
+/// when the Approval mode is not Default, else the `? for shortcuts` hint.
+/// Ratatui-free - the painter picks the per-mode colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterLeft {
+    /// The AutoAcceptIndicator (qwen `AutoAcceptIndicator.tsx`, ADR-0050): the
+    /// mode's label + the ` (shift + tab to cycle)` hint. Never `Default` (that
+    /// falls to [`FooterLeft::Shortcuts`], matching qwen rendering nothing).
+    AutoAccept(ApprovalMode),
+    /// The resting `? for shortcuts` hint (qwen's fallthrough), `text.secondary`.
+    Shortcuts,
 }
 
 /// The ratio at/above which the context figure reads `>100` (qwen `>1`).
@@ -4091,8 +3951,9 @@ const CONTEXT_NARROW_WIDTH: usize = 100;
 /// ADR-0048): `percentage = tokens / budget`; `>1 → ">100"` else `(p*100)` to one
 /// decimal, then the label - `% used` when the terminal is narrower than
 /// [`CONTEXT_NARROW_WIDTH`] else `% context used` (the leading `%` is part of the
-/// label). The `padded` block frames it like any other segment. A zero (or
-/// missing) budget has no figure to show.
+/// label). FLAT - no block padding (the powerline wrapper is retired, ADR-0053);
+/// the footer joins items with ` | ` instead. A zero (or missing) budget has no
+/// figure to show.
 fn context_percent_label(tokens: u64, budget: u64, width: usize) -> Option<String> {
     if budget == 0 {
         return None;
@@ -4108,7 +3969,7 @@ fn context_percent_label(tokens: u64, budget: u64, width: usize) -> Option<Strin
     } else {
         "% context used"
     };
-    Some(padded(&format!("{figure}{label}")))
+    Some(format!("{figure}{label}"))
 }
 
 /// Whether the context usage is over the budget (qwen `isOverLimit`): the figure
@@ -4118,18 +3979,11 @@ fn context_over_limit(tokens: u64, budget: u64) -> bool {
     budget > 0 && tokens > budget
 }
 
-/// The Tokens segment's display text: `~{estimate} tokens` (grouped with
-/// thousands separators).
-fn tokens_label(estimate: u64) -> String {
-    let estimate = estimate.separate_with_commas();
-    format!(" ~{estimate} tokens ")
-}
-
-/// The Cost segment's display text (ADR-0037: the Session's cumulative
+/// The Cost item's display text (ADR-0037: the Session's cumulative
 /// Catalog-priced total, in dollars). Two decimals from a cent up; a flat
 /// `<$0.01` below that - a sub-cent figure would render `$0.00` and read as
-/// free. Only prices a positive total: the assembly hides the segment
-/// entirely at zero, so this never formats one.
+/// free. Only prices a positive total: the assembly hides the item entirely at
+/// zero, so this never formats one.
 pub fn cost_label(total: f64) -> String {
     if total < COST_SUB_CENT {
         "<$0.01".to_string()
@@ -4138,252 +3992,133 @@ pub fn cost_label(total: f64) -> String {
     }
 }
 
-/// The status bar's assembled MEANING: an ordered left group (mode, then
-/// connection) and right group (thinking, tools, tokens, position), already
-/// fitted to the terminal width. Pure and ratatui-free - this is what the new
-/// colocated tests assert against without drawing a frame.
+/// The footer's assembled MEANING (ADR-0053): the left content and the ordered
+/// ` | `-joined right group (model, context%, cost), already fitted to the
+/// terminal width. Pure and ratatui-free - what the colocated tests assert
+/// against without drawing a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusBar {
-    /// Left-anchored segments, highest priority first.
-    pub left: Vec<StatusSegment>,
-    /// Right-anchored segments, in display order.
-    pub right: Vec<StatusSegment>,
+pub struct Footer {
+    /// The left content (AutoAcceptIndicator or the shortcuts hint).
+    pub left: FooterLeft,
+    /// The right group, in display order (model, context%, cost), post-fit.
+    pub right: Vec<FooterItem>,
 }
 
-impl StatusBar {
-    /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then model, then compact, then context, then cost, then
-    /// tokens - mode and position survive longest. Connection (the endpoint)
-    /// drops BEFORE model: the endpoint is a fixed, knowable fact, while the
-    /// model is what the user actively changes via `/model`, so the model
-    /// earns the scarcer columns. Compact (the detail-on-demand toggle) drops
-    /// after model but before the figures. Cost drops before tokens: tokens
-    /// carry the pressure level the operator steers by. Which segments to show
-    /// at a given width is a SEMANTIC decision, so it lives here in the pure
-    /// layer; the width arithmetic reads each segment's own
-    /// [`StatusSegment::cells`]. Simple on purpose: a partially-truncated
-    /// segment would garble the powerline blocks.
-    fn fit(mut self, width: usize) -> StatusBar {
-        let drop_order: [fn(&StatusSegment) -> bool; DROP_TIER_COUNT] = [
-            |s| matches!(s, StatusSegment::Connection { .. }),
-            |s| matches!(s, StatusSegment::Model { .. }),
-            |s| matches!(s, StatusSegment::Compact { .. }),
-            // Context is a derived convenience figure over the same token facts,
-            // so it drops before the cost and raw-token figures.
-            |s| matches!(s, StatusSegment::Context { .. }),
-            |s| matches!(s, StatusSegment::Cost { .. }),
-            |s| matches!(s, StatusSegment::Tokens { .. }),
+impl Footer {
+    /// Drops right-group items until the footer fits `width`, lowest-value
+    /// first: cost, then model - context% NEVER drops (it is qwen's sole footer
+    /// figure and the one the operator steers by). Which items show at a given
+    /// width is a SEMANTIC decision, so it lives here in the pure layer; the
+    /// arithmetic reads each item's own [`FooterItem::cells`] plus the left
+    /// content, the ` | ` joins, and the two-side padding. This is the narrow
+    /// "shed, don't wrap" divergence from qwen's two-line stack (ADR-0053).
+    fn fit(mut self, width: usize, left_cells: usize) -> Footer {
+        let drop_order: [fn(&FooterItem) -> bool; FOOTER_DROP_TIER_COUNT] = [
+            |i| matches!(i, FooterItem::Cost { .. }),
+            |i| matches!(i, FooterItem::Model { .. }),
         ];
         for dropped in drop_order {
-            if self.cells() <= width {
+            if self.cells(left_cells) <= width {
                 break;
             }
-            self.left.retain(|s| !dropped(s));
-            self.right.retain(|s| !dropped(s));
+            self.right.retain(|i| !dropped(i));
         }
         self
     }
 
-    /// The columns the segments occupy: their painted widths plus one
-    /// powerline separator glyph per segment (left segments each trail one,
-    /// right segments each lead with one).
-    fn cells(&self) -> usize {
-        let text: usize = self
-            .left
-            .iter()
-            .chain(&self.right)
-            .map(StatusSegment::cells)
-            .sum();
-        text + self.left.len() + self.right.len()
+    /// The columns the footer occupies: the two-side padding, the left content,
+    /// a gap of at least one cell, and the right group (item texts + one ` | `
+    /// join between each pair).
+    fn cells(&self, left_cells: usize) -> usize {
+        FOOTER_PADDING_X * 2 + left_cells + FOOTER_MIN_GAP + self.right_cells()
+    }
+
+    /// The right group's painted width: the item texts plus one ` | ` separator
+    /// between each adjacent pair (no leading separator).
+    fn right_cells(&self) -> usize {
+        let text: usize = self.right.iter().map(FooterItem::cells).sum();
+        let joins = self.right.len().saturating_sub(1) * FOOTER_SEP.chars().count();
+        text + joins
     }
 }
 
-/// The token facts the status bar's Tokens segment needs: the `estimate` it
-/// draws and the [`PressureLevel`] that colors it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenView {
-    pub estimate: u64,
-    pub level: PressureLevel,
-}
-
-/// The figures the bar's right side draws beside the toggles: the token facts
-/// (`None` before any estimate exists) and the Session's cumulative dollar
-/// cost (ADR-0037). A `session_cost` of 0.0 hides the cost segment entirely -
-/// an unpriced local Session shows exactly the bar it always did. One struct,
-/// like [`TokenView`] before it, so the `status_bar` arg COUNT stays at 8 (the
-/// Stage 3 review's binding precondition against growing the
-/// already-suppressed signature).
+/// The figures the footer's right side draws: the token estimate (`None` before
+/// any estimate exists) the context figure measures against the budget, the
+/// Session's cumulative dollar cost (ADR-0037; `0.0` hides the Cost item), and
+/// the context budget for the `% used` figure (ADR-0048).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FigureView {
-    pub tokens: Option<TokenView>,
+    /// The token estimate the context figure divides by the budget. The
+    /// powerline's per-`PressureLevel` block colour retired with it (ADR-0053);
+    /// the flat footer routes context colour off `over_limit` alone, so only the
+    /// count survives.
+    pub tokens: Option<u64>,
     pub session_cost: f64,
-    /// The Conversation's context budget (the model's usable window), used for
-    /// the `% context used` figure (ADR-0048). `None` before any estimate/budget
-    /// arrives; a zero budget shows no figure.
+    /// The Conversation's context budget (the model's usable window). `None`
+    /// before any estimate/budget arrives; a zero budget shows no figure.
     pub context_budget: Option<u64>,
 }
 
-/// All display facts for one status bar assembly, bundled to keep [`status_bar`]
-/// within the 5-param SRP_PARAMS ceiling. Each field is an independent semantic
-/// fact the bar renders; the struct is the boundary between the caller's state
-/// and the pure assembly logic.
-pub(crate) struct StatusBarView<'a> {
-    pub(crate) status: Status,
+/// All display facts for one footer assembly, bundled to keep [`footer`] within
+/// the param ceiling. Each field is an independent semantic fact the footer
+/// renders.
+pub(crate) struct FooterView<'a> {
     pub(crate) conn: ConnectionView<'a>,
-    pub(crate) toggles: Toggles,
     pub(crate) figures: FigureView,
-    /// The current Approval mode (ADR-0050), for the footer AutoAcceptIndicator.
-    /// `Default` shows nothing.
+    /// The current Approval mode (ADR-0050), for the left AutoAcceptIndicator.
+    /// `Default` shows the shortcuts hint instead.
     pub(crate) approval_mode: ApprovalMode,
 }
 
-/// Assembles the status bar's MEANING, pure and ratatui-free (ADR-0019): the
-/// ordered semantic segments the bar conveys, fitted to `width`. `view.figures`
-/// carries the token facts (`None` when no estimate exists yet) and the
-/// Session cost (segment hidden at zero). No colors, glyphs, or label
-/// strings are decided here - that is the painter's job
-/// ([`render_status_bar`]) - so every rule this expresses (segment order, the
-/// fit/drop policy, which [`PressureLevel`] the tokens segment carries, the
-/// tokens-absent-until-estimate and cost-hidden-at-zero rules) is a semantic
-/// fact assertable without a frame.
-pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
-    let StatusBarView {
-        status,
+/// Assembles the footer's MEANING, pure and ratatui-free (ADR-0019, ADR-0053):
+/// the left content and the ordered right group (model, context%, cost), fitted
+/// to `width`. No colours, glyphs, or separators are decided here - that is the
+/// painter's job ([`render_footer`]) - so every rule (item order, the shed/drop
+/// policy, the model-always / cost-hidden-at-zero / context-needs-a-budget
+/// rules, the Default-mode-shows-shortcuts rule) is assertable without a frame.
+pub(crate) fn footer(width: usize, view: FooterView<'_>) -> Footer {
+    let FooterView {
         conn,
-        toggles,
         figures,
         approval_mode,
     } = view;
-    let mode = match status {
-        Status::Idle => ModeState::Idle,
-        Status::Running => ModeState::Running,
-    };
-    let mut left = vec![
-        StatusSegment::Mode(mode),
-        StatusSegment::Connection {
-            base_url: conn.base_url.to_string(),
-        },
-        StatusSegment::Model {
-            model: conn.model.to_string(),
-        },
-    ];
-    // The AutoAcceptIndicator (ADR-0050, qwen `AutoAcceptIndicator`): shown only
-    // when the mode is not Default, as the mode label + its cycle hint. Placed
-    // right after the mode block so it reads as part of the agent-state group;
-    // it survives the fit/drop policy (no drop tier removes it) because an
-    // unusual approval mode is a safety signal the operator must keep seeing.
-    if approval_mode != ApprovalMode::Default {
-        left.push(StatusSegment::ApprovalMode(approval_mode));
-        left.push(StatusSegment::ApprovalModeHint);
-    }
 
-    let mut right = vec![StatusSegment::Compact {
-        compact: toggles.compact,
+    let left = if approval_mode == ApprovalMode::Default {
+        FooterLeft::Shortcuts
+    } else {
+        FooterLeft::AutoAccept(approval_mode)
+    };
+
+    let mut right = vec![FooterItem::Model {
+        model: conn.model.to_string(),
     }];
-    if let Some(TokenView { estimate, level }) = figures.tokens {
-        right.push(StatusSegment::Tokens { estimate, level });
-        // The context-usage figure (qwen `ContextUsageDisplay`, ADR-0048): shown
-        // beside the raw token count once a budget exists. The label's `% used` /
-        // `% context used` form depends on the terminal `width` (qwen's
-        // <100-column rule).
-        if let Some(budget) = figures.context_budget
-            && let Some(label) = context_percent_label(estimate, budget, width)
-        {
-            right.push(StatusSegment::Context {
-                label,
-                over_limit: context_over_limit(estimate, budget),
-            });
-        }
+    // The context-usage figure (qwen `ContextUsageDisplay`, ADR-0048): shown once
+    // a budget exists. The label's `% used` / `% context used` form depends on the
+    // terminal `width` (qwen's <100-column rule).
+    if let Some(estimate) = figures.tokens
+        && let Some(budget) = figures.context_budget
+        && let Some(label) = context_percent_label(estimate, budget, width)
+    {
+        right.push(FooterItem::Context {
+            label,
+            over_limit: context_over_limit(estimate, budget),
+        });
     }
-    // The cost segment exists only once a priced Response landed: at zero the
-    // Session has spent nothing meterable and the bar stays as it always was.
+    // The cost item exists only once a priced Response landed: at zero the
+    // Session has spent nothing meterable and the footer omits it.
     if figures.session_cost > COST_HIDDEN {
-        right.push(StatusSegment::Cost {
+        right.push(FooterItem::Cost {
             label: cost_label(figures.session_cost),
         });
     }
-    // Native scrollback owns history (ADR-0046): the pending body always follows
-    // the tail, so the position segment is a literal `Bot` - a unit, no state.
-    right.push(StatusSegment::Position);
 
-    StatusBar { left, right }.fit(width)
+    Footer { left, right }.fit(width, footer_left_cells(left))
 }
 
-/// The semantic kind of one status bar segment. The painter classifies each
-/// [`StatusSegment`] into a kind ([`StatusSegment::kind`]); [`segment_style`]
-/// is the single place kinds become colors (ADR-0008).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentKind {
-    /// Agent idle - calm green mode block.
-    ModeIdle,
-    /// Agent running - yellow mode block with the animated spinner.
-    ModeRunning,
-    /// `suspenders · <base_url>` - the brand + endpoint, lowest priority.
-    Connection,
-    /// `model · <id>` - the Active Model (ADR-0033), styled like the endpoint
-    /// since both are connection facts.
-    Model,
-    /// The Ctrl+O compact-mode state (`▾`/`▸`, qwen `compactMode`, ADR-0052).
-    /// Always visible so the toggle has feedback even when nothing
-    /// compact-affected is on screen.
-    Compact,
-    /// The Session's cumulative dollar cost (ADR-0037) - a quiet figure like
-    /// tokens at `Ok` pressure. Present only once a priced Response landed.
-    Cost,
-    /// The `~N tokens` estimate, colored by its [`PressureLevel`].
-    Tokens(PressureLevel),
-    /// The `NN.N% context used` figure (qwen `ContextUsageDisplay`, ADR-0048):
-    /// quiet secondary normally, `error` when over the budget.
-    Context {
-        /// Whether usage is over the context budget (routes to `error`).
-        over_limit: bool,
-    },
-    /// The viewport scroll position (`Bot`/`Top`/`NN%`) - the bold accent.
-    Position,
-    /// The AutoAcceptIndicator mode label (ADR-0050): coloured per mode - plan
-    /// success-green, auto-edit/auto warning-yellow, yolo error-red.
-    ApprovalMode(ApprovalMode),
-    /// The AutoAcceptIndicator's cycle hint - always `text.secondary`.
-    ApprovalModeHint,
-}
-
-impl StatusSegment {
-    /// Paints this segment into its display text (padding included). The ONLY
-    /// place the drawing details live: the mode dot, the `▾`/`▸` Thinking
-    /// marker, the `~N tokens` label, and the block padding. Semantics-in,
-    /// terminal-text-out - the seam ADR-0019 wants. No spinner: the running
-    /// animation moved to the `✦ Thinking` reasoning header; the mode
-    /// block is now a static dot (`●` running, pulsing color; `○` idle).
-    fn paint(&self) -> String {
-        match self {
-            StatusSegment::Mode(ModeState::Running) => " ● ".to_string(),
-            StatusSegment::Mode(ModeState::Idle) => " ○ ".to_string(),
-            StatusSegment::Connection { base_url } => padded(&format!("suspenders · {base_url}")),
-            StatusSegment::Model { model } => padded(&format!("model · {model}")),
-            StatusSegment::Compact { compact } => {
-                let marker = if *compact { "▾" } else { "▸" };
-                padded(&format!("{marker} compact"))
-            }
-            StatusSegment::Cost { label } => padded(label),
-            StatusSegment::Tokens { estimate, .. } => tokens_label(*estimate),
-            // The label is already block-padded by `context_percent_label`.
-            StatusSegment::Context { label, .. } => label.clone(),
-            // Native scrollback owns history (ADR-0046): always the tail.
-            StatusSegment::Position => padded("Bot"),
-            // The AutoAcceptIndicator label + hint (ADR-0050). The label is
-            // block-padded like any segment; the hint carries its own leading
-            // space (qwen's ` (shift + tab to cycle)`) so the two read as one
-            // phrase across the colour boundary.
-            StatusSegment::ApprovalMode(mode) => padded(approval_mode_label(*mode)),
-            StatusSegment::ApprovalModeHint => "(shift + tab to cycle) ".to_string(),
-        }
-    }
-}
-
-/// The AutoAcceptIndicator's mode label (ADR-0050, qwen `AutoAcceptIndicator.tsx`
-/// verbatim): `plan mode` / `auto-accept edits` / `auto mode (classifier-
-/// evaluated)` / `YOLO mode`. `Default` has no label (it never renders); it maps
-/// to the empty string defensively so the function is total.
+/// The AutoAcceptIndicator's mode label (qwen `AutoAcceptIndicator.tsx` verbatim,
+/// ADR-0050): `plan mode` / `auto-accept edits` / `auto mode (classifier-
+/// evaluated)` / `YOLO mode`. `Default` has no label (it never renders as an
+/// indicator); it maps to the empty string defensively so the function is total.
 fn approval_mode_label(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Plan => "plan mode",
@@ -4394,43 +4129,64 @@ fn approval_mode_label(mode: ApprovalMode) -> &'static str {
     }
 }
 
-/// The bottom status bar, powerline style: left segments (mode, connection)
-/// fading into the base bg, right segments (thinking, tokens, position)
-/// growing out of it, each block joined by triangle separators. `geometry` is
-/// the `(total_lines, height)` the viewport was measured at THIS frame - the
-/// position segment must agree with what is actually drawn above it.
-///
-/// A thin painter over the pure [`status_bar`] assembly: the semantics (which
-/// segments, in what order, at what [`PressureLevel`]) are decided there; this
-/// runs each [`StatusSegment`] into a styled span via [`StatusSegment::paint`]
-/// and [`segment_style`].
-/// Screen-state bundle for [`render_status_bar`], so the painter stays within
-/// the 5-param SRP_PARAMS ceiling without changing the public `render` signature.
-pub(crate) struct StatusBarCtx<'a> {
+/// The AutoAcceptIndicator's per-mode label colour (qwen `AutoAcceptIndicator`):
+/// plan → success, auto-edit/auto → warning, yolo → error. Default never renders
+/// as an indicator, so it borrows the neutral secondary defensively.
+fn approval_mode_style(mode: ApprovalMode, theme: &Theme) -> Style {
+    match mode {
+        ApprovalMode::Plan => success_style(theme),
+        ApprovalMode::AutoEdit | ApprovalMode::Auto => warning_style(theme),
+        ApprovalMode::Yolo => error_style(theme),
+        ApprovalMode::Default => secondary_style(theme),
+    }
+}
+
+/// The AutoAcceptIndicator's cycle hint (qwen ` (shift + tab to cycle)`), carried
+/// with a leading space so it reads as one phrase across the colour boundary.
+const CYCLE_HINT: &str = " (shift + tab to cycle)";
+
+/// The resting left hint (qwen `? for shortcuts`).
+const SHORTCUTS_HINT: &str = "? for shortcuts";
+
+/// The left content's painted width (ratatui-free), so the pure [`Footer::fit`]
+/// measures the same cells the painter draws.
+fn footer_left_cells(left: FooterLeft) -> usize {
+    match left {
+        FooterLeft::AutoAccept(mode) => {
+            approval_mode_label(mode).chars().count() + CYCLE_HINT.chars().count()
+        }
+        FooterLeft::Shortcuts => SHORTCUTS_HINT.chars().count(),
+    }
+}
+
+/// The number of shed tiers in the footer's right-group drop policy.
+const FOOTER_DROP_TIER_COUNT: usize = 2;
+
+/// The minimum gap the footer reserves between the left content and the right
+/// group (qwen's space-between never lets them touch).
+const FOOTER_MIN_GAP: usize = 1;
+
+/// Screen-state bundle for [`render_footer`], so the painter stays within the
+/// param ceiling.
+pub(crate) struct FooterCtx<'a> {
     pub(crate) screen: &'a Screen,
     pub(crate) conn: ConnectionView<'a>,
 }
 
-pub(crate) fn render_status_bar(
-    frame: &mut Frame,
-    area: Rect,
-    ctx: StatusBarCtx<'_>,
-    theme: &Theme,
-) {
-    let StatusBarCtx { screen: t, conn } = ctx;
-    let bar = status_bar(
-        area.width as usize,
-        StatusBarView {
-            status: t.status,
+/// The flat bottom footer (ADR-0053, qwen `Footer.tsx`): ONE row, hand-rolled
+/// space-between with a [`FOOTER_PADDING_X`] inset on each side and NO background
+/// fill. A thin painter over the pure [`footer`] assembly (which items, in what
+/// order): the left content wears its per-mode colour, the right group is
+/// ` | `-joined in `text.secondary` (context% goes `error` when over-limit).
+pub(crate) fn render_footer(frame: &mut Frame, area: Rect, ctx: FooterCtx<'_>, theme: &Theme) {
+    let FooterCtx { screen: t, conn } = ctx;
+    let width = area.width as usize;
+    let bar = footer(
+        width,
+        FooterView {
             conn,
-            toggles: Toggles {
-                compact: t.compact_mode,
-            },
             figures: FigureView {
-                tokens: t.token_estimate.map(|estimate| TokenView {
-                    estimate,
-                    level: t.pressure_level,
-                }),
+                tokens: t.token_estimate,
                 session_cost: t.session_cost,
                 context_budget: t.context_budget,
             },
@@ -4438,38 +4194,58 @@ pub(crate) fn render_status_bar(
         },
     );
 
-    let bar_bg = tui_color(theme.bar_bg);
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, segment) in bar.left.iter().enumerate() {
-        let kind = segment.kind();
-        spans.push(Span::styled(segment.paint(), segment_style(kind, theme)));
-        // The separator wears THIS segment's bg over the NEXT one's (the base
-        // bg after the last segment) - that is what draws the triangle.
-        let next_bg = bar
-            .left
-            .get(i + 1)
-            .map(|s| segment_bg(s.kind(), theme))
-            .unwrap_or(bar_bg);
-        spans.push(Span::styled(
-            SEP_RIGHT,
-            Style::default().fg(segment_bg(kind, theme)).bg(next_bg),
-        ));
-    }
-    let gap = (area.width as usize).saturating_sub(bar.cells());
-    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(bar_bg)));
-    let mut prev_bg = bar_bg;
-    for segment in &bar.right {
-        let kind = segment.kind();
-        spans.push(Span::styled(
-            SEP_LEFT,
-            Style::default().fg(segment_bg(kind, theme)).bg(prev_bg),
-        ));
-        spans.push(Span::styled(segment.paint(), segment_style(kind, theme)));
-        prev_bg = segment_bg(kind, theme);
+    // Left content: the AutoAcceptIndicator (mode label + hint) or the shortcuts
+    // hint. The hint is always `text.secondary` (qwen); the mode label wears its
+    // per-mode colour.
+    let mut left_spans: Vec<Span> = Vec::new();
+    match bar.left {
+        FooterLeft::AutoAccept(mode) => {
+            left_spans.push(Span::styled(
+                approval_mode_label(mode).to_string(),
+                approval_mode_style(mode, theme),
+            ));
+            left_spans.push(Span::styled(CYCLE_HINT.to_string(), secondary_style(theme)));
+        }
+        FooterLeft::Shortcuts => {
+            left_spans.push(Span::styled(
+                SHORTCUTS_HINT.to_string(),
+                secondary_style(theme),
+            ));
+        }
     }
 
-    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
-    frame.render_widget(bar, area);
+    // Right group: ` | `-joined in `text.secondary`, no leading separator; the
+    // context% item goes `error` when over the budget (qwen's inner colour).
+    let mut right_spans: Vec<Span> = Vec::new();
+    for (i, item) in bar.right.iter().enumerate() {
+        if i > 0 {
+            right_spans.push(Span::styled(FOOTER_SEP, secondary_style(theme)));
+        }
+        let style = match item {
+            FooterItem::Context {
+                over_limit: true, ..
+            } => error_style(theme),
+            _ => secondary_style(theme),
+        };
+        right_spans.push(Span::styled(item.text(), style));
+    }
+
+    // Hand-rolled space-between (qwen `justifyContent:"space-between"`): pad the
+    // gap between the inset left and right groups so the right group sits flush
+    // against the right inset.
+    let left_cells: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_cells: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let content = FOOTER_PADDING_X * 2 + left_cells + right_cells;
+    let gap = width.saturating_sub(content).max(FOOTER_MIN_GAP);
+
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(" ".repeat(FOOTER_PADDING_X)));
+    spans.append(&mut left_spans);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.append(&mut right_spans);
+    spans.push(Span::raw(" ".repeat(FOOTER_PADDING_X)));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The two-row chrome the Composer wears above and below its draft (ADR-0048,
@@ -5078,70 +4854,6 @@ mod tests {
     }
 
     #[test]
-    fn dark_pressure_styles_pin_the_legacy_palette() {
-        let t = theme::dark();
-        assert_eq!(
-            pressure_style(PressureLevel::Critical, t),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(
-            pressure_style(PressureLevel::Elevated, t),
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        );
-        assert_eq!(
-            pressure_style(PressureLevel::Ok, t),
-            Style::default().fg(Color::Gray).bg(Color::Rgb(40, 44, 58))
-        );
-    }
-
-    #[test]
-    fn dark_segment_styles_pin_the_legacy_palette() {
-        let t = theme::dark();
-        let bold = |fg, bg| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
-        let plain = |fg, bg| Style::default().fg(fg).bg(bg);
-        assert_eq!(
-            segment_style(SegmentKind::ModeIdle, t),
-            bold(Color::Black, Color::Green)
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Position, t),
-            bold(Color::Black, Color::Green)
-        );
-        assert_eq!(
-            segment_style(SegmentKind::ModeRunning, t),
-            bold(Color::Black, Color::Yellow)
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Connection, t),
-            plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Model, t),
-            plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Compact, t),
-            plain(Color::DarkGray, Color::Rgb(40, 44, 58))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Cost, t),
-            plain(Color::Gray, Color::Rgb(40, 44, 58))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Tokens(PressureLevel::Critical), t),
-            pressure_style(PressureLevel::Critical, t)
-        );
-        // The ex-constants, now slots: the code, bar, and quiet-segment
-        // backgrounds keep their exact legacy values under dark.
-        assert_eq!(tui_color(t.code_block_bg), Color::Rgb(25, 25, 35));
-        assert_eq!(tui_color(t.bar_bg), Color::Rgb(30, 30, 40));
-        assert_eq!(tui_color(t.segment_muted_bg), Color::Rgb(40, 44, 58));
-    }
-
-    #[test]
     fn a_non_default_theme_recolors_the_mappings() {
         let t = themed("[colors]\nadded = \"#123456\"\nheading = \"magenta\"\n");
         assert_eq!(
@@ -5386,8 +5098,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // -----------------------------------------------------------------------
-    // The powerline segment assembly.
+    // The flat footer assembly (ADR-0053).
     // -----------------------------------------------------------------------
 
     /// A [`FigureView`] with no token estimate and a zero (hidden) cost.
@@ -5399,618 +5110,361 @@ mod tests {
         }
     }
 
-    /// A [`FigureView`] carrying only the token facts, cost hidden.
-    fn tokens_only(tokens: TokenView) -> FigureView {
+    /// A [`FigureView`] carrying only the token estimate, cost hidden.
+    fn tokens_only(estimate: u64) -> FigureView {
         FigureView {
-            tokens: Some(tokens),
+            tokens: Some(estimate),
             session_cost: 0.0,
             context_budget: None,
         }
     }
 
-    /// Assembles the SEMANTIC bar at `width` with everything present: running,
-    /// tokens known at `Ok` pressure, a priced Session total. Returns the pure
-    /// [`StatusBar`] - no drawing, no frame.
-    fn bar_at(width: usize) -> StatusBar {
-        status_bar(
+    /// The pure footer assembly at `width` with the default fixtures (idle-ish,
+    /// tokens present with a budget, a positive cost) - the frame-free seam the
+    /// footer tests assert against.
+    fn footer_at(width: usize) -> Footer {
+        footer(
             width,
-            StatusBarView {
-                status: Status::Running,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "http://localhost:8080",
-                    model: "qwen/model",
+                    model: "qwen3-coder",
                 },
-                toggles: Toggles::default(),
-                approval_mode: ApprovalMode::Default,
                 figures: FigureView {
-                    tokens: Some(TokenView {
-                        estimate: 1200,
-                        level: PressureLevel::Ok,
-                    }),
+                    tokens: Some(2500),
                     session_cost: 0.42,
-                    context_budget: None,
+                    context_budget: Some(10_000),
                 },
+                approval_mode: ApprovalMode::Default,
             },
         )
     }
 
-    /// The painter's [`SegmentKind`] for each assembled segment - what routes
-    /// into [`segment_style`]. Asserting on kinds proves the right meaning
-    /// reaches the color mapping without drawing.
-    fn kinds(segments: &[StatusSegment]) -> Vec<SegmentKind> {
-        segments.iter().map(StatusSegment::kind).collect()
-    }
-
-    /// A wide idle bar under approval `mode` (ADR-0050), for the footer
-    /// AutoAcceptIndicator assertions.
-    fn bar_with_mode(mode: ApprovalMode) -> StatusBar {
-        status_bar(
+    /// The footer at `width` with a given approval mode (default fixtures else).
+    fn footer_with_mode(mode: ApprovalMode) -> Footer {
+        footer(
             200,
-            StatusBarView {
-                status: Status::Idle,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "http://localhost:8080",
-                    model: "qwen/model",
+                    model: "qwen3-coder",
                 },
-                toggles: Toggles::default(),
                 figures: no_figures(),
                 approval_mode: mode,
             },
         )
     }
 
-    // Default mode shows NO AutoAcceptIndicator (qwen renders nothing).
     #[test]
-    fn default_mode_shows_no_approval_indicator() {
-        let bar = bar_with_mode(ApprovalMode::Default);
-        assert!(
-            !bar.left.iter().chain(&bar.right).any(|s| matches!(
-                s,
-                StatusSegment::ApprovalMode(_) | StatusSegment::ApprovalModeHint
-            )),
-            "Default renders no indicator"
+    fn a_wide_footer_shows_model_then_context_then_cost_in_order() {
+        let bar = footer_at(200);
+        assert_eq!(bar.left, FooterLeft::Shortcuts);
+        assert_eq!(
+            bar.right,
+            vec![
+                FooterItem::Model {
+                    model: "qwen3-coder".into()
+                },
+                FooterItem::Context {
+                    label: "25.0% context used".into(),
+                    over_limit: false,
+                },
+                FooterItem::Cost {
+                    label: "$0.42".into(),
+                },
+            ]
         );
     }
 
-    // Every non-Default mode assembles the label + the cycle hint, in the left
-    // group, with the verbatim qwen label text.
     #[test]
-    fn each_non_default_mode_shows_its_label_and_cycle_hint() {
-        let cases = [
-            (ApprovalMode::Plan, "plan mode"),
-            (ApprovalMode::AutoEdit, "auto-accept edits"),
-            (ApprovalMode::Auto, "auto mode (classifier-evaluated)"),
-            (ApprovalMode::Yolo, "YOLO mode"),
-        ];
-        for (mode, label) in cases {
-            let bar = bar_with_mode(mode);
-            let seg = bar
-                .left
-                .iter()
-                .find(|s| matches!(s, StatusSegment::ApprovalMode(_)))
-                .unwrap_or_else(|| panic!("{mode:?} must show a label"));
-            assert!(
-                seg.paint().contains(label),
-                "{mode:?} label is `{label}`, painted `{}`",
-                seg.paint()
-            );
-            assert!(
-                bar.left
-                    .iter()
-                    .any(|s| matches!(s, StatusSegment::ApprovalModeHint)),
-                "{mode:?} must show the cycle hint"
-            );
-        }
-    }
+    fn a_narrow_footer_sheds_cost_then_model_keeping_context() {
+        // Cost drops first, then model; context% survives longest (qwen's sole
+        // figure). Widths chosen against the fixture: left `? for shortcuts` (15),
+        // right `model qwen3-coder` (17) + `25.0% used` (10) + `$0.42` (5), each
+        // ` | ` join (3), padding (4), min gap (1). Full = 4+15+1+(17+10+5+6)=58.
+        let full = footer_at(60);
+        assert_eq!(
+            full.right,
+            vec![
+                FooterItem::Model {
+                    model: "qwen3-coder".into()
+                },
+                FooterItem::Context {
+                    label: "25.0% used".into(),
+                    over_limit: false,
+                },
+                FooterItem::Cost {
+                    label: "$0.42".into(),
+                },
+            ]
+        );
 
-    // The hint paints the verbatim qwen phrase.
-    #[test]
-    fn the_cycle_hint_reads_shift_tab_to_cycle() {
-        assert!(
-            StatusSegment::ApprovalModeHint
-                .paint()
-                .contains("(shift + tab to cycle)")
+        // Tighter (52): cost sheds (drops to 50), model + context survive.
+        let no_cost = footer_at(52);
+        assert_eq!(
+            no_cost.right,
+            vec![
+                FooterItem::Model {
+                    model: "qwen3-coder".into()
+                },
+                FooterItem::Context {
+                    label: "25.0% used".into(),
+                    over_limit: false,
+                },
+            ]
+        );
+
+        // Tightest: model sheds too, context% NEVER drops.
+        let context_only = footer_at(20);
+        assert_eq!(
+            context_only.right,
+            vec![FooterItem::Context {
+                label: "25.0% used".into(),
+                over_limit: false,
+            }]
         );
     }
 
-    // Each mode routes to its semantic colour role (plan → success/added,
-    // auto-edit/auto → warning/marker_aid, yolo → error).
     #[test]
-    fn approval_mode_segments_carry_their_mode_for_colour() {
+    fn the_footer_joins_the_right_group_with_a_grey_pipe_no_leading_sep() {
+        // No powerline separators anywhere; the ` | ` join is the ONLY chrome
+        // between items and there is none before the first.
+        let bar = footer_at(200);
+        assert!(!FOOTER_SEP.contains('\u{e0b0}'));
+        assert!(!FOOTER_SEP.contains('\u{e0b2}'));
+        assert_eq!(FOOTER_SEP, " | ");
+        // right_cells = texts + one join per adjacent pair.
+        let texts: usize = bar.right.iter().map(FooterItem::cells).sum();
+        assert_eq!(
+            bar.right_cells(),
+            texts + (bar.right.len() - 1) * FOOTER_SEP.chars().count()
+        );
+    }
+
+    #[test]
+    fn default_mode_shows_the_shortcuts_hint() {
+        let bar = footer_with_mode(ApprovalMode::Default);
+        assert_eq!(bar.left, FooterLeft::Shortcuts);
+    }
+
+    #[test]
+    fn each_non_default_mode_shows_the_autoaccept_label_and_hint() {
         for mode in [
             ApprovalMode::Plan,
             ApprovalMode::AutoEdit,
             ApprovalMode::Auto,
             ApprovalMode::Yolo,
         ] {
-            assert_eq!(
-                StatusSegment::ApprovalMode(mode).kind(),
-                SegmentKind::ApprovalMode(mode)
-            );
+            let bar = footer_with_mode(mode);
+            assert_eq!(bar.left, FooterLeft::AutoAccept(mode), "{mode:?}");
+            assert!(!approval_mode_label(mode).is_empty(), "{mode:?}");
         }
     }
 
-    // The COLOUR mapping (P2), not just the structural kind: each mode resolves
-    // to the right foreground Color through `segment_style` - Yolo→error,
-    // Plan→added (green), AutoEdit/Auto→marker_aid (yellow).
     #[test]
-    fn approval_mode_segment_style_resolves_the_right_colour_per_mode() {
+    fn the_autoaccept_labels_match_qwen_verbatim() {
+        assert_eq!(approval_mode_label(ApprovalMode::Plan), "plan mode");
+        assert_eq!(
+            approval_mode_label(ApprovalMode::AutoEdit),
+            "auto-accept edits"
+        );
+        assert_eq!(
+            approval_mode_label(ApprovalMode::Auto),
+            "auto mode (classifier-evaluated)"
+        );
+        assert_eq!(approval_mode_label(ApprovalMode::Yolo), "YOLO mode");
+        assert_eq!(approval_mode_label(ApprovalMode::Default), "");
+        assert_eq!(CYCLE_HINT, " (shift + tab to cycle)");
+        assert_eq!(SHORTCUTS_HINT, "? for shortcuts");
+    }
+
+    #[test]
+    fn the_autoaccept_label_colour_matches_the_mode() {
+        // plan → success, auto-edit/auto → warning, yolo → error (qwen).
         let theme = theme::dark();
-        let fg = |mode: ApprovalMode| segment_style(SegmentKind::ApprovalMode(mode), theme).fg;
-        assert_eq!(fg(ApprovalMode::Yolo), Some(tui_color(theme.error)));
-        assert_eq!(fg(ApprovalMode::Plan), Some(tui_color(theme.added)));
         assert_eq!(
-            fg(ApprovalMode::AutoEdit),
-            Some(tui_color(theme.marker_aid))
-        );
-        assert_eq!(fg(ApprovalMode::Auto), Some(tui_color(theme.marker_aid)));
-    }
-
-    #[test]
-    fn a_wide_bar_keeps_every_segment_in_order() {
-        let bar = bar_at(200);
-        assert_eq!(
-            kinds(&bar.left),
-            vec![
-                SegmentKind::ModeRunning,
-                SegmentKind::Connection,
-                SegmentKind::Model,
-            ]
+            approval_mode_style(ApprovalMode::Plan, theme).fg,
+            success_style(theme).fg
         );
         assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Compact,
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Cost,
-                SegmentKind::Position,
-            ]
+            approval_mode_style(ApprovalMode::AutoEdit, theme).fg,
+            warning_style(theme).fg
         );
-        assert!(bar.cells() <= 200);
-    }
-
-    #[test]
-    fn a_narrow_bar_drops_the_connection_then_the_model_segment() {
-        // At 66 cols the endpoint drops first (lowest value), then the model -
-        // both connection facts leave before mode/position/tokens/cost. (The
-        // threshold sits lower than it once did: collapsing the two toggles into
-        // one compact segment freed a segment's worth of columns, ADR-0052.)
-        let bar = bar_at(66);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Compact,
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Cost,
-                SegmentKind::Position,
-            ]
+            approval_mode_style(ApprovalMode::Auto, theme).fg,
+            warning_style(theme).fg
+        );
+        assert_eq!(
+            approval_mode_style(ApprovalMode::Yolo, theme).fg,
+            error_style(theme).fg
         );
     }
 
     #[test]
-    fn a_narrower_bar_drops_compact_then_cost_then_tokens() {
-        // At 45 cols the compact toggle is gone but the figures survive - cost
-        // outlives compact in the drop order.
-        let bar = bar_at(45);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Cost,
-                SegmentKind::Position,
-            ]
-        );
-
-        // At 30 cost drops next; tokens survive it (they carry the pressure
-        // level the operator steers by). The threshold sits lower than it once
-        // did because the mode block is now a 3-col dot, not a spelled word.
-        let bar = bar_at(30);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(
-            kinds(&bar.right),
-            vec![
-                SegmentKind::Tokens(PressureLevel::Ok),
-                SegmentKind::Position
-            ]
-        );
-
-        let bar = bar_at(20);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
-    }
-
-    #[test]
-    fn mode_and_position_survive_even_when_nothing_fits() {
-        // Dropping stops at the last two; a sub-minimal width never panics.
-        let bar = bar_at(1);
-        assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
-        assert_eq!(kinds(&bar.right), vec![SegmentKind::Position]);
-    }
-
-    /// Builds a wide idle bar at width 200 with the given toggles and no
-    /// figures. Shared by the thinking and tools toggle tests to avoid
-    /// near-identical closure bodies (DUPLICATE fix).
-    fn idle_wide_bar(toggles: Toggles) -> StatusBar {
-        status_bar(
+    fn the_cost_item_is_absent_at_zero_and_present_when_priced() {
+        let zero = footer(
             200,
-            StatusBarView {
-                status: Status::Idle,
+            FooterView {
                 conn: ConnectionView {
-                    base_url: "http://localhost:8080",
-                    model: "qwen/model",
+                    base_url: "u",
+                    model: "m",
                 },
-                toggles,
-                approval_mode: ApprovalMode::Default,
                 figures: no_figures(),
+                approval_mode: ApprovalMode::Default,
             },
-        )
-    }
-
-    #[test]
-    fn the_compact_segment_carries_the_ctrl_o_state() {
-        // The MEANING (compact true/false) is a semantic fact; the ▾/▸ marker
-        // it paints to is a drawing detail asserted separately below.
-        let find_compact = |compact: bool| {
-            idle_wide_bar(Toggles { compact })
+        );
+        assert!(
+            !zero
                 .right
-                .into_iter()
-                .find(|s| matches!(s, StatusSegment::Compact { .. }))
-                .expect("compact segment is always assembled")
-        };
-        assert_eq!(find_compact(true), StatusSegment::Compact { compact: true });
+                .iter()
+                .any(|i| matches!(i, FooterItem::Cost { .. }))
+        );
+
+        let priced = footer(
+            200,
+            FooterView {
+                conn: ConnectionView {
+                    base_url: "u",
+                    model: "m",
+                },
+                figures: FigureView {
+                    tokens: None,
+                    session_cost: 0.42,
+                    context_budget: None,
+                },
+                approval_mode: ApprovalMode::Default,
+            },
+        );
         assert_eq!(
-            find_compact(false),
-            StatusSegment::Compact { compact: false }
+            priced
+                .right
+                .iter()
+                .find(|i| matches!(i, FooterItem::Cost { .. })),
+            Some(&FooterItem::Cost {
+                label: "$0.42".into()
+            })
         );
     }
-
-    #[test]
-    fn the_compact_marker_paints_from_its_state() {
-        assert_eq!(
-            StatusSegment::Compact { compact: true }.paint(),
-            " ▾ compact "
-        );
-        assert_eq!(
-            StatusSegment::Compact { compact: false }.paint(),
-            " ▸ compact "
-        );
-    }
-
-    #[test]
-    fn the_tokens_segment_is_absent_until_an_estimate_exists() {
-        let bar = idle_wide_bar(Toggles::default());
-        assert_eq!(
-            kinds(&bar.right),
-            vec![SegmentKind::Compact, SegmentKind::Position]
-        );
-    }
-
-    // --- the cost segment (ADR-0037: surfacing the priced Session total) ---
 
     #[test]
     fn cost_label_shows_two_decimals_and_a_sub_cent_floor() {
-        // A cent and up: plain two decimals.
         assert_eq!(cost_label(0.42), "$0.42");
         assert_eq!(cost_label(0.01), "$0.01");
         assert_eq!(cost_label(12.3), "$12.30");
         assert_eq!(cost_label(1234.567), "$1234.57");
-        // Sub-cent: never "$0.00" - a priced Session must not read as free.
         assert_eq!(cost_label(0.0099), "<$0.01");
         assert_eq!(cost_label(0.0001), "<$0.01");
     }
 
     #[test]
-    fn a_zero_cost_session_shows_no_cost_segment() {
-        // The local-only invariant: zero total means the segment is absent
-        // entirely, not shown as $0.00 - the bar is exactly the old bar.
-        let bar = status_bar(
-            200,
-            StatusBarView {
-                status: Status::Idle,
-                conn: ConnectionView {
-                    base_url: "http://localhost:8080",
-                    model: "qwen/model",
-                },
-                toggles: Toggles::default(),
-                approval_mode: ApprovalMode::Default,
-                figures: tokens_only(TokenView {
-                    estimate: 1200,
-                    level: PressureLevel::Ok,
-                }),
-            },
-        );
-        assert!(
-            !kinds(&bar.right).contains(&SegmentKind::Cost),
-            "zero cost must hide the segment"
-        );
-    }
-
-    #[test]
-    fn a_positive_cost_assembles_the_labelled_segment() {
-        let bar = bar_at(200);
-        let cost = bar
-            .right
-            .iter()
-            .find(|s| matches!(s, StatusSegment::Cost { .. }))
-            .expect("cost segment present once a priced Response landed");
-        assert_eq!(
-            *cost,
-            StatusSegment::Cost {
-                label: "$0.42".into()
-            }
-        );
-        assert_eq!(cost.paint(), " $0.42 ");
-        assert_eq!(cost.cells(), " $0.42 ".chars().count());
-    }
-
-    /// Assembles a wide bar with the given `figures` and returns the tokens
-    /// segment. Shared by the pressure-level tests so the bar-build and segment
-    /// search chains do not repeat (DUPLICATE fix).
-    fn tokens_segment(figures: FigureView) -> StatusSegment {
-        status_bar(
-            200,
-            StatusBarView {
-                status: Status::Running,
-                conn: ConnectionView {
-                    base_url: "u",
-                    model: "qwen/model",
-                },
-                toggles: Toggles::default(),
-                approval_mode: ApprovalMode::Default,
-                figures,
-            },
-        )
-        .right
-        .into_iter()
-        .find(|s| matches!(s, StatusSegment::Tokens { .. }))
-        .expect("tokens segment present when an estimate exists")
-    }
-
-    #[test]
-    fn critical_pressure_yields_a_tokens_segment_carrying_that_level() {
-        // The "Critical Context Pressure renders red" rule, asserted headless:
-        // the semantic segment carries PressureLevel::Critical, and its kind
-        // routes exactly that level into segment_style (which maps it to red).
-        let tokens = tokens_segment(tokens_only(TokenView {
-            estimate: 99000,
-            level: PressureLevel::Critical,
-        }));
-        assert_eq!(
-            tokens,
-            StatusSegment::Tokens {
-                estimate: 99000,
-                level: PressureLevel::Critical,
-            }
-        );
-        assert_eq!(tokens.kind(), SegmentKind::Tokens(PressureLevel::Critical));
-    }
-
-    // --- context usage figure (ADR-0048) -------------------------------------
-
-    #[test]
-    fn context_percent_label_formats_the_ratio_and_labels_by_width() {
-        // Under a minute of budget: one decimal, `% used` at narrow width.
+    fn context_percent_label_formats_the_ratio_flat_and_labels_by_width() {
+        // FLAT now (no block padding, ADR-0053): the leading `%` is part of the
+        // label; `% used` under 100 cols, `% context used` at/above.
         assert_eq!(
             context_percent_label(2500, 10_000, 80).as_deref(),
-            Some(" 25.0% used ")
+            Some("25.0% used")
         );
-        // Wide terminal (>=100): the full `% context used` label.
         assert_eq!(
             context_percent_label(2500, 10_000, 120).as_deref(),
-            Some(" 25.0% context used ")
+            Some("25.0% context used")
         );
-        // Over the budget: `>100` (qwen `>1 -> ">100"`).
         assert_eq!(
             context_percent_label(15_000, 10_000, 120).as_deref(),
-            Some(" >100% context used ")
+            Some(">100% context used")
         );
-        // A zero (or missing) budget has no figure.
         assert_eq!(context_percent_label(2500, 0, 80), None);
     }
 
     #[test]
     fn context_over_limit_flags_usage_past_the_budget() {
-        assert!(!context_over_limit(9_999, 10_000));
+        assert!(!context_over_limit(2500, 10_000));
         assert!(!context_over_limit(10_000, 10_000));
         assert!(context_over_limit(10_001, 10_000));
-        assert!(!context_over_limit(5, 0));
+        assert!(!context_over_limit(1, 0));
     }
 
     #[test]
-    fn the_bar_carries_a_context_segment_beside_the_raw_tokens_when_a_budget_exists() {
-        let figures = FigureView {
-            tokens: Some(TokenView {
-                estimate: 2500,
-                level: PressureLevel::Ok,
-            }),
-            session_cost: 0.0,
-            context_budget: Some(10_000),
-        };
-        let right = status_bar(
-            200,
-            StatusBarView {
-                status: Status::Running,
+    fn the_footer_carries_a_context_item_only_when_a_budget_exists() {
+        let with_budget = footer(
+            120,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "u",
-                    model: "qwen/model",
+                    model: "m",
                 },
-                toggles: Toggles::default(),
+                figures: FigureView {
+                    tokens: Some(2500),
+                    session_cost: 0.0,
+                    context_budget: Some(10_000),
+                },
                 approval_mode: ApprovalMode::Default,
-                figures,
             },
-        )
-        .right;
-        // The raw token count SURVIVES beside the derived context figure.
-        assert!(
-            right
-                .iter()
-                .any(|s| matches!(s, StatusSegment::Tokens { .. }))
         );
-        let ctx = right
-            .iter()
-            .find(|s| matches!(s, StatusSegment::Context { .. }))
-            .expect("context segment present when a budget exists");
         assert_eq!(
-            *ctx,
-            StatusSegment::Context {
-                label: " 25.0% context used ".to_string(),
+            with_budget
+                .right
+                .iter()
+                .find(|i| matches!(i, FooterItem::Context { .. })),
+            Some(&FooterItem::Context {
+                label: "25.0% context used".into(),
                 over_limit: false,
-            }
+            })
         );
-        assert_eq!(ctx.kind(), SegmentKind::Context { over_limit: false });
-    }
 
-    #[test]
-    fn no_budget_means_no_context_segment() {
-        let figures = tokens_only(TokenView {
-            estimate: 2500,
-            level: PressureLevel::Ok,
-        });
-        let right = status_bar(
-            200,
-            StatusBarView {
-                status: Status::Running,
+        let no_budget = footer(
+            120,
+            FooterView {
                 conn: ConnectionView {
                     base_url: "u",
-                    model: "qwen/model",
+                    model: "m",
                 },
-                toggles: Toggles::default(),
+                figures: tokens_only(2500),
                 approval_mode: ApprovalMode::Default,
-                figures,
             },
-        )
-        .right;
+        );
         assert!(
-            !right
+            !no_budget
+                .right
                 .iter()
-                .any(|s| matches!(s, StatusSegment::Context { .. }))
+                .any(|i| matches!(i, FooterItem::Context { .. }))
         );
     }
 
     #[test]
-    fn every_pressure_level_flows_through_the_tokens_segment_unchanged() {
-        for level in [
-            PressureLevel::Ok,
-            PressureLevel::Elevated,
-            PressureLevel::Critical,
-        ] {
-            let tokens = tokens_segment(tokens_only(TokenView { estimate: 1, level }));
-            assert_eq!(tokens.kind(), SegmentKind::Tokens(level));
-        }
-    }
-
-    #[test]
-    fn the_mode_segment_carries_idle_vs_running_not_the_spinner_frame() {
-        // The semantic distinction is Idle vs. Running; the animation frame is
-        // a drawing input the assembly never sees.
-        let mode = |status| {
-            status_bar(
-                200,
-                StatusBarView {
-                    status,
-                    conn: ConnectionView {
-                        base_url: "u",
-                        model: "qwen/model",
-                    },
-                    toggles: Toggles::default(),
-                    approval_mode: ApprovalMode::Default,
-                    figures: no_figures(),
+    fn an_over_budget_context_item_flags_over_limit() {
+        let bar = footer(
+            120,
+            FooterView {
+                conn: ConnectionView {
+                    base_url: "u",
+                    model: "m",
                 },
-            )
-            .left
-            .into_iter()
-            .next()
-            .unwrap()
+                figures: FigureView {
+                    tokens: Some(15_000),
+                    session_cost: 0.0,
+                    context_budget: Some(10_000),
+                },
+                approval_mode: ApprovalMode::Default,
+            },
+        );
+        assert_eq!(
+            bar.right
+                .iter()
+                .find(|i| matches!(i, FooterItem::Context { .. })),
+            Some(&FooterItem::Context {
+                label: ">100% context used".into(),
+                over_limit: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_footer_item_cells_match_its_text() {
+        let item = FooterItem::Model {
+            model: "qwen3-coder".into(),
         };
-        assert_eq!(mode(Status::Idle), StatusSegment::Mode(ModeState::Idle));
-        assert_eq!(
-            mode(Status::Running),
-            StatusSegment::Mode(ModeState::Running)
-        );
-    }
-
-    #[test]
-    fn the_mode_segment_paints_a_static_dot_no_spinner() {
-        // The running animation moved to the `✦ Thinking` reasoning header;
-        // the mode block is now a static dot, and cells() agrees
-        // with paint() in both modes (the drift invariant).
-        for mode in [ModeState::Running, ModeState::Idle] {
-            let seg = StatusSegment::Mode(mode);
-            assert_eq!(
-                seg.cells(),
-                seg.paint().chars().count(),
-                "{seg:?} cells() disagrees with painted width"
-            );
-        }
-        assert_eq!(StatusSegment::Mode(ModeState::Running).paint(), " ● ");
-        assert_eq!(StatusSegment::Mode(ModeState::Idle).paint(), " ○ ");
-    }
-
-    #[test]
-    fn the_tokens_segment_paints_the_estimate_grouped() {
-        assert_eq!(
-            StatusSegment::Tokens {
-                estimate: 1200,
-                level: PressureLevel::Ok,
-            }
-            .paint(),
-            " ~1,200 tokens "
-        );
-    }
-
-    #[test]
-    fn the_tokens_segment_cells_match_its_paint() {
-        // The load-bearing fit invariant: cells() must equal the painted width,
-        // or the bar over/underflows.
-        let seg = StatusSegment::Tokens {
-            estimate: 1200,
-            level: PressureLevel::Ok,
-        };
-        assert_eq!(
-            seg.cells(),
-            seg.paint().chars().count(),
-            "{seg:?} cells() disagrees with painted width"
-        );
-    }
-
-    #[test]
-    fn painted_width_matches_the_fit_measurement() {
-        // The pure fit policy measures StatusSegment::cells; the painter draws
-        // StatusSegment::paint. If they drift, the bar over/underflows. Assert
-        // they agree for every segment the running-with-tokens bar assembles.
-        let bar = bar_at(200);
-        for segment in bar.left.iter().chain(&bar.right) {
-            assert_eq!(
-                segment.cells(),
-                segment.paint().chars().count(),
-                "{segment:?} cells() disagrees with painted width"
-            );
-        }
-    }
-
-    #[test]
-    fn every_segment_style_carries_a_bg_for_the_separators() {
-        // The powerline triangles are fg-over-neighbor-bg; a segment without
-        // a bg would render a hole in the bar.
-        for kind in [
-            SegmentKind::ModeIdle,
-            SegmentKind::ModeRunning,
-            SegmentKind::Connection,
-            SegmentKind::Model,
-            SegmentKind::Compact,
-            SegmentKind::Cost,
-            SegmentKind::Tokens(PressureLevel::Ok),
-            SegmentKind::Tokens(PressureLevel::Elevated),
-            SegmentKind::Tokens(PressureLevel::Critical),
-            SegmentKind::Position,
-        ] {
-            assert!(
-                segment_style(kind, theme::dark()).bg.is_some(),
-                "{kind:?} has no bg"
-            );
-        }
+        assert_eq!(item.cells(), item.text().chars().count());
+        assert_eq!(item.text(), "model qwen3-coder");
     }
 
     // -----------------------------------------------------------------------
@@ -6230,8 +5684,8 @@ mod tests {
         for (tone, glyph, expected) in [
             (Tone::Housekeeping, "● ", theme.muted),
             (Tone::Aid, "● ", theme.muted),
-            (Tone::Constrain, "△ ", theme.marker_aid),
-            (Tone::Steering, "● ", theme.prompt_gutter),
+            (Tone::Constrain, "△ ", theme.warning),
+            (Tone::Steering, "● ", theme.accent),
             (Tone::Plain, "● ", theme.muted),
         ] {
             let item = TranscriptItem::Marker {
@@ -7903,7 +7357,7 @@ mod tests {
             first_span_fg(&TranscriptItem::Assistant { text: "hi".into() }),
             accent_style(theme).fg
         );
-        // Info `●` is `text.primary` (primary_style - a Phase-7 gap, terminal default).
+        // Info `●` is `text.primary` (primary_style - the `foreground` slot, ADR-0008).
         assert_eq!(
             first_span_fg(&TranscriptItem::Info {
                 text: "note".into()
@@ -7919,6 +7373,28 @@ mod tests {
         );
         // And the roles are genuinely distinct where the slots differ: accent != grey.
         assert_ne!(accent_style(theme).fg, secondary_style(theme).fg);
+    }
+
+    #[test]
+    fn the_phase_7_role_helpers_read_their_dedicated_slots() {
+        // Phase 7 (ADR-0008/0053) carved four qwen roles into real slots; each
+        // helper now reads its OWN slot, no longer a borrowed neighbour. Pinned
+        // against the slot value (a hex the theme drift test also guards), so a
+        // regression to the old borrow surfaces here.
+        let theme = theme::dark();
+        assert_eq!(accent_style(theme).fg, Some(tui_color(theme.accent)));
+        assert_eq!(success_style(theme).fg, Some(tui_color(theme.success)));
+        assert_eq!(warning_style(theme).fg, Some(tui_color(theme.warning)));
+        assert_eq!(primary_style(theme).fg, Some(tui_color(theme.foreground)));
+        // Purple accent, lime success, gold warning, real foreground - the
+        // QwenDark hexes, and distinct from the slots they used to borrow.
+        assert_eq!(accent_style(theme).fg, Some(Color::Rgb(0xD2, 0xA6, 0xFF)));
+        assert_eq!(success_style(theme).fg, Some(Color::Rgb(0xAA, 0xD9, 0x4C)));
+        assert_eq!(warning_style(theme).fg, Some(Color::Rgb(0xFF, 0xD7, 0x00)));
+        assert_eq!(primary_style(theme).fg, Some(Color::Rgb(0xbf, 0xbd, 0xb6)));
+        assert_ne!(accent_style(theme).fg, Some(tui_color(theme.prompt_gutter)));
+        assert_ne!(success_style(theme).fg, Some(tui_color(theme.added)));
+        assert_ne!(warning_style(theme).fg, Some(tui_color(theme.marker_aid)));
     }
 
     // --- render_pending (ADR-0046): bottom-anchor + top-clip -----------------
@@ -8264,7 +7740,7 @@ mod tests {
             't',
             "no gutter before the label"
         );
-        let accent = tui_color(theme::dark().prompt_gutter);
+        let accent = tui_color(theme::dark().accent);
         let secondary = tui_color(theme::dark().muted);
         assert_eq!(cell_fg(&terminal, 2, 8), Some(accent), "active row accent");
         assert_eq!(

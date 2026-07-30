@@ -2469,7 +2469,7 @@ mod tests {
             "frame 1: the greeting is in scrollback:\n{scrollback}"
         );
 
-        // (b) The live viewport already shows the composer placeholder AND status
+        // (b) The live viewport already shows the composer placeholder AND footer
         // content on frame 1 - no keypress needed.
         let viewport = buffer_text(&terminal);
         assert!(
@@ -2477,8 +2477,8 @@ mod tests {
             "frame 1: the composer placeholder is drawn:\n{viewport}"
         );
         assert!(
-            viewport.contains("model · m") && viewport.contains("Bot"),
-            "frame 1: the status bar (model fact + position segment) is drawn:\n{viewport}"
+            viewport.contains("model m") && viewport.contains("? for shortcuts"),
+            "frame 1: the flat footer (model fact + shortcuts hint) is drawn:\n{viewport}"
         );
         // The greeting is NOT re-drawn in the pending region (it is committed).
         assert!(

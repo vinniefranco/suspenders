@@ -27,6 +27,7 @@
 //!   (falling back to `dark` with a notice) is the caller's job.
 
 pub mod active;
+pub mod color;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -35,105 +36,7 @@ use serde::Deserialize;
 use syntect::highlighting::ThemeSet;
 
 pub use active::ActiveTheme;
-
-// ---------------------------------------------------------------------------
-// Color - this module's own, ratatui-free (ADR-0019).
-// ---------------------------------------------------------------------------
-
-/// A Theme color: one of the 16 ANSI names (drawn from the user's terminal
-/// palette) or a truecolor RGB value. Mirrors the terminal color model without
-/// importing it - `ui::components` translates at the presentation boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Color {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    Gray,
-    DarkGray,
-    LightRed,
-    LightGreen,
-    LightYellow,
-    LightBlue,
-    LightMagenta,
-    LightCyan,
-    White,
-    Rgb(u8, u8, u8),
-}
-
-/// The accepted ANSI-16 names, for the rejection message.
-const ANSI_NAMES: &str = "black, red, green, yellow, blue, magenta, cyan, gray, dark_gray, \
-     light_red, light_green, light_yellow, light_blue, light_magenta, light_cyan, white";
-
-impl std::str::FromStr for Color {
-    type Err = String;
-
-    /// Parses `#rrggbb` (case-insensitive hex) or an ANSI-16 snake_case name;
-    /// anything else is rejected with the full accepted vocabulary.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.starts_with('#') {
-            return parse_hex(s);
-        }
-        ansi_by_name(s).ok_or_else(|| {
-            format!("\"{s}\" is not a color: expected \"#rrggbb\" or an ANSI name ({ANSI_NAMES})")
-        })
-    }
-}
-
-/// The `#rrggbb` hex format requires exactly this many ASCII hex digit characters.
-const HEX_DIGIT_COUNT: usize = 6;
-/// Bit shift to extract the red byte from a packed `0xRRGGBB` value.
-const RED_SHIFT: u32 = 16;
-/// Bit shift to extract the green byte from a packed `0xRRGGBB` value.
-const GREEN_SHIFT: u32 = 8;
-/// Radix for hexadecimal parsing.
-const HEX_RADIX: u32 = 16;
-
-/// Parses a `#`-prefixed hex color; exactly six ASCII hex digits or rejection.
-/// The digit check is explicit because `from_str_radix` alone accepts a
-/// leading sign ("+12345" would sneak through a pairwise parse).
-fn parse_hex(s: &str) -> Result<Color, String> {
-    let digits = s.strip_prefix('#').unwrap_or(s);
-    if digits.len() == HEX_DIGIT_COUNT && digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let rgb = u32::from_str_radix(digits, HEX_RADIX)
-            .map_err(|e| format!("\"{s}\" is not a valid hex color: {e}"))?;
-        return Ok(Color::Rgb(
-            (rgb >> RED_SHIFT) as u8,
-            (rgb >> GREEN_SHIFT) as u8,
-            rgb as u8,
-        ));
-    }
-    Err(format!(
-        "\"{s}\" is not a valid hex color: expected \"#rrggbb\""
-    ))
-}
-
-/// The ANSI-16 name table: snake_case, mirroring the terminal palette's
-/// conventional names. Exact match - strictness keeps typos loud (ADR-0038).
-fn ansi_by_name(name: &str) -> Option<Color> {
-    match name {
-        "black" => Some(Color::Black),
-        "red" => Some(Color::Red),
-        "green" => Some(Color::Green),
-        "yellow" => Some(Color::Yellow),
-        "blue" => Some(Color::Blue),
-        "magenta" => Some(Color::Magenta),
-        "cyan" => Some(Color::Cyan),
-        "gray" => Some(Color::Gray),
-        "dark_gray" => Some(Color::DarkGray),
-        "light_red" => Some(Color::LightRed),
-        "light_green" => Some(Color::LightGreen),
-        "light_yellow" => Some(Color::LightYellow),
-        "light_blue" => Some(Color::LightBlue),
-        "light_magenta" => Some(Color::LightMagenta),
-        "light_cyan" => Some(Color::LightCyan),
-        "white" => Some(Color::White),
-        _ => None,
-    }
-}
+pub use color::Color;
 
 // ---------------------------------------------------------------------------
 // The error - one human-readable reason, shown verbatim by /theme.
@@ -269,6 +172,18 @@ theme_slots! {
     machinery,
     /// Error lines and failure notices.
     error,
+    /// qwen `text.primary` (Foreground `#bfbdb6`, Phase 7, ADR-0008): body/info
+    /// text and tool names - the pinned default reading colour.
+    foreground,
+    /// qwen `text.accent` (AccentPurple `#D2A6FF`, Phase 7, ADR-0008): the user
+    /// `>` caret and the assistant `✦` marker.
+    accent,
+    /// qwen `status.success` (AccentGreen `#AAD94C`, Phase 7, ADR-0008): the `✓`
+    /// success prefix and the `✓`/`o` tool markers.
+    success,
+    /// qwen `status.warning` (AccentYellow `#FFD700`, Phase 7, ADR-0008): the `△`
+    /// warning prefix and a pending tool-group border.
+    warning,
     /// Settled/streaming thinking lines (grey; hidden under compact mode, Ctrl+O).
     thinking,
     /// The live `✦ Thinking` header over the streaming reasoning tail
@@ -277,7 +192,7 @@ theme_slots! {
     /// The lull "waiting" animation + its elapsed timer (the spellcast scenes):
     /// quiet chrome under the running lane, so it reads muted by default. Named
     /// for the lull it fills - a quiet stretch WITHIN a running Run, distinct
-    /// from the Agent being Idle (the `segment_idle_*` slots).
+    /// from the Agent being Idle.
     lull,
     /// The `>` gutter marking the user's own prompts.
     prompt_gutter,
@@ -310,37 +225,6 @@ theme_slots! {
     code_block_bg,
     /// The Composer popup and modal border.
     popup_border,
-    /// The powerline status bar's base background.
-    bar_bg,
-    /// The shared quiet background of the low-emphasis segments
-    /// (thinking/tools toggles, cost, tokens at Ok pressure).
-    segment_muted_bg,
-    /// The idle status segment's text.
-    segment_idle_fg,
-    /// The idle status segment's block.
-    segment_idle_bg,
-    /// The running status segment's text.
-    segment_running_fg,
-    /// The running status segment's block.
-    segment_running_bg,
-    /// The model segment's text.
-    segment_model_fg,
-    /// The model segment's block.
-    segment_model_bg,
-    /// The thinking/tools toggle segments' text.
-    segment_toggle_fg,
-    /// The session-cost segment's text.
-    segment_cost_fg,
-    /// The tokens segment's text at Ok pressure.
-    pressure_ok_fg,
-    /// The tokens segment's text at Elevated pressure.
-    pressure_elevated_fg,
-    /// The tokens segment's block at Elevated pressure.
-    pressure_elevated_bg,
-    /// The tokens segment's text at Critical pressure.
-    pressure_critical_fg,
-    /// The tokens segment's block at Critical pressure.
-    pressure_critical_bg,
 }
 
 /// One stated slot value as a [`Color`]; a bad value's reason names the slot.
@@ -577,67 +461,7 @@ mod tests {
         assert_eq!(err, ThemeError::Invalid("missing slot \"syntax\"".into()));
     }
 
-    // --- Color parsing ------------------------------------------------------
-
-    #[test]
-    fn every_ansi_16_name_parses_to_its_variant() {
-        let names: [(&str, Color); 16] = [
-            ("black", Color::Black),
-            ("red", Color::Red),
-            ("green", Color::Green),
-            ("yellow", Color::Yellow),
-            ("blue", Color::Blue),
-            ("magenta", Color::Magenta),
-            ("cyan", Color::Cyan),
-            ("gray", Color::Gray),
-            ("dark_gray", Color::DarkGray),
-            ("light_red", Color::LightRed),
-            ("light_green", Color::LightGreen),
-            ("light_yellow", Color::LightYellow),
-            ("light_blue", Color::LightBlue),
-            ("light_magenta", Color::LightMagenta),
-            ("light_cyan", Color::LightCyan),
-            ("white", Color::White),
-        ];
-        for (name, expected) in names {
-            assert_eq!(name.parse(), Ok(expected), "{name}");
-        }
-    }
-
-    #[test]
-    fn hex_parses_case_insensitively() {
-        assert_eq!("#b9d7b4".parse(), Ok(Color::Rgb(185, 215, 180)));
-        assert_eq!("#B9D7B4".parse(), Ok(Color::Rgb(185, 215, 180)));
-        assert_eq!("#000000".parse(), Ok(Color::Rgb(0, 0, 0)));
-        assert_eq!("#FFffFF".parse(), Ok(Color::Rgb(255, 255, 255)));
-    }
-
-    #[test]
-    fn bad_hex_is_rejected_with_the_expected_shape() {
-        // "#+1+2+3" and "#-0-0-0" pin the from_str_radix sign hazard: a
-        // pairwise u8 parse accepts "+1" as 1, so these MUST reject.
-        for bad in [
-            "#12345", "#1234567", "#12345g", "#", "#ééé", "#+1+2+3", "#-0-0-0",
-        ] {
-            let err = bad.parse::<Color>().unwrap_err();
-            assert_eq!(
-                err,
-                format!("\"{bad}\" is not a valid hex color: expected \"#rrggbb\"")
-            );
-        }
-    }
-
-    #[test]
-    fn an_unknown_name_is_rejected_listing_the_vocabulary() {
-        let err = "mauve".parse::<Color>().unwrap_err();
-        assert!(err.contains("\"mauve\" is not a color"), "{err}");
-        assert!(err.contains("#rrggbb"), "{err}");
-        assert!(err.contains("dark_gray"), "the full name list is in: {err}");
-        // Names are exact: no case-folding, no hyphens (strictness, ADR-0038).
-        assert!("Cyan".parse::<Color>().is_err());
-        assert!("dark-gray".parse::<Color>().is_err());
-        assert!("".parse::<Color>().is_err());
-    }
+    // --- Color parsing lives in the `color` leaf's own tests. ---------------
 
     // --- SparseTheme::parse (strict per-file, ADR-0038) ---------------------
 
@@ -766,6 +590,11 @@ mod tests {
         assert_eq!(theme.muted, Color::DarkGray);
         assert_eq!(theme.machinery, Color::DarkGray);
         assert_eq!(theme.error, Color::Red);
+        // The Phase 7 qwen roles (ADR-0008): the designed QwenDark hexes.
+        assert_eq!(theme.foreground, Color::Rgb(0xbf, 0xbd, 0xb6));
+        assert_eq!(theme.accent, Color::Rgb(0xD2, 0xA6, 0xFF));
+        assert_eq!(theme.success, Color::Rgb(0xAA, 0xD9, 0x4C));
+        assert_eq!(theme.warning, Color::Rgb(0xFF, 0xD7, 0x00));
         assert_eq!(theme.thinking, Color::DarkGray);
         assert_eq!(theme.thinking_header, Color::DarkGray);
         assert_eq!(theme.prompt_gutter, Color::Cyan);
@@ -781,21 +610,6 @@ mod tests {
         assert_eq!(theme.code_block, Color::Rgb(185, 215, 180));
         assert_eq!(theme.code_block_bg, Color::Rgb(25, 25, 35));
         assert_eq!(theme.popup_border, Color::Cyan);
-        assert_eq!(theme.bar_bg, Color::Rgb(30, 30, 40));
-        assert_eq!(theme.segment_muted_bg, Color::Rgb(40, 44, 58));
-        assert_eq!(theme.segment_idle_fg, Color::Black);
-        assert_eq!(theme.segment_idle_bg, Color::Green);
-        assert_eq!(theme.segment_running_fg, Color::Black);
-        assert_eq!(theme.segment_running_bg, Color::Yellow);
-        assert_eq!(theme.segment_model_fg, Color::Rgb(150, 160, 185));
-        assert_eq!(theme.segment_model_bg, Color::Rgb(52, 58, 82));
-        assert_eq!(theme.segment_toggle_fg, Color::DarkGray);
-        assert_eq!(theme.segment_cost_fg, Color::Gray);
-        assert_eq!(theme.pressure_ok_fg, Color::Gray);
-        assert_eq!(theme.pressure_elevated_fg, Color::Black);
-        assert_eq!(theme.pressure_elevated_bg, Color::Yellow);
-        assert_eq!(theme.pressure_critical_fg, Color::Black);
-        assert_eq!(theme.pressure_critical_bg, Color::Red);
     }
 
     #[test]
@@ -809,7 +623,34 @@ mod tests {
             .expect("light states every slot");
         assert_eq!(theme, *light());
         assert_eq!(theme.syntax, "base16-ocean.light");
-        assert_ne!(theme.bar_bg, dark().bar_bg, "light is its own polarity");
+        assert_ne!(
+            theme.code_block_bg,
+            dark().code_block_bg,
+            "light is its own polarity"
+        );
+        // The Phase 7 qwen roles take light-polarity counterparts (ADR-0008),
+        // distinct from QwenDark's bright hues.
+        assert_eq!(theme.foreground, Color::Rgb(0x24, 0x29, 0x2f));
+        assert_eq!(theme.accent, Color::Rgb(0x88, 0x39, 0xef));
+        assert_eq!(theme.success, Color::Rgb(0x1a, 0x7f, 0x37));
+        assert_eq!(theme.warning, Color::Rgb(0x9a, 0x67, 0x00));
+        assert_ne!(
+            theme.accent,
+            dark().accent,
+            "light accent is its own polarity"
+        );
+    }
+
+    #[test]
+    fn the_phase_7_qwen_roles_parse_to_their_designed_hexes() {
+        // The four semantic slots carved in Phase 7 (ADR-0008) enter as HEX,
+        // not legacy ANSI - so a drift in either toml is caught right here at
+        // the slot boundary.
+        let dark = dark();
+        assert_eq!(dark.foreground, Color::Rgb(0xbf, 0xbd, 0xb6));
+        assert_eq!(dark.accent, Color::Rgb(0xD2, 0xA6, 0xFF));
+        assert_eq!(dark.success, Color::Rgb(0xAA, 0xD9, 0x4C));
+        assert_eq!(dark.warning, Color::Rgb(0xFF, 0xD7, 0x00));
     }
 
     #[test]

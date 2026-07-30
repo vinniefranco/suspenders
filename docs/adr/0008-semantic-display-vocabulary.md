@@ -87,3 +87,20 @@ shape is clearer than one generic item stretched thin, given how few rich shapes
 exist and how much structure each needs. The fold/collapse machinery keys on the
 semantic `has_foldable_body`/`fold_title` predicates, not on a concrete variant,
 so a new rich item folds without touching the fold rule.
+
+## Amendment (ADR-0053, Phase 7): distinct accent/success/warning roles, a real foreground
+
+The flat-footer port (ADR-0053) reconciled four colour roles that this
+vocabulary had been letting borrow a neighbour. `primary_style` now carries a
+REAL foreground (qwen `text.primary` `#bfbdb6`) instead of the terminal default,
+so body text, info bodies, and tool names match QwenDark on any background - the
+highest-visibility change in the phase. `accent_style` reads a dedicated `accent`
+slot (qwen `text.accent` purple: the user `>` caret and the assistant `✦` marker)
+rather than the cyan `prompt_gutter` it once shared. `success_style` reads a
+dedicated `success` slot (qwen `status.success` lime: the `✓` prefix and the
+`✓`/`o` tool markers) rather than the diff `added` green. `warning_style` reads a
+dedicated `warning` slot (qwen `status.warning` gold: the `△` prefix and a pending
+tool-group border) rather than the warm amber `marker_aid`. `error` was already a
+clean distinct role; `text.secondary`/`ui.symbol`/`border.default` still share the
+neutral gray `muted` slot by design (three names, one neutral). The four new slots
+enter the ADR-0038 schema as hex - see that ADR's Phase-7 amendment.

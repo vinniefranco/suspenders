@@ -11,7 +11,7 @@ themes ship day one - the file format is the feature, not a later add.
 
 **Keys are the semantic slots themselves, sparse.** A theme's `[colors]` table
 names the app's own slots (~20: `added`, `removed`, `heading`, `code_block_bg`,
-`bar_bg`, the status-bar segment pairs, ...), not a base16-style abstract
+`popup_border`, `prompt_gutter`, ...), not a base16-style abstract
 palette. Unstated keys fall back to the built-in default, so a three-line theme
 is valid. Base16 roles were rejected: portable, but a user cannot retune one
 slot without moving a role everywhere it is used, and the mapping from role to
@@ -78,3 +78,26 @@ unchanged; only its INPUT repoints from `Selector::highlight` to the dialog's
 active row (`Composer::selector_highlight`). Moving the highlight still previews
 that theme live, Enter keeps + persists it, Escape reverts - the revert still
 falls out of the per-frame derivation, not a new state machine.
+
+## Amendment (ADR-0053, Phase 7): four qwen roles added, powerline slots removed
+
+The flat-footer port carved four qwen semantic roles that used to BORROW a
+neighbouring slot into slots of their own, entering as designed HEX (QwenDark
+hues, not legacy ANSI): `foreground` (`text.primary` `#bfbdb6`, was the terminal
+default), `accent` (`text.accent` `#D2A6FF`, was the cyan `prompt_gutter`),
+`success` (`status.success` `#AAD94C`, was the diff `added` green), and `warning`
+(`status.warning` `#FFD700`, was the warm amber `marker_aid`). All four are stated
+in BOTH tomls - `dark.toml` (the total fallback floor) as the QwenDark hexes and
+`light.toml` as light-polarity counterparts (`#24292f`/`#8839ef`/`#1a7f37`/
+`#9a6700`). The totality/drift tests and a new roles-parse-to-their-hexes test
+pin them, so a drift in either toml is caught at the slot boundary.
+
+The powerline colour slots (`bar_bg`, `segment_muted_bg`, and the
+`segment_*`/`pressure_*` family) are GONE: the flat footer reads none of them,
+so they were removed outright from the schema and both tomls (ADR-0053). This is
+a deliberate, one-time schema shrink accompanying the powerline's deletion - the
+total-floor contract holds over the REMAINING slots, and `dark.toml`/`light.toml`
+still state every one of them, pinned by the totality/drift tests. Adding the
+four qwen roles was the routine growth this ADR anticipates; dropping the dead
+powerline slots keeps the schema honest rather than carrying colours nothing can
+ever paint.
