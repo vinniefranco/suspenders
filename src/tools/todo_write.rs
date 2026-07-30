@@ -277,11 +277,7 @@ mod tests {
     use super::*;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            root: std::path::PathBuf::from("/nowhere"),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(std::path::PathBuf::from("/nowhere"), 10_000)
     }
 
     async fn run(input: Value) -> Result<String, String> {

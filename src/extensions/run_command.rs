@@ -132,11 +132,7 @@ mod tests {
     use serde_json::json;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            root: "/nowhere".into(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test("/nowhere".into(), 10_000)
     }
 
     fn token_with(tool: &str, content: &str, is_error: bool) -> Token {

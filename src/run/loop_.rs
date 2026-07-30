@@ -241,15 +241,23 @@ async fn complete_and_emit<D: RunDeps>(
 }
 
 // Returns `Ok((request, conversation))` (Compaction may have rewritten the
-// Conversation) or `Err(())` for context-budget exhaustion. The FULL Tool
-// registry rides every request - there is no per-Pass narrowing.
+// Conversation) or `Err(())` for context-budget exhaustion. The wire tool list
+// is the Run Registry's reveal-aware projection (ADR-0054): every non-deferred
+// tool plus any deferred tool the model has surfaced via `tool_search` this
+// Run. There is no per-Pass narrowing beyond that reveal gate.
 async fn build_request<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Result<(LlmRequest, Conversation), ()> {
     match conversation.for_request() {
         Ok(req) => {
-            let request = LlmRequest::new(req.system, req.messages, crate::tools::specs());
+            // The reveal-aware wire list off the Run's Tool Registry: deferred
+            // tools the model has surfaced via `tool_search` this Run join the
+            // list here, on the very next request. (agent.rs's overhead estimate
+            // uses the BASE `tools::specs()` instead - reveals add token cost on
+            // demand that the one-time estimate does not pre-count, matching
+            // qwen. Don't "fix" that to read this list.)
+            let request = LlmRequest::new(req.system, req.messages, state.tool_ctx.registry.specs());
             Ok((request, conversation))
         }
         Err(_) => {

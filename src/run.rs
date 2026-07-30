@@ -53,9 +53,17 @@ pub async fn run(
     // Diff extension; the test config carries `[]`.
     let extensions = extensions::configured(&session.extensions);
 
-    // The Tool ctx: the Session's Root and timeout plus the Result Cap derived
-    // from this Run's captured Model (ADR-0037).
-    let tool_ctx = session.tool_ctx(&capture.model);
+    // The Tool Registry, built once per Run (F3). Reveals are Run-scoped: a
+    // fresh registry per Run resets them, matching qwen's
+    // clearRevealedDeferredTools on session reset. It rides the Tool ctx so
+    // `tool_search` can reveal deferred tools into the next request's wire list.
+    let registry = std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(
+        crate::tools::tools(),
+    ));
+
+    // The Tool ctx: the Session's Root and timeout, the Result Cap derived from
+    // this Run's captured Model (ADR-0037), and the Run's Tool Registry.
+    let tool_ctx = session.tool_ctx(&capture.model, registry);
 
     loop_::run(
         conversation,

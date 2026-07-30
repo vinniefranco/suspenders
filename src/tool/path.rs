@@ -297,11 +297,7 @@ mod tests {
         }
 
         fn ctx(&self) -> ToolCtx {
-            ToolCtx {
-                root: self.path.clone(),
-                result_cap: 4000,
-                command_timeout_ms: 120_000,
-            }
+            ToolCtx::for_test(self.path.clone(), 4000)
         }
     }
 

@@ -287,6 +287,18 @@ impl AgentHandle {
         // Run finishes on the Model it captured.
         let model = session.model.clone();
 
+        // Append the Deferred Tools section to the system prompt (F3): the model
+        // needs to know which tools exist off the wire list so it can reach them
+        // via `tool_search`. The summary is static across reveals (reveal only
+        // moves a name onto the wire list, it does not change what is *deferred*),
+        // so it is computed once here. For P1a nothing is deferred, so this is a
+        // no-op empty append; the machinery is here for the phases that flip
+        // `should_defer`. INTERIM SEAM: F5 will eventually own prompt-section
+        // composition.
+        let deferred = tools::deferred_summary();
+        let system_prompt =
+            format!("{system_prompt}{}", crate::context_files::deferred_tools_section(&deferred));
+
         // The budget figures derive from the launch Model here and are
         // re-derived from the captured Model at every Run start (ADR-0037,
         // `reset_run_state`).

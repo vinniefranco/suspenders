@@ -181,11 +181,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx(root: &Path) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), 10_000)
     }
 
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {

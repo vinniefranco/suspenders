@@ -372,11 +372,7 @@ mod tests {
 
     // ---- Test ctx: root "/nowhere", result_cap 10_000 ----
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            root: "/nowhere".into(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test("/nowhere".into(), 10_000)
     }
 
     fn ctx_with_cap(cap: usize) -> ToolCtx {

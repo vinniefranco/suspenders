@@ -47,15 +47,55 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
     async fn run(&self, input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, String>;
+
+    /// When true, the tool is hidden from the wire list the model sees at the
+    /// start of a Run - it is discovered on demand via `tool_search`, which
+    /// reveals its full schema into the next request. qwen carries `shouldDefer`
+    /// as a constructor field; Suspenders' tools are unit structs, so the flag
+    /// rides a default-provided trait method instead (behaviourally identical).
+    fn should_defer(&self) -> bool {
+        false
+    }
+
+    /// When true, the tool stays in the wire list even where deferral is the
+    /// default. Used for meta tools like `tool_search` itself. Mirrors qwen's
+    /// `alwaysLoad`.
+    fn always_load(&self) -> bool {
+        false
+    }
+
+    /// Optional space-separated keywords `tool_search`'s keyword scoring folds
+    /// in alongside the tool's name and description. Mirrors qwen's `searchHint`.
+    fn search_hint(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The ctx every Tool Call executes with: the Session's Project Root, the
-/// Result Cap, and the command timeout.
+/// Result Cap, the command timeout, and the [`ToolRegistry`] the Run built
+/// once at its start. `tool_search` reaches through the registry to reveal
+/// deferred tools; every other tool ignores it.
 #[derive(Clone, Debug)]
 pub struct ToolCtx {
     pub root: PathBuf,
     pub result_cap: usize,
     pub command_timeout_ms: u64,
+    pub registry: std::sync::Arc<crate::tool_registry::ToolRegistry>,
+}
+
+#[cfg(test)]
+impl ToolCtx {
+    /// A ctx over the full built-in tool registry, for tests. The single test
+    /// construction site, so a future ctx field (F1) touches one place rather
+    /// than every tool test helper.
+    pub fn for_test(root: PathBuf, result_cap: usize) -> ToolCtx {
+        ToolCtx {
+            root,
+            result_cap,
+            command_timeout_ms: 120_000,
+            registry: crate::tool_registry::test_registry(),
+        }
+    }
 }
 
 /// Validates the model-supplied input against a tool's JSON Schema. Returns

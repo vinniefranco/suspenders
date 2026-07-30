@@ -13,10 +13,11 @@ pub mod read_file;
 pub mod run_command;
 pub mod shaping;
 pub mod todo_write;
+pub mod tool_search;
 pub mod web_fetch;
 pub mod write_file;
 
-use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::Value;
 
 /// A Tool Result: the content that enters the Conversation and whether it was
@@ -27,10 +28,13 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-// The registry, in prompt order. The todo_write Tool leads so a small model
-// sees it first and records its task list early (CONTEXT.md: Plan). Boxed trait
-// objects so the async `run` stays object-safe (async-trait).
-fn tools() -> Vec<Box<dyn Tool>> {
+// The registry builder, in prompt order. The todo_write Tool leads so a small
+// model sees it first and records its task list early (CONTEXT.md: Plan). The
+// tool_search Tool trails: it is the on-demand discovery seam and is always on
+// the wire list (`always_load`). Boxed trait objects so the async `run` stays
+// object-safe (async-trait). `pub(crate)` because the ToolRegistry is the one
+// that owns this set at runtime; only the Run builds it.
+pub(crate) fn tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(todo_write::TodoWriteTool),
         Box::new(read_file::ReadFile),
@@ -41,58 +45,52 @@ fn tools() -> Vec<Box<dyn Tool>> {
         Box::new(write_file::WriteFile),
         Box::new(run_command::RunCommand),
         Box::new(web_fetch::WebFetch),
+        Box::new(tool_search::ToolSearch),
     ]
 }
 
-/// All tool specs, in prompt order.
+/// The BASE (non-revealed) wire list, in prompt order: every tool EXCEPT
+/// deferred, non-always-load tools (which the model discovers on demand via
+/// `tool_search`). Used for the Agent's one-time tool-spec overhead estimate,
+/// where zero tools are revealed - the wire list a request would carry at Run
+/// start. The Run's live, reveal-aware list comes off the `ToolRegistry`.
 pub fn specs() -> Vec<ToolSpec> {
-    tools().iter().map(|t| t.spec()).collect()
+    tools()
+        .iter()
+        .filter(|t| !(t.should_defer() && !t.always_load()))
+        .map(|t| t.spec())
+        .collect()
+}
+
+/// The `{name, description}` summary of every built-in tool the model must
+/// discover on demand (deferred, non-always-load), sorted by name. Feeds the
+/// "Deferred Tools" system-prompt section, computed once at Run launch. Empty
+/// until a later phase flips `should_defer`.
+///
+/// Sources the built-in set only. F8 (MCP) makes the deferred set
+/// instance-dependent - MCP tools register on a specific [`ToolRegistry`] and
+/// are all deferred - so once MCP lands this section must be sourced from the
+/// Run's live registry instead. The single-line throwaway build here is the
+/// interim: it owns the same summary logic the live registry would report.
+pub fn deferred_summary() -> Vec<(String, String)> {
+    crate::tool_registry::ToolRegistry::new(tools()).deferred_summary()
 }
 
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
-/// result to the Result Cap: the extension-free dispatch path.
+/// result to the Result Cap: the extension-free dispatch path. Delegates
+/// validation + dispatch to the Run's [`ToolRegistry`] (on the ctx).
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     let mut result = execute(name, input, ctx).await;
     result.content = shaping::shape(name, input, &result.content, ctx.result_cap);
     result
 }
 
-/// Runs the named tool WITHOUT Shaping - the raw result. Input is validated
-/// against the tool's JSON Schema before execution; an unknown tool name and an
-/// `Err` return both come back as `is_error` results.
+/// Runs the named tool WITHOUT Shaping - the raw result. A thin delegator to
+/// the ctx's [`ToolRegistry::execute`], which validates the input against the
+/// tool's JSON Schema before dispatch; an unknown tool name and an `Err` return
+/// both come back as `is_error` results.
 pub async fn execute(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
-    let all = tools();
-    let tool = match all.iter().find(|t| t.spec().name == name) {
-        Some(t) => t,
-        None => {
-            return ToolResult {
-                content: format!("unknown tool: {name:?}"),
-                is_error: true,
-            };
-        }
-    };
-
-    // Validate against the tool's own schema before dispatch. The empty-map
-    // case is handled by using an empty object when input is not an object.
-    let empty = serde_json::Map::new();
-    let input_map = input.as_object().unwrap_or(&empty);
-    if let Err(reason) = validate(&tool.spec().input_schema, input_map) {
-        return ToolResult {
-            content: reason,
-            is_error: true,
-        };
-    }
-
-    match tool.run(input, ctx).await {
-        Ok(content) => ToolResult {
-            content,
-            is_error: false,
-        },
-        Err(reason) => ToolResult {
-            content: reason,
-            is_error: true,
-        },
-    }
+    ctx.registry.execute(name, input, ctx).await
 }
 
 #[cfg(test)]
@@ -111,21 +109,18 @@ mod tests {
         "write_file",
         "run_command",
         "web_fetch",
+        "tool_search",
     ];
 
     fn ctx(root: &std::path::Path, cap: usize) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: cap,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), cap)
     }
 
     // ---- all/specs ----
 
     #[test]
     fn returns_every_tool_in_prompt_order_todo_write_first() {
-        assert_eq!(tools().len(), 9);
+        assert_eq!(tools().len(), 10);
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
     }
@@ -134,6 +129,16 @@ mod tests {
     fn specs_returns_one_spec_per_tool_in_registry_order() {
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
+    }
+
+    #[test]
+    fn deferred_append_is_a_no_op_for_the_builtin_set() {
+        // P1a defers nothing, so the Agent's Deferred Tools append
+        // (`deferred_tools_section(&deferred_summary())`) must add nothing to
+        // the system prompt. Proves the seam is inert until a phase flips
+        // `should_defer`.
+        assert!(deferred_summary().is_empty());
+        assert!(crate::context_files::deferred_tools_section(&deferred_summary()).is_empty());
     }
 
     #[test]
