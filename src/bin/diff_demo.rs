@@ -113,11 +113,11 @@ impl Demo {
     fn handle(mut self, key: KeyEvent) -> (Self, Flow) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return (self, Flow::Quit),
-            // `o` mirrors the app's Ctrl-O tool toggle: it collapses each Diff to
+            // `o` mirrors the app's Ctrl-O compact toggle: it folds each Diff to
             // its one-line title. The fold produces no Effect we must act on here
             // (no Agent to drive), so the returned effects are dropped.
             KeyCode::Char('o') => {
-                let (screen, _effects) = self.screen.handle_key(Key::ToggleTools);
+                let (screen, _effects) = self.screen.handle_key(Key::ToggleCompact);
                 self.screen = screen;
                 self.cache = RenderCache::new();
             }

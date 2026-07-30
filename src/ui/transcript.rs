@@ -39,6 +39,7 @@
 //! Steering marker and the extension-failure line.
 
 mod streaming;
+mod thought;
 
 use std::collections::HashMap;
 
@@ -314,6 +315,47 @@ impl Transcript {
         self.streaming.thinking()
     }
 
+    /// The rolling thought SUBJECT for the running spinner (qwen
+    /// `LoadingIndicator.tsx:72` `thought?.subject || currentLoadingPhrase`): the
+    /// short head of the live reasoning the spinner shows in place of the lull
+    /// phrase. A pure read over the streaming snapshot, SPINNER-ONLY - the
+    /// committed history keeps the raw Thinking text verbatim.
+    ///
+    /// Three fallbacks, in order (the divergence recorded in ADR-0046): (1) the
+    /// bold subject qwen's `parseThought` parses from the FIRST `**…**`
+    /// pair, when the reasoning emits one; else (2) the last non-empty line of the
+    /// streaming reasoning (the live head - suspenders' reasoning streams do NOT
+    /// reliably emit `**bold**` subjects); else (3) `None`, so the spinner falls
+    /// back to the lull phrase.
+    ///
+    /// Clear-timing is FREE: [`streaming_thinking`](Self::streaming_thinking)
+    /// empties between messages (subject → `None` automatically), and the spinner
+    /// only renders while the Run is Running, so it vanishes at Idle with no
+    /// manual reset. The parse itself lives in the `thought` child module (a
+    /// pure text concern, split from the store's history-invariant duty).
+    pub fn thought_subject(&self) -> Option<String> {
+        thought::thought_subject_of(&self.streaming.thinking())
+    }
+
+    /// Whether flipping compact mode would CHANGE what the frozen scrollback
+    /// shows (qwen `compactToggleHasVisualEffect`, `mergeCompactToolGroups.ts`):
+    /// `true` iff any COMMITTED item is one compact hides or reveals - a
+    /// [`TranscriptItem::Thinking`] (compact hides it entirely) or a tool-group
+    /// member (`ToolCall`/`ToolResult`/`Diff`/`Todo`, whose result BODY compact
+    /// hides). A transcript of only User/Assistant/Info/Marker items has nothing
+    /// compact touches, so the Ctrl+O handler skips the expensive scrollback
+    /// redraw (ADR-0052) - a plain chat toggles with no flicker.
+    ///
+    /// Committed-only on purpose: the pending region redraws every frame at the
+    /// new compact for free, so only the FROZEN prefix `[0, committed_high_water)`
+    /// needs the [`crate::ui::screen::Effect::RedrawScrollback`] re-blit. Pure -
+    /// no ratatui, a testable predicate.
+    pub fn compact_toggle_has_visual_effect(&self) -> bool {
+        self.items[..self.committed]
+            .iter()
+            .any(compact_hides_or_reveals)
+    }
+
     // ---- The Commit seam (ADR-0046) ----------------------------------------
 
     /// How many leading items have been frozen into native scrollback - the
@@ -417,6 +459,22 @@ impl Transcript {
 // delivery removes.
 fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
+}
+
+// Whether an item is one compact mode hides or reveals (qwen: a Thinking item,
+// hidden entirely, or a tool-group member, whose result body is hidden). A
+// User/Assistant/Info/Marker item is untouched by compact, so a transcript of
+// only those toggles with no visual effect. Pure - the predicate behind
+// [`Transcript::compact_toggle_has_visual_effect`].
+fn compact_hides_or_reveals(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Thinking { .. }
+            | TranscriptItem::ToolCall { .. }
+            | TranscriptItem::ToolResult { .. }
+            | TranscriptItem::Diff { .. }
+            | TranscriptItem::Todo { .. }
+    )
 }
 
 // Whether a settled item is FINAL - safe to freeze into native scrollback
@@ -1406,6 +1464,85 @@ mod tests {
         assert_eq!(idx, 3, "the newest todo item's index");
         assert_eq!(items.len(), 3);
         assert_eq!(items[2].content, "ship");
+    }
+
+    // --- compact_toggle_has_visual_effect (ADR-0052) -----------------------------
+
+    // An empty transcript, and one of only User/Info items, has nothing compact
+    // hides in the COMMITTED prefix -> no visual effect (the Ctrl+O handler skips
+    // the scrollback redraw).
+    #[test]
+    fn compact_toggle_is_inert_for_an_empty_or_plain_committed_prefix() {
+        let mut t = fresh();
+        assert!(!t.compact_toggle_has_visual_effect(), "empty");
+
+        t.info("a");
+        t.user("hi");
+        t.push(assistant("an answer"));
+        t.mark_committed(t.committable_upto());
+        assert!(
+            !t.compact_toggle_has_visual_effect(),
+            "only plain items committed (Info / User / Assistant are not compact-affected)"
+        );
+    }
+
+    // A committed Thinking / tool-group member DOES change under compact, so the
+    // predicate is true once one is frozen.
+    #[test]
+    fn compact_toggle_has_effect_for_committed_thinking_or_tool_items() {
+        for item in [
+            thinking("hmm"),
+            tool_call_item("id1", "grep", "hit"),
+            tool_result_item("grep", "hit", false),
+            diff_item("edit_file"),
+            todo_item(&["read"]),
+        ] {
+            let mut t = fresh();
+            t.push(item);
+            // A bare `ToolCall` is not terminal (`committable_upto` stops at it),
+            // so force the mark past it - the predicate reads `items[..committed]`
+            // regardless of terminality, and a committed ToolCall header is
+            // compact-affected (it is a tool-group member the predicate lists).
+            t.mark_committed(t.committable_upto().max(1));
+            assert!(
+                t.compact_toggle_has_visual_effect(),
+                "a committed compact-affected item has a visual effect"
+            );
+        }
+    }
+
+    // The predicate reads the COMMITTED prefix only: a Thinking item still in the
+    // pending region (uncommitted) has no scrollback effect - the pending body
+    // redraws at the new compact for free.
+    #[test]
+    fn compact_toggle_ignores_uncommitted_items() {
+        let mut t = fresh();
+        t.push(thinking("pending thought"));
+        // Nothing committed yet.
+        assert_eq!(t.committed_high_water(), 0);
+        assert!(
+            !t.compact_toggle_has_visual_effect(),
+            "an uncommitted Thinking item does not need a scrollback redraw"
+        );
+    }
+
+    // --- thought_subject (the spinner's rolling reasoning head) ------------------
+    // The pure parse ladder is tested in the `thought` child module; here we pin
+    // only the store read that threads the streaming snapshot through it.
+
+    // The store read threads the streaming snapshot through: subject shows
+    // mid-message, then empties to None between messages (clear-timing is free).
+    #[test]
+    fn thought_subject_reads_the_live_snapshot_and_clears_between_messages() {
+        let mut t = fresh();
+        assert_eq!(t.thought_subject(), None, "idle: no reasoning");
+        t.message_start();
+        t.message_update(vec![thinking_block("**Planning** the next move")]);
+        assert_eq!(t.thought_subject(), Some("Planning".to_string()));
+        // Settling the message empties the streaming snapshot; a new message
+        // starts from nothing, so the subject clears with no manual reset.
+        t.message_end(&[text_block("done")]);
+        assert_eq!(t.thought_subject(), None);
     }
 
     // --- item vocabulary ---------------------------------------------------------

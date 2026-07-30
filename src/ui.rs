@@ -322,7 +322,48 @@ async fn run_loop(
     // milliseconds since launch, advanced by the tick (no background timer).
     let started = std::time::Instant::now();
 
-    // Initial paint of the inline pending region.
+    // First frame, in three beats (ADR-0046). qwen commits the greeting/header to
+    // Static scrollback UP FRONT; we mirror that so frame 1 shows greeting-in-
+    // scrollback + composer + status, not a bare greeting waiting on a keypress.
+    //
+    // The launch notices (the GREETING Info line plus any pre-terminal info
+    // lines) are terminal, so `committable_upto()` already covers them while the
+    // high-water mark sits at 0 - the exact prefix a fold would freeze. But the
+    // fold-driven commit only runs on the FIRST event (key/agent/tick), so
+    // without this the initial pending draw would paint the greeting still
+    // UNCOMMITTED in the pending region, and the composer/status would not
+    // settle until that first keypress triggered the deferred commit.
+    //
+    // Ordering matters (a known ratatui inline gotcha): `insert_before` before
+    // the viewport is established misplaces it. So we (1) draw once to establish
+    // the inline viewport area, (2) run the startup commit through `dispatch` -
+    // whose trailing-freeze block blits precisely the committable notices into
+    // native scrollback and advances the high-water mark - then (3) redraw a
+    // clean pending region (composer + status) with the greeting now frozen
+    // above it. Passing an EMPTY effect vector routes solely through dispatch's
+    // `committable_upto - committed_high_water` trailing commit; no `Commit`
+    // effect is minted outside `with_commit`.
+    draw_previewed(
+        terminal,
+        screen.as_ref().unwrap(),
+        &conn,
+        anim,
+        &mut cache,
+        &state,
+    )?;
+    screen = Some(
+        dispatch(
+            terminal,
+            screen.take().unwrap(),
+            Vec::new(),
+            &mut Adapter {
+                ctx: &ctx,
+                state: &mut state,
+                cache: &mut cache,
+            },
+        )
+        .await?,
+    );
     draw_previewed(
         terminal,
         screen.as_ref().unwrap(),
@@ -566,6 +607,19 @@ async fn dispatch<B: Backend>(
     for effect in effects {
         match effect {
             Effect::Commit { count } => commit_items(terminal, &mut core, cache, count, &active)?,
+            // A compact toggle over frozen scrollback (ADR-0052): the pure fold
+            // already flipped `compact_mode`, so the pending region redraws at the
+            // new compact for free next frame; this only repaints the live
+            // viewport so the toggle takes hold with no transient artifact. See
+            // [`redraw_scrollback`] for the SPIKE result and the degraded-fallback
+            // scope (the frozen prefix above the fold stays at the old compact -
+            // ratatui exposes no portable scrollback purge).
+            Effect::RedrawScrollback => redraw_scrollback(terminal, &mut core, cache, &active)?,
+            // Ctrl-S peek (ADR-0046): blit the FULL, unclamped pending body into
+            // scrollback so the user reads the top-clipped rows. Non-committing -
+            // it reads `core` but does NOT advance the high-water mark, so the same
+            // body redraws (clipped) in the live viewport next frame.
+            Effect::PeekPending => peek_pending(terminal, &core, cache, &active)?,
             other => rest.push(other),
         }
     }
@@ -660,6 +714,100 @@ fn commit_items<B: Backend>(
     // Only now - after a successful blit (or a zero-height no-op) - advance the
     // pure core's high-water mark so a later fold never re-freezes this slice.
     screen.mark_committed(count);
+    Ok(())
+}
+
+/// Re-applies compact mode over already-frozen scrollback (ADR-0052, the sibling
+/// of [`commit_items`]): syncs the render cache to the new compact and repaints
+/// the live inline viewport so the toggle takes hold cleanly, WITHOUT resetting
+/// the high-water mark (the frozen prefix stays committed).
+///
+/// SPIKE RESULT (Risk #1, the HIGH one). qwen's faithful `refreshStatic` =
+/// `clearTerminal` (emit `\x1b[2J\x1b[3J\x1b[H`, wiping screen AND scrollback)
+/// then replay every committed item at the new compact. Two findings killed the
+/// faithful port here. First, `Terminal::clear()` on an `Inline` viewport clears
+/// only from the viewport top downwards (`ClearType::AfterCursor`) - it does NOT
+/// touch the frozen rows already in native scrollback, so `clear()` + a full
+/// re-`insert_before` DOUBLES the committed rows (old ones stay above, fresh ones
+/// push the viewport down). Second, ratatui's `backend::ClearType` has no `Purge`
+/// (`\x1b[3J`) variant, so there is NO PORTABLE way through the `Backend` trait to
+/// wipe native scrollback - and `TestBackend` cannot model a scrollback purge at
+/// all.
+///
+/// Per the Phase-6 design's directive ("if it doubles/orphans rows, use the
+/// degraded viewport-only fallback rather than shipping broken scrollback"), this
+/// is the DEGRADED fallback: the pending region (and every FUTURE commit) renders
+/// at the new compact, but the frozen prefix above the fold keeps the compact it
+/// was blitted at. A `terminal.clear()` repaints the live viewport so the flip is
+/// immediate and artifact-free; the next `draw` fills it at the new compact.
+///
+/// A no-op-safe path on a non-inline backend (`TestBackend` without `Inline`):
+/// `clear()` there just resets the buffer, and the cache re-sync is harmless.
+fn redraw_scrollback<B: Backend>(
+    terminal: &mut Terminal<B>,
+    screen: &mut Screen,
+    cache: &mut components::RenderCache,
+    theme: &theme::Theme,
+) -> anyhow::Result<()> {
+    // Rebuild the cache at the new compact so the very next `draw` measures and
+    // paints the pending region correctly (the cache keys on the compact toggle,
+    // so this is the wholesale rebuild `needs_rebuild` triggers).
+    let width = terminal
+        .size()
+        .map(|s| s.width)
+        .unwrap_or(FALLBACK_TERM_WIDTH);
+    let content_width = width.saturating_sub(2 * components::CONTENT_MARGIN);
+    components::sync_commit_cache(cache, screen, content_width, theme);
+    // Repaint the live viewport (degraded fallback: the frozen scrollback above
+    // cannot be un-drawn portably). The high-water mark is deliberately left
+    // UNCHANGED - the committed prefix is still committed.
+    terminal.clear()?;
+    Ok(())
+}
+
+/// The Ctrl-S peek (ADR-0046, [`Effect::PeekPending`]): blits the FULL, UNCLAMPED
+/// pending body into native scrollback via `insert_before`, above the live inline
+/// viewport, so the user can scroll up to read the rows the viewport top-clips
+/// away ("… Ctrl-S to show more"). The fixed inline viewport cannot grow, so the
+/// clipped rows are revealed ABOVE the live region rather than in place.
+///
+/// A PEEK, NOT a commit: unlike [`commit_items`], this does NOT advance the
+/// high-water mark and freezes NOTHING - the same body (clipped) redraws in the
+/// live viewport on the next `draw`. The blit lands in scrollback purely for the
+/// user to scroll back to. It reads `screen` immutably; nothing changes state.
+///
+/// A no-op-safe path on a non-inline backend (`TestBackend` without `Inline`):
+/// `insert_before` there is a documented no-op, so headless tests stay valid. A
+/// zero-height body (nothing pending) also no-ops - there is nothing to peek.
+///
+/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
+fn peek_pending<B: Backend>(
+    terminal: &mut Terminal<B>,
+    screen: &Screen,
+    cache: &mut components::RenderCache,
+    theme: &theme::Theme,
+) -> anyhow::Result<()> {
+    let width = terminal
+        .size()
+        .map(|s| s.width)
+        .unwrap_or(FALLBACK_TERM_WIDTH);
+    let content_width = width.saturating_sub(2 * components::CONTENT_MARGIN);
+    // The peek reads the SAME line set the live body draws (via `pending_body_lines`
+    // at the live high-water mark), so it syncs the cache at the same content width
+    // (measure == draw, ADR-0029). `Anim::default()` is fine: the spinner FRAME is
+    // irrelevant to a static scrollback snapshot the user reads at rest.
+    let mut peek = components::PendingPeek {
+        cache,
+        screen,
+        anim: components::Anim::default(),
+        theme,
+    };
+    let height = components::pending_peek_height(&mut peek, content_width);
+    if height > 0 {
+        terminal.insert_before(height, |buf| {
+            components::render_pending_peek(buf, &mut peek);
+        })?;
+    }
     Ok(())
 }
 
@@ -776,8 +924,14 @@ fn map_key(key: &KeyEvent) -> Key {
         KeyCode::Backspace => Key::Backspace,
         // Modifier-aware arms come BEFORE the generic Char arm, which would
         // otherwise swallow the keypress as a plain character.
-        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleThinking,
-        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleTools,
+        // Ctrl-O (qwen `TOGGLE_COMPACT_MODE`): toggle compact mode. Ctrl-T is
+        // RETIRED (ADR-0046/0052 completed the retirement) - it falls through to
+        // the generic Ctrl-chord arm below as `Key::Other`, never typing a 't'.
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleCompact,
+        // Ctrl-S (qwen `ShowMoreLines`): peek the full, unclamped pending body into
+        // scrollback (ADR-0046). BEFORE the generic Ctrl-chord/Char arms so it is
+        // named intent, not a typed 's'.
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ShowMore,
         // Shift+Tab cycles the Approval mode (ADR-0050). Crossterm reports it as
         // `BackTab`, or as `Tab` + SHIFT on terminals that do not synthesize
         // BackTab - both map to the same intent (qwen's win32 fallback is plain
@@ -846,6 +1000,14 @@ async fn run_effect(
         // is re-derived and frozen by that trailing pass - so the mark never
         // advances mid-recursion and the freeze stays atomic (ADR-0046).
         Effect::Commit { .. } => screen,
+        // `RedrawScrollback` (ADR-0052) needs the terminal to wipe + re-blit the
+        // committed slice, so like `Commit` it is handled a level up in
+        // `dispatch`; a stray one inside this recursion is a no-op.
+        Effect::RedrawScrollback => screen,
+        // `PeekPending` (ADR-0046, Ctrl-S) needs the terminal to `insert_before`
+        // the full body, so like `Commit`/`RedrawScrollback` it is handled a level
+        // up in `dispatch`; a stray one inside this recursion is a no-op.
+        Effect::PeekPending => screen,
         // Focus effects are a no-op in the ratatui adapter: there is no separate
         // focusable widget tree; the modal captures keys via the pure core's
         // pending_approval, and the composer is always the input target.
@@ -1063,26 +1225,42 @@ mod tests {
     // live in the pure core and are tested there; these tests only guard the
     // crossterm→Key mapping the adapter owns.
 
-    // Regression: Ctrl-T must map to ToggleThinking, not be swallowed by the
-    // generic Char arm as a plain 't' - the modifier arms must come first.
+    // Regression: Ctrl-T is RETIRED (ADR-0046/0052). It no longer maps to a
+    // display toggle - it falls through to the generic Ctrl-chord arm as
+    // `Key::Other`, so it never types a literal 't'.
     #[test]
-    fn ctrl_t_maps_to_toggle_thinking() {
+    fn ctrl_t_is_retired_and_maps_to_other() {
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(&key), Key::ToggleThinking);
+        assert_eq!(map_key(&key), Key::Other);
     }
 
-    // Regression: Ctrl-O must map to ToggleTools, not be swallowed by the
+    // Regression: Ctrl-O must map to ToggleCompact, not be swallowed by the
     // generic Char arm as a plain 'o' - the modifier arms must come first.
     #[test]
-    fn ctrl_o_maps_to_toggle_tools() {
+    fn ctrl_o_maps_to_toggle_compact() {
         let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(&key), Key::ToggleTools);
+        assert_eq!(map_key(&key), Key::ToggleCompact);
     }
 
     #[test]
     fn plain_t_is_still_a_typed_char() {
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
         assert_eq!(map_key(&key), Key::Char('t'));
+    }
+
+    // Regression (BUG 1, ADR-0046): Ctrl-S must map to ShowMore (the peek), not be
+    // swallowed as a plain 's' - the modifier arm must come before the generic
+    // Char arm.
+    #[test]
+    fn ctrl_s_maps_to_show_more() {
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(&key), Key::ShowMore);
+    }
+
+    #[test]
+    fn plain_s_is_still_a_typed_char() {
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(map_key(&key), Key::Char('s'));
     }
 
     // Since the core inserts every Key::Char into the Composer, a Ctrl chord
@@ -2177,6 +2355,350 @@ mod tests {
         assert!(
             !pending.contains("suspenders ready"),
             "the committed greeting is gone from the pending region:\n{pending}"
+        );
+    }
+
+    // FIRST-FRAME bug (ADR-0046): on startup the greeting must be committed to
+    // native scrollback UP FRONT, so frame 1 already shows the composer +
+    // status - WITHOUT any keypress. This mirrors `run_loop`'s three-beat first
+    // frame (draw to establish the inline viewport, startup `dispatch` with an
+    // EMPTY effect vector whose trailing-freeze flushes the committable notices,
+    // then a clean pending redraw). Before the fix the initial draw painted the
+    // greeting still uncommitted and the composer/status only appeared after the
+    // first key triggered the deferred commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_commits_greeting_and_frame_one_shows_composer_and_status() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
+        let ctx = adapter_ctx(&agent);
+        let mut state = test_state();
+        let mut cache = components::RenderCache::new();
+
+        // An INLINE TestBackend that is SHORT (a small terminal with a 5-row
+        // inline viewport) so the committed greeting overflows the top of the
+        // terminal buffer and lands in the backend's scrollback, while the
+        // viewport still fits the status bar + composer chrome.
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(40, 6),
+            TerminalOptions {
+                viewport: TermViewport::Inline(5),
+            },
+        )
+        .unwrap();
+
+        let conn = components::ConnectionFacts {
+            base_url: "http://test".into(),
+            model: "m".into(),
+        };
+        let anim = components::Anim::default();
+
+        // A launch Screen: the GREETING Info line (terminal, hence committable)
+        // with the high-water mark at 0.
+        let mut screen = Some(Screen::new(ScreenOpts::default()));
+        assert_eq!(
+            screen.as_ref().unwrap().transcript().committed_high_water(),
+            0,
+            "nothing committed before the startup pass"
+        );
+        let committable = screen.as_ref().unwrap().transcript().committable_upto();
+        assert!(committable >= 1, "the greeting is committable at launch");
+
+        // Beat 1: establish the inline viewport.
+        draw_previewed(
+            &mut terminal,
+            screen.as_ref().unwrap(),
+            &conn,
+            anim,
+            &mut cache,
+            &state,
+        )
+        .unwrap();
+
+        // Beat 2: the startup commit - an EMPTY effect vector, so ONLY dispatch's
+        // trailing freeze runs, flushing exactly the committable notices.
+        screen = Some(
+            dispatch(
+                &mut terminal,
+                screen.take().unwrap(),
+                Vec::new(),
+                &mut Adapter {
+                    ctx: &ctx,
+                    state: &mut state,
+                    cache: &mut cache,
+                },
+            )
+            .await
+            .expect("startup dispatch freezes without error"),
+        );
+
+        // Beat 3: the clean pending redraw.
+        draw_previewed(
+            &mut terminal,
+            screen.as_ref().unwrap(),
+            &conn,
+            anim,
+            &mut cache,
+            &state,
+        )
+        .unwrap();
+
+        let core = screen.as_ref().unwrap();
+
+        // The startup pass advanced the high-water mark past the notices - the
+        // greeting is now committed, with NO simulated keypress.
+        assert_eq!(
+            core.transcript().committed_high_water(),
+            committable,
+            "the startup commit advanced the mark past the committable notices"
+        );
+
+        // (a) The greeting froze into NATIVE SCROLLBACK.
+        let scrollback: String = {
+            let sb = terminal.backend().scrollback();
+            (0..sb.area.height)
+                .map(|y| {
+                    (0..sb.area.width)
+                        .map(|x| sb.cell((x, y)).expect("cell").symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            scrollback.contains("suspenders ready"),
+            "frame 1: the greeting is in scrollback:\n{scrollback}"
+        );
+
+        // (b) The live viewport already shows the composer placeholder AND status
+        // content on frame 1 - no keypress needed.
+        let viewport = buffer_text(&terminal);
+        assert!(
+            viewport.contains("Type your message"),
+            "frame 1: the composer placeholder is drawn:\n{viewport}"
+        );
+        assert!(
+            viewport.contains("model · m") && viewport.contains("Bot"),
+            "frame 1: the status bar (model fact + position segment) is drawn:\n{viewport}"
+        );
+        // The greeting is NOT re-drawn in the pending region (it is committed).
+        assert!(
+            !viewport.contains("suspenders ready"),
+            "frame 1: the committed greeting is gone from the pending region:\n{viewport}"
+        );
+    }
+
+    // Ctrl-S peek (BUG 1, ADR-0046): driving `dispatch` with a `PeekPending`
+    // effect must (a) blit the FULL pending body into the TestBackend's native
+    // SCROLLBACK via `insert_before`, and (b) leave the high-water mark UNCHANGED -
+    // it is a non-committing peek, so nothing freezes and the same body redraws
+    // (clipped) in the live viewport next frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_peek_pending_blits_the_full_body_and_keeps_the_mark() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
+        let ctx = adapter_ctx(&agent);
+        let mut state = test_state();
+        let mut cache = components::RenderCache::new();
+
+        // A SHORT inline terminal so the pending body overflows the live viewport
+        // and the peek's blit reaches the backend's scrollback.
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(60, 3),
+            TerminalOptions {
+                viewport: TermViewport::Inline(1),
+            },
+        )
+        .unwrap();
+
+        // First settle the transcript so the peek is the ONLY thing dispatch can
+        // do: a live (un-resulted) `run_command` tool call is NON-terminal, so
+        // `committable_upto` stops before it and dispatch's trailing commit is a
+        // no-op - isolating the peek's effect on the mark. The greeting + call are
+        // committed up front so the pending body is a stable, live tool group.
+        let core = Screen::new(ScreenOpts::default());
+        let (core, _) = core.apply_event(Event::run_started("r1"));
+        let (core, _) = core.apply_event(Event::tool_call(
+            "t1",
+            "run_command",
+            serde_json::json!({"command": "echo peek-me"}),
+        ));
+        // Freeze everything committable (the greeting), leaving the live call
+        // pending. Do it through dispatch so the mark reflects real adapter state.
+        let prime = core.transcript().committable_upto();
+        let core = dispatch(
+            &mut terminal,
+            core,
+            vec![Effect::Commit { count: prime }],
+            &mut Adapter {
+                ctx: &ctx,
+                state: &mut state,
+                cache: &mut cache,
+            },
+        )
+        .await
+        .expect("prime commit succeeds");
+
+        let mark_before = core.transcript().committed_high_water();
+        let (core, effects) = core.handle_key(crate::ui::screen::Key::ShowMore);
+        assert_eq!(
+            effects,
+            vec![Effect::PeekPending],
+            "Ctrl-S minted exactly the peek"
+        );
+
+        let core = dispatch(
+            &mut terminal,
+            core,
+            effects,
+            &mut Adapter {
+                ctx: &ctx,
+                state: &mut state,
+                cache: &mut cache,
+            },
+        )
+        .await
+        .expect("dispatch peeks without error");
+
+        // (a) The FULL pending body landed via `insert_before`: its rows scroll up
+        // from the live viewport into native SCROLLBACK (rows past the top of the
+        // short terminal). Capture the scrollback AND the live buffer so the check
+        // is robust to exactly where the short terminal's boundary falls.
+        let render = |area: ratatui::layout::Rect, cell: &dyn Fn(u16, u16) -> String| -> String {
+            (0..area.height)
+                .map(|y| (0..area.width).map(|x| cell(x, y)).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let scrollback = {
+            let sb = terminal.backend().scrollback();
+            render(sb.area, &|x, y| {
+                sb.cell((x, y)).expect("cell").symbol().to_string()
+            })
+        };
+        let live = {
+            let buf = terminal.backend().buffer();
+            render(buf.area, &|x, y| {
+                buf.cell((x, y)).expect("cell").symbol().to_string()
+            })
+        };
+        let combined = format!("{scrollback}\n{live}");
+        assert!(
+            combined.contains("echo peek-me"),
+            "the full pending body was peeked into scrollback + viewport:\n{combined}"
+        );
+
+        // (b) The high-water mark is UNCHANGED - the peek committed NOTHING.
+        assert_eq!(
+            core.transcript().committed_high_water(),
+            mark_before,
+            "a peek does not advance the high-water mark (non-committing)"
+        );
+    }
+
+    // RedrawScrollback (ADR-0052): a compact toggle over frozen scrollback must
+    // (a) leave the high-water mark UNCHANGED (the committed prefix stays
+    // committed), and (b) re-sync the render cache to the new compact so the very
+    // next pending draw hides the committed-then-uncommitted thought. The SPIKE
+    // (see `redraw_scrollback`) established that native scrollback above the fold
+    // cannot be un-drawn portably (the degraded fallback); this pins the parts
+    // that ARE correct - the mark and the fresh pending render.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_redraw_scrollback_keeps_the_mark_and_resyncs_to_compact() {
+        use crate::llm::Delta;
+        use crate::view_model::TranscriptItem;
+
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
+        let ctx = adapter_ctx(&agent);
+        let mut state = test_state();
+        let mut cache = components::RenderCache::new();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(60, 8),
+            TerminalOptions {
+                viewport: TermViewport::Inline(3),
+            },
+        )
+        .unwrap();
+
+        // Build a committed thought purely (the multi-dispatch stream is exercised
+        // elsewhere): stream + settle a thought, then freeze the terminal prefix as
+        // `commit_items` would. The pure `handle_key` then flips compact and mints
+        // the RedrawScrollback whose ADAPTER handling this test pins.
+        let core = Screen::new(ScreenOpts::default());
+        let (core, _) = core.apply_event(Event::message_start(1));
+        let (core, _) = core.apply_event(Event::message_update(
+            Delta::Thinking("thinking".into()),
+            vec![crate::content::ContentBlock::Thinking {
+                text: "a secret thought".into(),
+            }],
+        ));
+        let (mut core, _) = core.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+        core.mark_committed(core.transcript().committable_upto());
+        assert!(
+            core.transcript()
+                .items()
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::Thinking { .. })),
+            "a committed Thinking item exists"
+        );
+        let mark_before = core.transcript().committed_high_water();
+        assert!(mark_before >= 1, "the thought committed");
+
+        // Ctrl+O: the fold flips compact and mints RedrawScrollback.
+        let (core, effects) = core.handle_key(crate::ui::screen::Key::ToggleCompact);
+        assert!(core.compact_mode, "compact is now on");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RedrawScrollback)),
+            "the toggle minted a scrollback redraw: {effects:?}"
+        );
+
+        let core = dispatch(
+            &mut terminal,
+            core,
+            effects,
+            &mut Adapter {
+                ctx: &ctx,
+                state: &mut state,
+                cache: &mut cache,
+            },
+        )
+        .await
+        .expect("redraw dispatches without error");
+
+        // (a) The high-water mark is UNCHANGED - the prefix stays committed.
+        assert_eq!(
+            core.transcript().committed_high_water(),
+            mark_before,
+            "RedrawScrollback must not move the high-water mark"
+        );
+        // (b) The redraw actually re-synced the CACHE to the new compact: blitting
+        // the committed prefix from the re-synced cache now renders the secret
+        // thought as ZERO lines (compact hides a Thinking item entirely, like
+        // `cache_sync_rebuilds_when_compact_hides_a_thought`). Rendering FROM THE
+        // CACHE (not re-asserting the pure predicate) proves the adapter's
+        // `sync_commit_cache` took effect.
+        let hw = core.transcript().committed_high_water();
+        let items: Vec<_> = core.transcript().items().iter().take(hw).cloned().collect();
+        let theme = state.themes.active().clone();
+        let slice = components::CommittedSlice {
+            cache: &cache,
+            items: &items,
+            hw: 0,
+            count: hw,
+            theme: &theme,
+        };
+        let height = components::commit_slice_height(&slice, 60).max(1);
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 60, height));
+        components::render_committed_slice(&mut buf, &slice);
+        let text: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(
+            !text.contains("a secret thought"),
+            "the re-synced cache blits the committed thought as 0 lines under compact:\n{text}"
         );
     }
 }

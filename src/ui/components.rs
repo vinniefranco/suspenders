@@ -220,8 +220,8 @@ pub fn segment_style(kind: SegmentKind, theme: &Theme) -> Style {
         SegmentKind::Connection | SegmentKind::Model => Style::default()
             .fg(tui_color(theme.segment_model_fg))
             .bg(tui_color(theme.segment_model_bg)),
-        // Thinking + Tools are the two detail-on-demand toggles, styled alike.
-        SegmentKind::Thinking | SegmentKind::Tools => Style::default()
+        // Compact is the detail-on-demand toggle (qwen `compactMode`, ADR-0052).
+        SegmentKind::Compact => Style::default()
             .fg(tui_color(theme.segment_toggle_fg))
             .bg(tui_color(theme.segment_muted_bg)),
         // Cost is a quiet figure: the same muted read as tokens at Ok
@@ -453,17 +453,29 @@ fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> Pen
     // (costs no rows). The `.filter` is the measure == draw guard: reserving a
     // zone we cannot fully draw would paint a headless fragment over the
     // composer.
-    let sticky_items = sticky_todos(
-        t.transcript().latest_todo(),
-        t.transcript().committed_high_water(),
-    )
-    .filter(|items| {
-        sticky_fits(
-            area.height as usize,
-            sticky_todos_height(items.len()),
-            composer_height,
-        )
-    });
+    //
+    // An OPEN approval (ADR-0049) also drops the box: the approval renders inside
+    // the pending body, and the informational sticky box would starve that body
+    // (`Constraint::Min(1)`) and top-clip the "Apply this change?" question out of
+    // view. A visible approval takes priority over the sticky list, so we reserve
+    // NO sticky zone while `pending_approval.is_some()`.
+    let sticky_items = t
+        .pending_approval
+        .is_none()
+        .then(|| {
+            sticky_todos(
+                t.transcript().latest_todo(),
+                t.transcript().committed_high_water(),
+            )
+        })
+        .flatten()
+        .filter(|items| {
+            sticky_fits(
+                area.height as usize,
+                sticky_todos_height(items.len()),
+                composer_height,
+            )
+        });
     let sticky_height = sticky_items.map_or(0, |items| sticky_todos_height(items.len()));
     let chunks = frame_chunks(area, sticky_height, composer_height);
     PendingLayout {
@@ -528,42 +540,44 @@ fn render_pending_body(
     render_pending_body_at(frame, area, params, theme, hw)
 }
 
-/// Draws the pending body starting AT an explicit high-water mark `hw`: it emits
-/// the uncommitted settled tail `items[hw..]` plus the live stream, bottom-
-/// anchored and top-clipped (ADR-0046). [`render_pending_body`] calls this with
-/// the store's live
-/// [`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water)
-/// (committed items are already in native scrollback); passing `0` draws the
-/// WHOLE settled transcript, which is what a headless test wants to see on a
-/// TestBackend that has no real scrollback.
-fn render_pending_body_at(
-    frame: &mut Frame,
-    area: Rect,
+/// Assembles the FULL, UNCLAMPED pending body line set at content `width` and
+/// high-water mark `hw` (ADR-0046): the uncommitted settled tail `items[hw..]`
+/// through the SAME [`grouped_rows`] fold the commit blit uses (so pending and
+/// committed stay byte-identical), then the live entries newest-last (the
+/// reasoning tail, the streaming answer, the spinner). This is the PRE-CLIP line
+/// set `render_pending_body_at` anchors/clips for the live viewport, AND the exact
+/// content Ctrl-S's peek ([`Effect::PeekPending`]) blits into scrollback unclamped.
+/// Syncs the cache as a side effect (the settled tail's lines come from it); no
+/// frame access, no anchor/clip math (IOSP).
+fn pending_body_lines(
     params: &mut PendingBodyParams<'_>,
     theme: &Theme,
     hw: usize,
-) -> usize {
+    width: u16,
+) -> Vec<Line<'static>> {
     let t = params.screen;
     let cache = &mut params.cache;
     let anim = params.anim;
 
-    let content_area = Rect {
-        x: area.x + CONTENT_MARGIN,
-        width: area.width.saturating_sub(2 * CONTENT_MARGIN),
-        ..area
-    };
     cache.sync(
         t.transcript(),
         Toggles {
-            thinking_expanded: t.thinking_expanded,
-            tools_expanded: t.tools_expanded,
+            compact: t.compact_mode,
         },
-        content_area.width,
+        width,
         theme,
     );
 
     let thinking = t.transcript().streaming_thinking();
-    let thinking_lines = live_thinking_lines(&thinking, anim.spinner, content_area.width, theme);
+    // Compact suppresses the live thinking tail (qwen `HistoryItemDisplay.tsx:155`
+    // gates the pending `gemini_thought` under `!compactMode` too; Phase-6 design
+    // "live thinking tail suppressed"). The spinner SUBJECT still shows below -
+    // qwen does not compact-gate the LoadingIndicator.
+    let thinking_lines = if t.compact_mode {
+        Vec::new()
+    } else {
+        live_thinking_lines(&thinking, anim.spinner, width, theme)
+    };
 
     let items = t.transcript().items();
     // The inline approval (ADR-0049): when an Approval is pending, it attaches to
@@ -581,40 +595,87 @@ fn render_pending_body_at(
     // through the SAME [`grouped_rows`] fold `render_committed_slice` blits with,
     // so committed and pending are byte-identical and nothing reflows at the
     // commit seam (qwen's `<Static>` prints history un-clamped; the ONLY overflow
-    // reduction is the bottom-anchor + top-clip below).
+    // reduction is the bottom-anchor + top-clip the caller applies).
     let mut lines = grouped_rows_with_approval(&GroupedRows {
         cache,
         items,
         hw,
-        width: content_area.width,
+        width,
         theme,
         approving: approving.as_ref(),
     });
 
-    // The live entries follow the settled tail, newest last: the reasoning tail,
-    // then the streaming answer, then (whenever the Run is Running) the spinner
-    // line - the LoadingIndicator (ADR-0048), which keeps the lull scene as its
-    // phrase content and carries the elapsed/cancel affordance.
-    append_live(&mut lines, &thinking_lines);
-    let tail = cache.streaming_tail();
-    let receiving = if let Some((tail_lines, _)) = tail {
-        append_live(&mut lines, tail_lines);
-        true
-    } else {
-        false
-    };
-    let spinner = if t.status == Status::Running {
-        // `subject`/`tokens` are the Phase-6 seams (the thought subject and a live
-        // token counter, left `None`); the phrase is the lull scene.
-        let state = SpinnerState {
-            receiving,
-            ..SpinnerState::default()
+    // While an approval is OPEN, the approval block MUST stay bottom-most so the
+    // top-clip ([`anchor_clip`]) can never eat the "Apply this change?" /
+    // "Allow execution of..." question on a short terminal: the Run is not
+    // "loading", it is waiting on the USER, so the confirming ToolCall + its
+    // approval are the salient content, not the LoadingIndicator's
+    // waiting-for-confirmation state (qwen keeps the approval the focused
+    // interactive element). Suppress every trailing LIVE row below the approval -
+    // the reasoning tail, the streaming-answer tail, and the spinner - so the
+    // approving group ends the pending body and survives the clip. These rows are
+    // pending-only overlays never present in the committed slice, so
+    // measure==draw and committed==pending identity are unaffected.
+    if approving.is_none() {
+        // The live entries follow the settled tail, newest last: the reasoning
+        // tail, then the streaming answer, then (whenever the Run is Running) the
+        // spinner line - the LoadingIndicator (ADR-0048), which keeps the lull
+        // scene as its phrase content and carries the elapsed/cancel affordance.
+        append_live(&mut lines, &thinking_lines);
+        let tail = cache.streaming_tail();
+        let receiving = if let Some((tail_lines, _)) = tail {
+            append_live(&mut lines, tail_lines);
+            true
+        } else {
+            false
         };
-        spinner_line(anim, state, content_area.width, theme)
-    } else {
-        Vec::new()
+        // The rolling thought subject (Phase 6, qwen `thought?.subject ||
+        // currentLoadingPhrase`): the live reasoning head the spinner shows in
+        // place of the lull phrase while the Run reasons. Bound outside the `if`
+        // so its `String` outlives the borrow the `SpinnerState` takes.
+        let subject = t.transcript().thought_subject();
+        let spinner = if t.status == Status::Running {
+            // `subject` is the Phase-6 thought-subject seam (wins over the lull
+            // phrase when `Some`); `tokens` is left `None` to avoid per-frame
+            // jitter.
+            let state = SpinnerState {
+                subject: subject.as_deref(),
+                receiving,
+                ..SpinnerState::default()
+            };
+            spinner_line(anim, state, width, theme)
+        } else {
+            Vec::new()
+        };
+        append_live(&mut lines, &spinner);
+    }
+    lines
+}
+
+/// Draws the pending body starting AT an explicit high-water mark `hw`: it emits
+/// the uncommitted settled tail `items[hw..]` plus the live stream, bottom-
+/// anchored and top-clipped (ADR-0046). [`render_pending_body`] calls this with
+/// the store's live
+/// [`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water)
+/// (committed items are already in native scrollback); passing `0` draws the
+/// WHOLE settled transcript, which is what a headless test wants to see on a
+/// TestBackend that has no real scrollback.
+fn render_pending_body_at(
+    frame: &mut Frame,
+    area: Rect,
+    params: &mut PendingBodyParams<'_>,
+    theme: &Theme,
+    hw: usize,
+) -> usize {
+    let content_area = Rect {
+        x: area.x + CONTENT_MARGIN,
+        width: area.width.saturating_sub(2 * CONTENT_MARGIN),
+        ..area
     };
-    append_live(&mut lines, &spinner);
+    // Operation (IOSP): assemble the FULL, unclamped pending body once; the draw
+    // below only anchors/clips it. Ctrl-S's peek blits this SAME line set
+    // (ADR-0046, [`pending_body_lines`]).
+    let lines = pending_body_lines(params, theme, hw, content_area.width);
 
     // Integration (IOSP): compute the anchor/clip geometry in the pure
     // [`anchor_clip`] operation, then only issue the draw calls.
@@ -701,9 +762,12 @@ fn anchor_clip(total_lines: usize, area: Rect, content_area: Rect) -> PendingCli
 }
 
 /// Draws the `… Ctrl-S to show more` overflow marker (ADR-0046, qwen's
-/// `ShowMoreLines`) on the reserved top row. Ctrl-S expand handling is deferred -
-/// Phase 1 wires the marker + clip only.
-// TODO(ADR-0046): Ctrl-S to flip an expanded, unclamped one-shot view.
+/// `ShowMoreLines`) on the reserved top row. Ctrl-S is wired: it blits the FULL,
+/// unclamped body into scrollback as a non-committing peek ([`Effect::PeekPending`]
+/// / [`render_pending_peek`]) - the fixed inline viewport cannot grow, so the
+/// clipped rows are revealed ABOVE the live region rather than in place.
+///
+/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
 fn draw_overflow_marker(frame: &mut Frame, area: Rect, theme: &Theme) {
     let marker_style = Style::default()
         .fg(tui_color(theme.muted))
@@ -1343,7 +1407,7 @@ const COST_HIDDEN: f64 = 0.0;
 const MILLIS_PER_SEC: u64 = 1_000;
 
 /// The number of priority tiers in the status-bar segment drop policy.
-const DROP_TIER_COUNT: usize = 7;
+const DROP_TIER_COUNT: usize = 6;
 
 /// Brings the [`RenderCache`] up to date with `screen`'s Transcript at
 /// `content_width` (ADR-0046): the adapter's public door onto the cache's
@@ -1351,7 +1415,7 @@ const DROP_TIER_COUNT: usize = 7;
 /// at the SAME content width the committed slice draws at (frame width minus
 /// the two `CONTENT_MARGIN` columns) before measuring and blitting - keeping
 /// measure == draw
-/// (ADR-0029). The [`Toggles`] mirror the Screen's Ctrl-T/Ctrl-O flags.
+/// (ADR-0029). The [`Toggles`] mirror the Screen's Ctrl+O compact flag.
 pub fn sync_commit_cache(
     cache: &mut RenderCache,
     screen: &Screen,
@@ -1361,8 +1425,7 @@ pub fn sync_commit_cache(
     cache.sync(
         screen.transcript(),
         Toggles {
-            thinking_expanded: screen.thinking_expanded,
-            tools_expanded: screen.tools_expanded,
+            compact: screen.compact_mode,
         },
         content_width,
         theme,
@@ -1410,7 +1473,6 @@ pub struct CommittedSlice<'a> {
 /// caller sizes `buf` to [`commit_slice_height`], and a slice taller than the
 /// terminal scrolls whole into native scrollback (no clamp, qwen `<Static>`).
 pub fn render_committed_slice(buf: &mut Buffer, slice: &CommittedSlice<'_>) {
-    let content_x = buf.area.x + CONTENT_MARGIN;
     let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
     let lines = grouped_rows(
         slice.cache,
@@ -1419,9 +1481,21 @@ pub fn render_committed_slice(buf: &mut Buffer, slice: &CommittedSlice<'_>) {
         content_width,
         slice.theme,
     );
+    blit_body_lines(buf, lines);
+}
+
+/// Renders an already-assembled body line set into `buf`'s content column
+/// ([`CONTENT_MARGIN`] columns in, matching qwen `marginLeft:2`), sized to its own
+/// wrapped height so a stack taller than `buf` scrolls whole into native
+/// scrollback (no clamp, qwen `<Static>`). The ONE `insert_before` blit shared by
+/// the committed freeze ([`render_committed_slice`]) and the Ctrl-S peek
+/// ([`render_pending_peek`]) - both hand it their `grouped_rows` output, so the
+/// content-column geometry + wrap live in one place.
+fn blit_body_lines(buf: &mut Buffer, lines: Vec<Line<'static>>) {
+    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
     let height = wrapped_count(lines.clone(), content_width) as u16;
     let content_area = Rect {
-        x: content_x,
+        x: buf.area.x + CONTENT_MARGIN,
         y: buf.area.y,
         width: content_width,
         height,
@@ -1429,6 +1503,61 @@ pub fn render_committed_slice(buf: &mut Buffer, slice: &CommittedSlice<'_>) {
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .render(content_area, buf);
+}
+
+/// The Ctrl-S peek (ADR-0046, [`Effect::PeekPending`]): the whole pending body
+/// blitted UNCLAMPED into scrollback so the user can read the rows the live
+/// viewport top-clips away. Bundles the mutable cache the body's settled tail
+/// draws from, the `Screen` the pending items + live snapshot come from, the
+/// animation counters (so the reasoning/spinner match the live frame), and the
+/// ACTIVE theme the frozen rows bake. It renders at the LIVE high-water mark
+/// ([`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water),
+/// the same `hw` the live draw uses), so the peek is the live stack plus its
+/// clipped-off top, never the already-committed prefix (which is in scrollback).
+///
+/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
+pub struct PendingPeek<'a> {
+    pub cache: &'a mut RenderCache,
+    pub screen: &'a Screen,
+    pub anim: Anim,
+    pub theme: &'a Theme,
+}
+
+impl PendingPeek<'_> {
+    /// The full, unclamped pending body lines at content `width` and the live
+    /// high-water mark. Syncs the cache as a side effect (the settled tail draws
+    /// from it), exactly as the live body does.
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let hw = self.screen.transcript().committed_high_water();
+        let mut params = PendingBodyParams {
+            screen: self.screen,
+            cache: self.cache,
+            anim: self.anim,
+        };
+        pending_body_lines(&mut params, self.theme, hw, width)
+    }
+}
+
+/// The total wrapped height the Ctrl-S peek blits at `content_width` (ADR-0046):
+/// the wrapped-row count of the FULL, unclamped pending body. `0` means the body
+/// is empty and the adapter has nothing to peek. Mirrors [`commit_slice_height`].
+pub fn pending_peek_height(peek: &mut PendingPeek<'_>, content_width: u16) -> u16 {
+    let lines = peek.lines(content_width);
+    u16::try_from(wrapped_count(lines, content_width)).unwrap_or(u16::MAX)
+}
+
+/// Blits the FULL, UNCLAMPED pending body into `buf` (ADR-0046, the Ctrl-S peek's
+/// `insert_before` seam): the SAME line set the live body draws, but WITHOUT the
+/// `anchor_clip` top-clip, so every row the live viewport hides lands in
+/// scrollback for the user to scroll up to. The content sits `CONTENT_MARGIN`
+/// columns in (matching the live body + committed blit); the caller sizes `buf` to
+/// [`pending_peek_height`]. A PEEK, not a commit: the caller does NOT advance the
+/// high-water mark, so the same body redraws (clipped) in the live viewport next
+/// frame. Mirrors [`render_committed_slice`].
+pub fn render_pending_peek(buf: &mut Buffer, peek: &mut PendingPeek<'_>) {
+    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
+    let lines = peek.lines(content_width);
+    blit_body_lines(buf, lines);
 }
 
 /// The rolling reasoning tail shown while a Run streams: an animated
@@ -2221,24 +2350,10 @@ fn thinking_style(theme: &Theme) -> Style {
 
 /// A settled Thinking item's lines (qwen `ThinkMessage`, ConversationMessages.tsx
 /// :250): the grey `✦` U+2726 marker + grey markdown body, hung under the 2-col
-/// prefix. Collapsed (Ctrl-O off) shows a one-line grey form so a long settled
-/// thought never fills the viewport; expanded shows the full grey body.
-fn settled_thinking_lines(
-    text: &str,
-    thinking_expanded: bool,
-    content_width: u16,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    if !thinking_expanded {
-        let budget = (content_width as usize).saturating_sub(PREFIX_WIDTH).max(1);
-        return vec![Line::from(vec![
-            Span::styled("✦ ", thinking_style(theme)),
-            Span::styled(
-                truncate_visual(first_line(text), budget),
-                thinking_style(theme),
-            ),
-        ])];
-    }
+/// prefix. qwen has NO per-thought collapse - a thought either shows in full or
+/// is hidden entirely by compact mode (the show/hide decision is the caller's,
+/// ADR-0052), so this always renders the full grey body.
+fn settled_thinking_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     prefixed_markdown_lines(
         "✦",
         thinking_style(theme),
@@ -2274,14 +2389,14 @@ fn recolor_line(line: Line<'static>, style: Style) -> Line<'static> {
 // intersecting the window.
 // ---------------------------------------------------------------------------
 
-/// The two detail-on-demand display toggles the settled lines are built with:
-/// Ctrl-T (Thinking) and Ctrl-O (tool Blocks). Carried as named fields - never
-/// a position-coupled pair of bools, the same rule as [`ConnectionFacts`] -
-/// because two adjacent `bool` parameters swap without a type error.
+/// The single detail-on-demand display toggle the settled lines are built with:
+/// compact mode (Ctrl+O, qwen `compactMode`, ADR-0052). `compact == true` hides
+/// settled Thinking items entirely and folds tool result bodies to their header
+/// rows. Named field (not a bare `bool` parameter) so the cache key reads at
+/// every call site and a future second display fact has an obvious home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Toggles {
-    pub(crate) thinking_expanded: bool,
-    pub(crate) tools_expanded: bool,
+    pub(crate) compact: bool,
 }
 
 pub use render_cache::RenderCache;
@@ -2387,13 +2502,7 @@ mod render_cache {
                 self.revision = t.revision();
             }
             for item in &t.items()[self.items.len()..] {
-                let lines = message_lines(
-                    item,
-                    toggles.thinking_expanded,
-                    toggles.tools_expanded,
-                    width,
-                    theme,
-                );
+                let lines = message_lines(item, toggles.compact, width, theme);
                 // Per-item separators are added at assembly (`grouped_rows`
                 // interleaves a blank `separator_row`, qwen `marginTop:1`), not
                 // baked into each cached item - so the cache holds only the
@@ -2611,18 +2720,13 @@ fn wrapped_count(lines: Vec<Line<'static>>, width: u16) -> usize {
 /// The lines one Transcript item renders as. `Diff` is the first-class rich item
 /// of the semantic display vocabulary (ADR-0008): a titled diff whose lines take
 /// a semantic tint from their [`DiffSide`]'s Theme slots and a syntect foreground.
-/// `thinking_expanded` (Ctrl-T, the core's `Transcript::thinking_expanded`)
-/// picks the collapsed one-liner or the full text for settled `Thinking` items;
-/// `tools_expanded` (Ctrl-O, the core's `Transcript::tools_expanded`) does the
-/// same for a multi-line `Diff` body - the same detail-on-demand rule applied to
-/// the machinery plane. `content_width`
-/// is the `content_area` width the lines draw in - the collapsed Thinking
-/// one-liner truncates to it so it stays one visual row (a long newline-free
-/// thought otherwise soft-wraps to many).
+/// `compact` (Ctrl+O, qwen `compactMode`, the core's `Screen::compact_mode`) hides
+/// settled `Thinking` items ENTIRELY and folds a tool RESULT body (a multi-line
+/// `Diff`, or a `Todo` checklist) to its header row - keeping the transcript terse
+/// (ADR-0052). `content_width` is the `content_area` width the lines draw in.
 fn message_lines(
     item: &TranscriptItem,
-    thinking_expanded: bool,
-    tools_expanded: bool,
+    compact: bool,
     content_width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -2645,19 +2749,25 @@ fn message_lines(
         }
         // Settled Thinking (qwen `ThinkMessage`, ConversationMessages.tsx:250):
         // the same `✦` U+2726 marker but `text.secondary` (grey) for BOTH glyph
-        // and body. Ctrl-T collapse keeps a one-line settled form; expanded is
-        // the full grey body. Delegated so the toggle branch stays off this fold.
+        // and body. Compact mode HIDES it entirely (qwen `!compactMode`, ADR-0052:
+        // show/hide, never a collapsed one-liner); otherwise the full grey body.
         TranscriptItem::Thinking { text } => {
-            settled_thinking_lines(text, thinking_expanded, content_width, theme)
+            if compact {
+                Vec::new()
+            } else {
+                settled_thinking_lines(text, theme)
+            }
         }
         // Tool items render INSIDE the group box (qwen `ToolGroupMessage`); their
         // INNER content is built here at the box's inner width and wrapped with
         // borders at assembly by [`grouped_rows`]. Reached only via that path.
+        // Under compact the RESULT body folds to the header row (qwen
+        // `!compactMode || forceShowResult`).
         TranscriptItem::ToolCall { .. }
         | TranscriptItem::ToolResult { .. }
         | TranscriptItem::Diff { .. }
         | TranscriptItem::Todo { .. } => {
-            tool_inner_lines(item, tools_expanded, tool_inner_width(content_width), theme)
+            tool_inner_lines(item, compact, tool_inner_width(content_width), theme)
         }
         // Info/notification (qwen `InfoMessage`, StatusMessages.tsx:64): the `●`
         // U+25CF prefix `text.primary`, body `text.primary`, hanging under a
@@ -2801,11 +2911,12 @@ fn is_tool_item(item: &TranscriptItem) -> bool {
 /// header row (`marker + bold name + dim desc`, truncate-end) for a call/result,
 /// or an indented result body (the diff, indented under the marker column) for a
 /// Diff. Every produced [`Line`] is `<= inner_width` columns so the box wrapper
-/// never re-breaks it (measure==draw, ADR-0029). `tools_expanded` (Ctrl-O) keeps
-/// a Diff body from folding to its title one-liner.
+/// never re-breaks it (measure==draw, ADR-0029). `compact` (Ctrl+O, qwen
+/// `compactMode`) folds a tool RESULT body (the `Diff` body, the `Todo`
+/// checklist) to its header row, keeping the transcript terse (ADR-0052).
 fn tool_inner_lines(
     item: &TranscriptItem,
-    tools_expanded: bool,
+    compact: bool,
     inner_width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -2837,14 +2948,14 @@ fn tool_inner_lines(
                 theme,
             )]
         }
-        // A Diff renders its title header row then, unless folded, its body
-        // indented under the marker column (delegated so the toggle branch does
+        // A Diff renders its title header row then, unless folded by compact, its
+        // body indented under the marker column (delegated so the fold branch does
         // not add to this dispatch's logic).
-        TranscriptItem::Diff { .. } => tool_diff_lines(item, tools_expanded, inner_width, theme),
+        TranscriptItem::Diff { .. } => tool_diff_lines(item, compact, inner_width, theme),
         // A Todo renders a clean `✓ todo_write` header (no key_arg, so the raw
         // JSON args are gone STRUCTURALLY) then the circle checklist indented
-        // under the marker column.
-        TranscriptItem::Todo { items } => tool_todo_lines(items, inner_width, theme),
+        // under the marker column - folded away to the header under compact.
+        TranscriptItem::Todo { items } => tool_todo_lines(items, compact, inner_width, theme),
         _ => Vec::new(),
     }
 }
@@ -2887,7 +2998,12 @@ fn confirming_inner_lines(
 /// so every produced row is `<= inner_width` columns (measure==draw, ADR-0029).
 ///
 /// [`Todo`]: TranscriptItem::Todo
-fn tool_todo_lines(items: &[TodoItem], inner_width: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn tool_todo_lines(
+    items: &[TodoItem],
+    compact: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut out = vec![tool_header_row(
         tool_marker(ToolMarker::Success, "todo_write", theme),
         "todo_write",
@@ -2895,6 +3011,11 @@ fn tool_todo_lines(items: &[TodoItem], inner_width: u16, theme: &Theme) -> Vec<L
         inner_width,
         theme,
     )];
+    // Compact folds the checklist body away (qwen `!compactMode`), keeping only
+    // the header row (ADR-0052).
+    if compact {
+        return out;
+    }
     let content_width = inner_width
         .saturating_sub(STATUS_INDICATOR_WIDTH as u16)
         .max(1) as usize;
@@ -2934,13 +3055,13 @@ fn todo_item_rows(item: &TodoItem, content_width: usize, theme: &Theme) -> Vec<L
     out
 }
 
-/// A Diff tool item's inner box lines: the folded one-liner (Ctrl-O off on a
+/// A Diff tool item's inner box lines: the folded one-liner (compact on a
 /// foldable body), or the `diff` header row + the diff body (each row indented
 /// under the marker column) + the elided tail. Split out of [`tool_inner_lines`]
 /// so its fold branch stays off that dispatch. Panics on a non-Diff item.
 fn tool_diff_lines(
     item: &TranscriptItem,
-    tools_expanded: bool,
+    compact: bool,
     inner_width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -2953,7 +3074,7 @@ fn tool_diff_lines(
     else {
         return Vec::new();
     };
-    if !tools_expanded && item.has_foldable_body() {
+    if compact && item.has_foldable_body() {
         return vec![tool_diff_fold_row(title, inner_width, theme)];
     }
     let body_width = inner_width
@@ -3872,20 +3993,13 @@ pub enum StatusSegment {
         /// The Active Model identifier.
         model: String,
     },
-    /// The Ctrl-T Thinking-expansion state. Carries the boolean meaning; the
-    /// `▾`/`▸` marker is chosen by the painter. Always assembled so the toggle
-    /// has feedback even when no Thinking items are on screen.
-    Thinking {
-        /// Whether settled Thinking items are currently expanded.
-        expanded: bool,
-    },
-    /// The Ctrl-O tool-Block-expansion state. Carries the boolean meaning; the
-    /// `▾`/`▸` marker is chosen by the painter. Always assembled - the twin of
-    /// `Thinking` - so the toggle has feedback even when no Blocks are on
-    /// screen.
-    Tools {
-        /// Whether settled tool Blocks are currently expanded.
-        expanded: bool,
+    /// The Ctrl+O compact-mode state (qwen `compactMode`, ADR-0052). Carries the
+    /// boolean meaning; the `▾`/`▸` marker is chosen by the painter. Always
+    /// assembled so the toggle has feedback even when nothing compact-affected is
+    /// on screen.
+    Compact {
+        /// Whether compact mode is currently on (thinking + tool bodies hidden).
+        compact: bool,
     },
     /// The Session's cumulative dollar cost (ADR-0037: Catalog pricing,
     /// surfaced display-side). Carries the pre-formatted label (the pure
@@ -3942,8 +4056,7 @@ impl StatusSegment {
             StatusSegment::Mode(ModeState::Running) => SegmentKind::ModeRunning,
             StatusSegment::Connection { .. } => SegmentKind::Connection,
             StatusSegment::Model { .. } => SegmentKind::Model,
-            StatusSegment::Thinking { .. } => SegmentKind::Thinking,
-            StatusSegment::Tools { .. } => SegmentKind::Tools,
+            StatusSegment::Compact { .. } => SegmentKind::Compact,
             StatusSegment::Cost { .. } => SegmentKind::Cost,
             StatusSegment::Tokens { level, .. } => SegmentKind::Tokens(*level),
             StatusSegment::Context { over_limit, .. } => SegmentKind::Context {
@@ -4039,24 +4152,22 @@ pub struct StatusBar {
 
 impl StatusBar {
     /// Drops segments until the bar fits `width`, lowest-value first:
-    /// connection, then model, then tools, then thinking, then cost, then
+    /// connection, then model, then compact, then context, then cost, then
     /// tokens - mode and position survive longest. Connection (the endpoint)
     /// drops BEFORE model: the endpoint is a fixed, knowable fact, while the
     /// model is what the user actively changes via `/model`, so the model
-    /// earns the scarcer columns. Tools drops before thinking (both are the
-    /// same detail-on-demand class; thinking is the older, more-referenced
-    /// affordance). Cost drops before tokens: tokens carry the pressure level
-    /// the operator steers by. Which segments to show at a given width is a
-    /// SEMANTIC decision, so it lives here in the pure layer; the width
-    /// arithmetic reads each segment's own [`StatusSegment::cells`]. Simple on
-    /// purpose: a partially-truncated segment would garble the powerline
-    /// blocks.
+    /// earns the scarcer columns. Compact (the detail-on-demand toggle) drops
+    /// after model but before the figures. Cost drops before tokens: tokens
+    /// carry the pressure level the operator steers by. Which segments to show
+    /// at a given width is a SEMANTIC decision, so it lives here in the pure
+    /// layer; the width arithmetic reads each segment's own
+    /// [`StatusSegment::cells`]. Simple on purpose: a partially-truncated
+    /// segment would garble the powerline blocks.
     fn fit(mut self, width: usize) -> StatusBar {
         let drop_order: [fn(&StatusSegment) -> bool; DROP_TIER_COUNT] = [
             |s| matches!(s, StatusSegment::Connection { .. }),
             |s| matches!(s, StatusSegment::Model { .. }),
-            |s| matches!(s, StatusSegment::Tools { .. }),
-            |s| matches!(s, StatusSegment::Thinking { .. }),
+            |s| matches!(s, StatusSegment::Compact { .. }),
             // Context is a derived convenience figure over the same token facts,
             // so it drops before the cost and raw-token figures.
             |s| matches!(s, StatusSegment::Context { .. }),
@@ -4166,14 +4277,9 @@ pub(crate) fn status_bar(width: usize, view: StatusBarView<'_>) -> StatusBar {
         left.push(StatusSegment::ApprovalModeHint);
     }
 
-    let mut right = vec![
-        StatusSegment::Thinking {
-            expanded: toggles.thinking_expanded,
-        },
-        StatusSegment::Tools {
-            expanded: toggles.tools_expanded,
-        },
-    ];
+    let mut right = vec![StatusSegment::Compact {
+        compact: toggles.compact,
+    }];
     if let Some(TokenView { estimate, level }) = figures.tokens {
         right.push(StatusSegment::Tokens { estimate, level });
         // The context-usage figure (qwen `ContextUsageDisplay`, ADR-0048): shown
@@ -4217,13 +4323,10 @@ pub enum SegmentKind {
     /// `model · <id>` - the Active Model (ADR-0033), styled like the endpoint
     /// since both are connection facts.
     Model,
-    /// The Ctrl-T thinking-expansion state (`▾`/`▸`). Always visible so the
-    /// toggle has feedback even when no Thinking items are on screen.
-    Thinking,
-    /// The Ctrl-O tool-Block-expansion state (`▾`/`▸`). Always visible so the
-    /// toggle has feedback even when no Blocks are on screen - the twin of
-    /// `Thinking`.
-    Tools,
+    /// The Ctrl+O compact-mode state (`▾`/`▸`, qwen `compactMode`, ADR-0052).
+    /// Always visible so the toggle has feedback even when nothing
+    /// compact-affected is on screen.
+    Compact,
     /// The Session's cumulative dollar cost (ADR-0037) - a quiet figure like
     /// tokens at `Ok` pressure. Present only once a priced Response landed.
     Cost,
@@ -4257,13 +4360,9 @@ impl StatusSegment {
             StatusSegment::Mode(ModeState::Idle) => " ○ ".to_string(),
             StatusSegment::Connection { base_url } => padded(&format!("suspenders · {base_url}")),
             StatusSegment::Model { model } => padded(&format!("model · {model}")),
-            StatusSegment::Thinking { expanded } => {
-                let marker = if *expanded { "▾" } else { "▸" };
-                padded(&format!("{marker} thinking"))
-            }
-            StatusSegment::Tools { expanded } => {
-                let marker = if *expanded { "▾" } else { "▸" };
-                padded(&format!("{marker} tools"))
+            StatusSegment::Compact { compact } => {
+                let marker = if *compact { "▾" } else { "▸" };
+                padded(&format!("{marker} compact"))
             }
             StatusSegment::Cost { label } => padded(label),
             StatusSegment::Tokens { estimate, .. } => tokens_label(*estimate),
@@ -4325,8 +4424,7 @@ pub(crate) fn render_status_bar(
             status: t.status,
             conn,
             toggles: Toggles {
-                thinking_expanded: t.thinking_expanded,
-                tools_expanded: t.tools_expanded,
+                compact: t.compact_mode,
             },
             figures: FigureView {
                 tokens: t.token_estimate.map(|estimate| TokenView {
@@ -4658,10 +4756,6 @@ fn tool_desc(key_arg: Option<&str>, summary: &str) -> String {
         Some(arg) => format!("{arg} · {summary}"),
         None => summary.to_string(),
     }
-}
-
-fn first_line(text: &str) -> &str {
-    text.split('\n').next().unwrap_or("")
 }
 
 /// Wraps `label` in a single space on each side: `" {label} "`. The ONE
@@ -5029,11 +5123,7 @@ mod tests {
             plain(Color::Rgb(150, 160, 185), Color::Rgb(52, 58, 82))
         );
         assert_eq!(
-            segment_style(SegmentKind::Thinking, t),
-            plain(Color::DarkGray, Color::Rgb(40, 44, 58))
-        );
-        assert_eq!(
-            segment_style(SegmentKind::Tools, t),
+            segment_style(SegmentKind::Compact, t),
             plain(Color::DarkGray, Color::Rgb(40, 44, 58))
         );
         assert_eq!(
@@ -5470,8 +5560,7 @@ mod tests {
         assert_eq!(
             kinds(&bar.right),
             vec![
-                SegmentKind::Thinking,
-                SegmentKind::Tools,
+                SegmentKind::Compact,
                 SegmentKind::Tokens(PressureLevel::Ok),
                 SegmentKind::Cost,
                 SegmentKind::Position,
@@ -5482,15 +5571,16 @@ mod tests {
 
     #[test]
     fn a_narrow_bar_drops_the_connection_then_the_model_segment() {
-        // At 70 cols the endpoint drops first (lowest value), then the model -
-        // both connection facts leave before mode/position/tokens/cost.
-        let bar = bar_at(70);
+        // At 66 cols the endpoint drops first (lowest value), then the model -
+        // both connection facts leave before mode/position/tokens/cost. (The
+        // threshold sits lower than it once did: collapsing the two toggles into
+        // one compact segment freed a segment's worth of columns, ADR-0052.)
+        let bar = bar_at(66);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
             kinds(&bar.right),
             vec![
-                SegmentKind::Thinking,
-                SegmentKind::Tools,
+                SegmentKind::Compact,
                 SegmentKind::Tokens(PressureLevel::Ok),
                 SegmentKind::Cost,
                 SegmentKind::Position,
@@ -5499,9 +5589,9 @@ mod tests {
     }
 
     #[test]
-    fn a_narrower_bar_drops_thinking_then_cost_then_tokens() {
-        // At 45 cols both toggles are gone but the figures survive - cost
-        // outlives thinking in the drop order.
+    fn a_narrower_bar_drops_compact_then_cost_then_tokens() {
+        // At 45 cols the compact toggle is gone but the figures survive - cost
+        // outlives compact in the drop order.
         let bar = bar_at(45);
         assert_eq!(kinds(&bar.left), vec![SegmentKind::ModeRunning]);
         assert_eq!(
@@ -5559,66 +5649,32 @@ mod tests {
     }
 
     #[test]
-    fn the_thinking_segment_carries_the_ctrl_t_state() {
-        // The MEANING (expanded true/false) is a semantic fact; the ▾/▸ marker
+    fn the_compact_segment_carries_the_ctrl_o_state() {
+        // The MEANING (compact true/false) is a semantic fact; the ▾/▸ marker
         // it paints to is a drawing detail asserted separately below.
-        let find_thinking = |expanded: bool| {
-            idle_wide_bar(Toggles {
-                thinking_expanded: expanded,
-                tools_expanded: false,
-            })
-            .right
-            .into_iter()
-            .find(|s| matches!(s, StatusSegment::Thinking { .. }))
-            .expect("thinking segment is always assembled")
+        let find_compact = |compact: bool| {
+            idle_wide_bar(Toggles { compact })
+                .right
+                .into_iter()
+                .find(|s| matches!(s, StatusSegment::Compact { .. }))
+                .expect("compact segment is always assembled")
         };
+        assert_eq!(find_compact(true), StatusSegment::Compact { compact: true });
         assert_eq!(
-            find_thinking(true),
-            StatusSegment::Thinking { expanded: true }
-        );
-        assert_eq!(
-            find_thinking(false),
-            StatusSegment::Thinking { expanded: false }
+            find_compact(false),
+            StatusSegment::Compact { compact: false }
         );
     }
 
     #[test]
-    fn the_thinking_marker_paints_from_its_state() {
+    fn the_compact_marker_paints_from_its_state() {
         assert_eq!(
-            StatusSegment::Thinking { expanded: true }.paint(),
-            " ▾ thinking "
+            StatusSegment::Compact { compact: true }.paint(),
+            " ▾ compact "
         );
         assert_eq!(
-            StatusSegment::Thinking { expanded: false }.paint(),
-            " ▸ thinking "
-        );
-    }
-
-    #[test]
-    fn the_tools_segment_carries_the_ctrl_o_state() {
-        // The twin of the thinking segment for the machinery plane: the MEANING
-        // (expanded true/false) is the semantic fact; the ▾/▸ marker is a
-        // drawing detail asserted separately below.
-        let find_tools = |expanded: bool| {
-            idle_wide_bar(Toggles {
-                thinking_expanded: false,
-                tools_expanded: expanded,
-            })
-            .right
-            .into_iter()
-            .find(|s| matches!(s, StatusSegment::Tools { .. }))
-            .expect("tools segment is always assembled")
-        };
-        assert_eq!(find_tools(true), StatusSegment::Tools { expanded: true });
-        assert_eq!(find_tools(false), StatusSegment::Tools { expanded: false });
-    }
-
-    #[test]
-    fn the_tools_marker_paints_from_its_state() {
-        assert_eq!(StatusSegment::Tools { expanded: true }.paint(), " ▾ tools ");
-        assert_eq!(
-            StatusSegment::Tools { expanded: false }.paint(),
-            " ▸ tools "
+            StatusSegment::Compact { compact: false }.paint(),
+            " ▸ compact "
         );
     }
 
@@ -5627,11 +5683,7 @@ mod tests {
         let bar = idle_wide_bar(Toggles::default());
         assert_eq!(
             kinds(&bar.right),
-            vec![
-                SegmentKind::Thinking,
-                SegmentKind::Tools,
-                SegmentKind::Position
-            ]
+            vec![SegmentKind::Compact, SegmentKind::Position]
         );
     }
 
@@ -5947,8 +5999,7 @@ mod tests {
             SegmentKind::ModeRunning,
             SegmentKind::Connection,
             SegmentKind::Model,
-            SegmentKind::Thinking,
-            SegmentKind::Tools,
+            SegmentKind::Compact,
             SegmentKind::Cost,
             SegmentKind::Tokens(PressureLevel::Ok),
             SegmentKind::Tokens(PressureLevel::Elevated),
@@ -6009,34 +6060,29 @@ mod tests {
     }
 
     #[test]
-    fn cache_sync_rebuilds_when_the_thinking_toggle_flips() {
+    fn cache_sync_rebuilds_when_compact_hides_a_thought() {
+        // Compact mode (Ctrl+O) HIDES a settled Thinking item entirely (qwen
+        // `!compactMode`, ADR-0052); the default shows the full grey body.
         let mut t = fresh_transcript();
         t.push(TranscriptItem::Thinking {
             text: "line one\nline two".to_string(),
         });
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // Collapsed one-liner, dense (no per-item blank separator).
-        assert_eq!(cache.settled().next().unwrap().0.len(), 1);
-        cache.sync(
-            &t,
-            Toggles {
-                thinking_expanded: true,
-                ..Toggles::default()
-            },
-            80,
-            theme::dark(),
-        );
-        // The grey `✦`-prefixed markdown body (two source rows → two rows).
+        // Default (compact=false): the grey `✦`-prefixed markdown body (two
+        // source rows → two rows).
         assert_eq!(cache.settled().next().unwrap().0.len(), 2);
+        cache.sync(&t, Toggles { compact: true }, 80, theme::dark());
+        // Compact: the thought is hidden entirely - zero lines.
+        assert_eq!(cache.settled().next().unwrap().0.len(), 0);
     }
 
     #[test]
-    fn cache_sync_rebuilds_when_the_tools_toggle_flips() {
-        // The Ctrl-O twin of the thinking-toggle test: a multi-line Diff folds
-        // to a single title line when collapsed and to the full body when
-        // expanded, and flipping the toggle clears the cache so the change
-        // takes effect. Separators are added at assembly, not baked per item.
+    fn cache_sync_rebuilds_when_compact_folds_a_tool_body() {
+        // Compact folds a multi-line Diff to a single title line (qwen
+        // `!compactMode || forceShowResult`); the default shows the full body.
+        // Flipping the toggle clears the cache so the change takes effect.
+        // Separators are added at assembly, not baked per item.
         let mut t = fresh_transcript();
         t.push(diff_item(
             "edit_file src/foo.rs",
@@ -6046,23 +6092,16 @@ mod tests {
             ],
         ));
         let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), 80, theme::dark());
-        // Collapsed: one fold row (3-wide marker gutter + title + affordance).
+        cache.sync(&t, Toggles { compact: true }, 80, theme::dark());
+        // Compact: one fold row (3-wide marker gutter + title + affordance).
         let collapsed = cache.settled().next().unwrap().0;
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]).trim_start(),
             "edit_file src/foo.rs · ^O expand"
         );
-        cache.sync(
-            &t,
-            Toggles {
-                tools_expanded: true,
-                ..Toggles::default()
-            },
-            80,
-            theme::dark(),
-        );
+        // The default (compact=false) shows the full body.
+        cache.sync(&t, Toggles::default(), 80, theme::dark());
         // The tool header row + both diff body rows.
         let expanded = cache.settled().next().unwrap().0;
         assert_eq!(expanded.len(), 3);
@@ -6133,7 +6172,7 @@ mod tests {
         };
         // The INNER box content (qwen `ToolInfo`): the 3-wide `✓` marker gutter,
         // the bold name, then the dim `arg · result` description.
-        let lines = message_lines(&item, false, false, 80, theme::dark());
+        let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "✓  read_file src/foo.rs · 340 lines");
     }
@@ -6148,7 +6187,7 @@ mod tests {
             is_error: false,
             key_arg: None,
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
+        let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(line_text(&lines[0]), "✓  run_command injected");
     }
 
@@ -6162,7 +6201,7 @@ mod tests {
             is_error: true,
             key_arg: Some("cargo test".to_string()),
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
+        let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(line_text(&lines[0]), "x  run_command cargo test · exit 1");
     }
 
@@ -6174,7 +6213,7 @@ mod tests {
             is_error: true,
             key_arg: Some("src/foo.rs".to_string()),
         };
-        let lines = message_lines(&item, false, false, 80, theme::dark());
+        let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(
             line_text(&lines[0]),
             "x  edit_file src/foo.rs · old_str not found"
@@ -6200,7 +6239,7 @@ mod tests {
                 text: "harness marker".to_string(),
                 tone,
             };
-            let lines = message_lines(&item, false, false, 80, theme);
+            let lines = message_lines(&item, false, 80, theme);
             assert_eq!(lines.len(), 1);
             assert_eq!(
                 line_text(&lines[0]),
@@ -6248,16 +6287,16 @@ mod tests {
                 DiffLine::new(DiffSide::Removed, "old"),
             ],
         );
-        // Collapsed (tools_expanded = false): one fold row (3-wide marker gutter +
-        // the title and the `· ^O expand` affordance).
-        let collapsed = message_lines(&diff, false, false, 80, theme::dark());
+        // Compact (folds the body): one fold row (3-wide marker gutter + the
+        // title and the `· ^O expand` affordance).
+        let collapsed = message_lines(&diff, true, 80, theme::dark());
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]).trim_start(),
             "edit_file src/foo.rs (+1 -1) · ^O expand"
         );
-        // Expanded: the tool header row + both body rows.
-        let expanded = message_lines(&diff, false, true, 80, theme::dark());
+        // Default (compact=false): the tool header row + both body rows.
+        let expanded = message_lines(&diff, false, 80, theme::dark());
         assert_eq!(expanded.len(), 3);
     }
 
@@ -6667,16 +6706,11 @@ mod tests {
         for width in [10u16, 24, 80] {
             let per_item: usize = items
                 .iter()
-                .map(|item| {
-                    wrapped_count(
-                        message_lines(item, false, false, width, theme::dark()),
-                        width,
-                    )
-                })
+                .map(|item| wrapped_count(message_lines(item, false, width, theme::dark()), width))
                 .sum();
             let whole: Vec<Line> = items
                 .iter()
-                .flat_map(|item| message_lines(item, false, false, width, theme::dark()))
+                .flat_map(|item| message_lines(item, false, width, theme::dark()))
                 .collect();
             assert_eq!(per_item, wrapped_count(whole, width), "width {width}");
         }
@@ -6812,8 +6846,7 @@ mod tests {
         cache.sync(
             screen.transcript(),
             Toggles {
-                thinking_expanded: screen.thinking_expanded,
-                tools_expanded: screen.tools_expanded,
+                compact: screen.compact_mode,
             },
             content_width,
             theme,
@@ -6836,9 +6869,14 @@ mod tests {
             theme,
             approving: approving.as_ref(),
         });
-        // Add the live stream rows the body would append.
+        // Add the live stream rows the body would append. Compact suppresses the
+        // live thinking tail (matching `render_pending_body_at`).
         let thinking = screen.transcript().streaming_thinking();
-        let thinking_lines = live_thinking_lines(&thinking, 0, content_width, theme);
+        let thinking_lines = if screen.compact_mode {
+            Vec::new()
+        } else {
+            live_thinking_lines(&thinking, 0, content_width, theme)
+        };
         append_live(&mut lines, &thinking_lines);
         if let Some((tail, _)) = cache.streaming_tail() {
             append_live(&mut lines, tail);
@@ -7087,6 +7125,59 @@ mod tests {
         );
     }
 
+    // The identity holds UNDER COMPACT too (ADR-0052): with compact on, both the
+    // committed blit and the pending body hide thoughts + fold tool bodies through
+    // the SAME `message_lines` compact branch, so a RedrawScrollback re-blit at the
+    // new compact matches the pending region cell-for-cell (no split-brain in what
+    // each path chooses to draw).
+    #[test]
+    fn the_committed_slice_equals_the_pending_body_under_compact() {
+        // A compact Screen (Ctrl+O flipped on). `demo()` carries thoughts + a tool
+        // run, so compact actually changes the rows both paths emit.
+        let (screen, _) = Screen::demo().handle_key(crate::ui::screen::Key::ToggleCompact);
+        assert!(screen.compact_mode, "the demo screen is now compact");
+        let width: u16 = 100;
+        let count = screen.transcript().items().len();
+
+        // (a) The committed slice `[0, count)` at compact = true.
+        let content_width = width - 2 * CONTENT_MARGIN;
+        let mut commit_cache = RenderCache::new();
+        commit_cache.sync(
+            screen.transcript(),
+            Toggles { compact: true },
+            content_width,
+            theme::dark(),
+        );
+        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
+        let height = slice_height(&commit_cache, &items, 0, count, content_width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
+        blit_slice(&mut buf, &commit_cache, &items, 0, count);
+        let committed = commit_buffer_text(&buf);
+
+        // (b) The pending body (which reads `screen.compact_mode`) over the same
+        // prefix, top-aligned.
+        let terminal = draw_viewport(width, height.max(1), &screen);
+        let pending: String = (0..height.max(1))
+            .map(|y| row_text(&terminal, y).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let committed_trimmed: String = committed
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed_trimmed, pending,
+            "committed and pending must match under compact (no seam reflow)"
+        );
+        // Compact genuinely hid the thoughts: the demo's reasoning text is gone.
+        assert!(
+            !committed_trimmed.contains("The user wants me to evaluate"),
+            "compact hid the settled thoughts:\n{committed_trimmed}"
+        );
+    }
+
     // --- tool-group box (ADR-0047): grouping fold + border rigidity ----------
 
     /// A store carrying an assistant line, a two-tool run (a call + a result),
@@ -7175,7 +7266,7 @@ mod tests {
             todo("edit the file", InProgress),
             todo("build", Pending),
         ];
-        let lines = tool_todo_lines(&items, 40, theme::dark());
+        let lines = tool_todo_lines(&items, false, 40, theme::dark());
         let text: Vec<String> = lines.iter().map(line_text).collect();
 
         // A clean `✓ todo_write` header with NO raw JSON args (the key_arg is
@@ -7197,6 +7288,23 @@ mod tests {
     }
 
     #[test]
+    fn tool_todo_lines_folds_to_header_only_under_compact() {
+        // Compact (Ctrl+O) folds the checklist body away (qwen `!compactMode`,
+        // ADR-0052): the header stays, the circle rows are gone. This pins the
+        // one display-hide branch of `tool_todo_lines` (compact=true), where the
+        // non-compact tests above exercise compact=false's full list.
+        use TodoStatus::{Completed, InProgress, Pending};
+        let items = vec![
+            todo("read the file", Completed),
+            todo("edit the file", InProgress),
+            todo("build", Pending),
+        ];
+        let lines = tool_todo_lines(&items, true, 40, theme::dark());
+        assert_eq!(lines.len(), 1, "only the header row survives under compact");
+        assert_eq!(line_text(&lines[0]), "✓  todo_write");
+    }
+
+    #[test]
     fn tool_todo_lines_colours_in_progress_green_and_strikes_completed() {
         use TodoStatus::{Completed, InProgress, Pending};
         let items = vec![
@@ -7204,7 +7312,7 @@ mod tests {
             todo("active item", InProgress),
             todo("later item", Pending),
         ];
-        let lines = tool_todo_lines(&items, 40, theme::dark());
+        let lines = tool_todo_lines(&items, false, 40, theme::dark());
 
         // in_progress reads success (green); completed is CROSSED_OUT and NOT
         // green (qwen colours completed Foreground); pending is plain.
@@ -7237,7 +7345,7 @@ mod tests {
             "a rather long todo item that must wrap onto several rows",
             TodoStatus::Pending,
         )];
-        let lines = tool_todo_lines(&items, inner, theme::dark());
+        let lines = tool_todo_lines(&items, false, inner, theme::dark());
         assert!(lines.len() > 2, "the long item wrapped: {}", lines.len());
         for line in &lines {
             assert!(
@@ -7667,10 +7775,8 @@ mod tests {
             }],
             elided: 0,
         });
-        let expanded = Toggles {
-            thinking_expanded: false,
-            tools_expanded: true,
-        };
+        // Not compact: the diff body shows in full.
+        let expanded = Toggles::default();
         assert_every_box_row_is_exactly_width(&t, expanded, &[24, 40, 60]);
     }
 
@@ -7780,7 +7886,7 @@ mod tests {
     // committed prefix wears. Asserted against the style HELPERS (not raw hexes) so
     // the Phase-7 slot remap moves in lockstep.
     fn first_span_fg(item: &TranscriptItem) -> Option<Color> {
-        message_lines(item, false, false, 40, theme::dark())[0].spans[0]
+        message_lines(item, false, 40, theme::dark())[0].spans[0]
             .style
             .fg
     }
@@ -8381,16 +8487,16 @@ mod tests {
     // The non-interactive smoke for the `diff-demo` binary: the seeded
     // `Screen::demo_diffs()` renders through the real pending-body path (the same
     // one a live inline frame uses) without panicking, in BOTH diff-fold states -
-    // collapsed (each diff a fold-title one-liner, the app's default) and
-    // expanded (Ctrl-O / the binary's `o` key: the code rows and the diff's own
-    // elided tail). The binary only adds the terminal lifecycle on top of this.
+    // the default EXPANDED body (qwen `!compactMode`, the app's default) and the
+    // compact fold (Ctrl+O / the binary's `o` key: each diff a fold-title
+    // one-liner). The binary only adds the terminal lifecycle on top of this.
     #[test]
     fn the_diff_demo_screen_renders_its_diffs_without_panicking() {
-        // Collapsed (default): each diff shows its fold title.
-        let collapsed = buffer_text(&draw_viewport(100, 70, &Screen::demo_diffs()));
+        // Default (compact=false): the titles AND the code rows / elided tail.
+        let expanded = buffer_text(&draw_viewport(100, 70, &Screen::demo_diffs()));
         assert!(
-            collapsed.contains("clean up the tokenizer"),
-            "the request:\n{collapsed}"
+            expanded.contains("clean up the tokenizer"),
+            "the request:\n{expanded}"
         );
         for title in [
             "edit_file src/lexer.rs",
@@ -8398,12 +8504,8 @@ mod tests {
             "package.json",
             "src/generated.js",
         ] {
-            assert!(collapsed.contains(title), "the {title} title:\n{collapsed}");
+            assert!(expanded.contains(title), "the {title} title:\n{expanded}");
         }
-
-        // Expanded (Ctrl-O): the code rows and the capped diff's elision tail.
-        let (expanded_screen, _) = Screen::demo_diffs().handle_key(Key::ToggleTools);
-        let expanded = buffer_text(&draw_viewport(100, 70, &expanded_screen));
         assert!(
             expanded.contains("split_whitespace"),
             "the rust hunk body:\n{expanded}"
@@ -8415,6 +8517,19 @@ mod tests {
         assert!(
             expanded.contains("37 lines hidden"),
             "the elided tail:\n{expanded}"
+        );
+
+        // Compact (Ctrl+O): the diff bodies fold away to their fold titles - the
+        // code rows are gone, but the titles stay.
+        let (compact_screen, _) = Screen::demo_diffs().handle_key(Key::ToggleCompact);
+        let folded = buffer_text(&draw_viewport(100, 70, &compact_screen));
+        assert!(
+            folded.contains("edit_file src/lexer.rs"),
+            "the fold title stays:\n{folded}"
+        );
+        assert!(
+            !folded.contains("split_whitespace"),
+            "the rust hunk body folds away under compact:\n{folded}"
         );
     }
 
@@ -8600,32 +8715,31 @@ mod tests {
         }
     }
 
-    // ---- settled Thinking: the collapsed one-row grey form -----------------
+    // ---- settled Thinking: the full grey body (qwen `ThinkMessage`) ---------
 
     #[test]
-    fn settled_thinking_collapses_to_one_grey_prefixed_row() {
-        let long = "z".repeat(400);
-        let lines = settled_thinking_lines(&long, false, 40, theme::dark());
-        assert_eq!(lines.len(), 1, "collapsed thought is one row");
+    fn settled_thinking_prefixes_the_first_body_row_with_the_grey_marker() {
+        // qwen has no collapsed one-liner (ADR-0052): a shown thought renders its
+        // full grey markdown body, the `✦` marker hung on the first row.
+        let lines = settled_thinking_lines("one\ntwo\nthree", theme::dark());
         let text = lines[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        assert!(text.starts_with("✦ "), "grey thought marker: {text:?}");
-        assert!(text.width() <= 40, "one visual row: {text:?}");
-        assert!(text.ends_with('…'), "truncated: {text:?}");
+        assert!(text.starts_with("✦ one"), "grey thought marker: {text:?}");
     }
 
     #[test]
-    fn settled_thinking_collapse_takes_the_first_source_line_only() {
-        let lines = settled_thinking_lines("one\ntwo\nthree", false, 60, theme::dark());
-        let text = lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert_eq!(text, "✦ one");
+    fn settled_thinking_renders_every_source_row() {
+        // The full body: three source lines render as three (or more) rows, not a
+        // single collapsed line.
+        let lines = settled_thinking_lines("one\ntwo\nthree", theme::dark());
+        assert!(
+            lines.len() >= 3,
+            "the full body keeps every source row: {}",
+            lines.len()
+        );
     }
 
     #[test]
@@ -8768,45 +8882,55 @@ mod tests {
     }
 
     #[test]
-    fn a_long_settled_thought_collapses_to_one_visual_row() {
-        // Symptom 1: a long newline-free thought must fold to ONE visual row,
-        // not soft-wrap to many. The collapsed line truncates to the content
-        // width with a trailing `…` (the grey `✦` + z's on one row).
+    fn compact_mode_hides_a_settled_thought_entirely() {
+        // qwen has NO collapsed one-liner for a settled thought (ADR-0052): it
+        // either shows in full or, under compact mode (Ctrl+O), is HIDDEN
+        // entirely. A long thought shows its z's when NOT compact...
         let long = "z".repeat(400);
         let screen = screen_with_thinking("q", long);
         let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-        let terminal = draw_viewport(60, 20, &screen);
-        assert_z_line_folds_to_one_truncated_row(&terminal, 20);
+        let shown = draw_viewport(60, 20, &screen);
+        assert!(
+            (0..20).any(|y| row_text(&shown, y).contains('z')),
+            "the settled thought shows in full when not compact"
+        );
+
+        // ...and vanishes under compact mode.
+        let (screen, _) = screen.handle_key(crate::ui::screen::Key::ToggleCompact);
+        let hidden = draw_viewport(60, 20, &screen);
+        assert!(
+            (0..20).all(|y| !row_text(&hidden, y).contains('z')),
+            "compact mode hides the settled thought entirely"
+        );
     }
 
     #[test]
     fn settled_thinking_uses_the_star_glyph_not_the_brain_emoji() {
         // Symptom 3: settled thinking unifies on the `✦` family with the live
-        // tail, and drops the width-2 `🧠` emoji.
-        let collapsed = message_lines(
-            &TranscriptItem::Thinking {
-                text: "a short thought".into(),
-            },
-            false,
-            false,
-            80,
-            theme::dark(),
-        );
-        assert_eq!(line_text(&collapsed[0]), "✦ a short thought");
-        assert!(!line_text(&collapsed[0]).contains('🧠'));
-
-        // Expanded: the grey `✦` marker prefixes the first markdown body row.
-        let expanded = message_lines(
+        // tail, and drops the width-2 `🧠` emoji. Shown (compact=false) the grey
+        // `✦` marker prefixes the first markdown body row.
+        let shown = message_lines(
             &TranscriptItem::Thinking {
                 text: "line one\nline two".into(),
             },
-            true,
             false,
             80,
             theme::dark(),
         );
-        assert!(line_text(&expanded[0]).starts_with("✦ line one"));
-        assert!(!line_text(&expanded[0]).contains('🧠'));
+        assert!(line_text(&shown[0]).starts_with("✦ line one"));
+        assert!(!line_text(&shown[0]).contains('🧠'));
+
+        // Compact (Ctrl+O) HIDES the thought entirely (qwen `!compactMode`,
+        // ADR-0052): no rows at all.
+        let hidden = message_lines(
+            &TranscriptItem::Thinking {
+                text: "a short thought".into(),
+            },
+            true,
+            80,
+            theme::dark(),
+        );
+        assert!(hidden.is_empty());
     }
 
     #[test]
@@ -8854,6 +8978,43 @@ mod tests {
             "the reasoning tail:\n{text}"
         );
         assert!(!text.contains("tokens)"));
+    }
+
+    #[test]
+    fn compact_suppresses_the_live_thinking_tail_but_keeps_the_spinner_subject() {
+        // qwen gates the pending `gemini_thought` under `!compactMode`
+        // (`HistoryItemDisplay.tsx:155`) but does NOT compact-gate the
+        // LoadingIndicator. So under compact the animated `✦ Thinking` tail is
+        // ABSENT while the spinner SUBJECT (the thought-subject seam,
+        // `thought?.subject || currentLoadingPhrase`) is still PRESENT.
+        // RunStarted puts the Run into Running so the spinner (LoadingIndicator)
+        // draws - the seam the subject fills; then stream a thought.
+        let screen = screen_with_notices(vec![]);
+        let (screen, _) = screen.apply_event(Event::run_started("r1"));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("pondering".to_string()),
+            vec![ContentBlock::Thinking {
+                text: "weighing the tradeoffs".to_string(),
+            }],
+        ));
+        assert_eq!(screen.status, Status::Running, "the Run is Running");
+        let (screen, _) = screen.handle_key(crate::ui::screen::Key::ToggleCompact);
+        assert!(screen.compact_mode, "toggled into compact");
+
+        let terminal = draw_viewport(80, 20, &screen);
+        let text = buffer_text(&terminal);
+        // The live thinking tail's animated header is gone under compact.
+        assert!(
+            !text.contains("✦ Thinking"),
+            "the live thinking tail must be suppressed under compact:\n{text}"
+        );
+        // ...but the spinner still shows, and its subject is the live reasoning
+        // head (the last non-empty line fallback), not a lull phrase.
+        assert!(
+            text.contains("weighing the tradeoffs"),
+            "the spinner subject line stays present under compact:\n{text}"
+        );
     }
 
     #[test]
@@ -8962,6 +9123,301 @@ mod tests {
         let (screen, _) =
             screen.apply_event(Event::approval_request("approval-0", command.to_string()));
         screen
+    }
+
+    // A Screen carrying a COMMITTED Todo list (so the sticky "Current tasks" box
+    // would show) AND an open approval on a live `run_command` ToolCall. The Todo
+    // rides in through the real event path (a `todo_write` result with the todos
+    // artifact, promoted by the registered todo Extension), is frozen with
+    // `mark_committed`, then a second Run opens the confirming call + approval.
+    fn screen_committed_todo_then_confirming() -> Screen {
+        let opts = ScreenOpts {
+            extensions: crate::extensions::configured(&["todo".to_string()]),
+            ..ScreenOpts::default()
+        };
+        let screen = Screen::new(opts);
+        let todos = serde_json::json!({
+            "todos": [
+                {"content": "read the file", "status": "in_progress"},
+                {"content": "edit the file", "status": "pending"},
+            ]
+        });
+        let (s, _) = screen.apply_event(Event::run_started("r1"));
+        let (s, _) = s.apply_event(Event::tool_call("todo-call", "todo_write", todos));
+        // The todos artifact rides the result so the todo Extension promotes it
+        // to a first-class Todo item (ADR-0048).
+        let mut artifacts = std::collections::HashMap::new();
+        artifacts.insert(
+            "todos".to_string(),
+            serde_json::json!({
+                "items": [
+                    {"content": "read the file", "status": "in_progress"},
+                    {"content": "edit the file", "status": "pending"},
+                ]
+            }),
+        );
+        let (mut s, _) = s.apply_event(Event::ToolResult {
+            id: "todo-call".into(),
+            name: "todo_write".into(),
+            content: "ok".into(),
+            is_error: false,
+            artifacts,
+        });
+        // Confirm a Todo item landed and freeze the whole prefix (commit it into
+        // scrollback), so `latest_todo` reads a COMMITTED list -> sticky reserves.
+        assert!(
+            s.transcript().latest_todo().is_some(),
+            "the todo Extension promoted a Todo item"
+        );
+        s.mark_committed(s.transcript().committable_upto());
+        assert!(
+            s.transcript().latest_todo().map(|(i, _)| i)
+                < Some(s.transcript().committed_high_water()),
+            "the Todo is committed (index below the high-water mark)"
+        );
+        // Now a second, live run_command gated on an open approval.
+        let (s, _) = s.apply_event(Event::tool_call(
+            "t1",
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+        ));
+        let (s, _) = s.apply_event(Event::approval_request(
+            "approval-0",
+            "cargo test".to_string(),
+        ));
+        s
+    }
+
+    // BUG 2 (live-vet): with a committed Todo present, the sticky "Current tasks"
+    // box must NOT hide the open approval. The approval renders inside the pending
+    // body; reserving the sticky zone starves that body (Min(1)) and top-clips the
+    // question out of view. The fix drops the sticky box while an approval is open
+    // -- a visible approval wins over the informational list.
+    #[test]
+    fn an_open_approval_drops_the_sticky_box_so_the_question_stays_visible() {
+        let screen = screen_committed_todo_then_confirming();
+        // A full pending frame (render_pending -> pending_layout): the sticky box
+        // WOULD show here (committed, non-empty, incomplete list) if not for the
+        // open approval.
+        let terminal = draw_pending(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Allow execution of: 'cargo test'?"),
+            "the approval question is visible:\n{text}"
+        );
+        assert!(
+            text.contains("Yes, allow once"),
+            "the first radio option is visible:\n{text}"
+        );
+        assert!(
+            !text.contains("Current tasks"),
+            "the sticky box is dropped while the approval is open:\n{text}"
+        );
+    }
+
+    // The pending_layout-level guard: an open approval reserves NO sticky zone
+    // (`sticky_items` is None), even though `latest_todo` would otherwise qualify.
+    #[test]
+    fn pending_layout_reserves_no_sticky_zone_while_an_approval_is_open() {
+        let screen = screen_committed_todo_then_confirming();
+        // Sanity: the committed list DOES qualify for a sticky box on its own.
+        assert!(
+            sticky_todos(
+                screen.transcript().latest_todo(),
+                screen.transcript().committed_high_water(),
+            )
+            .is_some(),
+            "the committed Todo would reserve a sticky box absent an approval"
+        );
+        // But with the approval open, pending_layout drops it.
+        let view = screen.composer().view();
+        let plan = pending_layout(Rect::new(0, 0, 60, 24), &view, &screen);
+        assert!(
+            plan.sticky_items.is_none(),
+            "an open approval yields no sticky zone"
+        );
+        assert_eq!(
+            plan.sticky_box.height, 0,
+            "the sticky zone reserves zero rows"
+        );
+    }
+
+    // A Screen carrying a COMMITTED Todo list (so the sticky "Current tasks" box
+    // would show) with NO approval open - the regression counterpart to
+    // [`screen_committed_todo_then_confirming`]. Same committed-Todo setup, minus
+    // the second confirming Run: the Run has SETTLED (message_end), so the sticky
+    // box is the only thing driving the frame.
+    fn screen_committed_todo_no_approval() -> Screen {
+        let opts = ScreenOpts {
+            extensions: crate::extensions::configured(&["todo".to_string()]),
+            ..ScreenOpts::default()
+        };
+        let screen = Screen::new(opts);
+        let todos = serde_json::json!({
+            "todos": [
+                {"content": "read the file", "status": "in_progress"},
+                {"content": "edit the file", "status": "pending"},
+            ]
+        });
+        let (s, _) = screen.apply_event(Event::run_started("r1"));
+        let (s, _) = s.apply_event(Event::tool_call("todo-call", "todo_write", todos));
+        let mut artifacts = std::collections::HashMap::new();
+        artifacts.insert(
+            "todos".to_string(),
+            serde_json::json!({
+                "items": [
+                    {"content": "read the file", "status": "in_progress"},
+                    {"content": "edit the file", "status": "pending"},
+                ]
+            }),
+        );
+        let (mut s, _) = s.apply_event(Event::ToolResult {
+            id: "todo-call".into(),
+            name: "todo_write".into(),
+            content: "ok".into(),
+            is_error: false,
+            artifacts,
+        });
+        s.mark_committed(s.transcript().committable_upto());
+        s
+    }
+
+    // The MEDIUM finding: on a SHORT terminal the pending body TOP-clips (last N
+    // rows kept, [`anchor_clip`]). Before the fix the spinner/tails were appended
+    // BELOW the inline approval block, so the top-clip ate the "Allow execution
+    // of..." question first - the user could not see what they were approving. The
+    // fix suppresses every trailing LIVE row while an approval is open, so the
+    // approval block is the BOTTOM-most content and survives the clip. This test
+    // renders the real production frame ([`draw_pending`]) with a live spinner
+    // anim on a short terminal and asserts BOTH the question and the first radio
+    // option survive, and that the spinner's cancel affordance is gone (the
+    // approval block owns the bottom).
+    #[test]
+    fn short_terminal_keeps_the_approval_question_visible() {
+        let screen = screen_confirming(
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+            "cargo test",
+        );
+        // The FULL, unclamped confirming body: the approval box must be bottom-
+        // most, so the LAST non-blank row is its `╰` border, NOT a spinner row.
+        // This is what makes the top-clip keep the question. (Anim past the lull
+        // settle window, so a spinner WOULD render absent the suppression.)
+        let anim = Anim {
+            quiet_ticks: lull::SETTLE_TICKS + 4,
+            ..Anim::default()
+        };
+        let mut cache = RenderCache::new();
+        let mut params = PendingBodyParams {
+            screen: &screen,
+            cache: &mut cache,
+            anim,
+        };
+        let body = pending_body_lines(&mut params, theme::dark(), 0, 56);
+        let last_non_blank = body
+            .iter()
+            .rev()
+            .map(line_text)
+            .find(|t| !t.trim().is_empty())
+            .unwrap_or_default();
+        assert!(
+            last_non_blank.trim_start().starts_with('╰'),
+            "the approval box is bottom-most (last row is its border), not a \
+             spinner row: {last_non_blank:?}"
+        );
+        assert!(
+            !body.iter().any(|l| line_text(l).contains("esc to cancel")),
+            "the spinner is suppressed while the approval is open"
+        );
+
+        // And on a SHORT real frame the top-clip therefore keeps the question and
+        // the first option (they ride at the bottom of the pending body).
+        let terminal = draw_pending(60, 14, &screen);
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Allow execution of: 'cargo test'?"),
+            "the approval question survives top-clip on a short terminal:\n{text}"
+        );
+        assert!(
+            text.contains("Yes, allow once"),
+            "the first radio option is visible:\n{text}"
+        );
+    }
+
+    // Fix-1 regression guard: dropping the sticky box (BUG 2) and suppressing the
+    // trailing live rows (this finding) both key off `pending_approval.is_some()`.
+    // With NO approval open, a committed Todo must STILL render the sticky
+    // "Current tasks" box - the approval-only guards did not over-suppress.
+    #[test]
+    fn no_approval_still_renders_the_sticky_current_tasks_box() {
+        let screen = screen_committed_todo_no_approval();
+        // Sanity: the committed, non-empty, incomplete list qualifies for a box.
+        assert!(
+            sticky_todos(
+                screen.transcript().latest_todo(),
+                screen.transcript().committed_high_water(),
+            )
+            .is_some(),
+            "the committed Todo qualifies for a sticky box"
+        );
+        let terminal = draw_pending(60, 24, &screen);
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Current tasks"),
+            "the sticky box renders when no approval is open:\n{text}"
+        );
+    }
+
+    // The measure-level counterpart to the short-terminal test: an OPEN approval
+    // suppresses the spinner/lull row from the pending body, while an equivalent
+    // Running-but-no-approval frame KEEPS it. Driven at [`pending_body_lines`] with
+    // `quiet_ticks` past the lull settle window so the spinner has a phrase to draw
+    // (default anim is still settling, so it would be empty regardless).
+    #[test]
+    fn an_open_approval_suppresses_the_spinner_row_that_a_bare_run_keeps() {
+        let width: u16 = 60;
+        // A settled lull (quiet_ticks past SETTLE_TICKS) so the spinner has a scene.
+        let anim = Anim {
+            quiet_ticks: 60,
+            ..Anim::default()
+        };
+        let has_cancel =
+            |lines: &[Line<'static>]| lines.iter().any(|l| line_text(l).contains("esc to cancel"));
+
+        // Approval OPEN (Running, gated run_command): the spinner is suppressed.
+        let confirming = screen_confirming(
+            "run_command",
+            serde_json::json!({"command": "cargo test"}),
+            "cargo test",
+        );
+        let mut cache = RenderCache::new();
+        let mut params = PendingBodyParams {
+            screen: &confirming,
+            cache: &mut cache,
+            anim,
+        };
+        let under_approval = pending_body_lines(&mut params, theme::dark(), 0, width);
+        assert!(
+            !has_cancel(&under_approval),
+            "the spinner is suppressed while an approval is open"
+        );
+
+        // Running, NO approval: the same anim now DOES render the spinner row.
+        let running = Screen::new(ScreenOpts::default());
+        let (running, _) = running.apply_event(Event::run_started("r1"));
+        assert_eq!(running.status, Status::Running);
+        assert!(running.pending_approval.is_none());
+        let mut cache = RenderCache::new();
+        let mut params = PendingBodyParams {
+            screen: &running,
+            cache: &mut cache,
+            anim,
+        };
+        let bare_run = pending_body_lines(&mut params, theme::dark(), 0, width);
+        assert!(
+            has_cancel(&bare_run),
+            "the spinner renders on an equivalent Running frame with no approval"
+        );
     }
 
     // selection_rows: the active row wears the `›` marker + green label; inactive

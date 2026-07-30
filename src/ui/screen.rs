@@ -45,7 +45,7 @@ use crate::view_model::Tone;
 use crate::view_model::{DiffHunk, DiffLine, DiffSide, TranscriptItem};
 
 /// The greeting line a fresh Screen opens its Transcript with.
-const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-T toggles thinking, Ctrl-C quits";
+const GREETING: &str = "suspenders ready. Enter submits, Esc cancels a running turn, Ctrl-O toggles compact mode, Ctrl-C quits";
 
 /// The initial cumulative session cost before any priced response arrives.
 const INITIAL_SESSION_COST: f64 = 0.0;
@@ -161,10 +161,10 @@ pub enum Key {
     /// (rather than `Char('\n')`) so the modal's swallow-everything rule and
     /// the adapter's mapping both read as intent.
     InsertNewline,
-    /// Ctrl-T: toggle the expanded rendering of settled Thinking items.
-    ToggleThinking,
-    /// Ctrl-O: toggle the expanded rendering of settled tool Blocks.
-    ToggleTools,
+    /// Ctrl-O (qwen `TOGGLE_COMPACT_MODE`): toggle compact mode, which hides
+    /// settled Thinking items entirely and tool RESULT bodies (headers stay).
+    /// Named (not `Char`) so the intent reads at the mapping and routing seams.
+    ToggleCompact,
     /// Shift+Tab (win32: Tab): rotate the Approval mode one step in the cycle
     /// (ADR-0050). Named (not `Char`) so the intent reads at the mapping and
     /// routing seams alike.
@@ -173,6 +173,13 @@ pub enum Key {
     /// System B, qwen `handleAutocomplete`). Inert outside the palette (the
     /// editing fall-through refuses it), so it never types a literal tab.
     Tab,
+    /// Ctrl-S (ADR-0046, qwen `ShowMoreLines`): dump the FULL, unclamped pending
+    /// body into native scrollback as a non-committing "peek" the user scrolls up
+    /// to read. The fixed inline viewport (`Viewport::Inline`) cannot grow, so
+    /// "show more" cannot happen INSIDE the viewport - the overflow marker's
+    /// promise is honored by a one-shot blit above the live region instead. Named
+    /// (not `Char`) so the intent reads at the mapping and routing seams.
+    ShowMore,
     Char(char),
     /// A key the core does not act on (function keys, etc.).
     Other,
@@ -265,6 +272,37 @@ pub enum Effect {
     /// interprets it (e.g. `/model` swaps the Active Model and persists); the
     /// pure core neither knows nor cares. Phase 4b implements the arm.
     SelectorChosen { command: String, value: String },
+    /// Re-sync the render cache to the new compact mode and repaint the live
+    /// viewport after a Ctrl+O toggle (ADR-0052, the degraded fallback for qwen's
+    /// `refreshStatic`). This is the DEGRADED behaviour, not the faithful replay:
+    /// the adapter rebuilds the cache at the new compact and clears the viewport
+    /// (`terminal.clear()`, which clears from the viewport top down only), so the
+    /// pending region and every FUTURE commit render at the new compact. It does
+    /// NOT re-blit or touch anything frozen: the already-frozen prefix above the
+    /// fold keeps the compact it was blitted at (a bounded staleness that resolves
+    /// as that history scrolls away). Because it touches nothing frozen, it stays
+    /// INSIDE ADR-0046's "never touch frozen scrollback" rule - the faithful
+    /// re-blit that WOULD be the exception is blocked upstream (ratatui's private
+    /// viewport anchor; see ADR-0052). Carries no ratatui (ADR-0019) and NO count.
+    /// Minted by the Ctrl+O handler ONLY when
+    /// [`Transcript::compact_toggle_has_visual_effect`] is true (else the
+    /// pending-only re-render is free), and the high-water mark is NOT reset.
+    ///
+    /// [`Transcript::compact_toggle_has_visual_effect`]: crate::ui::transcript::Transcript::compact_toggle_has_visual_effect
+    RedrawScrollback,
+    /// Blit the FULL, UNCLAMPED pending body into native scrollback as a
+    /// non-committing "peek" (ADR-0046, qwen `ShowMoreLines` / Ctrl-S). The fixed
+    /// inline viewport cannot grow, so the top-clipped overflow ("… Ctrl-S to show
+    /// more") cannot be revealed IN PLACE; instead the adapter renders the whole
+    /// pending stack (every line before `anchor_clip` top-clips it) and
+    /// `insert_before`s it ABOVE the live viewport, so the user scrolls up to read
+    /// the clipped rows. It is a PEEK, not a commit: the high-water mark does NOT
+    /// move, NOTHING is frozen, and the next normal draw still shows the clipped
+    /// live view. The adapter no-ops when the body does not overflow (nothing is
+    /// clipped, so there is nothing to reveal). Carries no ratatui (ADR-0019) and
+    /// no payload - the adapter reads the body through [`Screen::transcript`] + its
+    /// `RenderCache`, exactly as the live draw does.
+    PeekPending,
 }
 
 /// The pure Screen state (ADR-0034; the renamed fold root of baud's
@@ -304,16 +342,14 @@ pub struct Screen {
     /// adapter's window), mutation only through the folds and the
     /// submitted/steered outcome hooks.
     composer: Composer,
-    /// Whether settled Thinking items render expanded (the full text) instead
-    /// of the collapsed one-line form. Toggled by [`Key::ToggleThinking`]
-    /// (Ctrl-T); defaults collapsed.
-    pub thinking_expanded: bool,
-    /// Whether settled Block items (diffs, tool output) render expanded (the
-    /// full body) instead of the collapsed one-line title. Toggled by
-    /// [`Key::ToggleTools`] (Ctrl-O); defaults collapsed - the same
-    /// detail-on-demand rule as `thinking_expanded`, applied to the machinery
-    /// plane so a burst of tool output can't eat the window.
-    pub tools_expanded: bool,
+    /// Compact mode (qwen `compactMode`, Ctrl+O `TOGGLE_COMPACT_MODE`): when
+    /// `true`, settled Thinking items are HIDDEN entirely and tool RESULT bodies
+    /// are hidden (their headers stay), keeping the transcript terse. Default
+    /// `false` = show everything. Toggled by [`Key::ToggleCompact`]; the single
+    /// display toggle that replaced suspenders' two expand flags (ADR-0052).
+    /// Note the inversion from the retired flags: they showed FULL when
+    /// `expanded == true`; this shows full when `compact_mode == false`.
+    pub compact_mode: bool,
 }
 
 /// The options a fresh Screen is opened with (baud's `new/1` keyword opts).
@@ -467,8 +503,7 @@ impl Screen {
             pressure_level: PressureLevel::Ok,
             session_cost: INITIAL_SESSION_COST,
             composer: Composer::new(opts.history),
-            thinking_expanded: false,
-            tools_expanded: false,
+            compact_mode: false,
         }
     }
 
@@ -932,6 +967,15 @@ impl Screen {
     /// plain chars must NOT edit the Composer while the block is open. Escape
     /// only cancels the whole Run in the no-approval, streaming case below.
     pub fn handle_key(mut self, key: Key) -> (Self, Vec<Effect>) {
+        // Ctrl-S peeks the full pending body into scrollback (ADR-0046): handled
+        // BEFORE the Approval gate and the Composer so it works in every state
+        // (an overflowing approval body is exactly when the user reaches for it).
+        // The pure core cannot see the live viewport height, so it emits
+        // `PeekPending` unconditionally; the adapter no-ops when nothing is
+        // clipped. A pure fire-through: no state changes, so no commit seam.
+        if key == Key::ShowMore {
+            return (self, vec![Effect::PeekPending]);
+        }
         if self.pending_approval.is_some() {
             return self.handle_approval_key(key);
         }
@@ -968,21 +1012,22 @@ impl Screen {
             // the pre-agent Session Picker (its own alt-screen list still
             // navigates by wheel/page).
 
-            // Ctrl-T: flip the Thinking expansion; a pure display toggle, no
-            // effects. The status bar's thinking segment renders this flag,
-            // so the flip is visible even with no Thinking items on screen.
-            Key::ToggleThinking => {
-                self.thinking_expanded = !self.thinking_expanded;
-                (self, vec![])
-            }
-
-            // Ctrl-O: flip the tool-Block expansion; a pure display toggle, no
-            // effects. Mirrors Ctrl-T for the machinery plane - the status
-            // bar's tools segment renders this flag, so the flip is visible
-            // even with no Blocks on screen.
-            Key::ToggleTools => {
-                self.tools_expanded = !self.tools_expanded;
-                (self, vec![])
+            // Ctrl-O (qwen `TOGGLE_COMPACT_MODE`): flip compact mode. The pending
+            // region redraws at the new compact for free, but the FROZEN
+            // scrollback can't un-draw its Thinking/tool rows, so emit
+            // `RedrawScrollback` (ADR-0052, qwen `refreshStatic`) ONLY when a
+            // committed item actually changes under compact
+            // (`compact_toggle_has_visual_effect`) - a plain chat toggles with no
+            // flicker. The status bar's compact segment renders the flag, so the
+            // flip is visible even with nothing compact-affected on screen.
+            Key::ToggleCompact => {
+                self.compact_mode = !self.compact_mode;
+                let effects = if self.transcript.compact_toggle_has_visual_effect() {
+                    vec![Effect::RedrawScrollback]
+                } else {
+                    vec![]
+                };
+                (self, effects)
             }
 
             // Shift+Tab: rotate the Approval mode (ADR-0050). A fire-through to
@@ -1480,7 +1525,7 @@ mod tests {
         match &t.transcript().items()[0] {
             TranscriptItem::Info { text } => {
                 assert!(text.contains("suspenders ready"));
-                assert!(text.contains("Ctrl-T toggles thinking"));
+                assert!(text.contains("Ctrl-O toggles compact mode"));
             }
             other => panic!("expected greeting info, got {other:?}"),
         }
@@ -2724,64 +2769,128 @@ mod tests {
         }
     }
 
-    // --- Ctrl-T thinking toggle ----------------------------------------------
+    // --- Ctrl-O compact mode (ADR-0052) --------------------------------------
 
     #[test]
-    fn thinking_starts_collapsed() {
-        assert!(!fresh().thinking_expanded);
+    fn compact_mode_starts_off() {
+        assert!(!fresh().compact_mode);
+    }
+
+    // A plain-chat transcript (only the greeting Info line committed, nothing
+    // compact-affected) flips compact with NO RedrawScrollback - the predicate is
+    // false, so no expensive scrollback redraw is minted.
+    #[test]
+    fn toggle_compact_flips_without_redraw_when_nothing_committed_is_affected() {
+        let (t, effects) = fresh().handle_key(Key::ToggleCompact);
+        assert!(t.compact_mode);
+        // Only the greeting Info line exists; no committed Thinking/tool item, so
+        // no RedrawScrollback. (The greeting's own Commit may ride along.)
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RedrawScrollback)),
+            "a plain chat toggles with no scrollback redraw"
+        );
+
+        let (t, effects) = t.handle_key(Key::ToggleCompact);
+        assert!(!t.compact_mode);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RedrawScrollback))
+        );
+    }
+
+    // With a committed Thinking item, flipping compact DOES mint a
+    // RedrawScrollback (the frozen thought must be un-drawn, ADR-0052).
+    #[test]
+    fn toggle_compact_emits_redraw_when_a_committed_item_is_affected() {
+        // Stream + settle a thought, then commit it into scrollback.
+        let (screen, _) = fresh().apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            crate::llm::Delta::Thinking("thinking".into()),
+            vec![ContentBlock::Thinking {
+                text: "a thought".into(),
+            }],
+        ));
+        let (mut screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+        // Freeze everything terminal (the adapter's job) so the thought is
+        // committed in the pure core's view.
+        let hw = screen.transcript().committable_upto();
+        screen.mark_committed(hw);
+        assert!(
+            screen.transcript().compact_toggle_has_visual_effect(),
+            "the committed thought makes the toggle visually effective"
+        );
+
+        let (screen, effects) = screen.handle_key(Key::ToggleCompact);
+        assert!(screen.compact_mode);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RedrawScrollback)),
+            "a committed thought forces the scrollback redraw: {effects:?}"
+        );
+    }
+
+    // Compact is DISPLAY-ONLY (ADR-0052): flipping `compact_mode` must not change
+    // the structural commit seam. `committable_upto` counts leading TERMINAL items
+    // (a structural property of the transcript), so it is invariant under a compact
+    // toggle - the invariant that lets committed==pending hold under compact.
+    #[test]
+    fn compact_toggle_does_not_change_committable_upto() {
+        // Settle a thought so there IS something committable to measure.
+        let (screen, _) = fresh().apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            crate::llm::Delta::Thinking("thinking".into()),
+            vec![ContentBlock::Thinking {
+                text: "a thought".into(),
+            }],
+        ));
+        let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+
+        let before = screen.transcript().committable_upto();
+        let (screen, _) = screen.handle_key(Key::ToggleCompact);
+        assert!(screen.compact_mode);
+        assert_eq!(
+            screen.transcript().committable_upto(),
+            before,
+            "compact is display-only; the commit seam is structural and unchanged"
+        );
     }
 
     #[test]
-    fn toggle_thinking_flips_on_and_off_with_no_effects() {
-        let (t, effects) = fresh().handle_key(Key::ToggleThinking);
-        assert!(t.thinking_expanded);
-        // The first fold on a fresh Screen commits the greeting (ADR-0046);
-        // the toggle itself emits nothing.
-        assert_eq!(sans_commit(effects), vec![]);
-
-        let (t, effects) = t.handle_key(Key::ToggleThinking);
-        assert!(!t.thinking_expanded);
-        // The greeting is STILL uncommitted (the pure fold never advances the
-        // mark - the adapter does, post-blit), so this fold re-emits the same
-        // Commit; the toggle itself still emits nothing.
-        assert_eq!(sans_commit(effects), vec![]);
+    fn modal_swallows_toggle_compact() {
+        assert_key_swallowed_while_modal_open(Key::ToggleCompact);
+        // The flag must not have flipped; a fresh Screen starts non-compact.
+        assert!(!fresh().compact_mode);
     }
 
+    // --- Ctrl-S peek (BUG 1, ADR-0046) ---------------------------------------
+
+    // Ctrl-S emits `PeekPending` and nothing else: the fixed inline viewport
+    // cannot grow, so the pure core fires a non-committing peek the adapter blits
+    // into scrollback. It changes NO state (no commit seam), so the effect list is
+    // exactly one `PeekPending`.
     #[test]
-    fn modal_swallows_toggle_thinking() {
-        assert_key_swallowed_while_modal_open(Key::ToggleThinking);
-        // The flag must not have flipped; a fresh Screen starts collapsed.
-        assert!(!fresh().thinking_expanded);
+    fn show_more_emits_peek_pending_only() {
+        let (_t, effects) = fresh().handle_key(Key::ShowMore);
+        assert_eq!(effects, vec![Effect::PeekPending]);
     }
 
-    // --- Ctrl-O tools toggle -------------------------------------------------
-    // The machinery-plane twin of the Ctrl-T thinking toggle: a pure display
-    // flip, no effects, swallowed by an open modal.
-
+    // Ctrl-S is handled BEFORE the Approval gate: an overflowing approval body is
+    // exactly when the user reaches for "show more", so the peek must fire even
+    // while a modal holds the keyboard. The pending approval is left untouched.
     #[test]
-    fn tools_start_collapsed() {
-        assert!(!fresh().tools_expanded);
-    }
-
-    #[test]
-    fn toggle_tools_flips_on_and_off_with_no_effects() {
-        let (t, effects) = fresh().handle_key(Key::ToggleTools);
-        assert!(t.tools_expanded);
-        // The first fold on a fresh Screen commits the greeting (ADR-0046).
-        assert_eq!(sans_commit(effects), vec![]);
-
-        let (t, effects) = t.handle_key(Key::ToggleTools);
-        assert!(!t.tools_expanded);
-        // Still uncommitted (the adapter advances the mark, not the fold), so the
-        // greeting's Commit repeats; the toggle emits nothing of its own.
-        assert_eq!(sans_commit(effects), vec![]);
-    }
-
-    #[test]
-    fn modal_swallows_toggle_tools() {
-        assert_key_swallowed_while_modal_open(Key::ToggleTools);
-        // The flag must not have flipped; a fresh Screen starts collapsed.
-        assert!(!fresh().tools_expanded);
+    fn show_more_peeks_even_while_a_modal_is_open() {
+        let t = with_pending_approval(fresh(), &approval());
+        let pending_before = t.pending_approval.clone();
+        let (t, effects) = t.handle_key(Key::ShowMore);
+        assert_eq!(effects, vec![Effect::PeekPending]);
+        assert_eq!(
+            t.pending_approval, pending_before,
+            "the peek does not resolve or disturb the open approval"
+        );
     }
 
     // --- the Approval gate vs the Composer ----------------------------------

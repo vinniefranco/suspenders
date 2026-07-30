@@ -269,7 +269,7 @@ theme_slots! {
     machinery,
     /// Error lines and failure notices.
     error,
-    /// Extended-thinking lines (Ctrl-T's plane).
+    /// Settled/streaming thinking lines (grey; hidden under compact mode, Ctrl+O).
     thinking,
     /// The live `✦ Thinking` header over the streaming reasoning tail
     /// (ADR-0040): the animated brain, where motion sits during a Run.

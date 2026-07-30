@@ -1188,12 +1188,7 @@ fn is_text_edit(key: &Key) -> bool {
 fn always_refused(key: &Key) -> bool {
     matches!(
         key,
-        Key::PageUp
-            | Key::PageDown
-            | Key::ToggleThinking
-            | Key::ToggleTools
-            | Key::Named(_)
-            | Key::Other
+        Key::PageUp | Key::PageDown | Key::ToggleCompact | Key::Named(_) | Key::Other
     )
 }
 
@@ -2294,8 +2289,7 @@ mod tests {
             for key in [
                 Key::PageUp,
                 Key::PageDown,
-                Key::ToggleThinking,
-                Key::ToggleTools,
+                Key::ToggleCompact,
                 Key::Named("f1".into()),
                 Key::Other,
             ] {

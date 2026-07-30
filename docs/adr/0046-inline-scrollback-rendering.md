@@ -94,3 +94,33 @@ or task-list behavior differs from qwen-code's, qwen-code's wins.
   in `Key` only for the pre-agent Session Picker, which stays on the alt-screen
   path). The Screen's scroll effects (`PinBottom`/`ScrollUp`/`ScrollDown`), the
   `ScrollStep` enum, `viewport.rs`, and the scrollbar are deleted.
+
+## Phase 6 update (thinking subject + compact mode)
+
+- **Ctrl-T retirement COMPLETED.** ADR-0046 decided to retire the Ctrl-T
+  settled-Thinking expand/collapse toggle, but Phase 1-5 left it inert in the
+  code (`Key::ToggleThinking` + `Screen::thinking_expanded` still existed). Phase
+  6 finishes the job: `Key::ToggleThinking`, its handler, `thinking_expanded`,
+  and the collapsed one-liner render branch are DELETED. Ctrl-T now maps to
+  `Key::Other` (crossterm arm removed), so it types nothing. There is no Ctrl-T
+  in suspenders (qwen's Ctrl+T = `TOGGLE_TOOL_DESCRIPTIONS`, which suspenders does
+  not adopt). The greeting line and its test now read `Ctrl-O toggles compact
+  mode`.
+- **Thought subject on the spinner (a faithful port with a bounded divergence).**
+  The pure `Transcript::thought_subject()` fills the Phase-3 `SpinnerState.subject`
+  seam (qwen `LoadingIndicator.tsx:72` `thought?.subject || currentLoadingPhrase`).
+  qwen's `parseThought` (the first `**...**` bold subject) is ported verbatim, but
+  suspenders' reasoning streams do NOT reliably emit `**bold**` subjects, so a
+  three-fallback ladder is used: (1) the bold subject if present, else (2) the
+  last non-empty line of the live reasoning (the streaming head), else (3) `None`
+  → the spinner falls back to the whimsical Lull phrase. Spinner-only; the
+  committed history keeps the raw Thinking text verbatim. Clear-timing is free:
+  `streaming_thinking` empties between messages and the spinner only renders while
+  Running, so the subject vanishes at Idle with no manual reset.
+- **Compact mode (Ctrl+O) replaces the two expand toggles.** See ADR-0052. The
+  one bounded exception to "never touch frozen scrollback" (`RedrawScrollback`,
+  the qwen `refreshStatic` analogue) lands there; the faithful scrollback purge
+  proved un-portable through ratatui's `Backend` trait, so the shipped behaviour
+  is the design's documented degraded fallback (the pending region + all future
+  commits use the new compact; the already-frozen prefix keeps the compact it was
+  blitted at).
