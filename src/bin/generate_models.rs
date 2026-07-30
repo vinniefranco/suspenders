@@ -18,6 +18,7 @@
 //! stays untouched by generated data.
 
 use serde_json::Value;
+use suspenders::content::Modalities;
 use suspenders::llm::catalog::{CatalogModel, CatalogProvider};
 use suspenders::llm::cost::Pricing;
 use suspenders::llm::model::Api;
@@ -190,10 +191,27 @@ fn map_model(entry: &Value) -> Option<CatalogModel> {
         context_window: entry["limit"]["context"].as_u64().filter(|n| *n > 0)?,
         max_tokens: entry["limit"]["output"].as_u64().filter(|n| *n > 0)?,
         reasoning: entry["reasoning"] == Value::Bool(true),
+        input_modalities: map_input_modalities(&entry["modalities"]["input"]),
         cost: map_cost(&entry["cost"]),
         id,
         name,
     })
+}
+
+/// The input modalities (ADR-0059) from models.dev's `modalities.input` array of
+/// strings: `image` and `pdf` set the matching booleans; other entries (text,
+/// audio, video) are not modalities Suspenders carries to the wire, so they are
+/// ignored. A missing array is text-only (all-false).
+fn map_input_modalities(input: &Value) -> Modalities {
+    let has = |name: &str| {
+        input
+            .as_array()
+            .is_some_and(|a| a.iter().any(|m| m.as_str() == Some(name)))
+    };
+    Modalities {
+        image: has("image"),
+        pdf: has("pdf"),
+    }
 }
 
 /// The four flat rates. `None` when the entry carries no pricing at all

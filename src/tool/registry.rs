@@ -210,12 +210,7 @@ impl ToolRegistry {
     ) -> ToolResult {
         let tool = match self.tools.iter().find(|t| t.spec().name == name) {
             Some(t) => t,
-            None => {
-                return ToolResult {
-                    content: format!("unknown tool: {name:?}"),
-                    is_error: true,
-                };
-            }
+            None => return error_result(format!("unknown tool: {name:?}")),
         };
 
         // Validate against the tool's own schema before dispatch. The empty-map
@@ -223,22 +218,29 @@ impl ToolRegistry {
         let empty = serde_json::Map::new();
         let input_map = input.as_object().unwrap_or(&empty);
         if let Err(reason) = validate(&tool.spec().input_schema, input_map) {
-            return ToolResult {
-                content: reason,
-                is_error: true,
-            };
+            return error_result(reason);
         }
 
-        match tool.run(input, ctx).await {
-            Ok(content) => ToolResult {
-                content,
+        // Dispatch through the rich variant (ADR-0059): a text tool's `String`
+        // return becomes one Text block via the default `run_rich`; only a media
+        // tool (P3 3b's read_file) yields more. An `Err` is a single Text error
+        // block.
+        match tool.run_rich(input, ctx).await {
+            Ok(output) => ToolResult {
+                content: output.blocks,
                 is_error: false,
             },
-            Err(reason) => ToolResult {
-                content: reason,
-                is_error: true,
-            },
+            Err(reason) => error_result(reason),
         }
+    }
+}
+
+/// An `is_error` Tool Result carrying a single Text block - the validate and
+/// unknown-tool paths, and a tool's `Err` return (ADR-0059).
+fn error_result(reason: String) -> ToolResult {
+    ToolResult {
+        content: vec![crate::content::ResultBlock::text(reason)],
+        is_error: true,
     }
 }
 

@@ -7,6 +7,7 @@ We carry those effect handles onto the `ToolCtx` as a Parameter Object, `Capabil
 ```rust
 pub struct Capabilities {
     pub registry: Arc<ToolRegistry>,      // concrete - Run-scoped state, not an effect
+    pub read_cache: Arc<FileReadCache>,   // concrete - Run-scoped state, not an effect (F6, ADR-0060)
     pub approver: Arc<dyn Approver>,      // dyn - the tool-initiated effect seam (P1b)
     pub side_query: Arc<dyn SideQuery>,   // dyn - the bounded-model side-query seam (P2b)
     pub questioner: Arc<dyn Questioner>,  // dyn - the ask_user_question seam (P2a)
@@ -28,6 +29,8 @@ Both channels terminate at the SAME Agent mpsc. A Capability's real impl sends t
 ## Concrete registry, dynamic effects
 
 The `ToolRegistry` rides `Capabilities` as a concrete `Arc`, not a `dyn` seam, because it is not an effect - it is Run-scoped state the tools READ (`tool_search` reveals deferred tools through it; every other tool ignores it). Only the things that reach back to the host for a decision are `dyn`.
+
+The `FileReadCache` (F6, ADR-0060) is the SECOND concrete Run-scoped state carried here, and it proves the pattern generalises past the registry: read_file records a successful read into it, notebook_edit checks it for a prior FULL read before mutating a notebook, every other tool ignores it. It is not an effect (nothing about it reaches back to the host for a decision), so like the registry it stays a concrete `Arc<FileReadCache>`, and `run::run` builds a fresh, empty one per Run and threads it on alongside the registry it builds itself. `ToolCtx` gains a `read_cache()` accessor beside `registry()`. See ADR-0060 for the cache's own design (path-keyed fingerprint, enforcement-only, the deferred fast-path).
 
 ## The degraded / real duality (headless posture)
 

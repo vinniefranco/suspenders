@@ -10,6 +10,7 @@ pub mod edit_file;
 pub mod glob;
 pub mod grep;
 pub mod list_files;
+pub mod notebook_edit;
 pub mod read_file;
 pub mod run_command;
 pub mod shaping;
@@ -41,6 +42,7 @@ pub(crate) fn tools() -> Vec<Box<dyn Tool>> {
         Box::new(grep::Grep),
         Box::new(edit_file::EditFile),
         Box::new(write_file::WriteFile),
+        Box::new(notebook_edit::NotebookEdit),
         Box::new(run_command::RunCommand),
         Box::new(web_fetch::WebFetch),
         Box::new(ask_user_question::AskUserQuestion),
@@ -82,7 +84,7 @@ pub fn deferred_summary() -> Vec<(String, String)> {
 /// validation + dispatch to the Run's [`ToolRegistry`] (on the ctx).
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     let mut result = execute(name, input, ctx).await;
-    result.content = shaping::shape(name, input, &result.content, ctx.result_cap);
+    result.content = shaping::shape(name, input, result.content, ctx.result_cap);
     result
 }
 
@@ -108,6 +110,7 @@ mod tests {
         "grep",
         "edit_file",
         "write_file",
+        "notebook_edit",
         "run_command",
         "web_fetch",
         "ask_user_question",
@@ -118,11 +121,17 @@ mod tests {
         ToolCtx::for_test(root.to_path_buf(), cap)
     }
 
+    // The text projection of a Tool Result's block list (ADR-0059) - the common
+    // single-Text-block case, so these result-content assertions read as before.
+    fn text_of(result: &ToolResult) -> String {
+        crate::content::result_blocks_text(&result.content)
+    }
+
     // ---- all/specs ----
 
     #[test]
     fn returns_every_tool_in_prompt_order_todo_write_first() {
-        assert_eq!(tools().len(), 11);
+        assert_eq!(tools().len(), 12);
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
     }
@@ -186,7 +195,7 @@ mod tests {
         )
         .await;
         assert!(!result.is_error);
-        assert_eq!(result.content, "a".repeat(500));
+        assert_eq!(text_of(&result), "a".repeat(500));
     }
 
     #[tokio::test]
@@ -194,7 +203,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = execute("bogus_tool", &json!({}), &ctx(tmp.path(), 100)).await;
         assert!(result.is_error);
-        assert!(result.content.contains("unknown tool"));
+        assert!(text_of(&result).contains("unknown tool"));
     }
 
     // ---- run ----
@@ -204,8 +213,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = run("bogus_tool", &json!({}), &ctx(tmp.path(), 10_000)).await;
         assert!(result.is_error);
-        assert!(result.content.contains("unknown tool"));
-        assert!(result.content.contains("bogus_tool"));
+        assert!(text_of(&result).contains("unknown tool"));
+        assert!(text_of(&result).contains("bogus_tool"));
     }
 
     #[tokio::test]
@@ -219,7 +228,7 @@ mod tests {
         )
         .await;
         assert!(!result.is_error);
-        assert!(result.content.contains("present.txt"));
+        assert!(text_of(&result).contains("present.txt"));
     }
 
     #[tokio::test]
@@ -232,7 +241,7 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
-        assert!(result.content.contains("enoent"));
+        assert!(text_of(&result).contains("enoent"));
     }
 
     #[tokio::test]
@@ -262,7 +271,7 @@ mod tests {
         .await;
         assert!(!result.is_error);
         assert_eq!(
-            result.content,
+            text_of(&result),
             format!(
                 "{}\n[truncated: output is 500 chars, showing the first 100]",
                 "a".repeat(100)
@@ -280,12 +289,8 @@ mod tests {
         )
         .await;
         assert!(!result.is_error);
-        assert!(result.content.contains("START"));
-        assert!(
-            result
-                .content
-                .contains("chars omitted from the middle of this output")
-        );
-        assert!(result.content.contains("[exit code: 0]"));
+        assert!(text_of(&result).contains("START"));
+        assert!(text_of(&result).contains("chars omitted from the middle of this output"));
+        assert!(text_of(&result).contains("[exit code: 0]"));
     }
 }

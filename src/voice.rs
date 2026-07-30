@@ -682,7 +682,8 @@ fn serialize_message(message: &Message) -> String {
                     } else {
                         format!("Tool result ({tool_use_id})")
                     };
-                    Some(format!("{label}: {}", truncate_for_serialization(content)))
+                    let text = crate::content::result_blocks_text(content);
+                    Some(format!("{label}: {}", truncate_for_serialization(&text)))
                 }
                 _ => None,
             })

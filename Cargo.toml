@@ -40,7 +40,12 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 
 # serde-tagged domain model + JSONL Session Log (ADR-0010)
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order makes serde_json::Map an IndexMap crate-wide, so a parse ->
+# edit -> serialize round-trip keeps object keys in on-disk INSERTION order
+# rather than re-sorting them alphabetically. notebook_edit leans on this: a
+# JSON.stringify-faithful serialize must not reorder a notebook's nested maps
+# (metadata / cell.data / kernelspec), or every write corrupts fidelity.
+serde_json = { version = "1", features = ["preserve_order"] }
 # user theme files are TOML (ADR-0038); config.json stays serde_json
 toml = "0.8"
 
@@ -60,6 +65,7 @@ directories = "5"                                            # XDG session_dir d
 time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UTC filenames
 rmcp = { version = "3.0.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 http = "1"
+base64 = "0.23.0"
 
 # The Catalog data generator (ADR-0037): `cargo run --bin generate-models`
 # rewrites the committed src/llm/catalog/data/*.json from models.dev.

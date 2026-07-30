@@ -375,7 +375,8 @@ async fn denied_run_command_is_never_executed_and_yields_the_denial_tool_result(
             && m.content.iter().any(|b| {
                 matches!(b,
                 ContentBlock::ToolResult { tool_use_id, is_error: true, content }
-                    if tool_use_id == "tu_run" && content == "[command denied by user]")
+                    if tool_use_id == "tu_run"
+                        && crate::content::result_blocks_text(content) == "[command denied by user]")
             })
     }));
 }

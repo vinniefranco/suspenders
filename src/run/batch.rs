@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::approvals;
-use crate::content::ContentBlock;
+use crate::content::{ContentBlock, ResultBlock, result_blocks_text};
 use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::extensions;
@@ -113,15 +113,18 @@ async fn execute_tool<D: RunDeps>(
 
     maybe_store_plan(state, &name, &input, is_error);
 
+    // The UI event carries the text projection (ADR-0059): a media block renders
+    // as a short placeholder there, while the Conversation keeps the full block
+    // list for the wire.
     state.emitter.emit(Event::tool_result(
         id.clone(),
         name.clone(),
-        content.clone(),
+        result_blocks_text(&content),
         is_error,
         answer.artifacts,
     ));
 
-    ContentBlock::tool_result(id, content, is_error)
+    ContentBlock::tool_result_blocks(id, content, is_error)
 }
 
 // A successful todo_write Tool Call replaces the Plan's task list and stores its
@@ -149,7 +152,7 @@ pub(super) fn display_input(input: &Value) -> Value {
 // How the batch answered one Tool Call: the Tool Result the model will read
 // plus whether it was an error. Built only through the constructors below.
 struct Answer {
-    content: String,
+    content: Vec<ResultBlock>,
     is_error: bool,
     artifacts: HashMap<String, Value>,
 }
@@ -158,37 +161,36 @@ impl Answer {
     /// A malformed-input answer is recorded like any error - it reads as a
     /// run.
     fn malformed(raw: &str) -> Self {
-        Answer {
-            content: voice::malformed_input(raw),
-            is_error: true,
-            artifacts: Default::default(),
-        }
+        Answer::text(voice::malformed_input(raw), true, Default::default())
     }
 
     /// A Middleware halt reads as a failed run.
     fn halted(reason: String, artifacts: HashMap<String, Value>) -> Self {
-        Answer {
-            content: reason,
-            is_error: true,
-            artifacts,
-        }
+        Answer::text(reason, true, artifacts)
     }
 
     /// An Approval denial (ADR-0005): the command never ran.
     fn denied() -> Self {
-        Answer {
-            content: voice::command_denied().to_string(),
-            is_error: true,
-            artifacts: Default::default(),
-        }
+        Answer::text(voice::command_denied(), true, Default::default())
     }
 
-    /// The Extension pipeline executed the call.
+    /// The Extension pipeline executed the call: the shaped block list rides
+    /// straight through (ADR-0059).
     fn ran(result: extensions::PipelineResult) -> Self {
         Answer {
             content: result.content,
             is_error: result.is_error,
             artifacts: result.artifacts,
+        }
+    }
+
+    /// A single-Text-block answer - the shape every Voice-worded outcome
+    /// (malformed/halted/denied) takes.
+    fn text(content: impl Into<String>, is_error: bool, artifacts: HashMap<String, Value>) -> Self {
+        Answer {
+            content: vec![ResultBlock::text(content)],
+            is_error,
+            artifacts,
         }
     }
 }
@@ -326,21 +328,24 @@ mod tests {
     fn a_denial_pairs_the_command_denied_voice_with_the_denied_fact() {
         // ADR-0005: the Approval gate; the command never ran.
         let answer = Answer::denied();
-        assert_eq!(answer.content, voice::command_denied());
+        assert_eq!(result_blocks_text(&answer.content), voice::command_denied());
         assert!(answer.is_error);
     }
 
     #[test]
     fn a_malformed_input_answer_reads_as_a_run() {
         let answer = Answer::malformed("{not json");
-        assert_eq!(answer.content, voice::malformed_input("{not json"));
+        assert_eq!(
+            result_blocks_text(&answer.content),
+            voice::malformed_input("{not json")
+        );
         assert!(answer.is_error);
     }
 
     #[test]
     fn an_extension_halt_reads_as_a_failed_run() {
         let answer = Answer::halted("blocked by plugin".to_string(), Default::default());
-        assert_eq!(answer.content, "blocked by plugin");
+        assert_eq!(result_blocks_text(&answer.content), "blocked by plugin");
         assert!(answer.is_error);
     }
 }

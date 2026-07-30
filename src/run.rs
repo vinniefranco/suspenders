@@ -81,6 +81,12 @@ pub async fn run(
         Arc::clone(&capture.tools),
     ));
 
+    // The file-read cache, built once per Run (F6, ADR-0060): fresh and empty at
+    // Run start, like the registry, so a file read in a prior Run does not clear
+    // this Run's read-before-edit enforcement. read_file records into it;
+    // notebook_edit checks it before mutating a notebook.
+    let read_cache = Arc::new(crate::tool::read_cache::FileReadCache::new());
+
     // The Side-Query effect seam (P2b, ADR-0055): the real impl is the captured
     // Llm boundary called OFF the main Conversation. Unlike the Approver, it does
     // NOT travel the Agent mpsc - a side-query touches no Agent/Conversation state
@@ -102,6 +108,7 @@ pub async fn run(
     // consuming phases.
     let caps = crate::tool::caps::Capabilities {
         registry,
+        read_cache,
         approver: Arc::clone(&capture.approver),
         side_query,
         // The Question seam (P2a, ADR-0057): the Agent's tx-backed handle,

@@ -13,3 +13,13 @@ Considered and rejected:
 Cost accepted: a small codec between the internal content-block representation and JSON - half of which exists already in the wire conversion performed on every request.
 
 Consequences: Thinking is never in the log (it never enters the Conversation), so a resumed Transcript rebuilds from the Conversation alone. A log ending mid-Run settles that Run as failed on Resume, per the existing rule that a crash settles as a failure.
+
+## Amendment (ADR-0059): ToolResult content is a block list
+
+A logged `ContentBlock::ToolResult`'s `content` is now a `Vec<ResultBlock>`
+(ADR-0059), not a `String`. The log line is still self-evident JSONL: the
+common case is a single `{"type":"text","text":...}` block, and the tagged
+`ResultBlock` enum round-trips through serde like every other content block.
+Media (`{"type":"image",...}` / `{"type":"document",...}`) is logged verbatim
+when a tool produced it, so a resumed Transcript rebuilds from the Conversation
+alone as before - the log stays greppable and diffable.

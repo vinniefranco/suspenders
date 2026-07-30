@@ -72,6 +72,7 @@
 use std::sync::Arc;
 
 use crate::llm::model::Model;
+use crate::tool::read_cache::FileReadCache;
 use crate::tool_registry::ToolRegistry;
 
 /// The effect handles and Run-scoped state a Tool Call reaches its host through
@@ -90,6 +91,12 @@ pub struct Capabilities {
     /// it is Run-scoped state the tools read, not an effect. `tool_search`
     /// reveals deferred tools through it; every other tool ignores it.
     pub registry: Arc<ToolRegistry>,
+    /// The Run-scoped file-read cache (F6, ADR-0060): concrete, like the
+    /// registry, because it is Run-scoped state the tools read/write, not an
+    /// effect. read_file records a successful read into it; notebook_edit checks
+    /// it for a prior FULL read before mutating a notebook. Enforcement only -
+    /// the qwen `file_unchanged` read fast-path is DEFERRED (ADR-0060).
+    pub read_cache: Arc<FileReadCache>,
     /// The Approval effect seam: the tool-initiated path to the user's decision
     /// on a gated action. `dyn` because its real impl lives in the Agent (which
     /// owns the mpsc), while the Run and its tools do not depend on the Agent.
@@ -116,6 +123,7 @@ impl std::fmt::Debug for Capabilities {
         // seam prints as an opaque marker. Keeps `ToolCtx` on `#[derive(Debug)]`.
         f.debug_struct("Capabilities")
             .field("registry", &self.registry)
+            .field("read_cache", &self.read_cache)
             .field("approver", &"<dyn>")
             .field("side_query", &"<dyn>")
             .field("questioner", &"<dyn>")
@@ -280,6 +288,7 @@ impl Capabilities {
     pub fn for_test() -> Self {
         Capabilities {
             registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
@@ -293,6 +302,7 @@ impl Capabilities {
     pub fn for_test_with_registry(registry: Arc<ToolRegistry>) -> Self {
         Capabilities {
             registry,
+            read_cache: Arc::new(FileReadCache::new()),
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
@@ -306,6 +316,7 @@ impl Capabilities {
     pub fn for_test_with_side_query(side_query: Arc<dyn SideQuery>) -> Self {
         Capabilities {
             registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
             approver: Arc::new(DenyingApprover),
             side_query,
             questioner: Arc::new(DecliningQuestioner),
@@ -320,9 +331,25 @@ impl Capabilities {
     pub fn for_test_with_questioner(questioner: Arc<dyn Questioner>) -> Self {
         Capabilities {
             registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
             approver: Arc::new(DenyingApprover),
             side_query: Arc::new(DenyingSideQuery),
             questioner,
+        }
+    }
+
+    /// Capabilities over a caller-supplied [`FileReadCache`] (and the full
+    /// built-in registry + denying effect seams), for the notebook_edit tests
+    /// that pre-populate the cache (or share it with read_file) and assert the
+    /// read-before-edit enforcement. The single read-cache construction site, so
+    /// a future consumer touches one place.
+    pub fn for_test_with_read_cache(read_cache: Arc<FileReadCache>) -> Self {
+        Capabilities {
+            registry: crate::tool_registry::test_registry(),
+            read_cache,
+            approver: Arc::new(DenyingApprover),
+            side_query: Arc::new(DenyingSideQuery),
+            questioner: Arc::new(DecliningQuestioner),
         }
     }
 }
@@ -370,6 +397,7 @@ mod tests {
     async fn a_real_approver_returns_its_injected_decision() {
         let caps = Capabilities {
             registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
             approver: Arc::new(FakeApprover { answer: true }),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
@@ -422,6 +450,7 @@ mod tests {
     fn capabilities_clones_and_debug_prints() {
         let caps = Capabilities {
             registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
             approver: Arc::new(FakeApprover { answer: false }),
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
@@ -431,6 +460,7 @@ mod tests {
         // registry expanded and the effect seams opaque.
         let rendered = format!("{cloned:?}");
         assert!(rendered.contains("Capabilities"));
+        assert!(rendered.contains("read_cache"));
         assert!(rendered.contains("approver"));
         assert!(rendered.contains("side_query"));
         assert!(rendered.contains("questioner"));

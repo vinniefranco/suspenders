@@ -948,6 +948,10 @@ impl Session {
                 self.reply_reserve_for(model),
             ),
             command_timeout_ms: self.command_timeout_ms,
+            // The captured Model's input modalities (ADR-0059): a copied fact,
+            // stamped here like the Result Cap so read_file (P3 3b) can gate media
+            // on it without reaching the llm layer.
+            input_modalities: model.input_modalities,
             caps,
         }
     }

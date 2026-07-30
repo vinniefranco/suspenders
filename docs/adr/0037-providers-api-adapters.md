@@ -188,3 +188,21 @@ that fails it is rejected with the reason.
 - `Connection` dissolves: base URL and credential belong to the Provider,
   window and output cap to the Model, temperature to the request options.
 - The Session Log format gains Provenance fields on assistant messages.
+
+## Amendment (ADR-0059): Model carries input_modalities; transform degrades media
+
+The **Model** now carries an `input_modalities` fact (`{image, pdf}`, a copied
+Catalog fact, all-false for synthesized Models and catalog misses), read from
+the Catalog's `modalities.input` at resolve. `CatalogModel` gains the field
+with `#[serde(default)]` so committed data written before it parses as
+text-only; the generator populates it on the next regeneration. The Model
+stamps it onto the `ToolCtx` at ctx-build (a copied fact like the Result Cap),
+so read_file can gate media on it (P3 3b) without a `tool -> llm` edge.
+
+The **transform pass** (the cross-Provider request-shaping normalizer) gains a
+media-degrade step, `degrade_unsupported_media`, run right after
+`normalize_request` in the Dispatcher's `complete` so both adapters get it for
+free. For each Tool Result `Image`/`Document` block the target Model cannot
+accept, it substitutes the verbatim unsupported-modality placeholder (ADR-0059)
+as a Text block - the cross-Model-history safety net, since a request may carry
+media a previous, more capable Model produced.

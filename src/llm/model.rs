@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::content::{Provenance, Usage};
+use crate::content::{Modalities, Provenance, Usage};
 use crate::llm::catalog;
 use crate::llm::cost::{self, Cost, Pricing};
 use crate::llm::provider::Provider;
@@ -51,6 +51,11 @@ pub struct Model {
     /// Whether the model can emit reasoning/thinking tokens (a Catalog fact;
     /// `false` for synthesized Models).
     pub reasoning: bool,
+    /// The input modalities the model accepts beyond text (ADR-0059): a Catalog
+    /// fact, all-false for synthesized Models and catalog misses. Stamped onto
+    /// the [`crate::tool::ToolCtx`] so read_file (P3 3b) gates media on it, and
+    /// read by the wire-build-time degrade pass ([`crate::llm::transform`]).
+    pub input_modalities: Modalities,
 }
 
 impl Model {
@@ -71,6 +76,7 @@ impl Model {
             max_tokens,
             pricing: None,
             reasoning: false,
+            input_modalities: Modalities::default(),
         }
     }
 
@@ -141,6 +147,7 @@ pub fn resolve(
         max_tokens: wire_output_cap(catalog_max_tokens, context_window),
         pricing: known.and_then(|k| k.cost),
         reasoning: known.is_some_and(|k| k.reasoning),
+        input_modalities: known.map(|k| k.input_modalities).unwrap_or_default(),
     })
 }
 

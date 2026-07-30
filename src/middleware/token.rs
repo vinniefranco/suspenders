@@ -22,16 +22,67 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::content::{ResultBlock, result_blocks_text};
 use crate::tool::ToolCtx;
 
 /// The raw Tool Result a Middleware sees mid-pipeline: the content the model
 /// would see and whether it was an error. Mirrors baud's `Token.result/0`
 /// (`%{content, is_error}`) - distinct from [`crate::tools::ToolResult`] only
 /// in that it is the in-flight, pre-Shaping value the `post_run` fold rewrites.
+///
+/// `content` is a [`ResultBlock`] list (ADR-0059): the text-editing Middleware
+/// (condense, diff, run_command) read and rewrite the TEXT through
+/// [`TokenResult::text`]/[`TokenResult::set_text`], and any media blocks (only
+/// P3 3b's read_file produces them) pass through the fold untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenResult {
-    pub content: String,
+    pub content: Vec<ResultBlock>,
     pub is_error: bool,
+}
+
+impl TokenResult {
+    /// A single-Text-block result - the common case a text tool produces, and
+    /// the shape the pipeline sets before the `post_run` fold from a text tool's
+    /// return.
+    pub fn text(content: impl Into<String>, is_error: bool) -> Self {
+        TokenResult {
+            content: vec![ResultBlock::text(content)],
+            is_error,
+        }
+    }
+
+    /// The text projection of the result's blocks (ADR-0059): what the
+    /// text-editing Middleware read. Text blocks concatenated, media rendered as
+    /// a placeholder.
+    pub fn text_of(&self) -> String {
+        result_blocks_text(&self.content)
+    }
+
+    /// Replaces the TEXT of the result, keeping any media blocks in place: the
+    /// condense/diff Middleware rewrite the text and the media (P3 3b) rides
+    /// through. With no media (the common case) this is exactly a single Text
+    /// block carrying the new text.
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        let text_block = ResultBlock::text(text);
+        let mut media: Vec<ResultBlock> = self
+            .content
+            .drain(..)
+            .filter(|b| !matches!(b, ResultBlock::Text { .. }))
+            .collect();
+        if media.is_empty() {
+            self.content = vec![text_block];
+        } else {
+            // Media-led results keep media first; otherwise text leads.
+            let text_first = !matches!(media.first(), Some(ResultBlock::Image { .. }))
+                && !matches!(media.first(), Some(ResultBlock::Document { .. }));
+            self.content = if text_first {
+                std::iter::once(text_block).chain(media.drain(..)).collect()
+            } else {
+                media.push(text_block);
+                media
+            };
+        }
+    }
 }
 
 /// The value threaded through one Tool Call's Middleware lifecycle.

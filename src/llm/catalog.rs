@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::content::Modalities;
 use crate::llm::cost::Pricing;
 use crate::llm::model::Api;
 use crate::llm::provider::Provider;
@@ -29,6 +30,12 @@ pub struct CatalogModel {
     pub max_tokens: u64,
     /// Whether the model can emit reasoning/thinking tokens.
     pub reasoning: bool,
+    /// The input modalities the model accepts beyond text (ADR-0059). `default`
+    /// (all-false) so committed data written before the field parses as
+    /// text-only; the generator populates it from `modalities.input` on the next
+    /// regeneration.
+    #[serde(default)]
+    pub input_modalities: Modalities,
     /// Flat rates in dollars per million tokens. `None` where models.dev
     /// carries no pricing (router pseudo-models) - such Models go unpriced.
     #[serde(default, skip_serializing_if = "Option::is_none")]

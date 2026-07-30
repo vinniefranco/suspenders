@@ -14,6 +14,7 @@ pub mod extensions;
 pub mod llm;
 pub mod mcp;
 pub mod middleware;
+pub mod notebook;
 pub mod plan;
 pub mod presenter;
 pub mod run;

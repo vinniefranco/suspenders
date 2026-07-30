@@ -30,9 +30,84 @@ pub struct ToolSpec {
     pub input_schema: serde_json::Value,
 }
 
+/// One block of a Tool Result's content (ADR-0059): the canonical block-list a
+/// Tool Result carries. The common case is a single [`ResultBlock::Text`]; media
+/// blocks (image, PDF document) ride only when a tool produces them and the
+/// target Model supports the modality, else they degrade to a text placeholder
+/// (the read-time and wire-build-time degrade paths, ADR-0059).
+///
+/// `#[serde(tag = "type")]` matches the Session-Log projection (ADR-0010): a Tool
+/// Result round-trips through the log as this tagged array. The Anthropic wire's
+/// `image`/`document` shape (`source.base64`) is NOT this internal form - the
+/// explicit visitor in `anthropic_messages::request` builds it (ADR-0002); this
+/// enum is the domain shape, `data` a base64 string on the media variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResultBlock {
+    Text { text: String },
+    Image { mime: String, data: String },
+    Document { mime: String, data: String },
+}
+
+impl ResultBlock {
+    /// A single Text block - the common case a text tool's result becomes.
+    pub fn text(text: impl Into<String>) -> Self {
+        ResultBlock::Text { text: text.into() }
+    }
+}
+
+/// The VERBATIM unsupported-modality placeholder qwen-code emits (qwen v0.16.0
+/// `fileUtils.ts` `unsupportedModalityMessage`): the text a media block degrades
+/// to when the target Model lacks that modality. Shared by the wire-build-time
+/// degrade pass ([`crate::llm::transform`]) and the OpenAI request visitor (whose
+/// tool-role messages carry no media, ADR-0059). `modality` is "image" or "pdf";
+/// `display_name` names the source so the model can reason about it.
+pub fn unsupported_modality_placeholder(modality: &str, display_name: &str) -> String {
+    format!(
+        "[Unsupported {modality} file: \"{display_name}\". This model does not \
+support {modality} input. The read_file tool cannot process this type of file \
+either. To handle this file, try using skills if applicable, or any tools \
+installed at system wide, or let the user know you cannot process this type of \
+file.]"
+    )
+}
+
+/// The text projection of a block list (ADR-0059): Text blocks concatenated,
+/// each media block rendered as a short `[image: <mime>]` / `[document: <mime>]`
+/// placeholder. The one place the block-list-to-text rule lives - the single
+/// block-list-to-text projection path, read by the UI, the loop-detector,
+/// summarize, the Session-Log projection, and the transform's orphan path.
+pub fn result_blocks_text(blocks: &[ResultBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ResultBlock::Text { text } => text.clone(),
+            ResultBlock::Image { mime, .. } => format!("[image: {mime}]"),
+            ResultBlock::Document { mime, .. } => format!("[document: {mime}]"),
+        })
+        .collect()
+}
+
+/// The input modalities a Model accepts beyond text (ADR-0037, ADR-0059): image
+/// and PDF. Default all-false, so a Model whose Catalog entry predates the
+/// modality fields (the committed data's `#[serde(default)]`) accepts text only
+/// and every media block degrades. A copied fact, stamped onto the Model at
+/// resolve and onto the [`crate::tool::ToolCtx`] at ctx-build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Modalities {
+    #[serde(default)]
+    pub image: bool,
+    #[serde(default)]
+    pub pdf: bool,
+}
+
 /// A content block. `#[serde(tag = "type")]` mirrors baud's `:type`
 /// discriminator; `rename_all = "snake_case"` matches the atom names
 /// (`text`, `tool_use`, `tool_result`, `thinking`).
+///
+/// A Tool Result's `content` is a [`ResultBlock`] list (ADR-0059): the common
+/// case is a single Text block, media reaches the wire when the Model supports
+/// it. Read its text projection through [`result_blocks_text`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -46,7 +121,7 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: Vec<ResultBlock>,
         is_error: bool,
     },
     Thinking {
@@ -72,6 +147,9 @@ impl ContentBlock {
         }
     }
 
+    /// A Tool Result carrying a single Text block - the common case, so every
+    /// existing construction site (a text result) reads unchanged. Media results
+    /// use [`ContentBlock::tool_result_blocks`].
     pub fn tool_result(
         tool_use_id: impl Into<String>,
         content: impl Into<String>,
@@ -79,7 +157,21 @@ impl ContentBlock {
     ) -> Self {
         ContentBlock::ToolResult {
             tool_use_id: tool_use_id.into(),
-            content: content.into(),
+            content: vec![ResultBlock::text(content)],
+            is_error,
+        }
+    }
+
+    /// A Tool Result carrying an explicit block list (ADR-0059): the media path,
+    /// where a tool's result is more than one Text block.
+    pub fn tool_result_blocks(
+        tool_use_id: impl Into<String>,
+        content: Vec<ResultBlock>,
+        is_error: bool,
+    ) -> Self {
+        ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content,
             is_error,
         }
     }

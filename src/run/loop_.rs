@@ -1809,7 +1809,7 @@ mod tests {
         let requests = deps.requests.lock().unwrap();
         let last = requests[1].messages.last().unwrap();
         assert!(
-            matches!(&last.content[0], ContentBlock::ToolResult { is_error, content, .. } if *is_error && content.contains("not valid JSON"))
+            matches!(&last.content[0], ContentBlock::ToolResult { is_error, content, .. } if *is_error && crate::content::result_blocks_text(content).contains("not valid JSON"))
         );
         // Nothing executed.
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

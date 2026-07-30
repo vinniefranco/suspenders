@@ -664,7 +664,12 @@ mod tests {
         let m3 = msgs[2]["content"].as_array().unwrap();
         assert_eq!(
             m3[0],
-            json!({ "type": "tool_result", "tool_use_id": "toolu_1", "content": "defmodule ...", "is_error": false })
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "is_error": false,
+                "content": [{ "type": "text", "text": "defmodule ..." }]
+            })
         );
     }
 

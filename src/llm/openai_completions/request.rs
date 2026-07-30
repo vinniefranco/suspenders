@@ -20,7 +20,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::content::{ContentBlock, Message, Role};
+use crate::content::{ContentBlock, Message, ResultBlock, Role};
 use crate::llm::LlmRequest;
 use crate::llm::model::Model;
 use crate::content::ToolSpec;
@@ -126,6 +126,7 @@ pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
                 "role": "tool",
                 "tool_call_id": tool_use_id,
                 "content": tool_content(content, *is_error),
+                // `content` is a `&Vec<ResultBlock>` (ADR-0059).
             })),
             ContentBlock::Thinking { .. } => {}
         }
@@ -152,14 +153,29 @@ pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
     }
 }
 
-// The tool message's content: this dialect has no error slot on `role:"tool"`
-// messages, so an error result carries the Voice's marker in-band (ADR-0037);
-// a successful result passes through byte-identical.
-fn tool_content(content: &str, is_error: bool) -> String {
+// The tool message's content: this dialect carries no media on a `role:"tool"`
+// message (OpenAI multimodal tool-role is out of scope, ADR-0059), so a media
+// block DEGRADES to the verbatim unsupported-modality placeholder; Text blocks
+// join as before. This dialect also has no error slot, so an error result
+// carries the Voice's marker in-band (ADR-0037); a successful text-only result
+// passes through byte-identical.
+fn tool_content(blocks: &[ResultBlock], is_error: bool) -> String {
+    let content = blocks
+        .iter()
+        .map(|block| match block {
+            ResultBlock::Text { text } => text.clone(),
+            ResultBlock::Image { mime, .. } => {
+                crate::content::unsupported_modality_placeholder("image", mime)
+            }
+            ResultBlock::Document { mime, .. } => {
+                crate::content::unsupported_modality_placeholder("pdf", mime)
+            }
+        })
+        .collect::<String>();
     if is_error {
         format!("{} {content}", crate::voice::tool_error_marker())
     } else {
-        content.to_string()
+        content
     }
 }
 

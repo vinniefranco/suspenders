@@ -39,6 +39,7 @@ use serde_json::Value;
 
 use std::collections::HashMap;
 
+use crate::content::{ResultBlock, result_blocks_text};
 use crate::event::Stage;
 use crate::middleware::token::TokenResult;
 use crate::middleware::{Middleware, Token};
@@ -96,14 +97,22 @@ pub struct Failure {
 }
 
 /// The shaped outcome of the back half of the pipeline: the model-facing
-/// content, its error flag, and the display-side Artifacts.
-/// Artifacts are keyed by `String` and hold arbitrary `Value`,
-/// mirroring the Token.
+/// content (a [`ResultBlock`] list, ADR-0059), its error flag, and the
+/// display-side Artifacts. Artifacts are keyed by `String` and hold arbitrary
+/// `Value`, mirroring the Token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineResult {
-    pub content: String,
+    pub content: Vec<ResultBlock>,
     pub is_error: bool,
     pub artifacts: std::collections::HashMap<String, Value>,
+}
+
+impl PipelineResult {
+    /// The text projection of the shaped blocks (ADR-0059): what the UI event
+    /// and the loop read where the old `content: String` was read.
+    pub fn text(&self) -> String {
+        result_blocks_text(&self.content)
+    }
 }
 
 /// Folds `pre_run` in registration order over the Extensions that carry a
@@ -142,6 +151,9 @@ pub async fn execute(extensions: &[Registered], token: Token) -> (PipelineResult
         content: raw.content,
         is_error: raw.is_error,
     });
+    // `raw.content` is already a `Vec<ResultBlock>` (a text tool's one Text
+    // block, ADR-0059); the text-editing Middleware rewrite the text through
+    // `TokenResult::set_text` and media rides through.
 
     // post_run folds in reverse registration order (onion): the last-registered
     // Extension runs first, the first-registered wraps it. A Presenter-only
@@ -163,7 +175,7 @@ pub async fn execute(extensions: &[Registered], token: Token) -> (PipelineResult
     let content = shaping::shape(
         &token.tool,
         &token.input,
-        &result.content,
+        result.content,
         token.ctx.result_cap,
     );
 
@@ -451,7 +463,8 @@ mod tests {
         fn post_run(&self, mut token: Token, opts: &Value) -> Token {
             let id = opts.get("id").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(result) = token.result.as_mut() {
-                result.content = format!("{} <{}>", result.content, id);
+                let tagged = format!("{} <{}>", result.text_of(), id);
+                result.set_text(tagged);
             }
             token
         }
@@ -662,7 +675,7 @@ mod tests {
 
         assert!(failures.is_empty());
         assert!(result.is_error);
-        assert!(result.content.contains("unknown tool"));
+        assert!(result.text().contains("unknown tool"));
         let mut expected = HashMap::new();
         expected.insert("mark".to_string(), json!("seen"));
         assert_eq!(result.artifacts, expected);
@@ -687,7 +700,7 @@ mod tests {
 
         assert!(failures.is_empty());
         // inner (last registered) runs first; outer wraps it.
-        assert!(result.content.ends_with("<inner> <outer>"));
+        assert!(result.text().ends_with("<inner> <outer>"));
     }
 
     #[tokio::test]
@@ -702,7 +715,7 @@ mod tests {
         let (result, failures) = execute(&extensions, token).await;
 
         assert!(failures.is_empty());
-        assert!(result.content.contains("[truncated:"));
+        assert!(result.text().contains("[truncated:"));
     }
 
     #[tokio::test]
@@ -720,7 +733,7 @@ mod tests {
 
         // ContentTagger:kept survives; Crasher's post_run is skipped. Reverse
         // fold: Crasher runs first (panics, token unchanged), then kept tags.
-        assert!(result.content.ends_with("<kept>"));
+        assert!(result.text().ends_with("<kept>"));
         assert_eq!(
             failures,
             vec![Failure {
