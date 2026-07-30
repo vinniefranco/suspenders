@@ -1,9 +1,10 @@
 //! `glob(pattern, path?)`: find files whose path matches a shell glob (`*`,
 //! `?`, `**`, `[set]`), returning matching paths relative to the search root,
 //! one per line, sorted. Searches recursively under `path` (default the project root).
-//! Skips the same well-known vendored/build directories `grep`/`list_files`
-//! skip, and never follows symlinks - the same confinement the sibling
-//! read-only tools use.
+//! Walks through the shared [`crate::walk::walk_files`], so it respects
+//! `.gitignore`, skips the same well-known vendored/build directories
+//! `grep`/`list_files` skip, and never follows symlinks - the same confinement
+//! the sibling read-only tools use.
 //!
 //! The glob is translated to a regex (reusing the `regex` dep grep already
 //! pulls) so `**` can cross directory boundaries and `*`/`?` cannot. A pattern
@@ -14,26 +15,17 @@
 
 use crate::tool::path::{FileError, file_error, resolve_path, with_path};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
+use crate::walk::walk_files;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::path::Path;
 
-pub struct Glob;
+// The vendored/build skip-list now lives with the shared walk (its single
+// source of truth), re-exported here so env_context's `use` of it, and any
+// reader that thinks of it as glob's prune, still resolve.
+pub use crate::walk::SKIP_DIRS;
 
-// The same vendored/build directories grep and list_files never descend into.
-// Public so the opening environment tree (env_context) prunes the SAME set the
-// read-only tools do, and the tree the model sees matches what glob would walk.
-pub const SKIP_DIRS: &[&str] = &[
-    ".claude",
-    ".git",
-    "_build",
-    "deps",
-    "node_modules",
-    ".direnv",
-    ".nix-hex",
-    ".nix-mix",
-    ".elixir_ls",
-];
+pub struct Glob;
 
 #[async_trait::async_trait]
 impl Tool for Glob {
@@ -51,8 +43,9 @@ impl Tool for Glob {
                 - Use this tool when you need to find files by name or extension but do not know \
                 the directory - it is faster than listing directories by hand.\n\
                 - Scope: searches recursively under `path` (default the project root); returned \
-                paths are relative to that search root. Skips .git, _build, deps, node_modules and \
-                other vendored/build directories, and does not follow symlinks.\n\
+                paths are relative to that search root. Respects .gitignore, skips .git, _build, \
+                deps, node_modules and other vendored/build directories, and does not follow \
+                symlinks.\n\
                 - Returns \"[no matches]\" when nothing matches (not an error). An invalid pattern \
                 is reported back so you can fix it.\n\
                 - You can call multiple tools in a single response. It is often better to \
@@ -175,10 +168,11 @@ fn glob_to_regex(pattern: &str) -> String {
     out
 }
 
-// Match every walked file's relative path against the regex, sorted (the walk
-// yields sorted paths). Zero matches is a clean explicit result.
+// Match every walked file's relative path against the regex, sorted (the shared
+// walk yields sorted, gitignore-filtered, SKIP_DIRS-pruned, symlink-free
+// files). Zero matches is a clean explicit result.
 fn search(root: &Path, rel_root: &Path, regex: &Regex) -> String {
-    let matches: Vec<String> = collect_files(root)
+    let matches: Vec<String> = walk_files(root)
         .iter()
         .map(|file| relative_to(file, rel_root))
         .filter(|rel| regex.is_match(rel))
@@ -188,42 +182,6 @@ fn search(root: &Path, rel_root: &Path, regex: &Regex) -> String {
         "[no matches]".to_string()
     } else {
         matches.join("\n")
-    }
-}
-
-// Depth-first, sorted for stable output. Skip-dirs are pruned by basename.
-// The same shape grep's `collect_files` uses.
-fn collect_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut entries: Vec<String> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    entries.sort();
-
-    let mut out = Vec::new();
-    for entry in entries {
-        out.extend(collect_entry(dir, &entry));
-    }
-    out
-}
-
-// lstat, not stat: symlinks are skipped entirely, the same reason grep gives -
-// following them could walk out of the root or loop forever.
-fn collect_entry(dir: &Path, entry: &str) -> Vec<std::path::PathBuf> {
-    let full = dir.join(entry);
-    match std::fs::symlink_metadata(&full) {
-        Ok(meta) if meta.file_type().is_dir() => {
-            if SKIP_DIRS.contains(&entry) {
-                Vec::new()
-            } else {
-                collect_files(&full)
-            }
-        }
-        Ok(meta) if meta.file_type().is_file() => vec![full],
-        _ => Vec::new(),
     }
 }
 
@@ -376,6 +334,21 @@ mod tests {
         assert_eq!(
             run(json!({"pattern": "**/*.rs"}), &ctx(tmp.path())).await,
             Ok("visible.rs".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn respects_a_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        // The unification proof: a .gitignore'd file is now excluded, where the
+        // old SKIP_DIRS-only walk would have returned it.
+        std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(tmp.path().join("ignored.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("kept.txt"), "").unwrap();
+
+        assert_eq!(
+            run(json!({"pattern": "**/*.txt"}), &ctx(tmp.path())).await,
+            Ok("kept.txt".into())
         );
     }
 

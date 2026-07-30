@@ -1,6 +1,8 @@
 //! `grep(pattern, path?)`: regex search under a path (default `.`), returning
-//! `relative/path:line: text` lines. Skips well-known vendored/build
-//! directories and binary files; capped at 100 matches.
+//! `relative/path:line: text` lines. Walks through the shared
+//! [`crate::walk::walk_files`], so it respects `.gitignore`, skips well-known
+//! vendored/build directories, and never follows symlinks; also skips binary
+//! files; capped at 100 matches.
 //!
 //! A pattern that fails to compile as a regex is retried as literal text, with
 //! a note prefixed to the result - the same forgive-the-caller philosophy as
@@ -10,23 +12,13 @@
 
 use crate::tool::path::{FileError, file_error, resolve_path, with_path};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
+use crate::walk::walk_files;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::path::Path;
 
 pub struct Grep;
 
-const SKIP_DIRS: &[&str] = &[
-    ".claude",
-    ".git",
-    "_build",
-    "deps",
-    "node_modules",
-    ".direnv",
-    ".nix-hex",
-    ".nix-mix",
-    ".elixir_ls",
-];
 const MAX_MATCHES: usize = 100;
 const BINARY_PROBE_BYTES: usize = 8_192;
 const LITERAL_NOTE: &str = "[pattern is not valid regex - searched for it as literal text]\n";
@@ -53,8 +45,8 @@ impl Tool for Grep {
                 \"foo(bar\" finds the literal characters. Zero matches from a VALID regex is a real \
                 answer and never falls back.\n\
                 - Scope: searches recursively under `path` (default the project root); `path` may \
-                also be a single file. Skips .git, _build, deps, node_modules and other \
-                vendored/build directories, and skips binary files.\n\
+                also be a single file. Respects .gitignore, skips .git, _build, deps, node_modules \
+                and other vendored/build directories, and skips binary files.\n\
                 - Output is capped at {MAX_MATCHES} matches; a trailer notes when the cap was \
                 reached. \"[no matches]\" is returned when nothing matches.\n\
                 - Use this to find where a symbol or string is defined or used before reading \
@@ -99,7 +91,7 @@ impl Tool for Grep {
             let result = if abs.is_file() {
                 search(&[abs.to_path_buf()], &regex, &root)
             } else if abs.is_dir() {
-                search(&collect_files(abs), &regex, &root)
+                search(&walk_files(abs), &regex, &root)
             } else {
                 Err(file_error("grep", path, FileError::Enoent))
             };
@@ -119,42 +111,6 @@ fn compile(pattern: &str) -> (Regex, String) {
             Regex::new(&regex::escape(pattern)).expect("escaped pattern always compiles"),
             LITERAL_NOTE.to_string(),
         ),
-    }
-}
-
-// Depth-first, sorted for stable output. Skip-dirs are pruned by basename.
-fn collect_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut entries: Vec<String> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    entries.sort();
-
-    let mut out = Vec::new();
-    for entry in entries {
-        out.extend(collect_entry(dir, &entry));
-    }
-    out
-}
-
-// lstat, not stat: symlinks are skipped entirely. Following them could walk
-// out of the project root (ln -s /) or loop forever (ln -s .); the path guard
-// only checks the starting path.
-fn collect_entry(dir: &Path, entry: &str) -> Vec<std::path::PathBuf> {
-    let full = dir.join(entry);
-    match std::fs::symlink_metadata(&full) {
-        Ok(meta) if meta.file_type().is_dir() => {
-            if SKIP_DIRS.contains(&entry) {
-                Vec::new()
-            } else {
-                collect_files(&full)
-            }
-        }
-        Ok(meta) if meta.file_type().is_file() => vec![full],
-        _ => Vec::new(),
     }
 }
 
@@ -353,6 +309,21 @@ mod tests {
         assert_eq!(
             run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
             Ok("visible.txt:1: needle".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn respects_a_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        // The unification proof: grep no longer returns a match inside a
+        // .gitignore'd file, where the old SKIP_DIRS-only walk would have.
+        std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(tmp.path().join("ignored.txt"), "needle\n").unwrap();
+        std::fs::write(tmp.path().join("kept.txt"), "needle\n").unwrap();
+
+        assert_eq!(
+            run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
+            Ok("kept.txt:1: needle".into())
         );
     }
 
