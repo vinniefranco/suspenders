@@ -128,7 +128,7 @@ recompute from that capture at Run start:
 
 - context window → Context Budget (config `context_budget` remains as the
   window for catalog-less Models and as an optional global cap),
-- output cap → the reply reserve,
+- output cap → the reply reserve (clamped to half the budget, below),
 - Context Budget → the Result Cap.
 
 A switch to a smaller window lands as ordinary budget pressure on the next
@@ -143,10 +143,18 @@ Provider's models), else the config `context_budget` figure, else the
 64K default. The effective Context Budget for a Run is then
 `min(context_budget, window)` when the config key is set, and the window
 alone when it is not - the key is a cap and a fallback, never the budget
-itself. The budget invariant is per-Model: the effective budget must leave
-room past that Model's own output cap, checked at launch for the launch
-Model and at a `/model` swap for the picked Model, so a pick that cannot
-fit is rejected with the reason instead of exploding on a later Run.
+itself. A Provider is trusted to report whatever output ceiling it likes -
+some report an output cap equal to the context window - but a request spends
+`input + max_tokens` against the window, so sending that raw ceiling would
+make the endpoint reject the moment the prompt is non-empty. The wire output
+cap is therefore clamped at Model resolution to half the window, leaving the
+other half for the prompt. The reply reserve is per-Model on top of that:
+the wire cap clamped again to half the effective budget (which matters only
+when the config caps the budget below the window), so a live window - and
+therefore a usable `/model` switch - always survives. The one per-Model
+budget invariant, checked at launch and at a `/model` swap, is that the
+Compaction Keep sits below the compaction trigger at that reserve; a config
+that fails it is rejected with the reason.
 
 ## Considered and rejected
 

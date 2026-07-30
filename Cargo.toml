@@ -55,6 +55,7 @@ anyhow = "1"
 nix = { version = "0.29", features = ["signal", "process"] } # killpg for run_command (ADR-0023)
 html2text = "0.12"                                           # web_fetch HTML → readable text (ADR-0024)
 regex = "1"                                                  # grep, edit_file fuzzy matching
+ignore = "0.4"                                               # gitignore-aware file walk shared by glob + @path completion (walk.rs)
 directories = "5"                                            # XDG session_dir default
 time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UTC filenames
 

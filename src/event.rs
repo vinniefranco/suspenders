@@ -52,6 +52,21 @@ impl Stage {
     }
 }
 
+/// One AT file-picker suggestion (qwen `useAtCompletion`'s `{label, value}`):
+/// the repo-relative `label` shown in the popup (and highlighted against the
+/// query) and the `value` INSERTED on accept - the same path with its spaces
+/// backslash-escaped (qwen `escapePath`), so the detection's unescaped-space
+/// scan round-trips. `matched` is the contiguous fuzzy-match window over
+/// `label` for the inverted highlight (`None` for the empty-query rows). Plain
+/// owned data crossing the async seam, mirroring [`SelectorRow`]; the composer
+/// maps it into a render `Suggestion` (no matcher type crosses this seam).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSuggestion {
+    pub label: String,
+    pub value: String,
+    pub matched: Option<(usize, usize)>,
+}
+
 /// Every event shape the Run and the Agent emit.
 ///
 /// The `artifacts` on [`Event::ToolResult`] is display-side Presenter data
@@ -186,6 +201,25 @@ pub enum Event {
         message: String,
     },
 
+    // ---- AT file completion (Phase C2, qwen `useAtCompletion`) ----
+    /// A `@path` file search finished: the adapter walked the (gitignore-aware)
+    /// project tree, ranked it against `query`, capped it, and hands the rows
+    /// back so the composer's AT overlay shows them. The core stays IO-free -
+    /// it neither walks nor ranks; these are ready-to-render suggestions.
+    /// `generation` echoes the [`Effect::FileSearch`](crate::ui::screen::Effect::FileSearch)
+    /// activation counter, and `query` echoes the pattern searched: a delivery
+    /// whose generation OR query no longer matches the live AT pattern is
+    /// DROPPED (a stale keystroke's result must not overwrite a newer one).
+    /// A failed/empty walk simply delivers an empty `suggestions` - there is no
+    /// separate failure event, the popup just shows "no matches".
+    ///
+    /// [`Effect::FileSearch`]: crate::ui::screen::Effect::FileSearch
+    FileSearchReady {
+        generation: u64,
+        query: String,
+        suggestions: Vec<FileSuggestion>,
+    },
+
     // ---- Settlement ----
     RunFinished {
         stop_reason: StopReason,
@@ -305,6 +339,20 @@ impl Event {
         Event::SelectorFailed {
             generation,
             message: message.into(),
+        }
+    }
+
+    // ---- AT file completion ----
+
+    pub fn file_search_ready(
+        generation: u64,
+        query: impl Into<String>,
+        suggestions: Vec<FileSuggestion>,
+    ) -> Self {
+        Event::FileSearchReady {
+            generation,
+            query: query.into(),
+            suggestions,
         }
     }
 

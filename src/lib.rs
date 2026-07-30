@@ -22,6 +22,7 @@ pub mod tools;
 pub mod ui;
 pub mod view_model;
 pub mod voice;
+pub mod walk;
 
 pub mod app;
 

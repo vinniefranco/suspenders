@@ -307,16 +307,25 @@ pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ct
     // Rect and whether the sticky box / overlay show; below we only issue the
     // draw calls against that plan.
     let plan = pending_layout(area, &composer_view, t);
-    render_pending_body(
-        frame,
-        plan.body,
-        &mut PendingBodyParams {
-            screen: t,
-            cache,
-            anim,
-        },
-        theme,
-    );
+    // The Help overlay (qwen `Help`) takes the whole body region when open,
+    // replacing the transcript body with the bordered shortcuts panel - the same
+    // slot the inline Approval draws in. It is a modal, so nothing behind it
+    // renders (the composer/footer stay so the `? for shortcuts` promise reads as
+    // resolved). Presence-branched HERE so the body path stays one call (IOSP).
+    if t.help_open {
+        render_help_overlay(frame, plan.body, theme);
+    } else {
+        render_pending_body(
+            frame,
+            plan.body,
+            &mut PendingBodyParams {
+                screen: t,
+                cache,
+                anim,
+            },
+            theme,
+        );
+    }
     render_sticky_slot(frame, plan.sticky_box, plan.sticky_items, theme);
     // The flat footer (ADR-0053): a single row, model | context% | cost on the
     // right, the AutoAcceptIndicator or `? for shortcuts` on the left. Native
@@ -779,6 +788,41 @@ fn menu_draw(
     }
 }
 
+// The `@path` file picker draw plan (Phase C2, qwen `useAtCompletion`): the
+// fuzzy path rows drawn like System B (color-only, no numbers), titled "files".
+// While the async fetch is in flight with nothing to show yet, a subtle
+// "searching…" line stands in for the rows (qwen shows a loading state).
+fn at_draw(
+    suggestions: &[completion::Suggestion],
+    cursor: MenuCursor,
+    loading: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> PopupDraw {
+    let lines = if loading && suggestions.is_empty() {
+        vec![searching_line(theme)]
+    } else {
+        suggestion_rows(suggestions, cursor, inner_width, theme)
+    };
+    PopupDraw {
+        title: "files".to_string(),
+        lines,
+        scroll_active: None,
+        body_cap: MENU_BODY_CAP,
+    }
+}
+
+/// The "searching…" placeholder line (muted italic) shown while an AT file
+/// search is in flight with no rows yet (qwen's loading state).
+fn searching_line(theme: &Theme) -> Line<'static> {
+    Line::styled(
+        "searching…",
+        Style::default()
+            .fg(tui_color(theme.muted))
+            .add_modifier(Modifier::ITALIC),
+    )
+}
+
 // The System A (numbered `›` dialog) draw plan: a status line, or the numbered
 // rows the box scrolls to keep the active row visible.
 fn dialog_draw(
@@ -840,6 +884,23 @@ fn render_composer_popup(
             active,
             detail: _,
         } => dialog_draw(command, status, rows, *active, inner_width, theme),
+        OverlayView::AtFiles {
+            suggestions,
+            active,
+            scroll,
+            query: _,
+            loading,
+        } => at_draw(
+            suggestions,
+            MenuCursor {
+                active: *active,
+                scroll: *scroll,
+                expanded: false,
+            },
+            *loading,
+            inner_width,
+            theme,
+        ),
     };
 
     let popup = popup_rect(anchor_y, area, plan.lines.len(), plan.body_cap);
@@ -992,15 +1053,38 @@ fn no_matches_line(theme: &Theme) -> Line<'static> {
     )
 }
 
+/// The width of the ` → `/` ← ` expand affordance (qwen SuggestionsDisplay), so
+/// the label column can reserve room for it when a long row would show it.
+const EXPAND_AFFORDANCE_COLS: usize = 3;
+
 /// The command column width (qwen `commandColumnWidth`): the widest label,
-/// capped at half the popup width, floored at one column. Pure.
+/// floored at one column. Capped at HALF the popup width when a second
+/// (description) column shares the row - the slash palette - to leave that
+/// column room. When every suggestion's description is EMPTY (the AT file
+/// picker: paths, no descriptions), there is no second column to reserve for, so
+/// the label column uses the FULL inner width and a long path renders whole
+/// instead of chopped at width/2 - minus the ` → ` affordance's columns when a
+/// long row could show it, so the affordance never falls off the row's end. Pure.
 fn command_column_width(suggestions: &[completion::Suggestion], width: usize) -> usize {
     let max_label = suggestions
         .iter()
         .map(|s| s.label.width())
         .max()
         .unwrap_or(0);
-    max_label.min(width / 2).max(1)
+    let has_descriptions = suggestions.iter().any(|s| !s.description.is_empty());
+    let cap = if has_descriptions {
+        width / 2
+    } else {
+        // No description column: give the label the full inner width, but keep
+        // the expand affordance's trailing columns when a long row could show it.
+        let long_row = suggestions.iter().any(|s| label_is_long(&s.label));
+        if long_row {
+            width.saturating_sub(EXPAND_AFFORDANCE_COLS)
+        } else {
+            width
+        }
+    };
+    max_label.min(cap).max(1)
 }
 
 /// One System B suggestion row's transient state (Parameter Object): whether it
@@ -2624,6 +2708,263 @@ fn wrapped_count(lines: Vec<Line<'static>>, width: u16) -> usize {
         .line_count(width)
 }
 
+/// The ASCII wordmark logo (qwen `AsciiArt.ts` `shortAsciiLogo`), "suspenders"
+/// in the ANSI-Shadow block font. All 6 rows are EXACTLY 83 display columns wide,
+/// so the two-column width gate ([`header_lines`]) can size the layout against a
+/// fixed logo width. Drawn in the theme accent colour.
+const HEADER_LOGO: &str = "\
+███████╗██╗   ██╗███████╗██████╗ ███████╗███╗   ██╗██████╗ ███████╗██████╗ ███████╗
+██╔════╝██║   ██║██╔════╝██╔══██╗██╔════╝████╗  ██║██╔══██╗██╔════╝██╔══██╗██╔════╝
+███████╗██║   ██║███████╗██████╔╝█████╗  ██╔██╗ ██║██║  ██║█████╗  ██████╔╝███████╗
+╚════██║██║   ██║╚════██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║  ██║██╔══╝  ██╔══██╗╚════██║
+███████║╚██████╔╝███████║██║     ███████╗██║ ╚████║██████╔╝███████╗██║  ██║███████║
+╚══════╝ ╚═════╝ ╚══════╝╚═╝     ╚══════╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝";
+
+/// The fixed display width of every [`HEADER_LOGO`] row (qwen `getAsciiArtWidth`).
+const HEADER_LOGO_WIDTH: usize = 83;
+
+/// The gap columns between the logo and the info panel (qwen `logoGap`).
+const HEADER_LOGO_GAP: usize = 2;
+
+/// The minimum readable working-directory path width (qwen `minPathLength`); with
+/// the box chrome it sets the minimum info-panel width the logo must leave room
+/// for before the two-column layout is used.
+const HEADER_MIN_PATH: usize = 40;
+
+/// The info panel's inner content width in a two-column layout is capped here
+/// (qwen `maxInfoPanelWidth = 60`, minus the box chrome), so a very wide terminal
+/// does not stretch the panel across the whole screen beside the logo.
+const HEADER_MAX_PANEL_INNER: usize = 60 - HEADER_BOX_CHROME;
+
+/// The box chrome width the info panel spends on borders + padding: `│ ` left and
+/// ` │` right (qwen `borderWidth 2 + paddingX*2`).
+const HEADER_BOX_CHROME: usize = 4;
+
+/// The borrowed startup Header facts the render path takes (qwen `AppHeader`
+/// props): the brand title, crate version, scoped model id, working directory,
+/// and the startup tip. A value object so [`header_lines`] takes one borrow.
+struct HeaderView<'a> {
+    title: &'a str,
+    version: &'a str,
+    model: &'a str,
+    cwd: &'a str,
+    tip: &'a str,
+}
+
+/// The widest the STACKED tier lets its info panel + tips grow (columns): a full
+/// content width beyond this reads the cap, so the box and tips do not sprawl the
+/// whole screen under a full-width logo banner. Chosen at qwen's `maxInfoPanelWidth`.
+const HEADER_STACKED_MAX_WIDTH: usize = 80;
+
+/// Which of the three width tiers the startup [`TranscriptItem::Header`] draws in,
+/// resolved from the content width `W` against the fixed 83-col logo. The gate is
+/// the ONE place the tier boundaries live so the render and the tests agree:
+///
+/// * [`HeaderTier::SideBySide`] - `W >= 83 + gap(2) + min_panel(44) = 129`: the
+///   logo left, the boxed panel right.
+/// * [`HeaderTier::Stacked`] - `83 <= W < 129`: the full-width logo banner on top,
+///   the boxed panel (capped at [`HEADER_STACKED_MAX_WIDTH`]) below it, left-aligned.
+/// * [`HeaderTier::NoLogo`] - `W < 83`: the logo cannot fit, so the panel (+ tips)
+///   render alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderTier {
+    SideBySide,
+    Stacked,
+    NoLogo,
+}
+
+/// Resolves the [`HeaderTier`] for a content width (the ONE gate, so render and
+/// tests share the boundary math).
+fn header_tier(available: usize) -> HeaderTier {
+    let min_panel = HEADER_MIN_PATH + HEADER_BOX_CHROME;
+    if available >= HEADER_LOGO_WIDTH + HEADER_LOGO_GAP + min_panel {
+        HeaderTier::SideBySide
+    } else if available >= HEADER_LOGO_WIDTH {
+        HeaderTier::Stacked
+    } else {
+        HeaderTier::NoLogo
+    }
+}
+
+/// The lines the startup [`TranscriptItem::Header`] banner renders as (qwen
+/// `AppHeader` = `Header` + `Tips`): the ASCII wordmark logo (accent), a single-
+/// border info panel, and a `Tips:` line below - arranged by [`header_tier`] into
+/// one of three width tiers (side-by-side / stacked / no-logo). The epic wordmark
+/// shows on ANY terminal that can fit its 83 columns (tiers 1-2); only a truly
+/// narrow terminal (< 83) hides it. Every produced [`Line`] is `<= content_width`
+/// columns (the box rows funnelled through the same column-exact assembly as the
+/// tool-group box), so the viewport's `Wrap` never re-breaks it (measure==draw,
+/// ADR-0029).
+fn header_lines(view: &HeaderView<'_>, content_width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let available = content_width as usize;
+    let tier = header_tier(available);
+
+    // The info panel's inner content width, per tier:
+    // - SideBySide: the space left of the logo + gap, capped at qwen's max.
+    // - Stacked:    the width up to HEADER_STACKED_MAX_WIDTH, minus box chrome.
+    // - NoLogo:     the full width minus box chrome.
+    let panel_inner = match tier {
+        HeaderTier::SideBySide => (available - HEADER_LOGO_WIDTH - HEADER_LOGO_GAP
+            - HEADER_BOX_CHROME)
+            .min(HEADER_MAX_PANEL_INNER),
+        HeaderTier::Stacked => {
+            available.min(HEADER_STACKED_MAX_WIDTH).saturating_sub(HEADER_BOX_CHROME)
+        }
+        HeaderTier::NoLogo => available.saturating_sub(HEADER_BOX_CHROME),
+    }
+    .max(1);
+
+    // The bordered info panel (qwen `Header` info column): the 4 content rows
+    // wrapped in a single-line box - always drawn; the logo placement is the tier's.
+    let panel = header_boxed_panel(view, panel_inner, theme);
+    let mut out = match tier {
+        HeaderTier::SideBySide => header_two_column(&panel, theme),
+        HeaderTier::Stacked => header_stacked(panel, theme),
+        HeaderTier::NoLogo => panel,
+    };
+    // The Tips line below the box (qwen `Tips`), in secondary, `<= content_width`.
+    out.push(header_tips_line(view.tip, available, theme));
+    out
+}
+
+/// The bordered info panel (qwen `Header`): the 4 content rows funnelled through
+/// [`box_row`] to the exact `inner` width, framed with a single-line top/bottom
+/// border - exactly `inner + 2` columns per row and 6 rows tall (1 top + 4 content
+/// + 1 bottom), so it lines up beside the 6-row logo in the two-column layout.
+fn header_boxed_panel(view: &HeaderView<'_>, inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let border = border_style(theme);
+    let mut rows: Vec<Line<'static>> = Vec::with_capacity(6);
+    rows.push(Line::styled(format!("╭{}╮", "─".repeat(inner)), border));
+    for row in header_panel_rows(view, inner, theme) {
+        rows.push(box_row(&row.spans, inner, border));
+    }
+    rows.push(Line::styled(format!("╰{}╯", "─".repeat(inner)), border));
+    rows
+}
+
+/// The four info-panel content rows (qwen `Header` info column), each already
+/// clipped to `inner` columns: the bold accent title + secondary version, a blank
+/// spacer, the scoped model id with a ` (/model to change)` hint when it fits, and
+/// the tilde-shortened working directory. Borderless spans - [`header_two_column`]
+/// or the one-column path wraps them in the box.
+fn header_panel_rows(view: &HeaderView<'_>, inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+    // Title line: `>_ suspenders` bold accent, then ` (v<version>)` secondary.
+    let title_line = {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut used = 0;
+        used = push_cols(
+            &mut spans,
+            &format!(">_ {}", view.title),
+            accent_style(theme).add_modifier(Modifier::BOLD),
+            used,
+            inner,
+        );
+        push_cols(
+            &mut spans,
+            &format!(" (v{})", view.version),
+            secondary_style(theme),
+            used,
+            inner,
+        );
+        Line::from(spans)
+    };
+
+    // Model line: the scoped id, plus ` (/model to change)` when the whole line
+    // still fits the inner width (qwen `showModelHint`).
+    let model_line = {
+        let hint = " (/model to change)";
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let used = push_cols(&mut spans, view.model, secondary_style(theme), 0, inner);
+        // The hint rides along only when the whole line still fits (qwen
+        // `showModelHint`); otherwise the model id shows alone.
+        if view.model.width() + hint.width() <= inner {
+            push_cols(&mut spans, hint, secondary_style(theme), used, inner);
+        }
+        Line::from(spans)
+    };
+
+    // Directory line: tilde-abbreviated then column-clipped to the inner width.
+    let dir_line = {
+        let path = tildeify_path(view.cwd);
+        Line::from(Span::styled(
+            truncate_cols(&path, inner),
+            secondary_style(theme),
+        ))
+    };
+
+    vec![title_line, Line::default(), model_line, dir_line]
+}
+
+/// The logo + boxed info panel side by side (qwen two-column `Header`): the 6
+/// accent logo rows on the left, a [`HEADER_LOGO_GAP`]-col gap, then the pre-built
+/// 6-row bordered `panel` box (they line up 1:1). Every row is exactly
+/// `HEADER_LOGO_WIDTH + gap + inner + 2` columns (measure==draw, ADR-0029).
+fn header_two_column(panel: &[Line<'static>], theme: &Theme) -> Vec<Line<'static>> {
+    let gap = " ".repeat(HEADER_LOGO_GAP);
+    // Zip the 6 logo rows against the 6 box rows into one row each. When the box
+    // has fewer rows than the logo (never today - it is always 6), the extra logo
+    // rows draw the logo alone; when it has more, the extra box rows draw alone.
+    HEADER_LOGO
+        .lines()
+        .zip(panel)
+        .map(|(logo, boxed)| {
+            let mut spans = vec![
+                Span::styled(logo.to_string(), accent_style(theme)),
+                Span::raw(gap.clone()),
+            ];
+            spans.extend(boxed.spans.clone());
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The logo STACKED above the boxed info panel (the middle tier): the 6 accent
+/// logo rows as a full-width TOP banner (each exactly [`HEADER_LOGO_WIDTH`] cols),
+/// then the pre-built bordered `panel` box below it. Left-aligned to the content
+/// gutter (no centering), so it lines up with the composer. Every logo row is 83
+/// columns and every box row is `inner + 2` - both `<= content_width` in this tier
+/// by construction (measure==draw, ADR-0029).
+fn header_stacked(panel: Vec<Line<'static>>, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = HEADER_LOGO
+        .lines()
+        .map(|logo| Line::from(Span::styled(logo.to_string(), accent_style(theme))))
+        .collect();
+    out.extend(panel);
+    out
+}
+
+/// The `Tips: <tip>` line below the box (qwen `Tips`), in secondary, clipped to
+/// `width` columns so it never soft-wraps (measure==draw, ADR-0029).
+fn header_tips_line(tip: &str, width: usize, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate_cols(&format!("Tips: {tip}"), width),
+        secondary_style(theme),
+    ))
+}
+
+/// Abbreviates a leading `$HOME` in `path` to `~` (qwen `tildeifyPath`); other
+/// paths pass through unchanged. Reads the home directory from the environment at
+/// this one edge, then delegates to the pure [`tildeify_with_home`] rewrite - so
+/// the string logic is testable without touching process env (ADR-0019).
+fn tildeify_path(path: &str) -> String {
+    let home = std::env::var_os("HOME").and_then(|h| h.into_string().ok());
+    tildeify_with_home(path, home.as_deref())
+}
+
+/// The pure `~`-abbreviation of `path` against a known `home` (qwen `tildeifyPath`):
+/// an exact-match home becomes `~`, a home-prefixed path keeps its `~`-rooted tail,
+/// everything else (including no/empty home) passes through unchanged. Pure text,
+/// no IO - the env read lives in [`tildeify_path`].
+fn tildeify_with_home(path: &str, home: Option<&str>) -> String {
+    match home {
+        Some(home) if !home.is_empty() && path == home => "~".to_string(),
+        Some(home) if !home.is_empty() && path.starts_with(&format!("{home}/")) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_string(),
+    }
+}
+
 /// The lines one Transcript item renders as. `Diff` is the first-class rich item
 /// of the semantic display vocabulary (ADR-0008): a titled diff whose lines take
 /// a semantic tint from their [`DiffSide`]'s Theme slots and a syntect foreground.
@@ -2676,6 +3017,28 @@ fn message_lines(
         | TranscriptItem::Todo { .. } => {
             tool_inner_lines(item, compact, tool_inner_width(content_width), theme)
         }
+        // The startup banner (qwen `AppHeader` = `Header` + `Tips`): the ASCII
+        // wordmark logo (accent) left, a single-border info panel right, and the
+        // `Tips:` line below. Drawn at the FULL content width so the width gate
+        // ([`header_lines`]) can decide whether the 83-col logo + gap + a minimum
+        // info panel fits, hiding the logo when it does not.
+        TranscriptItem::Header {
+            title,
+            version,
+            model,
+            cwd,
+            tip,
+        } => header_lines(
+            &HeaderView {
+                title,
+                version,
+                model,
+                cwd,
+                tip,
+            },
+            content_width,
+            theme,
+        ),
         // Info/notification (qwen `InfoMessage`, StatusMessages.tsx:64): the `●`
         // U+25CF prefix `text.primary`, body `text.primary`, hanging under a
         // 2-col prefix. A Marker tints its prefix + body by TONE alone.
@@ -3155,6 +3518,267 @@ fn approval_question(kind: ConfirmKind, command: &str) -> String {
         ConfirmKind::Exec => format!("Allow execution of: '{command}'?"),
         ConfirmKind::Info => "Do you want to proceed?".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The keyboard-shortcuts Help overlay (qwen `Help.tsx`, the `?` affordance the
+// footer's `? for shortcuts` promises). A single bordered panel - suspenders has
+// only two built-in commands and none of qwen's custom-command/MCP/skill/plugin
+// ecosystem, so qwen's THREE-tab chrome (general / commands / custom-commands)
+// would be two empty tabs of vaporware; we port the CONTENT (shortcuts + the
+// built-in COMMANDS registry) into one panel and drop the tab chrome. The
+// Screen's `help_open` flag gates it and [`Screen::handle_help_key`] closes it.
+// ---------------------------------------------------------------------------
+
+/// The width of the accent key column in a shortcut row (qwen `KEY_COL_WIDTH`,
+/// Help.tsx:42): the fixed-width column the key sits in before its description.
+const HELP_KEY_COL_WIDTH: usize = 12;
+
+/// The gap (columns) between the two shortcut columns (qwen `GeneralHelp` `gap:2`).
+const HELP_COL_GAP: usize = 2;
+
+/// The (key, description) shortcut rows the Help panel lists, verified against
+/// `ui.rs` `map_key` + `screen.rs` routing. `@` is already promised by the
+/// composer placeholder (the AT-completion phase wires its behaviour), so it is
+/// listed here alongside the live bindings.
+const HELP_SHORTCUTS: &[(&str, &str)] = &[
+    ("/", "Open the command menu"),
+    ("@", "Add files or folders as context"),
+    ("?", "Show this help"),
+    ("Enter", "Submit (steer a running turn)"),
+    ("Alt+Enter", "Insert a newline"),
+    ("Esc", "Cancel a running turn / close a menu"),
+    ("Ctrl+O", "Toggle compact mode"),
+    ("Ctrl+S", "Peek the full pending output into scrollback"),
+    ("Ctrl+C", "Quit"),
+    ("Shift+Tab", "Cycle approval mode"),
+    ("Tab", "Accept the highlighted suggestion"),
+    ("↑/↓", "Cycle prompt history / move the cursor"),
+];
+
+/// Draws the Help overlay (qwen `Help`) into `area`: the bordered shortcuts +
+/// commands panel, top-clipped to the zone if it is taller than the body. The
+/// panel is built once by the pure [`help_panel_lines`] (measure==draw), then
+/// bottom-anchored so its footer (`Esc to close`) sits just above the composer -
+/// the same anchor the pending body uses (ADR-0046).
+fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let content_area = Rect {
+        x: area.x + CONTENT_MARGIN,
+        width: area.width.saturating_sub(2 * CONTENT_MARGIN),
+        ..area
+    };
+    let lines = help_panel_lines(content_area.width, theme);
+    // Bottom-anchor + top-clip exactly like the pending body: keep the LAST
+    // `height` rows (qwen's `overflowDirection:"top"`) when the panel is tall, else
+    // pad the top so the footer meets the composer.
+    let total = lines.len();
+    let clip = anchor_clip(total, area, content_area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((clip.scroll, 0)),
+        clip.content_draw,
+    );
+    if let Some(marker_draw) = clip.marker_draw {
+        draw_overflow_marker(frame, marker_draw, theme);
+    }
+}
+
+/// The Help panel's lines (qwen `Help`), framed with a single-line border to the
+/// `inner` inner width (the same box-drawing the header panel uses): a title row
+/// (`suspenders` bold accent + ` keyboard shortcuts`), a `Shortcuts` heading + the
+/// shortcut rows (two columns when the width allows, one otherwise), a `Commands`
+/// heading + the built-in [`slash::COMMANDS`] (derived, so a future command shows
+/// up automatically), and an italic `Esc to close` footer. Every row is exactly
+/// `inner + 2` columns (measure==draw, ADR-0029) so the viewport never re-breaks it.
+fn help_panel_lines(content_width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    // The panel takes the full content width minus the 2-col box chrome (`│…│`),
+    // floored so a tiny terminal still draws a legible sliver.
+    let inner = (content_width as usize).saturating_sub(2).max(1);
+    let border = border_style(theme);
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    rows.push(Line::styled(format!("╭{}╮", "─".repeat(inner)), border));
+    for row in help_panel_body_rows(inner, theme) {
+        rows.push(box_row(&row.spans, inner, border));
+    }
+    rows.push(Line::styled(format!("╰{}╯", "─".repeat(inner)), border));
+    rows
+}
+
+/// The Help panel's borderless content rows (qwen `GeneralHelp` + `CommandsHelp`),
+/// each clipped to `inner` columns - [`help_panel_lines`] wraps them in the box.
+/// The order: title, blank, `Shortcuts` heading, the shortcut rows, blank,
+/// `Commands` heading, the built-in command rows, blank, the `Esc to close` footer.
+fn help_panel_body_rows(inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Title row: `suspenders` bold accent + ` keyboard shortcuts` primary (qwen's
+    // `Qwen Code` help header).
+    {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let used = push_cols(
+            &mut spans,
+            "suspenders",
+            accent_style(theme).add_modifier(Modifier::BOLD),
+            0,
+            inner,
+        );
+        push_cols(
+            &mut spans,
+            " keyboard shortcuts",
+            primary_style(theme),
+            used,
+            inner,
+        );
+        out.push(Line::from(spans));
+    }
+    out.push(Line::default());
+
+    // Shortcuts section.
+    out.push(help_heading_row("Shortcuts", inner, theme));
+    out.extend(help_shortcut_rows(inner, theme));
+    out.push(Line::default());
+
+    // Commands section, derived from the registry so a future command appears
+    // without touching this panel.
+    out.push(help_heading_row("Commands", inner, theme));
+    for cmd in slash::COMMANDS {
+        out.push(help_command_row(cmd, inner, theme));
+    }
+    out.push(Line::default());
+
+    // Footer: `Esc to close`, italic secondary (qwen's `Esc to cancel`).
+    out.push(Line::from(Span::styled(
+        truncate_cols("Esc to close", inner),
+        secondary_style(theme).add_modifier(Modifier::ITALIC),
+    )));
+
+    out
+}
+
+/// A section heading row (qwen `Text bold`): the label bold primary, clipped to
+/// `inner`.
+fn help_heading_row(label: &str, inner: usize, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate_cols(label, inner),
+        primary_style(theme).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The widest single shortcut cell that fits every entry WITHOUT truncation: the
+/// fixed key column plus the longest description in [`HELP_SHORTCUTS`]. The
+/// two-column layout only engages when the inner width holds two of these side by
+/// side (plus the gap), so neither column ever chops a description - suspenders'
+/// descriptions are longer than qwen's, so a single clean column is the norm.
+fn help_full_cell_width() -> usize {
+    let longest_desc = HELP_SHORTCUTS
+        .iter()
+        .map(|(_, desc)| desc.width())
+        .max()
+        .unwrap_or(0);
+    HELP_KEY_COL_WIDTH + longest_desc
+}
+
+/// The shortcut rows (qwen `GeneralHelp`), DEFAULTING TO ONE CLEAN COLUMN:
+/// suspenders' descriptions are longer than qwen's, so a single column reads
+/// better and never truncates, and an overlay has the vertical room for ~12 rows.
+/// Two columns engage ONLY at genuinely wide widths where BOTH columns' FULL
+/// descriptions fit without truncation (`inner >= 2*(key_col + longest_desc) +
+/// gap`, ~114 cols given the ~44-col longest description) - so the two-column
+/// branch is rarely hit. In it, the left cell is padded to an exact fixed width so
+/// the right column aligns vertically; if a description must ever clip it does so
+/// with one trailing ellipsis (never a hard mid-word cut).
+fn help_shortcut_rows(inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let full_cell = help_full_cell_width();
+    let two_col = inner >= full_cell * 2 + HELP_COL_GAP;
+    if two_col {
+        // Both columns get the full untruncated cell width; the leftover inner
+        // padding rides in the gap so the left cell stays a fixed column.
+        let col_width = full_cell;
+        let half = HELP_SHORTCUTS.len().div_ceil(2);
+        let (left, right) = HELP_SHORTCUTS.split_at(half);
+        (0..half)
+            .map(|i| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                match right.get(i) {
+                    // A left cell WITH a right column: pad the left cell out to the
+                    // fixed width so the right column aligns vertically.
+                    Some(row) => {
+                        help_shortcut_cell(&mut spans, left[i], col_width, true, theme);
+                        spans.push(Span::raw(" ".repeat(HELP_COL_GAP)));
+                        help_shortcut_cell(&mut spans, *row, col_width, false, theme);
+                    }
+                    // The shorter (right) half leaves later rows single-column.
+                    None => help_shortcut_cell(&mut spans, left[i], col_width, false, theme),
+                }
+                Line::from(spans)
+            })
+            .collect()
+    } else {
+        HELP_SHORTCUTS
+            .iter()
+            .map(|row| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                help_shortcut_cell(&mut spans, *row, inner, false, theme);
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+/// One shortcut cell up to `cell_width` columns: the accent key padded to the
+/// fixed [`HELP_KEY_COL_WIDTH`], then the secondary description. The key column is
+/// always padded (so descriptions line up). `pad_trailing` pads the WHOLE cell out
+/// to `cell_width` - set only for a LEFT cell that a right column must align after;
+/// a single/last cell leaves no trailing filler. A description that overflows the
+/// cell is clipped with ONE trailing ellipsis ([`truncate_cols`]), never a hard
+/// mid-word cut.
+fn help_shortcut_cell(
+    spans: &mut Vec<Span<'static>>,
+    (key, desc): (&str, &str),
+    cell_width: usize,
+    pad_trailing: bool,
+    theme: &Theme,
+) {
+    let key_col = HELP_KEY_COL_WIDTH.min(cell_width);
+    // The accent key, clipped to and padded out to the fixed key column.
+    let key_text = truncate_cols(key, key_col);
+    let key_pad = key_col.saturating_sub(key_text.width());
+    spans.push(Span::styled(key_text, accent_style(theme)));
+    if key_pad > 0 {
+        spans.push(Span::raw(" ".repeat(key_pad)));
+    }
+    // The description fills the rest of the cell, ellipsis-clipped if it must.
+    let desc_room = cell_width.saturating_sub(key_col);
+    let desc_text = truncate_cols(desc, desc_room);
+    let desc_width = desc_text.width();
+    spans.push(Span::styled(desc_text, secondary_style(theme)));
+    // A left cell pads out to the full cell so the right column starts on grid.
+    if pad_trailing {
+        let pad = desc_room.saturating_sub(desc_width);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+    }
+}
+
+/// One built-in command row (qwen `CommandsHelp` signature + description): the
+/// accent `/name`, then a secondary ` — help` on the same row, clipped to `inner`.
+fn help_command_row(cmd: &slash::SlashCommand, inner: usize, theme: &Theme) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let key_end = HELP_KEY_COL_WIDTH.min(inner);
+    let mut used = push_cols(
+        &mut spans,
+        &format!("/{}", cmd.name),
+        accent_style(theme),
+        0,
+        key_end,
+    );
+    if used < key_end {
+        spans.push(Span::raw(" ".repeat(key_end - used)));
+        used = key_end;
+    }
+    push_cols(&mut spans, cmd.help, secondary_style(theme), used, inner);
+    Line::from(spans)
 }
 
 /// The inline approval block's inner rows (ADR-0049), appended after the
@@ -5645,6 +6269,205 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "✓  run_command injected");
     }
 
+    // --- The startup Header banner (qwen `AppHeader`) ----------------------
+
+    // Tier 1 (side-by-side): at a WIDE content width (>= 129) the 83-col logo
+    // draws to the LEFT of the bordered info panel, and the last row is the
+    // `Tips:` line. Every drawn row stays within the content width (measure==draw).
+    #[test]
+    fn a_header_at_a_wide_width_shows_the_logo_beside_the_boxed_panel() {
+        let item = TranscriptItem::Header {
+            title: "suspenders".into(),
+            version: "1.2.3".into(),
+            model: "openrouter/qwen3-coder".into(),
+            cwd: "/tmp/proj".into(),
+            tip: "Type / to see all available commands.".into(),
+        };
+        let width = 140;
+        let lines = message_lines(&item, false, width, theme::dark());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        // The logo drew (its first row's block glyphs are present) beside the box.
+        assert!(text.contains("███████╗"), "the logo drew:\n{text}");
+        assert!(text.contains("╭") && text.contains("╮"), "the box drew:\n{text}");
+        assert!(text.contains(">_ suspenders"), "the brand title:\n{text}");
+        assert!(text.contains("(v1.2.3)"), "the version:\n{text}");
+        assert!(
+            text.contains("openrouter/qwen3-coder"),
+            "the scoped model:\n{text}"
+        );
+        assert!(
+            text.contains("(/model to change)"),
+            "the model hint fits at this width:\n{text}"
+        );
+        // The Tips line is the final row.
+        assert_eq!(
+            line_text(lines.last().unwrap()),
+            "Tips: Type / to see all available commands."
+        );
+        // No row soft-wraps: each is within the content width (measure==draw).
+        for row in &lines {
+            assert!(
+                row_display_width(row) <= width as usize,
+                "row exceeds content width: {:?}",
+                line_text(row)
+            );
+        }
+    }
+
+    // The WIDTH GATE (qwen `showLogo`): a NARROW content width cannot fit the
+    // 83-col logo + gap + a minimum info panel, so the logo is hidden and the
+    // panel (+ tips) render alone. The block glyphs never appear.
+    #[test]
+    fn a_header_at_a_narrow_width_hides_the_logo() {
+        let item = TranscriptItem::Header {
+            title: "suspenders".into(),
+            version: "1.2.3".into(),
+            model: "openrouter/qwen3-coder".into(),
+            cwd: "/tmp/proj".into(),
+            tip: "Type / to see all available commands.".into(),
+        };
+        let width = 50;
+        let lines = message_lines(&item, false, width, theme::dark());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains("███████╗"),
+            "the logo is hidden on a narrow terminal:\n{text}"
+        );
+        // The bordered panel + brand + tips still render.
+        assert!(text.contains(">_ suspenders"), "the brand title:\n{text}");
+        assert!(text.contains("╭"), "the box top border:\n{text}");
+        assert!(text.contains("Tips:"), "the tips line:\n{text}");
+        for row in &lines {
+            assert!(
+                row_display_width(row) <= width as usize,
+                "row exceeds content width: {:?}",
+                line_text(row)
+            );
+        }
+    }
+
+    // Tier 2 (stacked): a MID content width (83 <= W < 129) that fits the logo but
+    // not the side-by-side panel draws the full-width logo banner ON TOP, then the
+    // bordered info panel BELOW it. Both the block glyphs AND the box appear, and
+    // no row exceeds the content width (measure==draw).
+    #[test]
+    fn a_header_at_a_mid_width_stacks_the_logo_above_the_boxed_panel() {
+        let item = TranscriptItem::Header {
+            title: "suspenders".into(),
+            version: "1.2.3".into(),
+            model: "openrouter/qwen3-coder".into(),
+            cwd: "/tmp/proj".into(),
+            tip: "Type / to see all available commands.".into(),
+        };
+        let width = 100;
+        let lines = message_lines(&item, false, width, theme::dark());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        // The logo banner AND the box both drew.
+        assert!(text.contains("███████╗"), "the logo banner drew:\n{text}");
+        assert!(
+            text.contains("╭") && text.contains("╮"),
+            "the box drew below the logo:\n{text}"
+        );
+        assert!(text.contains(">_ suspenders"), "the brand title:\n{text}");
+        assert!(text.contains("Tips:"), "the tips line:\n{text}");
+        // The logo is a full-width TOP banner: the first 6 rows are pure logo (no
+        // box border yet), then the box begins. Row 0 is a logo row, and the box
+        // top border appears only AFTER the 6 logo rows.
+        assert!(
+            line_text(&lines[0]).contains("███████╗"),
+            "row 0 is the logo banner top:\n{text}"
+        );
+        let box_top = lines
+            .iter()
+            .position(|l| line_text(l).contains('╭'))
+            .expect("the box top border row");
+        assert!(
+            box_top >= 6,
+            "the box begins after the 6 logo rows (stacked), got row {box_top}"
+        );
+        // No row soft-wraps: each is within the content width (measure==draw).
+        for row in &lines {
+            assert!(
+                row_display_width(row) <= width as usize,
+                "row exceeds content width: {:?}",
+                line_text(row)
+            );
+        }
+    }
+
+    // The tier gate is the ONE place the boundary math lives: side-by-side at
+    // >= 129, stacked at 83..129, no-logo below 83.
+    #[test]
+    fn header_tier_boundaries_are_exact() {
+        assert_eq!(header_tier(129), HeaderTier::SideBySide);
+        assert_eq!(header_tier(128), HeaderTier::Stacked);
+        assert_eq!(header_tier(83), HeaderTier::Stacked);
+        assert_eq!(header_tier(82), HeaderTier::NoLogo);
+        assert_eq!(header_tier(0), HeaderTier::NoLogo);
+    }
+
+    // Measure==draw (ADR-0029): every Header row is `<= content width` across
+    // ALL three tiers (NoLogo, Stacked, SideBySide), so the startup banner never
+    // soft-wraps a row - the same width-sweep guard the Help panel carries.
+    #[test]
+    fn header_rows_never_exceed_the_content_width() {
+        let item = TranscriptItem::Header {
+            title: "suspenders".into(),
+            version: "1.2.3".into(),
+            model: "openrouter/qwen3-coder".into(),
+            cwd: "/home/vinnie/Projects/suspenders".into(),
+            tip: "Use @path/to/file to add files as context.".into(),
+        };
+        for width in [40u16, 60, 82, 83, 100, 128, 129, 160, 220] {
+            let lines = message_lines(&item, false, width, theme::dark());
+            for row in &lines {
+                assert!(
+                    row_display_width(row) <= width as usize,
+                    "row exceeds width {width}: {:?}",
+                    line_text(row)
+                );
+            }
+        }
+    }
+
+    // The model hint is dropped when the scoped id + ` (/model to change)` would
+    // overflow the info panel's inner width (qwen `showModelHint`), so the panel
+    // never soft-wraps.
+    #[test]
+    fn a_header_drops_the_model_hint_when_it_would_not_fit() {
+        let item = TranscriptItem::Header {
+            title: "suspenders".into(),
+            version: "1.2.3".into(),
+            model: "some-very-long-provider/a-very-long-model-identifier-name".into(),
+            cwd: "/tmp/proj".into(),
+            tip: "tip".into(),
+        };
+        // A width wide enough for the panel but not the model + hint together.
+        let width = 50;
+        let lines = message_lines(&item, false, width, theme::dark());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains("(/model to change)"),
+            "the hint is dropped when it would overflow:\n{text}"
+        );
+    }
+
+    // tildeify_with_home abbreviates a leading home to `~`, and leaves other
+    // paths (and the no-home case) untouched. Pure - no process env is touched.
+    #[test]
+    fn tildeify_abbreviates_the_home_prefix() {
+        let home = Some("/home/dev");
+        assert_eq!(tildeify_with_home("/home/dev/proj/src", home), "~/proj/src");
+        assert_eq!(tildeify_with_home("/home/dev", home), "~");
+        assert_eq!(tildeify_with_home("/etc/hosts", home), "/etc/hosts");
+        // A path merely PREFIXED by the home string but not on a path boundary is
+        // left alone (no `~/develop` from `/home/develop`).
+        assert_eq!(tildeify_with_home("/home/develop", home), "/home/develop");
+        // No home / empty home: pass through.
+        assert_eq!(tildeify_with_home("/home/dev/x", None), "/home/dev/x");
+        assert_eq!(tildeify_with_home("/home/dev/x", Some("")), "/home/dev/x");
+    }
+
     #[test]
     fn a_failing_result_shows_the_error_marker() {
         // A failed result reads the `x` U+0078 ERROR marker (0.16.0 ASCII, NOT
@@ -7490,13 +8313,13 @@ mod tests {
     // of the body zone are blank and the content sits just above the status bar.
     #[test]
     fn render_pending_bottom_anchors_a_short_stack() {
-        // A fresh screen: only the greeting Info line is pending.
+        // A fresh screen: only the startup Header banner is pending.
         let screen = Screen::new(ScreenOpts::default());
         let terminal = draw_pending(60, 12, &screen);
 
-        // The greeting wraps to a few rows and anchors to the BOTTOM of the
-        // body zone, so the top rows are blank and the content sits low. Find
-        // the first non-blank body row: it must be past the top of the zone.
+        // The banner spans a few rows and anchors to the BOTTOM of the body
+        // zone, so the top rows are blank and the content sits low. Find the
+        // first non-blank body row: it must be past the top of the zone.
         let first_content = (0..10)
             .find(|&y| !row_text(&terminal, y).trim().is_empty())
             .expect("some content drew");
@@ -7504,11 +8327,13 @@ mod tests {
             first_content > 0,
             "the top of the body zone is blank (bottom-anchored); first content at row {first_content}"
         );
-        // The greeting text is present in the drawn body.
+        // The header brand + tips drew in the body.
+        let body = buffer_text(&terminal);
         assert!(
-            buffer_text(&terminal).contains("suspenders ready"),
-            "the greeting drew in the body"
+            body.contains(">_ suspenders"),
+            "the header brand drew in the body:\n{body}"
         );
+        assert!(body.contains("Tips:"), "the tips line drew:\n{body}");
     }
 
     // An overflowing pending stack is top-clipped: the NEWEST rows survive and
@@ -7588,6 +8413,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- the Help overlay (qwen `Help`, the `?` affordance) ------------------
+
+    // A Screen whose Help overlay is open, for the render assertions below.
+    fn screen_with_help_open() -> Screen {
+        let mut screen = Screen::new(ScreenOpts::default());
+        screen.help_open = true;
+        screen
+    }
+
+    // The open Help overlay draws the bordered panel in the body region: the
+    // title, a shortcut row, a built-in command, and the `Esc to close` footer all
+    // land, and it replaces the transcript body (no header/tips row shows through).
+    #[test]
+    fn help_overlay_shows_shortcuts_commands_and_the_close_hint() {
+        let screen = screen_with_help_open();
+        // Tall enough that the whole one-column panel fits above the composer
+        // (title through footer) without top-clipping.
+        let terminal = draw_pending(80, 32, &screen);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("keyboard shortcuts"), "title present: {text:?}");
+        assert!(text.contains("Shortcuts"), "Shortcuts heading present");
+        assert!(text.contains("Show this help"), "a shortcut row present");
+        assert!(text.contains("Commands"), "Commands heading present");
+        // A built-in command from the registry, derived (not hardcoded).
+        assert!(text.contains("/model"), "the /model command is listed");
+        assert!(
+            text.contains("choose the model for this session"),
+            "the /model help is listed"
+        );
+        assert!(text.contains("Esc to close"), "the close hint present");
+        // The panel is bordered (box-drawing chars from the same helpers).
+        assert!(text.contains('╭') && text.contains('╰'), "the panel is bordered");
+    }
+
+    // Measure==draw (ADR-0029): every emitted panel Line is `<= content width`, so
+    // the viewport never soft-wraps a row. Spans the one-column widths AND past the
+    // two-column threshold (~116 content cols) so both layouts are exercised.
+    #[test]
+    fn help_panel_rows_never_exceed_the_content_width() {
+        for width in [40u16, 60, 80, 100, 120, 140, 200] {
+            let lines = help_panel_lines(width, theme::dark());
+            for line in &lines {
+                let cols: usize = line.spans.iter().map(|s| s.content.width()).sum();
+                assert!(
+                    cols <= width as usize,
+                    "a Help row is {cols} cols, over the {width}-col width"
+                );
+            }
+        }
+    }
+
+    // At a common width (100) the panel is ONE clean column: no row carries the
+    // second column's key, and the longest description renders in FULL with no
+    // ellipsis (the mid-word truncation bug the two-column layout caused is gone).
+    #[test]
+    fn help_defaults_to_a_single_untruncated_column_at_width_100() {
+        let lines = help_panel_lines(100, theme::dark());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let longest = "Peek the full pending output into scrollback";
+        assert!(
+            texts.iter().any(|t| t.contains(longest)),
+            "the longest description renders in full at width 100: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains('…')),
+            "no row is truncated with an ellipsis at width 100: {texts:?}"
+        );
+        // A single column: no shortcut row pairs two keys (e.g. `/` … `Ctrl+O`).
+        assert!(
+            !texts.iter().any(|t| t.contains('/') && t.contains("Ctrl+O")),
+            "no row carries a second column at width 100: {texts:?}"
+        );
+    }
+
+    // Past the threshold (content width >= 2*(key_col + longest_desc) + gap, ~116)
+    // the panel goes two-column: a row pairs the first-half and second-half keys,
+    // the right column's descriptions stay untruncated, and every row still fits.
+    #[test]
+    fn help_goes_two_column_only_at_wide_widths_with_aligned_untruncated_cells() {
+        let width = 140u16;
+        let lines = help_panel_lines(width, theme::dark());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        // The first shortcut row pairs the first-half `/` key with the second-half
+        // key (the split puts `Ctrl+O` at the top of the right column).
+        assert!(
+            texts.iter().any(|t| t.contains('/') && t.contains("Ctrl+O")),
+            "a two-column row pairs left+right keys at width {width}: {texts:?}"
+        );
+        // No ellipsis: both columns' full descriptions fit.
+        assert!(
+            !texts.iter().any(|t| t.contains('…')),
+            "two columns never truncate at width {width}: {texts:?}"
+        );
+        // The right column aligns: every paired row starts its right key at the
+        // SAME column (the fixed left-cell width). Find the column of `Ctrl+O`.
+        let right_key_col = |t: &str| t.find("Ctrl+O").map(|b| t[..b].chars().count());
+        let cols: Vec<usize> = texts.iter().filter_map(|t| right_key_col(t)).collect();
+        assert!(!cols.is_empty(), "found the right column key");
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "the right column aligns to a fixed left-cell width: {cols:?}"
+        );
     }
 
     /// Draws a composer overlay popup on a 40x12 test terminal with the standard
@@ -7796,6 +8725,85 @@ mod tests {
             text.contains(&format!("(4/{})", MAX_SUGGESTIONS + 3)),
             "the (n/m) counter:\n{text}"
         );
+    }
+
+    // --- render_composer_popup: AT file picker (Phase C2) -------------------
+
+    fn at_files(suggestions: Vec<completion::Suggestion>, loading: bool) -> OverlayView {
+        OverlayView::AtFiles {
+            suggestions,
+            active: 0,
+            scroll: 0,
+            query: "co".to_string(),
+            loading,
+        }
+    }
+
+    #[test]
+    fn the_at_picker_lists_repo_relative_paths_titled_files() {
+        let view = at_files(
+            vec![
+                suggestion("src/ui/composer.rs", "src/ui/composer.rs", "", Some((7, 9))),
+                suggestion("src/config.rs", "src/config.rs", "", Some((4, 6))),
+            ],
+            false,
+        );
+        let text = buffer_text(&draw_popup(&view));
+        assert!(text.contains(" files "), "bordered 'files' title:\n{text}");
+        assert!(text.contains("composer.rs"), "a path row is shown:\n{text}");
+        assert!(text.contains("config.rs"));
+    }
+
+    #[test]
+    fn a_long_at_path_renders_in_full_not_chopped_at_half_width() {
+        // A path longer than HALF the inner width (36/2 = 18) must render WHOLE:
+        // AT rows carry no description, so the label column uses the full inner
+        // width, not the slash palette's width/2 cap. Before the fix
+        // "src/ui/components.rs" (20 cols) chopped to "src/ui/components." (18).
+        let view = at_files(
+            vec![suggestion(
+                "src/ui/components.rs",
+                "src/ui/components.rs",
+                "",
+                Some((7, 9)),
+            )],
+            false,
+        );
+        let text = buffer_text(&draw_popup(&view));
+        assert!(
+            text.contains("src/ui/components.rs"),
+            "the full path renders (no width/2 truncation):\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_at_picker_match_substring_is_inverted() {
+        // "co" matches "src/config.rs" at [4,6): the 'co' draws REVERSED.
+        let view = at_files(
+            vec![suggestion("src/config.rs", "src/config.rs", "", Some((4, 6)))],
+            false,
+        );
+        let terminal = draw_popup(&view);
+        // One body row + borders = height 3 above row 10 → row 8, text x = 2.
+        // "src/" is x=2..6, so the 'c' at char 4 is cell x=6.
+        assert!(
+            cell_modifier(&terminal, 6, 8).contains(Modifier::REVERSED),
+            "the match is inverted"
+        );
+    }
+
+    #[test]
+    fn an_empty_at_search_still_loading_shows_searching() {
+        // A fetch in flight with no rows yet draws the subtle "searching…" line.
+        let view = at_files(vec![], true);
+        assert!(buffer_text(&draw_popup(&view)).contains("searching…"));
+    }
+
+    #[test]
+    fn an_empty_at_search_that_finished_shows_no_matches() {
+        // Not loading + no rows: the "no matches" placeholder (a real empty walk).
+        let view = at_files(vec![], false);
+        assert!(buffer_text(&draw_popup(&view)).contains("no matches"));
     }
 
     // --- render_composer_popup: System A (numbered `›` dialog) --------------
@@ -8124,7 +9132,7 @@ mod tests {
         let screen = screen_with_notices(vec!["a launch notice".to_string()]);
         let terminal = draw_viewport(80, 20, &screen);
         let text = buffer_text(&terminal);
-        assert!(text.contains("suspenders ready"), "the greeting:\n{text}");
+        assert!(text.contains(">_ suspenders"), "the header brand:\n{text}");
         assert!(text.contains("a launch notice"));
     }
 
@@ -8273,9 +9281,10 @@ mod tests {
 
     #[test]
     fn a_user_prompt_shows_the_caret_prefix_and_the_agent_the_marker() {
-        // qwen chrome: the greeting reads `●`; a User prompt the `>` caret; the
-        // agent's answer the `✦` marker. All baked into the content, 2-col margin.
-        let screen = screen_with_notices(vec![]);
+        // qwen chrome: an Info line (a launch notice) reads `●`; a User prompt
+        // the `>` caret; the agent's answer the `✦` marker. All baked into the
+        // content, 2-col margin.
+        let screen = screen_with_notices(vec!["a launch notice".to_string()]);
         let (screen, _) = screen.submitted("do the thing", Ok(()));
         let (screen, _) = screen.apply_event(Event::message_start(1));
         let (screen, _) = screen.apply_event(Event::message_end(
@@ -8289,7 +9298,7 @@ mod tests {
             "user caret prefix:\n{text}"
         );
         assert!(text.contains("✦ done"), "assistant marker prefix:\n{text}");
-        assert!(text.contains("● suspenders ready"), "info prefix:\n{text}");
+        assert!(text.contains("● a launch notice"), "info prefix:\n{text}");
     }
 
     #[test]
@@ -9071,28 +10080,34 @@ mod tests {
         // proving the width is rigid (measure==draw).
         let _ = width;
         let rows = terminal.backend().buffer().area.height;
-        // Every boxed row must place its two `│` borders at the SAME two columns
-        // (the box is rigid: measure==draw, ADR-0029). Collect the (left,right)
-        // border columns of each bordered row and assert they all agree.
+        // Every boxed row of ONE box must place its two `│` borders at the SAME
+        // two columns (the box is rigid: measure==draw, ADR-0029). The startup
+        // Header's own info panel is a SEPARATE box at its own inner width, so
+        // rigidity is asserted per contiguous box-row run (a blank / non-bordered
+        // row ends a box), then a bordered box must have been seen.
         let mut border_cols: Option<(usize, usize)> = None;
+        let mut saw_box = false;
         for y in 0..rows {
             let row: Vec<char> = row_text(&terminal, y).chars().collect();
             let left = row.iter().position(|&c| c == '│');
             let right = row.iter().rposition(|&c| c == '│');
-            if let (Some(l), Some(r)) = (left, right)
-                && l != r
-            {
-                match border_cols {
-                    None => border_cols = Some((l, r)),
-                    Some((el, er)) => assert_eq!(
-                        (l, r),
-                        (el, er),
-                        "row {y} borders at ({l},{r}) not the rigid ({el},{er})"
-                    ),
+            match (left, right) {
+                (Some(l), Some(r)) if l != r => {
+                    saw_box = true;
+                    match border_cols {
+                        None => border_cols = Some((l, r)),
+                        Some((el, er)) => assert_eq!(
+                            (l, r),
+                            (el, er),
+                            "row {y} borders at ({l},{r}) not the rigid ({el},{er}) of its box"
+                        ),
+                    }
                 }
+                // A row with no border pair ends the current box run.
+                _ => border_cols = None,
             }
         }
-        assert!(border_cols.is_some(), "the approval box drew bordered rows");
+        assert!(saw_box, "the approval box drew bordered rows");
     }
 
     // committed==pending identity (ADR-0049): once the Approval resolves and the

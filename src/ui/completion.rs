@@ -469,6 +469,75 @@ fn to_suggestion(r: Ranked) -> Suggestion {
     }
 }
 
+/// Ranks repo-relative `paths` against `query` for the AT file picker (System B,
+/// qwen `useAtCompletion` → `FileSearch.search`), best-first. Each kept path
+/// becomes a [`Suggestion`] whose `label`/`value` are BOTH the path (the caller
+/// escapes the value before inserting - see the composer's `escape_path`), and
+/// whose `matched` is the contiguous fuzzy-match window over the path for the
+/// inverted highlight. An EMPTY `query` keeps every path in the given (already
+/// sorted, `walk::walk_files`-deterministic) order with no highlight - qwen
+/// searches `''` and the file searcher returns its natural order. Capping to
+/// `MAX_SUGGESTIONS_TO_SHOW * 3` is the CALLER's job (the adapter), matching
+/// qwen's `maxResults`; this ranks the whole set.
+///
+/// PURE like [`rank`]: the one impurity is the `nucleo-matcher` fuzzy pass,
+/// surfaced only as a score + window. A path that does not fuzzy-match `query`
+/// is dropped, so a narrowing query shrinks the list (mirroring the palette).
+pub fn rank_paths(paths: &[String], query: &str) -> Vec<Suggestion> {
+    if query.is_empty() {
+        // qwen's empty-pattern search returns the searcher's natural order; the
+        // walk is already sorted, so keep it verbatim with nothing highlighted.
+        return paths.iter().map(|p| path_suggestion(p)).collect();
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    // The fuzzy score is the sole sort key (paths carry no strength ladder /
+    // recency / priority the way commands do): higher score first, ties broken
+    // by the original (sorted) order so the result stays deterministic.
+    let mut ranked: Vec<RankedPath<'_>> = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            fuzzy_one(&mut matcher, path, query).map(|(score, window)| RankedPath {
+                score,
+                index,
+                path,
+                window,
+            })
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index)));
+    ranked
+        .into_iter()
+        .map(|r| Suggestion {
+            label: r.path.to_string(),
+            value: r.path.to_string(),
+            description: String::new(),
+            matched: r.window,
+        })
+        .collect()
+}
+
+// One fuzzy-matched path before it collapses to a [`Suggestion`]: its nucleo
+// score (the sort key), original index (the sorted-order tiebreak), the path,
+// and the contiguous match window for the highlight.
+struct RankedPath<'a> {
+    score: u16,
+    index: usize,
+    path: &'a str,
+    window: Option<(usize, usize)>,
+}
+
+// One AT path suggestion with no match window - the empty-query row (the whole
+// path is the label AND the value; the caller escapes it on accept).
+fn path_suggestion(path: &str) -> Suggestion {
+    Suggestion {
+        label: path.to_string(),
+        value: path.to_string(),
+        description: String::new(),
+        matched: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +863,56 @@ mod tests {
         assert_eq!(exact[0].strength, MatchStrength::Exact);
         // A non-prefix query yields nothing (prefix-only, no fuzzy).
         assert!(prefix_ranked("dl", &recent_of).is_empty());
+    }
+
+    // --- rank_paths (the AT file picker's pure ranking) --------------------
+
+    fn paths(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_empty_query_keeps_every_path_in_the_given_order() {
+        // qwen searches '' and gets the searcher's natural order back; the walk
+        // is already sorted, so rank_paths keeps it verbatim, nothing highlighted.
+        let all = paths(&["README.md", "src/main.rs", "src/ui/composer.rs"]);
+        let out = rank_paths(&all, "");
+        assert_eq!(values(&out), all);
+        assert!(out.iter().all(|s| s.matched.is_none()));
+        // label == value for every AT row (the whole path is both).
+        assert!(out.iter().all(|s| s.label == s.value));
+    }
+
+    #[test]
+    fn a_query_fuzzy_orders_paths_best_first_and_drops_non_matches() {
+        let all = paths(&[
+            "README.md",
+            "src/main.rs",
+            "src/ui/composer.rs",
+            "docs/adr/0001.md",
+        ]);
+        let out = rank_paths(&all, "composer");
+        // Only the composer path fuzzy-matches "composer".
+        assert_eq!(values(&out), vec!["src/ui/composer.rs"]);
+        // A query matching nothing yields no rows (a narrowing filter shrinks).
+        assert!(rank_paths(&all, "zzznope").is_empty());
+    }
+
+    #[test]
+    fn the_match_window_spans_the_fuzzy_hit_for_the_highlight() {
+        let all = paths(&["src/main.rs"]);
+        let out = rank_paths(&all, "main");
+        assert_eq!(out.len(), 1);
+        // "main" sits at chars [4, 8) of "src/main.rs" - the inverted window.
+        assert_eq!(out[0].matched, Some((4, 8)));
+    }
+
+    #[test]
+    fn a_stronger_fuzzy_hit_ranks_before_a_scattered_one() {
+        // "srcmain" contiguously-ish hits "src/main.rs" better than the
+        // scattered hit in "docs/some-readme.rs"; the tighter match sorts first.
+        let all = paths(&["docs/some-readme.rs", "src/main.rs"]);
+        let out = rank_paths(&all, "srcmain");
+        assert_eq!(out[0].value, "src/main.rs");
     }
 }
