@@ -23,6 +23,7 @@ pub mod markdown;
 pub mod model_command;
 pub mod picker;
 pub mod screen;
+pub mod selection;
 pub mod selector;
 pub mod slash;
 pub mod theme;
@@ -316,6 +317,10 @@ async fn run_loop(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut anim = components::Anim::default();
+    // The monotonic host clock the pure core reads for the Approval radio's
+    // digit-quick-select timeout (ADR-0049, `Screen::expire_approval`): elapsed
+    // milliseconds since launch, advanced by the tick (no background timer).
+    let started = std::time::Instant::now();
 
     // Initial paint of the inline pending region.
     draw_previewed(
@@ -332,6 +337,24 @@ async fn run_loop(
             // Animation tick: advance the spinner and repaint, but ONLY while a
             // Run is running - an idle UI does no work between events.
             _ = ticker.tick() => {
+                // Drive the Approval radio's digit-quick-select timeout (ADR-0049):
+                // the pure core reads the elapsed-millis clock and, on a fired
+                // buffered digit, resolves the Approval. A no-op when no Approval
+                // is open or nothing is buffered (the 3-row radio never buffers).
+                {
+                    let core = screen.take().unwrap();
+                    let now = started.elapsed().as_millis() as u64;
+                    let (core, effects) = core.expire_approval(now);
+                    screen = Some(
+                        dispatch(
+                            terminal,
+                            core,
+                            effects,
+                            &mut Adapter { ctx: &ctx, state: &mut state, cache: &mut cache },
+                        )
+                        .await?,
+                    );
+                }
                 let s = screen.as_ref().unwrap();
                 if s.status == Status::Running {
                     anim.spinner = anim.spinner.wrapping_add(1);
@@ -599,32 +622,39 @@ fn commit_items<B: Backend>(
     let hw = screen.transcript().committed_high_water();
 
     // Sync the cache at the content width the commit draws at (full frame width
-    // minus the lane gutter, no scrollbar) so measure == draw. `insert_before`
-    // renders into a full-terminal-width buffer, so the content width is the
-    // terminal width minus the gutter.
+    // minus the two `CONTENT_MARGIN` columns, no scrollbar) so measure == draw.
+    // `insert_before` renders into a full-terminal-width buffer, so the content
+    // width is the terminal width minus those margins.
     let width = terminal
         .size()
         .map(|s| s.width)
         .unwrap_or(FALLBACK_TERM_WIDTH);
-    let content_width = width.saturating_sub(components::LANE_GUTTER);
+    let content_width = width.saturating_sub(2 * components::CONTENT_MARGIN);
     components::sync_commit_cache(cache, screen, content_width, theme);
 
-    let height = components::commit_slice_height(cache, hw, count);
+    // Bound the item list to the committed slice `[0, hw + count)` so the
+    // render-time tool-group fold stops a group at the slice edge; the fold emits
+    // only `[hw..]`.
+    let items: Vec<_> = screen
+        .transcript()
+        .items()
+        .iter()
+        .take(hw + count)
+        .cloned()
+        .collect();
+    let committed = components::CommittedSlice {
+        cache,
+        items: &items,
+        hw,
+        count,
+        theme,
+    };
+    let height = components::commit_slice_height(&committed, content_width);
     if height > 0 {
-        let items = screen.transcript().items().to_vec();
         // FATAL on error (`?`): a failed blit must not leave the mark advanced,
         // so we advance it only on the `Ok` path below.
         terminal.insert_before(height, |buf| {
-            components::render_committed_slice(
-                buf,
-                &components::CommittedSlice {
-                    cache,
-                    items: &items,
-                    hw,
-                    count,
-                    theme,
-                },
-            );
+            components::render_committed_slice(buf, &committed);
         })?;
     }
     // Only now - after a successful blit (or a zero-height no-op) - advance the
@@ -748,6 +778,12 @@ fn map_key(key: &KeyEvent) -> Key {
         // otherwise swallow the keypress as a plain character.
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleThinking,
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ToggleTools,
+        // Shift+Tab cycles the Approval mode (ADR-0050). Crossterm reports it as
+        // `BackTab`, or as `Tab` + SHIFT on terminals that do not synthesize
+        // BackTab - both map to the same intent (qwen's win32 fallback is plain
+        // Tab, which suspenders does not adopt: bare Tab stays inert).
+        KeyCode::BackTab => Key::CycleApprovalMode,
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Key::CycleApprovalMode,
         // Any other Ctrl chord is a command, never text: since the core now
         // inserts every `Key::Char` into the Composer, letting e.g. Ctrl-X
         // through as Char('x') would type an 'x'.
@@ -834,7 +870,7 @@ async fn run_effect(
 /// fire-through calls that leave the screen untouched.
 async fn run_agent_command(
     command: AgentCommand,
-    screen: Screen,
+    mut screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
 ) -> Screen {
@@ -854,6 +890,16 @@ async fn run_agent_command(
         }
         AgentCommand::Approve(id, decision) => {
             agent.approve(id, to_agent_decision(decision)).await;
+            screen
+        }
+        AgentCommand::CycleApprovalMode => {
+            // Set the Screen mirror DIRECTLY from the authoritative fold result
+            // (P0): the `ApprovalModeChanged` broadcast is lossy (a `Lagged`
+            // in the event loop could drop it and leave the footer indicator
+            // permanently stale, a safety-signal lie). The broadcast still
+            // fires for any other subscribers; this call site no longer depends
+            // on it for the mirror the footer reads.
+            screen.approval_mode = agent.cycle_approval_mode().await;
             screen
         }
         AgentCommand::Cancel => {
@@ -1007,6 +1053,7 @@ fn draw<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approvals::ApprovalMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     // The composer-editing rules themselves (insert/backspace/modal gating)
@@ -1075,6 +1122,20 @@ mod tests {
         assert_eq!(
             map_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
             Key::Other
+        );
+    }
+
+    // Shift+Tab cycles the Approval mode (ADR-0050): crossterm reports it as
+    // BackTab, or Tab + SHIFT on terminals that do not synthesize BackTab.
+    #[test]
+    fn shift_tab_maps_to_the_approval_mode_cycle() {
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            Key::CycleApprovalMode
+        );
+        assert_eq!(
+            map_key(&KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Key::CycleApprovalMode
         );
     }
 
@@ -1674,6 +1735,50 @@ mod tests {
         )
         .await
         .expect("cancel returns");
+    }
+
+    // P0 (mode-mirror desync): the footer AutoAcceptIndicator must derive from
+    // the AUTHORITATIVE cycle result, never from the lossy `ApprovalModeChanged`
+    // broadcast (a `RecvError::Lagged` in the event loop could drop that event
+    // and leave the mirror permanently stale - a safety-signal lie). This test
+    // NEVER subscribes to events, so the broadcast is, from the Screen's point
+    // of view, dropped; the mirror must still advance because `run_agent_command`
+    // sets it directly from `cycle_approval_mode`'s return value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cycle_updates_the_mirror_even_when_the_broadcast_is_dropped() {
+        let dir = TempDir::new().unwrap();
+        let agent = start_agent(&dir, FakeLlm::script(vec![]));
+        let ctx = adapter_ctx(&agent);
+        let mut state = test_state();
+
+        // Fresh Screen starts at Default; no event subscriber exists here.
+        let mut screen = Screen::new(ScreenOpts::default());
+        assert_eq!(screen.approval_mode, ApprovalMode::Default);
+
+        // One cycle through the real dispatch path lands on AutoEdit (qwen order:
+        // plan → default → auto-edit → …) purely from the returned mode.
+        screen = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_effect(
+                screen,
+                Effect::Agent(AgentCommand::CycleApprovalMode),
+                &ctx,
+                &mut state,
+            ),
+        )
+        .await
+        .expect("cycle returns");
+        assert_eq!(screen.approval_mode, ApprovalMode::AutoEdit);
+
+        // A second cycle advances to Auto - again with no broadcast consumed.
+        screen = run_effect(
+            screen,
+            Effect::Agent(AgentCommand::CycleApprovalMode),
+            &ctx,
+            &mut state,
+        )
+        .await;
+        assert_eq!(screen.approval_mode, ApprovalMode::Auto);
     }
 
     // (The old scroll-effect executor test is retired: native scrollback owns

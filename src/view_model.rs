@@ -194,6 +194,12 @@ pub struct DiffHunk {
 ///   unknown), the tagged hunks, and the count of lines elided by the display
 ///   cap. The adapter renders the marker glyph, the added/removed background
 ///   tint, and the syntect foreground.
+/// * `Todo { items }` - a first-class task list (ADR-0048): the model's
+///   `todo_write` items in order, the SAME [`crate::plan::TodoItem`] vocabulary
+///   the Run-loop's Plan fold reads. The Todo display extension's Presenter swaps
+///   a successful `todo_write` Tool Result for this item, so the committed render
+///   draws the circle list (`○ ◐ ●`) instead of the raw JSON args. Pure - the
+///   glyph/colour treatment lives in `ui/components` (ADR-0019).
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
 ///   plane (the greeting, launch notices, the extension-failure line).
 /// * `Marker { text, tone }` - a harness-authored line in the tinted marker
@@ -241,6 +247,13 @@ pub enum TranscriptItem {
         /// Lines the display cap elided, rendered as a muted `… N more lines`
         /// tail; `0` when nothing was cut.
         elided: usize,
+    },
+    /// A first-class task list (ADR-0048): the model's `todo_write` items in
+    /// order, held as the pure [`crate::plan::TodoItem`] vocabulary. The Todo
+    /// display extension's Presenter emits this in place of a successful
+    /// `todo_write` Tool Result; the adapter draws the circle list.
+    Todo {
+        items: Vec<crate::plan::TodoItem>,
     },
     Info {
         text: String,

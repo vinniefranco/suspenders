@@ -23,19 +23,28 @@
 //! verbatim task statement per CONTEXT.md.
 
 use crate::conversation::Conversation;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One item in the model's task list: a `content` line in the model's voice and
 /// its `status`. Held verbatim; the harness never edits the content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` so the Todo display extension can attach the parsed
+/// list as an Artifact (ADR-0048): the same value the Run-loop's Plan fold reads
+/// rides the Tool Result to Presentment, so the committed render never re-parses
+/// the raw JSON args.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,
     pub status: TodoStatus,
 }
 
 /// A task item's status, the `todo_write` vocabulary: not started, the single
-/// item currently being worked, or finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// item currently being worked, or finished. `snake_case` on the wire so the
+/// serialized form matches the `todo_write` tokens (`pending`/`in_progress`/
+/// `completed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     Pending,
     InProgress,
@@ -54,13 +63,15 @@ impl TodoStatus {
         }
     }
 
-    /// The checklist glyph for this status: `[ ]` pending, `[~]` in progress,
-    /// `[x]` completed. Used to render the list for the log and the UI.
-    fn glyph(self) -> &'static str {
+    /// The checklist glyph for this status (qwen `STATUS_ICONS`, TodoDisplay.tsx):
+    /// `○` U+25CB pending, `◐` U+25D0 in progress, `●` U+25CF completed. Plain
+    /// `&str` so `plan.rs` stays ratatui-free (ADR-0019); the in_progress-green /
+    /// completed-strikethrough treatment lives in `ui/components`.
+    pub(crate) fn glyph(self) -> &'static str {
         match self {
-            TodoStatus::Pending => "[ ]",
-            TodoStatus::InProgress => "[~]",
-            TodoStatus::Completed => "[x]",
+            TodoStatus::Pending => "○",
+            TodoStatus::InProgress => "◐",
+            TodoStatus::Completed => "●",
         }
     }
 }
@@ -147,7 +158,12 @@ impl Plan {
 /// Parses the `todos` array from a `todo_write` input, returning the well-formed
 /// items. An item needs a non-empty string `content` and a known `status`;
 /// malformed items are dropped. A missing or non-array `todos` yields `None`.
-fn parse_todos(input: &Value) -> Option<Vec<TodoItem>> {
+///
+/// `pub(crate)` so the Todo display extension parses the SAME vocabulary the
+/// Run-loop's Plan fold does (ADR-0048: `plan.rs` owns the todo vocabulary; the
+/// three consumers - Plan fold, committed render, sticky box - never re-derive
+/// it).
+pub(crate) fn parse_todos(input: &Value) -> Option<Vec<TodoItem>> {
     let items = input.get("todos")?.as_array()?;
     let todos = items
         .iter()
@@ -348,7 +364,7 @@ mod tests {
             Update::Updated(plan) => plan,
             Update::Unchanged => panic!("expected Updated"),
         };
-        assert_eq!(plan.render(), "[x] read\n[~] edit\n[ ] build");
+        assert_eq!(plan.render(), "● read\n◐ edit\n○ build");
     }
 
     #[test]
@@ -362,6 +378,40 @@ mod tests {
         assert_eq!(Plan::default().render(), "");
     }
 
+    // ---- serde round-trip (ADR-0048: the artifact wire form) ----
+
+    #[test]
+    fn todo_item_serializes_status_as_snake_case_and_round_trips() {
+        let items = vec![
+            TodoItem {
+                content: "read".to_string(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                content: "edit".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                content: "build".to_string(),
+                status: TodoStatus::Completed,
+            },
+        ];
+
+        let value = serde_json::to_value(&items).unwrap();
+        // The status tokens on the wire match the `todo_write` vocabulary.
+        assert_eq!(
+            value,
+            json!([
+                { "content": "read", "status": "pending" },
+                { "content": "edit", "status": "in_progress" },
+                { "content": "build", "status": "completed" },
+            ])
+        );
+
+        let back: Vec<TodoItem> = serde_json::from_value(value).unwrap();
+        assert_eq!(back, items);
+    }
+
     #[test]
     fn a_fresh_todo_write_supersedes_the_restored_render() {
         let plan = Plan::new(Some("[ ] old".to_string()), None);
@@ -373,6 +423,6 @@ mod tests {
             Update::Updated(plan) => plan,
             Update::Unchanged => panic!("expected Updated"),
         };
-        assert_eq!(updated.render(), "[ ] new");
+        assert_eq!(updated.render(), "○ new");
     }
 }

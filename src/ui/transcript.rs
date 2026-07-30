@@ -178,7 +178,7 @@ impl Transcript {
         self.push(TranscriptItem::Info { text: text.into() });
     }
 
-    /// Appends a harness marker in the tinted plane (ADR-0040): the caller
+    /// Appends a harness marker: the caller
     /// authors both the text (glyph included) and the [`Tone`] at the firing
     /// site; the store only records the pair. An APPEND - never bumps the
     /// revision. The Steering pending marker takes the same path through
@@ -196,7 +196,7 @@ impl Transcript {
     /// (path/command/pattern by tool name), falling back to the raw
     /// `key=value` summary only when no arg stands out. Appends; never bumps.
     pub fn tool_call(&mut self, id: String, name: String, input: &Value) {
-        let summary = key_arg(&name, input).unwrap_or_else(|| summarize_input(input));
+        let summary = call_summary(&name, input);
         self.append(
             TranscriptItem::ToolCall { id, name, summary },
             &HashMap::new(),
@@ -235,8 +235,8 @@ impl Transcript {
         });
     }
 
-    /// Appends the pending-Steering marker (ADR-0040: a [`Tone::Steering`]
-    /// marker, the user's own voice in the plane). Its text is authored HERE
+    /// Appends the pending-Steering marker (a [`Tone::Steering`]
+    /// marker, the user's own voice). Its text is authored HERE
     /// so [`Transcript::steering_delivered`]'s removal-by-equality can never
     /// desync from it.
     pub fn steering_queued(&mut self, text: &str) {
@@ -287,6 +287,26 @@ impl Transcript {
     /// The in-flight assistant text, from the latest streaming snapshot.
     pub fn streaming_text(&self) -> String {
         self.streaming.text()
+    }
+
+    /// The latest task list on screen (ADR-0048): the items of the newest
+    /// [`TranscriptItem::Todo`] in the history, or `&[]` when none has landed.
+    /// The sticky "Current tasks" box DERIVES from this (qwen
+    /// `findLatestTodoSnapshot`) rather than a parallel Agent→view Plan channel -
+    /// the Todo item IS the single source of truth the committed render and the
+    /// sticky box both read, so the two can never disagree. Also returns the
+    /// item's index (its position in [`Transcript::items`]) so the caller can
+    /// gate the sticky box against the high-water mark (show only once the inline
+    /// copy has committed, avoiding a double-render). `None` when no Todo exists.
+    pub fn latest_todo(&self) -> Option<(usize, &[crate::plan::TodoItem])> {
+        self.items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, item)| match item {
+                TranscriptItem::Todo { items } => Some((i, items.as_slice())),
+                _ => None,
+            })
     }
 
     /// The in-flight Thinking text, from the latest streaming snapshot.
@@ -425,6 +445,23 @@ fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> Strin
 const SUMMARY_WIDTH: usize = 100;
 /// Maximum display width for a single field value inside a summary line.
 const VALUE_WIDTH: usize = 60;
+
+// The Tool Call / merged-result summary for a Tool Call input map. Special-cases
+// `todo_write`: its `todos` array is rendered as the BODY of a
+// [`TranscriptItem::Todo`] (the circle list), so the call/result summary is
+// deliberately empty (qwen shows no description on a TodoWrite header). This is
+// the STRUCTURAL fix for the raw-JSON leak: without it, both [`key_arg`] and its
+// [`summarize_input`] fallback JSON-format the `todos` array, so an in-flight
+// `todo_write` call OR a schema-passing-but-semantically-malformed one that
+// drops all items (no Todo artifact → the Tool Result passes through) would show
+// `todos=[{"content"...}]` in its summary. Every other tool defers to the
+// salient-arg pick with its `key=value` fallback.
+fn call_summary(name: &str, input: &Value) -> String {
+    if name == "todo_write" {
+        return String::new();
+    }
+    key_arg(name, input).unwrap_or_else(|| summarize_input(input))
+}
 
 // The single salient input arg for a merged one-liner, picked by tool: the
 // `path` for read/edit/write, the `command` for run_command, the `pattern`/
@@ -696,6 +733,41 @@ mod tests {
         assert_eq!(
             t.items(),
             vec![tool_call_item("t1", "run_command", "command=")]
+        );
+    }
+
+    // The raw-JSON leak fix (P0): a `todo_write` NEVER shows its `todos` array in
+    // a summary - not the in-flight call, not a schema-passing-but-semantically-
+    // malformed result that drops all items (no Todo artifact, so the Tool Result
+    // passes through). Both paths draw their summary from `call_summary`, which is
+    // empty for `todo_write` (the list is the Todo body, not a description).
+    #[test]
+    fn todo_write_never_leaks_raw_json_in_any_summary() {
+        // The salient-arg pick and its fallback BOTH JSON-format the array; the
+        // structural fix is a clean empty summary.
+        let malformed = json!({"todos": [{"content": "", "status": "bogus"}]});
+        assert_eq!(call_summary("todo_write", &malformed), "");
+        // The raw pick DOES carry the JSON (this is what would have leaked).
+        assert!(key_arg("mystery", &malformed).unwrap().contains("content"));
+
+        // (b) The in-flight call reads a bare `todo_write` (empty summary).
+        let mut t = fresh();
+        t.tool_call("t1".into(), "todo_write".into(), &malformed);
+        assert_eq!(t.items(), vec![tool_call_item("t1", "todo_write", "")]);
+
+        // (a) A malformed result that passes through (no Todo artifact) recovers
+        // the call's clean summary as its key_arg - no `todos=[...]` anywhere.
+        t.tool_result(
+            "t1",
+            "todo_write".into(),
+            "Recorded.",
+            false,
+            &HashMap::new(),
+        );
+        let rendered = format!("{:?}", t.items());
+        assert!(
+            !rendered.contains("todos") && !rendered.contains("content:"),
+            "todo_write summary leaked raw JSON: {rendered}"
         );
     }
 
@@ -1285,7 +1357,7 @@ mod tests {
         }
     }
 
-    // --- marker plane (ADR-0040) -------------------------------------------------
+    // --- markers -----------------------------------------------------------------
 
     // A marker APPENDS with its carried tone and never bumps the revision - it
     // is an ordinary append, not a structural edit.
@@ -1302,6 +1374,38 @@ mod tests {
             ]
         );
         assert_eq!(t.revision(), 0);
+    }
+
+    // --- latest_todo (ADR-0048: the sticky box's single source of truth) ---------
+
+    fn todo_item(contents: &[&str]) -> TranscriptItem {
+        TranscriptItem::Todo {
+            items: contents
+                .iter()
+                .map(|c| crate::plan::TodoItem {
+                    content: (*c).into(),
+                    status: crate::plan::TodoStatus::Pending,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn latest_todo_returns_the_newest_todo_with_its_index() {
+        let mut t = fresh();
+        assert_eq!(t.latest_todo(), None, "no todo yet");
+
+        t.user("do it");
+        t.push(todo_item(&["read", "edit"]));
+        t.push(info("working"));
+        // A later todo_write supersedes the earlier list (a fresh append, not a
+        // structural edit) - latest_todo returns the NEWEST one and its index.
+        t.push(todo_item(&["read", "edit", "ship"]));
+
+        let (idx, items) = t.latest_todo().expect("a todo is on screen");
+        assert_eq!(idx, 3, "the newest todo item's index");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].content, "ship");
     }
 
     // --- item vocabulary ---------------------------------------------------------

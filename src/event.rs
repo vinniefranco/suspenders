@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::approvals::ApprovalMode;
 use crate::content::ContentBlock;
 use crate::llm::Delta;
 use crate::llm::response::StopReason;
@@ -107,6 +108,14 @@ pub enum Event {
     },
     ApprovalAuto {
         command: String,
+    },
+    /// The Approval mode changed (ADR-0050): the Agent's pure `Approvals` fold
+    /// rotated its mode via the Shift+Tab cycle, and this mirrors the new mode
+    /// to the Screen so the footer AutoAcceptIndicator can render it. The mode
+    /// state lives authoritatively on the Agent; the Screen holds a display-only
+    /// copy fed by this event.
+    ApprovalModeChanged {
+        mode: ApprovalMode,
     },
 
     // ---- Extensions / Session Log / Context ----
@@ -280,6 +289,10 @@ impl Event {
         Event::ApprovalAuto {
             command: command.into(),
         }
+    }
+
+    pub fn approval_mode_changed(mode: ApprovalMode) -> Self {
+        Event::ApprovalModeChanged { mode }
     }
 
     // ---- Slash Command selector ----

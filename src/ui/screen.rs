@@ -33,11 +33,13 @@
 //!   `a` is approve-always (Standing Approval); Escape means Cancellation,
 //!   which wins over the Approval.
 
+use crate::approvals::ApprovalMode;
 use crate::conversation::compaction_target;
 use crate::event::Event;
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
+use crate::ui::selection::{SelectionKey, SelectionList, SelectionOutcome};
 use crate::ui::transcript::Transcript;
 use crate::view_model::Tone;
 use crate::view_model::{DiffHunk, DiffLine, DiffSide, TranscriptItem};
@@ -68,11 +70,62 @@ pub enum Status {
     Running,
 }
 
-/// A pending run_command Approval: the id to resolve and the command shown.
+/// Which confirmation shape a pending Approval wears (ADR-0049), derived from
+/// the confirming ToolCall's name: `run_command` reads `Exec` (the command is
+/// arbitrary code), `web_fetch` reads `Info` (a plain proceed prompt). Drives
+/// the inline block's question line - `Allow execution of: '{command}'?` for
+/// `Exec`, `Do you want to proceed?` for `Info` - both offering the same three
+/// options. Edit/plan/mcp are future exhaustive arms (stubbed generic today via
+/// the fallback in [`ConfirmKind::from_tool_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    /// A shell/exec confirmation (`run_command`).
+    Exec,
+    /// A generic proceed confirmation (`web_fetch`, and the fallback).
+    Info,
+}
+
+impl ConfirmKind {
+    /// The ConfirmKind for a gated tool name (ADR-0049). Only `run_command` and
+    /// `web_fetch` gate today (`approvals::GATED`); everything else falls back
+    /// to the generic `Info` prompt, so a future gated tool never renders an
+    /// empty block.
+    pub fn from_tool_name(name: &str) -> ConfirmKind {
+        match name {
+            "run_command" => ConfirmKind::Exec,
+            _ => ConfirmKind::Info,
+        }
+    }
+}
+
+/// A pending Approval (ADR-0049): the id to resolve, the command/URL shown, the
+/// confirmation shape, and the pure [`SelectionList`] the radio rows drive. The
+/// three options are fixed (`Yes, allow once` / `Always allow in this project` /
+/// `No, suggest changes (esc)`), so the list is always length 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
     pub approval_id: String,
     pub command: String,
+    pub kind: ConfirmKind,
+    /// The radio selection state (active row, digit quick-select buffer).
+    pub selection: SelectionList,
+}
+
+/// The number of Approval options (`Yes, allow once` / `Always allow in this
+/// project` / `No, suggest changes (esc)`) - the fixed length of a pending
+/// Approval's [`SelectionList`].
+pub const APPROVAL_OPTION_COUNT: usize = 3;
+
+/// Maps a selected Approval option index to its [`Decision`] (ADR-0049): row 0
+/// approves once, row 1 approves-always (session-scoped standing, ADR-0005), row
+/// 2 denies. Out of range is `None` (defensive - the list is length 3).
+fn decision_for_option(index: usize) -> Option<Decision> {
+    match index {
+        0 => Some(Decision::Approve),
+        1 => Some(Decision::ApproveAlways),
+        2 => Some(Decision::Deny),
+        _ => None,
+    }
 }
 
 /// A PURE key press, defined here so the core stays crossterm-free (ADR-0019):
@@ -112,6 +165,10 @@ pub enum Key {
     ToggleThinking,
     /// Ctrl-O: toggle the expanded rendering of settled tool Blocks.
     ToggleTools,
+    /// Shift+Tab (win32: Tab): rotate the Approval mode one step in the cycle
+    /// (ADR-0050). Named (not `Char`) so the intent reads at the mapping and
+    /// routing seams alike.
+    CycleApprovalMode,
     Char(char),
     /// A key the core does not act on (function keys, etc.).
     Other,
@@ -149,6 +206,10 @@ pub enum AgentCommand {
     Steer(String),
     /// Resolve a pending Approval with a decision.
     Approve(String, Decision),
+    /// Rotate the Approval mode one step (ADR-0050, the Shift+Tab cycle). A
+    /// fire-through to the Agent; the new mode returns via
+    /// [`Event::ApprovalModeChanged`].
+    CycleApprovalMode,
     Cancel,
 }
 
@@ -217,6 +278,12 @@ pub struct Screen {
     transcript: Transcript,
     pub status: Status,
     pub pending_approval: Option<PendingApproval>,
+    /// The current Approval mode (ADR-0050), a DISPLAY-ONLY mirror of the
+    /// Agent's authoritative `Approvals::mode`, fed by
+    /// [`Event::ApprovalModeChanged`]. The Screen never decides the mode - it
+    /// only reflects it, so the footer AutoAcceptIndicator (and, in a later
+    /// phase, the composer chrome) can render it. `Default` shows nothing.
+    pub approval_mode: ApprovalMode,
     pub token_estimate: Option<u64>,
     pub context_budget: Option<u64>,
     pub compaction_slack: f64,
@@ -389,6 +456,7 @@ impl Screen {
             transcript,
             status: Status::Idle,
             pending_approval: None,
+            approval_mode: ApprovalMode::default(),
             token_estimate: None,
             context_budget: opts.context_budget,
             compaction_slack: opts.compaction_slack,
@@ -403,8 +471,8 @@ impl Screen {
     /// A representative populated Screen for eyeballing the render (the `--demo`
     /// harness and the render tests): one user request whose run interleaves
     /// several Thinking passes, tool machinery, harness markers, and an answer
-    /// with a code fence - the exact shape that exposed the fold / spine / blank
-    /// -line bugs. No IO, no events; the transcript is authored directly.
+    /// with a code fence - the exact shape that exposed the fold / separator /
+    /// blank-line bugs. No IO, no events; the transcript is authored directly.
     // qual:test_helper - called only from render tests in ui::components
     pub fn demo() -> Self {
         let mut screen = Screen::new(ScreenOpts::default());
@@ -488,7 +556,7 @@ impl Screen {
     /// test helper - the render snapshot tests pin [`Screen::demo`], so this one
     /// is free to grow without churning them.
     ///
-    /// One user request opens the lane; the diffs hang off its spine and fold
+    /// One user request; the diffs follow it in the transcript and fold
     /// under Ctrl-O exactly like a real edit would. Each Diff is shaped as the
     /// diff extension's Presenter emits it (raw marker-free lines, a
     /// `display::title`-style title, the file extension as `lang`).
@@ -559,7 +627,8 @@ impl Screen {
 
             event @ (Event::ApprovalRequest { .. }
             | Event::ApprovalResolved { .. }
-            | Event::ApprovalAuto { .. }) => self.apply_approval(event),
+            | Event::ApprovalAuto { .. }
+            | Event::ApprovalModeChanged { .. }) => self.apply_approval(event),
 
             event @ (Event::SteeringQueued { .. } | Event::SteeringDelivered { .. }) => {
                 self.apply_steering(event)
@@ -709,9 +778,20 @@ impl Screen {
                 approval_id,
                 command,
             } => {
+                // The inline approval attaches to the NEWEST pending ToolCall by
+                // position (ADR-0049): batch tools run sequentially, so the only
+                // live ToolCall (one with no result yet) is the one being gated.
+                // Its name derives the ConfirmKind (run_command → Exec, else
+                // Info); no tool_use id is plumbed through the event.
+                let kind = self
+                    .newest_live_tool_name()
+                    .map(ConfirmKind::from_tool_name)
+                    .unwrap_or(ConfirmKind::Info);
                 self.pending_approval = Some(PendingApproval {
                     approval_id,
                     command,
+                    kind,
+                    selection: SelectionList::new(APPROVAL_OPTION_COUNT),
                 });
                 (self, vec![Effect::FocusModal])
             }
@@ -725,6 +805,13 @@ impl Screen {
             Event::ApprovalAuto { command } => {
                 self.transcript
                     .info(format!("auto-approved (standing): {command}"));
+                (self, vec![])
+            }
+
+            // The Agent rotated its Approval mode (ADR-0050): mirror it for the
+            // footer indicator. Display-only - the Screen never decides the mode.
+            Event::ApprovalModeChanged { mode } => {
+                self.approval_mode = mode;
                 (self, vec![])
             }
 
@@ -832,34 +919,17 @@ impl Screen {
     /// leg is compiler-enforced: [`Composer::handle_key`] takes an
     /// [`UngatedKey`], and only the gate below can mint one.
     ///
-    /// While an Approval is pending, only `y`, `n`, `a` and `Escape` do
-    /// anything; every other key is swallowed - in particular, plain chars
-    /// must NOT edit the Composer while the modal is open. Escape is
-    /// Cancellation, which wins over the Approval.
+    /// While an Approval is pending, the inline radio holds the keyboard
+    /// (ADR-0049): the arrow keys + Enter drive the [`SelectionList`], the
+    /// numbered digits quick-select, and the legacy `y`/`n`/`a` quick-keys stay
+    /// as a SUPERSET (approve-once / deny / approve-always). Escape DENIES THIS
+    /// TOOL and lets the Run continue (qwen-faithful, matching the `(esc)` option
+    /// label), NOT cancel the Run. Every other key is swallowed; in particular,
+    /// plain chars must NOT edit the Composer while the block is open. Escape
+    /// only cancels the whole Run in the no-approval, streaming case below.
     pub fn handle_key(mut self, key: Key) -> (Self, Vec<Effect>) {
-        // Modal-open handling swallows everything but y/n/a/Escape. A
-        // swallowed key pays nothing - only a resolving key clones the id it
-        // sends to the Agent.
-        if let Some(pending) = &self.pending_approval {
-            let command = match key {
-                Key::Char('y') => {
-                    AgentCommand::Approve(pending.approval_id.clone(), Decision::Approve)
-                }
-                Key::Char('n') => {
-                    AgentCommand::Approve(pending.approval_id.clone(), Decision::Deny)
-                }
-                Key::Char('a') => {
-                    AgentCommand::Approve(pending.approval_id.clone(), Decision::ApproveAlways)
-                }
-                // Escape is Cancellation, which wins over the Approval.
-                Key::Escape => AgentCommand::Cancel,
-                // Every other key is swallowed.
-                _ => return (self, vec![]),
-            };
-            let (t, mut effects) = self.clear_approval();
-            let mut out = vec![Effect::Agent(command)];
-            out.append(&mut effects);
-            return t.with_commit(out);
+        if self.pending_approval.is_some() {
+            return self.handle_approval_key(key);
         }
 
         // The Composer gets first refusal (ADR-0034): every key the modal did
@@ -911,9 +981,111 @@ impl Screen {
                 (self, vec![])
             }
 
+            // Shift+Tab: rotate the Approval mode (ADR-0050). A fire-through to
+            // the Agent; the new mode returns via `Event::ApprovalModeChanged`
+            // and updates the footer. Works with no Run in flight (Session-
+            // scoped) and with no Approval open (the gate above already returned
+            // when one was).
+            Key::CycleApprovalMode => (self, vec![Effect::Agent(AgentCommand::CycleApprovalMode)]),
+
             _ => (self, vec![]),
         };
         screen.with_commit(effects)
+    }
+
+    // The Approval-block key gate (ADR-0049): the arrow/Enter keys drive the
+    // pure [`SelectionList`], the numbered digits quick-select, and `y`/`n`/`a`
+    // stay as a legacy superset. Escape DENIES THIS TOOL and lets the Run
+    // CONTINUE (qwen `ToolConfirmationMessage.tsx:106-114`: Escape →
+    // `ToolConfirmationOutcome.Cancel` = deny the call, not abort the Run) -
+    // matching the `No, suggest changes (esc)` option label. (Escape only
+    // cancels the whole Run when NO approval is open and a Run is streaming; that
+    // arm lives in `handle_key`.) A digit here always resolves immediately (the
+    // radio has 3 rows, so the buffered path in `SelectionList` never arises),
+    // so the `now` fed to the fold is irrelevant - passed as 0. Every other key
+    // is swallowed with no effect, so a stray key can never leak to the Composer.
+    fn handle_approval_key(mut self, key: Key) -> (Self, Vec<Effect>) {
+        // Bind the pending Approval once (the caller only enters here when one is
+        // open); a defensive `None` swallows the key with no effect, so no
+        // `unwrap` is needed below.
+        let Some(pending) = self.pending_approval.as_mut() else {
+            return (self, vec![]);
+        };
+        // Escape denies THIS tool and the Run continues: route it through the
+        // widget's `Cancelled` outcome to the `No, suggest changes (esc)` option
+        // (`Decision::Deny`), matching qwen and the label. The Run is NOT
+        // cancelled here.
+        if key == Key::Escape {
+            let id = pending.approval_id.clone();
+            return self.resolve_approval(AgentCommand::Approve(id, Decision::Deny));
+        }
+        // The legacy quick-keys stay a superset of the radio.
+        let quick = match key {
+            Key::Char('y') => Some(Decision::Approve),
+            Key::Char('n') => Some(Decision::Deny),
+            Key::Char('a') => Some(Decision::ApproveAlways),
+            _ => None,
+        };
+        if let Some(decision) = quick {
+            let id = pending.approval_id.clone();
+            return self.resolve_approval(AgentCommand::Approve(id, decision));
+        }
+
+        // Otherwise drive the SelectionList with the mapped key.
+        let Some(sel_key) = approval_selection_key(&key) else {
+            // A key the radio does not act on: swallowed, no effect.
+            return (self, vec![]);
+        };
+        match pending.selection.handle(sel_key, 0) {
+            SelectionOutcome::Selected(i) => match decision_for_option(i) {
+                Some(decision) => {
+                    let id = pending.approval_id.clone();
+                    self.resolve_approval(AgentCommand::Approve(id, decision))
+                }
+                // Out of range (never, the list is length 3): swallow.
+                None => (self, vec![]),
+            },
+            // A move redraws the radio; the cancel/ignore paths (Escape is
+            // handled above) leave the block open.
+            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
+                (self, vec![])
+            }
+        }
+    }
+
+    /// Drives the pending Approval radio's digit quick-select timeout at host
+    /// time `now` (ADR-0049, the host-driven `expire` seam - no background
+    /// timer). The adapter's tick calls this each frame; when a buffered digit
+    /// reaches its deadline the radio auto-selects the buffered row and this
+    /// resolves the Approval with that option's Decision. With the 3-row
+    /// approval every digit selects immediately, so the buffer never fills and
+    /// this is a no-op today - but the seam is live so Phase 5's longer dialogs
+    /// reuse the same mechanic. No pending Approval, or nothing buffered: no
+    /// effect.
+    pub fn expire_approval(mut self, now: u64) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_approval.as_mut() else {
+            return (self, vec![]);
+        };
+        match pending.selection.expire(now) {
+            SelectionOutcome::Selected(i) => match decision_for_option(i) {
+                Some(decision) => {
+                    let id = pending.approval_id.clone();
+                    self.resolve_approval(AgentCommand::Approve(id, decision))
+                }
+                None => (self, vec![]),
+            },
+            _ => (self, vec![]),
+        }
+    }
+
+    // Clears the Approval block and emits the resolving Agent command, ahead of
+    // the FocusComposer + commit seam (the confirming ToolCall commits later,
+    // when its ToolResult supersedes it - never with the Approval rows).
+    fn resolve_approval(self, command: AgentCommand) -> (Self, Vec<Effect>) {
+        let (t, mut effects) = self.clear_approval();
+        let mut out = vec![Effect::Agent(command)];
+        out.append(&mut effects);
+        t.with_commit(out)
     }
 
     /// Records how the `Submit` effect went: `Ok` appends the user line and
@@ -1063,6 +1235,23 @@ impl Screen {
         (self, effects)
     }
 
+    // The name of the newest live ToolCall - a `TranscriptItem::ToolCall` still
+    // awaiting its result (a ToolResult supersedes the call, so any surviving
+    // ToolCall item is unresolved). Because the batch runs sequentially
+    // (`run::batch`), at most one call is live at a time, and it is the one the
+    // pending Approval gates (ADR-0049). `None` when no call is live (defensive:
+    // the gate is only reached mid-call, so in practice one always is).
+    fn newest_live_tool_name(&self) -> Option<&str> {
+        self.transcript()
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                TranscriptItem::ToolCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+    }
+
     fn clear_approval(mut self) -> (Self, Vec<Effect>) {
         match self.pending_approval {
             None => (self, vec![]),
@@ -1097,6 +1286,21 @@ pub struct Idle;
 // Free functions (pure helpers).
 // ---------------------------------------------------------------------------
 
+// Maps a Screen [`Key`] to the [`SelectionKey`] the Approval radio acts on
+// (ADR-0049), or `None` for a key the radio ignores. ArrowUp/Down navigate;
+// Enter selects; a `Char` digit `1`-`9` quick-selects (the numbered rows). `y`,
+// `n`, `a` and Escape are handled by the caller BEFORE this (the legacy superset
+// + Run-cancel), so they never reach here.
+fn approval_selection_key(key: &Key) -> Option<SelectionKey> {
+    match key {
+        Key::ArrowUp => Some(SelectionKey::Up),
+        Key::ArrowDown => Some(SelectionKey::Down),
+        Key::Enter => Some(SelectionKey::Enter),
+        Key::Char(c) if c.is_ascii_digit() => Some(SelectionKey::Digit(*c as u8 - b'0')),
+        _ => None,
+    }
+}
+
 // The closing note a stop reason earns: nothing for the two normal ends, a
 // terse `turn stopped: :{reason}` otherwise. This fold's Voice - the store
 // records what it is handed.
@@ -1125,7 +1329,7 @@ fn pressure_level(estimate: u64, budget: u64, reserve: u64, slack: f64) -> Press
 }
 
 // One Compaction-progress marker line (CONTEXT.md: Compaction). The `⟨ … ⟩`
-// glyph pair marks it as a summary fold in the Housekeeping plane (ADR-0040),
+// glyph pair marks it as a summary fold in the Housekeeping tone,
 // distinct from the `✂` eviction glyph; the tint comes from the tone, never
 // from this text.
 fn compaction_line(status: &str) -> String {
@@ -1188,10 +1392,16 @@ mod tests {
         text.chars().map(Key::Char).collect()
     }
 
+    // A PendingApproval as `apply_event(ApprovalRequest)` builds it with no live
+    // ToolCall in the transcript: ConfirmKind falls back to `Info` and the radio
+    // is a fresh 3-row SelectionList. Tests that compare `pending_approval`
+    // against this must open the modal the same way (`with_pending_approval`).
     fn approval_with(command: &str) -> PendingApproval {
         PendingApproval {
             approval_id: format!("ref-{command}"),
             command: command.to_string(),
+            kind: ConfirmKind::Info,
+            selection: SelectionList::new(APPROVAL_OPTION_COUNT),
         }
     }
 
@@ -1506,6 +1716,33 @@ mod tests {
         assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
     }
 
+    // P2: a `run_command` approval derives `ConfirmKind::Exec` (not the Info
+    // fallback the bare `approval_with` helper hard-codes). The kind comes from
+    // the newest live ToolCall's name (ADR-0049), so we must emit that call
+    // first, then the ApprovalRequest. This proves the exec question path.
+    #[test]
+    fn a_run_command_approval_derives_confirm_kind_exec() {
+        let t = fold(
+            fresh(),
+            vec![
+                Event::run_started("r1"),
+                Event::tool_call(
+                    "t1",
+                    "run_command",
+                    serde_json::json!({"command": "cargo test"}),
+                ),
+                Event::approval_request("approval-0", "cargo test"),
+            ],
+        );
+        let pending = t.pending_approval.as_ref().expect("an open approval");
+        // Exec (not the Info fallback): this is the kind the render reads to draw
+        // the `Allow execution of: '{command}'?` question (ADR-0049), so the exec
+        // question path is exercised - not only the Info fallback the other
+        // Screen tests hard-code.
+        assert_eq!(pending.kind, ConfirmKind::Exec);
+        assert_eq!(pending.command, "cargo test");
+    }
+
     #[test]
     fn y_approves_clears_and_refocuses() {
         let a = approval();
@@ -1554,28 +1791,185 @@ mod tests {
         );
     }
 
+    // Escape while an Approval is open DENIES this tool and the Run continues
+    // (P1, qwen `ToolConfirmationMessage.tsx:106-114`; matches the
+    // `No, suggest changes (esc)` label) - it does NOT cancel the Run.
     #[test]
-    fn escape_while_modal_open_is_cancellation_and_wins() {
-        let t = with_pending_approval(fresh(), &approval());
+    fn escape_while_modal_open_denies_the_tool_not_the_run() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
         let (t, effects) = t.handle_key(Key::Escape);
         assert_eq!(t.pending_approval, None);
         assert_eq!(
             sans_commit(effects),
-            vec![Effect::Agent(AgentCommand::Cancel), Effect::FocusComposer]
+            vec![
+                Effect::Agent(AgentCommand::Approve(a.approval_id, Decision::Deny)),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    // The counterpart (P1): with NO approval open and a Run streaming, Escape
+    // STILL cancels the whole Run (qwen's `esc to cancel` spinner + suspenders'
+    // global cancel). This behavior is unchanged.
+    #[test]
+    fn escape_while_streaming_without_an_approval_cancels_the_run() {
+        let mut t = fresh();
+        t.status = Status::Running;
+        assert!(t.pending_approval.is_none());
+        let (_t, effects) = t.handle_key(Key::Escape);
+        assert_eq!(
+            sans_commit(effects),
+            vec![Effect::Agent(AgentCommand::Cancel)]
+        );
+    }
+
+    // Keys the radio does not act on (non-digit chars, page keys) are swallowed
+    // with no effect and no change to the pending Approval. Enter and the arrows
+    // are NOT here - they now drive the radio (asserted below).
+    #[test]
+    fn every_other_key_swallowed_while_modal_open() {
+        for key in [Key::Char('x'), Key::PageUp, Key::PageDown, Key::Char('q')] {
+            assert_key_swallowed_while_modal_open(key);
+        }
+    }
+
+    // The inline radio (ADR-0049): Enter selects the active row (option 0,
+    // Approve, by default), so it resolves the Approval and refocuses.
+    #[test]
+    fn enter_selects_the_active_radio_row_which_is_approve_once() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(t.pending_approval, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::Approve(a.approval_id, Decision::Approve)),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    // ArrowDown moves the radio to row 1 (Always allow); Enter there resolves as
+    // ApproveAlways. The move itself emits no effect but changes the selection.
+    #[test]
+    fn arrow_down_then_enter_selects_approve_always() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let (t, moved) = t.handle_key(Key::ArrowDown);
+        assert_eq!(sans_commit(moved), vec![], "a move emits no effect");
+        assert_eq!(
+            t.pending_approval.as_ref().unwrap().selection.active(),
+            1,
+            "the radio moved to row 1"
+        );
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(t.pending_approval, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::Approve(
+                    a.approval_id,
+                    Decision::ApproveAlways
+                )),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    // The numbered digits quick-select (3 rows, so a digit always resolves
+    // immediately): `2` → Always allow (row 1, ApproveAlways), `3` → No/Deny.
+    #[test]
+    fn digit_two_quick_selects_approve_always() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let (t, effects) = t.handle_key(Key::Char('2'));
+        assert_eq!(t.pending_approval, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::Approve(
+                    a.approval_id,
+                    Decision::ApproveAlways
+                )),
+                Effect::FocusComposer,
+            ]
         );
     }
 
     #[test]
-    fn every_other_key_swallowed_while_modal_open() {
-        for key in [
-            Key::Enter,
-            Key::Char('x'),
-            Key::PageUp,
-            Key::PageDown,
-            Key::Char('q'),
-        ] {
-            assert_key_swallowed_while_modal_open(key);
-        }
+    fn digit_three_quick_selects_deny() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        let (t, effects) = t.handle_key(Key::Char('3'));
+        assert_eq!(t.pending_approval, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::Approve(a.approval_id, Decision::Deny)),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    // Shift+Tab (Key::CycleApprovalMode) fires the cycle command through the
+    // Agent - even with an Approval open it does NOT disturb the pending block,
+    // and with no Approval open it still fires.
+    #[test]
+    fn cycle_approval_mode_key_emits_the_cycle_command() {
+        let (t, effects) = fresh().handle_key(Key::CycleApprovalMode);
+        assert_eq!(
+            sans_commit(effects),
+            vec![Effect::Agent(AgentCommand::CycleApprovalMode)]
+        );
+        assert_eq!(t.pending_approval, None);
+    }
+
+    // The host-driven expire seam (ADR-0049): with the 3-row approval no digit
+    // ever buffers, so expire_approval is a no-op - the block stays open and no
+    // command fires however far the clock advances.
+    #[test]
+    fn expire_approval_is_a_no_op_for_the_three_row_radio() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        // A digit press resolves immediately (never buffers), so before any press
+        // the buffer is empty and a far-future tick fires nothing.
+        let (t, effects) = t.expire_approval(10_000);
+        assert_eq!(sans_commit(effects), vec![]);
+        assert_eq!(t.pending_approval, Some(a));
+    }
+
+    // With no Approval open, expire is inert.
+    #[test]
+    fn expire_approval_with_no_pending_is_inert() {
+        let (t, effects) = fresh().expire_approval(10_000);
+        assert_eq!(sans_commit(effects), vec![]);
+        assert_eq!(t.pending_approval, None);
+    }
+
+    // The mirror event (ADR-0050): ApprovalModeChanged updates the Screen's
+    // display-only copy and touches nothing else.
+    #[test]
+    fn approval_mode_changed_mirrors_the_mode_silently() {
+        let (t, effects) = fresh().apply_event(Event::approval_mode_changed(ApprovalMode::Yolo));
+        assert_eq!(t.approval_mode, ApprovalMode::Yolo);
+        assert_eq!(sans_commit(effects), vec![]);
+        assert_eq!(items(&t), vec![], "the mirror is never a Transcript item");
+    }
+
+    // Cycling the mode while an Approval is open (a Shift+Tab press) fires the
+    // command and leaves the pending Approval whole - the block keeps holding the
+    // keyboard.
+    #[test]
+    fn cycling_the_mode_while_the_approval_is_open_leaves_it_pending() {
+        let a = approval();
+        let t = with_pending_approval(fresh(), &a);
+        // Shift+Tab is swallowed by the Approval gate (only the radio keys +
+        // y/n/a + Escape act), so the block stays open and no command fires.
+        let (t, effects) = t.handle_key(Key::CycleApprovalMode);
+        assert_eq!(sans_commit(effects), vec![]);
+        assert_eq!(t.pending_approval, Some(a));
     }
 
     #[test]
@@ -1828,6 +2222,56 @@ mod tests {
         (t, count)
     }
 
+    // committed==pending identity for the inline approval (ADR-0049): the
+    // confirming ToolCall carries no result while the Approval is open, so it is
+    // non-terminal and BLOCKS the commit after it - the approval rows (which
+    // render off `pending_approval`, not the item) can therefore never freeze
+    // into scrollback. Once the decision resolves and the ToolResult supersedes
+    // the call, the tail becomes terminal and commits - as a plain ToolResult,
+    // with the approval gone.
+    #[test]
+    fn a_confirming_tool_call_blocks_commit_until_the_approval_resolves() {
+        // Greeting commits; the gated ToolCall stays pending.
+        let (t, greeting) = fold_and_commit(
+            fresh(),
+            Event::tool_call("t1", "run_command", serde_json::json!({"command": "ls"})),
+        );
+        assert_eq!(greeting, Some(1));
+
+        // The Approval opens on the live call: still non-terminal, nothing new
+        // commits, and the approval lives on `pending_approval` (never an item).
+        let (t, opened) = fold_and_commit(t, Event::approval_request("approval-0", "ls"));
+        assert_eq!(opened, None, "the confirming call blocks the commit");
+        assert!(t.pending_approval.is_some());
+
+        // Resolve: the pending Approval clears. The call is still an unresolved
+        // ToolCall item (no result yet), so it STILL blocks the commit - the
+        // approval rows are already gone (pending_approval is None).
+        let (t, resolved) = fold_and_commit(t, Event::approval_resolved("approval-0", true));
+        assert_eq!(t.pending_approval, None);
+        assert_eq!(
+            resolved, None,
+            "the bare call still blocks until its result"
+        );
+
+        // The result supersedes the call → a terminal ToolResult, which commits.
+        let (t, committed) = fold_and_commit(
+            t,
+            Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
+        );
+        assert_eq!(committed, Some(1), "the resolved call commits as a result");
+        // The committed item is a plain ToolResult - no approval trace.
+        assert_eq!(
+            items(&t),
+            vec![TranscriptItem::ToolResult {
+                name: "run_command".into(),
+                summary: "ok".into(),
+                is_error: false,
+                key_arg: Some("ls".into()),
+            }]
+        );
+    }
+
     // Once the result merges the call away, the whole run tail becomes terminal
     // and the next fold exit commits it.
     #[test]
@@ -1943,6 +2387,55 @@ mod tests {
             Event::tool_result("t1", "read_file", "ok", false, HashMap::new()),
         );
         assert_eq!(batch, Some(2), "one fold committed both freed results");
+    }
+
+    // `newest_live_tool_name` (ADR-0049) is what the inline approval attaches
+    // to. With two live ToolCalls it picks the NEWEST by position; and a
+    // resolved (superseded → ToolResult) call is skipped so the block never
+    // binds to a call that already has a result.
+    #[test]
+    fn newest_live_tool_name_picks_the_newest_live_call_and_skips_resolved_ones() {
+        // Two live calls, neither resolved: the newest (t2) is the live one.
+        let t = fold(
+            fresh(),
+            vec![
+                Event::tool_call(
+                    "t1",
+                    "run_command",
+                    serde_json::json!({"command": "echo one"}),
+                ),
+                Event::tool_call("t2", "web_fetch", serde_json::json!({"url": "https://x"})),
+            ],
+        );
+        assert_eq!(t.newest_live_tool_name(), Some("web_fetch"));
+
+        // Resolve the newer call (t2 supersedes to a ToolResult): the only
+        // surviving live ToolCall is the older t1, so the attach falls to it -
+        // a resolved call is never chosen.
+        let t = fold(
+            t,
+            vec![Event::tool_result(
+                "t2",
+                "web_fetch",
+                "ok",
+                false,
+                HashMap::new(),
+            )],
+        );
+        assert_eq!(t.newest_live_tool_name(), Some("run_command"));
+
+        // With no live ToolCall at all (t1 also resolved), it is None.
+        let t = fold(
+            t,
+            vec![Event::tool_result(
+                "t1",
+                "run_command",
+                "ok",
+                false,
+                HashMap::new(),
+            )],
+        );
+        assert_eq!(t.newest_live_tool_name(), None);
     }
 
     // Negative case: a fold that only ADDS a still-pending leading ToolCall (with

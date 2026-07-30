@@ -1984,7 +1984,7 @@ mod tests {
         let (outcome, deps) = run_with(&session, "do X", deps).await;
         ok(&outcome);
         let plans = deps.plans.lock().unwrap();
-        assert_eq!(plans.as_slice(), &["[~] read\n[ ] edit".to_string()]);
+        assert_eq!(plans.as_slice(), &["◐ read\n○ edit".to_string()]);
     }
 
     #[tokio::test]

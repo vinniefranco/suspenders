@@ -84,6 +84,52 @@ pub enum Decision {
     ApproveAlways,
 }
 
+/// The Approval mode - the Session-scoped policy the Shift+Tab cycle rotates
+/// through (ADR-0050, qwen `ApprovalMode`/`APPROVAL_MODES`). The order of the
+/// variants IS qwen's `APPROVAL_MODES` array order, so [`ApprovalMode::cycle`]
+/// is the same `(i + 1) % len` fold the CLI uses
+/// (`AgentComposer.tsx:113-116`): plan → default → auto-edit → auto → yolo →
+/// (wrap to plan).
+///
+/// Only two modes change BEHAVIOR in suspenders today (ADR-0050): `Default`
+/// gates exactly as before, and `Yolo` auto-approves every gated Call.
+/// `Plan`/`AutoEdit`/`Auto` are DISPLAY-COMPLETE but behavior-STUBBED - they
+/// gate exactly like `Default` - because suspenders has no plan-loop, no
+/// classifier, and does not gate edits (so `AutoEdit` is vacuous). The footer
+/// still names them so the cycle is whole; the stub is documented, not hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalMode {
+    Plan,
+    #[default]
+    Default,
+    AutoEdit,
+    Auto,
+    Yolo,
+}
+
+impl ApprovalMode {
+    /// The next mode in the Shift+Tab cycle (qwen `(i + 1) % len` over
+    /// `APPROVAL_MODES`): plan → default → auto-edit → auto → yolo → plan. A
+    /// total function with a hard wrap, so the cycle can never leave the set.
+    pub fn cycle(self) -> ApprovalMode {
+        match self {
+            ApprovalMode::Plan => ApprovalMode::Default,
+            ApprovalMode::Default => ApprovalMode::AutoEdit,
+            ApprovalMode::AutoEdit => ApprovalMode::Auto,
+            ApprovalMode::Auto => ApprovalMode::Yolo,
+            ApprovalMode::Yolo => ApprovalMode::Plan,
+        }
+    }
+
+    /// Whether this mode auto-approves EVERY gated Call without ever showing an
+    /// Approval (ADR-0050). Only `Yolo` does; every other mode - including the
+    /// display-stubbed `Plan`/`AutoEdit`/`Auto` - defers to Standing Approvals
+    /// and the pending gate, exactly like `Default`.
+    fn auto_approves_all(self) -> bool {
+        matches!(self, ApprovalMode::Yolo)
+    }
+}
+
 /// The one pending Approval: the open modal's id and its exact command string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -113,12 +159,14 @@ pub enum Decide {
     Ignore(Approvals),
 }
 
-/// The Approval state: the one pending Approval (or none) and the Session's
-/// Standing Approvals (string-equality set).
+/// The Approval state: the one pending Approval (or none), the Session's
+/// Standing Approvals (string-equality set), and the current Approval mode
+/// (ADR-0050) the Shift+Tab cycle rotates.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Approvals {
     pub pending: Option<Pending>,
     pub standing: HashSet<String>,
+    pub mode: ApprovalMode,
 }
 
 impl Approvals {
@@ -126,15 +174,30 @@ impl Approvals {
         Approvals::default()
     }
 
-    /// Folds in an Approval request from the Run.
+    /// Folds in an Approval request from the Run. `Yolo` mode (ADR-0050)
+    /// auto-approves EVERY gated Call, so the request answers `Auto` without a
+    /// modal; otherwise a covering Standing Approval answers `Auto`, and a bare
+    /// request becomes the pending Approval. `Plan`/`AutoEdit`/`Auto` gate
+    /// exactly like `Default` this phase (display-complete, behavior-stubbed).
     pub fn request(mut self, id: ApprovalId, command: impl Into<String>) -> Request {
         let command = command.into();
-        if self.standing.contains(&command) {
+        if self.mode.auto_approves_all() || self.standing.contains(&command) {
             Request::Auto(self)
         } else {
             self.pending = Some(Pending { id, command });
             Request::Pending(self)
         }
+    }
+
+    /// Rotates the Approval mode one step in the Shift+Tab cycle (ADR-0050),
+    /// returning the new state and the mode it landed on so the host can
+    /// broadcast it. Pure: it touches only `mode`, never the pending Approval
+    /// or the Standing set, so cycling while an Approval is open leaves that
+    /// Approval untouched.
+    pub fn cycle_mode(mut self) -> (Self, ApprovalMode) {
+        self.mode = self.mode.cycle();
+        let mode = self.mode;
+        (self, mode)
     }
 
     /// Folds in the user's decision.
@@ -414,6 +477,91 @@ mod tests {
         assert!(matches!(
             approvals.request(id(), "mix test"),
             Request::Auto(_)
+        ));
+    }
+
+    // ---- ApprovalMode + cycle_mode + mode-aware request (ADR-0050) ----
+
+    // The Shift+Tab cycle order IS qwen's APPROVAL_MODES order with a hard wrap:
+    // plan → default → auto-edit → auto → yolo → plan.
+    #[test]
+    fn cycle_walks_plan_default_auto_edit_auto_yolo_then_wraps() {
+        let order = [
+            ApprovalMode::Plan,
+            ApprovalMode::Default,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::Auto,
+            ApprovalMode::Yolo,
+            ApprovalMode::Plan,
+        ];
+        for pair in order.windows(2) {
+            assert_eq!(pair[0].cycle(), pair[1], "{:?} → {:?}", pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn a_fresh_approvals_defaults_to_default_mode() {
+        assert_eq!(Approvals::new().mode, ApprovalMode::Default);
+    }
+
+    // cycle_mode folds the state and reports the mode it landed on, from Default.
+    #[test]
+    fn cycle_mode_rotates_and_reports_the_new_mode() {
+        let (approvals, mode) = Approvals::new().cycle_mode();
+        assert_eq!(mode, ApprovalMode::AutoEdit);
+        assert_eq!(approvals.mode, ApprovalMode::AutoEdit);
+    }
+
+    // Yolo mode auto-approves EVERY gated Call, no modal, no standing entry.
+    #[test]
+    fn yolo_mode_auto_approves_every_request_without_a_modal() {
+        let mut approvals = Approvals::new();
+        approvals.mode = ApprovalMode::Yolo;
+        let Request::Auto(approvals) = approvals.request(id(), "rm -rf /") else {
+            panic!("expected auto under yolo");
+        };
+        assert_eq!(approvals.pending, None);
+        // Auto did NOT record a standing approval: dropping out of yolo re-gates.
+        let mut approvals = approvals;
+        approvals.mode = ApprovalMode::Default;
+        assert!(matches!(
+            approvals.request(id(), "rm -rf /"),
+            Request::Pending(_)
+        ));
+    }
+
+    // Plan/AutoEdit/Auto are behavior-stubbed: they gate exactly like Default.
+    #[test]
+    fn plan_auto_edit_and_auto_gate_exactly_like_default() {
+        for mode in [
+            ApprovalMode::Plan,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::Auto,
+            ApprovalMode::Default,
+        ] {
+            let mut approvals = Approvals::new();
+            approvals.mode = mode;
+            assert!(
+                matches!(approvals.request(id(), "mix test"), Request::Pending(_)),
+                "{mode:?} must gate like Default"
+            );
+        }
+    }
+
+    // Cycling the mode while an Approval is pending leaves that Approval whole.
+    #[test]
+    fn cycling_the_mode_does_not_disturb_the_pending_approval() {
+        let r = id();
+        let Request::Pending(approvals) = Approvals::new().request(r.clone(), "mix test") else {
+            panic!();
+        };
+        let pending_before = approvals.pending.clone();
+        let (approvals, _mode) = approvals.cycle_mode();
+        assert_eq!(approvals.pending, pending_before);
+        // The still-pending decision still forwards to the same waiting Run.
+        assert!(matches!(
+            approvals.decide(r, Decision::Approve),
+            Decide::Forward(true, _)
         ));
     }
 }

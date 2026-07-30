@@ -37,7 +37,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::approvals::{ApprovalId, Approvals, Decide, Decision, Request};
+use crate::approvals::{ApprovalId, ApprovalMode, Approvals, Decide, Decision, Request};
 use crate::compaction::Compaction;
 use crate::content::{ContentBlock, Provenance};
 use crate::conversation::{Conversation, ConversationOpts};
@@ -217,6 +217,14 @@ pub enum Command {
     /// whole - a failed discovery is its group's unreachable note.
     ListModels(oneshot::Sender<Vec<ProviderModels>>),
     Approve(String, Decision, oneshot::Sender<()>),
+    /// Rotate the Approval mode one step in the Shift+Tab cycle (ADR-0050): the
+    /// pure `Approvals` fold cycles and the Agent broadcasts the new mode so the
+    /// Screen mirror updates. Session-scoped, not per-Run - it applies whether
+    /// or not a Run is in flight. The reply carries the NEW mode so the caller
+    /// can set the Screen mirror directly from the authoritative fold result,
+    /// not from the lossy broadcast (P0: broadcast `Lagged` must not desync the
+    /// footer AutoAcceptIndicator).
+    CycleApprovalMode(oneshot::Sender<ApprovalMode>),
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
     Conversation(oneshot::Sender<Conversation>),
@@ -421,6 +429,22 @@ impl AgentHandle {
         let _ = rx.await;
     }
 
+    /// Rotates the Approval mode one step (ADR-0050, the Shift+Tab cycle): the
+    /// Agent's pure `Approvals` fold cycles and broadcasts the new mode. Applies
+    /// whether or not a Run is in flight (Session-scoped). RETURNS the new mode
+    /// so the caller can set the Screen mirror directly from this authoritative
+    /// result rather than depending on the lossy `ApprovalModeChanged` broadcast
+    /// (P0: a broadcast `Lagged` must never desync the footer indicator). The
+    /// broadcast still fires for any other subscribers. Falls back to `Default`
+    /// only if the actor is gone (reply dropped), which is the safest mode.
+    pub async fn cycle_approval_mode(&self) -> ApprovalMode {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(Msg::Command(Command::CycleApprovalMode(reply)));
+        rx.await.unwrap_or(ApprovalMode::Default)
+    }
+
     /// Cancels the running Run (baud's `cancel/1`). No-op when idle.
     pub async fn cancel(&self) {
         let (reply, rx) = oneshot::channel();
@@ -549,6 +573,10 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         Command::Approve(id, decision, reply) => {
             approve(state, id, decision);
             let _ = reply.send(());
+        }
+        Command::CycleApprovalMode(reply) => {
+            let mode = cycle_approval_mode(state);
+            let _ = reply.send(mode);
         }
         Command::Cancel(reply) => {
             if let Some(abort) = &state.task {
@@ -696,6 +724,18 @@ fn approve(state: &mut AgentState, id: String, decision: Decision) {
             state.approvals = approvals;
         }
     }
+}
+
+// The Shift+Tab Approval-mode cycle (ADR-0050): the pure `Approvals` fold
+// rotates the mode and the Agent broadcasts the new mode so every subscriber
+// (the Screen mirror, hence the footer indicator) sees it. Session-scoped, so
+// no Run needs to be running - `Yolo` then auto-approves the NEXT gated Call
+// via `request` without a modal.
+fn cycle_approval_mode(state: &mut AgentState) -> ApprovalMode {
+    let (approvals, mode) = std::mem::take(&mut state.approvals).cycle_mode();
+    state.approvals = approvals;
+    broadcast(state, Event::approval_mode_changed(mode));
+    mode
 }
 
 fn broadcast(state: &AgentState, event: Event) {
