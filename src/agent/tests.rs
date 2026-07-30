@@ -1150,19 +1150,33 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             // Guidelines, Executing-with-care, Git-as-source-of-truth, worked
             // Examples, Final Reminder - grew the system prompt from ~5k to
             // ~22.6k chars, about +5.0k tokens on every request's estimate)
-            // moved it from 13786).
+            // moved it from 13786; the managed-auto-memory prompt suffix (P5,
+            // ADR-0062: the `# auto memory` section - type blocks, save
+            // protocol, recall + persistence guidance, ~13k chars plus the
+            // interpolated memory_dir - about +7.5k tokens appended to every
+            // request's system prompt) moved it from 20950).
             //
             // Retune mechanism: `Compaction::proactive` fires when
             // `token_estimate > compaction_target`, with `compaction_target =
             // budget - reserve(200) - trunc(0.3 * budget) ~= 0.7*budget - 200`.
             // The estimate is `ceil((overhead + system_prompt + messages)/3.5)`
             // and is INDEPENDENT of `budget`, so `budget` is the free knob that
-            // slides the target. Measured estimates here are run2 ~14283 tokens
-            // and run3 ~14642; budget 20950 puts the target at 14465, which sits
-            // between them so exactly the third Run crosses.
-            context_budget: Some(20_950),
+            // slides the target. With the memory suffix the estimates here are
+            // run2 ~21757 tokens and run3 ~22118; budget 31620 puts the target
+            // at ~21934, which sits between them so exactly the third Run crosses.
+            //
+            // `compaction_keep` tracks the budget: the Keep amount is
+            // `trunc(keep * (budget - reserve))`, and the cutoff walk measures it
+            // in raw chars against the fixed ~1250-char replies, so the ABSOLUTE
+            // Keep (not the fraction) is what decides how much survives. The
+            // original tuning kept ~2075 chars at budget 20950/keep 0.1; raising
+            // the budget to 31620 for the memory suffix would balloon the Keep to
+            // ~3140 and retain the WHOLE conversation (compaction becomes a
+            // no-op). Dropping keep to 0.066 restores the ~2073-char absolute
+            // Keep, so the third Run still cuts to a summary head.
+            context_budget: Some(31_620),
             compaction_slack: Some(0.3),
-            compaction_keep: Some(0.1),
+            compaction_keep: Some(0.066),
             ..Default::default()
         },
         &SessionConfig::test_defaults(),

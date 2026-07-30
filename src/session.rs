@@ -81,6 +81,12 @@ pub struct Session {
     pub skip_next_speaker: bool,
     pub command_timeout_ms: u64,
     pub session_dir: String,
+    /// The managed-auto-memory root (P5, ADR-0062): where the model's memory
+    /// files live, resolved once at launch via [`default_memory_root`]. Threaded
+    /// into every [`ToolCtx`] so the shared path seam extends confinement to
+    /// this subtree (the trust-path allowance), and read by `init_agent` to
+    /// build the memory prompt suffix and mkdir the dir.
+    pub memory_root: String,
     /// The resolved Provider set (ADR-0037): custom Providers from config,
     /// built-ins from the generated Catalog with their environment credentials.
     pub providers: Vec<Provider>,
@@ -837,8 +843,14 @@ impl Session {
             .map_err(SessionError)?,
         };
 
+        // The Project Root resolves first: the memory root (P5, ADR-0062)
+        // derives from it, so both land as fixed facts here.
+        let root = opts.root.unwrap_or_else(default_root);
+        let memory_root = default_memory_root(&root);
+
         let session = Session {
-            root: opts.root.unwrap_or_else(default_root),
+            root,
+            memory_root,
             llm_module: opts.llm_module.unwrap_or_else(|| config.llm_module.clone()),
             extensions: opts.extensions.unwrap_or_else(|| config.extensions.clone()),
             context_budget,
@@ -952,6 +964,11 @@ impl Session {
             // stamped here like the Result Cap so read_file (P3 3b) can gate media
             // on it without reaching the llm layer.
             input_modalities: model.input_modalities,
+            // The trusted memory subtree (P5, ADR-0062): stamped here like the
+            // Result Cap so the shared path seam lets write_file/edit_file/
+            // read_file reach memory files without per-tool duplication. A
+            // resolved subtree, NOT a general escape.
+            memory_root: Some(std::path::PathBuf::from(&self.memory_root)),
             caps,
         }
     }
@@ -995,14 +1012,7 @@ fn default_root() -> String {
 // XDG spec, a set-but-empty var is treated as unset (else the path degrades to
 // `/suspenders/sessions`).
 fn default_session_dir() -> String {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/.local/share")
-        });
-    format!("{base}/suspenders/sessions")
+    format!("{}/suspenders/sessions", xdg_data_base())
 }
 
 // The user config file lives beside the Session Logs (ADR-0031): XDG config
@@ -1026,6 +1036,76 @@ pub fn default_user_skills_dir() -> String {
     format!("{}/suspenders/skills", xdg_config_base())
 }
 
+/// The managed-auto-memory root for `project_root` (P5, ADR-0062; qwen
+/// `getAutoMemoryRoot`): where the model's `MEMORY.md` index and topic files
+/// live. Two shapes, both resolved once at the launch edge like the dirs above:
+///
+/// * `SUSPENDERS_MEMORY_LOCAL=1` -> in-root `<project_root>/.suspenders/memory`
+///   (qwen's `QWEN_CODE_MEMORY_LOCAL` -> `<root>/.qwen/memory`).
+/// * otherwise the GLOBAL, project-keyed default:
+///   `<base>/projects/<slug(canonical_git_root)>/memory`, where `base` is the
+///   XDG data home (`memory_base()`, `SUSPENDERS_MEMORY_BASE_DIR` overriding for
+///   tests), the canonical git root is the `.git`-bearing ancestor of
+///   `project_root` (falling back to `project_root` itself when none), and the
+///   slug replaces every `[^a-zA-Z0-9]` with `-` (qwen `sanitizeCwd`).
+///
+/// Global-by-default keeps memory out of the working tree (it is not the
+/// user's code) while still keying it to the project, so two checkouts of the
+/// same repo share one memory.
+pub fn default_memory_root(project_root: &str) -> String {
+    if std::env::var("SUSPENDERS_MEMORY_LOCAL").as_deref() == Ok("1") {
+        return format!("{project_root}/.suspenders/memory");
+    }
+    let canonical = canonical_git_root(project_root).unwrap_or_else(|| project_root.to_string());
+    format!(
+        "{}/projects/{}/memory",
+        memory_base(),
+        sanitize_cwd(&canonical)
+    )
+}
+
+// The base directory for the global, project-keyed memory store (qwen
+// `getMemoryBaseDir`): the XDG data home, mirroring `default_session_dir`, with
+// SUSPENDERS_MEMORY_BASE_DIR overriding it (the test seam, empty var == unset).
+fn memory_base() -> String {
+    if let Some(base) = std::env::var("SUSPENDERS_MEMORY_BASE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return base;
+    }
+    format!("{}/suspenders", xdg_data_base())
+}
+
+// The project identifier slug (qwen `sanitizeCwd`): every non-alphanumeric char
+// becomes `-`, so a filesystem path becomes one safe directory-name segment.
+fn sanitize_cwd(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+// The canonical git root of `start` (qwen `findCanonicalGitRoot`, simplified):
+// walk up for the first ancestor holding a `.git` entry. qwen additionally
+// resolves a worktree's `.git` FILE (a `gitdir:` pointer) back to the main
+// checkout so sibling worktrees of one repo share a memory; Suspenders takes the
+// DOCUMENTED simplification of returning the worktree's own root (its `.git` is
+// a file, `Path::exists` still finds it), so each worktree keys its own memory.
+// That is a conservative, safe divergence: worktrees get separate memory rather
+// than a mis-shared one, and the common non-worktree case is identical.
+fn canonical_git_root(start: &str) -> Option<String> {
+    let mut current = std::path::Path::new(start).to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_string_lossy().into_owned());
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
 // The XDG config home both paths above hang off (empty var == unset, per XDG).
 fn xdg_config_base() -> String {
     std::env::var("XDG_CONFIG_HOME")
@@ -1034,6 +1114,19 @@ fn xdg_config_base() -> String {
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             format!("{home}/.config")
+        })
+}
+
+// The XDG data home the Session Logs and the memory store hang off (empty var
+// == unset, per XDG). The data-home counterpart to `xdg_config_base`, so the
+// `XDG_DATA_HOME` -> `~/.local/share` fallback lives once for both callers.
+fn xdg_data_base() -> String {
+    std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.local/share")
         })
 }
 
@@ -2500,5 +2593,90 @@ mod tests {
         assert_eq!(cfg.theme, "from-env");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- default_memory_root (P5, ADR-0062) ----
+    //
+    // These tests mutate the process environment (SUSPENDERS_MEMORY_*), so they
+    // set-then-clear within one test body. Safe under both nextest
+    // (process-per-test) and `--test-threads=1` (serial, one process): each test
+    // clears the two vars before it reads them and after it is done, and spawns
+    // no threads, so nothing reads them concurrently.
+
+    fn clear_memory_env() {
+        // SAFETY: process-per-test / serial single-threaded (see above).
+        unsafe {
+            std::env::remove_var("SUSPENDERS_MEMORY_LOCAL");
+            std::env::remove_var("SUSPENDERS_MEMORY_BASE_DIR");
+        }
+    }
+
+    #[test]
+    fn default_memory_root_slugs_the_project_under_a_projects_dir() {
+        clear_memory_env();
+        // SAFETY: process-per-test / serial single-threaded.
+        unsafe { std::env::set_var("SUSPENDERS_MEMORY_BASE_DIR", "/tmp/mem-base") };
+
+        // A non-git tmp dir (no `.git` ancestor up to /tmp): the canonical root
+        // falls back to the project root itself, and the slug replaces every
+        // non-alphanumeric char with `-`.
+        let proj = std::env::temp_dir().join("suspenders_mem_root_test_no_git");
+        let _ = std::fs::create_dir_all(&proj);
+        let proj = proj.to_string_lossy().into_owned();
+
+        let root = default_memory_root(&proj);
+        let expected_slug = sanitize_cwd(&proj);
+        assert_eq!(
+            root,
+            format!("/tmp/mem-base/projects/{expected_slug}/memory")
+        );
+        // Every path separator and dot became a hyphen (qwen sanitizeCwd).
+        assert!(!expected_slug.contains('/'));
+        assert!(!expected_slug.contains('.'));
+
+        let _ = std::fs::remove_dir_all(&proj);
+        clear_memory_env();
+    }
+
+    #[test]
+    fn default_memory_root_local_override_places_it_in_root() {
+        clear_memory_env();
+        // SAFETY: process-per-test / serial single-threaded.
+        unsafe { std::env::set_var("SUSPENDERS_MEMORY_LOCAL", "1") };
+
+        assert_eq!(
+            default_memory_root("/some/project"),
+            "/some/project/.suspenders/memory"
+        );
+
+        clear_memory_env();
+    }
+
+    #[test]
+    fn sanitize_cwd_replaces_every_non_alphanumeric_with_a_hyphen() {
+        assert_eq!(sanitize_cwd("/home/vinnie/Proj_1.2"), "-home-vinnie-Proj-1-2");
+        assert_eq!(sanitize_cwd("abcXYZ123"), "abcXYZ123");
+    }
+
+    #[test]
+    fn canonical_git_root_walks_up_to_the_dot_git_bearing_ancestor() {
+        // A tmp tree with a `.git` at the top and a nested subdir: the walk
+        // finds the `.git`-bearing root, not the leaf.
+        let top = std::env::temp_dir().join(format!(
+            "suspenders_git_root_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = top.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+
+        let found = canonical_git_root(&nested.to_string_lossy());
+        assert_eq!(found, Some(top.to_string_lossy().into_owned()));
+
+        let _ = std::fs::remove_dir_all(&top);
     }
 }

@@ -3,9 +3,13 @@
 //! Two std-only concerns live here, split out of the authoring contract:
 //!
 //! * **Path confinement.** [`with_path`] resolves a model-supplied path against
-//!   the Session's Project Root (via [`resolve_path`]) and keeps it inside that
-//!   root; a path that climbs out is refused before the tool ever touches the
-//!   filesystem.
+//!   the Session's Project Root - OR the trusted managed-auto-memory subtree the
+//!   ctx carries (P5, ADR-0062) - via [`resolve_path_in`], and keeps it inside
+//!   one of those two normalized subtrees; a path that climbs out of both is
+//!   refused before the tool ever touches the filesystem. The memory allowance
+//!   is narrow: a resolved subtree with the same `..`-collapse + trailing-SEP
+//!   containment as the root check (so a `<memory_root>-evil` sibling is
+//!   refused), NOT a general escape.
 //! * **File-error wording.** [`file_error`] formats a failed file operation's
 //!   POSIX reason ([`FileError`] / [`format_posix`], baud's
 //!   `:file.format_error/1`), appending closest-match suggestions on ENOENT
@@ -63,14 +67,14 @@ impl FileError {
     }
 }
 
-/// Resolves a model-supplied path against the ctx's Project Root and runs
-/// `fun` with the absolute path; a path that escapes the root returns the
-/// confinement error instead.
+/// Resolves a model-supplied path against the ctx's Project Root (or the
+/// trusted memory subtree, P5/ADR-0062) and runs `fun` with the absolute path;
+/// a path that escapes both returns the confinement error instead.
 pub fn with_path<F>(path: &str, ctx: &ToolCtx, fun: F) -> Result<String, String>
 where
     F: FnOnce(&Path) -> Result<String, String>,
 {
-    let abs = resolve_path(path, &ctx.root)?;
+    let abs = resolve_path_in(path, &ctx.root, ctx.memory_root.as_deref())?;
     fun(&abs)
 }
 
@@ -211,16 +215,73 @@ pub fn jaro_distance(s1: &str, s2: &str) -> f64 {
 }
 
 /// Resolves a model-supplied path against the Project Root and refuses paths
-/// that escape it. A cheap guard, not a sandbox.
+/// that escape it. A cheap guard, not a sandbox. The Project-Root-only form;
+/// [`resolve_path_in`] adds the trusted-memory allowance.
 pub fn resolve_path(path: &str, root: &Path) -> Result<PathBuf, String> {
+    resolve_path_in(path, root, None)
+}
+
+/// Resolves a model-supplied path against the Project Root OR, when `memory`
+/// is `Some`, the trusted managed-auto-memory subtree (P5, ADR-0062). A path
+/// that lands in EITHER normalized subtree is accepted; one that escapes both
+/// is refused.
+///
+/// SECURITY-CRITICAL: both boundaries use the SAME normalized-containment
+/// discipline (lexical `..`-collapse, then `== boundary` OR
+/// `starts_with(boundary <> SEP)`). The trailing separator is what refuses a
+/// `<memory_root>-evil` sibling: it shares the string prefix but not the
+/// path-component boundary, exactly the `isAutoMemPath` shape. The memory root
+/// is normalized here too, so a `..` inside the configured root cannot widen
+/// the allowance.
+///
+/// DEFENSE-IN-DEPTH: a memory boundary that normalizes to the filesystem root
+/// (or fewer than [`MIN_MEMORY_BOUNDARY_COMPONENTS`] path components) is IGNORED,
+/// treated as no memory allowance. `default_memory_root` always yields a
+/// `<base>/projects/<slug>/memory` shape (>= 3 components), so this is
+/// unreachable through the documented interface; but the memory boundary is now
+/// security-load-bearing, and a `/`-rooted boundary would otherwise widen
+/// confinement to the ENTIRE filesystem. Cheaper to guard than to trust every
+/// future caller.
+pub fn resolve_path_in(path: &str, root: &Path, memory: Option<&Path>) -> Result<PathBuf, String> {
     let root = expand(root);
     let expanded = expand_against(path, &root);
 
-    if expanded == root || expanded.starts_with(join_sep(&root)) {
-        Ok(expanded)
-    } else {
-        Err("path escapes project root".to_string())
+    if contained(&expanded, &root) {
+        return Ok(expanded);
     }
+    if let Some(mem) = memory {
+        let mem = expand(mem);
+        if is_usable_memory_boundary(&mem) && contained(&expanded, &mem) {
+            return Ok(expanded);
+        }
+    }
+    Err("path escapes project root".to_string())
+}
+
+/// The minimum normal-component count a memory boundary must have to widen
+/// confinement. `<base>/projects/<slug>/memory` clears this comfortably; a bare
+/// `/` or `""` does not, so it is treated as no allowance rather than opening
+/// the whole filesystem.
+const MIN_MEMORY_BOUNDARY_COMPONENTS: usize = 2;
+
+// Whether a (already-normalized) memory boundary is safe to widen confinement
+// to: it must NOT be the filesystem root and must carry at least
+// `MIN_MEMORY_BOUNDARY_COMPONENTS` normal path segments. A `/` or `""` boundary
+// fails this and is ignored (no memory allowance).
+fn is_usable_memory_boundary(mem: &Path) -> bool {
+    use std::path::Component;
+    let normal_components = mem
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    normal_components >= MIN_MEMORY_BOUNDARY_COMPONENTS
+}
+
+// Normalized containment: `abs` IS `boundary` or sits strictly inside it. The
+// `starts_with(boundary <> SEP)` half is what refuses a sibling that merely
+// shares the string prefix (`<boundary>-evil`).
+fn contained(abs: &Path, boundary: &Path) -> bool {
+    abs == boundary || abs.starts_with(join_sep(boundary))
 }
 
 // Path.expand semantics: absolute normalization without touching the
@@ -344,6 +405,78 @@ mod tests {
         let tmp = TmpDir::new();
         assert_eq!(
             resolve_path("/etc/passwd", &tmp.path),
+            Err("path escapes project root".to_string())
+        );
+    }
+
+    // ---- resolve_path_in: the trusted-memory allowance (P5, ADR-0062) ----
+
+    #[test]
+    fn without_a_memory_root_out_of_root_is_refused_unchanged() {
+        // The Project-Root-only behavior is preserved when there is no memory.
+        let root = Path::new("/proj");
+        assert_eq!(
+            resolve_path_in("/etc/passwd", root, None),
+            Err("path escapes project root".to_string())
+        );
+    }
+
+    #[test]
+    fn a_path_inside_the_memory_root_is_accepted() {
+        let root = Path::new("/proj");
+        let mem = Path::new("/data/projects/slug/memory");
+        // An absolute path landing inside the trusted memory subtree resolves,
+        // even though it is far outside the Project Root.
+        assert_eq!(
+            resolve_path_in("/data/projects/slug/memory/MEMORY.md", root, Some(mem)),
+            Ok(PathBuf::from("/data/projects/slug/memory/MEMORY.md"))
+        );
+        // The memory root itself is inside.
+        assert_eq!(
+            resolve_path_in("/data/projects/slug/memory", root, Some(mem)),
+            Ok(PathBuf::from("/data/projects/slug/memory"))
+        );
+    }
+
+    #[test]
+    fn a_sibling_sharing_the_memory_string_prefix_is_still_refused() {
+        // SECURITY: `<memory_root>-evil` shares the string prefix but not the
+        // path-component boundary - the trailing-separator check refuses it.
+        let root = Path::new("/proj");
+        let mem = Path::new("/data/projects/slug/memory");
+        assert_eq!(
+            resolve_path_in("/data/projects/slug/memory-evil/x.md", root, Some(mem)),
+            Err("path escapes project root".to_string())
+        );
+    }
+
+    #[test]
+    fn a_filesystem_root_memory_boundary_does_not_widen_confinement() {
+        // DEFENSE-IN-DEPTH: a memory boundary that normalized to `/` (or too
+        // few components) is IGNORED - it must not open the whole filesystem.
+        // `/etc/passwd` is outside the Project Root and would be "contained" by a
+        // `/` boundary, so the guard is the only thing refusing it here.
+        let root = Path::new("/proj");
+        let fs_root = Path::new("/");
+        assert_eq!(
+            resolve_path_in("/etc/passwd", root, Some(fs_root)),
+            Err("path escapes project root".to_string())
+        );
+        // A one-component boundary is below the minimum too.
+        let shallow = Path::new("/data");
+        assert_eq!(
+            resolve_path_in("/etc/passwd", root, Some(shallow)),
+            Err("path escapes project root".to_string())
+        );
+    }
+
+    #[test]
+    fn a_dotdot_escape_out_of_the_memory_root_is_refused() {
+        let root = Path::new("/proj");
+        let mem = Path::new("/data/projects/slug/memory");
+        // Climbing out of the memory subtree lands nowhere trusted.
+        assert_eq!(
+            resolve_path_in("/data/projects/slug/memory/../secret", root, Some(mem)),
             Err("path escapes project root".to_string())
         );
     }

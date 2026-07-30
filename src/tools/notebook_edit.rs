@@ -313,6 +313,7 @@ mod tests {
             result_cap: 100_000,
             command_timeout_ms: 120_000,
             input_modalities: crate::content::Modalities::default(),
+            memory_root: None,
             caps,
         }
     }

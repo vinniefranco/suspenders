@@ -309,6 +309,34 @@ mod tests {
         assert_eq!(gate_text("no_such_tool", &json!({})), None);
     }
 
+    // Memory writes auto-approve (P5, ADR-0062): qwen flips the default
+    // permission to 'allow' for a memory write so autonomous memory does not
+    // prompt. In Suspenders, write_file/edit_file are UNGATED by design
+    // (ADR-0050 gates only code-execution and outbound-fetch), so a write into
+    // the memory dir - like any write - carries no gate at all, while
+    // run_command still gates. This test pins that: the auto-approval of memory
+    // writes is inherent in the ungated write path, not a per-path branch.
+    #[test]
+    fn memory_dir_writes_do_not_gate_while_code_execution_still_does() {
+        // A write/edit targeting a memory path is ungated (auto-approved).
+        assert_eq!(
+            gate_text(
+                "write_file",
+                &json!({"path": "/data/projects/slug/memory/MEMORY.md", "content": "x"})
+            ),
+            None
+        );
+        assert_eq!(
+            gate_text(
+                "edit_file",
+                &json!({"path": "/data/projects/slug/memory/user.md", "old_str": "a", "new_str": "b"})
+            ),
+            None
+        );
+        // A non-memory code-execution call still gates, unchanged.
+        assert!(gate_text("run_command", &json!({"command": "rm -rf /"})).is_some());
+    }
+
     #[test]
     fn gate_text_falls_back_to_empty_when_the_field_is_missing_or_non_string() {
         assert_eq!(gate_text("run_command", &json!({})), Some(String::new()));

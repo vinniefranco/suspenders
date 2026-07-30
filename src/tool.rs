@@ -12,7 +12,8 @@
 //!   before every call: required fields present, string-typed fields are
 //!   strings, unknown fields rejected.
 //! * **Model-supplied paths go through [`with_path`]**, which confines them to
-//!   the Project Root.
+//!   the Project Root - or the trusted managed-auto-memory subtree the ctx
+//!   carries (P5, ADR-0062).
 //! * **Failed file operations are worded by [`file_error`]**, which formats the
 //!   POSIX reason and appends closest-match suggestions on ENOENT.
 //! * **Errors return, never raise.**
@@ -156,6 +157,14 @@ pub struct ToolCtx {
     /// decide whether an image/PDF rides as media or degrades to a text
     /// placeholder at read time; every other tool ignores it.
     pub input_modalities: Modalities,
+    /// The trusted managed-auto-memory subtree (P5, ADR-0062): when `Some`, the
+    /// shared path seam ([`path::resolve_path`]) confines a model-supplied path
+    /// to the Project Root OR this subtree, so the memory-writing tools reach
+    /// memory files uniformly. `None` (tests) keeps the Project-Root-only
+    /// confinement; child Runs / subagents build their ctx through
+    /// `Session::tool_ctx`, which stamps `Some(...)`, so they inherit the parent
+    /// Session's memory root. A resolved subtree, never a general escape.
+    pub memory_root: Option<PathBuf>,
     pub caps: caps::Capabilities,
 }
 
@@ -188,6 +197,9 @@ impl ToolCtx {
             result_cap,
             command_timeout_ms: 120_000,
             input_modalities: Modalities::default(),
+            // Tests get Project-Root-only confinement by default; the memory
+            // trust-path tests opt in explicitly by setting this field.
+            memory_root: None,
             caps: caps::Capabilities::for_test(),
         }
     }
