@@ -5,6 +5,7 @@
 //! a tool can never crash the Run. [`run`] adds Shaping on top - the
 //! extension-free dispatch path.
 
+pub mod ask_user_question;
 pub mod edit_file;
 pub mod glob;
 pub mod grep;
@@ -12,6 +13,7 @@ pub mod list_files;
 pub mod read_file;
 pub mod run_command;
 pub mod shaping;
+pub mod skill;
 pub mod todo_write;
 pub mod tool_search;
 pub mod web_fetch;
@@ -41,6 +43,7 @@ pub(crate) fn tools() -> Vec<Box<dyn Tool>> {
         Box::new(write_file::WriteFile),
         Box::new(run_command::RunCommand),
         Box::new(web_fetch::WebFetch),
+        Box::new(ask_user_question::AskUserQuestion),
         Box::new(tool_search::ToolSearch),
     ]
 }
@@ -107,6 +110,7 @@ mod tests {
         "write_file",
         "run_command",
         "web_fetch",
+        "ask_user_question",
         "tool_search",
     ];
 
@@ -118,7 +122,7 @@ mod tests {
 
     #[test]
     fn returns_every_tool_in_prompt_order_todo_write_first() {
-        assert_eq!(tools().len(), 10);
+        assert_eq!(tools().len(), 11);
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
     }

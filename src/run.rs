@@ -12,6 +12,7 @@ mod finish;
 pub mod loop_;
 pub mod next_speaker;
 pub mod settlement;
+pub mod side_query;
 
 // Shared test fixtures for the split Loop (today only `loop_`'s tests; any
 // test module `batch`/`finish` grow shares this set instead of drifting
@@ -43,6 +44,12 @@ pub struct Capture {
     /// alongside the registry it builds itself. `Arc<dyn Approver>` is Send+Sync,
     /// so the [`Capture`] stays `Send` for the `tokio::spawn` at the Agent.
     pub approver: Arc<dyn crate::tool::caps::Approver>,
+    /// The tool-initiated Question seam (P2a, ADR-0057), built by the host that
+    /// owns the effect channel (the Agent builds a tx-backed `AgentQuestioner`).
+    /// The Run assembles it into the Tool [`crate::tool::caps::Capabilities`]
+    /// alongside the Approver. `Arc<dyn Questioner>` is Send+Sync, so the
+    /// [`Capture`] stays `Send` for the `tokio::spawn` at the Agent.
+    pub questioner: Arc<dyn crate::tool::caps::Questioner>,
     /// The Session-stable tool set the Agent built once (F8, ADR-0056):
     /// built-ins plus any discovered MCP tools. The Run builds its per-Run
     /// [`crate::tool_registry::ToolRegistry`] over this shared `Arc` (fresh
@@ -74,14 +81,32 @@ pub async fn run(
         Arc::clone(&capture.tools),
     ));
 
+    // The Side-Query effect seam (P2b, ADR-0055): the real impl is the captured
+    // Llm boundary called OFF the main Conversation. Unlike the Approver, it does
+    // NOT travel the Agent mpsc - a side-query touches no Agent/Conversation state
+    // - so the Run builds it here from the Capture's own `llm`/`model` (no new
+    // Capture field). `None` temperature defers a side-query to the server's own
+    // default, matching qwen's side-query (which sets no temperature).
+    let side_query: Arc<dyn crate::tool::caps::SideQuery> =
+        Arc::new(crate::run::side_query::LlmSideQuery {
+            llm: Arc::clone(&capture.llm),
+            model: capture.model.clone(),
+            temperature: None,
+        });
+
     // The Tool Capability Context (F1, ADR-0055): the registry the Run built plus
     // the effect seams a Tool Call reaches its host through. P1b carries the
     // registry (concrete, Run-scoped state) and the Approver (the host's
-    // tx-backed handle, threaded through the Capture). The other three
-    // capabilities land in their consuming phases.
+    // tx-backed handle, threaded through the Capture); P2b adds the SideQuery
+    // (built here at the Llm boundary). The other two capabilities land in their
+    // consuming phases.
     let caps = crate::tool::caps::Capabilities {
         registry,
         approver: Arc::clone(&capture.approver),
+        side_query,
+        // The Question seam (P2a, ADR-0057): the Agent's tx-backed handle,
+        // threaded through the Capture like the Approver.
+        questioner: Arc::clone(&capture.questioner),
     };
 
     // The Tool ctx: the Session's Root and timeout, the Result Cap derived from

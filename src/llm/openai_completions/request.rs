@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use crate::content::{ContentBlock, Message, Role};
 use crate::llm::LlmRequest;
 use crate::llm::model::Model;
-use crate::tool::ToolSpec;
+use crate::content::ToolSpec;
 
 /// The wire name of the output-cap field. Newer OpenAI models want
 /// `max_completion_tokens`; models.dev records no such compat fact, so the

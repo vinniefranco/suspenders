@@ -95,6 +95,13 @@ impl AgentDeps {
             approver: Arc::new(AgentApprover {
                 tx: self.tx.clone(),
             }),
+            // The tool-initiated Question seam (P2a, ADR-0057): a tx-backed
+            // handle over this Agent's mpsc, like the Approver but with no
+            // Standing-Approval / auto path. The Run assembles it into the Tool
+            // Capabilities; the Agent owns the channel, so it builds the handle.
+            questioner: Arc::new(AgentQuestioner {
+                tx: self.tx.clone(),
+            }),
             // The Session-stable tool set (F8, ADR-0056): the Run's registry
             // shares it via `with_shared`, so MCP tools ride every Run.
             tools: Arc::clone(&self.session_tools),
@@ -277,4 +284,62 @@ impl crate::tool::caps::Approver for AgentApprover {
         ))));
         approved
     }
+}
+
+/// The tx-backed [`Questioner`]: the Agent's fulfilment of the tool-initiated
+/// Question seam (P2a, ADR-0057). It mints a question id, relays an `AskQuestion`
+/// over the same mpsc the Approver uses, and awaits the reply oneshot - so the
+/// tool call parks until the user answers. Unlike the Approver there is NO
+/// Standing-Approval / auto path: every question opens a modal (the Agent's
+/// `ask_question` handler is unconditionally the pending leg). Built by
+/// [`AgentDeps::capture`] and carried on the Run's [`crate::run::Capture`] into
+/// the Tool [`crate::tool::caps::Capabilities`].
+///
+/// On a closed/dropped channel (a dead Agent, a cancelled Run) it returns the
+/// VERBATIM decline string, the safe answer the tool folds into its content -
+/// symmetric with [`AgentApprover`] returning `false`.
+struct AgentQuestioner {
+    tx: mpsc::UnboundedSender<Msg>,
+}
+
+/// The VERBATIM qwen decline string (askUserQuestion.ts): what the tool returns
+/// when the user cancels - or when the channel is gone before an answer arrives.
+const DECLINE_MESSAGE: &str = "User declined to answer the questions.";
+
+#[async_trait::async_trait]
+impl crate::tool::caps::Questioner for AgentQuestioner {
+    async fn ask(
+        &self,
+        questions: Vec<crate::tool::caps::Question>,
+    ) -> Result<Vec<(usize, String)>, String> {
+        // Mint the per-call id (baud's `make_ref()`), relay the question, and
+        // await the picks. A closed channel or dropped reply is a decline (the
+        // safe answer the tool returns as content), not a panic.
+        let id = mint_question_id();
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::AskQuestion {
+                id: id.clone(),
+                questions,
+                reply,
+            }))
+            .is_err()
+        {
+            return Err(DECLINE_MESSAGE.to_string());
+        }
+        // No timeout - the user decides. A cancel aborts this task, so a pending
+        // question dies with it (a dropped sender yields the decline below).
+        let answers = rx.await.unwrap_or_else(|_| Err(DECLINE_MESSAGE.to_string()));
+        // Emit `question_resolved` after reading the reply, the same on both
+        // paths (mirrors the Approver emitting `approval_resolved`).
+        let _ = tx.send(Msg::Run(RunMsg::Emit(Event::question_resolved(id))));
+        answers
+    }
+}
+
+fn mint_question_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    format!("question-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }

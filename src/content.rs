@@ -10,6 +10,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A tool's spec in Anthropic tool format: a name, a description, and a JSON
+/// Schema `input_schema` (an open edge, so it stays a `serde_json::Value`).
+/// Mirrors baud's `Baud.Tool.spec/0` shape. Serializes to exactly its wire
+/// shape, so the Conversation's tool-spec overhead estimate counts what a
+/// request carries without reaching into an adapter.
+///
+/// Lives here in the shared content-shapes leaf (alongside [`ContentBlock`]'s
+/// `ToolUse`/`ToolResult`, the other wire tool-shapes) rather than in `tool`, so
+/// the LLM boundary can carry it on an [`crate::llm::LlmRequest`] without an
+/// `llm -> tool` edge - the `tool` capability layer names `Model` (`llm -> `
+/// via [`crate::tool::caps::SideQueryRequest`]) and the two would otherwise
+/// cycle. `tool` re-exports it (`crate::tool::ToolSpec`) so the tool authoring
+/// contract still reads as one home.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
 /// A content block. `#[serde(tag = "type")]` mirrors baud's `:type`
 /// discriminator; `rename_all = "snake_case"` matches the atom names
 /// (`text`, `tool_use`, `tool_result`, `thinking`).

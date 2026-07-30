@@ -29,7 +29,9 @@ use crate::ui::composer::{self, ComposerLayout, ComposerView, OverlayStatus, Ove
 use crate::ui::lull;
 use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::picker::Picker;
-use crate::ui::screen::{ConfirmKind, PendingApproval, Screen, Status};
+use crate::ui::screen::{
+    ConfirmKind, OTHER_OPTION_LABEL, PendingApproval, PendingQuestion, Screen, Status,
+};
 use crate::ui::slash;
 use crate::ui::theme::{self, Theme};
 use crate::view_model::Tone;
@@ -378,9 +380,7 @@ fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> Pen
     // (`Constraint::Min(1)`) and top-clip the "Apply this change?" question out of
     // view. A visible approval takes priority over the sticky list, so we reserve
     // NO sticky zone while `pending_approval.is_some()`.
-    let sticky_items = t
-        .pending_approval
-        .is_none()
+    let sticky_items = (t.pending_approval.is_none() && t.pending_question.is_none())
         .then(|| {
             sticky_todos(
                 t.transcript().latest_todo(),
@@ -567,6 +567,17 @@ fn pending_body_lines(
             Vec::new()
         };
         append_live(&mut lines, &spinner);
+    }
+
+    // The question modal (ADR-0057, qwen `ask_user_question`): a standalone
+    // bordered box appended BOTTOM-MOST so the top-clip never eats it - the Run
+    // is waiting on the USER, so the questions are the salient content (the same
+    // rule the open approval follows). Unlike an approval it is NOT tied to a
+    // transcript ToolCall, so it draws as its own box rather than inside a tool
+    // group. `None` when no question is pending, so the pending body stays
+    // byte-identical to the committed blit (which never carries it).
+    if let Some(pending) = t.pending_question.as_ref() {
+        append_live(&mut lines, &question_modal_lines(pending, width, theme));
     }
     lines
 }
@@ -3808,6 +3819,105 @@ fn approval_block_rows(
     rows
 }
 
+/// The question-modal title (ADR-0057, qwen `askUserQuestion` confirmation
+/// title, VERBATIM).
+const QUESTION_MODAL_TITLE: &str = "Please answer the following question(s):";
+
+/// The free-form "Other" capture hint shown under a question while the composer
+/// collects the answer (ADR-0057): tells the user to type below and submit.
+const QUESTION_OTHER_HINT: &str = "Type your answer below, then press Enter.";
+
+/// The question modal as a standalone bordered box (ADR-0057, qwen
+/// `ask_user_question`): a rounded box with the title, then each question's text
+/// and its numbered radio (its options PLUS the auto-appended "Other" row).
+/// Answered questions show their recorded answer; the one collecting a free-form
+/// "Other" answer shows the composer hint. Every content row is `<= inner`
+/// columns and boxed to exactly `inner + 2` (measure==draw, ADR-0029). Rendered
+/// bottom-most in the pending body so the top-clip never eats it.
+fn question_modal_lines(pending: &PendingQuestion, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    // The box interior width (border + paddingX:1 each side is the box's own; the
+    // interior here is width - 2 for the two border columns).
+    let inner = (width as usize).saturating_sub(2);
+    let inner_u16 = inner as u16;
+    let border = border_style(theme);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+
+    // Title row.
+    let mut title_spans = Vec::new();
+    let _ = push_cols(
+        &mut title_spans,
+        QUESTION_MODAL_TITLE,
+        primary_style(theme).add_modifier(Modifier::BOLD),
+        0,
+        inner,
+    );
+    body.push(Line::from(title_spans));
+
+    for (i, question) in pending.questions.iter().enumerate() {
+        // A blank gap before each question (qwen `marginBottom:1`).
+        body.push(Line::from(Vec::<Span<'static>>::new()));
+
+        // The `[header]` chip + the question text (secondary chip, primary text).
+        let mut q_spans = Vec::new();
+        let used = push_cols(
+            &mut q_spans,
+            &format!("[{}] ", question.header),
+            secondary_style(theme),
+            0,
+            inner,
+        );
+        let _ = push_cols(&mut q_spans, &question.question, primary_style(theme), used, inner);
+        body.push(Line::from(q_spans));
+
+        // The per-question rows: the recorded answer, the free-form hint, or the
+        // interactive radio - one branch per state.
+        if let Some(Some(answer)) = pending.answers.get(i) {
+            // Answered: a success-green `✓ answer` line.
+            let mut a_spans = Vec::new();
+            let _ = push_cols(
+                &mut a_spans,
+                &format!("✓ {answer}"),
+                success_style(theme),
+                0,
+                inner,
+            );
+            body.push(Line::from(a_spans));
+        } else if pending.collecting_other == Some(i) {
+            // Collecting a free-form "Other" answer: the hint (the composer draws
+            // below this box).
+            let mut h_spans = Vec::new();
+            let _ = push_cols(
+                &mut h_spans,
+                QUESTION_OTHER_HINT,
+                secondary_style(theme),
+                0,
+                inner,
+            );
+            body.push(Line::from(h_spans));
+        } else {
+            // The interactive radio: the question's option labels PLUS the
+            // auto-appended "Other" row. `active` reads the per-question
+            // SelectionList; only the CURRENT question (cursor) is highlighted.
+            let mut labels: Vec<&str> =
+                question.options.iter().map(|o| o.label.as_str()).collect();
+            labels.push(OTHER_OPTION_LABEL);
+            let active = pending
+                .per_question
+                .get(i)
+                .map(|s| s.active())
+                .unwrap_or(0);
+            body.extend(selection_rows(&labels, active, true, inner_u16, theme));
+        }
+    }
+
+    // Frame the body in a rounded box, every row exactly `inner + 2` columns.
+    let mut lines = vec![box_top(inner, border)];
+    lines.extend(body.iter().map(|line| box_row(&line.spans, inner, border)));
+    lines.push(box_bottom(inner, border));
+    lines
+}
+
 /// A folded Diff's one-line row inside the box: the marker gutter, the title, and
 /// the `· ^O expand` affordance, truncate-end at `inner_width`.
 fn tool_diff_fold_row(title: &str, inner_width: u16, theme: &Theme) -> Line<'static> {
@@ -4941,7 +5051,15 @@ struct ComposerChrome {
 /// are made here so [`render_composer`] never branches.
 fn composer_chrome(area: Rect, t: &Screen, theme: &Theme) -> Option<ComposerChrome> {
     let fits = area.height as usize > COMPOSER_CHROME_ROWS && area.width >= 2;
-    let focused = t.pending_approval.is_none();
+    // The composer is focused when no modal holds the keyboard. A pending
+    // question modal takes focus like an approval, EXCEPT while it is collecting
+    // a free-form "Other" answer - then the composer is the interactive element
+    // and stays focused (ADR-0057).
+    let question_holds_focus = t
+        .pending_question
+        .as_ref()
+        .is_some_and(|q| q.collecting_other.is_none());
+    let focused = t.pending_approval.is_none() && !question_holds_focus;
     fits.then(|| ComposerChrome {
         border: composer_border_style(focused, theme),
         bottom: Rect {
@@ -10021,6 +10139,95 @@ mod tests {
         let terminal = draw_viewport(60, 24, &screen);
         let text = buffer_text(&terminal);
         assert!(text.contains("Do you want to proceed?"), "{text}");
+    }
+
+    // The question modal (ADR-0057, ask_user_question): a bordered box with the
+    // VERBATIM title, the `[header]` chip + question text, the option labels, and
+    // the auto-appended "Other" row.
+    fn screen_with_question() -> Screen {
+        use crate::tool::caps::{Question, QuestionOption};
+        let screen = Screen::new(ScreenOpts::default());
+        let (screen, _) = screen.apply_event(Event::run_started("r1"));
+        let questions = vec![Question {
+            question: "Which library should we use?".into(),
+            header: "Library".into(),
+            options: vec![
+                QuestionOption {
+                    label: "serde".into(),
+                    description: "the standard".into(),
+                },
+                QuestionOption {
+                    label: "miniserde".into(),
+                    description: "smaller".into(),
+                },
+            ],
+            multi_select: false,
+        }];
+        let (screen, _) = screen.apply_event(Event::question_request("q-1", questions));
+        screen
+    }
+
+    #[test]
+    fn question_modal_renders_title_question_options_and_the_other_row() {
+        let screen = screen_with_question();
+        // The bordered modal draws bottom-most in the pending body (top-clipped
+        // like the approval), so a short viewport clips the title first. Assert
+        // the interactive rows are visible in the live viewport...
+        let terminal = draw_viewport(60, 40, &screen);
+        let text = buffer_text(&terminal);
+        assert!(text.contains("[Library]"), "the header chip shows: {text}");
+        assert!(text.contains("Which library should we use?"), "{text}");
+        assert!(text.contains("serde"), "{text}");
+        assert!(text.contains("miniserde"), "{text}");
+        // qwen ALWAYS appends an "Other" row.
+        assert!(text.contains("Other"), "the auto-Other row shows: {text}");
+
+        // ...and the VERBATIM title is the box's first content row (checked on the
+        // pure line set so the top-clip does not hide it).
+        let pending = screen.pending_question.as_ref().unwrap();
+        let lines = question_modal_lines(pending, 58, theme::dark());
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains("Please answer the following question(s):")),
+            "the VERBATIM title row: {rendered:?}"
+        );
+    }
+
+    // ADR-0029 rigidity: every rendered question-modal row is exactly the box
+    // width, so the right border aligns (the box wrapper padded each row).
+    #[test]
+    fn question_modal_rows_are_rigid_to_the_box_width() {
+        use crate::tool::caps::Question;
+        let theme = theme::dark();
+        let pending = crate::ui::screen::PendingQuestion::new(
+            "q-1".into(),
+            vec![Question {
+                question: "Pick?".into(),
+                header: "Lib".into(),
+                options: vec![
+                    crate::tool::caps::QuestionOption {
+                        label: "a".into(),
+                        description: "d".into(),
+                    },
+                    crate::tool::caps::QuestionOption {
+                        label: "b".into(),
+                        description: "d".into(),
+                    },
+                ],
+                multi_select: false,
+            }],
+        );
+        let width: u16 = 50;
+        let lines = question_modal_lines(&pending, width, theme);
+        for line in &lines {
+            let cols: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            assert_eq!(cols, width as usize, "every row spans the full box width");
+        }
     }
 
     // The confirming call's marker is `?` (warning), not the executing `⊷`.

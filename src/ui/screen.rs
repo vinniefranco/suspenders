@@ -39,6 +39,7 @@ use crate::event::Event;
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
+use crate::tool::caps::Question;
 use crate::ui::selection::{SelectionKey, SelectionList, SelectionOutcome};
 use crate::ui::transcript::Transcript;
 use crate::view_model::Tone;
@@ -139,6 +140,75 @@ pub struct PendingApproval {
 /// project` / `No, suggest changes (esc)`) - the fixed length of a pending
 /// Approval's [`SelectionList`].
 pub const APPROVAL_OPTION_COUNT: usize = 3;
+
+/// The auto-appended "Other" row label (ADR-0057, qwen `askUserQuestion`): every
+/// question ALWAYS offers this on top of its own options, so the user can answer
+/// free-form. Selecting it focuses the composer and the next submit fills the
+/// answer.
+pub const OTHER_OPTION_LABEL: &str = "Other";
+
+/// A pending question round-trip (ADR-0057, qwen `ask_user_question`): the id to
+/// resolve, the [`Question`]s to render, and the per-question selection state.
+/// Runs parallel to [`PendingApproval`] but has NO auto/standing path - every
+/// question opens a modal.
+///
+/// The modal walks the questions in order: `cursor` is the current question
+/// index; `per_question[i]` is that question's radio (its options PLUS the
+/// auto-appended "Other" row); `answers[i]` holds the recorded answer once given.
+/// `collecting_other` is `Some(i)` while the composer is capturing a free-form
+/// answer for question `i` (the user picked "Other"); the next composer submit
+/// fills `answers[i]` and advances the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub question_id: String,
+    pub questions: Vec<Question>,
+    /// The current question index (`0..questions.len()`); when it reaches
+    /// `questions.len()` every question is answered and the modal resolves.
+    pub cursor: usize,
+    /// Per-question radios, each `options.len() + 1` rows (the trailing "Other").
+    pub per_question: Vec<SelectionList>,
+    /// `Some(i)` while the composer captures a free-form answer for question `i`.
+    pub collecting_other: Option<usize>,
+    /// The recorded answer per question (`None` until answered).
+    pub answers: Vec<Option<String>>,
+}
+
+impl PendingQuestion {
+    /// Builds the modal state for a `question_request`: one radio per question
+    /// (its options plus the auto-appended "Other" row), the cursor at the first
+    /// question, and no answers yet.
+    pub fn new(question_id: String, questions: Vec<Question>) -> Self {
+        let per_question = questions
+            .iter()
+            // options + 1 for the auto-"Other" row (qwen ALWAYS appends it).
+            .map(|q| SelectionList::new(q.options.len() + 1))
+            .collect();
+        let answers = vec![None; questions.len()];
+        PendingQuestion {
+            question_id,
+            questions,
+            cursor: 0,
+            per_question,
+            collecting_other: None,
+            answers,
+        }
+    }
+
+    /// The label for row `index` of question `q`: a real option's label, or the
+    /// auto-appended "Other" row (the last row, `options.len()`).
+    fn option_label(question: &Question, index: usize) -> Option<String> {
+        match question.options.get(index) {
+            Some(opt) => Some(opt.label.clone()),
+            None if index == question.options.len() => Some(OTHER_OPTION_LABEL.to_string()),
+            None => None,
+        }
+    }
+
+    /// Whether row `index` of question `q` is the auto-"Other" row.
+    fn is_other_row(question: &Question, index: usize) -> bool {
+        index == question.options.len()
+    }
+}
 
 /// Maps a selected Approval option index to its [`Decision`] (ADR-0049): row 0
 /// approves once, row 1 approves-always (session-scoped standing, ADR-0005), row
@@ -245,6 +315,11 @@ pub enum AgentCommand {
     /// fire-through to the Agent; the new mode returns via
     /// [`Event::ApprovalModeChanged`].
     CycleApprovalMode,
+    /// Resolve a pending question (ADR-0057, `ask_user_question`): the id and the
+    /// user's answer - `Ok(answers)` carries `(question_index, answer_value)`
+    /// picks, `Err(decline)` the VERBATIM decline string. Mirrors
+    /// [`AgentCommand::Approve`] but carries the full answer set.
+    AnswerQuestion(String, Result<Vec<(usize, String)>, String>),
     Cancel,
 }
 
@@ -354,6 +429,12 @@ pub struct Screen {
     transcript: Transcript,
     pub status: Status,
     pub pending_approval: Option<PendingApproval>,
+    /// A pending question round-trip (ADR-0057, `ask_user_question`): the modal
+    /// state while the user answers one or more structured questions. Runs
+    /// parallel to `pending_approval` - opened by [`Event::QuestionRequest`],
+    /// cleared when the last question is answered (or on Escape/decline). Unlike
+    /// an Approval there is NO auto path; every question opens this modal.
+    pub pending_question: Option<PendingQuestion>,
     /// The current Approval mode (ADR-0050), a DISPLAY-ONLY mirror of the
     /// Agent's authoritative `Approvals::mode`, fed by
     /// [`Event::ApprovalModeChanged`]. The Screen never decides the mode - it
@@ -571,6 +652,7 @@ impl Screen {
             transcript,
             status: Status::Idle,
             pending_approval: None,
+            pending_question: None,
             approval_mode: ApprovalMode::default(),
             token_estimate: None,
             context_budget: opts.context_budget,
@@ -744,6 +826,10 @@ impl Screen {
             | Event::ApprovalResolved { .. }
             | Event::ApprovalAuto { .. }
             | Event::ApprovalModeChanged { .. }) => self.apply_approval(event),
+
+            event @ (Event::QuestionRequest { .. } | Event::QuestionResolved { .. }) => {
+                self.apply_question(event)
+            }
 
             event @ (Event::SteeringQueued { .. } | Event::SteeringDelivered { .. }) => {
                 self.apply_steering(event)
@@ -936,6 +1022,30 @@ impl Screen {
         }
     }
 
+    // The Question lifecycle (ADR-0057, qwen `ask_user_question`): a request
+    // opens the modal (no auto path - every question opens one), resolved is the
+    // operator-visible settlement (the modal was already cleared on the answering
+    // keypress).
+    fn apply_question(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
+            Event::QuestionRequest {
+                question_id,
+                questions,
+            } => {
+                self.pending_question = Some(PendingQuestion::new(question_id, questions));
+                (self, vec![Effect::FocusModal])
+            }
+
+            // The round-trip settled: the modal was cleared when the user
+            // answered (mirroring how ApprovalResolved arrives AFTER
+            // clear_approval). A stray resolved for an already-cleared modal is a
+            // no-op. Display-only; no Transcript item.
+            Event::QuestionResolved { .. } => (self, vec![]),
+
+            _ => (self, vec![]),
+        }
+    }
+
     // Steering: queued shows a pending line; delivered promotes it to a
     // user line (the text is now in the Conversation). The marker text
     // and the promotion are the store's rule.
@@ -1015,6 +1125,10 @@ impl Screen {
                 self.status = Status::Idle;
                 self.token_estimate = Some(token_estimate);
                 self.context_budget = Some(context_budget);
+                // Robustness: a Run should never finish with the question modal
+                // still open, but if a future finish-with-open-modal path arises,
+                // clear it here so it can't leave a dangling modal.
+                self.pending_question = None;
                 (self, vec![])
             }
 
@@ -1056,6 +1170,19 @@ impl Screen {
         }
         if self.pending_approval.is_some() {
             return self.handle_approval_key(key);
+        }
+
+        // The question modal (ADR-0057) gates like the Approval modal, with one
+        // twist: while it is COLLECTING an "Other" free-form answer the composer
+        // must stay editable (the user is typing the answer), so the gate defers
+        // to the composer below and only intercepts the eventual submit
+        // ([`Screen::handle_other_capture_key`]). Otherwise the modal holds the
+        // keyboard and drives the current question's radio.
+        if let Some(pending) = &self.pending_question {
+            if pending.collecting_other.is_some() {
+                return self.handle_other_capture_key(key);
+            }
+            return self.handle_question_key(key);
         }
 
         // The Help overlay (qwen `Help`) gates like the Approval modal (Approval
@@ -1196,6 +1323,180 @@ impl Screen {
                 (self, vec![])
             }
         }
+    }
+
+    // The question-modal key gate (ADR-0057): the arrow/Enter keys drive the
+    // CURRENT question's [`SelectionList`], the numbered digits quick-select, and
+    // Escape DECLINES the whole round-trip (the qwen `Cancel` outcome = "User
+    // declined to answer the questions."). Selecting a real option records its
+    // label and advances the cursor; selecting the auto-"Other" row focuses the
+    // composer to capture a free-form answer (handled by
+    // [`Screen::handle_other_capture_key`] once `collecting_other` is set). Every
+    // other key is swallowed, so a stray key never leaks to the Composer while
+    // the modal holds the keyboard.
+    fn handle_question_key(mut self, key: Key) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_question.as_mut() else {
+            return (self, vec![]);
+        };
+        // Escape declines the whole round-trip - the modal's counterpart of the
+        // Approval's `No, suggest changes (esc)`, but here it ends the questions
+        // (qwen returns "User declined to answer the questions.").
+        if key == Key::Escape {
+            return self.decline_question();
+        }
+
+        let cursor = pending.cursor;
+        // Defensive: a cursor past the last question means the modal should have
+        // resolved already; swallow rather than index out of range.
+        let Some(sel_key) = question_selection_key(&key) else {
+            return (self, vec![]);
+        };
+        let Some(selection) = pending.per_question.get_mut(cursor) else {
+            return (self, vec![]);
+        };
+        match selection.handle(sel_key, 0) {
+            SelectionOutcome::Selected(index) => self.answer_option(cursor, index),
+            // A move redraws the radio; cancel is handled above (Escape).
+            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
+                (self, vec![])
+            }
+        }
+    }
+
+    // Row `index` of question `cursor` was selected. A REAL option records its
+    // label and advances; the auto-"Other" row instead arms free-form capture
+    // (focus the composer, set `collecting_other`) so the user types the answer.
+    fn answer_option(mut self, cursor: usize, index: usize) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_question.as_mut() else {
+            return (self, vec![]);
+        };
+        let Some(question) = pending.questions.get(cursor).cloned() else {
+            return (self, vec![]);
+        };
+        if PendingQuestion::is_other_row(&question, index) {
+            // Focus the composer to capture the free-form answer; the next submit
+            // fills it (handled by `handle_other_capture_key`).
+            pending.collecting_other = Some(cursor);
+            // Clear any pre-existing draft FIRST (M2): a stale in-progress message
+            // the user had typed before the modal opened must NOT leak into - or be
+            // committed as - the "Other" answer. `steered_ok` resets the whole
+            // composer (draft + menu + overlay) without recording it as a prompt.
+            self.composer.steered_ok();
+            return (self, vec![Effect::FocusComposer]);
+        }
+        match PendingQuestion::option_label(&question, index) {
+            Some(label) => self.record_answer(cursor, label),
+            // Out of range (never in practice): swallow.
+            None => (self, vec![]),
+        }
+    }
+
+    // The "Other" capture gate (ADR-0057): while `collecting_other` is set the
+    // composer edits the free-form answer, so this defers ALL keys to it EXCEPT
+    // the eventual submit, which it intercepts to fill the answer instead of
+    // sending a prompt/steer. Escape here cancels the capture and returns to the
+    // radio (the answer is not yet given), not the whole round-trip.
+    fn handle_other_capture_key(mut self, key: Key) -> (Self, Vec<Effect>) {
+        // Escape backs out of the free-form capture: drop `collecting_other` and
+        // hand the keyboard back to the radio (the user can pick again).
+        if key == Key::Escape {
+            if let Some(pending) = self.pending_question.as_mut() {
+                pending.collecting_other = None;
+            }
+            return (self, vec![]);
+        }
+
+        // Offer the key to the composer (the free-form answer is a draft). A
+        // Submit/Steer effect is the "answer is ready" signal: intercept it and
+        // fill the answer from the draft instead of prompting/steering.
+        let cursor = self
+            .pending_question
+            .as_ref()
+            .and_then(|p| p.collecting_other);
+        let key = match self.composer.handle_key(UngatedKey(key), self.status) {
+            KeyOutcome::Consumed { effects, notice } => {
+                if let Some(text) = notice {
+                    self.transcript.info(text);
+                }
+                if let Some(cursor) = cursor
+                    && effects.iter().any(is_submit_or_steer)
+                {
+                    // The composer would have submitted/steered: capture the draft
+                    // as the free-form answer instead. Read then clear the draft
+                    // (steered_ok clears without recording it as a prompt).
+                    let answer = self.composer.view().draft.trim().to_string();
+                    if answer.is_empty() {
+                        // An empty "Other" submit is a no-op: keep collecting.
+                        return (self, vec![]);
+                    }
+                    self.composer.steered_ok();
+                    return self.record_answer(cursor, answer);
+                }
+                // ONLY Submit/Steer (the answer-ready signal above) and pure text
+                // entry act during "Other" capture. Any OTHER composer effect - a
+                // leading `/` opening the slash menu, a client command firing - must
+                // NOT leak out while the question modal is open, so commit the text
+                // edit but SWALLOW the effects rather than firing them. (Rendering
+                // the draft is enough; the slash menu/command would break the modal.)
+                let non_editing = effects.iter().any(|e| !is_composer_edit(e));
+                if non_editing {
+                    return (self, vec![]);
+                }
+                return self.with_commit(effects);
+            }
+            KeyOutcome::Refused(key) => key,
+        };
+        // A refused key (the composer did not act): swallow it while the modal is
+        // up, so nothing leaks to the fold arms below.
+        let _ = key;
+        (self, vec![])
+    }
+
+    // Records `answer` for question `cursor`, advances the cursor, and - if every
+    // question is now answered - resolves the round-trip (emit the answers, clear
+    // the modal, refocus the composer). Mirrors `resolve_approval`.
+    fn record_answer(mut self, cursor: usize, answer: String) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_question.as_mut() else {
+            return (self, vec![]);
+        };
+        if let Some(slot) = pending.answers.get_mut(cursor) {
+            *slot = Some(answer);
+        }
+        pending.collecting_other = None;
+        pending.cursor = cursor + 1;
+        if pending.cursor >= pending.questions.len() {
+            return self.resolve_question();
+        }
+        (self, vec![])
+    }
+
+    // Every question answered: build the `(index, value)` answer set, emit the
+    // AnswerQuestion command, clear the modal, and refocus the composer (mirrors
+    // `resolve_approval` -> `clear_approval` -> FocusComposer).
+    fn resolve_question(mut self) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_question.take() else {
+            return (self, vec![]);
+        };
+        let answers: Vec<(usize, String)> = pending
+            .answers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.map(|value| (i, value)))
+            .collect();
+        let command = AgentCommand::AnswerQuestion(pending.question_id, Ok(answers));
+        self.with_commit(vec![Effect::Agent(command), Effect::FocusComposer])
+    }
+
+    // Escape declined the whole round-trip: emit the decline and clear the modal.
+    fn decline_question(mut self) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_question.take() else {
+            return (self, vec![]);
+        };
+        let command = AgentCommand::AnswerQuestion(
+            pending.question_id,
+            Err("User declined to answer the questions.".to_string()),
+        );
+        self.with_commit(vec![Effect::Agent(command), Effect::FocusComposer])
     }
 
     // The Help-overlay key gate (qwen `Help` `useKeypress`): while the panel is up
@@ -1431,6 +1732,10 @@ impl Screen {
     fn close_abnormally(mut self, note: String) -> (Self, Vec<Effect>) {
         self.transcript.close(Some(note));
         self.status = Status::Idle;
+        // A cancel/error/agent-down clears any open question modal too (its
+        // reply oneshot dies with the aborted Run, so the tool call unwinds); it
+        // must not linger claiming an answer is still due.
+        self.pending_question = None;
         self.clear_approval()
     }
 }
@@ -1461,6 +1766,42 @@ fn approval_selection_key(key: &Key) -> Option<SelectionKey> {
         Key::Char(c) if c.is_ascii_digit() => Some(SelectionKey::Digit(*c as u8 - b'0')),
         _ => None,
     }
+}
+
+// Maps a Screen [`Key`] to the [`SelectionKey`] the question radio acts on
+// (ADR-0057), or `None` for a key it ignores. The same mapping as the Approval
+// radio (ArrowUp/Down navigate, Enter selects, a digit quick-selects); Escape is
+// handled by the caller (decline) before this, so it never reaches here.
+fn question_selection_key(key: &Key) -> Option<SelectionKey> {
+    approval_selection_key(key)
+}
+
+// Whether an effect is a composer Submit or Steer (ADR-0057): the "answer is
+// ready" signal the "Other" capture intercepts to fill the free-form answer
+// instead of sending a prompt/steer.
+fn is_submit_or_steer(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Agent(AgentCommand::Submit(_)) | Effect::Agent(AgentCommand::Steer(_))
+    )
+}
+
+// Whether an effect is a pure composer text-edit / redraw effect that is SAFE to
+// fire while the "Other" capture modal is up (ADR-0057). Text entry commits the
+// draft and repaints; anything else the composer might mint - the slash menu
+// (`Command`), a chosen selector row (`SelectorChosen`), a `@path` file search
+// (`FileSearch`), or a history append/agent call - is composer MACHINERY that must
+// not leak out while the question modal owns the screen, so it is swallowed. Only
+// the answer-ready Submit/Steer (handled above) and these edits act during capture.
+fn is_composer_edit(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Commit { .. }
+            | Effect::PeekPending
+            | Effect::RedrawScrollback
+            | Effect::FocusComposer
+            | Effect::FocusModal
+    )
 }
 
 // The closing note a stop reason earns: nothing for the two normal ends, a
@@ -2196,6 +2537,300 @@ mod tests {
         let (t, effects) = t.apply_event(Event::approval_resolved(a.approval_id.clone(), true));
         assert_eq!(t.pending_approval, None);
         assert_eq!(sans_commit(effects), vec![Effect::FocusComposer]);
+    }
+
+    // --- Question modal (ADR-0057, ask_user_question) -----------------------
+
+    fn question(header: &str, options: &[&str]) -> Question {
+        Question {
+            question: format!("Pick for {header}?"),
+            header: header.to_string(),
+            options: options
+                .iter()
+                .map(|label| crate::tool::caps::QuestionOption {
+                    label: label.to_string(),
+                    description: "desc".to_string(),
+                })
+                .collect(),
+            multi_select: false,
+        }
+    }
+
+    fn with_question(t: Screen, id: &str, questions: Vec<Question>) -> Screen {
+        let (t, _effects) = t.apply_event(Event::question_request(id, questions));
+        t
+    }
+
+    #[test]
+    fn question_request_stores_pending_and_focuses_modal() {
+        let (t, effects) = fresh().apply_event(Event::question_request(
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        ));
+        let pending = t.pending_question.as_ref().expect("an open question");
+        assert_eq!(pending.question_id, "q-1");
+        assert_eq!(pending.cursor, 0);
+        // One radio per question, each options + 1 for the auto-"Other" row.
+        assert_eq!(pending.per_question.len(), 1);
+        assert_eq!(pending.per_question[0].len(), 3);
+        assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
+    }
+
+    #[test]
+    fn selecting_a_real_option_records_it_and_resolves_a_single_question() {
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        // Enter selects the active row (row 0 = "serde"); the single question
+        // resolves, emitting the answer and refocusing the composer.
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(t.pending_question, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::AnswerQuestion(
+                    "q-1".to_string(),
+                    Ok(vec![(0, "serde".to_string())])
+                )),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_digit_quick_selects_an_option() {
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        // Digit '2' selects the second option ("miniserde"); it resolves. The
+        // tuple's first element is the QUESTION index (0), not the option index.
+        let (t, effects) = t.handle_key(Key::Char('2'));
+        assert_eq!(t.pending_question, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::AnswerQuestion(
+                    "q-1".to_string(),
+                    Ok(vec![(0, "miniserde".to_string())])
+                )),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    #[test]
+    fn two_questions_advance_the_cursor_before_resolving() {
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![
+                question("Library", &["serde", "miniserde"]),
+                question("Runtime", &["tokio", "smol"]),
+            ],
+        );
+        // Answer the first question (row 0 = "serde"): the cursor advances, no
+        // resolve yet.
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(sans_commit(effects), vec![]);
+        let pending = t.pending_question.as_ref().expect("still open");
+        assert_eq!(pending.cursor, 1);
+        assert_eq!(pending.answers[0], Some("serde".to_string()));
+        // Answer the second (row 0 = "tokio"): now it resolves with both answers.
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(t.pending_question, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::AnswerQuestion(
+                    "q-1".to_string(),
+                    Ok(vec![(0, "serde".to_string()), (1, "tokio".to_string())])
+                )),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_other_routes_to_the_composer_and_the_next_submit_fills_it() {
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        // The auto-"Other" row is the last one (index 2); digit '3' picks it.
+        let (mut t, effects) = t.handle_key(Key::Char('3'));
+        // It focuses the composer and arms free-form capture, without resolving.
+        assert_eq!(sans_commit(effects), vec![Effect::FocusComposer]);
+        assert_eq!(
+            t.pending_question.as_ref().unwrap().collecting_other,
+            Some(0)
+        );
+        // The user types a free-form answer into the composer.
+        for key in typed("something else") {
+            let (next, _e) = t.handle_key(key);
+            t = next;
+        }
+        // Enter (a submit) fills the answer instead of prompting; the single
+        // question resolves with the typed text.
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(t.pending_question, None);
+        assert!(effects.contains(&Effect::Agent(AgentCommand::AnswerQuestion(
+            "q-1".to_string(),
+            Ok(vec![(0, "something else".to_string())])
+        ))));
+    }
+
+    #[test]
+    fn a_slash_command_during_other_capture_does_not_route_to_the_slash_menu() {
+        // Arm "Other" capture, then type a full `/model` slash command and press
+        // Enter. Outside capture the composer would fire `Effect::Command` and
+        // open the model selector; during capture the question modal MUST swallow
+        // that machinery so it never leaks out, and the modal stays open collecting.
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let (mut t, _e) = t.handle_key(Key::Char('3')); // pick "Other"
+        assert_eq!(
+            t.pending_question.as_ref().unwrap().collecting_other,
+            Some(0)
+        );
+        // Type the leading `/model` (each keystroke should stay text/swallowed and
+        // never route out).
+        for key in typed("/model") {
+            let (next, effects) = t.handle_key(key);
+            t = next;
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Command { .. } | Effect::SelectorChosen { .. })),
+                "a slash keystroke during Other capture must not route to a command"
+            );
+        }
+        // Enter (which would commit the slash command outside capture): swallowed.
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(effects, vec![], "the slash-command Enter is swallowed");
+        // The modal is still open and still collecting - the command did not fire.
+        let pending = t.pending_question.as_ref().expect("modal stays open");
+        assert_eq!(pending.collecting_other, Some(0));
+        assert_eq!(pending.answers[0], None, "no answer recorded");
+    }
+
+    #[test]
+    fn arming_other_capture_clears_a_pre_existing_draft() {
+        // The user had typed a message before the modal opened; when they pick
+        // "Other", that stale draft must NOT leak into the answer (M2). Seed the
+        // draft BEFORE the modal opens, while the composer still owns the keyboard.
+        let mut t = fresh();
+        for key in typed("stale in-progress text") {
+            let (next, _e) = t.handle_key(key);
+            t = next;
+        }
+        assert!(!t.composer().view().draft.is_empty(), "draft is seeded");
+        let t = with_question(t, "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        assert!(
+            !t.composer().view().draft.is_empty(),
+            "the stale draft survives the modal opening"
+        );
+        // Pick "Other": the draft is cleared as capture arms.
+        let (mut t, _e) = t.handle_key(Key::Char('3'));
+        assert_eq!(
+            t.pending_question.as_ref().unwrap().collecting_other,
+            Some(0)
+        );
+        assert!(
+            t.composer().view().draft.is_empty(),
+            "arming Other capture clears the stale draft"
+        );
+        // Now type + submit the real answer; the stale text does not appear.
+        for key in typed("real answer") {
+            let (next, _e) = t.handle_key(key);
+            t = next;
+        }
+        let (t, effects) = t.handle_key(Key::Enter);
+        assert_eq!(t.pending_question, None);
+        assert!(effects.contains(&Effect::Agent(AgentCommand::AnswerQuestion(
+            "q-1".to_string(),
+            Ok(vec![(0, "real answer".to_string())])
+        ))));
+    }
+
+    #[test]
+    fn escape_during_other_capture_backs_out_to_the_radio() {
+        // Escape while collecting an "Other" answer drops back to the radio: the
+        // modal stays open, `collecting_other` resets to None, no answer recorded.
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let (t, _e) = t.handle_key(Key::Char('3')); // pick "Other"
+        assert_eq!(
+            t.pending_question.as_ref().unwrap().collecting_other,
+            Some(0)
+        );
+        let (t, effects) = t.handle_key(Key::Escape);
+        let pending = t.pending_question.as_ref().expect("modal stays open");
+        assert_eq!(pending.collecting_other, None, "back to the radio");
+        assert_eq!(pending.answers[0], None, "no answer recorded");
+        assert_eq!(sans_commit(effects), vec![], "backing out emits nothing");
+    }
+
+    #[test]
+    fn an_empty_other_submit_is_a_no_op_that_keeps_collecting() {
+        // Submitting an empty "Other" draft records nothing and keeps collecting -
+        // it must not resolve the question with an empty answer.
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let (t, _e) = t.handle_key(Key::Char('3')); // pick "Other"
+        let (t, effects) = t.handle_key(Key::Enter); // Enter on an empty draft
+        // No answer is emitted (a redraw Commit may fire, but never an
+        // AnswerQuestion): the empty submit records nothing and keeps collecting.
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Agent(AgentCommand::AnswerQuestion(..)))),
+            "an empty submit records no answer"
+        );
+        let pending = t.pending_question.as_ref().expect("modal stays open");
+        assert_eq!(pending.collecting_other, Some(0), "still collecting");
+        assert_eq!(pending.answers[0], None, "no empty answer recorded");
+    }
+
+    #[test]
+    fn escape_declines_the_question_round_trip() {
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let (t, effects) = t.handle_key(Key::Escape);
+        assert_eq!(t.pending_question, None);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::Agent(AgentCommand::AnswerQuestion(
+                    "q-1".to_string(),
+                    Err("User declined to answer the questions.".to_string())
+                )),
+                Effect::FocusComposer,
+            ]
+        );
+    }
+
+    #[test]
+    fn arrows_move_the_question_radio_without_resolving() {
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde", "time"])],
+        );
+        let (t, effects) = t.handle_key(Key::ArrowDown);
+        assert_eq!(sans_commit(effects), vec![], "a move emits nothing");
+        assert!(t.pending_question.is_some());
+        assert_eq!(t.pending_question.as_ref().unwrap().per_question[0].active(), 1);
+    }
+
+    #[test]
+    fn a_stray_char_is_swallowed_while_the_question_modal_holds_the_keyboard() {
+        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let before = t.pending_question.clone();
+        let (t, effects) = t.handle_key(Key::Char('x'));
+        assert_eq!(effects, vec![], "no effect");
+        assert_eq!(
+            t.pending_question, before,
+            "the draft was not edited; the modal is unchanged"
+        );
+        // The composer never saw the key (it did not open a slash menu etc.).
+        assert!(t.composer().view().draft.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_clears_the_question_modal() {
+        let mut t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        t.status = Status::Running;
+        let (t, _e) = t.apply_event(Event::RunCancelled);
+        assert_eq!(t.pending_question, None, "a cancel clears the modal");
     }
 
     // --- submit / steer outcomes --------------------------------------------

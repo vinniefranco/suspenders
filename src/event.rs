@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::approvals::ApprovalMode;
 use crate::content::ContentBlock;
 use crate::llm::Delta;
+use crate::tool::caps::Question;
 use crate::llm::response::StopReason;
 use crate::view_model::SelectorRow;
 
@@ -131,6 +132,24 @@ pub enum Event {
     /// copy fed by this event.
     ApprovalModeChanged {
         mode: ApprovalMode,
+    },
+
+    // ---- Questions (ADR-0057, qwen ask_user_question) ----
+    /// A tool put one or more questions to the user (`ask_user_question`): the
+    /// Screen opens the question modal. Unlike an Approval there is NO auto path -
+    /// every question opens a modal (ADR-0057). `question_id` is the per-call
+    /// reference the Agent holds the reply oneshot under; `questions` are the
+    /// shaped [`Question`]s the modal renders.
+    QuestionRequest {
+        question_id: String,
+        questions: Vec<Question>,
+    },
+    /// A question round-trip settled (answered or declined): the Agent emits it
+    /// after the reply is sent, mirroring [`Event::ApprovalResolved`]. The Screen
+    /// has already cleared the modal on the answering keypress; this is the
+    /// operator-visible settlement marker, carrying only the `question_id`.
+    QuestionResolved {
+        question_id: String,
     },
 
     // ---- Extensions / Session Log / Context ----
@@ -327,6 +346,21 @@ impl Event {
 
     pub fn approval_mode_changed(mode: ApprovalMode) -> Self {
         Event::ApprovalModeChanged { mode }
+    }
+
+    // ---- Questions ----
+
+    pub fn question_request(id: impl Into<String>, questions: Vec<Question>) -> Self {
+        Event::QuestionRequest {
+            question_id: id.into(),
+            questions,
+        }
+    }
+
+    pub fn question_resolved(id: impl Into<String>) -> Self {
+        Event::QuestionResolved {
+            question_id: id.into(),
+        }
     }
 
     // ---- Slash Command selector ----

@@ -24,17 +24,12 @@ pub mod caps;
 pub mod path;
 pub mod registry;
 
-/// A tool's spec in Anthropic tool format: a name, a description, and a JSON
-/// Schema `input_schema` (an open edge, so it stays a `serde_json::Value`).
-/// Mirrors baud's `Baud.Tool.spec/0` shape. Serializes to exactly its wire
-/// shape, so the Conversation's tool-spec overhead estimate counts what a
-/// request carries without reaching into an adapter.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-}
+/// The tool's wire spec, re-exported from the [`crate::content`] leaf where it
+/// lives alongside the other wire tool-shapes. Kept re-exported here so the tool
+/// authoring contract still reads as one home (`crate::tool::ToolSpec`) - the
+/// type moved out only to break the `tool <-> llm` cycle the P2b SideQuery
+/// capability (which names `Model`) would otherwise close (see ADR-0055).
+pub use crate::content::ToolSpec;
 
 /// A Tool Result: the content that enters the Conversation and whether it was
 /// an error. Mirrors baud's `Baud.Tools.result/0`. Lives with the Tool

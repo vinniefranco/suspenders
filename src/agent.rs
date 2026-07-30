@@ -165,6 +165,13 @@ impl std::error::Error for StartError {}
 // The message protocol: public Commands + the Run's talk-back, one mpsc.
 // ---------------------------------------------------------------------------
 
+/// The user's answer to a pending question (ADR-0057): `Ok` is one
+/// `(question_index, answer_value)` per answered question, `Err` the VERBATIM
+/// decline/degraded string the tool returns as its content. Named so the
+/// question reply oneshot and the [`Command::AnswerQuestion`] payload read the
+/// same shape (clippy: this Result-of-Vec-of-tuple is otherwise "very complex").
+pub type QuestionAnswers = Result<Vec<(usize, String)>, String>;
+
 /// A message the Run task sends back to the Agent (baud's `{:turn_event, ...}`,
 /// `{:turn_checkpoint, ...}`, `{:turn_plan, ...}`, `{:compacted, ...}`, and the
 /// `:drain_steering`/approval reply calls). Routed through the same mpsc as
@@ -184,6 +191,16 @@ pub enum RunMsg {
         id: String,
         command: String,
         reply: oneshot::Sender<bool>,
+    },
+    /// A question request (ADR-0057, `ask_user_question`): the Agent broadcasts
+    /// `question_request` (opening the modal) and holds the reply until
+    /// `answer_question` arrives. Unlike an Approval there is NO auto/standing
+    /// path - every question opens a modal. The reply carries the user's picks
+    /// (`Ok`) or the decline/degraded string (`Err`).
+    AskQuestion {
+        id: String,
+        questions: Vec<crate::tool::caps::Question>,
+        reply: oneshot::Sender<QuestionAnswers>,
     },
     /// A completed Compaction from the Run task: log the `{:compacted, ...}`
     /// entry and update the accumulated state (ADR-0012).
@@ -225,6 +242,16 @@ pub enum Command {
     /// not from the lossy broadcast (P0: broadcast `Lagged` must not desync the
     /// footer AutoAcceptIndicator).
     CycleApprovalMode(oneshot::Sender<ApprovalMode>),
+    /// Resolve a pending question (ADR-0057): `Ok(answers)` carries the user's
+    /// `(question_index, answer_value)` picks; `Err(string)` is the decline the
+    /// tool returns as its content. The Agent forwards it to the parked tool
+    /// call's reply oneshot. Mirrors [`Command::Approve`] but with no Standing-
+    /// Approval fold - the reply map is the whole mechanic.
+    AnswerQuestion(
+        String,
+        QuestionAnswers,
+        oneshot::Sender<()>,
+    ),
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
     Conversation(oneshot::Sender<Conversation>),
@@ -407,6 +434,24 @@ impl AgentHandle {
         let _ = rx.await;
     }
 
+    /// Resolves a pending question (ADR-0057, `ask_user_question`): `Ok(answers)`
+    /// carries the user's `(question_index, answer_value)` picks, `Err(string)`
+    /// the decline. The Agent forwards it to the parked tool call's reply oneshot.
+    /// Mirrors [`AgentHandle::approve`]; a dead Agent silently drops it.
+    pub async fn answer_question(
+        &self,
+        question_id: impl Into<String>,
+        answers: QuestionAnswers,
+    ) {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Msg::Command(Command::AnswerQuestion(
+            question_id.into(),
+            answers,
+            reply,
+        )));
+        let _ = rx.await;
+    }
+
     /// Rotates the Approval mode one step (ADR-0050, the Shift+Tab cycle): the
     /// Agent's pure `Approvals` fold cycles and broadcasts the new mode. Applies
     /// whether or not a Run is in flight (Session-scoped). RETURNS the new mode
@@ -504,6 +549,11 @@ struct AgentState {
     // Run parks awaiting this oneshot; `approve` (or a Standing Approval hit)
     // answers it.
     approval_replies: HashMap<String, oneshot::Sender<bool>>,
+    // The per-question reply channels (ADR-0057), keyed by the question id the
+    // tool minted: the tool call parks awaiting this oneshot; `answer_question`
+    // removes and answers it. No Standing-Approval analog - every question opens
+    // a modal, so there is no auto/fold path, just this map.
+    question_replies: HashMap<String, oneshot::Sender<QuestionAnswers>>,
     steering: Vec<String>,
     compaction: Compaction,
     // A clone of the mpsc sender, handed to the Run's AgentDeps so the Run
@@ -576,8 +626,38 @@ async fn init_agent(init: AgentInit) -> AgentState {
         ));
     }
 
+    // Discover disk skills once (fail-open, ADR-0058), the same shape as the MCP
+    // attach above: `<root>/.suspenders/skills/<name>/SKILL.md` (project) +
+    // `~/.suspenders/skills/<name>/SKILL.md` (user). A malformed/invalid manifest
+    // is recorded on the manager and skipped, surfaced below as a launch notice.
+    // The one `skill` tool holds the manager and embeds its `<available_skills>`
+    // catalog in its description, so the tool is ALWAYS registered (even with an
+    // empty catalog) - the catalog is how the model learns skills can exist.
+    let project_skills = std::path::Path::new(&session.root)
+        .join(".suspenders")
+        .join("skills");
+    let user_skills = crate::session::default_user_skills_dir();
+    let skill_manager = Arc::new(crate::skills::SkillManager::discover(
+        &project_skills,
+        Some(std::path::Path::new(&user_skills)),
+    ));
+
+    // Surface each fail-open skill parse skip as a launch notice, exactly like an
+    // MCP connect failure (ADR-0007's fail-open report seam): a broken SKILL.md is
+    // a visible skip, not a silent one.
+    for (name, reason) in skill_manager.failures() {
+        let _ = events.send(Event::extension_error(
+            format!("skill {name}"),
+            crate::event::Stage::PreRun,
+            reason.clone(),
+        ));
+    }
+
     let mut all = tools::tools();
     all.extend(adapters);
+    all.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
+        &skill_manager,
+    ))));
     let session_tools: Arc<[Box<dyn crate::tool::Tool>]> = all.into();
 
     // A live per-session registry over the Session-stable set, used ONLY to
@@ -641,6 +721,7 @@ async fn init_agent(init: AgentInit) -> AgentState {
         settlement: Settlement::new(),
         approvals: Approvals::new(),
         approval_replies: HashMap::new(),
+        question_replies: HashMap::new(),
         steering: Vec::new(),
         compaction: Compaction::new(),
         self_tx,
@@ -693,6 +774,10 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         Command::CycleApprovalMode(reply) => {
             let mode = cycle_approval_mode(state);
             let _ = reply.send(mode);
+        }
+        Command::AnswerQuestion(id, answers, reply) => {
+            answer_question(state, id, answers);
+            let _ = reply.send(());
         }
         Command::Cancel(reply) => {
             if let Some(abort) = &state.task {
@@ -747,6 +832,13 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
         }
         RunMsg::RequestApproval { id, command, reply } => {
             request_approval(state, id, command, reply);
+        }
+        RunMsg::AskQuestion {
+            id,
+            questions,
+            reply,
+        } => {
+            ask_question(state, id, questions, reply);
         }
         RunMsg::Compacted {
             new_state,
@@ -839,6 +931,36 @@ fn approve(state: &mut AgentState, id: String, decision: Decision) {
         Decide::Ignore(approvals) => {
             state.approvals = approvals;
         }
+    }
+}
+
+// A question request (ADR-0057, `ask_user_question`): broadcast
+// `question_request` to open the modal and hold the reply oneshot under the
+// question id until `answer_question` arrives. Unlike `request_approval` there is
+// NO Standing-Approval / auto path - every question opens a modal - so this is
+// unconditionally the "pending" leg: insert the reply, broadcast the request.
+fn ask_question(
+    state: &mut AgentState,
+    id: String,
+    questions: Vec<crate::tool::caps::Question>,
+    reply: oneshot::Sender<QuestionAnswers>,
+) {
+    state.question_replies.insert(id.clone(), reply);
+    broadcast(state, Event::question_request(id, questions));
+}
+
+// Resolve a pending question (ADR-0057): remove the parked reply and forward the
+// user's answer to it. A stale/duplicate `answer_question` (no matching entry)
+// is dropped, mirroring `approve`'s `Decide::Ignore`. The tool emits
+// `question_resolved` after it reads the reply, like the Approver emits
+// `approval_resolved`.
+fn answer_question(
+    state: &mut AgentState,
+    id: String,
+    answers: QuestionAnswers,
+) {
+    if let Some(reply) = state.question_replies.remove(&id) {
+        let _ = reply.send(answers);
     }
 }
 
@@ -970,6 +1092,7 @@ fn reset_run_state(state: &mut AgentState) {
     state.settlement = Settlement::new();
     state.approvals = std::mem::take(&mut state.approvals).reset();
     state.approval_replies.clear();
+    state.question_replies.clear();
     state.cancel_flag = false;
     state.run_provenance = state.model.provenance();
     // The captured Model's budget figures land at Run start (ADR-0037): the
@@ -1055,6 +1178,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     state.settlement = Settlement::new();
     state.approvals = std::mem::take(&mut state.approvals).reset();
     state.approval_replies.clear();
+    state.question_replies.clear();
     state.steering.clear();
     state.cancel_flag = false;
 

@@ -43,8 +43,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::content::{ContentBlock, Message};
-use crate::tool::ToolSpec;
+use crate::content::{ContentBlock, Message, ToolSpec};
 use model::{Api, Model};
 use provider::Provider;
 use response::Response;

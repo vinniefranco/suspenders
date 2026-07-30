@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use crate::content::Message;
 use crate::llm::LlmRequest;
 use crate::llm::model::Model;
-use crate::tool::ToolSpec;
+use crate::content::ToolSpec;
 
 /// Builds the complete Anthropic Messages API payload as JSON.
 ///

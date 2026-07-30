@@ -18,6 +18,7 @@ pub mod plan;
 pub mod presenter;
 pub mod run;
 pub mod session;
+pub mod skills;
 pub mod tool;
 /// The Tool Registry lives under the `tool` module (co-located with the Tool
 /// contract and the Capability Context it is part of, so the three

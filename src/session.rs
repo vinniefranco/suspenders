@@ -1014,6 +1014,14 @@ pub fn default_themes_dir() -> String {
     format!("{}/suspenders/themes", xdg_config_base())
 }
 
+/// The user skills directory (ADR-0058): `skills/` beside `config.json` in the
+/// XDG config home, the user-level counterpart to the project's
+/// `.suspenders/skills/`. Resolved at the launch edge like the themes dir; a
+/// missing directory just means no user skills.
+pub fn default_user_skills_dir() -> String {
+    format!("{}/suspenders/skills", xdg_config_base())
+}
+
 // The XDG config home both paths above hang off (empty var == unset, per XDG).
 fn xdg_config_base() -> String {
     std::env::var("XDG_CONFIG_HOME")

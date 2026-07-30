@@ -6,9 +6,11 @@ We carry those effect handles onto the `ToolCtx` as a Parameter Object, `Capabil
 
 ```rust
 pub struct Capabilities {
-    pub registry: Arc<ToolRegistry>,   // concrete - Run-scoped state, not an effect
-    pub approver: Arc<dyn Approver>,   // dyn - the tool-initiated effect seam
-    // P2a: questioner, P2b: side_query, P4: subagents (deferred, see below)
+    pub registry: Arc<ToolRegistry>,      // concrete - Run-scoped state, not an effect
+    pub approver: Arc<dyn Approver>,      // dyn - the tool-initiated effect seam (P1b)
+    pub side_query: Arc<dyn SideQuery>,   // dyn - the bounded-model side-query seam (P2b)
+    pub questioner: Arc<dyn Questioner>,  // dyn - the ask_user_question seam (P2a)
+    // P4: subagents (deferred, see below)
 }
 ```
 
@@ -42,44 +44,25 @@ The degraded posture never silently does the risky thing: `DenyingApprover::appr
 
 P1b is *seam only, no behavior change*: no tool consumes `Capabilities.approver` yet - the batch gate still drives approval through `RunDeps::request_approval`. The `AgentApprover` and the gate share the exact request path; a later phase collapses that transient duplication once a tool initiates its own Approval. The seam is proven by unit tests, and every existing approval / batch / tool test passes unchanged.
 
+## SideQuery lands wired DIRECT to the Llm, not the Agent (P2b)
+
+`SideQuery` is the second capability to land (P2b, web_fetch's prompt-guided extraction), and it lands DIFFERENTLY from the Approver - a distinction that sharpens what "two channels, one terminus" means. The Approver's real impl (`AgentApprover`) relays over the Agent mpsc because approval is an Agent-OWNED decision: the Agent consults the Standing Approvals, opens the modal, and forwards the reply. A side-query owns none of that. Its only effect is a completion the Run ALREADY captured (the `Arc<dyn Llm>` and the `Model` on the `Capture`), and it mutates no Agent/Conversation state - it checkpoints nothing, logs nothing, and never touches the next-speaker fold. So its real impl, `LlmSideQuery`, is just that captured Llm boundary called with a transient `LlmRequest` (Thinking off, no tools, a no-op stream sink), off the main Conversation - exactly the shape `run::next_speaker` already uses for the other genuine side-query.
+
+Because the effect terminates at the Llm boundary rather than the Agent mpsc, `LlmSideQuery` lives at that boundary (`run::side_query`), built by `run::run` from the `Capture`'s own `llm`/`model` - no new `Capture` field, no `RunMsg` variant, and crucially no Agent round-trip. This keeps `caps.rs` free of any `agent`/`run` import (it names only `Model`), and it means the degraded posture is a plain `DenyingSideQuery` (a host with no model channel returns an `Err` the tool folds into its own error result), symmetric with `DenyingApprover`.
+
+One structural consequence: `SideQueryRequest.model` is `Option<Model>`, so the `tool` capability layer now names `llm::model::Model`. Paired with the pre-existing `LlmRequest.tools: Vec<ToolSpec>`, that would close a `tool <-> llm` cycle. `ToolSpec` therefore moved to the `content` leaf (the shared wire-shapes home, alongside `ContentBlock`'s `ToolUse`/`ToolResult`) and `tool` re-exports it, so the boundary carries `ToolSpec` with no `llm -> tool` edge while the tool authoring contract still reads `crate::tool::ToolSpec`. The `tool -> llm` edge (naming `Model`) is now one-directional and acyclic.
+
+web_fetch consumes it live: it fetches, caps the content at 100 000 chars, wraps it in qwen's verbatim fallback prompt, and runs the extraction through `caps.side_query` with `model: None` (defer to the captured MAIN model, faithful to qwen) and `max_attempts: 1`. web_fetch does NOT call the Approver - its Approval is upstream in the batch gate (now domain-scoped, ADR-0024).
+
+## Questioner LANDED tx-backed like the Approver (P2a, ADR-0057)
+
+`Questioner` is the third capability to land (P2a, `ask_user_question`), and it lands like the Approver, NOT like SideQuery - the CONTRAST that completes the picture. A question is an Agent-relayed, USER-owned decision: the Agent broadcasts the request (opening the modal) and forwards the reply the user gives. So its real impl, `AgentQuestioner`, is tx-backed over the Agent mpsc (a `RunMsg::AskQuestion` and a reply oneshot), a near-twin of `AgentApprover` - where SideQuery, an Llm-owned effect, bypassed the mpsc entirely. The one place it DIVERGES from the Approver is that there is no auto/standing path: `ask_question` is unconditionally the pending leg (every question opens a modal), so the Agent holds a plain `question_replies` map with none of the `Approvals` fold beside it (see ADR-0057). Its degraded impl is `DecliningQuestioner`, which returns the VERBATIM qwen non-interactive string - symmetric with `DenyingApprover`/`DenyingSideQuery` as the headless posture. Threaded from the Agent to the Run through the `Capture` snapshot, exactly like the Approver.
+
 ## Deferral policy
 
-Only the carrier plus `Approver` land in P1b. The other three capabilities (Questioner, SideQuery, SubagentSpawner) land in the phase that consumes them, NOT now. Building them now would mean non-functional stub impls, because their `RunMsg` variants do not exist yet - dead code against the quality floor. Their trait signatures are recorded here as the contract those phases implement:
+The carrier plus `Approver` land in P1b; `SideQuery` lands in P2b; `Questioner` lands in P2a (above). The remaining capability (SubagentSpawner) lands in the phase that consumes it, NOT now. Building it now would mean a non-functional stub impl, because its `RunMsg` variant does not exist yet - dead code against the quality floor. Its trait signature is recorded here as the contract that phase implements:
 
 ```rust
-// P2a - Questioner (faithful to qwen askUserQuestion.ts).
-struct QuestionOption { label: String, description: String }
-struct Question {
-    question: String,
-    header: String,
-    options: Vec<QuestionOption>,
-    multi_select: bool,
-}
-#[async_trait]
-trait Questioner: Send + Sync {
-    async fn ask(&self, questions: Vec<Question>) -> Result<Vec<(usize, String)>, String>;
-}
-// Degraded (non-interactive) string, VERBATIM:
-// "Cannot ask user questions in non-interactive mode without ACP support. \
-//  Please run in interactive mode or enable ACP mode to use this tool."
-// Decline (user cancelled) string, VERBATIM:
-// "User declined to answer the questions."
-
-// P2b - SideQuery (faithful to qwen web-fetch.ts).
-// NOTE: qwen's runSideQuery takes multi-part `contents`; `user_content: String`
-// narrows to web_fetch's single text part. Multimodal is FULL scope (D3), so P2b
-// widens this to a parts list if a second consumer needs it.
-struct SideQueryRequest {
-    system: String,
-    user_content: String,
-    model: Option<Model>,
-    max_attempts: u32,
-}
-#[async_trait]
-trait SideQuery: Send + Sync {
-    async fn run(&self, request: SideQueryRequest) -> Result<String, String>;
-}
-
 // P4/F4 - SubagentSpawner. The `model` field is the F4 per-subagent seam
 // (Opus-main / Qwen-scout): a subagent may run a different Model than the Run
 // that spawned it.
@@ -93,8 +76,9 @@ trait SubagentSpawner: Send + Sync {
 
 Considered and rejected:
 
-- **Adding all four capabilities now with stub degraded impls.** Three of the four would be dead code (no `RunMsg` variant, no consumer), and a stub that only ever returns the degraded answer is untested behavior against the quality floor. The signatures recorded above give the later phases their contract without the dead code.
+- **Adding all four capabilities up front with stub degraded impls.** A capability with no consumer yet (SubagentSpawner) would be dead code (no `RunMsg` variant, no consumer), and a stub that only ever returns the degraded answer is untested behavior against the quality floor. Each lands with its consumer instead: `Approver` in P1b (its wire already existed), `SideQuery` in P2b (web_fetch consumes it), `Questioner` in P2a (`ask_user_question` consumes it), and the signature recorded above gives the remaining phase its contract without the dead code.
+- **Routing `SideQuery` through the Agent like `Approver`.** A side-query touches no Agent-owned state (no Standing Approvals, no modal, no Conversation mutation), so an mpsc round-trip and a `RunMsg` variant would be ceremony around a completion the Run already captured. `LlmSideQuery` calls the captured Llm boundary directly instead - the effect terminates at the Llm, not the Agent (see the P2b section).
 - **A second `dyn RunDeps` instead of a separate `Capabilities` carrier.** `RunDeps` is loop-owned `&mut D` at control points; a Tool Call has neither the `&mut D` nor a control point. The two channels are genuinely different shapes; merging them would force `RunDeps` to be `dyn` (losing its RPITIT static dispatch) for no gain.
 - **A `dyn` registry on `Capabilities`.** The registry is state, not an effect; making it `dyn` would hide a concrete type behind a seam that buys nothing.
 
-Consequence: the `ToolCtx` is the single place a Tool Call reads BOTH its Run-scoped state and its tool-initiated effect seams, and the DI mechanism is proven live in P1b by the one capability whose wire already exists.
+Consequence: the `ToolCtx` is the single place a Tool Call reads BOTH its Run-scoped state and its tool-initiated effect seams. The DI mechanism is proven live in P1b by the `Approver` (whose wire already existed) and consumed for the first time in P2b by `SideQuery` (web_fetch's extraction), which also shows the seam is not Agent-bound: a capability whose effect terminates at the Llm boundary wires there directly.

@@ -582,7 +582,7 @@ mod tests {
         )
         .await;
 
-        let tool_spec = crate::tool::ToolSpec {
+        let tool_spec = crate::content::ToolSpec {
             name: "read_file".into(),
             description: "Reads the contents of a file.".into(),
             input_schema: json!({

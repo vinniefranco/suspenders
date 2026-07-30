@@ -16,10 +16,11 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Approval policy: the one place that declares which Tools gate and, for
-/// each, the field whose value the user reads in the modal (and a Standing
-/// Approval matches by exact string equality - ADR-0005). run_command shows
-/// the command (arbitrary code); web_fetch shows the URL (the one Tool that
-/// reaches outside the Project Root - ADR-0024).
+/// each, the field whose value seeds what the user reads in the modal (and a
+/// Standing Approval matches by exact string equality - ADR-0005). run_command
+/// shows the command (arbitrary code); web_fetch reads the URL but shows (and
+/// matches on) its DOMAIN (the one Tool that reaches outside the Project Root -
+/// ADR-0024, revised: domain-scoped, faithful to qwen's `WebFetch(<hostname>)`).
 ///
 /// One row per gated Tool ties "this gates" to "this is the field" so the two
 /// facts can never disagree. A gated Tool with the field missing or non-string
@@ -33,15 +34,31 @@ const GATED: &[(&str, &str)] = &[("run_command", "command"), ("web_fetch", "url"
 /// answers both facts, "does this gate" and "what text" can never disagree.
 ///
 /// The text is read from the extension-adjusted input the caller hands over.
+/// For most gated Tools the field value IS the gate text; web_fetch is the one
+/// exception - its gate text is the URL's DOMAIN (ADR-0024, revised), so a
+/// Standing Approval covers the whole host and a second fetch to the same host
+/// auto-approves.
 pub fn gate_text(name: &str, input: &Value) -> Option<String> {
     let (_, field) = GATED.iter().find(|(tool, _)| *tool == name)?;
-    Some(
-        input
-            .get(field)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-    )
+    let raw = input.get(field).and_then(Value::as_str).unwrap_or("");
+    if name == "web_fetch" {
+        Some(web_fetch_domain(raw))
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// The DOMAIN a web_fetch Approval scopes to (qwen web-fetch.ts
+/// `getConfirmationDetails`): the URL's hostname, or - if the URL will not parse
+/// or carries no host - the raw string itself (qwen's `catch { domain = url }`).
+/// Domain-scoped is the deliberate widening ADR-0024 (revised) chose for
+/// qwen-fidelity: a Standing Approval on `docs.rs` covers every path under it,
+/// so repeated doc lookups do not re-prompt per URL.
+fn web_fetch_domain(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| url.to_string())
 }
 
 /// A unique identifier for an Approval request, standing in for baud's
@@ -261,10 +278,28 @@ mod tests {
     }
 
     #[test]
-    fn gate_text_is_the_url_for_web_fetch() {
+    fn gate_text_is_the_domain_for_web_fetch() {
+        // Domain-scoped (ADR-0024, revised, faithful to qwen): the gate text is
+        // the URL's hostname, so a Standing Approval covers every path under it.
         assert_eq!(
-            gate_text("web_fetch", &json!({"url": "https://docs.rs/tokio"})),
-            Some("https://docs.rs/tokio".to_string())
+            gate_text("web_fetch", &json!({"url": "https://docs.rs/tokio/latest"})),
+            Some("docs.rs".to_string())
+        );
+        // A second fetch to the same host reads the same gate text (would
+        // auto-approve under a Standing Approval).
+        assert_eq!(
+            gate_text("web_fetch", &json!({"url": "https://docs.rs/serde"})),
+            Some("docs.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_text_web_fetch_falls_back_to_the_raw_string_when_unparseable() {
+        // qwen's `catch { domain = url }`: an unparseable URL (or one with no
+        // host) scopes to the raw string itself.
+        assert_eq!(
+            gate_text("web_fetch", &json!({"url": "not a url"})),
+            Some("not a url".to_string())
         );
     }
 

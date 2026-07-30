@@ -417,6 +417,121 @@ async fn approved_run_command_executes_and_returns_its_output() {
     recv_match(&mut rx, is_run_finished).await;
 }
 
+// ---- ask_user_question (ADR-0057) -------------------------------------
+
+// A Run whose model calls `ask_user_question`: assert a QuestionRequest is
+// broadcast, answer it, and assert the tool result is the VERBATIM formatted
+// string. Mirrors the approval integration test (request event -> resolve ->
+// tool result), but through the question round-trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_user_question_opens_the_modal_and_formats_the_answer() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "tu_ask",
+            "ask_user_question",
+            json!({
+                "questions": [{
+                    "question": "Which library should we use?",
+                    "header": "Library",
+                    "options": [
+                        { "label": "serde", "description": "the standard" },
+                        { "label": "miniserde", "description": "smaller" }
+                    ]
+                }]
+            }),
+        )),
+        Entry::just(text_end("using serde then")),
+    ]);
+
+    agent.submit("pick a library").await.unwrap();
+
+    // The tool opened the modal: a QuestionRequest carrying the question id and
+    // the shaped questions.
+    let req = recv_match(&mut rx, |e| matches!(e, Event::QuestionRequest { .. })).await;
+    let (id, questions) = match req {
+        Event::QuestionRequest {
+            question_id,
+            questions,
+        } => (question_id, questions),
+        other => panic!("expected a QuestionRequest, got {other:?}"),
+    };
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].header, "Library");
+
+    // Answer it as the UI would (row 0 = "serde").
+    agent
+        .answer_question(id.clone(), Ok(vec![(0, "serde".to_string())]))
+        .await;
+
+    // The Agent emits QuestionResolved once the tool reads the reply.
+    recv_match(&mut rx, |e| {
+        matches!(e, Event::QuestionResolved { question_id } if *question_id == id)
+    })
+    .await;
+
+    // The tool result is the VERBATIM formatted answer string.
+    let result = recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "tu_ask"),
+    )
+    .await;
+    if let Event::ToolResult { content, .. } = result {
+        assert_eq!(
+            content,
+            "User has provided the following answers:\n\n**Library**: serde"
+        );
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
+// The decline path: answering with the VERBATIM decline string yields it as the
+// tool result content (an ordinary, non-error result - qwen returns it as both
+// llmContent and display).
+#[tokio::test(flavor = "multi_thread")]
+async fn declining_a_question_yields_the_verbatim_decline_string() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "tu_ask",
+            "ask_user_question",
+            json!({
+                "questions": [{
+                    "question": "Which library should we use?",
+                    "header": "Library",
+                    "options": [
+                        { "label": "serde", "description": "the standard" },
+                        { "label": "miniserde", "description": "smaller" }
+                    ]
+                }]
+            }),
+        )),
+        Entry::just(text_end("okay, skipping")),
+    ]);
+
+    agent.submit("pick a library").await.unwrap();
+
+    let id = match recv_match(&mut rx, |e| matches!(e, Event::QuestionRequest { .. })).await {
+        Event::QuestionRequest { question_id, .. } => question_id,
+        other => panic!("expected a QuestionRequest, got {other:?}"),
+    };
+
+    agent
+        .answer_question(
+            id.clone(),
+            Err("User declined to answer the questions.".to_string()),
+        )
+        .await;
+
+    let result = recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ToolResult { id, .. } if id == "tu_ask"),
+    )
+    .await;
+    if let Event::ToolResult { content, .. } = result {
+        assert_eq!(content, "User declined to answer the questions.");
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
 // ---- standing approval ------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
