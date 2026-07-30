@@ -82,6 +82,14 @@ pub trait Tool: Send + Sync {
     fn search_hint(&self) -> Option<&str> {
         None
     }
+
+    /// When true, the tool was discovered from an MCP server (F8, ADR-0056), so
+    /// `tool_search` weighs it slightly higher - it is always deferred, and
+    /// discovery is the only way the model reaches it. Every built-in tool
+    /// answers false; only [`crate::mcp::adapter::McpTool`] overrides it.
+    fn is_mcp(&self) -> bool {
+        false
+    }
 }
 
 /// The ctx every Tool Call executes with: the Session's Project Root, the

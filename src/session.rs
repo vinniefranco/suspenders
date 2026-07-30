@@ -113,6 +113,13 @@ pub struct Session {
     /// The output cap for Models the Catalog does not know (the config knob):
     /// the synthesis fallback when a scoped id resolves at `/model` time.
     pub max_tokens: u64,
+    /// The configured MCP servers, keyed by user-chosen name (F8, ADR-0056):
+    /// each an external tool server the Agent attaches once at startup. A
+    /// file-only map like `providers` (structure the env cannot express). Empty
+    /// when the user configures none. Each entry's transport is validated at
+    /// build (a malformed entry is a LOUD launch failure); the attach itself is
+    /// fail-open (a server that will not connect is skipped, not fatal).
+    pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
 }
 
 /// Raised (returned) when a Session's fixed facts fail validation. The message
@@ -130,6 +137,9 @@ pub struct SessionConfig {
     /// the env cannot express. A custom entry shadows a built-in with the
     /// same id.
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// The MCP servers, keyed by user-chosen name (F8, ADR-0056): a file-only
+    /// map like `providers`. Default empty; overlaid (replace) by the file.
+    pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
     /// The scoped `provider/model-id` the launch Model resolves from.
     pub model: String,
     /// The configured Theme name (ADR-0038): a built-in (`dark`, `light`) or a
@@ -229,6 +239,9 @@ impl SessionConfig {
                     token: None,
                 },
             )]),
+            // No MCP servers out of the box (F8, ADR-0056): the user adds them
+            // by hand. Empty means the Agent attaches none.
+            mcp_servers: BTreeMap::new(),
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             theme: "dark".into(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -358,6 +371,10 @@ impl SessionConfig {
             // Per-provider tokens are deliberately absent from base(): the
             // template never persists a secret.
             providers: Some(base.providers),
+            // The MCP servers map (F8, ADR-0056): base ships none, so this is an
+            // empty map in the template - the key is present + self-documenting,
+            // the user fills it with `command`/`http_url` entries by hand.
+            mcp_servers: Some(base.mcp_servers),
             model: Some(base.model),
             theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
@@ -509,6 +526,11 @@ pub struct ProviderConfig {
 pub(crate) struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     providers: Option<BTreeMap<String, ProviderConfig>>,
+    /// The MCP servers map (F8, ADR-0056): the Suspenders-native snake_case key
+    /// is `mcp_servers`. qwen-code names the same map `mcpServers` (camelCase);
+    /// the divergence is deliberate - a config port stays in Suspenders' idiom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_servers: Option<BTreeMap<String, crate::mcp::McpServerConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -557,6 +579,7 @@ impl FileConfig {
     /// through `validate()` on the built [`Session`].
     fn apply(&self, cfg: &mut SessionConfig) {
         overlay(&self.providers, &mut cfg.providers);
+        overlay(&self.mcp_servers, &mut cfg.mcp_servers);
         overlay(&self.model, &mut cfg.model);
         overlay(&self.theme, &mut cfg.theme);
         overlay(&self.max_tokens, &mut cfg.max_tokens);
@@ -838,6 +861,10 @@ impl Session {
             thinking_budget: opts.thinking_budget.unwrap_or(config.thinking_budget),
             tool_call_style: opts.tool_call_style.unwrap_or(config.tool_call_style),
             max_tokens: config.max_tokens,
+            // The MCP servers ride from config verbatim (F8, ADR-0056): a
+            // file-only map like `providers`, no opts override. Each entry's
+            // transport is validated below.
+            mcp_servers: config.mcp_servers.clone(),
         };
 
         validate(&session)?;
@@ -1023,9 +1050,22 @@ fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionE
 fn validate(s: &Session) -> Result<(), SessionError> {
     validate_scalars(s)?;
     validate_providers(s)?;
+    validate_mcp_servers(s)?;
     // The per-Model budget invariants, applied to the launch Model here; the
     // Agent re-applies them to every `/model` pick (ADR-0037).
     s.validate_model_budget(&s.model).map_err(SessionError)?;
+    Ok(())
+}
+
+// Each MCP server entry must resolve a transport (F8, ADR-0056): a malformed
+// entry - both `command` and `http_url`, or neither - is a LOUD launch failure
+// here, distinct from the fail-open connect path (a server that resolves but
+// will not connect is skipped at attach, not rejected here).
+fn validate_mcp_servers(s: &Session) -> Result<(), SessionError> {
+    for (name, cfg) in &s.mcp_servers {
+        cfg.transport()
+            .map_err(|reason| SessionError(format!("mcp_server {name:?}: {reason}")))?;
+    }
     Ok(())
 }
 
@@ -1876,6 +1916,72 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn file_config_parses_an_mcp_servers_block_stdio_and_http() {
+        // A stdio entry and an HTTP entry round-trip through FileConfig, keyed
+        // by the snake_case `mcp_servers` key (F8, ADR-0056).
+        let fc = FileConfig::parse(
+            r#"{"mcp_servers": {
+                "fs": {
+                    "command": "mcp-fs",
+                    "args": ["--root", "/tmp"],
+                    "env": {"LOG": "debug"},
+                    "exclude_tools": ["delete"]
+                },
+                "remote": {
+                    "http_url": "https://mcp.example.test/mcp",
+                    "headers": {"Authorization": "Bearer x"},
+                    "trust": true
+                }
+            }}"#,
+        )
+        .unwrap();
+        let servers = fc.mcp_servers.clone().unwrap();
+
+        let fs = &servers["fs"];
+        assert_eq!(fs.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(fs.args, vec!["--root".to_string(), "/tmp".to_string()]);
+        assert_eq!(fs.env["LOG"], "debug");
+        assert_eq!(fs.exclude_tools, vec!["delete".to_string()]);
+        assert!(matches!(fs.transport(), Ok(crate::mcp::McpTransport::Stdio { .. })));
+
+        let remote = &servers["remote"];
+        assert_eq!(remote.http_url.as_deref(), Some("https://mcp.example.test/mcp"));
+        assert_eq!(remote.headers["Authorization"], "Bearer x");
+        assert_eq!(remote.trust, Some(true));
+        assert!(matches!(remote.transport(), Ok(crate::mcp::McpTransport::Http { .. })));
+    }
+
+    #[test]
+    fn file_config_mcp_server_entry_rejects_an_unknown_key() {
+        // Each server entry is deny_unknown_fields too - a typo'd key is a loud
+        // parse error (ADR-0056).
+        assert!(
+            FileConfig::parse(
+                r#"{"mcp_servers": {"x": {"command": "cmd", "bogus": 1}}}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_build_rejects_a_malformed_mcp_server_transport() {
+        // A malformed entry (both transports) is a LOUD launch failure at build,
+        // distinct from the fail-open connect path (ADR-0056).
+        let mut cfg = cfg();
+        cfg.mcp_servers.insert(
+            "broken".to_string(),
+            crate::mcp::McpServerConfig {
+                command: Some("cmd".into()),
+                http_url: Some("https://x.test".into()),
+                ..Default::default()
+            },
+        );
+        let err = Session::build(SessionOpts::default(), &cfg).unwrap_err();
+        assert!(err.0.contains("mcp_server"));
+        assert!(err.0.contains("broken"));
     }
 
     #[test]

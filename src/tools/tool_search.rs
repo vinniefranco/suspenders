@@ -198,9 +198,15 @@ impl Tool for ToolSearch {
             if !candidate_matches_required(&spec.name, &required_terms) {
                 continue;
             }
-            // Real tools are never MCP-sourced yet; the `is_mcp` weight branch is
-            // pinned by unit tests for when MCP lands (P-later).
-            let score = score_tool(&spec, registry.search_hint_of(&name).as_deref(), &search_terms, false);
+            // MCP-discovered tools score slightly higher (F8, ADR-0056): they
+            // are always deferred, so surfacing them through search is the only
+            // way the model reaches them. The flag comes off the live registry.
+            let score = score_tool(
+                &spec,
+                registry.search_hint_of(&name).as_deref(),
+                &search_terms,
+                registry.is_mcp(&name),
+            );
             if score > 0 {
                 scored.push((spec.name, score));
             }
@@ -521,6 +527,7 @@ mod tests {
         hint: Option<String>,
         defer: bool,
         always: bool,
+        is_mcp: bool,
     }
 
     impl Fixture {
@@ -531,6 +538,7 @@ mod tests {
                 hint: None,
                 defer: true,
                 always: false,
+                is_mcp: false,
             })
         }
         fn deferred_with_hint(name: &str, desc: &str, hint: &str) -> Box<dyn Tool> {
@@ -540,6 +548,7 @@ mod tests {
                 hint: Some(hint.to_string()),
                 defer: true,
                 always: false,
+                is_mcp: false,
             })
         }
         fn core(name: &str, desc: &str) -> Box<dyn Tool> {
@@ -549,6 +558,7 @@ mod tests {
                 hint: None,
                 defer: false,
                 always: false,
+                is_mcp: false,
             })
         }
         fn always_load(name: &str, desc: &str) -> Box<dyn Tool> {
@@ -558,6 +568,19 @@ mod tests {
                 hint: None,
                 defer: true,
                 always: true,
+                is_mcp: false,
+            })
+        }
+        /// A deferred, MCP-sourced fixture: same shape as `deferred` but its
+        /// `is_mcp()` is true, so the scorer weighs it higher (F8, ADR-0056).
+        fn mcp(name: &str, desc: &str) -> Box<dyn Tool> {
+            Box::new(Fixture {
+                name: name.to_string(),
+                description: desc.to_string(),
+                hint: None,
+                defer: true,
+                always: false,
+                is_mcp: true,
             })
         }
     }
@@ -582,6 +605,9 @@ mod tests {
         }
         fn search_hint(&self) -> Option<&str> {
             self.hint.as_deref()
+        }
+        fn is_mcp(&self) -> bool {
+            self.is_mcp
         }
     }
 
@@ -781,6 +807,26 @@ mod tests {
         assert!(registry.is_revealed("slack_send_message"));
         let second = search(registry, "slack").await;
         assert!(second.contains("No tools found matching"));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tool_outranks_an_identical_builtin_via_registry_is_mcp() {
+        // Two deferred tools that match the query identically; only one is
+        // MCP-sourced. The scorer reads `is_mcp` off the LIVE registry (F8,
+        // ADR-0056), so the MCP tool ranks first in the returned block order.
+        let registry = Arc::new(ToolRegistry::new(vec![
+            Fixture::deferred("send_builtin", "send a message"),
+            Fixture::mcp("send_mcp", "send a message"),
+        ]));
+        let content = search(registry, "send").await;
+        let mcp_at = content.find("\"name\":\"send_mcp\"").expect("mcp present");
+        let builtin_at = content
+            .find("\"name\":\"send_builtin\"")
+            .expect("builtin present");
+        assert!(
+            mcp_at < builtin_at,
+            "the MCP tool should be ranked ahead of the identical built-in"
+        );
     }
 
     #[tokio::test]

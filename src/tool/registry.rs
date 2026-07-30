@@ -14,6 +14,7 @@
 //! reset).
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::tool::{Tool, ToolCtx, ToolResult, ToolSpec, validate};
@@ -21,14 +22,35 @@ use crate::tool::{Tool, ToolCtx, ToolResult, ToolSpec, validate};
 /// The tool set plus the revealed-deferred name set. A `Box<dyn Tool>` is not
 /// `Debug`, so the [`Debug`] impl below is hand-written (tool count + names)
 /// rather than derived.
+///
+/// The tool set rides an `Arc<[Box<dyn Tool>]>` so one Session-stable set backs
+/// every per-Run registry without re-boxing the tools each Run (F8, ADR-0056):
+/// the Agent builds the set once (built-ins + discovered MCP tools) and each Run
+/// gets a fresh [`with_shared`](ToolRegistry::with_shared) registry over the
+/// same `Arc` with its own empty revealed set. `Arc<[T]>` derefs to `[T]`, so
+/// every read below is unchanged.
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Arc<[Box<dyn Tool>]>,
     revealed: Mutex<BTreeSet<String>>,
 }
 
 impl ToolRegistry {
-    /// Builds a registry over the given tool set (prompt order preserved).
+    /// Builds a registry over the given tool set (prompt order preserved). The
+    /// `Vec` is moved into the backing `Arc<[…]>`; a caller that needs to share
+    /// one set across Runs uses [`with_shared`](ToolRegistry::with_shared).
     pub fn new(tools: Vec<Box<dyn Tool>>) -> Self {
+        ToolRegistry {
+            tools: tools.into(),
+            revealed: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// Builds a registry sharing an existing `Arc<[Box<dyn Tool>]>` - the
+    /// Session-stable tool set the Agent built once - with a FRESH empty
+    /// revealed set (F8, ADR-0056). Cloning the `Arc` is a refcount bump; the
+    /// tools are not re-boxed. Two registries over the same `Arc` keep
+    /// independent reveal state (each Run reveals on its own copy).
+    pub fn with_shared(tools: Arc<[Box<dyn Tool>]>) -> Self {
         ToolRegistry {
             tools,
             revealed: Mutex::new(BTreeSet::new()),
@@ -95,6 +117,17 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.spec().name == canonical)
             .map(|t| t.should_defer() && !t.always_load())
+            .unwrap_or(false)
+    }
+
+    /// Whether the tool with this exact (canonical) name was discovered from an
+    /// MCP server (F8, ADR-0056). `tool_search` reads it to weigh MCP tools
+    /// slightly higher in its scoring. An unknown name answers false.
+    pub fn is_mcp(&self, canonical: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.spec().name == canonical)
+            .map(|t| t.is_mcp())
             .unwrap_or(false)
     }
 
@@ -355,5 +388,88 @@ mod tests {
         assert!(!registry.is_loadable("meta"));
         assert!(!registry.is_loadable("core"));
         assert!(!registry.is_loadable("missing"));
+    }
+
+    // ---- MCP tools in a registry (F8, ADR-0056) ----
+
+    /// A [`crate::mcp::McpConn`] answering with empty text, for an McpTool
+    /// fixture in the registry tests.
+    struct QuietConn;
+
+    #[async_trait]
+    impl crate::mcp::McpConn for QuietConn {
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<crate::mcp::McpCallResult, crate::mcp::McpError> {
+            Ok(crate::mcp::McpCallResult {
+                content: vec![],
+                is_error: false,
+            })
+        }
+    }
+
+    fn mcp_tool() -> Box<dyn Tool> {
+        Box::new(crate::mcp::adapter::McpTool::new(
+            "srv",
+            "do_thing",
+            "does a thing",
+            json!({"type": "object", "properties": {}, "required": []}),
+            std::sync::Arc::new(QuietConn),
+            None,
+        ))
+    }
+
+    #[test]
+    fn an_mcp_tool_is_hidden_from_specs_but_listed_in_deferred_summary() {
+        let registry = ToolRegistry::new(vec![fixture("core", false, false), mcp_tool()]);
+        // Hidden from the base wire list (MCP tools are all deferred).
+        assert_eq!(spec_names(&registry), vec!["core".to_string()]);
+        // But listed for the model to discover.
+        let deferred: Vec<String> = registry
+            .deferred_summary()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(deferred, vec!["mcp__srv__do_thing".to_string()]);
+    }
+
+    #[test]
+    fn revealing_an_mcp_tool_joins_specs() {
+        let registry = ToolRegistry::new(vec![fixture("core", false, false), mcp_tool()]);
+        registry.reveal("mcp__srv__do_thing");
+        let mut names = spec_names(&registry);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["core".to_string(), "mcp__srv__do_thing".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_mcp_is_true_for_the_adapter_and_false_for_a_builtin() {
+        let registry = ToolRegistry::new(vec![fixture("core", false, false), mcp_tool()]);
+        assert!(registry.is_mcp("mcp__srv__do_thing"));
+        assert!(!registry.is_mcp("core"));
+        assert!(!registry.is_mcp("missing"));
+    }
+
+    #[test]
+    fn with_shared_gives_two_registries_independent_reveals_over_one_arc() {
+        let shared: std::sync::Arc<[Box<dyn Tool>]> =
+            vec![fixture("core", false, false), fixture("hidden", true, false)].into();
+        let a = ToolRegistry::with_shared(std::sync::Arc::clone(&shared));
+        let b = ToolRegistry::with_shared(std::sync::Arc::clone(&shared));
+
+        a.reveal("hidden");
+        // The reveal is registry-local: `a` sees it, `b` does not, even though
+        // both share the one tool-set Arc.
+        assert!(a.is_revealed("hidden"));
+        assert!(!b.is_revealed("hidden"));
+        assert_eq!(spec_names(&b), vec!["core".to_string()]);
+        let mut a_names = spec_names(&a);
+        a_names.sort();
+        assert_eq!(a_names, vec!["core".to_string(), "hidden".to_string()]);
     }
 }

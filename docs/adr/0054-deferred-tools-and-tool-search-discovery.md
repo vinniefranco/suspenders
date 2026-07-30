@@ -10,6 +10,13 @@ The registry handle is the first capability carried on `ToolCtx`; F1 (the capabi
 
 Consequences:
 
-- The Agent's one-time tool-spec overhead estimate uses the base `tools::specs()` (nothing revealed yet). Reveals add token cost on demand that the estimate does not pre-count - the same property qwen has, and the reason the reveal-aware list is read only in the request builder.
+- The Agent's one-time tool-spec overhead estimate uses a per-session registry's `specs()` (the base wire list, nothing revealed yet). Reveals add token cost on demand that the estimate does not pre-count - the same property qwen has, and the reason the reveal-aware list is read only in the request builder.
 - The `<function>` blocks `tool_search` returns serialize the native Anthropic `ToolSpec` (`input_schema`, ADR-0003), not qwen's Gemini `parametersJsonSchema` shape.
-- In this phase no built-in is deferred, so the "## Deferred Tools" section is empty and the machinery is inert. It exists for the phases that flip `should_defer` (subagents, skills, MCP).
+
+## Revision (F8 / ADR-0056: MCP tools land)
+
+MCP tools (ADR-0056) are the first tools that are actually deferred, and they are *instance-dependent*: they register on a specific tool set that depends on the Session's configured servers, not on a static built-in list. Three things become live:
+
+- **The Session-stable tool set is `Arc`-shared.** The Agent builds one `Arc<[Box<dyn Tool>]>` at startup (built-ins plus discovered `mcp__*` tools) and each Run's registry is built with `ToolRegistry::with_shared` over it - a fresh empty `revealed` set per Run, no re-boxing of the tools. `ToolRegistry::new(Vec<…>)` stays for tests and the single-Session case.
+- **The overhead and the Deferred Tools section are sourced from a live per-session registry**, not the built-in-only `tools::specs()`/`tools::deferred_summary()` free fns. The Agent builds a per-session `with_shared` registry in `init_agent` and reads both figures off it. Because MCP tools are all deferred, `specs()` excludes them, so the overhead is unchanged and correct (exactly as if no server were attached); `deferred_summary()` now lists the `mcp__*` tools, so the model sees them in the "## Deferred Tools" section and can `tool_search` for them. The `tools.rs` free fns stay as the documented built-in floor.
+- **`is_mcp` scoring is live.** `tool_search` reads `registry.is_mcp(name)` (a new registry accessor backed by a defaulted `Tool::is_mcp()`), so an MCP tool outranks an identical built-in - discovery is the only way the model reaches a deferred MCP tool. The scoring branch that was pinned by unit tests for this phase is now on the production path.

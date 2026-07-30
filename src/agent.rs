@@ -271,51 +271,12 @@ impl AgentHandle {
         // logged Plan - no re-reading the log for the Plan.
         let (resumed_messages, resume_info, plan) = maybe_resume(resume, &session)?;
 
-        // The tool specs ride with every request but live outside the messages;
-        // the estimate has to count them or Eviction fires late (baud's
-        // `String.length(JSON.encode!(Baud.Tools.specs()))`). A ToolSpec
-        // serializes to exactly its wire shape (name, description,
-        // input_schema), so serde counts what a request would carry.
-        let overhead = serde_json::to_string(&tools::specs())
-            .map(|s| s.chars().count() as u64)
-            .unwrap_or(0);
-
         // The Active Model lives here as mutable Agent state (ADR-0033,
         // CONTEXT.md: Active Model), seeded from the Session's launch-resolved
         // Model. Each Run is spawned with a snapshot of THIS Model, so a
         // `SetModel` between Runs lands on the next Run and an in-flight
         // Run finishes on the Model it captured.
         let model = session.model.clone();
-
-        // Append the Deferred Tools section to the system prompt (F3): the model
-        // needs to know which tools exist off the wire list so it can reach them
-        // via `tool_search`. The summary is static across reveals (reveal only
-        // moves a name onto the wire list, it does not change what is *deferred*),
-        // so it is computed once here. For P1a nothing is deferred, so this is a
-        // no-op empty append; the machinery is here for the phases that flip
-        // `should_defer`. INTERIM SEAM: F5 will eventually own prompt-section
-        // composition.
-        let deferred = tools::deferred_summary();
-        let system_prompt =
-            format!("{system_prompt}{}", crate::context_files::deferred_tools_section(&deferred));
-
-        // The budget figures derive from the launch Model here and are
-        // re-derived from the captured Model at every Run start (ADR-0037,
-        // `reset_run_state`).
-        let mut conversation = Conversation::new(
-            system_prompt,
-            ConversationOpts::new(
-                session.context_budget_for(&model),
-                session.reply_reserve_for(&model),
-            )
-                .overhead_chars(overhead)
-                .compaction_slack(session.compaction_slack)
-                .compaction_keep(session.compaction_keep),
-        );
-        // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.
-        let mut seeded = resumed_messages.clone();
-        seeded.extend(std::mem::take(&mut conversation.messages));
-        conversation.messages = seeded;
 
         // Every Session gets a fresh log; a Resume seeds it with the folded
         // messages verbatim so the new file alone rebuilds the Conversation.
@@ -342,27 +303,29 @@ impl AgentHandle {
             }))
         };
 
-        let state = AgentState {
+        // The rest of the Session's assembly - MCP connect, the
+        // built-ins+MCP tool set, the tool-spec overhead, and the Deferred Tools
+        // system-prompt section - must see the MCP tools, so it moves into the
+        // async init below (`init_agent`). It is `async` (the connect awaits per
+        // server), so it cannot run in this sync `start`; the raw pieces travel
+        // there in [`AgentInit`].
+        let init = AgentInit {
             session,
-            run_provenance: model.provenance(),
             model,
             llm,
-            conversation,
+            system_prompt,
+            resumed_messages,
             log,
             resume_info,
             plan,
             events: events.clone(),
-            task: None,
-            cancel_flag: false,
-            settlement: Settlement::new(),
-            approvals: Approvals::new(),
-            approval_replies: HashMap::new(),
-            steering: Vec::new(),
-            compaction: Compaction::new(),
             self_tx: tx.clone(),
         };
 
-        tokio::spawn(run_agent(state, rx));
+        tokio::spawn(async move {
+            let state = init_agent(init).await;
+            run_agent(state, rx).await;
+        });
 
         Ok(AgentHandle { tx, events })
     }
@@ -546,6 +509,144 @@ struct AgentState {
     // A clone of the mpsc sender, handed to the Run's AgentDeps so the Run
     // talks back over the same channel, and used to post the Run's outcome.
     self_tx: mpsc::UnboundedSender<Msg>,
+    // The attached MCP servers (F8, ADR-0056): connected once in `init_agent`,
+    // held for the Session's lifetime so the transports stay alive. Read only
+    // for `failures()` (a startup notice); the tools themselves live on
+    // `session_tools`.
+    #[allow(dead_code)]
+    mcp: crate::mcp::manager::McpManager,
+    // The Session-stable tool set (F8, ADR-0056): built-ins plus discovered MCP
+    // tools, built once in `init_agent`. Threaded into each Run's Capture (via
+    // AgentDeps) so every Run's registry shares it.
+    session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+}
+
+/// The raw Session pieces `start` resolves synchronously and hands to the async
+/// [`init_agent`], which finishes assembly (MCP connect, the tool set, the
+/// tool-spec overhead, the Deferred Tools system-prompt section, the
+/// Conversation) - all of which must see the MCP tools, so they cannot run in
+/// the sync `start` (the connect awaits).
+struct AgentInit {
+    session: Session,
+    model: Model,
+    llm: Arc<dyn Llm>,
+    system_prompt: String,
+    resumed_messages: Vec<crate::content::Message>,
+    log: Option<Log>,
+    resume_info: Option<ResumeInfo>,
+    plan: Option<String>,
+    events: broadcast::Sender<Event>,
+    self_tx: mpsc::UnboundedSender<Msg>,
+}
+
+/// The async second half of Agent construction (F8, ADR-0056): attach the MCP
+/// servers, assemble the Session-stable tool set (built-ins + discovered MCP
+/// tools), and build the Conversation whose tool-spec overhead and Deferred
+/// Tools section are sourced from a LIVE per-session registry over that set - so
+/// both now count the MCP tools. Fail-open: a broken server is recorded on the
+/// manager and skipped, never fatal.
+async fn init_agent(init: AgentInit) -> AgentState {
+    let AgentInit {
+        session,
+        model,
+        llm,
+        system_prompt,
+        resumed_messages,
+        log,
+        resume_info,
+        plan,
+        events,
+        self_tx,
+    } = init;
+
+    // Attach the MCP servers once (fail-open). The discovered tools join the
+    // built-ins to form the Session-stable set every Run shares.
+    let (mcp, adapters) = crate::mcp::manager::McpManager::connect(&session.mcp_servers).await;
+
+    // Surface each fail-open connect skip as a launch notice (ADR-0007's
+    // fail-open report seam, the same line an Extension crash takes): a broken
+    // MCP server is a visible skip, not a silent one. Server-name-sorted, so the
+    // notices are stable across runs. This is the only production reader of
+    // `mcp.failures()`.
+    for (server, reason) in mcp.failures() {
+        let _ = events.send(Event::extension_error(
+            format!("mcp server {server}"),
+            crate::event::Stage::PreRun,
+            format!("could not connect - {reason}"),
+        ));
+    }
+
+    let mut all = tools::tools();
+    all.extend(adapters);
+    let session_tools: Arc<[Box<dyn crate::tool::Tool>]> = all.into();
+
+    // A live per-session registry over the Session-stable set, used ONLY to
+    // source the overhead + Deferred Tools section here at launch (the Runs
+    // build their own `with_shared` registries). It includes the MCP tools, so
+    // both figures now count them.
+    let session_registry = crate::tool_registry::ToolRegistry::with_shared(Arc::clone(&session_tools));
+
+    // The tool specs ride with every request but live outside the messages; the
+    // estimate has to count them or Eviction fires late (baud's
+    // `String.length(JSON.encode!(Baud.Tools.specs()))`). Sourced from the live
+    // registry's `specs()` - the BASE (non-revealed) wire list. MCP tools are
+    // all deferred, so they are excluded here: overhead is unchanged and
+    // correct, exactly as if no MCP server were attached (F8, ADR-0054).
+    let overhead = serde_json::to_string(&session_registry.specs())
+        .map(|s| s.chars().count() as u64)
+        .unwrap_or(0);
+
+    // Append the Deferred Tools section to the system prompt (F3, F8): the model
+    // needs to know which tools exist off the wire list so it can reach them via
+    // `tool_search`. Sourced from the live registry's `deferred_summary()`,
+    // which now INCLUDES the discovered `mcp__*` tools (ADR-0054, ADR-0056). The
+    // summary is static across reveals (a reveal moves a name onto the wire
+    // list, it does not change what is deferred), so it is computed once here.
+    // INTERIM SEAM: F5 will eventually own prompt-section composition.
+    let deferred = session_registry.deferred_summary();
+    let system_prompt = format!(
+        "{system_prompt}{}",
+        crate::context_files::deferred_tools_section(&deferred)
+    );
+
+    // The budget figures derive from the launch Model here and are re-derived
+    // from the captured Model at every Run start (ADR-0037, `reset_run_state`).
+    let mut conversation = Conversation::new(
+        system_prompt,
+        ConversationOpts::new(
+            session.context_budget_for(&model),
+            session.reply_reserve_for(&model),
+        )
+        .overhead_chars(overhead)
+        .compaction_slack(session.compaction_slack)
+        .compaction_keep(session.compaction_keep),
+    );
+    // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.
+    let mut seeded = resumed_messages.clone();
+    seeded.extend(std::mem::take(&mut conversation.messages));
+    conversation.messages = seeded;
+
+    AgentState {
+        session,
+        run_provenance: model.provenance(),
+        model,
+        llm,
+        conversation,
+        log,
+        resume_info,
+        plan,
+        events,
+        task: None,
+        cancel_flag: false,
+        settlement: Settlement::new(),
+        approvals: Approvals::new(),
+        approval_replies: HashMap::new(),
+        steering: Vec::new(),
+        compaction: Compaction::new(),
+        self_tx,
+        mcp,
+        session_tools,
+    }
 }
 
 async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) {
@@ -848,6 +949,7 @@ fn spawn_run(state: &mut AgentState) {
         state.session.thinking_budget,
         state.session.tool_call_style,
         state.compaction.clone(),
+        Arc::clone(&state.session_tools),
     );
     let conversation = state.conversation.clone();
     let session = state.session.clone();

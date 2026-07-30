@@ -47,9 +47,19 @@ pub(crate) struct AgentDeps {
     /// closes over it and, on success, notifies the Agent to log + update state
     /// (baud's compact_fn, ADR-0012).
     compaction: Compaction,
+    /// The Session-stable tool set (F8, ADR-0056): built-ins plus any MCP tools
+    /// the Agent discovered at startup. Threaded into each Run's [`Capture`] so
+    /// the Run's registry shares it (fresh reveal state per Run).
+    session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
 }
 
 impl AgentDeps {
+    // Each argument is a distinct Agent-owned value the Run captures at spawn
+    // (the channel, the Llm, the Model, the three request settings, the
+    // Compaction state, and now the Session-stable tool set). A Parameter Object
+    // would only rename the same bundle, so the targeted allow is clearer than
+    // the indirection.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tx: mpsc::UnboundedSender<Msg>,
         llm: Arc<dyn Llm>,
@@ -58,6 +68,7 @@ impl AgentDeps {
         thinking_budget: Option<u64>,
         tool_call_style: ToolCallStyle,
         compaction: Compaction,
+        session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
     ) -> Self {
         AgentDeps {
             tx,
@@ -67,6 +78,7 @@ impl AgentDeps {
             thinking_budget,
             tool_call_style,
             compaction,
+            session_tools,
         }
     }
 
@@ -83,6 +95,9 @@ impl AgentDeps {
             approver: Arc::new(AgentApprover {
                 tx: self.tx.clone(),
             }),
+            // The Session-stable tool set (F8, ADR-0056): the Run's registry
+            // shares it via `with_shared`, so MCP tools ride every Run.
+            tools: Arc::clone(&self.session_tools),
         }
     }
 

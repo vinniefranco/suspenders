@@ -63,11 +63,13 @@ pub fn specs() -> Vec<ToolSpec> {
 /// "Deferred Tools" system-prompt section, computed once at Run launch. Empty
 /// until a later phase flips `should_defer`.
 ///
-/// Sources the built-in set only. F8 (MCP) makes the deferred set
-/// instance-dependent - MCP tools register on a specific [`ToolRegistry`] and
-/// are all deferred - so once MCP lands this section must be sourced from the
-/// Run's live registry instead. The single-line throwaway build here is the
-/// interim: it owns the same summary logic the live registry would report.
+/// Sources the built-in set only - the built-in deferred floor. F8 (MCP) landed
+/// (ADR-0056): the Agent now sources its live Deferred Tools section from a
+/// per-session [`crate::tool_registry::ToolRegistry::with_shared`] registry over
+/// the built-ins PLUS the discovered `mcp__*` tools
+/// ([`crate::agent`]'s `init_agent`), so the section the model actually sees
+/// includes MCP tools. This free fn stays as the built-in floor these tests
+/// document; production reads the live registry instead.
 pub fn deferred_summary() -> Vec<(String, String)> {
     crate::tool_registry::ToolRegistry::new(tools()).deferred_summary()
 }

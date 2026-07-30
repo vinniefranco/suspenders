@@ -12,6 +12,7 @@ pub mod env_context;
 pub mod event;
 pub mod extensions;
 pub mod llm;
+pub mod mcp;
 pub mod middleware;
 pub mod plan;
 pub mod presenter;

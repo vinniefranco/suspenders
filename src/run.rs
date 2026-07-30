@@ -43,6 +43,11 @@ pub struct Capture {
     /// alongside the registry it builds itself. `Arc<dyn Approver>` is Send+Sync,
     /// so the [`Capture`] stays `Send` for the `tokio::spawn` at the Agent.
     pub approver: Arc<dyn crate::tool::caps::Approver>,
+    /// The Session-stable tool set the Agent built once (F8, ADR-0056):
+    /// built-ins plus any discovered MCP tools. The Run builds its per-Run
+    /// [`crate::tool_registry::ToolRegistry`] over this shared `Arc` (fresh
+    /// revealed set per Run), so MCP tools ride every Run without re-boxing.
+    pub tools: Arc<[Box<dyn crate::tool::Tool>]>,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -59,12 +64,14 @@ pub async fn run(
     // Diff extension; the test config carries `[]`.
     let extensions = extensions::configured(&session.extensions);
 
-    // The Tool Registry, built once per Run (F3). Reveals are Run-scoped: a
+    // The Tool Registry, built once per Run (F3, F8). Reveals are Run-scoped: a
     // fresh registry per Run resets them, matching qwen's
-    // clearRevealedDeferredTools on session reset. It rides the Tool ctx so
+    // clearRevealedDeferredTools on session reset. It shares the Agent's
+    // Session-stable tool set (built-ins + discovered MCP tools, ADR-0056) via
+    // `with_shared`, so MCP tools ride every Run. It rides the Tool ctx so
     // `tool_search` can reveal deferred tools into the next request's wire list.
-    let registry = std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(
-        crate::tools::tools(),
+    let registry = std::sync::Arc::new(crate::tool_registry::ToolRegistry::with_shared(
+        Arc::clone(&capture.tools),
     ));
 
     // The Tool Capability Context (F1, ADR-0055): the registry the Run built plus
