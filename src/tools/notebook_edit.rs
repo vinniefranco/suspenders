@@ -30,7 +30,9 @@
 //! consumer of the read cache; `edit_file`/`write_file` do not yet consult it
 //! (DEFERRED, ADR-0060).
 
-use crate::tool::path::{FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim};
+use crate::tool::path::{
+    FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim,
+};
 use crate::tool::read_cache::ReadState;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
@@ -494,10 +496,7 @@ cells.",
         // A full read_file records a Fresh, full entry for the notebook.
         // read_file now takes an absolute `file_path` (qwen contract).
         crate::tools::read_file::ReadFile
-            .run_rich(
-                &json!({"file_path": nb_abs.to_string_lossy()}),
-                &ctx,
-            )
+            .run_rich(&json!({"file_path": nb_abs.to_string_lossy()}), &ctx)
             .await
             .unwrap();
 

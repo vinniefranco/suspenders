@@ -99,11 +99,7 @@ mod tests {
     #[test]
     fn comments_and_blank_lines_are_skipped() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join(".qwenignore"),
-            "# a comment\n\nbuild/\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".qwenignore"), "# a comment\n\nbuild/\n").unwrap();
         write(tmp.path(), "build/out.o", "x");
         write(tmp.path(), "src/main.rs", "x");
         assert!(is_ignored(tmp.path(), &tmp.path().join("build/out.o")));

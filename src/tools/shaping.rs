@@ -94,7 +94,13 @@ fn shape_text(tool_name: &str, input: &Value, content: &str, cap: usize) -> Stri
     if total <= cap {
         content.to_string()
     } else {
-        cut(tool_name, content, cap, total, read_offset(tool_name, input))
+        cut(
+            tool_name,
+            content,
+            cap,
+            total,
+            read_offset(tool_name, input),
+        )
     }
 }
 
@@ -109,13 +115,7 @@ fn read_offset(tool_name: &str, input: &Value) -> Option<i64> {
     }
 }
 
-fn cut(
-    tool_name: &str,
-    content: &str,
-    cap: usize,
-    total: usize,
-    offset: Option<i64>,
-) -> String {
+fn cut(tool_name: &str, content: &str, cap: usize, total: usize, offset: Option<i64>) -> String {
     match tool_name {
         "run_shell_command" => {
             let head = cap / HEAD_QUARTER;
@@ -306,8 +306,7 @@ mod tests {
             .map(|i| format!("line-{i:04}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let resume =
-            "[truncated at line 10 of 30 - continue with read_file offset 10 (0-based) and a limit]";
+        let resume = "[truncated at line 10 of 30 - continue with read_file offset 10 (0-based) and a limit]";
 
         assert!(st("read_file", &json!({"file_path": "/a.txt"}), &content, 100).contains(resume));
         assert!(st("read_file", &json!({"offset": "20"}), &content, 100).contains(resume));

@@ -120,8 +120,8 @@ impl Tool for Glob {
                 Some(_) => format!("within {}", abs.display()),
                 None => "in the workspace directory".to_string(),
             };
-            let root = resolve_path(path.unwrap_or("."), &ctx.root)
-                .unwrap_or_else(|_| abs.to_path_buf());
+            let root =
+                resolve_path(path.unwrap_or("."), &ctx.root).unwrap_or_else(|_| abs.to_path_buf());
             // The pattern matches relative to `root` (the search dir); ignores
             // anchor to `ctx.root` (the project root, glob.ts:159).
             Ok(search(abs, &root, &ctx.root, &regex, pattern, &location))
@@ -215,7 +215,11 @@ impl Entry {
 // `recency_window` of `now` are "recent" and sort first, newest to oldest;
 // everything older sorts after them, alphabetically by absolute path.
 fn sort_file_entries(entries: &mut [Entry], now: SystemTime, recency_window: Duration) {
-    let is_recent = |t: SystemTime| now.duration_since(t).map(|d| d < recency_window).unwrap_or(true);
+    let is_recent = |t: SystemTime| {
+        now.duration_since(t)
+            .map(|d| d < recency_window)
+            .unwrap_or(true)
+    };
     entries.sort_by(|a, b| {
         match (is_recent(a.mtime), is_recent(b.mtime)) {
             // Both recent: newest first (qwen `mtimeB - mtimeA`).
@@ -279,7 +283,10 @@ mod tests {
             spec.input_schema["properties"]["path"]["description"],
             json!(PATH_DESCRIPTION)
         );
-        assert!(spec.description.starts_with("Fast file pattern matching tool"));
+        assert!(
+            spec.description
+                .starts_with("Fast file pattern matching tool")
+        );
         assert!(spec.description.contains("use the Agent tool instead"));
     }
 
@@ -349,7 +356,12 @@ mod tests {
         let listed = out.split("\n---\n").nth(1).unwrap();
         assert_eq!(
             listed,
-            format!("{}\n{}\n{}", abs(&tmp, "a.rs"), abs(&tmp, "b.rs"), abs(&tmp, "c.rs")),
+            format!(
+                "{}\n{}\n{}",
+                abs(&tmp, "a.rs"),
+                abs(&tmp, "b.rs"),
+                abs(&tmp, "c.rs")
+            ),
         );
     }
 
@@ -503,9 +515,12 @@ mod tests {
         std::fs::write(tmp.path().join("build/top.txt"), "").unwrap();
         std::fs::write(tmp.path().join("sub/build/nested.txt"), "").unwrap();
 
-        let out = run(json!({"pattern": "**/*.txt", "path": "sub"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"pattern": "**/*.txt", "path": "sub"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         // Root-anchored: the nested build survives (it is not the top-level one).
         assert!(out.contains(&abs(&tmp, "sub/build/nested.txt")));
 
@@ -607,7 +622,11 @@ mod tests {
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            run(json!({"pattern": "*.rs", "path": "../.."}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "*.rs", "path": "../.."}),
+                &ctx(tmp.path())
+            )
+            .await,
             Err("path escapes project root".into())
         );
         assert_eq!(

@@ -59,8 +59,7 @@ const FILE_FILTERING_OPTIONS_DESCRIPTION: &str =
     "Optional: Whether to respect ignore patterns from .gitignore or .qwenignore";
 
 /// The verbatim `respect_git_ignore` property description (qwen ls.ts:337-338).
-const RESPECT_GIT_IGNORE_DESCRIPTION: &str =
-    "Optional: Whether to respect .gitignore patterns when listing files. Only available in git repositories. Defaults to true.";
+const RESPECT_GIT_IGNORE_DESCRIPTION: &str = "Optional: Whether to respect .gitignore patterns when listing files. Only available in git repositories. Defaults to true.";
 
 /// The verbatim `respect_qwen_ignore` property description (qwen ls.ts:342-343).
 const RESPECT_QWEN_IGNORE_DESCRIPTION: &str =
@@ -279,7 +278,12 @@ fn list(
 // Sort (directories first, then alphabetical by name), cap at MAX_ENTRY_COUNT,
 // and render qwen's header + `[DIR] ` lines + truncation trailer + ignored-count
 // suffix (ls.ts:243-280).
-fn render(mut entries: Vec<Entry>, display_path: &str, git_ignored: usize, qwen_ignored: usize) -> String {
+fn render(
+    mut entries: Vec<Entry>,
+    display_path: &str,
+    git_ignored: usize,
+    qwen_ignored: usize,
+) -> String {
     // Directories first, then alphabetical by name (qwen ls.ts:244-248).
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
@@ -289,7 +293,11 @@ fn render(mut entries: Vec<Entry>, display_path: &str, git_ignored: usize, qwen_
 
     let total = entries.len();
     let truncated = total > MAX_ENTRY_COUNT;
-    let shown = if truncated { &entries[..MAX_ENTRY_COUNT] } else { &entries[..] };
+    let shown = if truncated {
+        &entries[..MAX_ENTRY_COUNT]
+    } else {
+        &entries[..]
+    };
 
     let body = shown
         .iter()
@@ -373,13 +381,13 @@ mod tests {
             json!(FILE_FILTERING_OPTIONS_DESCRIPTION)
         );
         assert_eq!(
-            spec.input_schema["properties"]["file_filtering_options"]["properties"]
-                ["respect_git_ignore"]["description"],
+            spec.input_schema["properties"]["file_filtering_options"]["properties"]["respect_git_ignore"]
+                ["description"],
             json!(RESPECT_GIT_IGNORE_DESCRIPTION)
         );
         assert_eq!(
-            spec.input_schema["properties"]["file_filtering_options"]["properties"]
-                ["respect_qwen_ignore"]["description"],
+            spec.input_schema["properties"]["file_filtering_options"]["properties"]["respect_qwen_ignore"]
+                ["description"],
             json!(RESPECT_QWEN_IGNORE_DESCRIPTION)
         );
     }
@@ -410,7 +418,9 @@ mod tests {
         let p = abs(&tmp, "sub");
         assert_eq!(
             run(json!({"path": p}), &ctx(tmp.path())).await,
-            Ok(format!("Listed 2 item(s) in {p}:\n---\n[DIR] inner\nfile.txt"))
+            Ok(format!(
+                "Listed 2 item(s) in {p}:\n---\n[DIR] inner\nfile.txt"
+            ))
         );
     }
 
@@ -501,12 +511,20 @@ mod tests {
 
         // Wrong case: the file survives.
         assert_eq!(
-            run(json!({"path": p.clone(), "ignore": ["*.LOG"]}), &ctx(tmp.path())).await,
+            run(
+                json!({"path": p.clone(), "ignore": ["*.LOG"]}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok(format!("Listed 1 item(s) in {p}:\n---\nrun.log"))
         );
         // Right case: the file is dropped, leaving an empty listing.
         assert_eq!(
-            run(json!({"path": p.clone(), "ignore": ["*.log"]}), &ctx(tmp.path())).await,
+            run(
+                json!({"path": p.clone(), "ignore": ["*.log"]}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok(format!("Listed 0 item(s) in {p}:\n---\n"))
         );
     }

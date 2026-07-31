@@ -339,7 +339,10 @@ mod tests {
 
     #[test]
     fn gate_text_falls_back_to_empty_when_the_field_is_missing_or_non_string() {
-        assert_eq!(gate_text("run_shell_command", &json!({})), Some(String::new()));
+        assert_eq!(
+            gate_text("run_shell_command", &json!({})),
+            Some(String::new())
+        );
         assert_eq!(
             gate_text("web_fetch", &json!({"url": 42})),
             Some(String::new())

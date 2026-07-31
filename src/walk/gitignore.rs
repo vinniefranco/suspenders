@@ -87,7 +87,11 @@ mod tests {
     fn no_gitignore_ignores_nothing() {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "secret.txt", "x");
-        assert!(!is_ignored(tmp.path(), &tmp.path().join("secret.txt"), false));
+        assert!(!is_ignored(
+            tmp.path(),
+            &tmp.path().join("secret.txt"),
+            false
+        ));
     }
 
     #[test]
@@ -97,7 +101,11 @@ mod tests {
         write(tmp.path(), "ignored.txt", "x");
         write(tmp.path(), "run.log", "x");
         write(tmp.path(), "kept.txt", "x");
-        assert!(is_ignored(tmp.path(), &tmp.path().join("ignored.txt"), false));
+        assert!(is_ignored(
+            tmp.path(),
+            &tmp.path().join("ignored.txt"),
+            false
+        ));
         assert!(is_ignored(tmp.path(), &tmp.path().join("run.log"), false));
         assert!(!is_ignored(tmp.path(), &tmp.path().join("kept.txt"), false));
     }

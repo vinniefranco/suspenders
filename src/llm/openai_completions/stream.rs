@@ -407,7 +407,9 @@ mod tests {
     fn parallel_tool_calls_interleave_without_collapsing() {
         let r = fold(vec![
             tool_fragment(json!({ "index": 0, "id": "c1", "function": { "name": "read_file" } })),
-            tool_fragment(json!({ "index": 1, "id": "c2", "function": { "name": "list_directory" } })),
+            tool_fragment(
+                json!({ "index": 1, "id": "c2", "function": { "name": "list_directory" } }),
+            ),
             tool_fragment(json!({ "index": 0, "function": { "arguments": "{\"path\": \"a\"}" } })),
             tool_fragment(json!({ "index": 1, "function": { "arguments": "{}" } })),
             finish("tool_calls"),
@@ -484,7 +486,9 @@ mod tests {
     #[test]
     fn empty_accumulated_arguments_become_an_empty_map() {
         let r = fold(vec![
-            tool_fragment(json!({ "index": 0, "id": "c1", "function": { "name": "list_directory" } })),
+            tool_fragment(
+                json!({ "index": 0, "id": "c1", "function": { "name": "list_directory" } }),
+            ),
             finish("tool_calls"),
         ]);
         assert_eq!(
@@ -686,7 +690,9 @@ mod tests {
         assert_eq!(
             r.content,
             vec![
-                ContentBlock::text("<tool_call>\n<function=list_directory>\n</function>\n</tool_call>"),
+                ContentBlock::text(
+                    "<tool_call>\n<function=list_directory>\n</function>\n</tool_call>"
+                ),
                 ContentBlock::tool_use("call_1", "read_file", json!({ "path": "x" })),
             ]
         );

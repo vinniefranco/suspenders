@@ -404,7 +404,10 @@ mod tests {
         assert_eq!(accept_header("markdown"), "text/markdown");
         assert_eq!(accept_header("html"), "text/html");
         assert_eq!(accept_header("text"), "text/plain");
-        assert_eq!(accept_header("auto"), "text/markdown, text/html, text/plain");
+        assert_eq!(
+            accept_header("auto"),
+            "text/markdown, text/html, text/plain"
+        );
         // An absent/unknown value defaults to auto.
         assert_eq!(
             accept_header("something-else"),
@@ -592,7 +595,9 @@ Use tokio::spawn to spawn.\n---"
         // 404 Not Found` (no repeated url).
         assert_eq!(
             err,
-            format!("Error: Error during fetch for {url}: Request failed with status code 404 Not Found")
+            format!(
+                "Error: Error during fetch for {url}: Request failed with status code 404 Not Found"
+            )
         );
     }
 

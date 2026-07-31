@@ -604,7 +604,11 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
             "run_shell_command",
             json!({ "command": "echo hi" }),
         )),
-        Entry::just(tool_use_result("ls", "list_directory", json!({ "path": "." }))),
+        Entry::just(tool_use_result(
+            "ls",
+            "list_directory",
+            json!({ "path": "." }),
+        )),
         Entry::just(tool_use_result(
             "r2",
             "run_shell_command",
@@ -906,7 +910,11 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
     let (agent, mut rx) = session_harness(
         session,
         vec![
-            Entry::just(tool_use_result("t1", "list_directory", json!({ "path": path }))),
+            Entry::just(tool_use_result(
+                "t1",
+                "list_directory",
+                json!({ "path": path }),
+            )),
             barrier,
         ],
     );
@@ -968,7 +976,11 @@ async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_ma
 #[tokio::test(flavor = "multi_thread")]
 async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_marker() {
     let (_dir, session, agent, mut rx) = harness_with_session(vec![
-        Entry::just(tool_use_result("t1", "list_directory", json!({ "path": "." }))),
+        Entry::just(tool_use_result(
+            "t1",
+            "list_directory",
+            json!({ "path": "." }),
+        )),
         Entry::error("boom"),
     ]);
     let provenance = session.model.provenance();
@@ -1029,7 +1041,11 @@ async fn a_run_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error
 #[tokio::test(flavor = "multi_thread")]
 async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
     let (_dir, session, first, mut rx) = harness_with_session(vec![
-        Entry::just(tool_use_result("t1", "list_directory", json!({ "path": "." }))),
+        Entry::just(tool_use_result(
+            "t1",
+            "list_directory",
+            json!({ "path": "." }),
+        )),
         Entry::just(text_end("Nothing here.")),
     ]);
     let session_dir = session.session_dir.clone();
@@ -1077,9 +1093,21 @@ fn rider_session(dir: &TempDir) -> Session {
 // carried Conversation resumes byte-for-byte.
 fn exploring_script() -> Vec<Entry> {
     vec![
-        Entry::just(tool_use_result("t1", "list_directory", json!({ "path": "." }))),
-        Entry::just(tool_use_result("t2", "list_directory", json!({ "path": "." }))),
-        Entry::just(tool_use_result("t3", "list_directory", json!({ "path": "." }))),
+        Entry::just(tool_use_result(
+            "t1",
+            "list_directory",
+            json!({ "path": "." }),
+        )),
+        Entry::just(tool_use_result(
+            "t2",
+            "list_directory",
+            json!({ "path": "." }),
+        )),
+        Entry::just(tool_use_result(
+            "t3",
+            "list_directory",
+            json!({ "path": "." }),
+        )),
         Entry::just(text_end("done")),
     ]
 }
@@ -1160,7 +1188,11 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             SessionOpts {
                 root: Some(probe_dir.path().to_string_lossy().into_owned()),
                 session_dir: Some(
-                    probe_dir.path().join("sessions").to_string_lossy().into_owned(),
+                    probe_dir
+                        .path()
+                        .join("sessions")
+                        .to_string_lossy()
+                        .into_owned(),
                 ),
                 model: Some(model.clone()),
                 // Under the 64k model window and far above any run estimate, so
@@ -1793,7 +1825,9 @@ async fn recv_shell_done(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(Msg::Run(RunMsg::BackgroundShellDone { id, outcome }))) => return (id, outcome),
+            Ok(Some(Msg::Run(RunMsg::BackgroundShellDone { id, outcome }))) => {
+                return (id, outcome);
+            }
             Ok(Some(_)) => continue,
             Ok(None) => panic!("mpsc closed"),
             Err(_) => panic!("timed out waiting for BackgroundShellDone"),
@@ -1952,8 +1986,7 @@ async fn stop_background_shell_cancels_synchronously_and_drops_the_late_done() {
 async fn stop_background_shell_of_a_settled_shell_is_the_not_running_wording() {
     let dir = TempDir::new().unwrap();
     let session = session_in(&dir);
-    let (mut state, _rx) =
-        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+    let (mut state, _rx) = super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
     // Register a settled (Completed) shell by hand over a never-firing task.
     let handle = tokio::spawn(async { std::future::pending::<()>().await });
     state.background_shells.insert(

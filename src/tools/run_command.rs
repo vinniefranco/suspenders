@@ -145,7 +145,8 @@ impl Tool for RunCommand {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
-                    "invalid input: run_shell_command requires a non-empty string \"command\"".into(),
+                    "invalid input: run_shell_command requires a non-empty string \"command\""
+                        .into(),
                 );
             }
         };
@@ -258,7 +259,11 @@ fn validate_params(
 /// capability. Returns the "Background shell started." block (OMITTING the pid line
 /// and `/tasks` inspect sentence - no such UI here). A capability `Err` (a degraded
 /// host) folds into the tool error.
-async fn run_background(command: &str, cwd: &std::path::Path, ctx: &ToolCtx) -> Result<String, String> {
+async fn run_background(
+    command: &str,
+    cwd: &std::path::Path,
+    ctx: &ToolCtx,
+) -> Result<String, String> {
     let stripped = strip_shell_wrapper(command);
     // Refuse a top-level `git commit` in background mode. VERBATIM qwen wording
     // (shell.ts:2714-2717). Suspenders lacks qwen's `git notes` attribution path,
@@ -289,10 +294,8 @@ async fn run_background(command: &str, cwd: &std::path::Path, ctx: &ToolCtx) -> 
     // OMITTING the pid line and the `/tasks`/dialog inspect sentence (no such UI).
     // The capture-file path comes from the SHARED helper the Agent's watcher also
     // uses, so the reported path can never drift from the file that gets written.
-    let output_path = crate::agent::background_shell::output_path(
-        &ctx.session_dir.to_string_lossy(),
-        &id,
-    );
+    let output_path =
+        crate::agent::background_shell::output_path(&ctx.session_dir.to_string_lossy(), &id);
     Ok(format!(
         "Background shell started.\n\
          id: {id}\n\
@@ -578,10 +581,11 @@ fn is_env_assignment(token: &str) -> bool {
     if let Some(eq) = token.find('=') {
         let name = &token[..eq];
         !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             && name
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
     } else {
         false
     }
@@ -787,10 +791,7 @@ fn trim_trailing_shell_comment(command: &str) -> String {
             '`' if !in_double => in_backtick = !in_backtick,
             // A `#` begins a comment only at start-of-word (start of input or
             // preceded by whitespace), outside quotes/backticks.
-            '#' if !in_double
-                && !in_backtick
-                && (i == 0 || chars[i - 1].is_whitespace()) =>
-            {
+            '#' if !in_double && !in_backtick && (i == 0 || chars[i - 1].is_whitespace()) => {
                 return chars[..i].iter().collect();
             }
             _ => {}
@@ -824,17 +825,21 @@ mod tests {
         assert!(props.get("timeout").is_some());
         assert!(props.get("directory").is_some());
         // The description carries the Background vs Foreground section verbatim.
-        assert!(spec.description.contains("**Background vs Foreground Execution:**"));
+        assert!(
+            spec.description
+                .contains("**Background vs Foreground Execution:**")
+        );
         assert!(spec.description.contains("is_background: true"));
     }
 
     #[test]
     fn spec_accepts_an_optional_description_field() {
         let spec = RunCommand.spec();
-        let input = json!({"command": "git log --oneline -30", "description": "list recent commits"})
-            .as_object()
-            .unwrap()
-            .clone();
+        let input =
+            json!({"command": "git log --oneline -30", "description": "list recent commits"})
+                .as_object()
+                .unwrap()
+                .clone();
         assert_eq!(crate::tool::validate(&spec.input_schema, &input), Ok(()));
     }
 
@@ -1056,7 +1061,10 @@ mod tests {
 
     #[test]
     fn strip_trailing_amp_is_precise() {
-        assert_eq!(strip_trailing_background_amp("npm run dev &"), "npm run dev");
+        assert_eq!(
+            strip_trailing_background_amp("npm run dev &"),
+            "npm run dev"
+        );
         assert_eq!(strip_trailing_background_amp("a && b"), "a && b");
         assert_eq!(strip_trailing_background_amp("echo \\&"), "echo \\&");
         assert_eq!(strip_trailing_background_amp("plain"), "plain");
