@@ -40,22 +40,25 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::approvals::{ApprovalId, ApprovalMode, Approvals, Decide, Decision, Request};
 use crate::compaction::Compaction;
 use crate::content::{ContentBlock, Provenance};
-use crate::conversation::{Conversation, ConversationOpts};
+use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::model::Model;
-use crate::llm::response::StopReason as RespStopReason;
 use crate::llm::{Llm, ProviderModels};
-use crate::run::loop_::{Outcome as LoopOutcome, OutcomeStop, RunOpts};
-use crate::run::settlement::{Event as SettleEvent, Outcome, Reason, Rollover, Settlement};
+use crate::run::loop_::{Outcome as LoopOutcome, RunOpts};
+use crate::run::settlement::{Reason, Rollover, Settlement};
 use crate::session::Session;
-use crate::session::log::{self, Entry as LogEntry, Log, ResumeError, StopReason};
+use crate::session::log::{self, Entry as LogEntry, Log, ResumeError};
 use crate::tool::caps::SubagentResult;
-use crate::{tools, voice};
+use crate::voice;
 
 pub mod background;
+mod capabilities;
 mod deps;
-use background::{BackgroundStatus, BackgroundTask, mint_task_id, task_notification};
+mod init;
+mod settle;
+use background::BackgroundTask;
 use deps::AgentDeps;
+use settle::{LoopOrDown, settle_event_to_event, to_settlement_outcome};
 
 #[cfg(test)]
 mod tests;
@@ -225,10 +228,7 @@ pub enum RunMsg {
     /// watcher posts its result back so the Agent updates the registry entry and
     /// queues the `<task-notification>` for the next Run to drain. A `Stopped`
     /// entry (a `task_stop` already cancelled it) drops the result.
-    BackgroundDone {
-        id: String,
-        result: SubagentResult,
-    },
+    BackgroundDone { id: String, result: SubagentResult },
     /// A background-subagent stop request (P4b/4d, ADR-0063): `task_stop` asked
     /// the Agent to cancel a running background agent. The Agent aborts the
     /// child, sets the entry `Stopped`, queues the `was cancelled` notification
@@ -280,11 +280,7 @@ pub enum Command {
     /// tool returns as its content. The Agent forwards it to the parked tool
     /// call's reply oneshot. Mirrors [`Command::Approve`] but with no Standing-
     /// Approval fold - the reply map is the whole mechanic.
-    AnswerQuestion(
-        String,
-        QuestionAnswers,
-        oneshot::Sender<()>,
-    ),
+    AnswerQuestion(String, QuestionAnswers, oneshot::Sender<()>),
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
     Conversation(oneshot::Sender<Conversation>),
@@ -369,7 +365,7 @@ impl AgentHandle {
         // async init below (`init_agent`). It is `async` (the connect awaits per
         // server), so it cannot run in this sync `start`; the raw pieces travel
         // there in [`AgentInit`].
-        let init = AgentInit {
+        let init = init::AgentInit {
             session,
             model,
             llm,
@@ -383,7 +379,7 @@ impl AgentHandle {
         };
 
         tokio::spawn(async move {
-            let state = init_agent(init).await;
+            let state = init::init_agent(init).await;
             run_agent(state, rx).await;
         });
 
@@ -471,11 +467,7 @@ impl AgentHandle {
     /// carries the user's `(question_index, answer_value)` picks, `Err(string)`
     /// the decline. The Agent forwards it to the parked tool call's reply oneshot.
     /// Mirrors [`AgentHandle::approve`]; a dead Agent silently drops it.
-    pub async fn answer_question(
-        &self,
-        question_id: impl Into<String>,
-        answers: QuestionAnswers,
-    ) {
+    pub async fn answer_question(&self, question_id: impl Into<String>, answers: QuestionAnswers) {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Msg::Command(Command::AnswerQuestion(
             question_id.into(),
@@ -625,204 +617,6 @@ struct AgentState {
     background_counter: u64,
 }
 
-/// The raw Session pieces `start` resolves synchronously and hands to the async
-/// [`init_agent`], which finishes assembly (MCP connect, the tool set, the
-/// tool-spec overhead, the Deferred Tools system-prompt section, the
-/// Conversation) - all of which must see the MCP tools, so they cannot run in
-/// the sync `start` (the connect awaits).
-struct AgentInit {
-    session: Session,
-    model: Model,
-    llm: Arc<dyn Llm>,
-    system_prompt: String,
-    resumed_messages: Vec<crate::content::Message>,
-    log: Option<Log>,
-    resume_info: Option<ResumeInfo>,
-    plan: Option<String>,
-    events: broadcast::Sender<Event>,
-    self_tx: mpsc::UnboundedSender<Msg>,
-}
-
-/// The async second half of Agent construction (F8, ADR-0056): attach the MCP
-/// servers, assemble the Session-stable tool set (built-ins + discovered MCP
-/// tools), and build the Conversation whose tool-spec overhead and Deferred
-/// Tools section are sourced from a LIVE per-session registry over that set - so
-/// both now count the MCP tools. Fail-open: a broken server is recorded on the
-/// manager and skipped, never fatal.
-async fn init_agent(init: AgentInit) -> AgentState {
-    let AgentInit {
-        session,
-        model,
-        llm,
-        system_prompt,
-        resumed_messages,
-        log,
-        resume_info,
-        plan,
-        events,
-        self_tx,
-    } = init;
-
-    // Attach the MCP servers once (fail-open). The discovered tools join the
-    // built-ins to form the Session-stable set every Run shares.
-    let (mcp, adapters) = crate::mcp::manager::McpManager::connect(&session.mcp_servers).await;
-
-    // Surface each fail-open connect skip as a launch notice (ADR-0007's
-    // fail-open report seam, the same line an Extension crash takes): a broken
-    // MCP server is a visible skip, not a silent one. Server-name-sorted, so the
-    // notices are stable across runs. This is the only production reader of
-    // `mcp.failures()`.
-    for (server, reason) in mcp.failures() {
-        let _ = events.send(Event::extension_error(
-            format!("mcp server {server}"),
-            crate::event::Stage::PreRun,
-            format!("could not connect - {reason}"),
-        ));
-    }
-
-    // Discover disk skills once (fail-open, ADR-0058), the same shape as the MCP
-    // attach above: `<root>/.suspenders/skills/<name>/SKILL.md` (project) +
-    // `~/.suspenders/skills/<name>/SKILL.md` (user). A malformed/invalid manifest
-    // is recorded on the manager and skipped, surfaced below as a launch notice.
-    // The one `skill` tool holds the manager and embeds its `<available_skills>`
-    // catalog in its description, so the tool is ALWAYS registered (even with an
-    // empty catalog) - the catalog is how the model learns skills can exist.
-    let project_skills = std::path::Path::new(&session.root)
-        .join(".suspenders")
-        .join("skills");
-    let user_skills = crate::session::default_user_skills_dir();
-    let skill_manager = Arc::new(crate::skills::SkillManager::discover(
-        &project_skills,
-        Some(std::path::Path::new(&user_skills)),
-    ));
-
-    // Surface each fail-open skill parse skip as a launch notice, exactly like an
-    // MCP connect failure (ADR-0007's fail-open report seam): a broken SKILL.md is
-    // a visible skip, not a silent one.
-    for (name, reason) in skill_manager.failures() {
-        let _ = events.send(Event::extension_error(
-            format!("skill {name}"),
-            crate::event::Stage::PreRun,
-            reason.clone(),
-        ));
-    }
-
-    // The subagent registry (P4/F4, ADR-0061): the built-in defs, built once
-    // here. The `agent` tool holds it (for its dynamic schema/description, the
-    // way the `skill` tool holds a SkillManager) AND each Run's Capture threads
-    // it into the DirectSubagentSpawner.
-    let subagents = Arc::new(crate::subagents::SubagentRegistry::new(
-        crate::subagents::builtins(),
-    ));
-
-    let mut all = tools::tools();
-    all.extend(adapters);
-    all.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
-        &skill_manager,
-    ))));
-    all.push(Box::new(crate::tools::agent::AgentTool::new(Arc::clone(
-        &subagents,
-    ))));
-    let session_tools: Arc<[Box<dyn crate::tool::Tool>]> = all.into();
-
-    // A live per-session registry over the Session-stable set, used ONLY to
-    // source the overhead + Deferred Tools section here at launch (the Runs
-    // build their own `with_shared` registries). It includes the MCP tools, so
-    // both figures now count them.
-    let session_registry = crate::tool_registry::ToolRegistry::with_shared(Arc::clone(&session_tools));
-
-    // The tool specs ride with every request but live outside the messages; the
-    // estimate has to count them or Eviction fires late (baud's
-    // `String.length(JSON.encode!(Baud.Tools.specs()))`). Sourced from the live
-    // registry's `specs()` - the BASE (non-revealed) wire list. MCP tools are
-    // all deferred, so they are excluded here: overhead is unchanged and
-    // correct, exactly as if no MCP server were attached (F8, ADR-0054).
-    let overhead = serde_json::to_string(&session_registry.specs())
-        .map(|s| s.chars().count() as u64)
-        .unwrap_or(0);
-
-    // Append the Deferred Tools section to the system prompt (F3, F8): the model
-    // needs to know which tools exist off the wire list so it can reach them via
-    // `tool_search`. Sourced from the live registry's `deferred_summary()`,
-    // which now INCLUDES the discovered `mcp__*` tools (ADR-0054, ADR-0056). The
-    // summary is static across reveals (a reveal moves a name onto the wire
-    // list, it does not change what is deferred), so it is computed once here.
-    // F5 SEAM (ADR-0054 revision, ADR-0062): this is where prompt sections
-    // compose - the Deferred Tools section here, then the managed-auto-memory
-    // suffix just below, each `\n\n---\n\n`-joined onto the system prompt.
-    let deferred = session_registry.deferred_summary();
-    let system_prompt = format!(
-        "{system_prompt}{}",
-        crate::context_files::deferred_tools_section(&deferred)
-    );
-
-    // Append the managed-auto-memory suffix (P5, F5, ADR-0062): the same
-    // `\n\n---\n\n`-joined composition point as the Deferred Tools section, now
-    // that F5 owns prompt-section composition. The index is loaded ONCE here at
-    // Session start and never refreshed mid-Session - faithful to qwen: the
-    // model's own writes during this Session land in the files but only re-enter
-    // the prompt on the NEXT Session's load. The memory dir is scaffolded
-    // (mkdir) fail-open, exactly like the MCP/skill attach: a scaffold failure
-    // is a visible launch notice, never fatal.
-    // Load from the Session's ALREADY-resolved memory root (P5, ADR-0062): the
-    // SAME fact the ToolCtx confinement carries, so the dir the model is told to
-    // write to is exactly the dir confinement permits - one resolution, no drift.
-    let memory =
-        crate::memory::MemoryStore::load_at(std::path::Path::new(&session.memory_root));
-    if let Err(reason) = memory.ensure_scaffold() {
-        let _ = events.send(Event::extension_error(
-            "memory".to_string(),
-            crate::event::Stage::PreRun,
-            format!("could not scaffold memory dir {} - {reason}", memory.memory_dir),
-        ));
-    }
-    let system_prompt = format!("{system_prompt}{}", memory.prompt_suffix());
-
-    // The budget figures derive from the launch Model here and are re-derived
-    // from the captured Model at every Run start (ADR-0037, `reset_run_state`).
-    let mut conversation = Conversation::new(
-        system_prompt,
-        ConversationOpts::new(
-            session.context_budget_for(&model),
-            session.reply_reserve_for(&model),
-        )
-        .overhead_chars(overhead)
-        .compaction_slack(session.compaction_slack)
-        .compaction_keep(session.compaction_keep),
-    );
-    // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.
-    let mut seeded = resumed_messages.clone();
-    seeded.extend(std::mem::take(&mut conversation.messages));
-    conversation.messages = seeded;
-
-    AgentState {
-        session,
-        run_provenance: model.provenance(),
-        model,
-        llm,
-        conversation,
-        log,
-        resume_info,
-        plan,
-        events,
-        task: None,
-        cancel_flag: false,
-        settlement: Settlement::new(),
-        approvals: Approvals::new(),
-        approval_replies: HashMap::new(),
-        question_replies: HashMap::new(),
-        steering: Vec::new(),
-        compaction: Compaction::new(),
-        self_tx,
-        mcp,
-        session_tools,
-        subagents,
-        background: HashMap::new(),
-        notifications: Vec::new(),
-        background_counter: 0,
-    }
-}
-
 #[cfg(test)]
 impl AgentState {
     /// A minimal [`AgentState`] for the background-registry unit tests (P4b,
@@ -830,17 +624,17 @@ impl AgentState {
     /// posts `BackgroundDone` back over, everything else empty/default. Returns
     /// the state alongside the receiver end of its own mpsc, so a test can drain
     /// the `BackgroundDone` the child posts.
-    fn for_test(
-        session: Session,
-        llm: Arc<dyn Llm>,
-    ) -> (AgentState, mpsc::UnboundedReceiver<Msg>) {
+    fn for_test(session: Session, llm: Arc<dyn Llm>) -> (AgentState, mpsc::UnboundedReceiver<Msg>) {
         let model = session.model.clone();
         let (self_tx, rx) = mpsc::unbounded_channel();
         let (events, _rx0) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let subagents = Arc::new(crate::subagents::SubagentRegistry::new(
             crate::subagents::builtins(),
         ));
-        let conversation = Conversation::new("sys", ConversationOpts::new(10_000, 1_000));
+        let conversation = Conversation::new(
+            "sys",
+            crate::conversation::ConversationOpts::new(10_000, 1_000),
+        );
         let state = AgentState {
             run_provenance: model.provenance(),
             model,
@@ -882,7 +676,7 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
     }
     // The actor loop ended (every handle dropped): the Session is over, so any
     // still-running background child must not outlive it (P4b, ADR-0063).
-    abort_all_background(&mut state);
+    state.abort_all_background();
 }
 
 fn handle_command(state: &mut AgentState, cmd: Command) {
@@ -1008,14 +802,14 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             description,
             reply,
         } => {
-            let id = spawn_background(state, request, description);
+            let id = state.spawn_background(request, description);
             let _ = reply.send(id);
         }
         RunMsg::BackgroundDone { id, result } => {
-            background_done(state, id, result);
+            state.background_done(id, result);
         }
         RunMsg::StopBackground { id, reply } => {
-            let wording = stop_background(state, id);
+            let wording = state.stop_background(id);
             let _ = reply.send(wording);
         }
         RunMsg::DrainNotifications(reply) => {
@@ -1117,177 +911,10 @@ fn ask_question(
 // is dropped, mirroring `approve`'s `Decide::Ignore`. The tool emits
 // `question_resolved` after it reads the reply, like the Approver emits
 // `approval_resolved`.
-fn answer_question(
-    state: &mut AgentState,
-    id: String,
-    answers: QuestionAnswers,
-) {
+fn answer_question(state: &mut AgentState, id: String, answers: QuestionAnswers) {
     if let Some(reply) = state.question_replies.remove(&id) {
         let _ = reply.send(answers);
     }
-}
-
-// A background-subagent launch (P4b/4c, ADR-0063): mint the id, build the child
-// request through the SHARED DirectSubagentSpawner resolution (so foreground and
-// background never drift), spawn a DETACHED child Run, register the entry, and
-// return the id. The `agent` tool does NOT park - a background launch returns
-// immediately with the id and the parent carries on. A resolution Err (unknown
-// type, unresolvable Model) surfaces as the id string carrying the Err so the
-// tool folds it into its own result - the same launch-failure shape spawn takes.
-fn spawn_background(
-    state: &mut AgentState,
-    request: crate::tool::caps::SubagentRequest,
-    description: String,
-) -> String {
-    // Build the shared spawner (the same handles `capture()` builds it from) so
-    // the background resolution matches the foreground one exactly.
-    let spawner = crate::run::subagent::DirectSubagentSpawner {
-        llm: Arc::clone(&state.llm),
-        parent_model: state.model.clone(),
-        temperature: state.session.temperature,
-        thinking_budget: state.session.thinking_budget,
-        tool_call_style: state.session.tool_call_style,
-        session: state.session.clone(),
-        registry: Arc::clone(&state.subagents),
-        subagent_run_limit: state.session.run_limit as usize,
-    };
-
-    // Mint the id BEFORE resolving, so it reads `{subagent_type}-{n}` even on a
-    // resolution failure the caller surfaces. The counter is per-Session.
-    state.background_counter += 1;
-    let id = mint_task_id(&request.subagent_type, state.background_counter);
-
-    // Resolve into the child request (the shared path). `sink: None` - the live
-    // background feed is DEFERRED (ADR-0063), so a background child is as
-    // invisible mid-run as a foreground one; only its settlement notification
-    // crosses back.
-    let child = match spawner.build_child_request(request, None) {
-        Ok(child) => child,
-        // A launch failure: return the Err string as the id so the tool folds it
-        // into its own error result (mirrors `spawn`'s Err propagation).
-        Err(reason) => return reason,
-    };
-
-    // Spawn the DETACHED child Run: a plain `tokio::spawn` that drives the child
-    // to settlement, then posts a `BackgroundDone` back over the SAME mpsc every
-    // Run event travels (so the single owner serializes the registry mutation).
-    // The Agent holds only the AbortHandle - `task_stop`/abortAll cancel through
-    // it, and the detached task's own JoinHandle is dropped (fire-and-forget).
-    let tx = state.self_tx.clone();
-    let done_id = id.clone();
-    let handle = tokio::spawn(async move {
-        let result = crate::run::run_child(child).await;
-        let _ = tx.send(Msg::Run(RunMsg::BackgroundDone {
-            id: done_id,
-            result,
-        }));
-    });
-
-    state.background.insert(
-        id.clone(),
-        BackgroundTask {
-            abort: handle.abort_handle(),
-            status: BackgroundStatus::Running,
-            description,
-        },
-    );
-
-    id
-}
-
-// A background child settled (P4b/4c, ADR-0063): if the entry is still Running,
-// record its terminal status, queue the `<task-notification>` for the next Run
-// to drain, log it as a durable user-role entry, and broadcast the finished
-// Event. If the entry is already Stopped (a `task_stop` cancelled it), drop the
-// result - the `was cancelled` notification was queued synchronously at stop.
-fn background_done(state: &mut AgentState, id: String, result: SubagentResult) {
-    let Some(entry) = state.background.get_mut(&id) else {
-        return; // Unknown/pruned id: nothing to settle.
-    };
-    if !matches!(entry.status, BackgroundStatus::Running) {
-        return; // Already Stopped/settled: drop the racing result.
-    }
-
-    // GOAL vs a non-GOAL terminate maps to completed vs failed (qwen's registry
-    // complete/fail split). The `<result>` is the child's answer text, or the
-    // `Error: {finalText}` line for a failure (empty finalText -> bare `Error:`).
-    // The terminal status is a UNIT marker (ADR-0063): the notification is
-    // assembled from `result` inline here, never read back off the status.
-    let (status_word, result_text) = if result.terminate_reason == "GOAL" {
-        entry.status = BackgroundStatus::Done;
-        ("completed", result.result.clone())
-    } else {
-        entry.status = BackgroundStatus::Failed;
-        ("failed", format!("Error: {}", result.result))
-    };
-    let description = entry.description.clone();
-
-    let notification = task_notification(&id, status_word, &description, &result_text);
-    state.notifications.push(notification.clone());
-    // Durable + operator-visible: the notification is a user-role log entry (so a
-    // resumed Session carries it) and a broadcast Event (so the UI sees it now).
-    log_entry(state, LogEntry::UserText(notification.clone()));
-    broadcast(state, Event::background_notification(notification));
-    broadcast(state, Event::background_task_finished(id, status_word));
-}
-
-// A background-subagent stop request (P4b/4d, ADR-0063): abort the child, set
-// the entry Stopped, queue the `was cancelled` notification SYNCHRONOUSLY (the
-// terminal notification the parent still receives), and return the VERBATIM qwen
-// `task_stop` wording. Three legs, all VERBATIM: found+running (stop
-// confirmation), found+not-running (the not-running error), not-found.
-fn stop_background(state: &mut AgentState, id: String) -> String {
-    let Some(entry) = state.background.get_mut(&id) else {
-        return format!("Error: No background task found with ID \"{id}\".");
-    };
-    if !matches!(entry.status, BackgroundStatus::Running) {
-        let status = background_status_word(&entry.status);
-        return format!(
-            "Error: Background agent \"{id}\" is not running (status: {status})."
-        );
-    }
-
-    // Abort the detached child at its next `.await`, then mark it Stopped so the
-    // racing `BackgroundDone` (if the abort loses the race) is dropped.
-    entry.abort.abort();
-    entry.status = BackgroundStatus::Stopped;
-    let description = entry.description.clone();
-
-    // Queue the terminal `was cancelled` notification synchronously - qwen's own
-    // handler emits the terminal notification via the registry, and here the
-    // abort means no `BackgroundDone` will arrive to carry the child's partial
-    // result, so the cancelled notification is queued now.
-    let notification = task_notification(&id, "cancelled", &description, "");
-    state.notifications.push(notification.clone());
-    log_entry(state, LogEntry::UserText(notification.clone()));
-    broadcast(state, Event::background_notification(notification));
-    broadcast(state, Event::background_task_finished(id.clone(), "cancelled"));
-
-    format!(
-        "Cancellation requested for background agent \"{id}\". A final \
-         task-notification carrying the agent's last result will follow.\n\
-         Description: {description}"
-    )
-}
-
-// The lifecycle word qwen's `not-running` error shows (status: {status}).
-fn background_status_word(status: &BackgroundStatus) -> &'static str {
-    match status {
-        BackgroundStatus::Running => "running",
-        BackgroundStatus::Done => "completed",
-        BackgroundStatus::Stopped => "cancelled",
-        BackgroundStatus::Failed => "failed",
-    }
-}
-
-// Abort every tracked background child at actor-loop exit (P4b, ADR-0063): the
-// Session is ending, so the detached child Runs must not outlive it. `abort()`
-// cancels each at its next `.await`; the entries are dropped with the state.
-fn abort_all_background(state: &mut AgentState) {
-    for entry in state.background.values() {
-        entry.abort.abort();
-    }
-    state.background.clear();
 }
 
 // The Shift+Tab Approval-mode cycle (ADR-0050): the pure `Approvals` fold
@@ -1481,11 +1108,6 @@ fn mint_run_ref() -> String {
 
 // ---- Settlement ------------------------------------------------------------
 
-enum LoopOrDown {
-    Loop(LoopOutcome),
-    Down(Reason),
-}
-
 fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     // If there is no running Run, this is a stale outcome (e.g. the watcher for
     // an already-settled Run); ignore it.
@@ -1525,69 +1147,6 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     match resolution.rollover {
         Rollover::Submit(prompt) => start_run(state, prompt),
         Rollover::None => {}
-    }
-}
-
-// Maps the Loop's outcome (or the watcher's Down) into the settlement's outcome
-// vocabulary.
-fn to_settlement_outcome(outcome: LoopOrDown) -> Outcome {
-    match outcome {
-        LoopOrDown::Loop(LoopOutcome::Ok(conv, stop)) => {
-            Outcome::Ok(conv, outcome_stop_to_log(stop))
-        }
-        // The Loop already closed the Conversation with the failure marker and
-        // kept the errored response's partial text (the LLM error algebra).
-        LoopOrDown::Loop(LoopOutcome::Failed(reason, conv)) => {
-            Outcome::Failed(Reason::tuple(reason), conv)
-        }
-        // Eviction + Compaction together could not fit the request.
-        LoopOrDown::Loop(LoopOutcome::Error) => {
-            Outcome::Error(Reason::atom("context_budget_exhausted"))
-        }
-        // A panic or an abort - settlement tells them apart via the cancel flag.
-        LoopOrDown::Down(reason) => Outcome::Down(reason),
-    }
-}
-
-fn outcome_stop_to_log(stop: OutcomeStop) -> StopReason {
-    match stop {
-        OutcomeStop::Reason(r) => r,
-        // A custom after-Pass Stop atom - the wired AgentDeps never produces one
-        // (its after_pass defaults to Continue). Degrade to Unknown.
-        OutcomeStop::Custom(_) => StopReason::Unknown,
-    }
-}
-
-// The settlement's Event → the broadcast event::Event (baud shares one shape;
-// the Rust port has two typed enums that carry the same facts).
-fn settle_event_to_event(event: &SettleEvent) -> Event {
-    match event {
-        SettleEvent::RunFinished {
-            stop_reason,
-            token_estimate,
-            context_budget,
-        } => Event::RunFinished {
-            stop_reason: log_stop_to_resp(*stop_reason),
-            token_estimate: *token_estimate,
-            context_budget: *context_budget,
-        },
-        SettleEvent::RunError(reason) => Event::RunError {
-            reason: reason.inspect(),
-        },
-        SettleEvent::RunCancelled => Event::RunCancelled,
-    }
-}
-
-fn log_stop_to_resp(stop: StopReason) -> RespStopReason {
-    match stop {
-        StopReason::EndTurn => RespStopReason::EndTurn,
-        StopReason::ToolUse => RespStopReason::ToolUse,
-        StopReason::MaxTokens => RespStopReason::MaxTokens,
-        StopReason::StopSequence => RespStopReason::StopSequence,
-        StopReason::RunLimit
-        | StopReason::RunLimitStuck
-        | StopReason::Error
-        | StopReason::Unknown => RespStopReason::Unknown,
     }
 }
 

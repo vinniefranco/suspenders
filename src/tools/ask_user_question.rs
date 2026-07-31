@@ -26,6 +26,15 @@ use serde_json::{Value, json};
 
 pub struct AskUserQuestion;
 
+/// The most questions one call may put to the user (qwen's `maxItems: 4`).
+const MAX_QUESTIONS: usize = 4;
+/// The longest a question's `header` chip may be (qwen's `max 12 chars`).
+const MAX_HEADER_CHARS: usize = 12;
+/// The fewest options a question must offer (qwen's `minItems: 2`).
+const MIN_OPTIONS: usize = 2;
+/// The most options a question may offer (qwen's `maxItems: 4`).
+const MAX_OPTIONS: usize = 4;
+
 /// The tool description, VERBATIM from qwen askUserQuestion.ts.
 const DESCRIPTION: &str = "Use this tool when you need to ask the user questions during execution. This allows you to:
 1. Gather user preferences or requirements
@@ -151,7 +160,7 @@ fn parse_and_validate(input: &Value) -> Result<Vec<Question>, String> {
         _ => return Err("Parameter \"questions\" must be an array.".to_string()),
     };
 
-    if raw.is_empty() || raw.len() > 4 {
+    if raw.is_empty() || raw.len() > MAX_QUESTIONS {
         return Err("Parameter \"questions\" must contain between 1 and 4 questions.".to_string());
     }
 
@@ -168,7 +177,7 @@ fn parse_and_validate(input: &Value) -> Result<Vec<Question>, String> {
 
         // qwen uses JS `.length` (UTF-16 code units); suspenders counts chars.
         // For the <= 12 rule the two agree on any realistic short header.
-        if header.chars().count() > 12 {
+        if header.chars().count() > MAX_HEADER_CHARS {
             return Err(format!(
                 "Question {n}: \"header\" must be 12 characters or less."
             ));
@@ -179,7 +188,7 @@ fn parse_and_validate(input: &Value) -> Result<Vec<Question>, String> {
             _ => return Err(format!("Question {n}: \"options\" must be an array.")),
         };
 
-        if raw_options.len() < 2 || raw_options.len() > 4 {
+        if raw_options.len() < MIN_OPTIONS || raw_options.len() > MAX_OPTIONS {
             return Err(format!(
                 "Question {n}: \"options\" must contain between 2 and 4 options."
             ));
@@ -267,8 +276,7 @@ mod tests {
     }
 
     fn ctx_with(answers: Result<Vec<(usize, String)>, String>) -> ToolCtx {
-        let caps =
-            Capabilities::for_test_with_questioner(Arc::new(ScriptedQuestioner { answers }));
+        let caps = Capabilities::for_test_with_questioner(Arc::new(ScriptedQuestioner { answers }));
         let mut ctx = ToolCtx::for_test("/nowhere".into(), 100_000);
         ctx.caps = caps;
         ctx

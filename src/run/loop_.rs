@@ -1037,9 +1037,10 @@ mod tests {
 
         // Announced as a BackgroundNotification event.
         let evs = events(&deps);
-        assert!(evs.iter().any(
-            |e| matches!(e, Event::BackgroundNotification { text } if text == note)
-        ));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::BackgroundNotification { text } if text == note))
+        );
 
         // The notification rides the next request's tool-results user message as
         // a trailing text block (after the tool result).
@@ -1049,9 +1050,7 @@ mod tests {
         assert!(
             matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")
         );
-        assert!(
-            matches!(&last.content[1], ContentBlock::Text { text } if text == note)
-        );
+        assert!(matches!(&last.content[1], ContentBlock::Text { text } if text == note));
     }
 
     #[tokio::test]

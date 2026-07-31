@@ -233,6 +233,9 @@ pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> 
 /// fence is a line that is exactly `---`, and the body is everything after that
 /// line (allowing the frontmatter to end at EOF via `(?:\n|$)`).
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    /// The YAML frontmatter fence marker (qwen's `---`).
+    const FENCE: &str = "---";
+
     // Opening fence must be the first line: `---` then a newline.
     let rest = content.strip_prefix("---\n")?;
 
@@ -240,12 +243,12 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     // inside a value (mid-line) does not close the block.
     let mut search_from = 0;
     loop {
-        let idx = rest[search_from..].find("---")?;
+        let idx = rest[search_from..].find(FENCE)?;
         let abs = search_from + idx;
         // The fence must start a line (at the block start or right after a \n).
         let at_line_start = abs == 0 || rest.as_bytes()[abs - 1] == b'\n';
         // ...and end a line: the `---` is followed by a newline or EOF.
-        let after = abs + 3;
+        let after = abs + FENCE.len();
         let ends_line = after == rest.len() || rest.as_bytes()[after] == b'\n';
         if at_line_start && ends_line {
             let frontmatter = &rest[..abs];
@@ -258,7 +261,7 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
             };
             return Some((frontmatter, body));
         }
-        search_from = abs + 3;
+        search_from = abs + FENCE.len();
     }
 }
 
@@ -394,8 +397,7 @@ mod tests {
 
     #[test]
     fn when_to_use_is_optional_and_parsed_when_present() {
-        let text =
-            "---\nname: pdf\ndescription: Work with PDFs\nwhen_to_use: When asked about a PDF\n---\nbody";
+        let text = "---\nname: pdf\ndescription: Work with PDFs\nwhen_to_use: When asked about a PDF\n---\nbody";
         let (fm, _) = parse_skill_content(text).unwrap();
         assert_eq!(fm.when_to_use.as_deref(), Some("When asked about a PDF"));
     }

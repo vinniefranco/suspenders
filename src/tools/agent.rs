@@ -304,9 +304,7 @@ fn format_result(result: crate::tool::caps::SubagentResult) -> String {
 mod tests {
     use super::*;
     use crate::subagents::builtins;
-    use crate::tool::caps::{
-        Capabilities, SubagentRequest, SubagentResult, SubagentSpawner,
-    };
+    use crate::tool::caps::{Capabilities, SubagentRequest, SubagentResult, SubagentSpawner};
     use std::sync::Mutex;
 
     fn tool() -> AgentTool {
@@ -337,9 +335,7 @@ mod tests {
         assert!(spec.description.contains("- **Explore**:"));
         // P4b restores the run_in_background bullet AND the schema property.
         assert!(spec.description.contains("run_in_background: true"));
-        assert!(
-            spec.input_schema["properties"]["run_in_background"]["type"] == "boolean"
-        );
+        assert!(spec.input_schema["properties"]["run_in_background"]["type"] == "boolean");
         // The worktree/isolation note stays trimmed (deferred).
         assert!(!spec.description.contains("worktree"));
         assert!(spec.input_schema["properties"]["isolation"].is_null());
@@ -350,10 +346,15 @@ mod tests {
     fn empty_registry_omits_the_enum_and_shows_the_empty_wording() {
         let t = AgentTool::new(Arc::new(SubagentRegistry::default()));
         let spec = t.spec();
-        assert!(spec.input_schema["properties"]["subagent_type"]
-            .get("enum")
-            .is_none());
-        assert!(spec.description.contains("No subagents are currently configured."));
+        assert!(
+            spec.input_schema["properties"]["subagent_type"]
+                .get("enum")
+                .is_none()
+        );
+        assert!(
+            spec.description
+                .contains("No subagents are currently configured.")
+        );
     }
 
     // A spawner that records the request it received and returns a fixed result.
@@ -395,11 +396,10 @@ mod tests {
             request: SubagentRequest,
             description: String,
         ) -> Result<String, String> {
-            self.bg_seen.lock().unwrap().push((
-                request.subagent_type,
-                request.prompt,
-                description,
-            ));
+            self.bg_seen
+                .lock()
+                .unwrap()
+                .push((request.subagent_type, request.prompt, description));
             Ok(self.bg_id.clone())
         }
 
@@ -418,10 +418,13 @@ mod tests {
     #[tokio::test]
     async fn run_spawns_the_resolved_request_and_returns_the_goal_result() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let spawner = Arc::new(RecordingSpawner::new(Arc::clone(&seen), SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(
+            Arc::clone(&seen),
+            SubagentResult {
                 terminate_reason: "GOAL".into(),
                 result: "the findings".into(),
-            }));
+            },
+        ));
         let out = tool()
             .run(
                 &json!({
@@ -438,17 +441,23 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen[0],
-            ("general-purpose".to_string(), "investigate the panic".to_string())
+            (
+                "general-purpose".to_string(),
+                "investigate the panic".to_string()
+            )
         );
     }
 
     #[tokio::test]
     async fn run_defaults_the_subagent_type_to_general_purpose() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let spawner = Arc::new(RecordingSpawner::new(Arc::clone(&seen), SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(
+            Arc::clone(&seen),
+            SubagentResult {
                 terminate_reason: "GOAL".into(),
                 result: "ok".into(),
-            }));
+            },
+        ));
         tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -462,10 +471,13 @@ mod tests {
     #[tokio::test]
     async fn run_error_empty_result_is_the_verbatim_execution_failed_message() {
         // qwen foreground: ERROR + empty finalText -> "Subagent execution failed."
-        let spawner = Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(
+            Arc::new(Mutex::new(Vec::new())),
+            SubagentResult {
                 terminate_reason: "ERROR".into(),
                 result: String::new(),
-            }));
+            },
+        ));
         let out = tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -480,10 +492,13 @@ mod tests {
     async fn run_error_non_empty_result_surfaces_the_bare_partial_text() {
         // qwen foreground: ERROR + non-empty finalText -> the raw finalText, no
         // synthetic message.
-        let spawner = Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(
+            Arc::new(Mutex::new(Vec::new())),
+            SubagentResult {
                 terminate_reason: "ERROR".into(),
                 result: "got this far".into(),
-            }));
+            },
+        ));
         let out = tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -499,10 +514,13 @@ mod tests {
         // qwen foreground: a non-ERROR terminate (MAX_TURNS) with an empty
         // finalText surfaces the bare (empty) text, NOT the background
         // `Agent terminated with mode: ...` string.
-        let spawner = Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(
+            Arc::new(Mutex::new(Vec::new())),
+            SubagentResult {
                 terminate_reason: "MAX_TURNS".into(),
                 result: String::new(),
-            }));
+            },
+        ));
         let out = tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -518,10 +536,13 @@ mod tests {
         let err = tool()
             .run(
                 &json!({"description": "d", "prompt": "p", "subagent_type": "nope"}),
-                &ctx_with(Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
+                &ctx_with(Arc::new(RecordingSpawner::new(
+                    Arc::new(Mutex::new(Vec::new())),
+                    SubagentResult {
                         terminate_reason: "GOAL".into(),
                         result: String::new(),
-                    }))),
+                    },
+                ))),
             )
             .await
             .unwrap_err();

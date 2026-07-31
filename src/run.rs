@@ -582,10 +582,7 @@ mod child_tests {
         );
         // The Loop appends a marker-only assistant message on a Run-Limit close.
         conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::run_limit_marker())]);
-        let out = outcome_to_result(Outcome::Ok(
-            conv,
-            OutcomeStop::Reason(StopReason::RunLimit),
-        ));
+        let out = outcome_to_result(Outcome::Ok(conv, OutcomeStop::Reason(StopReason::RunLimit)));
         assert_eq!(out.terminate_reason, "MAX_TURNS");
         // The trailing pure-marker message is skipped; the real text is the answer.
         assert_eq!(out.result, "real work so far");
@@ -594,10 +591,7 @@ mod child_tests {
     #[test]
     fn outcome_failed_maps_to_error_with_partial_text() {
         let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 100));
-        conv.add_assistant_response(
-            vec![ContentBlock::text("partial")],
-            model().provenance(),
-        );
+        conv.add_assistant_response(vec![ContentBlock::text("partial")], model().provenance());
         conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::run_failed_marker())]);
         let out = outcome_to_result(Outcome::Failed("boom".to_string(), conv));
         assert_eq!(out.terminate_reason, "ERROR");

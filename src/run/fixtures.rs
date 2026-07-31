@@ -275,10 +275,7 @@ impl FakeDeps {
 
     /// Seeds the canned background-notification batches (one popped per
     /// `drain_notifications`, P4b, ADR-0063).
-    pub fn with_notifications(
-        mut self,
-        batches: impl IntoIterator<Item = Vec<String>>,
-    ) -> Self {
+    pub fn with_notifications(mut self, batches: impl IntoIterator<Item = Vec<String>>) -> Self {
         self.notifications = Arc::new(Mutex::new(batches.into_iter().collect()));
         self
     }

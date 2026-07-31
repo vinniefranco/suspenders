@@ -62,6 +62,22 @@ pub struct FileReadEntry {
     pub last_read_cacheable: bool,
 }
 
+impl FileReadEntry {
+    /// A fresh entry at `(mtime_ms, size)` with no read/write stamped yet - the
+    /// seed both `record_read` and `record_write` insert before overwriting the
+    /// operation-specific fields.
+    fn seed(mtime_ms: u128, size: u64) -> FileReadEntry {
+        FileReadEntry {
+            mtime_ms,
+            size_bytes: size,
+            last_read_at: None,
+            last_write_at: None,
+            last_read_was_full: false,
+            last_read_cacheable: false,
+        }
+    }
+}
+
 /// The result of [`FileReadCache::check`] (qwen `FileReadCheckResult`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadState {
@@ -109,16 +125,18 @@ impl FileReadCache {
     /// the fast-path (a `Read full -> Read partial` sequence keeping read-
     /// rights); the enforcement-only port does not carry the fast-path, so a
     /// plain overwrite is correct and matches qwen's own drift-reset arm.
-    pub fn record_read(&self, path: PathBuf, mtime_ms: u128, size: u64, full: bool, cacheable: bool) {
+    pub fn record_read(
+        &self,
+        path: PathBuf,
+        mtime_ms: u128,
+        size: u64,
+        full: bool,
+        cacheable: bool,
+    ) {
         let mut by_path = self.lock();
-        let entry = by_path.entry(path).or_insert_with(|| FileReadEntry {
-            mtime_ms,
-            size_bytes: size,
-            last_read_at: None,
-            last_write_at: None,
-            last_read_was_full: false,
-            last_read_cacheable: false,
-        });
+        let entry = by_path
+            .entry(path)
+            .or_insert_with(|| FileReadEntry::seed(mtime_ms, size));
         entry.mtime_ms = mtime_ms;
         entry.size_bytes = size;
         entry.last_read_at = Some(now_ms());
@@ -137,14 +155,9 @@ impl FileReadCache {
     pub fn record_write(&self, path: PathBuf, mtime_ms: u128, size: u64) {
         let mut by_path = self.lock();
         let now = now_ms();
-        let entry = by_path.entry(path).or_insert_with(|| FileReadEntry {
-            mtime_ms,
-            size_bytes: size,
-            last_read_at: None,
-            last_write_at: None,
-            last_read_was_full: false,
-            last_read_cacheable: false,
-        });
+        let entry = by_path
+            .entry(path)
+            .or_insert_with(|| FileReadEntry::seed(mtime_ms, size));
         entry.mtime_ms = mtime_ms;
         entry.size_bytes = size;
         entry.last_write_at = Some(now);

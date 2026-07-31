@@ -211,13 +211,8 @@ without offset or limit, before editing cells."
 /// read (which tolerates a stat miss), a missing stat here means we cannot
 /// verify the prior read, so the edit is refused - never silently allowed.
 fn stat_fingerprint(abs: &std::path::Path) -> Result<(u128, u64), String> {
-    let meta = std::fs::metadata(abs).map_err(|err| {
-        file_error(
-            "read",
-            &abs.to_string_lossy(),
-            FileError::from_io(&err),
-        )
-    })?;
+    let meta = std::fs::metadata(abs)
+        .map_err(|err| file_error("read", &abs.to_string_lossy(), FileError::from_io(&err)))?;
     let mtime_ms = meta
         .modified()
         .ok()
@@ -254,8 +249,12 @@ fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
 
 /// The model-facing summary (qwen's `llmContent`): the mode + edited cell id, and
 /// for a non-delete edit the updated source echoed back.
-fn edit_summary(path: &str, result: &apply::NotebookEditResult, params: &NotebookEditParams) -> String {
-    let mode = mode_word(result.mode);
+fn edit_summary(
+    path: &str,
+    result: &apply::NotebookEditResult,
+    params: &NotebookEditParams,
+) -> String {
+    let mode = result.mode.as_str();
     let head = format!(
         "Notebook {path} has been updated. {mode} cell {}.",
         result.edited_cell_id
@@ -265,14 +264,6 @@ fn edit_summary(path: &str, result: &apply::NotebookEditResult, params: &Noteboo
     } else {
         let source = params.new_source.as_deref().unwrap_or("");
         format!("{head}\n\nUpdated source:\n\n---\n\n{source}")
-    }
-}
-
-fn mode_word(mode: EditMode) -> &'static str {
-    match mode {
-        EditMode::Replace => "replace",
-        EditMode::Insert => "insert",
-        EditMode::Delete => "delete",
     }
 }
 

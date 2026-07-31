@@ -148,9 +148,7 @@ impl SubagentSpawner for DirectSubagentSpawner {
     async fn stop_background(&self, id: String) -> Result<String, String> {
         // No registry here (foreground-only), so any id is not-found (the
         // VERBATIM qwen wording). The real path is the tx-backed spawner.
-        Ok(format!(
-            "Error: No background task found with ID \"{id}\"."
-        ))
+        Ok(format!("Error: No background task found with ID \"{id}\"."))
     }
 }
 
@@ -321,7 +319,10 @@ mod tests {
         // with exactly that resolved Model - the Opus-main / Qwen-scout seam over
         // a def-level pin.
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
-        let fake = FakeLlm::script(vec![recording(Arc::clone(&captured), text_response("scouted"))]);
+        let fake = FakeLlm::script(vec![recording(
+            Arc::clone(&captured),
+            text_response("scouted"),
+        )]);
         let providers = vec![provider("local"), provider("scout")];
         let spawner =
             spawner_with_registry(Arc::new(fake), providers, scoped_registry("scout/fast"));

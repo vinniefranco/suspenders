@@ -154,47 +154,21 @@ impl ToolRegistry {
     /// insert - the next request's [`specs`] picks it up. Mirrors
     /// `revealDeferredTool`.
     pub fn reveal(&self, name: &str) {
-        self.revealed
-            .lock()
-            .expect("revealed set mutex poisoned")
-            .insert(name.to_string());
-    }
-
-    /// Removes a single name from the revealed set (`unrevealDeferredTool`).
-    ///
-    /// Why kept without a production caller yet: qwen unreveals on the
-    /// MCP-disconnect rollback path (a server drops, its tools stop being
-    /// reachable). Suspenders gains that caller when the MCP subsystem lands
-    /// (F8); the parity surface is built now so the reveal state model is
-    /// complete.
-    pub fn unreveal(&self, name: &str) {
-        self.revealed
-            .lock()
-            .expect("revealed set mutex poisoned")
-            .remove(name);
+        self.revealed_set().insert(name.to_string());
     }
 
     /// Whether a tool has been revealed via [`reveal`] this Run.
     pub fn is_revealed(&self, name: &str) -> bool {
-        self.revealed
-            .lock()
-            .expect("revealed set mutex poisoned")
-            .contains(name)
+        self.revealed_set().contains(name)
     }
 
-    /// Empties the revealed set (`clearRevealedDeferredTools`). Suspenders builds
-    /// a fresh registry per Run, so this exists for parity and explicit resets
-    /// rather than being on the hot path.
-    ///
-    /// Why kept without a production caller yet: qwen clears reveals on session
-    /// reset (`/clear`). Suspenders' per-Run fresh registry already gives a
-    /// clean slate, but the explicit reset stays on the parity surface for an
-    /// in-Run reset the later phases may need.
-    pub fn clear_revealed(&self) {
-        self.revealed
-            .lock()
-            .expect("revealed set mutex poisoned")
-            .clear();
+    /// The revealed-name set, recovering a poisoned lock rather than panicking.
+    /// A poisoned lock means a prior holder panicked mid-insert; the `BTreeSet`
+    /// of owned `String`s is still structurally sound, so recover the guard the
+    /// same way [`crate::tool::read_cache::FileReadCache`] does - a reveal must
+    /// never bring down a tool dispatch.
+    fn revealed_set(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.revealed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Validates the model-supplied input against the named tool's schema, then
@@ -348,11 +322,9 @@ mod tests {
         assert!(!registry.is_revealed("hidden"));
         registry.reveal("hidden");
         assert!(registry.is_revealed("hidden"));
-        registry.unreveal("hidden");
-        assert!(!registry.is_revealed("hidden"));
+        // A second reveal of the same name is idempotent (a set insert).
         registry.reveal("hidden");
-        registry.clear_revealed();
-        assert!(!registry.is_revealed("hidden"));
+        assert!(registry.is_revealed("hidden"));
     }
 
     #[test]
@@ -414,10 +386,12 @@ mod tests {
 
     fn mcp_tool() -> Box<dyn Tool> {
         Box::new(crate::mcp::adapter::McpTool::new(
-            "srv",
-            "do_thing",
-            "does a thing",
-            json!({"type": "object", "properties": {}, "required": []}),
+            crate::mcp::adapter::McpToolInfo::new(
+                "srv",
+                "do_thing",
+                "does a thing",
+                json!({"type": "object", "properties": {}, "required": []}),
+            ),
             std::sync::Arc::new(QuietConn),
             None,
         ))
@@ -459,8 +433,11 @@ mod tests {
 
     #[test]
     fn with_shared_gives_two_registries_independent_reveals_over_one_arc() {
-        let shared: std::sync::Arc<[Box<dyn Tool>]> =
-            vec![fixture("core", false, false), fixture("hidden", true, false)].into();
+        let shared: std::sync::Arc<[Box<dyn Tool>]> = vec![
+            fixture("core", false, false),
+            fixture("hidden", true, false),
+        ]
+        .into();
         let a = ToolRegistry::with_shared(std::sync::Arc::clone(&shared));
         let b = ToolRegistry::with_shared(std::sync::Arc::clone(&shared));
 

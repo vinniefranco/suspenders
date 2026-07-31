@@ -187,6 +187,19 @@ enum RunOutcome {
     },
 }
 
+impl RunOutcome {
+    /// A ran-but-failed outcome carrying the execution error as stderr and a
+    /// non-zero exit (both the spawn-failure and the wait-failure arms yield
+    /// this shape).
+    fn exec_failure(err: std::io::Error) -> RunOutcome {
+        RunOutcome::Ran {
+            stdout: String::new(),
+            stderr: format!("pdftotext execution failed: {err}"),
+            code: 1,
+        }
+    }
+}
+
 /// Spawn `pdftotext` with the run_command timeout pattern. A spawn ENOENT means
 /// the binary is not installed (qwen's `isPdftotextAvailable` false path).
 async fn run_pdftotext(args: &[String]) -> RunOutcome {
@@ -200,32 +213,17 @@ async fn run_pdftotext(args: &[String]) -> RunOutcome {
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return RunOutcome::Missing,
-        Err(err) => {
-            return RunOutcome::Ran {
-                stdout: String::new(),
-                stderr: format!("pdftotext execution failed: {err}"),
-                code: 1,
-            };
-        }
+        Err(err) => return RunOutcome::exec_failure(err),
     };
 
     let wait = child.wait_with_output();
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(PDFTOTEXT_TIMEOUT_MS),
-        wait,
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_millis(PDFTOTEXT_TIMEOUT_MS), wait).await {
         Ok(Ok(output)) => RunOutcome::Ran {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             code: output.status.code().unwrap_or(1),
         },
-        Ok(Err(err)) => RunOutcome::Ran {
-            stdout: String::new(),
-            stderr: format!("pdftotext execution failed: {err}"),
-            code: 1,
-        },
+        Ok(Err(err)) => RunOutcome::exec_failure(err),
         Err(_elapsed) => RunOutcome::TimedOut,
     }
 }

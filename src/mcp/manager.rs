@@ -31,8 +31,8 @@ use crate::tool::Tool;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ResourceContents};
 use rmcp::service::{Peer, RoleClient, RunningService};
-use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
 /// The default per-server connect timeout for a stdio server (its process may
 /// need to boot).
@@ -45,6 +45,11 @@ const DEFAULT_HTTP_TIMEOUT_MS: u64 = 5_000;
 /// holds one for the Session's lifetime (the [`conns`](McpManager) keep each
 /// server's rmcp service alive); [`failures`](McpManager::failures) feeds the
 /// per-server launch notices the Agent emits after connect.
+///
+/// The derived [`Default`] (empty connections, empty failures) is the same shape
+/// [`McpManager::connect`] yields for an empty server map - a test that needs an
+/// [`crate::agent`] state without attaching any MCP server reaches for it.
+#[derive(Default)]
 pub struct McpManager {
     /// The live connections, one per successfully-attached server. Held ONLY to
     /// keep the underlying rmcp service (and its transport worker) alive for the
@@ -56,18 +61,6 @@ pub struct McpManager {
     /// transport, a failed handshake, a failed discovery. Fail-open: each is a
     /// skip, never a crash.
     failures: Vec<(String, String)>,
-}
-
-impl Default for McpManager {
-    /// An empty manager (no connections, no failures): the same shape
-    /// [`McpManager::connect`] yields for an empty server map, for tests that
-    /// need an [`crate::agent`] state without attaching any MCP server.
-    fn default() -> Self {
-        McpManager {
-            conns: Vec::new(),
-            failures: Vec::new(),
-        }
-    }
 }
 
 impl McpManager {
@@ -122,7 +115,11 @@ type Attached<'a> = (&'a str, Result<ServerAttach, String>);
 
 /// The assembled manager parts: the live conns, the flattened tool set, and the
 /// `(server, reason)` failures.
-type Assembled = (Vec<Arc<dyn McpConn>>, Vec<Box<dyn Tool>>, Vec<(String, String)>);
+type Assembled = (
+    Vec<Arc<dyn McpConn>>,
+    Vec<Box<dyn Tool>>,
+    Vec<(String, String)>,
+);
 
 /// Folds the per-server connect outcomes into the manager's parts, IN THE ORDER
 /// GIVEN (the caller hands them server-name-sorted, so the tool set + failure
@@ -191,10 +188,7 @@ async fn connect_one(name: &str, cfg: &McpServerConfig) -> Result<ServerAttach, 
         let description = tool.description.map(|d| d.to_string()).unwrap_or_default();
         let input_schema = Value::Object((*tool.input_schema).clone());
         let mcp_tool = crate::mcp::adapter::McpTool::new(
-            name,
-            tool_name,
-            description,
-            input_schema,
+            crate::mcp::adapter::McpToolInfo::new(name, tool_name, description, input_schema),
             Arc::clone(&conn) as Arc<dyn McpConn>,
             cfg.timeout_ms,
         );
@@ -310,12 +304,12 @@ fn decode_block(block: ContentBlock) -> McpBlock {
             mime: audio.mime_type,
         },
         ContentBlock::Resource(embedded) => match embedded.resource {
-            ResourceContents::TextResourceContents { text, mime_type, .. } => {
-                McpBlock::EmbeddedResource {
-                    text: Some(text),
-                    mime: mime_type,
-                }
-            }
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => McpBlock::EmbeddedResource {
+                text: Some(text),
+                mime: mime_type,
+            },
             ResourceContents::BlobResourceContents { mime_type, .. } => {
                 McpBlock::EmbeddedResource {
                     text: None,
@@ -380,7 +374,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl McpConn for StubConn {
-        async fn call_tool(&self, _tool: &str, _arguments: Value) -> Result<McpCallResult, McpError> {
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _arguments: Value,
+        ) -> Result<McpCallResult, McpError> {
             Ok(McpCallResult {
                 content: vec![],
                 is_error: false,
@@ -391,10 +389,12 @@ mod tests {
     fn ok_server(server: &str, tool: &str) -> Result<ServerAttach, String> {
         let conn: Arc<dyn McpConn> = Arc::new(StubConn);
         let mcp_tool = crate::mcp::adapter::McpTool::new(
-            server,
-            tool,
-            String::new(),
-            Value::Object(Default::default()),
+            crate::mcp::adapter::McpToolInfo::new(
+                server,
+                tool,
+                String::new(),
+                Value::Object(Default::default()),
+            ),
             Arc::clone(&conn),
             None,
         );

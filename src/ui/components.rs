@@ -2815,12 +2815,13 @@ fn header_lines(view: &HeaderView<'_>, content_width: u16, theme: &Theme) -> Vec
     // - Stacked:    the width up to HEADER_STACKED_MAX_WIDTH, minus box chrome.
     // - NoLogo:     the full width minus box chrome.
     let panel_inner = match tier {
-        HeaderTier::SideBySide => (available - HEADER_LOGO_WIDTH - HEADER_LOGO_GAP
-            - HEADER_BOX_CHROME)
-            .min(HEADER_MAX_PANEL_INNER),
-        HeaderTier::Stacked => {
-            available.min(HEADER_STACKED_MAX_WIDTH).saturating_sub(HEADER_BOX_CHROME)
+        HeaderTier::SideBySide => {
+            (available - HEADER_LOGO_WIDTH - HEADER_LOGO_GAP - HEADER_BOX_CHROME)
+                .min(HEADER_MAX_PANEL_INNER)
         }
+        HeaderTier::Stacked => available
+            .min(HEADER_STACKED_MAX_WIDTH)
+            .saturating_sub(HEADER_BOX_CHROME),
         HeaderTier::NoLogo => available.saturating_sub(HEADER_BOX_CHROME),
     }
     .max(1);
@@ -3834,7 +3835,11 @@ const QUESTION_OTHER_HINT: &str = "Type your answer below, then press Enter.";
 /// "Other" answer shows the composer hint. Every content row is `<= inner`
 /// columns and boxed to exactly `inner + 2` (measure==draw, ADR-0029). Rendered
 /// bottom-most in the pending body so the top-clip never eats it.
-fn question_modal_lines(pending: &PendingQuestion, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn question_modal_lines(
+    pending: &PendingQuestion,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     // The box interior width (border + paddingX:1 each side is the box's own; the
     // interior here is width - 2 for the two border columns).
     let inner = (width as usize).saturating_sub(2);
@@ -3867,7 +3872,13 @@ fn question_modal_lines(pending: &PendingQuestion, width: u16, theme: &Theme) ->
             0,
             inner,
         );
-        let _ = push_cols(&mut q_spans, &question.question, primary_style(theme), used, inner);
+        let _ = push_cols(
+            &mut q_spans,
+            &question.question,
+            primary_style(theme),
+            used,
+            inner,
+        );
         body.push(Line::from(q_spans));
 
         // The per-question rows: the recorded answer, the free-form hint, or the
@@ -3899,14 +3910,9 @@ fn question_modal_lines(pending: &PendingQuestion, width: u16, theme: &Theme) ->
             // The interactive radio: the question's option labels PLUS the
             // auto-appended "Other" row. `active` reads the per-question
             // SelectionList; only the CURRENT question (cursor) is highlighted.
-            let mut labels: Vec<&str> =
-                question.options.iter().map(|o| o.label.as_str()).collect();
+            let mut labels: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
             labels.push(OTHER_OPTION_LABEL);
-            let active = pending
-                .per_question
-                .get(i)
-                .map(|s| s.active())
-                .unwrap_or(0);
+            let active = pending.per_question.get(i).map(|s| s.active()).unwrap_or(0);
             body.extend(selection_rows(&labels, active, true, inner_u16, theme));
         }
     }
@@ -6406,7 +6412,10 @@ mod tests {
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         // The logo drew (its first row's block glyphs are present) beside the box.
         assert!(text.contains("███████╗"), "the logo drew:\n{text}");
-        assert!(text.contains("╭") && text.contains("╮"), "the box drew:\n{text}");
+        assert!(
+            text.contains("╭") && text.contains("╮"),
+            "the box drew:\n{text}"
+        );
         assert!(text.contains(">_ suspenders"), "the brand title:\n{text}");
         assert!(text.contains("(v1.2.3)"), "the version:\n{text}");
         assert!(
@@ -8552,7 +8561,10 @@ mod tests {
         // (title through footer) without top-clipping.
         let terminal = draw_pending(80, 32, &screen);
         let text = buffer_text(&terminal);
-        assert!(text.contains("keyboard shortcuts"), "title present: {text:?}");
+        assert!(
+            text.contains("keyboard shortcuts"),
+            "title present: {text:?}"
+        );
         assert!(text.contains("Shortcuts"), "Shortcuts heading present");
         assert!(text.contains("Show this help"), "a shortcut row present");
         assert!(text.contains("Commands"), "Commands heading present");
@@ -8564,7 +8576,10 @@ mod tests {
         );
         assert!(text.contains("Esc to close"), "the close hint present");
         // The panel is bordered (box-drawing chars from the same helpers).
-        assert!(text.contains('╭') && text.contains('╰'), "the panel is bordered");
+        assert!(
+            text.contains('╭') && text.contains('╰'),
+            "the panel is bordered"
+        );
     }
 
     // Measure==draw (ADR-0029): every emitted panel Line is `<= content width`, so
@@ -8602,7 +8617,9 @@ mod tests {
         );
         // A single column: no shortcut row pairs two keys (e.g. `/` … `Ctrl+O`).
         assert!(
-            !texts.iter().any(|t| t.contains('/') && t.contains("Ctrl+O")),
+            !texts
+                .iter()
+                .any(|t| t.contains('/') && t.contains("Ctrl+O")),
             "no row carries a second column at width 100: {texts:?}"
         );
     }
@@ -8618,7 +8635,9 @@ mod tests {
         // The first shortcut row pairs the first-half `/` key with the second-half
         // key (the split puts `Ctrl+O` at the top of the right column).
         assert!(
-            texts.iter().any(|t| t.contains('/') && t.contains("Ctrl+O")),
+            texts
+                .iter()
+                .any(|t| t.contains('/') && t.contains("Ctrl+O")),
             "a two-column row pairs left+right keys at width {width}: {texts:?}"
         );
         // No ellipsis: both columns' full descriptions fit.
@@ -8898,7 +8917,12 @@ mod tests {
     fn the_at_picker_match_substring_is_inverted() {
         // "co" matches "src/config.rs" at [4,6): the 'co' draws REVERSED.
         let view = at_files(
-            vec![suggestion("src/config.rs", "src/config.rs", "", Some((4, 6)))],
+            vec![suggestion(
+                "src/config.rs",
+                "src/config.rs",
+                "",
+                Some((4, 6)),
+            )],
             false,
         );
         let terminal = draw_popup(&view);

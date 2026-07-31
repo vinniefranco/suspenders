@@ -26,8 +26,8 @@ use serde_json::Value;
 use crate::approvals::ApprovalMode;
 use crate::content::ContentBlock;
 use crate::llm::Delta;
-use crate::tool::caps::Question;
 use crate::llm::response::StopReason;
+use crate::tool::caps::Question;
 use crate::view_model::SelectorRow;
 
 /// The `extension_error` stage: which point in the extension's lifecycle crashed
@@ -414,10 +414,7 @@ impl Event {
         Event::BackgroundNotification { text: text.into() }
     }
 
-    pub fn background_task_finished(
-        task_id: impl Into<String>,
-        status: impl Into<String>,
-    ) -> Self {
+    pub fn background_task_finished(task_id: impl Into<String>, status: impl Into<String>) -> Self {
         Event::BackgroundTaskFinished {
             task_id: task_id.into(),
             status: status.into(),

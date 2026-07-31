@@ -387,9 +387,7 @@ impl SubagentSpawner for UnavailableSubagentSpawner {
         // No registry here, so any id is not-found (the VERBATIM qwen wording).
         // A child Run reaching for `task_stop` (the exclusion should have kept it
         // off the wire) sees the same answer a headless host would.
-        Ok(format!(
-            "Error: No background task found with ID \"{id}\"."
-        ))
+        Ok(format!("Error: No background task found with ID \"{id}\"."))
     }
 }
 
@@ -511,7 +509,11 @@ mod tests {
     #[tokio::test]
     async fn denying_approver_denies() {
         let approver = DenyingApprover;
-        assert!(!approver.approve("id".to_string(), "rm -rf /".to_string()).await);
+        assert!(
+            !approver
+                .approve("id".to_string(), "rm -rf /".to_string())
+                .await
+        );
     }
 
     /// A fake real [`SideQuery`] that answers with a fixed reply text. Proves
@@ -701,10 +703,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Questioner for FakeQuestioner {
-        async fn ask(
-            &self,
-            _questions: Vec<Question>,
-        ) -> Result<Vec<(usize, String)>, String> {
+        async fn ask(&self, _questions: Vec<Question>) -> Result<Vec<(usize, String)>, String> {
             Ok(self.answers.clone())
         }
     }

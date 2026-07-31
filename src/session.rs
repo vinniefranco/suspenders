@@ -2050,13 +2050,22 @@ mod tests {
         assert_eq!(fs.args, vec!["--root".to_string(), "/tmp".to_string()]);
         assert_eq!(fs.env["LOG"], "debug");
         assert_eq!(fs.exclude_tools, vec!["delete".to_string()]);
-        assert!(matches!(fs.transport(), Ok(crate::mcp::McpTransport::Stdio { .. })));
+        assert!(matches!(
+            fs.transport(),
+            Ok(crate::mcp::McpTransport::Stdio { .. })
+        ));
 
         let remote = &servers["remote"];
-        assert_eq!(remote.http_url.as_deref(), Some("https://mcp.example.test/mcp"));
+        assert_eq!(
+            remote.http_url.as_deref(),
+            Some("https://mcp.example.test/mcp")
+        );
         assert_eq!(remote.headers["Authorization"], "Bearer x");
         assert_eq!(remote.trust, Some(true));
-        assert!(matches!(remote.transport(), Ok(crate::mcp::McpTransport::Http { .. })));
+        assert!(matches!(
+            remote.transport(),
+            Ok(crate::mcp::McpTransport::Http { .. })
+        ));
     }
 
     #[test]
@@ -2064,10 +2073,8 @@ mod tests {
         // Each server entry is deny_unknown_fields too - a typo'd key is a loud
         // parse error (ADR-0056).
         assert!(
-            FileConfig::parse(
-                r#"{"mcp_servers": {"x": {"command": "cmd", "bogus": 1}}}"#,
-            )
-            .is_err()
+            FileConfig::parse(r#"{"mcp_servers": {"x": {"command": "cmd", "bogus": 1}}}"#,)
+                .is_err()
         );
     }
 
@@ -2614,8 +2621,7 @@ mod tests {
     #[test]
     fn default_memory_root_slugs_the_project_under_a_projects_dir() {
         clear_memory_env();
-        // SAFETY: process-per-test / serial single-threaded.
-        unsafe { std::env::set_var("SUSPENDERS_MEMORY_BASE_DIR", "/tmp/mem-base") };
+        set_env("SUSPENDERS_MEMORY_BASE_DIR", "/tmp/mem-base");
 
         // A non-git tmp dir (no `.git` ancestor up to /tmp): the canonical root
         // falls back to the project root itself, and the slug replaces every
@@ -2641,8 +2647,7 @@ mod tests {
     #[test]
     fn default_memory_root_local_override_places_it_in_root() {
         clear_memory_env();
-        // SAFETY: process-per-test / serial single-threaded.
-        unsafe { std::env::set_var("SUSPENDERS_MEMORY_LOCAL", "1") };
+        set_env("SUSPENDERS_MEMORY_LOCAL", "1");
 
         assert_eq!(
             default_memory_root("/some/project"),
@@ -2654,7 +2659,10 @@ mod tests {
 
     #[test]
     fn sanitize_cwd_replaces_every_non_alphanumeric_with_a_hyphen() {
-        assert_eq!(sanitize_cwd("/home/vinnie/Proj_1.2"), "-home-vinnie-Proj-1-2");
+        assert_eq!(
+            sanitize_cwd("/home/vinnie/Proj_1.2"),
+            "-home-vinnie-Proj-1-2"
+        );
         assert_eq!(sanitize_cwd("abcXYZ123"), "abcXYZ123");
     }
 

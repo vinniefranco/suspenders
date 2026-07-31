@@ -109,8 +109,8 @@ impl Tool for WebFetch {
 
         // An unparseable url or a non-http/https scheme is qwen's verbatim
         // param-validation message, not the fetch-failure shape.
-        let parsed = reqwest::Url::parse(&fetch_url)
-            .map_err(|_| INVALID_URL_MESSAGE.to_string())?;
+        let parsed =
+            reqwest::Url::parse(&fetch_url).map_err(|_| INVALID_URL_MESSAGE.to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(INVALID_URL_MESSAGE.into());
         }
@@ -294,6 +294,44 @@ mod tests {
         server
     }
 
+    /// The `/page` URL of a mock server - the shape every fetch test targets.
+    fn page_url(server: &MockServer) -> String {
+        format!("{}/page", server.uri())
+    }
+
+    /// The content the side-query saw, pulled out of the verbatim fallback
+    /// wrapper (the text fenced between the `---` lines).
+    fn fenced_content(seen: &[SideQueryRequest]) -> String {
+        seen[0]
+            .user_content
+            .split("---\n")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches("\n---")
+            .to_string()
+    }
+
+    /// Serve a `body`-sized text page through an UNCAPPED ctx (so only the tool's
+    /// own guards trim), run the fetch, and return the content the side-query
+    /// saw. The shared body of the content-cap and download-guard tests.
+    async fn content_seen_for_body(root: &std::path::Path, body: String) -> String {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sq = Arc::new(FakeSideQuery {
+            reply: "ok".into(),
+            seen: Arc::clone(&seen),
+        });
+        let server = serve(ResponseTemplate::new(200).set_body_raw(body, "text/plain")).await;
+
+        let mut c = ctx_with_side_query(root, sq);
+        c.result_cap = usize::MAX;
+        run(json!({"url": page_url(&server), "prompt": "x"}), &c)
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        fenced_content(&seen)
+    }
+
     #[test]
     fn spec_requires_url_and_prompt() {
         let spec = WebFetch.spec();
@@ -323,7 +361,7 @@ mod tests {
             ResponseTemplate::new(200).set_body_raw("Use tokio::spawn to spawn.", "text/plain"),
         )
         .await;
-        let url = format!("{}/page", server.uri());
+        let url = page_url(&server);
 
         let out = run(
             json!({"url": url.clone(), "prompt": "how do I spawn?"}),
@@ -421,32 +459,10 @@ Use tokio::spawn to spawn.\n---"
     #[tokio::test]
     async fn content_is_capped_at_100000_chars() {
         let tmp = TempDir::new().unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sq = Arc::new(FakeSideQuery {
-            reply: "ok".into(),
-            seen: Arc::clone(&seen),
-        });
         let big = "a".repeat(MAX_CONTENT_LENGTH + 5_000);
-        let server = serve(ResponseTemplate::new(200).set_body_raw(big, "text/plain")).await;
-
-        let mut c = ctx_with_side_query(tmp.path(), sq);
-        c.result_cap = usize::MAX;
-        run(
-            json!({"url": format!("{}/page", server.uri()), "prompt": "count the a's"}),
-            &c,
-        )
-        .await
-        .unwrap();
-
         // The fallback wrapper carries exactly MAX_CONTENT_LENGTH content chars.
-        let seen = seen.lock().unwrap();
-        let content_between = seen[0]
-            .user_content
-            .split("---\n")
-            .nth(1)
-            .unwrap()
-            .trim_end_matches("\n---");
-        assert_eq!(content_between.chars().count(), MAX_CONTENT_LENGTH);
+        let content = content_seen_for_body(tmp.path(), big).await;
+        assert_eq!(content.chars().count(), MAX_CONTENT_LENGTH);
     }
 
     // A non-2xx fetch is qwen's `Error during fetch for {url}: {message}`, naming
@@ -459,7 +475,7 @@ Use tokio::spawn to spawn.\n---"
             seen: Arc::new(Mutex::new(Vec::new())),
         });
         let server = serve(ResponseTemplate::new(404)).await;
-        let url = format!("{}/page", server.uri());
+        let url = page_url(&server);
 
         let err = run(
             json!({"url": url.clone(), "prompt": "anything"}),
@@ -483,9 +499,8 @@ Use tokio::spawn to spawn.\n---"
         }
 
         let tmp = TempDir::new().unwrap();
-        let server =
-            serve(ResponseTemplate::new(200).set_body_raw("body", "text/plain")).await;
-        let url = format!("{}/page", server.uri());
+        let server = serve(ResponseTemplate::new(200).set_body_raw("body", "text/plain")).await;
+        let url = page_url(&server);
 
         let err = run(
             json!({"url": url.clone(), "prompt": "extract"}),
@@ -514,7 +529,7 @@ Use tokio::spawn to spawn.\n---"
             serve(ResponseTemplate::new(200).set_body_raw(html, "text/html; charset=utf-8")).await;
 
         run(
-            json!({"url": format!("{}/page", server.uri()), "prompt": "what is it?"}),
+            json!({"url": page_url(&server), "prompt": "what is it?"}),
             &ctx_with_side_query(tmp.path(), sq),
         )
         .await
@@ -605,7 +620,7 @@ Use tokio::spawn to spawn.\n---"
             ResponseTemplate::new(200).set_body_raw(vec![0u8, 1, 2], "application/octet-stream"),
         )
         .await;
-        let url = format!("{}/page", server.uri());
+        let url = page_url(&server);
 
         let err = run(
             json!({"url": url.clone(), "prompt": "x"}),
@@ -624,34 +639,12 @@ Use tokio::spawn to spawn.\n---"
     #[tokio::test]
     async fn the_download_guard_cuts_the_body_at_2mb() {
         let tmp = TempDir::new().unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sq = Arc::new(FakeSideQuery {
-            reply: "ok".into(),
-            seen: Arc::clone(&seen),
-        });
         // A body over both the 2 MB download guard and the content cap: the guard
         // trims to 2 MB, then the content cap trims to MAX_CONTENT_LENGTH.
         let big = "a".repeat(MAX_BODY_BYTES + 500_000);
-        let server = serve(ResponseTemplate::new(200).set_body_raw(big, "text/plain")).await;
-
-        let mut c = ctx_with_side_query(tmp.path(), sq);
-        c.result_cap = usize::MAX;
-        run(
-            json!({"url": format!("{}/page", server.uri()), "prompt": "x"}),
-            &c,
-        )
-        .await
-        .unwrap();
-
         // The content the side-query saw is capped at MAX_CONTENT_LENGTH (well
         // under the 2 MB guard), proving both trims ran.
-        let seen = seen.lock().unwrap();
-        let content_between = seen[0]
-            .user_content
-            .split("---\n")
-            .nth(1)
-            .unwrap()
-            .trim_end_matches("\n---");
-        assert_eq!(content_between.chars().count(), MAX_CONTENT_LENGTH);
+        let content = content_seen_for_body(tmp.path(), big).await;
+        assert_eq!(content.chars().count(), MAX_CONTENT_LENGTH);
     }
 }

@@ -1556,7 +1556,10 @@ fn consumed(effects: Vec<Effect>) -> KeyOutcome {
 // but the AT fold never refuses (every key in an AT context is consumed).
 fn prepend_effects(mut head: Vec<Effect>, outcome: KeyOutcome) -> KeyOutcome {
     match outcome {
-        KeyOutcome::Consumed { mut effects, notice } => {
+        KeyOutcome::Consumed {
+            mut effects,
+            notice,
+        } => {
             head.append(&mut effects);
             KeyOutcome::Consumed {
                 effects: head,
@@ -3276,7 +3279,11 @@ mod tests {
             &mut c,
             Event::file_search_ready(search_gen + 99, "", vec![file("nope.rs", "nope.rs")]),
         );
-        assert_eq!(at_values(&c), vec!["src/main.rs"], "stale generation dropped");
+        assert_eq!(
+            at_values(&c),
+            vec!["src/main.rs"],
+            "stale generation dropped"
+        );
         // A fill for a DIFFERENT query is dropped too.
         deliver(
             &mut c,
@@ -3308,7 +3315,11 @@ mod tests {
         let (_, search_gen) = last_file_search(&fold_consumed(&mut c, Key::Char('m')));
         deliver(
             &mut c,
-            Event::file_search_ready(search_gen, "com", vec![file("src/composer.rs", "src/composer.rs")]),
+            Event::file_search_ready(
+                search_gen,
+                "com",
+                vec![file("src/composer.rs", "src/composer.rs")],
+            ),
         );
         fold_consumed(&mut c, Key::Tab);
         assert_eq!(c.view().draft, "see @src/composer.rs ");

@@ -219,10 +219,7 @@ mod tests {
         .await
         .unwrap();
         assert!(msg.contains("created"));
-        assert_eq!(
-            std::fs::read_to_string(&abs).unwrap(),
-            "- [X](x.md) - hook"
-        );
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "- [X](x.md) - hook");
     }
 
     #[tokio::test]

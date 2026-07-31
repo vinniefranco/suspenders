@@ -91,9 +91,7 @@ impl Tool for TaskStop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::caps::{
-        Capabilities, SubagentRequest, SubagentResult, SubagentSpawner,
-    };
+    use crate::tool::caps::{Capabilities, SubagentRequest, SubagentResult, SubagentSpawner};
     use std::sync::Arc;
 
     #[test]
@@ -101,17 +99,17 @@ mod tests {
         let spec = TaskStop.spec();
         assert_eq!(spec.name, "task_stop");
         assert_eq!(spec.description, DESCRIPTION);
-        assert_eq!(
-            spec.input_schema["properties"]["task_id"]["type"],
-            "string"
-        );
+        assert_eq!(spec.input_schema["properties"]["task_id"]["type"], "string");
         let required = spec.input_schema["required"].as_array().unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0], "task_id");
         // Deferred, never always-load, with the verbatim search hint.
         assert!(TaskStop.should_defer());
         assert!(!TaskStop.always_load());
-        assert_eq!(TaskStop.search_hint(), Some("task stop cancel kill background"));
+        assert_eq!(
+            TaskStop.search_hint(),
+            Some("task stop cancel kill background")
+        );
     }
 
     // A spawner that returns a scripted `stop_background` wording, so the tool's

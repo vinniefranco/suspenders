@@ -49,7 +49,9 @@ impl SideQuery for LlmSideQuery {
         // completion.
         let req = LlmRequest::new(
             request.system,
-            vec![Message::user(vec![ContentBlock::text(request.user_content)])],
+            vec![Message::user(vec![ContentBlock::text(
+                request.user_content,
+            )])],
             Vec::new(),
         )
         .with_no_think(true)
@@ -138,6 +140,29 @@ mod tests {
         })
     }
 
+    // A side-query over a scripted FakeLlm, on the default main model.
+    fn side_query_over(entries: Vec<Entry>) -> LlmSideQuery {
+        LlmSideQuery {
+            llm: Arc::new(FakeLlm::script(entries)),
+            model: model(),
+            temperature: None,
+        }
+    }
+
+    // Run a standard two-attempt request against the scripted side-query and
+    // surface the error - the shared body of the retry-exhaustion tests.
+    async fn err_after(entries: Vec<Entry>) -> String {
+        side_query_over(entries)
+            .run(SideQueryRequest {
+                system: "sys".into(),
+                user_content: "content".into(),
+                model: None,
+                max_attempts: 2,
+            })
+            .await
+            .unwrap_err()
+    }
+
     // The side-query runs the captured Llm with the request's system + single
     // user part, NO tools, Thinking off - and returns the concatenated reply.
     #[tokio::test]
@@ -209,47 +234,18 @@ mod tests {
     // forever.
     #[tokio::test]
     async fn all_attempts_empty_errs() {
-        let fake = FakeLlm::script(vec![
+        let err = err_after(vec![
             Entry::just(text_response("")),
             Entry::just(text_response("")),
-        ]);
-        let sq = LlmSideQuery {
-            llm: Arc::new(fake),
-            model: model(),
-            temperature: None,
-        };
-
-        let err = sq
-            .run(SideQueryRequest {
-                system: "sys".into(),
-                user_content: "content".into(),
-                model: None,
-                max_attempts: 2,
-            })
-            .await
-            .unwrap_err();
+        ])
+        .await;
         assert_eq!(err, "side query returned no text");
     }
 
     // An error Response retries too, then surfaces the last error string.
     #[tokio::test]
     async fn an_error_response_retries_then_surfaces_the_error() {
-        let fake = FakeLlm::script(vec![Entry::error("boom"), Entry::error("boom again")]);
-        let sq = LlmSideQuery {
-            llm: Arc::new(fake),
-            model: model(),
-            temperature: None,
-        };
-
-        let err = sq
-            .run(SideQueryRequest {
-                system: "sys".into(),
-                user_content: "content".into(),
-                model: None,
-                max_attempts: 2,
-            })
-            .await
-            .unwrap_err();
+        let err = err_after(vec![Entry::error("boom"), Entry::error("boom again")]).await;
         assert_eq!(err, "boom again");
     }
 
@@ -274,6 +270,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(captured.lock().unwrap()[0].1.scoped_id(), pinned.scoped_id());
+        assert_eq!(
+            captured.lock().unwrap()[0].1.scoped_id(),
+            pinned.scoped_id()
+        );
     }
 }

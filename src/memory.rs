@@ -302,9 +302,7 @@ fn truncate_managed_auto_memory_index(index_content: &str) -> String {
             MAX_MANAGED_AUTO_MEMORY_INDEX_BYTES as f64 / 1024.0
         )
     } else if was_line_truncated && !was_byte_truncated {
-        format!(
-            "{line_count} lines (limit: {MAX_MANAGED_AUTO_MEMORY_INDEX_LINES})"
-        )
+        format!("{line_count} lines (limit: {MAX_MANAGED_AUTO_MEMORY_INDEX_LINES})")
     } else {
         format!(
             "{line_count} lines and {:.1} KB",
@@ -372,7 +370,10 @@ pub fn build_managed_auto_memory_prompt(memory_dir: &str, index_content: Option<
     push(format!(
         "- `{memory_dir}/MEMORY.md` is always loaded into your conversation context - lines after {MAX_MANAGED_AUTO_MEMORY_INDEX_LINES} will be truncated, so keep the index concise"
     ));
-    push("- Keep the name, description, and type fields in memory files up-to-date with the content".into());
+    push(
+        "- Keep the name, description, and type fields in memory files up-to-date with the content"
+            .into(),
+    );
     push("- Organize memory semantically by topic, not chronologically.".into());
     push("- Update or remove memories that turn out to be wrong or outdated.".into());
     push("- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.".into());
@@ -394,7 +395,10 @@ pub fn build_managed_auto_memory_prompt(memory_dir: &str, index_content: Option<
     push(String::new());
     push(match trimmed {
         Some(body) => truncate_managed_auto_memory_index(body),
-        None => "Your MEMORY.md is currently empty. When you save new memories, they will appear here.".into(),
+        None => {
+            "Your MEMORY.md is currently empty. When you save new memories, they will appear here."
+                .into()
+        }
     });
 
     lines.join("\n")
@@ -491,12 +495,17 @@ mod tests {
     #[test]
     fn the_empty_index_shows_the_placeholder() {
         let p = empty_prompt();
-        assert!(p.contains("Your MEMORY.md is currently empty. When you save new memories, they will appear here."));
+        assert!(p.contains(
+            "Your MEMORY.md is currently empty. When you save new memories, they will appear here."
+        ));
     }
 
     #[test]
     fn a_present_index_body_lands_in_the_prompt() {
-        let p = build_managed_auto_memory_prompt("/mem", Some("- [Testing](feedback_testing.md) - use a real db"));
+        let p = build_managed_auto_memory_prompt(
+            "/mem",
+            Some("- [Testing](feedback_testing.md) - use a real db"),
+        );
         assert!(p.contains("- [Testing](feedback_testing.md) - use a real db"));
         assert!(!p.contains("currently empty"));
     }
@@ -590,9 +599,11 @@ mod tests {
             store.ensure_scaffold().unwrap();
             assert!(std::path::Path::new(&store.memory_dir).is_dir());
             // No meta.json / extract-cursor (the deferred pipeline is dropped).
-            assert!(!std::path::Path::new(&store.memory_dir)
-                .join("meta.json")
-                .exists());
+            assert!(
+                !std::path::Path::new(&store.memory_dir)
+                    .join("meta.json")
+                    .exists()
+            );
         });
     }
 

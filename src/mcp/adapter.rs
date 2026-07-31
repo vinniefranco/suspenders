@@ -18,6 +18,34 @@ use serde_json::Value;
 use crate::mcp::{McpConn, result};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 
+/// The discovered-tool identity a server reports (ADR-0056): the bare server +
+/// tool names, the description, and the input schema. Grouped so the six-field
+/// construction reads as `identity + connection`, and so the wire [`ToolSpec`]
+/// can be built once at construction rather than re-cloned on every `spec()`.
+pub struct McpToolInfo {
+    pub server: String,
+    pub tool: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl McpToolInfo {
+    /// Builds the info from the parts a server's tool listing yields.
+    pub fn new(
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        McpToolInfo {
+            server: server.into(),
+            tool: tool.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
 /// The maximum wire-name length before elision (qwen: Gemini's API rejects names
 /// over 63, despite advertising 64).
 const MAX_WIRE_NAME_LEN: usize = 63;
@@ -28,42 +56,45 @@ const ELIDE_HEAD: usize = 28;
 /// The tail slice kept when a wire name is elided.
 const ELIDE_TAIL: usize = 32;
 
-/// A discovered MCP tool as a Suspenders [`Tool`]. Holds the server + tool
-/// names, the wire name it presents to the model, the reported description +
-/// schema, the [`McpConn`] to call, and the optional per-server call timeout.
+/// A discovered MCP tool as a Suspenders [`Tool`]. Holds the bare server + tool
+/// names, the wire [`ToolSpec`] it presents to the model (built once so `spec()`
+/// is a single clone, not three field clones), the [`McpConn`] to call, the
+/// optional per-server call timeout, and the precomputed search hint.
 pub struct McpTool {
     server: String,
     tool: String,
     wire_name: String,
-    description: String,
-    input_schema: Value,
+    spec: ToolSpec,
     conn: Arc<dyn McpConn>,
     timeout_ms: Option<u64>,
     search_hint: String,
 }
 
 impl McpTool {
-    /// Builds an `McpTool`. The wire name is computed once via [`valid_name`];
-    /// the search hint is `mcp <server>` (qwen parity), so the model's mention
-    /// of the server boosts fuzzy matching.
-    pub fn new(
-        server: impl Into<String>,
-        tool: impl Into<String>,
-        description: impl Into<String>,
-        input_schema: Value,
-        conn: Arc<dyn McpConn>,
-        timeout_ms: Option<u64>,
-    ) -> Self {
-        let server = server.into();
-        let tool = tool.into();
+    /// Builds an `McpTool` from a discovered [`McpToolInfo`] and its connection.
+    /// The wire name is computed once via [`valid_name`] and the wire [`ToolSpec`]
+    /// is assembled here (so `spec()` clones one struct); the search hint is
+    /// `mcp <server>` (qwen parity), so the model's mention of the server boosts
+    /// fuzzy matching.
+    pub fn new(info: McpToolInfo, conn: Arc<dyn McpConn>, timeout_ms: Option<u64>) -> Self {
+        let McpToolInfo {
+            server,
+            tool,
+            description,
+            input_schema,
+        } = info;
         let wire_name = valid_name(&server, &tool);
         let search_hint = format!("mcp {server}");
+        let spec = ToolSpec {
+            name: wire_name.clone(),
+            description,
+            input_schema,
+        };
         McpTool {
             server,
             tool,
             wire_name,
-            description: description.into(),
-            input_schema,
+            spec,
             conn,
             timeout_ms,
             search_hint,
@@ -101,11 +132,7 @@ pub(crate) fn valid_name(server: &str, tool: &str) -> String {
 #[async_trait::async_trait]
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: self.wire_name.clone(),
-            description: self.description.clone(),
-            input_schema: self.input_schema.clone(),
-        }
+        self.spec.clone()
     }
 
     async fn run(&self, input: &Value, _ctx: &ToolCtx) -> Result<String, String> {
@@ -116,16 +143,17 @@ impl Tool for McpTool {
         let call = self.conn.call_tool(&self.tool, input.clone());
 
         let outcome = match self.timeout_ms {
-            Some(ms) => match tokio::time::timeout(std::time::Duration::from_millis(ms), call).await
-            {
-                Ok(res) => res,
-                Err(_) => {
-                    return Err(format!(
-                        "MCP tool {:?} on server {:?} timed out after {}ms",
-                        self.tool, self.server, ms
-                    ));
+            Some(ms) => {
+                match tokio::time::timeout(std::time::Duration::from_millis(ms), call).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        return Err(format!(
+                            "MCP tool {:?} on server {:?} timed out after {}ms",
+                            self.tool, self.server, ms
+                        ));
+                    }
                 }
-            },
+            }
             None => call.await,
         };
 
@@ -179,10 +207,12 @@ mod tests {
 
     fn tool_over(outcome: Result<McpCallResult, McpError>) -> McpTool {
         McpTool::new(
-            "github",
-            "create_issue",
-            "create a github issue",
-            json!({"type": "object", "properties": {}, "required": []}),
+            McpToolInfo::new(
+                "github",
+                "create_issue",
+                "create a github issue",
+                json!({"type": "object", "properties": {}, "required": []}),
+            ),
             Arc::new(FakeConn { outcome }),
             None,
         )

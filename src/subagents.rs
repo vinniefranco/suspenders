@@ -286,10 +286,14 @@ mod tests {
         assert_eq!(def.model, SubagentModel::Inherit);
         assert_eq!(def.tools, ToolSelector::All);
         // A load-bearing verbatim fragment of qwen's prompt (em-dash -> hyphen).
-        assert!(def.system_prompt.starts_with("You are a general-purpose agent."));
-        assert!(def
-            .system_prompt
-            .contains("Do what has been asked; nothing more, nothing less."));
+        assert!(
+            def.system_prompt
+                .starts_with("You are a general-purpose agent.")
+        );
+        assert!(
+            def.system_prompt
+                .contains("Do what has been asked; nothing more, nothing less.")
+        );
     }
 
     #[test]
@@ -310,13 +314,17 @@ mod tests {
                 "todo_write".into(),
             ])
         );
-        assert!(def
-            .system_prompt
-            .starts_with("You are a file search specialist agent."));
+        assert!(
+            def.system_prompt
+                .starts_with("You are a file search specialist agent.")
+        );
         assert!(def.system_prompt.contains("READ-ONLY MODE"));
         // The prompt instructs run_command / web fetches, so the grant must back
         // them.
-        assert!(def.system_prompt.contains("Use run_command ONLY for read-only"));
+        assert!(
+            def.system_prompt
+                .contains("Use run_command ONLY for read-only")
+        );
     }
 
     #[test]

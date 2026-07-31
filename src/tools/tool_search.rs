@@ -109,11 +109,16 @@ impl Tool for ToolSearch {
             .to_string();
         if query.is_empty() {
             // Runtime guard for whitespace-only inputs that pass minLength.
-            return Err("Error: query is empty. Use `select:ToolName` or free-text keywords.".to_string());
+            return Err(
+                "Error: query is empty. Use `select:ToolName` or free-text keywords.".to_string(),
+            );
         }
 
         let max_results = clamp(
-            input.get("max_results").and_then(|v| v.as_i64()).unwrap_or(DEFAULT_MAX_RESULTS),
+            input
+                .get("max_results")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(DEFAULT_MAX_RESULTS),
             1,
             HARD_MAX_RESULTS,
         ) as usize;
@@ -215,7 +220,11 @@ impl Tool for ToolSearch {
         // Sort by score desc, then name asc for a deterministic tie-break.
         scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        let matches: Vec<String> = scored.into_iter().take(max_results).map(|(n, _)| n).collect();
+        let matches: Vec<String> = scored
+            .into_iter()
+            .take(max_results)
+            .map(|(n, _)| n)
+            .collect();
         if matches.is_empty() {
             return Ok(format!(
                 "No tools found matching '{query}'. Try broader keywords or use `select:ToolName`."
@@ -292,7 +301,10 @@ fn load_and_return_schemas(
 
     let mut content = String::new();
     if !schema_blocks.is_empty() {
-        content.push_str(&format!("<functions>\n{}\n</functions>", schema_blocks.join("\n")));
+        content.push_str(&format!(
+            "<functions>\n{}\n</functions>",
+            schema_blocks.join("\n")
+        ));
     }
     if !missing.is_empty() {
         if !content.is_empty() {
@@ -358,21 +370,31 @@ pub(crate) fn candidate_matches_required(name: &str, required_terms: &[String]) 
         return true;
     }
     let name_lower = name.to_lowercase();
-    required_terms.iter().all(|t| name_lower.contains(t.as_str()))
+    required_terms
+        .iter()
+        .all(|t| name_lower.contains(t.as_str()))
 }
 
 /// Scores a tool against the search terms. Returns 0 if no signal matched; the
 /// caller filters by `> 0`. `is_mcp` selects the MCP weight branch (all real
 /// tools pass false today; the branch is pinned by unit tests for when MCP
 /// lands).
-pub(crate) fn score_tool(spec: &ToolSpec, search_hint: Option<&str>, terms: &[String], is_mcp: bool) -> i64 {
+pub(crate) fn score_tool(
+    spec: &ToolSpec,
+    search_hint: Option<&str>,
+    terms: &[String],
+    is_mcp: bool,
+) -> i64 {
     let name_lower = spec.name.to_lowercase();
     let desc_lower = spec.description.to_lowercase();
     let hint_lower = search_hint.unwrap_or("").to_lowercase();
     let hint_parts: Vec<String> = if hint_lower.is_empty() {
         Vec::new()
     } else {
-        hint_lower.split_whitespace().map(|s| s.to_string()).collect()
+        hint_lower
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect()
     };
 
     let mut total = 0;
@@ -430,7 +452,11 @@ mod tests {
     fn tokenize_splits_on_whitespace_and_lowercases() {
         assert_eq!(
             tokenize("SlACK Send Message"),
-            vec!["slack".to_string(), "send".to_string(), "message".to_string()]
+            vec![
+                "slack".to_string(),
+                "send".to_string(),
+                "message".to_string()
+            ]
         );
     }
 
@@ -492,7 +518,10 @@ mod tests {
     fn score_mcp_double_underscore_name_gets_exact_suffix() {
         // `mcp__github__create_issue` ends with `_create_issue` - exact suffix.
         let mcp = spec("mcp__github__create_issue", "create a github issue");
-        assert_eq!(score_tool(&mcp, None, &["create_issue".to_string()], true), 12);
+        assert_eq!(
+            score_tool(&mcp, None, &["create_issue".to_string()], true),
+            12
+        );
         // The trailing single token `issue` ALSO satisfies the `_`-boundary.
         assert!(score_tool(&mcp, None, &["issue".to_string()], true) >= 12);
     }
@@ -502,21 +531,31 @@ mod tests {
         let with_hint = spec("cron_create", "scheduler");
         let without_hint = spec("cron_create", "scheduler");
         assert!(
-            score_tool(&with_hint, Some("schedule recurring timer"), &["schedule".to_string()], false)
-                > score_tool(&without_hint, None, &["schedule".to_string()], false)
+            score_tool(
+                &with_hint,
+                Some("schedule recurring timer"),
+                &["schedule".to_string()],
+                false
+            ) > score_tool(&without_hint, None, &["schedule".to_string()], false)
         );
     }
 
     #[test]
     fn score_description_match_is_two() {
         let tool = spec("foo", "this tool does slack things");
-        assert_eq!(score_tool(&tool, None, &["slack".to_string()], false), SCORE_DESC_BUILTIN);
+        assert_eq!(
+            score_tool(&tool, None, &["slack".to_string()], false),
+            SCORE_DESC_BUILTIN
+        );
     }
 
     #[test]
     fn score_no_match_is_zero() {
         let tool = spec("foo", "bar");
-        assert_eq!(score_tool(&tool, None, &["unrelated".to_string()], false), 0);
+        assert_eq!(
+            score_tool(&tool, None, &["unrelated".to_string()], false),
+            0
+        );
     }
 
     // ---- run() with a fixture registry ----
@@ -680,7 +719,11 @@ mod tests {
     #[tokio::test]
     async fn keyword_search_returns_top_n_ranked() {
         let registry = Arc::new(ToolRegistry::new(vec![
-            Fixture::deferred_with_hint("cron_create", "schedules recurring jobs", "schedule cron timer"),
+            Fixture::deferred_with_hint(
+                "cron_create",
+                "schedules recurring jobs",
+                "schedule cron timer",
+            ),
             Fixture::deferred("lsp", "language server"),
             Fixture::deferred("ask_user_question", "asks the user"),
         ]));
@@ -731,7 +774,10 @@ mod tests {
         assert!(content.contains("Truncated by max_results"));
         assert!(content.contains("tool_3"));
         assert!(content.contains("tool_6"));
-        let truncated_section = content.split("Truncated by max_results").nth(1).unwrap_or("");
+        let truncated_section = content
+            .split("Truncated by max_results")
+            .nth(1)
+            .unwrap_or("");
         assert!(!truncated_section.contains("tool_0"));
     }
 
@@ -744,7 +790,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_mode_dedupes_repeated_and_case_variant_names() {
-        let registry = Arc::new(ToolRegistry::new(vec![Fixture::deferred("cron_create", "")]));
+        let registry = Arc::new(ToolRegistry::new(vec![Fixture::deferred(
+            "cron_create",
+            "",
+        )]));
         let content = search(registry, "select:cron_create,cron_create,CRON_CREATE").await;
         let occurrences = content.matches("\"name\":\"cron_create\"").count();
         assert_eq!(occurrences, 1);
@@ -771,7 +820,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_mode_always_load_returns_schema_without_revealing() {
-        let registry = Arc::new(ToolRegistry::new(vec![Fixture::always_load("always_loaded", "")]));
+        let registry = Arc::new(ToolRegistry::new(vec![Fixture::always_load(
+            "always_loaded",
+            "",
+        )]));
         let content = search(registry.clone(), "select:always_loaded").await;
         assert!(content.contains("\"name\":\"always_loaded\""));
         assert!(!registry.is_revealed("always_loaded"));
@@ -790,7 +842,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_tolerates_json_quoted_names() {
-        let registry = Arc::new(ToolRegistry::new(vec![Fixture::deferred("cron_create", "")]));
+        let registry = Arc::new(ToolRegistry::new(vec![Fixture::deferred(
+            "cron_create",
+            "",
+        )]));
         let dq = search(registry.clone(), "select:\"cron_create\"").await;
         assert!(dq.contains("\"name\":\"cron_create\""));
         let sq = search(registry, "select:'cron_create'").await;

@@ -38,8 +38,8 @@ use crate::conversation::compaction_target;
 use crate::event::Event;
 use crate::extensions::Registered;
 use crate::llm::response::StopReason;
-use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
 use crate::tool::caps::Question;
+use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
 use crate::ui::selection::{SelectionKey, SelectionList, SelectionOutcome};
 use crate::ui::transcript::Transcript;
 use crate::view_model::Tone;
@@ -2031,7 +2031,10 @@ mod tests {
     #[test]
     fn startup_tip_is_seed_indexed_into_the_registry() {
         for seed in 0..(STARTUP_TIPS.len() * 2) {
-            assert_eq!(pick_startup_tip(seed), STARTUP_TIPS[seed % STARTUP_TIPS.len()]);
+            assert_eq!(
+                pick_startup_tip(seed),
+                STARTUP_TIPS[seed % STARTUP_TIPS.len()]
+            );
         }
     }
 
@@ -2596,7 +2599,11 @@ mod tests {
 
     #[test]
     fn selecting_a_real_option_records_it_and_resolves_a_single_question() {
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         // Enter selects the active row (row 0 = "serde"); the single question
         // resolves, emitting the answer and refocusing the composer.
         let (t, effects) = t.handle_key(Key::Enter);
@@ -2615,7 +2622,11 @@ mod tests {
 
     #[test]
     fn a_digit_quick_selects_an_option() {
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         // Digit '2' selects the second option ("miniserde"); it resolves. The
         // tuple's first element is the QUESTION index (0), not the option index.
         let (t, effects) = t.handle_key(Key::Char('2'));
@@ -2666,7 +2677,11 @@ mod tests {
 
     #[test]
     fn selecting_other_routes_to_the_composer_and_the_next_submit_fills_it() {
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         // The auto-"Other" row is the last one (index 2); digit '3' picks it.
         let (mut t, effects) = t.handle_key(Key::Char('3'));
         // It focuses the composer and arms free-form capture, without resolving.
@@ -2684,10 +2699,12 @@ mod tests {
         // question resolves with the typed text.
         let (t, effects) = t.handle_key(Key::Enter);
         assert_eq!(t.pending_question, None);
-        assert!(effects.contains(&Effect::Agent(AgentCommand::AnswerQuestion(
-            "q-1".to_string(),
-            Ok(vec![(0, "something else".to_string())])
-        ))));
+        assert!(
+            effects.contains(&Effect::Agent(AgentCommand::AnswerQuestion(
+                "q-1".to_string(),
+                Ok(vec![(0, "something else".to_string())])
+            )))
+        );
     }
 
     #[test]
@@ -2696,7 +2713,11 @@ mod tests {
         // Enter. Outside capture the composer would fire `Effect::Command` and
         // open the model selector; during capture the question modal MUST swallow
         // that machinery so it never leaks out, and the modal stays open collecting.
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         let (mut t, _e) = t.handle_key(Key::Char('3')); // pick "Other"
         assert_eq!(
             t.pending_question.as_ref().unwrap().collecting_other,
@@ -2756,17 +2777,23 @@ mod tests {
         }
         let (t, effects) = t.handle_key(Key::Enter);
         assert_eq!(t.pending_question, None);
-        assert!(effects.contains(&Effect::Agent(AgentCommand::AnswerQuestion(
-            "q-1".to_string(),
-            Ok(vec![(0, "real answer".to_string())])
-        ))));
+        assert!(
+            effects.contains(&Effect::Agent(AgentCommand::AnswerQuestion(
+                "q-1".to_string(),
+                Ok(vec![(0, "real answer".to_string())])
+            )))
+        );
     }
 
     #[test]
     fn escape_during_other_capture_backs_out_to_the_radio() {
         // Escape while collecting an "Other" answer drops back to the radio: the
         // modal stays open, `collecting_other` resets to None, no answer recorded.
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         let (t, _e) = t.handle_key(Key::Char('3')); // pick "Other"
         assert_eq!(
             t.pending_question.as_ref().unwrap().collecting_other,
@@ -2783,7 +2810,11 @@ mod tests {
     fn an_empty_other_submit_is_a_no_op_that_keeps_collecting() {
         // Submitting an empty "Other" draft records nothing and keeps collecting -
         // it must not resolve the question with an empty answer.
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         let (t, _e) = t.handle_key(Key::Char('3')); // pick "Other"
         let (t, effects) = t.handle_key(Key::Enter); // Enter on an empty draft
         // No answer is emitted (a redraw Commit may fire, but never an
@@ -2801,7 +2832,11 @@ mod tests {
 
     #[test]
     fn escape_declines_the_question_round_trip() {
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         let (t, effects) = t.handle_key(Key::Escape);
         assert_eq!(t.pending_question, None);
         assert_eq!(
@@ -2826,12 +2861,19 @@ mod tests {
         let (t, effects) = t.handle_key(Key::ArrowDown);
         assert_eq!(sans_commit(effects), vec![], "a move emits nothing");
         assert!(t.pending_question.is_some());
-        assert_eq!(t.pending_question.as_ref().unwrap().per_question[0].active(), 1);
+        assert_eq!(
+            t.pending_question.as_ref().unwrap().per_question[0].active(),
+            1
+        );
     }
 
     #[test]
     fn a_stray_char_is_swallowed_while_the_question_modal_holds_the_keyboard() {
-        let t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         let before = t.pending_question.clone();
         let (t, effects) = t.handle_key(Key::Char('x'));
         assert_eq!(effects, vec![], "no effect");
@@ -2845,7 +2887,11 @@ mod tests {
 
     #[test]
     fn a_cancel_clears_the_question_modal() {
-        let mut t = with_question(fresh(), "q-1", vec![question("Library", &["serde", "miniserde"])]);
+        let mut t = with_question(
+            fresh(),
+            "q-1",
+            vec![question("Library", &["serde", "miniserde"])],
+        );
         t.status = Status::Running;
         let (t, _e) = t.apply_event(Event::RunCancelled);
         assert_eq!(t.pending_question, None, "a cancel clears the modal");
@@ -3707,8 +3753,15 @@ mod tests {
     fn question_mark_on_non_empty_draft_types_normally() {
         let t = press(fresh(), typed("fix"));
         let (t, _effects) = t.handle_key(Key::Char('?'));
-        assert!(!t.help_open, "? does not open Help while the draft is non-empty");
-        assert_eq!(t.composer().view().draft, "fix?", "the ? typed into the draft");
+        assert!(
+            !t.help_open,
+            "? does not open Help while the draft is non-empty"
+        );
+        assert_eq!(
+            t.composer().view().draft,
+            "fix?",
+            "the ? typed into the draft"
+        );
     }
 
     // Esc closes the open Help overlay and hands focus back to the composer.
@@ -3741,8 +3794,15 @@ mod tests {
             let t = press(fresh(), vec![Key::Char('?')]);
             let (next, effects) = t.handle_key(key.clone());
             assert!(next.help_open, "{key:?} leaves Help open");
-            assert!(effects.is_empty(), "{key:?} produces no effect while Help is open");
-            assert_eq!(next.composer().view().draft, "", "{key:?} did not leak to the draft");
+            assert!(
+                effects.is_empty(),
+                "{key:?} produces no effect while Help is open"
+            );
+            assert_eq!(
+                next.composer().view().draft,
+                "",
+                "{key:?} did not leak to the draft"
+            );
         }
     }
 

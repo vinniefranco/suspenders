@@ -15,7 +15,13 @@
 //! today). No actor, no channel - the Agent drives all of that; this is the
 //! vocabulary it drives over.
 
+use std::sync::Arc;
+
+use crate::agent::{AgentState, Msg, RunMsg};
+use crate::event::Event;
+use crate::session::log::Entry as LogEntry;
 use crate::skills::escape_xml;
+use crate::tool::caps::SubagentResult;
 
 /// One background subagent the Agent is tracking (ADR-0063). The `abort` handle
 /// cancels the detached `tokio::spawn` at its next `.await` (`task_stop`, or the
@@ -110,6 +116,184 @@ pub fn task_notification(id: &str, status: &str, description: &str, result: &str
     )
 }
 
+/// The background-subagent lifecycle handlers the Agent's actor loop delegates to
+/// (P4b/4c/4d, ADR-0063). They live here beside the registry vocabulary they
+/// drive over (a launch, a settlement, a stop, and the actor-loop-exit abortAll),
+/// so the actor file keeps the `RunMsg` dispatch and this module owns the
+/// registry mechanics. Each takes `&mut self` (the Agent's single-owner state),
+/// so the map never leaves the owning task (ADR-0017).
+impl AgentState {
+    /// A background-subagent launch (P4b/4c, ADR-0063): mint the id, build the
+    /// child request through the SHARED DirectSubagentSpawner resolution (so
+    /// foreground and background never drift), spawn a DETACHED child Run,
+    /// register the entry, and return the id. The `agent` tool does NOT park - a
+    /// background launch returns immediately with the id and the parent carries
+    /// on. A resolution Err (unknown type, unresolvable Model) surfaces as the id
+    /// string carrying the Err so the tool folds it into its own result - the
+    /// same launch-failure shape spawn takes.
+    pub(super) fn spawn_background(
+        &mut self,
+        request: crate::tool::caps::SubagentRequest,
+        description: String,
+    ) -> String {
+        // Build the shared spawner (the same handles `capture()` builds it from)
+        // so the background resolution matches the foreground one exactly.
+        let spawner = crate::run::subagent::DirectSubagentSpawner {
+            llm: Arc::clone(&self.llm),
+            parent_model: self.model.clone(),
+            temperature: self.session.temperature,
+            thinking_budget: self.session.thinking_budget,
+            tool_call_style: self.session.tool_call_style,
+            session: self.session.clone(),
+            registry: Arc::clone(&self.subagents),
+            subagent_run_limit: self.session.run_limit as usize,
+        };
+
+        // Mint the id BEFORE resolving, so it reads `{subagent_type}-{n}` even on
+        // a resolution failure the caller surfaces. The counter is per-Session.
+        self.background_counter += 1;
+        let id = mint_task_id(&request.subagent_type, self.background_counter);
+
+        // Resolve into the child request (the shared path). `sink: None` - the
+        // live background feed is DEFERRED (ADR-0063), so a background child is as
+        // invisible mid-run as a foreground one; only its settlement notification
+        // crosses back.
+        let child = match spawner.build_child_request(request, None) {
+            Ok(child) => child,
+            // A launch failure: return the Err string as the id so the tool folds
+            // it into its own error result (mirrors `spawn`'s Err propagation).
+            Err(reason) => return reason,
+        };
+
+        // Spawn the DETACHED child Run: a plain `tokio::spawn` that drives the
+        // child to settlement, then posts a `BackgroundDone` back over the SAME
+        // mpsc every Run event travels (so the single owner serializes the
+        // registry mutation). The Agent holds only the AbortHandle -
+        // `task_stop`/abortAll cancel through it, and the detached task's own
+        // JoinHandle is dropped (fire-and-forget).
+        let tx = self.self_tx.clone();
+        let done_id = id.clone();
+        let handle = tokio::spawn(async move {
+            let result = crate::run::run_child(child).await;
+            let _ = tx.send(Msg::Run(RunMsg::BackgroundDone {
+                id: done_id,
+                result,
+            }));
+        });
+
+        self.background.insert(
+            id.clone(),
+            BackgroundTask {
+                abort: handle.abort_handle(),
+                status: BackgroundStatus::Running,
+                description,
+            },
+        );
+
+        id
+    }
+
+    /// A background child settled (P4b/4c, ADR-0063): if the entry is still
+    /// Running, record its terminal status, queue the `<task-notification>` for
+    /// the next Run to drain, log it as a durable user-role entry, and broadcast
+    /// the finished Event. If the entry is already Stopped (a `task_stop`
+    /// cancelled it), drop the result - the `was cancelled` notification was
+    /// queued synchronously at stop.
+    pub(super) fn background_done(&mut self, id: String, result: SubagentResult) {
+        let Some(entry) = self.background.get_mut(&id) else {
+            return; // Unknown/pruned id: nothing to settle.
+        };
+        if !matches!(entry.status, BackgroundStatus::Running) {
+            return; // Already Stopped/settled: drop the racing result.
+        }
+
+        // GOAL vs a non-GOAL terminate maps to completed vs failed (qwen's
+        // registry complete/fail split). The `<result>` is the child's answer
+        // text, or the `Error: {finalText}` line for a failure (empty finalText ->
+        // bare `Error:`). The terminal status is a UNIT marker (ADR-0063): the
+        // notification is assembled from `result` inline here, never read back off
+        // the status.
+        let (status_word, result_text) = if result.terminate_reason == "GOAL" {
+            entry.status = BackgroundStatus::Done;
+            ("completed", result.result.clone())
+        } else {
+            entry.status = BackgroundStatus::Failed;
+            ("failed", format!("Error: {}", result.result))
+        };
+        let description = entry.description.clone();
+
+        let notification = task_notification(&id, status_word, &description, &result_text);
+        self.notifications.push(notification.clone());
+        // Durable + operator-visible: the notification is a user-role log entry
+        // (so a resumed Session carries it) and a broadcast Event (so the UI sees
+        // it now).
+        super::log_entry(self, LogEntry::UserText(notification.clone()));
+        super::broadcast(self, Event::background_notification(notification));
+        super::broadcast(self, Event::background_task_finished(id, status_word));
+    }
+
+    /// A background-subagent stop request (P4b/4d, ADR-0063): abort the child, set
+    /// the entry Stopped, queue the `was cancelled` notification SYNCHRONOUSLY
+    /// (the terminal notification the parent still receives), and return the
+    /// VERBATIM qwen `task_stop` wording. Three legs, all VERBATIM: found+running
+    /// (stop confirmation), found+not-running (the not-running error), not-found.
+    pub(super) fn stop_background(&mut self, id: String) -> String {
+        let Some(entry) = self.background.get_mut(&id) else {
+            return format!("Error: No background task found with ID \"{id}\".");
+        };
+        if !matches!(entry.status, BackgroundStatus::Running) {
+            let status = background_status_word(&entry.status);
+            return format!("Error: Background agent \"{id}\" is not running (status: {status}).");
+        }
+
+        // Abort the detached child at its next `.await`, then mark it Stopped so
+        // the racing `BackgroundDone` (if the abort loses the race) is dropped.
+        entry.abort.abort();
+        entry.status = BackgroundStatus::Stopped;
+        let description = entry.description.clone();
+
+        // Queue the terminal `was cancelled` notification synchronously - qwen's
+        // own handler emits the terminal notification via the registry, and here
+        // the abort means no `BackgroundDone` will arrive to carry the child's
+        // partial result, so the cancelled notification is queued now.
+        let notification = task_notification(&id, "cancelled", &description, "");
+        self.notifications.push(notification.clone());
+        super::log_entry(self, LogEntry::UserText(notification.clone()));
+        super::broadcast(self, Event::background_notification(notification));
+        super::broadcast(
+            self,
+            Event::background_task_finished(id.clone(), "cancelled"),
+        );
+
+        format!(
+            "Cancellation requested for background agent \"{id}\". A final \
+             task-notification carrying the agent's last result will follow.\n\
+             Description: {description}"
+        )
+    }
+
+    /// Abort every tracked background child at actor-loop exit (P4b, ADR-0063):
+    /// the Session is ending, so the detached child Runs must not outlive it.
+    /// `abort()` cancels each at its next `.await`; the entries are dropped with
+    /// the state.
+    pub(super) fn abort_all_background(&mut self) {
+        for entry in self.background.values() {
+            entry.abort.abort();
+        }
+        self.background.clear();
+    }
+}
+
+/// The lifecycle word qwen's `not-running` error shows (status: {status}).
+fn background_status_word(status: &BackgroundStatus) -> &'static str {
+    match status {
+        BackgroundStatus::Running => "running",
+        BackgroundStatus::Done => "completed",
+        BackgroundStatus::Stopped => "cancelled",
+        BackgroundStatus::Failed => "failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +344,10 @@ mod tests {
         // result, so the `<result>` line is omitted ENTIRELY - no empty
         // `<result></result>` where qwen writes nothing.
         let out = task_notification("scout-4", "cancelled", "explore api", "");
-        assert!(!out.contains("<result>"), "no result tag on an empty result: {out}");
+        assert!(
+            !out.contains("<result>"),
+            "no result tag on an empty result: {out}"
+        );
         assert!(!out.contains("</result>"));
         // The rest of the envelope is intact, and the summary line is the last
         // line before the close tag.

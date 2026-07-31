@@ -18,24 +18,19 @@
 //! `validateToolParamValues` (the ipynb / pages rejections). Detection, notebook
 //! formatting, and pdftotext extraction live in the submodules below.
 
-use crate::content::{ResultBlock, unsupported_modality_placeholder};
-use crate::tool::path::{FileError, file_error};
 use crate::tool::{Tool, ToolCtx, ToolOutput, ToolSpec};
-use base64::Engine;
 use serde_json::{Value, json};
 
+mod cache;
 mod detect;
+mod media;
 mod notebook;
+mod params;
 mod pdf;
 
 use detect::FileType;
 
 pub struct ReadFile;
-
-/// The base64-after-encoding size guard (qwen's `9.9` MB, margin under 10MB).
-const MAX_BASE64_MB: f64 = 9.9;
-/// The SVG-as-text size cap (qwen `SVG_MAX_SIZE_BYTES`, 1MB).
-const SVG_MAX_SIZE_BYTES: u64 = 1024 * 1024;
 
 const DESCRIPTION: &str = "\
 Reads and returns the content of a specified file. If the file is large, the content will be \
@@ -102,16 +97,16 @@ impl Tool for ReadFile {
     /// that reaches `run` directly (the default `run_rich` path, or a test) still
     /// reads text files exactly as before.
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let path = read_path(input)?;
-        let start = start_line(input)?;
+        let path = params::read_path(input)?;
+        let start = params::start_line(input)?;
         let abs = crate::tool::path::resolve_path(path, &ctx.root)?;
-        let content = read_from(&abs, path, start)?;
+        let content = media::read_from(&abs, path, start)?;
         // A text read is cacheable; it is FULL when it starts at the top (no
         // windowing). The result_cap truncation the Tools dispatch applies after
         // this return is not visible here - matching qwen, whose read cache
         // records at the read site (F6, ADR-0060). notebook_edit, the only
         // enforcement consumer, never edits a plain-text read anyway.
-        record_read(ctx, &abs, start == 1, true);
+        cache::record_read(ctx, &abs, start == 1, true);
         Ok(content)
     }
 
@@ -120,16 +115,16 @@ impl Tool for ReadFile {
     /// image or native PDF becomes a media block when the Model accepts it, else
     /// the verbatim placeholder Text block (read-time modality degrade).
     async fn run_rich(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, String> {
-        let path = read_path(input)?.to_string();
-        let start = start_line(input)?;
-        let pages = pages(input)?;
+        let path = params::read_path(input)?.to_string();
+        let start = params::start_line(input)?;
+        let pages = params::pages(input)?;
 
         // Resolve + read a head sample and stat once, confined to the root.
         let abs = crate::tool::path::resolve_path(&path, &ctx.root)?;
-        validate_media_params(&path, &abs, start, pages.as_deref())?;
+        params::validate_media_params(&path, &abs, start, pages.as_deref())?;
 
-        let file_type = detect_file_type(&abs, &path)?;
-        let display_name = basename(&path);
+        let file_type = params::detect_file_type(&abs, &path)?;
+        let display_name = params::basename(&path);
 
         // Each branch produces its output and whether the read was FULL (the
         // whole current content, not windowed or internally truncated). After a
@@ -138,366 +133,36 @@ impl Tool for ReadFile {
         // native-PDF block is not text-cacheable), `full` is per-branch.
         let (output, full) = match file_type {
             FileType::Text => {
-                let text = read_from(&abs, &path, start)?;
+                let text = media::read_from(&abs, &path, start)?;
                 (ToolOutput::text(text), start == 1)
             }
-            FileType::Svg => (ToolOutput::text(read_svg(&abs, &path)?), true),
+            FileType::Svg => (ToolOutput::text(media::read_svg(&abs, &path)?), true),
             FileType::Notebook => {
-                let raw = read_text(&abs, &path)?;
+                let raw = media::read_text(&abs, &path)?;
                 let read = notebook::read_with_meta(&raw)?;
                 // A notebook whose rendered cell listing was truncated is NOT a
                 // full read: notebook_edit refuses to cell-edit it (qwen's
                 // `lastReadWasFull = !isTruncated`).
                 (ToolOutput::text(read.content), !read.is_truncated)
             }
-            FileType::Image => (read_image(&abs, &path, &display_name, ctx)?, true),
+            FileType::Image => (media::read_image(&abs, &path, &display_name, ctx)?, true),
             FileType::Pdf => (
-                read_pdf(&abs, &path, &display_name, pages.as_deref(), ctx).await?,
+                media::read_pdf(&abs, &path, &display_name, pages.as_deref(), ctx).await?,
                 true,
             ),
         };
 
-        let cacheable = is_single_text_block(&output);
-        record_read(ctx, &abs, full, cacheable);
+        let cacheable = cache::is_single_text_block(&output);
+        cache::record_read(ctx, &abs, full, cacheable);
         Ok(output)
-    }
-}
-
-// ---- read-cache recording (F6, ADR-0060) ------------------------------------
-
-/// Record a successful read of `abs` into the Run's file-read cache. Stats the
-/// file for the `(mtime, size)` fingerprint; a stat failure here is silently
-/// dropped (the read already succeeded, and a later check simply reads
-/// `Unknown` / `Stale` and asks the model to re-read - never a false pass).
-/// `full` is whether the read saw the whole current content; `cacheable` is
-/// whether the result is a single Text block.
-fn record_read(ctx: &ToolCtx, abs: &std::path::Path, full: bool, cacheable: bool) {
-    if let Some((mtime_ms, size)) = stat_fingerprint(abs) {
-        ctx.read_cache()
-            .record_read(abs.to_path_buf(), mtime_ms, size, full, cacheable);
-    }
-}
-
-/// The `(mtime_ms, size)` fingerprint of `abs`, or `None` if it cannot be
-/// stat'd. mtime is milliseconds since the epoch (qwen `stats.mtimeMs`).
-fn stat_fingerprint(abs: &std::path::Path) -> Option<(u128, u64)> {
-    let meta = std::fs::metadata(abs).ok()?;
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    Some((mtime_ms, meta.len()))
-}
-
-/// Whether the output is a single Text block - qwen's `cacheable` (plain text
-/// vs. a media / native-PDF payload the mutating tools cannot alter as text).
-fn is_single_text_block(output: &ToolOutput) -> bool {
-    matches!(output.blocks.as_slice(), [ResultBlock::Text { .. }])
-}
-
-// ---- shared param decoding (used by both run and run_rich) ------------------
-
-fn read_path(input: &Value) -> Result<&str, String> {
-    input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "invalid input: read_file requires a string \"path\"".to_string())
-}
-
-// The model may supply start_line; default 1, and reject non-positive/non-int.
-fn start_line(input: &Value) -> Result<i64, String> {
-    match input.get("start_line") {
-        None | Some(Value::Null) => Ok(1),
-        Some(Value::Number(n)) if n.is_i64() && n.as_i64().unwrap() >= 1 => Ok(n.as_i64().unwrap()),
-        Some(other) => Err(format!(
-            "invalid input: start_line must be a positive integer, got {}",
-            inspect(other)
-        )),
-    }
-}
-
-// Optional PDF page range, validated with qwen's rules: parseable, not
-// open-ended, within the 20-page limit. An empty string is treated as absent.
-fn pages(input: &Value) -> Result<Option<String>, String> {
-    let raw = match input.get("pages") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(other) => {
-            return Err(format!(
-                "invalid input: pages must be a string, got {}",
-                inspect(other)
-            ));
-        }
-    };
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let parsed = pdf::parse_page_range(&raw).ok_or_else(|| {
-        format!("Invalid pages parameter: '{raw}'. Use formats like '5' or '1-10'.")
-    })?;
-    if parsed.last.is_none() {
-        return Err("Open-ended page ranges (e.g. '3-') are not supported; specify an \
-explicit end page within the 20-page limit (e.g. '3-22')."
-            .to_string());
-    }
-    let last = parsed.last.unwrap();
-    if last - parsed.first + 1 > 20 {
-        return Err("Pages range exceeds maximum of 20 pages per request.".to_string());
-    }
-    Ok(Some(raw))
-}
-
-// ---- validation of media params against the file kind -----------------------
-
-/// Reject start_line/pages on kinds that do not window (qwen's ipynb rejections
-/// generalized to the media kinds): notebooks / images / PDFs are always read in
-/// full, so a windowing param on them is a hard error naming the reason.
-fn validate_media_params(
-    path: &str,
-    abs: &std::path::Path,
-    start: i64,
-    pages: Option<&str>,
-) -> Result<(), String> {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    if ext == "ipynb" {
-        if start != 1 {
-            return Err("start_line is not supported for Jupyter notebook (.ipynb) files. \
-Notebooks are always read in full with structured cell output."
-                .to_string());
-        }
-        if pages.is_some() {
-            return Err("pages is not supported for Jupyter notebook (.ipynb) files. \
-Notebooks are always read in full with structured cell output."
-                .to_string());
-        }
-        return Ok(());
-    }
-
-    // For image / PDF, a start_line makes no sense (the file is not read by
-    // line). Detect the kind from a head sample so a mislabeled binary is caught
-    // too. `pages` is valid only for PDFs.
-    if start != 1 || pages.is_some() {
-        let head = read_head(abs);
-        match detect::detect(path, &head) {
-            FileType::Image => {
-                if start != 1 {
-                    return Err("start_line is not supported for image files. Images are \
-read in full."
-                        .to_string());
-                }
-                if pages.is_some() {
-                    return Err("pages is only supported for PDF files.".to_string());
-                }
-            }
-            FileType::Pdf => {
-                if start != 1 {
-                    return Err("start_line is not supported for PDF files. Use the 'pages' \
-parameter to read a specific page range as text."
-                        .to_string());
-                }
-            }
-            _ => {
-                if pages.is_some() {
-                    return Err("pages is only supported for PDF files.".to_string());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-// ---- file-kind detection (reads a head sample) ------------------------------
-
-fn detect_file_type(abs: &std::path::Path, path: &str) -> Result<FileType, String> {
-    let head = read_head(abs);
-    Ok(detect::detect(path, &head))
-}
-
-fn read_head(abs: &std::path::Path) -> Vec<u8> {
-    use std::io::Read;
-    match std::fs::File::open(abs) {
-        Ok(mut f) => {
-            let mut buf = vec![0u8; 512];
-            match f.read(&mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    buf
-                }
-                Err(_) => Vec::new(),
-            }
-        }
-        Err(_) => Vec::new(),
-    }
-}
-
-// ---- text branch (String) ---------------------------------------------------
-
-fn read_from(abs: &std::path::Path, path: &str, start: i64) -> Result<String, String> {
-    match std::fs::read_to_string(abs) {
-        Ok(content) => slice_from(&content, start, path),
-        Err(err) => Err(file_error("read", path, FileError::from_io(&err))),
-    }
-}
-
-fn slice_from(content: &str, start: i64, path: &str) -> Result<String, String> {
-    if start == 1 {
-        return Ok(content.to_string());
-    }
-    let lines: Vec<&str> = content.split('\n').collect();
-    // A trailing newline splits into a final empty string that is not a line.
-    let count = if content.ends_with('\n') {
-        lines.len() - 1
-    } else {
-        lines.len()
-    } as i64;
-
-    if start > count {
-        Err(format!(
-            "start_line {start} is past the end of {path} ({count} lines)"
-        ))
-    } else {
-        Ok(lines[(start - 1) as usize..].join("\n"))
-    }
-}
-
-// ---- svg branch (Text, 1MB cap) ---------------------------------------------
-
-/// SVG is read as text (qwen returns `'svg'` and reads it with the text reader),
-/// capped at 1MB (qwen `SVG_MAX_SIZE_BYTES`) with the verbatim skip message.
-fn read_svg(abs: &std::path::Path, path: &str) -> Result<String, String> {
-    let size = std::fs::metadata(abs)
-        .map(|m| m.len())
-        .map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
-    if size > SVG_MAX_SIZE_BYTES {
-        return Ok(format!(
-            "Cannot display content of SVG file larger than 1MB: {path}"
-        ));
-    }
-    read_text(abs, path)
-}
-
-fn read_text(abs: &std::path::Path, path: &str) -> Result<String, String> {
-    std::fs::read_to_string(abs).map_err(|err| file_error("read", path, FileError::from_io(&err)))
-}
-
-// ---- image branch (media block or read-time degrade) ------------------------
-
-/// An image rides as a media block when the Model accepts image input, else it
-/// degrades to the VERBATIM unsupported-modality placeholder Text block at read
-/// time (P3 3b). A base64 payload past 9.9MB is a hard error (qwen's data-URI
-/// guard).
-fn read_image(
-    abs: &std::path::Path,
-    path: &str,
-    display_name: &str,
-    ctx: &ToolCtx,
-) -> Result<ToolOutput, String> {
-    if !ctx.input_modalities.image {
-        return Ok(ToolOutput::text(unsupported_modality_placeholder(
-            "image",
-            display_name,
-        )));
-    }
-
-    let bytes = std::fs::read(abs).map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    if let Some(err) = base64_too_large(&data, path) {
-        return Err(err);
-    }
-    Ok(ToolOutput {
-        blocks: vec![ResultBlock::Image {
-            mime: detect::image_mime(path).to_string(),
-            data,
-        }],
-    })
-}
-
-// ---- pdf branch (native document block, or pdftotext text) ------------------
-
-/// A PDF with no `pages` on a PDF-capable Model rides as a native Document block;
-/// otherwise (a `pages` request, or a Model without PDF support) it is extracted
-/// to text via pdftotext. The oversized-for-extraction guard and the base64
-/// guard mirror qwen's `processSingleFileContent` PDF arm.
-async fn read_pdf(
-    abs: &std::path::Path,
-    path: &str,
-    display_name: &str,
-    pages: Option<&str>,
-    ctx: &ToolCtx,
-) -> Result<ToolOutput, String> {
-    let native = pages.is_none() && ctx.input_modalities.pdf;
-
-    if native {
-        let bytes =
-            std::fs::read(abs).map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        if let Some(err) = base64_too_large(&data, path) {
-            return Err(err);
-        }
-        return Ok(ToolOutput {
-            blocks: vec![ResultBlock::Document {
-                mime: "application/pdf".to_string(),
-                data,
-            }],
-        });
-    }
-
-    // Text-extraction path: guard the on-disk size first (qwen PDF_EXTRACTION_MAX_MB).
-    let size = std::fs::metadata(abs)
-        .map(|m| m.len())
-        .map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
-    let size_mb = size as f64 / (1024.0 * 1024.0);
-    if size_mb > pdf::PDF_EXTRACTION_MAX_MB {
-        return Err(format!(
-            "PDF file is too large for text extraction: {size_mb:.2}MB exceeds the {:.0}MB \
-limit. Use the 'pages' parameter to read a narrower range, or split the document.",
-            pdf::PDF_EXTRACTION_MAX_MB
-        ));
-    }
-
-    let range = pages.and_then(pdf::parse_page_range);
-    match pdf::extract_text(abs, range).await {
-        pdf::PdfText::Ok(text) => Ok(ToolOutput::text(text)),
-        pdf::PdfText::Failed(error) => Err(format!(
-            "[Cannot extract text from PDF: \"{display_name}\". {error}]"
-        )),
-    }
-}
-
-// ---- shared media helpers ---------------------------------------------------
-
-/// The verbatim data-URI-limit error when a base64 payload exceeds 9.9MB, or
-/// `None` when it fits (qwen's `File exceeds the 10MB data URI limit...`).
-fn base64_too_large(data: &str, _path: &str) -> Option<String> {
-    let mb = data.len() as f64 / (1024.0 * 1024.0);
-    if mb > MAX_BASE64_MB {
-        Some(format!(
-            "File exceeds the 10MB data URI limit after base64 encoding ({mb:.2}MB encoded)."
-        ))
-    } else {
-        None
-    }
-}
-
-fn basename(path: &str) -> String {
-    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
-}
-
-// Elixir `inspect/1` for the values start_line can carry: a quoted string, or
-// a JSON-ish rendering for anything else.
-fn inspect(value: &Value) -> String {
-    match value {
-        Value::String(s) => format!("{s:?}"),
-        other => other.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::Modalities;
+    use crate::content::{Modalities, ResultBlock, unsupported_modality_placeholder};
+    use base64::Engine;
     use tempfile::TempDir;
 
     fn ctx(root: &std::path::Path) -> ToolCtx {
@@ -505,11 +170,7 @@ mod tests {
     }
 
     fn ctx_with(root: &std::path::Path, image: bool, pdf: bool) -> ToolCtx {
-        ToolCtx::for_test_with_modalities(
-            root.to_path_buf(),
-            10_000,
-            Modalities { image, pdf },
-        )
+        ToolCtx::for_test_with_modalities(root.to_path_buf(), 10_000, Modalities { image, pdf })
     }
 
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -726,7 +387,10 @@ mod tests {
     #[tokio::test]
     async fn svg_over_1mb_is_the_verbatim_skip_message() {
         let tmp = TempDir::new().unwrap();
-        let big = format!("<svg>{}</svg>", "a".repeat(SVG_MAX_SIZE_BYTES as usize + 10));
+        let big = format!(
+            "<svg>{}</svg>",
+            "a".repeat(media::svg_max_size_bytes() as usize + 10)
+        );
         std::fs::write(tmp.path().join("big.svg"), big).unwrap();
         let out = run_rich(json!({"path": "big.svg"}), &ctx(tmp.path()))
             .await
@@ -793,9 +457,12 @@ mod tests {
     async fn image_with_capable_model_rides_as_a_base64_image_block() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pic.png"), PNG_1X1).unwrap();
-        let out = run_rich(json!({"path": "pic.png"}), &ctx_with(tmp.path(), true, false))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"path": "pic.png"}),
+            &ctx_with(tmp.path(), true, false),
+        )
+        .await
+        .unwrap();
         match &out.blocks[0] {
             ResultBlock::Image { mime, data } => {
                 assert_eq!(mime, "image/png");
@@ -831,9 +498,12 @@ mod tests {
         let mut bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         bytes.resize(8 * 1024 * 1024, 0);
         std::fs::write(tmp.path().join("huge.png"), &bytes).unwrap();
-        let err = run_rich(json!({"path": "huge.png"}), &ctx_with(tmp.path(), true, false))
-            .await
-            .unwrap_err();
+        let err = run_rich(
+            json!({"path": "huge.png"}),
+            &ctx_with(tmp.path(), true, false),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("File exceeds the 10MB data URI limit after base64 encoding"));
         assert!(err.contains("MB encoded)."));
     }
@@ -846,9 +516,12 @@ mod tests {
         let mut bytes = Vec::from(*b"%PDF-1.7\n");
         bytes.extend_from_slice(b"body bytes");
         std::fs::write(tmp.path().join("doc.pdf"), &bytes).unwrap();
-        let out = run_rich(json!({"path": "doc.pdf"}), &ctx_with(tmp.path(), false, true))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"path": "doc.pdf"}),
+            &ctx_with(tmp.path(), false, true),
+        )
+        .await
+        .unwrap();
         match &out.blocks[0] {
             ResultBlock::Document { mime, data } => {
                 assert_eq!(mime, "application/pdf");

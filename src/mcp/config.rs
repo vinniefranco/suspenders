@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 /// `headers`). Exactly one of the two transports must be expressed - see
 /// [`transport`](McpServerConfig::transport). `deny_unknown_fields` like the
 /// rest of the config schema, so a typo'd key is a loud parse error.
+// qual:allow(srp, god_struct) reason: "untagged serde config DTO - stdio and http fields are mutually-exclusive clusters that mirror qwen's flat MCPServerConfig; an enum would diverge from the ported wire shape"
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {

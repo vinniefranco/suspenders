@@ -173,7 +173,10 @@ mod tests {
         assert_eq!(detect("blob", &png), FileType::Image);
         assert_eq!(detect("blob.dat", &png), FileType::Image);
         assert_eq!(detect("doc", b"%PDF-1.7\n..."), FileType::Pdf);
-        assert_eq!(detect("jpg_blob", &[0xff, 0xd8, 0xff, 0xe0]), FileType::Image);
+        assert_eq!(
+            detect("jpg_blob", &[0xff, 0xd8, 0xff, 0xe0]),
+            FileType::Image
+        );
         let mut webp = Vec::from(*b"RIFF____WEBPVP8 ");
         webp.truncate(16);
         assert_eq!(detect("blob", &webp), FileType::Image);

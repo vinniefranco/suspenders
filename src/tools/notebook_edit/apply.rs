@@ -41,6 +41,19 @@ pub enum EditMode {
     Delete,
 }
 
+impl EditMode {
+    /// The mode's lowercase wire word (qwen's mode string) - the single home for
+    /// this mapping, shared by `apply`'s "0 occurrences" error and the tool
+    /// wrapper's result summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EditMode::Replace => "replace",
+            EditMode::Insert => "insert",
+            EditMode::Delete => "delete",
+        }
+    }
+}
+
 /// The cell-level edit params (qwen `NotebookEditToolParams`, minus
 /// `notebook_path` which the tool wrapper owns). `cell_id` is the display id
 /// from read_file output; `new_source` is required for replace/insert;
@@ -142,8 +155,8 @@ pub fn apply_notebook_edit(
     // re-read UNLESS the notebook carried stable ids both before AND after. A
     // replace never renumbers the `cell-N` fallbacks, so it never forces one.
     let structural_edit = matches!(mode, EditMode::Insert | EditMode::Delete);
-    let requires_read_after_write = structural_edit
-        && !(original_has_stable_cell_ids && notebook.has_stable_cell_ids());
+    let requires_read_after_write =
+        structural_edit && !(original_has_stable_cell_ids && notebook.has_stable_cell_ids());
 
     Ok(NotebookEditResult {
         updated_content: serialize_notebook(&notebook, format),
@@ -160,7 +173,7 @@ fn require_source(source: Option<&str>, mode: EditMode) -> Result<&str, String> 
         return Ok("");
     }
     source.ok_or_else(|| {
-        let m = mode_str(mode);
+        let m = mode.as_str();
         format!("new_source is required when edit_mode is \"{m}\".")
     })
 }
@@ -245,14 +258,6 @@ fn cell_type_str(cell: &Cell) -> &'static str {
         // wrong; fall back to code (qwen keeps `target.cell_type` verbatim - a
         // string - here we only reach this arm for a well-formed notebook).
         _ => "code",
-    }
-}
-
-fn mode_str(mode: EditMode) -> &'static str {
-    match mode {
-        EditMode::Replace => "replace",
-        EditMode::Insert => "insert",
-        EditMode::Delete => "delete",
     }
 }
 
@@ -356,6 +361,16 @@ mod tests {
         NotebookEditParams {
             edit_mode: mode,
             ..Default::default()
+        }
+    }
+
+    /// A replace-mode edit of `cell_id` to `new_source` - the most common test
+    /// shape (swap a cell's source, keep everything else).
+    fn replace(cell_id: &str, new_source: &str) -> NotebookEditParams {
+        NotebookEditParams {
+            cell_id: Some(cell_id.into()),
+            new_source: Some(new_source.into()),
+            ..params(EditMode::Replace)
         }
     }
 
@@ -481,7 +496,10 @@ and target a stable real cell ID before editing."
             ..params(EditMode::Replace)
         };
         let err = apply_notebook_edit(FIXTURE, &p).unwrap_err();
-        assert_eq!(err, "cell_id is required for replace and delete operations.");
+        assert_eq!(
+            err,
+            "cell_id is required for replace and delete operations."
+        );
     }
 
     #[test]
@@ -560,11 +578,7 @@ and target a stable real cell ID before editing."
 "##;
         // Edit the OTHER concern (source) so the populated maps ride through
         // untouched, then assert their key order is the on-disk order.
-        let p = NotebookEditParams {
-            cell_id: Some("run".into()),
-            new_source: Some("print('bye')\n".into()),
-            ..params(EditMode::Replace)
-        };
+        let p = replace("run", "print('bye')\n");
         let out = apply_notebook_edit(raw, &p).unwrap().updated_content;
         // The cell metadata keys stay in insertion order (zebra, alpha, middle),
         // not alphabetical (alpha, middle, zebra).
@@ -593,11 +607,7 @@ and target a stable real cell ID before editing."
  "nbformat_minor": 5
 }
 "##;
-        let p = NotebookEditParams {
-            cell_id: Some("run".into()),
-            new_source: Some("y\n".into()),
-            ..params(EditMode::Replace)
-        };
+        let p = replace("run", "y\n");
         let out = apply_notebook_edit(raw, &p).unwrap().updated_content;
         let round: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(round["metadata"]["authors"][0]["name"], "Ada");

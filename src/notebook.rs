@@ -11,19 +11,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The nbformat major version at which Jupyter began generating stable cell ids
+/// (nbformat 4). See [`Notebook::should_generate_cell_ids`].
+const NBFORMAT_STABLE_IDS_MAJOR: i64 = 4;
+/// The nbformat 4.x minor version at which stable cell ids became the default
+/// (nbformat 4.5). See [`Notebook::should_generate_cell_ids`].
+const NBFORMAT_STABLE_IDS_MINOR: i64 = 5;
+
 /// Deserialize a present `execution_count` field, keeping the JSON literal
 /// `null` as `Some(Value::Null)` (not `None`). serde's default `Option` handling
 /// folds a present `null` onto `None`, which would make an absent field and a
 /// present-null field indistinguishable; a code cell qwen normalized carries
 /// `"execution_count": null`, so that distinction must survive a round-trip.
 /// An ABSENT field never calls this (it takes the `default`, `None`).
-// qual:allow(test_quality, untested) reason: "a serde `deserialize_with` fn is
-// only reachable through the derived Deserialize, never by direct name; the
-// `deserialize_present_null_keeps_absent_and_null_apart` test drives all three
-// branches (present-null, absent, number) via `Cell` deserialization."
-fn deserialize_present_null<'de, D>(
-    deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error>
+fn deserialize_present_null<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -88,6 +89,7 @@ pub struct CellOutput {
 /// A notebook cell (qwen `NotebookCell`). `cell_type` is `code | markdown | raw`
 /// on well-formed notebooks; kept a `String` so an unknown type still parses and
 /// formats through the default arm.
+// qual:allow(srp, god_struct) reason: "serde ipynb wire DTO - fields are independent JSON keys preserved verbatim for notebook round-trip; splitting breaks fidelity"
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Cell {
     pub cell_type: String,
@@ -178,6 +180,7 @@ pub struct Kernelspec {
 
 /// The top-level notebook (qwen `NotebookContent`). `cells` is required for a
 /// valid notebook; everything else is optional.
+// qual:allow(srp, god_struct) reason: "serde ipynb wire DTO - fields are independent JSON keys preserved verbatim for notebook round-trip; splitting breaks fidelity"
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Notebook {
     #[serde(default)]
@@ -201,8 +204,8 @@ impl Notebook {
     pub fn parse(content: &str) -> Result<Notebook, String> {
         // Strip a leading UTF-8 BOM the way qwen slices `﻿`.
         let json = content.strip_prefix('\u{feff}').unwrap_or(content);
-        let value: serde_json::Value = serde_json::from_str(json)
-            .map_err(|e| format!("Invalid notebook: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("Invalid notebook: {e}"))?;
         if !value.is_object() {
             return Err("Invalid notebook: expected a JSON object".to_string());
         }
@@ -270,7 +273,9 @@ impl Notebook {
     /// model can target it on the next edit.
     pub fn should_generate_cell_ids(&self) -> bool {
         let nbformat = self.nbformat.unwrap_or(0);
-        nbformat > 4 || (nbformat == 4 && self.nbformat_minor.unwrap_or(0) >= 5)
+        nbformat > NBFORMAT_STABLE_IDS_MAJOR
+            || (nbformat == NBFORMAT_STABLE_IDS_MAJOR
+                && self.nbformat_minor.unwrap_or(0) >= NBFORMAT_STABLE_IDS_MINOR)
     }
 
     /// A fresh, unused display id for a newly inserted cell (qwen `makeCellId`):
@@ -302,7 +307,9 @@ impl Notebook {
     pub fn source_array_style(&self) -> bool {
         self.cells
             .iter()
-            .find(|c| !matches!(c.source, Source::Text(ref s) if s.is_empty()) || c.source_is_array())
+            .find(|c| {
+                !matches!(c.source, Source::Text(ref s) if s.is_empty()) || c.source_is_array()
+            })
             .map(Cell::source_is_array)
             .unwrap_or(true)
     }
@@ -445,20 +452,18 @@ mod tests {
         // deserializer), while an ABSENT field takes the default None. This is
         // the distinction a code cell qwen normalized (`execution_count: null`)
         // relies on to round-trip.
-        let present_null: Cell = serde_json::from_str(
-            r#"{"cell_type":"code","source":"x","execution_count":null}"#,
-        )
-        .unwrap();
+        let present_null: Cell =
+            serde_json::from_str(r#"{"cell_type":"code","source":"x","execution_count":null}"#)
+                .unwrap();
         assert_eq!(present_null.execution_count, Some(serde_json::Value::Null));
 
         let absent: Cell =
             serde_json::from_str(r#"{"cell_type":"markdown","source":"x"}"#).unwrap();
         assert_eq!(absent.execution_count, None);
 
-        let number: Cell = serde_json::from_str(
-            r#"{"cell_type":"code","source":"x","execution_count":7}"#,
-        )
-        .unwrap();
+        let number: Cell =
+            serde_json::from_str(r#"{"cell_type":"code","source":"x","execution_count":7}"#)
+                .unwrap();
         assert_eq!(
             number.execution_count,
             Some(serde_json::Value::Number(7.into()))
