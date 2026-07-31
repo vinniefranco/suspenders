@@ -285,7 +285,7 @@ pub fn normalize(entry: impl Into<ExtensionSpec>) -> ExtensionSpec {
 /// implementation ([`build`]); an unknown name is skipped (it cannot be
 /// registered, so it has no effect and cannot fail a stage). This is the
 /// production registry: the shipped config resolves
-/// `["diff", "run_command", "condense", "todo"]` into the Diff extension, the
+/// `["diff", "run_shell_command", "condense", "todo"]` into the Diff extension, the
 /// run_command exit-badge extension, the condense noise-collapse extension, and
 /// the Todo display extension (ADR-0048), so the live app runs the
 /// Run/Presentment pipeline with all four.
@@ -309,8 +309,8 @@ fn build(spec: &ExtensionSpec) -> Option<Registered> {
                 .with_middleware(Box::new(diff::Diff))
                 .with_presenter(Box::new(diff::Diff)),
         ),
-        "run_command" => Some(
-            Registered::new("run_command", spec.opts.clone())
+        "run_shell_command" => Some(
+            Registered::new("run_shell_command", spec.opts.clone())
                 .with_middleware(Box::new(run_command::RunCommand))
                 .with_presenter(Box::new(run_command::RunCommand)),
         ),
@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn present_folds_over_the_item_extensions_that_pass_leave_it_unchanged() {
         let item = TranscriptItem::ToolResult {
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "edited x".to_string(),
             is_error: false,
             key_arg: None,
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn present_an_extension_may_replace_the_item_using_the_artifacts() {
         let item = TranscriptItem::ToolResult {
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "edited x".to_string(),
             is_error: false,
             key_arg: None,
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(
             presented,
             TranscriptItem::Diff {
-                title: "presented edit_file".to_string(),
+                title: "presented edit".to_string(),
                 lang: None,
                 hunks: vec![DiffHunk {
                     header: None,
@@ -804,7 +804,7 @@ mod tests {
     fn present_a_crashing_present_keeps_the_item_from_before_that_extension_and_reports() {
         let item = TranscriptItem::ToolCall {
             id: "t1".to_string(),
-            name: "grep".to_string(),
+            name: "grep_search".to_string(),
             summary: "pattern=x".to_string(),
         };
         let extensions =

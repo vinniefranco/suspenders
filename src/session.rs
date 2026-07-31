@@ -273,7 +273,7 @@ impl SessionConfig {
             skip_next_speaker: false,
             extensions: vec![
                 "diff".into(),
-                "run_command".into(),
+                "run_shell_command".into(),
                 "condense".into(),
                 "todo".into(),
             ],
@@ -969,6 +969,10 @@ impl Session {
             // read_file reach memory files without per-tool duplication. A
             // resolved subtree, NOT a general escape.
             memory_root: Some(std::path::PathBuf::from(&self.memory_root)),
+            // The session directory (Phase 9, ADR-0063): where background-shell
+            // capture files live, so run_command's background branch can name the
+            // capture file in its started block (the Agent builds them there too).
+            session_dir: std::path::PathBuf::from(&self.session_dir),
             caps,
         }
     }

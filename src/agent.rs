@@ -52,11 +52,13 @@ use crate::tool::caps::SubagentResult;
 use crate::voice;
 
 pub mod background;
+pub mod background_shell;
 mod capabilities;
 mod deps;
 mod init;
 mod settle;
 use background::BackgroundTask;
+use background_shell::{BackgroundShell, ShellOutcome};
 use deps::AgentDeps;
 use settle::{LoopOrDown, settle_event_to_event, to_settlement_outcome};
 
@@ -235,6 +237,29 @@ pub enum RunMsg {
     /// synchronously, and replies the VERBATIM qwen wording (found/not-running/
     /// not-found).
     StopBackground {
+        id: String,
+        reply: oneshot::Sender<String>,
+    },
+    /// A background-shell launch (Phase 9, ADR-0063): `run_command` with
+    /// `is_background: true` asked the Agent (which owns the process lifecycle) to
+    /// spawn a detached shell. The Agent mints the id, spawns the child, registers
+    /// it, and replies the id - the tool does NOT park (the whole point of a
+    /// background launch).
+    SpawnBackgroundShell {
+        command: String,
+        cwd: String,
+        reply: oneshot::Sender<String>,
+    },
+    /// A background shell settled (Phase 9, ADR-0063): the detached watcher task
+    /// posts the child's [`background_shell::ShellOutcome`] back so the Agent
+    /// updates the registry entry and queues the `<task-notification>`. A
+    /// `Cancelled` entry (a `task_stop` already killpg'd it) drops the outcome.
+    BackgroundShellDone { id: String, outcome: ShellOutcome },
+    /// A background-shell stop request (Phase 9, ADR-0063): the shell-only leg of
+    /// the [`crate::tool::caps::BackgroundShellSpawner`] seam. The dual-registry
+    /// resolution `task_stop` drives lives on [`RunMsg::StopBackground`]; this
+    /// variant is the direct shell-registry stop the bg-shells capability relays.
+    StopBackgroundShell {
         id: String,
         reply: oneshot::Sender<String>,
     },
@@ -615,6 +640,15 @@ struct AgentState {
     // The monotonic per-Session background task counter (ADR-0063): the `n` in
     // `{subagent_type}-{n}`, so ids never collide within a Session.
     background_counter: u64,
+    // The background shell registry (Phase 9, ADR-0063): the detached subprocesses
+    // the Agent is tracking, keyed by the minted shell id (`bg_{n}`). Single-owner
+    // state (ADR-0017) like `background`: a launch inserts, a settlement/stop
+    // mutates, an actor-loop exit killpg's + aborts them all. `run_command`'s
+    // background branch and `task_stop` reach it ONLY through the mpsc.
+    background_shells: HashMap<String, BackgroundShell>,
+    // The monotonic per-Session background shell counter (Phase 9, ADR-0063): the
+    // `n` in `bg_{n}`, so shell ids never collide within a Session.
+    background_shell_counter: u64,
 }
 
 #[cfg(test)]
@@ -659,6 +693,8 @@ impl AgentState {
             background: HashMap::new(),
             notifications: Vec::new(),
             background_counter: 0,
+            background_shells: HashMap::new(),
+            background_shell_counter: 0,
             session,
         };
         (state, rx)
@@ -675,8 +711,10 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
         }
     }
     // The actor loop ended (every handle dropped): the Session is over, so any
-    // still-running background child must not outlive it (P4b, ADR-0063).
+    // still-running background child (subagent OR shell) must not outlive it
+    // (P4b/Phase 9, ADR-0063).
     state.abort_all_background();
+    state.abort_all_background_shells();
 }
 
 fn handle_command(state: &mut AgentState, cmd: Command) {
@@ -809,7 +847,31 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             state.background_done(id, result);
         }
         RunMsg::StopBackground { id, reply } => {
-            let wording = state.stop_background(id);
+            // Dual-registry (Phase 9, ADR-0063): `task_stop` names one id space, so
+            // try the subagent registry, then the shell registry, then synthesize
+            // the VERBATIM not-found ONCE. Both `stop_background` handlers return an
+            // `Option` so the fall-through is a `None`, not a string sniff.
+            let wording = state
+                .stop_background(id.clone())
+                .or_else(|| state.stop_background_shell(id.clone()))
+                .unwrap_or_else(|| format!("Error: No background task found with ID \"{id}\"."));
+            let _ = reply.send(wording);
+        }
+        RunMsg::SpawnBackgroundShell {
+            command,
+            cwd,
+            reply,
+        } => {
+            let id = state.spawn_background_shell(command, cwd);
+            let _ = reply.send(id);
+        }
+        RunMsg::BackgroundShellDone { id, outcome } => {
+            state.background_shell_done(id, outcome);
+        }
+        RunMsg::StopBackgroundShell { id, reply } => {
+            let wording = state
+                .stop_background_shell(id.clone())
+                .unwrap_or_else(|| format!("Error: No background task found with ID \"{id}\"."));
             let _ = reply.send(wording);
         }
         RunMsg::DrainNotifications(reply) => {

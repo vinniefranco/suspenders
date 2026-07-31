@@ -1,27 +1,35 @@
-//! `write_file(path, content)`: creates a new file, creating parent
-//! directories as needed. Refuses to overwrite an existing file - changing an
-//! existing file is edit_file's job. Closing the whole-file-rewrite channel
-//! stops a small model from destroying a file by rewriting it (each
-//! reproduction shorter than the last) instead of making a targeted edit.
+//! `write_file(file_path, content)`: writes `content` to a file in the local
+//! filesystem, creating parent directories as needed. A FAITHFUL port of qwen
+//! v0.16.0 `tools/write-file.ts`: an ABSOLUTE `file_path` (a relative one is
+//! refused with qwen's verbatim message), and an OVERWRITE contract - an
+//! existing file is overwritten, not refused. The result string distinguishes a
+//! fresh create ("Successfully created and wrote to new file: ...") from an
+//! overwrite ("Successfully overwrote file: ...").
+//!
+//! qwen's write-file.ts also carries internal infrastructure this port does not
+//! reproduce (out of the model-facing contract): BOM / encoding / line-ending
+//! detection, git commit attribution, file-history backup, prior-read
+//! enforcement (the `checkPriorRead` TOCTOU guards, gated on
+//! `getFileReadCacheDisabled`), and hooks. What DOES survive is the read-cache
+//! recording: after a successful write the Run's [`FileReadCache`] is stamped
+//! (qwen's `recordWrite`), so a follow-up read_file serves fresh content and a
+//! subsequent full read gets the unchanged placeholder rather than treating the
+//! tool's own write as a stale external change.
+//!
+//! [`FileReadCache`]: crate::tool::read_cache::FileReadCache
 
-use crate::tool::path::{FileError, file_error, with_path};
+use crate::tool::path::{FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct WriteFile;
 
-const DESCRIPTION: &str = "\
-Writes content to a new file in the project's filesystem, creating any missing parent directories \
-along the way.\n\
-\n\
-Usage:\n\
-- The `path` is relative to the project root (e.g. \"src/tools/new.rs\"), NOT an absolute path.\n\
-- This tool ONLY creates new files. It fails if the file already exists - to change an existing \
-file, use edit_file instead (targeted edits, not whole-file rewrites, keep changes reviewable and \
-avoid clobbering).\n\
-- Missing parent directories are created automatically, so you do not need to run a separate mkdir \
-command.\n\
-- `content` is written verbatim; provide the complete, final contents of the file.";
+/// VERBATIM from qwen v0.16.0 `tools/write-file.ts` (the description passed to the
+/// `WriteFileTool` constructor), including its exact indentation on the second
+/// line.
+const DESCRIPTION: &str = "Writes content to a specified file in the local filesystem.
+
+      The user has the ability to modify `content`. If modified, this will be stated in the response.";
 
 #[async_trait::async_trait]
 impl Tool for WriteFile {
@@ -29,60 +37,125 @@ impl Tool for WriteFile {
         ToolSpec {
             name: "write_file".into(),
             description: DESCRIPTION.into(),
+            // Schema property set + each description string are VERBATIM from
+            // qwen write-file.ts's `parametersJsonSchema`.
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "file_path": {
                         "type": "string",
-                        "description": "The path of the new file to create, relative to the \
-                            project root (e.g. \"src/tools/new.rs\"). Do not pass an absolute \
-                            path. Fails if the file already exists."
+                        "description": "The absolute path to the file to write to (e.g., '/home/user/project/file.txt'). Relative paths are not supported."
                     },
                     "content": {
                         "type": "string",
-                        "description": "The full, final content to write to the file."
+                        "description": "The content to write to the file."
                     }
                 },
-                "required": ["path", "content"]
+                "required": ["file_path", "content"]
             }),
         }
     }
 
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let path = input
-            .get("path")
+        let raw_path = input
+            .get("file_path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: write_file requires a string \"path\"".to_string())?;
+            .ok_or_else(|| {
+                "invalid input: write_file requires a string \"file_path\"".to_string()
+            })?;
+        // qwen's `unescapePath(params.file_path.trim())` (write-file.ts): trim
+        // surrounding whitespace and strip shell-escaping backslashes BEFORE the
+        // absolute-path check and before the path is echoed back.
+        let path = unescape_and_trim(raw_path);
         let content = input
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "invalid input: write_file requires a string \"content\"".to_string())?;
 
-        with_path(path, ctx, |abs| {
-            if abs.is_dir() {
-                Err(format!("{path} is a directory"))
-            } else if abs.exists() {
-                Err(format!(
-                    "{path} already exists; write_file only creates new files. \
-                     Use edit_file to change it."
-                ))
-            } else {
-                write(abs, path, content)
-            }
-        })
+        let abs = resolve(&path, ctx)?;
+        write(&abs, content, ctx)
     }
 }
 
-fn write(abs: &std::path::Path, path: &str, content: &str) -> Result<String, String> {
+/// Resolve a model-supplied ABSOLUTE `file_path` and confine it to the Project
+/// Root (or the trusted memory subtree), rendering qwen's verbatim
+/// absolute-path message for a relative path (write-file.ts
+/// `validateToolParamValues`) and the shared confinement wording for an escape.
+fn resolve(path: &str, ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
+    resolve_absolute_in(path, &ctx.root, ctx.memory_root.as_deref()).map_err(|reject| match reject {
+        // VERBATIM qwen write-file.ts `validateToolParamValues`.
+        PathReject::Relative => format!("File path must be absolute: {path}"),
+        // qwen has no write-file.ts message for a path outside the workspace (it
+        // asks for confirmation via getDefaultPermission instead). Suspenders
+        // confines every tool path to the Project Root, so an escape is a hard
+        // refusal with the shared confinement wording.
+        PathReject::Escapes => "path escapes project root".to_string(),
+    })
+}
+
+/// Write `content` to the (already confined, absolute) `abs`, creating parent
+/// directories, then stamp the read cache. `abs` is used in the model-facing
+/// result string, matching qwen's `${file_path}` (its already-resolved absolute
+/// path).
+fn write(abs: &std::path::Path, content: &str, ctx: &ToolCtx) -> Result<String, String> {
+    if abs.is_dir() {
+        // qwen's `validateToolParamValues` rejects a directory target; keep the
+        // POSIX-narrative wording the other file tools use.
+        return Err(file_error("write", &abs.display().to_string(), FileError::Eisdir));
+    }
+
+    // qwen creates parent directories only on the new-file path; `create_dir_all`
+    // on an existing file's (existing) parent is a harmless no-op, so a single
+    // unconditional call is equivalent and simpler.
     if let Some(parent) = abs.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
-        return Err(file_error("write", path, FileError::from_io(&err)));
+        return Err(file_error("write", &abs.display().to_string(), FileError::from_io(&err)));
     }
-    match std::fs::write(abs, content) {
-        Ok(()) => Ok(format!("created {path} ({} bytes)", content.len())),
-        Err(err) => Err(file_error("write", path, FileError::from_io(&err))),
+
+    let existed = abs.exists();
+    if let Err(err) = std::fs::write(abs, content) {
+        return Err(file_error("write", &abs.display().to_string(), FileError::from_io(&err)));
     }
+
+    // Stamp the read cache with the post-write fingerprint (qwen `recordWrite`):
+    // the model authored the current bytes, so a follow-up read_file serves fresh
+    // content rather than reading the tool's own write as a stale external change.
+    record_write(ctx, abs);
+
+    Ok(result_message(abs, existed))
+}
+
+/// qwen's `llmSuccessMessageParts` (write-file.ts): a fresh create vs. an
+/// overwrite, VERBATIM. `abs` stands in for qwen's already-resolved absolute
+/// `file_path`.
+fn result_message(abs: &std::path::Path, existed: bool) -> String {
+    let path = abs.display();
+    if existed {
+        format!("Successfully overwrote file: {path}.")
+    } else {
+        format!("Successfully created and wrote to new file: {path}.")
+    }
+}
+
+/// Record the write into the Run's read cache (F6, qwen `recordWrite`). Stats the
+/// file for the `(mtime, size)` fingerprint; a stat miss is dropped - the write
+/// already succeeded, and the next read re-stats.
+fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(abs) else {
+        return;
+    };
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // `cacheable = true`: write_file authored plain-text bytes, so a following
+    // full read_file can serve qwen's `file_unchanged` placeholder (qwen's
+    // `recordWrite` default). Only the notebook writer passes `false`.
+    ctx.read_cache()
+        .record_write(abs.to_path_buf(), mtime_ms, meta.len(), true);
 }
 
 #[cfg(test)]
@@ -94,27 +167,57 @@ mod tests {
         ToolCtx::for_test(root.to_path_buf(), 10_000)
     }
 
+    // An absolute path to `rel` inside `root`, as a JSON string, since the tool
+    // now requires an absolute file_path (qwen contract).
+    fn abs(root: &std::path::Path, rel: &str) -> String {
+        root.join(rel).to_string_lossy().into_owned()
+    }
+
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
         WriteFile.run(&input, ctx).await
     }
 
     #[test]
-    fn spec_requires_path_and_content() {
+    fn spec_requires_file_path_and_content() {
         let spec = WriteFile.spec();
         assert_eq!(spec.name, "write_file");
-        assert_eq!(spec.input_schema["required"], json!(["path", "content"]));
+        assert_eq!(
+            spec.input_schema["required"],
+            json!(["file_path", "content"])
+        );
+        // The old relative `path` param is gone.
+        assert!(spec.input_schema["properties"]["path"].is_null());
+        assert!(spec.input_schema["properties"]["file_path"].is_object());
+    }
+
+    #[test]
+    fn description_is_the_verbatim_qwen_string() {
+        let spec = WriteFile.spec();
+        let desc = spec.description;
+        assert_eq!(
+            desc,
+            "Writes content to a specified file in the local filesystem.\n\n      The user has the ability to modify `content`. If modified, this will be stated in the response."
+        );
+        // No suspenders-only additions.
+        assert!(!desc.contains("Usage:"));
+        assert!(!desc.contains("relative to the project root"));
+        assert!(!desc.contains("only creates new files"));
     }
 
     #[tokio::test]
-    async fn creates_a_new_file_and_reports_it_as_created() {
+    async fn creates_a_new_file_with_the_verbatim_created_message() {
         let tmp = TempDir::new().unwrap();
+        let target = abs(tmp.path(), "new.txt");
         let msg = run(
-            json!({"path": "new.txt", "content": "hello"}),
+            json!({"file_path": &target, "content": "hello"}),
             &ctx(tmp.path()),
         )
         .await
         .unwrap();
-        assert!(msg.contains("created new.txt"));
+        assert_eq!(
+            msg,
+            format!("Successfully created and wrote to new file: {target}.")
+        );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
             "hello"
@@ -122,15 +225,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_missing_parent_directories() {
+    async fn a_padded_file_path_is_trimmed_before_validation() {
+        // qwen unescapePath(file_path.trim()) (write-file.ts): surrounding
+        // whitespace is stripped, so a padded absolute path writes fine (and is
+        // echoed trimmed) rather than being rejected as relative.
         let tmp = TempDir::new().unwrap();
+        let target = abs(tmp.path(), "only.txt");
+        let padded = format!("  {target}  ");
         let msg = run(
-            json!({"path": "deeply/nested/dir/file.txt", "content": "x"}),
+            json!({"file_path": padded, "content": "body"}),
             &ctx(tmp.path()),
         )
         .await
         .unwrap();
-        assert!(msg.contains("created"));
+        assert_eq!(
+            msg,
+            format!("Successfully created and wrote to new file: {target}.")
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("only.txt")).unwrap(),
+            "body"
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_missing_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        let target = abs(tmp.path(), "deeply/nested/dir/file.txt");
+        let msg = run(json!({"file_path": &target, "content": "x"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(msg.starts_with("Successfully created and wrote to new file:"));
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("deeply/nested/dir/file.txt")).unwrap(),
             "x"
@@ -138,31 +263,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overwriting_an_existing_file_is_refused() {
+    async fn overwrites_an_existing_file_with_the_verbatim_overwrite_message() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "old").unwrap();
+        let target = abs(tmp.path(), "a.txt");
 
-        let err = run(json!({"path": "a.txt", "content": "new"}), &ctx(tmp.path()))
+        let msg = run(json!({"file_path": &target, "content": "new"}), &ctx(tmp.path()))
             .await
-            .unwrap_err();
-        assert!(err.contains("a.txt"));
-        assert!(err.contains("edit_file"));
+            .unwrap();
+        assert_eq!(msg, format!("Successfully overwrote file: {target}."));
+        // The overwrite actually replaced the bytes.
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
-            "old"
+            "new"
         );
     }
 
     #[tokio::test]
     async fn empty_content_is_allowed() {
         let tmp = TempDir::new().unwrap();
+        let target = abs(tmp.path(), "empty.txt");
         assert!(
-            run(
-                json!({"path": "empty.txt", "content": ""}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
+            run(json!({"file_path": &target, "content": ""}), &ctx(tmp.path()))
+                .await
+                .is_ok()
         );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap(),
@@ -174,27 +298,30 @@ mod tests {
     async fn writing_over_a_directory_is_an_error() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("somedir")).unwrap();
+        let target = abs(tmp.path(), "somedir");
 
-        let err = run(json!({"path": "somedir", "content": "x"}), &ctx(tmp.path()))
+        let err = run(json!({"file_path": &target, "content": "x"}), &ctx(tmp.path()))
             .await
             .unwrap_err();
         assert!(err.contains("directory"));
     }
 
     #[tokio::test]
+    async fn a_relative_path_is_the_verbatim_absolute_required_message() {
+        let tmp = TempDir::new().unwrap();
+        let err = run(json!({"file_path": "new.txt", "content": "x"}), &ctx(tmp.path()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "File path must be absolute: new.txt");
+    }
+
+    #[tokio::test]
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
+        // An absolute path outside the root escapes.
         assert_eq!(
             run(
-                json!({"path": "../escape.txt", "content": "x"}),
-                &ctx(tmp.path())
-            )
-            .await,
-            Err("path escapes project root".into())
-        );
-        assert_eq!(
-            run(
-                json!({"path": "/tmp/absolute_escape.txt", "content": "x"}),
+                json!({"file_path": "/tmp/absolute_escape.txt", "content": "x"}),
                 &ctx(tmp.path())
             )
             .await,
@@ -211,15 +338,18 @@ mod tests {
         let mut ctx = ctx(proj.path());
         ctx.memory_root = Some(mem.path().to_path_buf());
 
-        let abs = mem.path().join("MEMORY.md");
+        let target = mem.path().join("MEMORY.md");
         let msg = run(
-            json!({"path": abs.to_str().unwrap(), "content": "- [X](x.md) - hook"}),
+            json!({"file_path": target.to_str().unwrap(), "content": "- [X](x.md) - hook"}),
             &ctx,
         )
         .await
         .unwrap();
-        assert!(msg.contains("created"));
-        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "- [X](x.md) - hook");
+        assert!(msg.starts_with("Successfully created and wrote to new file:"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "- [X](x.md) - hook"
+        );
     }
 
     #[tokio::test]
@@ -232,24 +362,57 @@ mod tests {
         // A sibling of the memory root that merely shares its string prefix.
         let evil = format!("{}-evil/x.md", mem.path().to_str().unwrap());
         assert_eq!(
-            run(json!({"path": evil, "content": "x"}), &ctx).await,
+            run(json!({"file_path": evil, "content": "x"}), &ctx).await,
             Err("path escapes project root".into())
         );
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_records_into_the_read_cache() {
+        // qwen `recordWrite`: after a write, the path reads Fresh (the tool's own
+        // write is not a stale external change) and is a full read the model has
+        // "seen", so read_file's unchanged fast-path is eligible.
+        use crate::tool::read_cache::ReadState;
+        let tmp = TempDir::new().unwrap();
+        let c = ctx(tmp.path());
+        let target = abs(tmp.path(), "cached.txt");
+        run(json!({"file_path": &target, "content": "body"}), &c)
+            .await
+            .unwrap();
+
+        let path = std::path::Path::new(&target);
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert_eq!(
+            c.read_cache().check(path, mtime_ms, meta.len()),
+            ReadState::Fresh
+        );
+        assert!(c.read_cache().entry(path).unwrap().last_read_was_full);
     }
 
     #[tokio::test]
     async fn missing_or_non_string_arguments_are_a_structured_error() {
         let tmp = TempDir::new().unwrap();
         let c = ctx(tmp.path());
+        let target = abs(tmp.path(), "a.txt");
         assert!(
-            crate::tools::execute("write_file", &json!({"path": "a.txt"}), &c)
+            crate::tools::execute("write_file", &json!({"file_path": target}), &c)
                 .await
                 .is_error
         );
         assert!(
-            crate::tools::execute("write_file", &json!({"path": "a.txt", "content": 42}), &c)
-                .await
-                .is_error
+            crate::tools::execute(
+                "write_file",
+                &json!({"file_path": abs(tmp.path(), "a.txt"), "content": 42}),
+                &c
+            )
+            .await
+            .is_error
         );
     }
 }

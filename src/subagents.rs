@@ -169,13 +169,13 @@ Notes:
 // LS, WEB_FETCH, TODO_WRITE, MEMORY, SKILL, LSP, ASK_USER_QUESTION); per ADR-0061
 // the `'fast'` alias is deferred (ships Inherit) and the allowlist is qwen's set
 // intersected with the tools that exist here, then minus the exclusions - so it
-// is read_file/grep/glob/run_command/list_files/web_fetch/todo_write (qwen's
-// MEMORY/SKILL/LSP have no Suspenders analog, and ASK_USER_QUESTION is an
+// is read_file/grep_search/glob/run_shell_command/list_directory/web_fetch/todo_write
+// (qwen's MEMORY/SKILL/LSP have no Suspenders analog, and ASK_USER_QUESTION is an
 // EXCLUDED tool). This grant backs the verbatim prompt, which instructs the
-// model to use run_command (read-only git/ls/cat) and to fetch the web.
+// model to use run_shell_command (read-only git/ls/cat) and to fetch the web.
 // Description + system prompt VERBATIM from qwen; the `${ToolDisplayNames.*}`
-// interpolations resolve to Suspenders' own tool names (write_file/edit_file/
-// glob/grep/read_file/run_command).
+// interpolations resolve to Suspenders' own tool names (write_file/edit/
+// glob/grep_search/read_file/run_shell_command).
 fn explore() -> SubagentDef {
     SubagentDef {
         name: "Explore".to_string(),
@@ -185,7 +185,7 @@ fn explore() -> SubagentDef {
 === CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
 This is a READ-ONLY exploration task. You are STRICTLY PROHIBITED from:
 - Creating new files (no write_file, touch, or file creation of any kind)
-- Modifying existing files (no edit_file operations)
+- Modifying existing files (no edit operations)
 - Deleting files (no rm or deletion)
 - Moving or copying files (no mv or cp)
 - Creating temporary files anywhere, including /tmp
@@ -201,10 +201,10 @@ Your strengths:
 
 Guidelines:
 - Use glob for broad file pattern matching
-- Use grep for searching file contents with regex
+- Use grep_search for searching file contents with regex
 - Use read_file when you know the specific file path you need to read
-- Use run_command ONLY for read-only operations (ls, git status, git log, git diff, find, cat, head, tail)
-- NEVER use run_command for: mkdir, touch, rm, cp, mv, git add, git commit, npm install, pip install, or any file creation/modification
+- Use run_shell_command ONLY for read-only operations (ls, git status, git log, git diff, find, cat, head, tail)
+- NEVER use run_shell_command for: mkdir, touch, rm, cp, mv, git add, git commit, npm install, pip install, or any file creation/modification
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
 - For clear communication, avoid using emojis
@@ -223,10 +223,10 @@ Notes:
         model: SubagentModel::Inherit,
         tools: ToolSelector::Allow(vec![
             "read_file".to_string(),
-            "grep".to_string(),
+            "grep_search".to_string(),
             "glob".to_string(),
-            "run_command".to_string(),
-            "list_files".to_string(),
+            "run_shell_command".to_string(),
+            "list_directory".to_string(),
             "web_fetch".to_string(),
             "todo_write".to_string(),
         ]),
@@ -306,10 +306,10 @@ mod tests {
             def.tools,
             ToolSelector::Allow(vec![
                 "read_file".into(),
-                "grep".into(),
+                "grep_search".into(),
                 "glob".into(),
-                "run_command".into(),
-                "list_files".into(),
+                "run_shell_command".into(),
+                "list_directory".into(),
                 "web_fetch".into(),
                 "todo_write".into(),
             ])
@@ -319,11 +319,11 @@ mod tests {
                 .starts_with("You are a file search specialist agent.")
         );
         assert!(def.system_prompt.contains("READ-ONLY MODE"));
-        // The prompt instructs run_command / web fetches, so the grant must back
-        // them.
+        // The prompt instructs run_shell_command / web fetches, so the grant must
+        // back them.
         assert!(
             def.system_prompt
-                .contains("Use run_command ONLY for read-only")
+                .contains("Use run_shell_command ONLY for read-only")
         );
     }
 
@@ -337,7 +337,7 @@ mod tests {
         assert!(!names.contains(&"task_stop".to_string()));
         // But the ordinary built-ins remain.
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"run_command".to_string()));
+        assert!(names.contains(&"run_shell_command".to_string()));
         assert!(names.contains(&"tool_search".to_string()));
     }
 
@@ -347,13 +347,13 @@ mod tests {
         // must still be dropped.
         let selector = ToolSelector::Allow(vec![
             "read_file".into(),
-            "grep".into(),
+            "grep_search".into(),
             "ask_user_question".into(),
         ]);
         let names = names_of(&subagent_tools(&selector));
         assert_eq!(
             names,
-            vec!["read_file".to_string(), "grep".to_string()],
+            vec!["read_file".to_string(), "grep_search".to_string()],
             "only the allowed, non-excluded tools survive"
         );
     }
@@ -366,10 +366,10 @@ mod tests {
         // registry order of `crate::tools::tools`. run_command + web_fetch ride
         // so the prompt's read-only-shell and web-fetch instructions are backed.
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"grep".to_string()));
+        assert!(names.contains(&"grep_search".to_string()));
         assert!(names.contains(&"glob".to_string()));
-        assert!(names.contains(&"run_command".to_string()));
-        assert!(names.contains(&"list_files".to_string()));
+        assert!(names.contains(&"run_shell_command".to_string()));
+        assert!(names.contains(&"list_directory".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
         assert!(names.contains(&"todo_write".to_string()));
         assert_eq!(names.len(), 7, "exactly the seven allowed tools, no more");

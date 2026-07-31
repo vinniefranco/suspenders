@@ -39,7 +39,7 @@ risk. It leaves "Pass" as a coined word for what the ecosystem calls a turn:
 category (a) friction, one glossary lookup, no false friend. Adopting "turn"
 for a Pass later is not foreclosed; it is deferred.
 
-**The Run collision, accepted.** "Run" brushes against `run_command` and the
+**The Run collision, accepted.** "Run" brushes against `run_shell_command` and the
 informal "a run of the TUI" (now spelled as a **Session**, "one session from
 launch to exit"). Context disambiguates; the Session entry was reworded to
 drop "one run". The weaker fallbacks were rejected: "Exchange" reads as a

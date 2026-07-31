@@ -56,12 +56,12 @@ fn message_end_lists_tool_names_and_the_joined_text() {
 #[test]
 fn message_end_without_text_prints_only_the_tools_line() {
     let event = Event::MessageEnd {
-        content: vec![ContentBlock::tool_use("t1", "list_files", json!({}))],
+        content: vec![ContentBlock::tool_use("t1", "list_directory", json!({}))],
         stop_reason: StopReason::ToolUse,
     };
     assert_eq!(
         event_lines(&event, 0.0),
-        vec!["   message_end (t=0.0s) tools=[\"list_files\"]".to_string()]
+        vec!["   message_end (t=0.0s) tools=[\"list_directory\"]".to_string()]
     );
 }
 

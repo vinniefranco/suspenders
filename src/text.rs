@@ -1,14 +1,18 @@
-//! ANSI escape stripping for notebook output (qwen `stripAnsi`) - the terminal
-//! control codes ipykernel writes into stream/traceback output must not leak
-//! into the prompt. Split out of the notebook formatter so the escape-family
-//! machinery lives on its own, away from the cell-rendering rules.
+//! Shared text-normalisation helpers - a std-only crate-root leaf, so both the
+//! notebook read projection and the background-shell capture file import the same
+//! [`strip_ansi`] with no tool-graph cycle (mirrors the `notebook` leaf's role).
 //!
-//! Covers the four families notebook.ts matches - CSI, OSC, DCS/APC/PM/SOS, and
+//! Ported from qwen v0.16.0's `stripAnsi` (used by the notebook formatter and the
+//! background-shell output stream): terminal control codes a subprocess writes
+//! (dev servers, build tools, ipykernel) must not leak into the prompt or into a
+//! capture file the model reads as plain text.
+//!
+//! Covers the four escape families qwen matches - CSI, OSC, DCS/APC/PM/SOS, and
 //! lone C1 Fe two-byte escapes. Each escape family is skipped by a helper that
 //! returns the index just past the sequence; a plain char passes through.
 
 /// Strip ANSI escape sequences from `input`, returning the cleaned string.
-pub(super) fn strip_ansi(input: &str) -> String {
+pub fn strip_ansi(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;

@@ -120,11 +120,11 @@ Eviction / Dead Mass / Supersession machinery is gone. The dense-small budget
 
 ### The tool set matches qwen-code
 
-`read_file`, `write_file`, `edit_file`, `run_command`, `grep`, `glob`,
-`list_files`, `web_fetch`, and `todo_write` (a structured task list replacing the
-freeform `plan`). Descriptions are written in qwen-code's concrete,
-guidance-rich style. The Scout sub-agent and its `explore` tool are gone; the
-model explores inline with `grep`/`glob`/`list_files`/`read_file`.
+`read_file`, `write_file`, `edit`, `run_shell_command`, `grep_search`, `glob`,
+`list_directory`, `web_fetch`, and `todo_write` (a structured task list replacing the
+freeform `plan`). These are qwen v0.16.0's wire names; descriptions are written in
+qwen-code's concrete, guidance-rich style. The Scout sub-agent and its `explore` tool
+are gone; the model explores inline with `grep_search`/`glob`/`list_directory`/`read_file`.
 
 ## Consequences
 

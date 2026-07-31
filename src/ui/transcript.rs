@@ -556,9 +556,11 @@ fn key_arg(name: &str, input: &Value) -> Option<String> {
         _ => return None,
     };
     let salient: &[&str] = match name {
-        "read_file" | "edit_file" | "write_file" => &["path"],
-        "run_command" => &["command"],
-        "grep" | "search" => &["pattern", "query"],
+        "read_file" | "edit" | "write_file" => &["file_path"],
+        "notebook_edit" => &["notebook_path"],
+        "list_directory" => &["path"],
+        "run_shell_command" => &["command"],
+        "grep_search" | "glob" => &["pattern", "query"],
         _ => &[],
     };
     let value = salient.iter().find_map(|key| obj.get(*key)).or_else(|| {
@@ -776,11 +778,11 @@ mod tests {
             Some("src/foo.rs".to_string())
         );
         assert_eq!(
-            key_arg("run_command", &json!({"command": "cargo test"})),
+            key_arg("run_shell_command", &json!({"command": "cargo test"})),
             Some("cargo test".to_string())
         );
         assert_eq!(
-            key_arg("grep", &json!({"pattern": "TODO", "path": "src"})),
+            key_arg("grep_search", &json!({"pattern": "TODO", "path": "src"})),
             Some("TODO".to_string())
         );
         assert_eq!(
@@ -806,13 +808,13 @@ mod tests {
     // dangling `name  ` with a blank arg.
     #[test]
     fn key_arg_maps_an_empty_formatted_value_to_none() {
-        assert_eq!(key_arg("run_command", &json!({"command": ""})), None);
+        assert_eq!(key_arg("run_shell_command", &json!({"command": ""})), None);
         // The live call line then falls back to summarize_input, not a blank arg.
         let mut t = fresh();
-        t.tool_call("t1".into(), "run_command".into(), &json!({"command": ""}));
+        t.tool_call("t1".into(), "run_shell_command".into(), &json!({"command": ""}));
         assert_eq!(
             t.items(),
-            vec![tool_call_item("t1", "run_command", "command=")]
+            vec![tool_call_item("t1", "run_shell_command", "command=")]
         );
     }
 
@@ -870,10 +872,10 @@ mod tests {
     #[test]
     fn tool_result_appends_summary_with_error_flag() {
         let mut t = fresh();
-        t.tool_result("t1", "grep".into(), "a\nb\nc", false, &HashMap::new());
+        t.tool_result("t1", "grep_search".into(), "a\nb\nc", false, &HashMap::new());
         assert_eq!(
             t.items(),
-            vec![tool_result_item("grep", "a (+2 more lines)", false)]
+            vec![tool_result_item("grep_search", "a (+2 more lines)", false)]
         );
     }
 
@@ -913,8 +915,8 @@ mod tests {
     #[test]
     fn an_in_flight_call_renders_alone_without_bumping_revision() {
         let mut t = fresh();
-        t.tool_call("t1".into(), "run_command".into(), &json!({"command": "ls"}));
-        assert_eq!(t.items(), vec![tool_call_item("t1", "run_command", "ls")]);
+        t.tool_call("t1".into(), "run_shell_command".into(), &json!({"command": "ls"}));
+        assert_eq!(t.items(), vec![tool_call_item("t1", "run_shell_command", "ls")]);
         assert_eq!(t.revision(), 0);
     }
 
@@ -944,14 +946,14 @@ mod tests {
         let mut t = fresh();
         t.tool_result(
             "orphan",
-            "run_command".into(),
+            "run_shell_command".into(),
             "injected",
             false,
             &HashMap::new(),
         );
         assert_eq!(
             t.items(),
-            vec![tool_result_item("run_command", "injected", false)]
+            vec![tool_result_item("run_shell_command", "injected", false)]
         );
         assert_eq!(t.revision(), 0);
     }
@@ -963,14 +965,14 @@ mod tests {
         let mut t = fresh();
         t.tool_call(
             "t1".into(),
-            "run_command".into(),
+            "run_shell_command".into(),
             &json!({"command": "cargo test"}),
         );
-        t.tool_result("t1", "run_command".into(), "boom", true, &HashMap::new());
+        t.tool_result("t1", "run_shell_command".into(), "boom", true, &HashMap::new());
         assert_eq!(
             t.items(),
             vec![tool_result_merged(
-                "run_command",
+                "run_shell_command",
                 "boom",
                 true,
                 "cargo test"
@@ -1120,7 +1122,7 @@ mod tests {
         t.mark_committed(2);
         // A live ToolCall now leads the pending region, but the two already
         // committed items keep committable at the high-water mark.
-        t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}));
+        t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}));
         assert_eq!(t.committable_upto(), 2);
     }
 
@@ -1185,29 +1187,29 @@ mod tests {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_result(
             "t1",
-            "edit_file".into(),
+            "edit".into(),
             "edited x",
             false,
             &diff_artifacts(),
         );
-        assert_eq!(t.items(), vec![diff_item("edit_file")]);
+        assert_eq!(t.items(), vec![diff_item("edit")]);
     }
 
     #[test]
     fn without_matching_artifact_default_summary_survives() {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
-        t.tool_result("t1", "edit_file".into(), "edited x", false, &HashMap::new());
+        t.tool_result("t1", "edit".into(), "edited x", false, &HashMap::new());
         assert_eq!(
             t.items(),
-            vec![tool_result_item("edit_file", "edited x", false)]
+            vec![tool_result_item("edit", "edited x", false)]
         );
     }
 
     #[test]
     fn tool_call_items_pass_through_present() {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
-        t.tool_call("t1".into(), "grep".into(), &json!({}));
-        assert_eq!(t.items(), vec![tool_call_item("t1", "grep", "")]);
+        t.tool_call("t1".into(), "grep_search".into(), &json!({}));
+        assert_eq!(t.items(), vec![tool_call_item("t1", "grep_search", "")]);
     }
 
     #[test]
@@ -1215,14 +1217,14 @@ mod tests {
         let mut t = Transcript::new(vec![reg("PresentCrasher", Box::new(PresentCrasher))]);
         t.tool_result(
             "t1",
-            "edit_file".into(),
+            "edit".into(),
             "edited x",
             false,
             &diff_artifacts(),
         );
         let items = t.items();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0], tool_result_item("edit_file", "edited x", false));
+        assert_eq!(items[0], tool_result_item("edit", "edited x", false));
         match &items[1] {
             TranscriptItem::Info { text } => {
                 assert!(text.contains("PresentCrasher"));
@@ -1258,12 +1260,12 @@ mod tests {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_call(
             "t1".into(),
-            "edit_file".into(),
+            "edit".into(),
             &json!({"path": "src/x.rs"}),
         );
-        t.tool_result("t1", "edit_file".into(), "edited", false, &diff_artifacts());
+        t.tool_result("t1", "edit".into(), "edited", false, &diff_artifacts());
         // Only the Diff remains - the redundant call line is gone.
-        assert_eq!(t.items(), vec![diff_item("edit_file")]);
+        assert_eq!(t.items(), vec![diff_item("edit")]);
         assert_eq!(t.revision(), 1);
     }
 
@@ -1290,7 +1292,7 @@ mod tests {
                 Box::new(|t| t.marker("✂ evicted 3 stale results", Tone::Housekeeping)),
             ),
             ("user", Box::new(|t| t.user("hello"))),
-            ("push", Box::new(|t| t.push(diff_item("edit_file")))),
+            ("push", Box::new(|t| t.push(diff_item("edit")))),
             ("message_start", Box::new(|t| t.message_start())),
             (
                 "message_update",
@@ -1310,11 +1312,11 @@ mod tests {
             ),
             (
                 "tool_call",
-                Box::new(|t| t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}))),
+                Box::new(|t| t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}))),
             ),
             (
                 "tool_result",
-                Box::new(|t| t.tool_result("t1", "grep".into(), "hit", false, &HashMap::new())),
+                Box::new(|t| t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())),
             ),
             (
                 "extension_failure",
@@ -1384,7 +1386,7 @@ mod tests {
                 Box::new(|t| t.header("suspenders", "0.1.0", "p/m", "~/x", "tip")),
             ),
             ("user", Box::new(|t| t.user("hello"))),
-            ("push", Box::new(|t| t.push(diff_item("edit_file")))),
+            ("push", Box::new(|t| t.push(diff_item("edit")))),
             ("message_start", Box::new(|t| t.message_start())),
             (
                 "message_end",
@@ -1400,11 +1402,11 @@ mod tests {
             ),
             (
                 "tool_call",
-                Box::new(|t| t.tool_call("t1".into(), "grep".into(), &json!({"pattern": "x"}))),
+                Box::new(|t| t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}))),
             ),
             (
                 "tool_result",
-                Box::new(|t| t.tool_result("t1", "grep".into(), "hit", false, &HashMap::new())),
+                Box::new(|t| t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())),
             ),
             (
                 "extension_failure",
@@ -1522,9 +1524,9 @@ mod tests {
     fn compact_toggle_has_effect_for_committed_thinking_or_tool_items() {
         for item in [
             thinking("hmm"),
-            tool_call_item("id1", "grep", "hit"),
-            tool_result_item("grep", "hit", false),
-            diff_item("edit_file"),
+            tool_call_item("id1", "grep_search", "hit"),
+            tool_result_item("grep_search", "hit", false),
+            diff_item("edit"),
             todo_item(&["read"]),
         ] {
             let mut t = fresh();
@@ -1583,7 +1585,7 @@ mod tests {
     #[test]
     fn foldable_body_and_fold_title_agree_on_what_collapses() {
         let diff = TranscriptItem::Diff {
-            title: "edit_file x (+1 -1)".into(),
+            title: "edit x (+1 -1)".into(),
             lang: None,
             hunks: vec![DiffHunk {
                 header: None,
@@ -1592,7 +1594,7 @@ mod tests {
             elided: 0,
         };
         assert!(diff.has_foldable_body());
-        assert_eq!(diff.fold_title(), Some("edit_file x (+1 -1)"));
+        assert_eq!(diff.fold_title(), Some("edit x (+1 -1)"));
 
         // A Diff with no hunk lines: no body to fold. (It still HAS a title, but
         // the view gates on `has_foldable_body()`, so it never collapses.)

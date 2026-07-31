@@ -638,11 +638,13 @@ mod tests {
     async fn runs_the_tool_emits_events_checkpoints_and_feeds_result_back() {
         let root = root();
         write(&root, "marker.txt", "");
+        // list_files requires an ABSOLUTE path (qwen ls contract).
+        let dir = root.path().to_string_lossy().into_owned();
         let session = session(root.path());
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("tu_1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("tu_1", "list_directory", json!({"path": dir}))),
                 just(text_end("Here are the files.")),
             ],
         );
@@ -655,8 +657,8 @@ mod tests {
         // tool_call for tu_1
         assert!(
             evs.iter()
-                .any(|e| matches!(e, Event::ToolCall { id, name, input }
-            if id == "tu_1" && name == "list_files" && input == &json!({"path": "."})))
+                .any(|e| matches!(e, Event::ToolCall { id, name, .. }
+            if id == "tu_1" && name == "list_directory"))
         );
         // tool_result for tu_1, not error, listing contains marker.txt
         let listing = evs.iter().find_map(|e| match e {
@@ -713,8 +715,8 @@ mod tests {
         // the settlement fallback).
         let two_tool_pass = Response {
             content: vec![
-                ContentBlock::tool_use("tu_1", "list_files", json!({"path": "."})),
-                ContentBlock::tool_use("tu_2", "list_files", json!({"path": "."})),
+                ContentBlock::tool_use("tu_1", "list_directory", json!({"path": "."})),
+                ContentBlock::tool_use("tu_2", "list_directory", json!({"path": "."})),
             ],
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),
@@ -772,7 +774,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         );
@@ -808,7 +810,7 @@ mod tests {
             &session,
             vec![just(tool_use_result(
                 "t1",
-                "list_files",
+                "list_directory",
                 json!({"path": "."}),
             ))],
         )
@@ -931,7 +933,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         );
@@ -965,7 +967,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         );
@@ -985,7 +987,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         )
@@ -1026,7 +1028,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         )
@@ -1104,7 +1106,7 @@ mod tests {
             &session,
             vec![just(tool_use_result(
                 "t1",
-                "list_files",
+                "list_directory",
                 json!({"path": "."}),
             ))],
         )
@@ -1131,7 +1133,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         )
@@ -1157,7 +1159,7 @@ mod tests {
         let errored = Response {
             content: vec![
                 ContentBlock::text("partial thought"),
-                ContentBlock::tool_use("t1", "grep", json!({"pattern": "x"})),
+                ContentBlock::tool_use("t1", "grep_search", json!({"pattern": "x"})),
             ],
             stop_reason: StopReason::Error,
             usage: Usage::default(),
@@ -1389,7 +1391,9 @@ mod tests {
     async fn reissued_call_after_truncation_executes_not_duplicate() {
         let root = root();
         let session = session(root.path());
-        let input = json!({"path": "a.txt", "content": "hello"});
+        // write_file takes an absolute file_path (qwen contract).
+        let target = root.path().join("a.txt").to_string_lossy().into_owned();
+        let input = json!({"file_path": target, "content": "hello"});
         let deps = deps_for(
             &session,
             vec![
@@ -1455,8 +1459,8 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_files", json!({"path": "lib"}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_directory", json!({"path": "lib"}))),
             ],
         );
         let (outcome, _deps) = run_with(&session, "explore", deps).await;
@@ -1484,9 +1488,9 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
-                just(tool_use_result("t3", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_directory", json!({"path": "."}))),
+                just(tool_use_result("t3", "list_directory", json!({"path": "."}))),
                 // A fourth model reply must never be requested.
                 just(text_end("should never be reached")),
             ],
@@ -1519,7 +1523,7 @@ mod tests {
         let session = session_with(root.path(), opts);
 
         // The same call, Pass after Pass: three identical batches trip the cap.
-        let same = || just(tool_use_result("t1", "list_files", json!({"path": "."})));
+        let same = || just(tool_use_result("t1", "list_directory", json!({"path": "."})));
         let deps = deps_for(
             &session,
             vec![
@@ -1591,10 +1595,10 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_files", json!({"path": "src"}))),
-                just(tool_use_result("t3", "list_files", json!({"path": "lib"}))),
-                just(tool_use_result("t4", "list_files", json!({"path": "docs"}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_directory", json!({"path": "src"}))),
+                just(tool_use_result("t3", "list_directory", json!({"path": "lib"}))),
+                just(tool_use_result("t4", "list_directory", json!({"path": "docs"}))),
                 just(text_end("done exploring")),
             ],
         );
@@ -1617,8 +1621,8 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result("t2", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         );
@@ -1828,13 +1832,14 @@ mod tests {
     async fn tool_use_with_a_non_tool_use_stop_reason_still_continues() {
         let root = root();
         write(&root, "marker.txt", "");
+        let dir = root.path().to_string_lossy().into_owned();
         let session = session(root.path());
         // stop_reason EndTurn, but a tool_use block is present -> must execute.
         let end_turn_with_tool = Response {
             content: vec![ContentBlock::tool_use(
                 "t1",
-                "list_files",
-                json!({"path": "."}),
+                "list_directory",
+                json!({"path": dir}),
             )],
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
@@ -1864,7 +1869,7 @@ mod tests {
             vec![
                 just(tool_use_result(
                     "r1",
-                    "run_command",
+                    "run_shell_command",
                     json!({"command": "true"}),
                 )),
                 just(text_end("moved on")),
@@ -1949,7 +1954,7 @@ mod tests {
     struct HaltEdits;
     impl Middleware for HaltEdits {
         fn pre_run(&self, token: Token, _opts: &Value) -> Token {
-            if token.tool == "edit_file" {
+            if token.tool == "edit" {
                 token.halt("[edits are frozen by HaltEdits]")
             } else {
                 token
@@ -2002,7 +2007,7 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "edit_file", input)),
+                just(tool_use_result("t1", "edit", input)),
                 just(text_end("ok")),
             ],
         );
@@ -2035,11 +2040,12 @@ mod tests {
     #[tokio::test]
     async fn artifacts_ride_the_tool_result_event() {
         let root = root();
+        let dir = root.path().to_string_lossy().into_owned();
         let session = session(root.path());
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": dir}))),
                 just(text_end("ok")),
             ],
         );
@@ -2061,7 +2067,7 @@ mod tests {
                 assert!(!is_error);
                 assert_eq!(
                     artifacts.get("mark"),
-                    Some(&Value::String("list_files".to_string()))
+                    Some(&Value::String("list_directory".to_string()))
                 );
             }
             _ => unreachable!(),
@@ -2071,11 +2077,12 @@ mod tests {
     #[tokio::test]
     async fn crashing_extension_is_fail_open() {
         let root = root();
+        let dir = root.path().to_string_lossy().into_owned();
         let session = session(root.path());
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": dir}))),
                 just(text_end("ok")),
             ],
         );
@@ -2112,8 +2119,8 @@ mod tests {
                     "p1",
                     "todo_write",
                     json!({"todos": [
-                        { "content": "read", "status": "in_progress" },
-                        { "content": "edit", "status": "pending" },
+                        { "id": "1", "content": "read", "status": "in_progress" },
+                        { "id": "2", "content": "edit", "status": "pending" },
                     ]}),
                 )),
                 just(text_end("planned, done")),
@@ -2155,7 +2162,7 @@ mod tests {
         let mut deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
                 just(text_end("done")),
             ],
         )

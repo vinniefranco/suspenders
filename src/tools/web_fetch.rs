@@ -1,20 +1,25 @@
-//! `web_fetch(url, prompt)`: fetches an http/https URL and runs a prompt-guided
-//! extraction over its readable text (faithful to qwen web-fetch.ts). The first
-//! tool that reaches outside the Project Root, so every call passes the Approval
-//! gate - but the gate is DOMAIN-scoped now (ADR-0024, revised): a Standing
-//! Approval matches the URL's hostname, so a second fetch to the same host
-//! auto-approves. This mirrors qwen's `WebFetch(<hostname>)` permission rule.
+//! `web_fetch(url, prompt, format?)`: fetches an http/https URL and runs a
+//! prompt-guided extraction over its content (faithful to qwen web-fetch.ts).
+//! The first tool that reaches outside the Project Root, so every call passes
+//! the Approval gate - but the gate is DOMAIN-scoped now (ADR-0024, revised): a
+//! Standing Approval matches the URL's hostname, so a second fetch to the same
+//! host auto-approves. This mirrors qwen's `WebFetch(<hostname>)` permission
+//! rule.
 //!
-//! The tool fetches the URL (HTML converts to readable text via html2text;
-//! other `text/*` and JSON pass through raw), caps the content at 100 000 chars,
-//! then hands it to a bounded model SIDE-QUERY ([`crate::tool::caps::SideQuery`],
-//! ADR-0055) with the user's `prompt`: the model extracts and summarizes what
-//! the prompt asked for and its reply is the tool's result. On any failure the
-//! result is qwen's `Error during fetch for {url}: {message}`.
+//! The optional `format` param steers ONLY the Accept header sent to the server
+//! (auto/markdown/html/text); the content is always normalized to plain text for
+//! the LLM regardless. `text/markdown` and `text/plain` responses pass through
+//! raw; EVERYTHING ELSE is converted via HTML-to-text (qwen never rejects a
+//! content type). The content is capped at 100 000 chars, then handed to a
+//! bounded model SIDE-QUERY ([`crate::tool::caps::SideQuery`], ADR-0055) with the
+//! user's `prompt`: the model extracts and summarizes what the prompt asked for
+//! and its reply is the tool's result. On any failure the result is qwen's
+//! `Error: Error during fetch for {url}: {message}`.
 //!
-//! The download itself is guarded at 2 MB - the Result Cap (Shaping) handles the
-//! Conversation-side size, but the guard keeps a huge file from streaming into
-//! memory before the content cap trims it.
+//! The fetch uses a FIXED 10 s timeout (qwen `URL_FETCH_TIMEOUT_MS`), not the
+//! Run's command timeout. The download itself is guarded at 2 MB - the Result Cap
+//! (Shaping) handles the Conversation-side size, but the guard keeps a huge file
+//! from streaming into memory before the content cap trims it.
 
 use crate::tool::caps::SideQueryRequest;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
@@ -22,7 +27,10 @@ use serde_json::{Value, json};
 
 pub struct WebFetch;
 
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// The fixed fetch timeout, VERBATIM from qwen web-fetch.ts (`URL_FETCH_TIMEOUT_MS
+/// = 10000`): the fetch is bounded at 10 s regardless of the Run's command
+/// timeout.
+const URL_FETCH_TIMEOUT_MS: u64 = 10_000;
 
 /// The download guard: read at most this many body bytes (ADR-0024).
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -32,9 +40,12 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// blows the side-query's own context.
 const MAX_CONTENT_LENGTH: usize = 100_000;
 
-/// Render width for the HTML → text conversion: wide, so code blocks and
-/// tables survive without aggressive rewrapping.
-const RENDER_WIDTH: usize = 100;
+/// Render width for the HTML → text conversion. qwen converts with
+/// `wordwrap: false` (web-fetch.ts:130), i.e. NO wrapping, so we hand html2text
+/// an effectively-unbounded width and let long lines overflow rather than
+/// rewrap. A large finite sentinel (not `usize::MAX`, which risks internal
+/// width arithmetic overflowing) achieves no-wrap for any realistic page.
+const NO_WRAP_WIDTH: usize = 1_000_000;
 
 /// The side-query's system instruction, VERBATIM from qwen web-fetch.ts: the
 /// model is told to extract and summarize only what the prompt asked for.
@@ -46,40 +57,43 @@ const EXTRACTION_INSTRUCTION: &str = "Extract and summarize the requested inform
 const INVALID_URL_MESSAGE: &str =
     "The 'url' must be a valid URL starting with http:// or https://.";
 
+/// The tool description, VERBATIM from qwen web-fetch.ts `WebFetchTool` ctor.
+const DESCRIPTION: &str = "Fetches content from a specified URL and processes it using an AI model\n- Takes a URL and a prompt as input\n- Supports content negotiation for markdown (reduces tokens by ~80%)\n- Fetches the URL content, converts HTML to text if needed\n- Processes the content with the prompt using a small, fast model\n- Returns the model's response about the content\n- Use this tool when you need to retrieve and analyze web content\n\nUsage notes:\n  - IMPORTANT: If an MCP-provided web fetch tool is available, prefer using that tool instead of this one, as it may have fewer restrictions. All MCP-provided tools start with \"mcp__\".\n  - The URL must be a fully-formed valid URL\n  - The prompt should describe what information you want to extract from the page\n  - format parameter (optional): controls only the Accept header sent to the server. All content is normalized to plain text for LLM processing, regardless of format.\n  - \"auto\" (default): Prefers markdown via content negotiation, accepts HTML as fallback. Use when user does NOT specify a format.\n  - \"markdown\": Sends Accept: text/markdown. Use when user explicitly asks for markdown content.\n  - \"html\": Sends Accept: text/html. Content is still converted to plain text for LLM processing.\n  - \"text\": Sends Accept: text/plain. Use when user explicitly asks for plain text.\n  - This tool is read-only and does not modify any files\n  - Results may be summarized if the content is very large\n  - Supports both public and private/localhost URLs using direct fetch";
+
+/// The `format` → Accept-header mapping, VERBATIM from qwen web-fetch.ts
+/// `getAcceptHeader`. `format` steers ONLY this header; the response is always
+/// normalized to plain text for the LLM. An unknown/absent value is `auto`.
+fn accept_header(format: &str) -> &'static str {
+    match format {
+        "markdown" => "text/markdown",
+        "html" => "text/html",
+        "text" => "text/plain",
+        // "auto" and any other value.
+        _ => "text/markdown, text/html, text/plain",
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for WebFetch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_fetch".into(),
-            description: "Fetch an http/https URL and process its content with a prompt using an \
-                AI model. \
-                Usage:\n\
-                - Takes a URL and a prompt describing what to extract from the page.\n\
-                - HTML is converted to plain text; other text/* and JSON are read raw.\n\
-                - The fetched content is summarized by a model against your prompt - use this to \
-                look up documentation for a library, API, or an error message, \
-                e.g. url \"https://docs.rs/tokio\", prompt \"how do I spawn a task?\".\n\
-                - Large pages are truncated automatically before processing.\n\
-                - The user must approve the URL's domain before it is fetched."
-                .into(),
-            // Schema note: qwen carries an optional `format` enum that steers ONLY
-            // the Accept header (auto/markdown/html/text); suspenders keeps its own
-            // content negotiation (HTML→text, text/*+JSON raw) and does not expose
-            // `format`, so the schema stays url + prompt required. If a host wants
-            // Accept-header steering later, `format` rides here without touching the
-            // extraction path.
+            description: DESCRIPTION.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "url": {
-                        "type": "string",
-                        "description": "The full http/https URL to fetch, e.g. \
-                            \"https://docs.rs/tokio\"."
+                        "description": "The URL to fetch content from",
+                        "type": "string"
                     },
                     "prompt": {
+                        "description": "The prompt to run on the fetched content",
+                        "type": "string"
+                    },
+                    "format": {
+                        "description": "Preferred content format (Accept header only): auto (default, prefers markdown), markdown, html, or text. All content is normalized to plain text.",
                         "type": "string",
-                        "description": "What to extract from the page, e.g. \
-                            \"how do I spawn a task?\"."
+                        "enum": ["auto", "markdown", "html", "text"]
                     }
                 },
                 "required": ["url", "prompt"]
@@ -99,6 +113,12 @@ impl Tool for WebFetch {
             Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
             _ => return Err("The 'prompt' parameter cannot be empty.".into()),
         };
+        // `format` steers only the Accept header; absent/unknown is `auto`.
+        let format = input
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("auto")
+            .to_string();
 
         // GitHub blob → raw rewrite (qwen web-fetch.ts): a blob page is HTML
         // chrome around the file; the raw host serves the file itself. The
@@ -115,15 +135,10 @@ impl Tool for WebFetch {
             return Err(INVALID_URL_MESSAGE.into());
         }
 
-        let timeout = if ctx.command_timeout_ms == 0 {
-            DEFAULT_TIMEOUT_MS
-        } else {
-            ctx.command_timeout_ms
-        };
-
-        // Fetch the readable text, capped for the side-query. A fetch failure is
-        // already qwen's `Error during fetch for {url}: {message}`.
-        let content = match fetch(parsed, timeout).await {
+        // Fetch the content, normalized to plain text and capped for the
+        // side-query. A fetch failure is qwen's
+        // `Error: Error during fetch for {url}: {message}`.
+        let content = match fetch(parsed, accept_header(&format)).await {
             Ok(text) => cap_content(text),
             Err(message) => return Err(fetch_error(&fetch_url, &message)),
         };
@@ -177,27 +192,39 @@ fn cap_content(text: String) -> String {
     text.chars().take(MAX_CONTENT_LENGTH).collect()
 }
 
-/// qwen's fetch-failure shape (web-fetch.ts): `Error during fetch for {url}:
-/// {message}`. The `{url}` is the (rewritten) URL actually fetched.
+/// qwen's fetch-failure llmContent (web-fetch.ts): the leading `Error: ` prefix
+/// on `Error during fetch for {url}: {message}`. The `{url}` is the (rewritten)
+/// URL actually fetched.
 fn fetch_error(url: &str, message: &str) -> String {
-    format!("Error during fetch for {url}: {message}")
+    format!("Error: Error during fetch for {url}: {message}")
 }
 
-async fn fetch(url: reqwest::Url, timeout_ms: u64) -> Result<String, String> {
+async fn fetch(url: reqwest::Url, accept: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .timeout(std::time::Duration::from_millis(URL_FETCH_TIMEOUT_MS))
         .build()
         .map_err(|err| format!("could not build http client: {err}"))?;
 
     let response = client
         .get(url.clone())
+        .header(reqwest::header::ACCEPT, accept)
         .send()
         .await
         .map_err(|err| err.to_string())?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("HTTP {status} fetching {url}"));
+        // qwen's non-ok {message}, VERBATIM (web-fetch.ts:107): `Request failed
+        // with status code {status} {statusText}` where `status` is the numeric
+        // code and `statusText` the reason phrase. Built from `as_u16()` +
+        // `canonical_reason()` so reqwest's Display (which already folds in the
+        // reason) does not double it. The wrapper already names the url, so the
+        // message deliberately does not repeat it.
+        return Err(format!(
+            "Request failed with status code {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        ));
     }
 
     let content_type = response
@@ -208,7 +235,7 @@ async fn fetch(url: reqwest::Url, timeout_ms: u64) -> Result<String, String> {
         .to_string();
 
     let body = read_capped(response).await?;
-    readable_text(&content_type, &body)
+    Ok(readable_text(&content_type, &body))
 }
 
 // The download guard: accumulate body chunks up to MAX_BODY_BYTES, then stop
@@ -226,9 +253,19 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, String>
     Ok(body)
 }
 
-// HTML converts to readable text; other text/* and JSON pass through raw;
-// anything else is unsupported.
-fn readable_text(content_type: &str, body: &[u8]) -> Result<String, String> {
+/// Normalize the response body to plain text (qwen web-fetch.ts content
+/// handling): `text/markdown` and `text/plain` are read raw; EVERYTHING ELSE is
+/// converted via HTML-to-text. qwen never rejects a content type. HTML that will
+/// not parse degrades to the lossy body text rather than erroring.
+///
+/// The conversion mirrors qwen's `convert` options (web-fetch.ts:130-134):
+/// - `{ a, ignoreHref: true }` -> link URLs are dropped (no inline `[N]` markers
+///   and no trailing `[N]: <url>` footnotes), via [`TrivialDecorator`] rather
+///   than the default [`PlainDecorator`] (which emits both);
+/// - `{ img, format: 'skip' }` -> images contribute no URL (Trivial emits only
+///   an image's title text, which is virtually always empty, never the src);
+/// - `wordwrap: false` -> no rewrapping, via the no-wrap render width.
+fn readable_text(content_type: &str, body: &[u8]) -> String {
     let ct = content_type
         .split(';')
         .next()
@@ -236,14 +273,13 @@ fn readable_text(content_type: &str, body: &[u8]) -> Result<String, String> {
         .trim()
         .to_ascii_lowercase();
 
-    if ct.contains("text/html") {
-        html2text::config::plain()
-            .string_from_read(body, RENDER_WIDTH)
-            .map_err(|err| format!("could not convert HTML to text: {err}"))
-    } else if ct.starts_with("text/") || ct == "application/json" {
-        Ok(String::from_utf8_lossy(body).into_owned())
+    if ct.contains("text/markdown") || ct.contains("text/plain") {
+        String::from_utf8_lossy(body).into_owned()
     } else {
-        Err(format!("unsupported content type: {content_type}"))
+        html2text::config::with_decorator(html2text::render::text_renderer::TrivialDecorator::new())
+            .allow_width_overflow()
+            .string_from_read(body, NO_WRAP_WIDTH)
+            .unwrap_or_else(|_| String::from_utf8_lossy(body).into_owned())
     }
 }
 
@@ -253,7 +289,7 @@ mod tests {
     use crate::tool::caps::{Capabilities, SideQuery};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{headers, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A fake [`SideQuery`] that records the request it saw and returns a fixed
@@ -333,17 +369,85 @@ mod tests {
     }
 
     #[test]
-    fn spec_requires_url_and_prompt() {
+    fn spec_carries_url_prompt_and_optional_format() {
         let spec = WebFetch.spec();
         assert_eq!(spec.name, "web_fetch");
+        // Only url + prompt are required; format is optional.
         assert_eq!(
             spec.input_schema["required"],
             serde_json::json!(["url", "prompt"])
         );
-        assert!(spec.input_schema["properties"]["url"].is_object());
-        assert!(spec.input_schema["properties"]["prompt"].is_object());
-        // No `format` enum: suspenders keeps its own content negotiation.
-        assert!(spec.input_schema["properties"]["format"].is_null());
+        // Property descriptions are the qwen verbatim strings.
+        assert_eq!(
+            spec.input_schema["properties"]["url"]["description"],
+            "The URL to fetch content from"
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["prompt"]["description"],
+            "The prompt to run on the fetched content"
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["format"]["description"],
+            "Preferred content format (Accept header only): auto (default, prefers markdown), \
+             markdown, html, or text. All content is normalized to plain text."
+        );
+        // The format enum carries exactly qwen's four values.
+        assert_eq!(
+            spec.input_schema["properties"]["format"]["enum"],
+            serde_json::json!(["auto", "markdown", "html", "text"])
+        );
+    }
+
+    // The `format` → Accept-header mapping, VERBATIM from qwen `getAcceptHeader`.
+    #[test]
+    fn format_maps_to_the_qwen_accept_header() {
+        assert_eq!(accept_header("markdown"), "text/markdown");
+        assert_eq!(accept_header("html"), "text/html");
+        assert_eq!(accept_header("text"), "text/plain");
+        assert_eq!(accept_header("auto"), "text/markdown, text/html, text/plain");
+        // An absent/unknown value defaults to auto.
+        assert_eq!(
+            accept_header("something-else"),
+            "text/markdown, text/html, text/plain"
+        );
+    }
+
+    // The Accept header sent on the wire is the one the `format` param selects;
+    // the default (no `format`) is auto.
+    #[tokio::test]
+    async fn the_selected_accept_header_is_sent_on_the_wire() {
+        let tmp = TempDir::new().unwrap();
+        for (format, accept) in [
+            (Some("markdown"), "text/markdown"),
+            (Some("html"), "text/html"),
+            (Some("text"), "text/plain"),
+            (Some("auto"), "text/markdown, text/html, text/plain"),
+            (None, "text/markdown, text/html, text/plain"),
+        ] {
+            let sq = Arc::new(FakeSideQuery {
+                reply: "ok".into(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            });
+            // wiremock's header matcher splits the request value on commas, so
+            // pass the expected Accept as its comma-split parts (one part for
+            // the single-value formats, three for auto).
+            let expected: Vec<&str> = accept.split(", ").collect();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/page"))
+                .and(headers("accept", expected))
+                .respond_with(ResponseTemplate::new(200).set_body_raw("body", "text/plain"))
+                .mount(&server)
+                .await;
+
+            let mut input = json!({"url": page_url(&server), "prompt": "x"});
+            if let Some(f) = format {
+                input["format"] = json!(f);
+            }
+            // A 200 only comes back when the Accept header matched the mock.
+            let out = run(input, &ctx_with_side_query(tmp.path(), sq)).await;
+            assert_eq!(out, Ok("ok".to_string()), "format {format:?}");
+        }
     }
 
     // The extraction result IS the side-query's reply, and the side-query saw the
@@ -465,8 +569,8 @@ Use tokio::spawn to spawn.\n---"
         assert_eq!(content.chars().count(), MAX_CONTENT_LENGTH);
     }
 
-    // A non-2xx fetch is qwen's `Error during fetch for {url}: {message}`, naming
-    // the fetched url.
+    // A non-2xx fetch is qwen's `Error: Error during fetch for {url}: {message}`,
+    // naming the fetched url and carrying the leading `Error: ` prefix.
     #[tokio::test]
     async fn a_fetch_failure_is_the_qwen_error_shape() {
         let tmp = TempDir::new().unwrap();
@@ -483,8 +587,13 @@ Use tokio::spawn to spawn.\n---"
         )
         .await
         .unwrap_err();
-        assert!(err.starts_with(&format!("Error during fetch for {url}: ")));
-        assert!(err.contains("HTTP 404"));
+        // The full qwen shape: the `Error: ` wrapper, the fetched url, then
+        // qwen's verbatim non-ok message `Request failed with status code
+        // 404 Not Found` (no repeated url).
+        assert_eq!(
+            err,
+            format!("Error: Error during fetch for {url}: Request failed with status code 404 Not Found")
+        );
     }
 
     // A side-query failure is also folded into the qwen error shape.
@@ -510,7 +619,7 @@ Use tokio::spawn to spawn.\n---"
         .unwrap_err();
         assert_eq!(
             err,
-            format!("Error during fetch for {url}: model unavailable")
+            format!("Error: Error during fetch for {url}: model unavailable")
         );
     }
 
@@ -537,10 +646,17 @@ Use tokio::spawn to spawn.\n---"
 
         // The side-query saw stripped text, not markup.
         let seen = seen.lock().unwrap();
-        assert!(!seen[0].user_content.contains("<h1>"));
-        assert!(!seen[0].user_content.contains("<a href"));
-        assert!(seen[0].user_content.contains("Tokio"));
-        assert!(seen[0].user_content.contains("async runtime"));
+        let content = &seen[0].user_content;
+        assert!(!content.contains("<h1>"));
+        assert!(!content.contains("<a href"));
+        assert!(content.contains("Tokio"));
+        assert!(content.contains("async runtime"));
+        // qwen drops link targets (`ignoreHref: true`): the href URL must NOT
+        // appear, neither inline nor as a trailing footnote.
+        assert!(
+            !content.contains("https://docs.rs/tokio"),
+            "link target leaked into converted text: {content:?}"
+        );
     }
 
     #[tokio::test]
@@ -609,31 +725,58 @@ Use tokio::spawn to spawn.\n---"
         }
     }
 
+    // qwen NEVER rejects a content type: anything that is not text/markdown or
+    // text/plain is run through HTML-to-text and handed to the side-query. An
+    // arbitrary content type (here `application/octet-stream`) succeeds, not
+    // errors.
     #[tokio::test]
-    async fn unsupported_content_type_is_the_qwen_error_shape() {
+    async fn an_arbitrary_content_type_is_converted_never_rejected() {
         let tmp = TempDir::new().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let sq = Arc::new(FakeSideQuery {
-            reply: String::new(),
-            seen: Arc::new(Mutex::new(Vec::new())),
+            reply: "ok".into(),
+            seen: Arc::clone(&seen),
         });
         let server = serve(
-            ResponseTemplate::new(200).set_body_raw(vec![0u8, 1, 2], "application/octet-stream"),
+            ResponseTemplate::new(200)
+                .set_body_raw("<p>hello world</p>", "application/octet-stream"),
         )
         .await;
-        let url = page_url(&server);
 
-        let err = run(
-            json!({"url": url.clone(), "prompt": "x"}),
+        let out = run(
+            json!({"url": page_url(&server), "prompt": "x"}),
+            &ctx_with_side_query(tmp.path(), sq),
+        )
+        .await;
+        // No error, and the converted (markup-stripped) text reached the
+        // side-query.
+        assert_eq!(out, Ok("ok".to_string()));
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].user_content.contains("hello world"));
+        assert!(!seen[0].user_content.contains("<p>"));
+    }
+
+    // text/markdown passes through raw (not HTML-converted).
+    #[tokio::test]
+    async fn markdown_content_passes_through_raw() {
+        let tmp = TempDir::new().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sq = Arc::new(FakeSideQuery {
+            reply: "ok".into(),
+            seen: Arc::clone(&seen),
+        });
+        let md = "# Title\n\n- one\n- two";
+        let server = serve(ResponseTemplate::new(200).set_body_raw(md, "text/markdown")).await;
+
+        run(
+            json!({"url": page_url(&server), "prompt": "x"}),
             &ctx_with_side_query(tmp.path(), sq),
         )
         .await
-        .unwrap_err();
-        assert_eq!(
-            err,
-            format!(
-                "Error during fetch for {url}: unsupported content type: application/octet-stream"
-            )
-        );
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(fenced_content(&seen), md);
     }
 
     #[tokio::test]

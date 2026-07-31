@@ -3,7 +3,7 @@
 A session attempted to render structured Tool Results as
 [TOON](https://toonformat.dev/) (Token-Oriented Object Notation) to reduce
 tokens for small local models: an `OutputFormat` fixed fact on the Session,
-threaded through `ToolCtx`, with grep and list_files building a `Serialize`
+threaded through `ToolCtx`, with grep_search and list_directory building a `Serialize`
 value rendered as either the canonical text or TOON. The work was reviewed and
 rejected; this ADR records why, so the experiment is not repeated.
 
@@ -13,9 +13,9 @@ rejected; this ADR records why, so the experiment is not repeated.
 savings are against JSON, which Suspenders never emitted. The existing text
 forms are already denser than TOON for the tools that were converted:
 
-- grep: `path:12: text` versus a TOON header line, tab rows, plus
+- grep_search: `path:12: text` versus a TOON header line, tab rows, plus
   `truncated:`/`literal_fallback:`/`status:` scalar lines on every result.
-- list_files: a `/` suffix marks a directory in one character; TOON spends an
+- list_directory: a `/` suffix marks a directory in one character; TOON spends an
   `is_dir` column per row plus header and flag lines.
 
 On both tools TOON was a small token *regression*, so the stated objective

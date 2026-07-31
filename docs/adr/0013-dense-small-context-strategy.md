@@ -52,8 +52,8 @@ load-bearing memory almost immediately.
 
 ## Consequences
 
-- Compaction alone carries the strategy: exploration (grep, glob,
-  list_files, read_file) grows the main window inline, and Compaction
+- Compaction alone carries the strategy: exploration (grep_search, glob,
+  list_directory, read_file) grows the main window inline, and Compaction
   reclaims it when the target is crossed. The model records task state
   through `todo_write`. See CONTEXT.md for the language.
 - Thinking stays enabled at every call site (main loop, Compaction),

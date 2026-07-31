@@ -110,13 +110,13 @@ mod tests {
     const EXPECTED_NAMES: &[&str] = &[
         "todo_write",
         "read_file",
-        "list_files",
+        "list_directory",
         "glob",
-        "grep",
-        "edit_file",
+        "grep_search",
+        "edit",
         "write_file",
         "notebook_edit",
-        "run_command",
+        "run_shell_command",
         "web_fetch",
         "ask_user_question",
         "tool_search",
@@ -196,12 +196,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("big.txt"), "a".repeat(500)).unwrap();
 
-        let result = execute(
-            "read_file",
-            &json!({"path": "big.txt"}),
-            &ctx(tmp.path(), 100),
-        )
-        .await;
+        let target = tmp.path().join("big.txt").to_string_lossy().into_owned();
+        let result = execute("read_file", &json!({"file_path": target}), &ctx(tmp.path(), 100)).await;
         assert!(!result.is_error);
         assert_eq!(text_of(&result), "a".repeat(500));
     }
@@ -229,9 +225,11 @@ mod tests {
     async fn run_ok_maps_to_is_error_false() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("present.txt"), "").unwrap();
+        // list_files requires an ABSOLUTE path (qwen ls contract); pass the
+        // tempdir's absolute path.
         let result = run(
-            "list_files",
-            &json!({"path": "."}),
+            "list_directory",
+            &json!({"path": tmp.path().to_string_lossy()}),
             &ctx(tmp.path(), 10_000),
         )
         .await;
@@ -242,12 +240,12 @@ mod tests {
     #[tokio::test]
     async fn run_error_maps_to_is_error_true() {
         let tmp = TempDir::new().unwrap();
-        let result = run(
-            "read_file",
-            &json!({"path": "definitely_missing.txt"}),
-            &ctx(tmp.path(), 10_000),
-        )
-        .await;
+        let target = tmp
+            .path()
+            .join("definitely_missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        let result = run("read_file", &json!({"file_path": target}), &ctx(tmp.path(), 10_000)).await;
         assert!(result.is_error);
         assert!(text_of(&result).contains("enoent"));
     }
@@ -257,13 +255,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let c = ctx(tmp.path(), 10_000);
         assert!(run("read_file", &json!({}), &c).await.is_error);
-        assert!(run("read_file", &json!({"path": 42}), &c).await.is_error);
+        assert!(run("read_file", &json!({"file_path": 42}), &c).await.is_error);
         assert!(
-            run("edit_file", &json!({"path": 1, "old_str": 2}), &c)
+            run("edit", &json!({"path": 1, "old_str": 2}), &c)
                 .await
                 .is_error
         );
-        assert!(run("grep", &json!({}), &c).await.is_error);
+        assert!(run("grep_search", &json!({}), &c).await.is_error);
     }
 
     #[tokio::test]
@@ -271,12 +269,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("big.txt"), "a".repeat(500)).unwrap();
 
-        let result = run(
-            "read_file",
-            &json!({"path": "big.txt"}),
-            &ctx(tmp.path(), 100),
-        )
-        .await;
+        let target = tmp.path().join("big.txt").to_string_lossy().into_owned();
+        let result = run("read_file", &json!({"file_path": target}), &ctx(tmp.path(), 100)).await;
         assert!(!result.is_error);
         assert_eq!(
             text_of(&result),
@@ -291,7 +285,7 @@ mod tests {
     async fn run_command_results_keep_start_and_end_when_shaped() {
         let tmp = TempDir::new().unwrap();
         let result = run(
-            "run_command",
+            "run_shell_command",
             &json!({"command": "printf 'START'; printf 'x%.0s' $(seq 500); printf 'END'"}),
             &ctx(tmp.path(), 100),
         )

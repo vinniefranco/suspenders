@@ -45,13 +45,16 @@ the `Arc` so it crosses the `tokio::spawn` at the Agent.
 ## Path-keyed, not inode-keyed (the Suspenders simplification)
 
 qwen keys entries by `${dev}:${ino}` so symlinks / hardlinks / case-variant
-paths collapse onto one file. Suspenders confines every tool path to the Project
-Root (`tool::path::with_path`) and records the ABSOLUTE resolved path, so a plain
-`PathBuf` key suffices: root confinement already removes the symlink-escape
-surface the inode key defends against, and a `read_file` then `notebook_edit` on
-the same relative path resolve to the same absolute path. This is a deliberate
-narrowing, recorded here because a future non-confined caller (an escape hatch
-past the root) would need the inode key back.
+paths collapse onto one file. Suspenders requires an ABSOLUTE model-supplied path
+and confines it to the Project Root or the trusted memory subtree
+(`tool::path::resolve_absolute_in`, which resolves the absolute path and refuses
+anything outside those boundaries), recording that resolved absolute path, so a
+plain `PathBuf` key suffices: the containment check already removes the
+symlink-escape surface the inode key defends against, and a `read_file` then
+`notebook_edit` on the same absolute path resolve to the same key. This is a
+deliberate narrowing, recorded here because a future caller allowed outside the
+root/memory boundaries (an escape hatch, which qwen reaches through an
+ask-permission seam Suspenders does not have) would need the inode key back.
 
 ## Enforcement only; the fast-path is DEFERRED
 
@@ -148,6 +151,6 @@ does not mistake them for bugs:
 - **Porting the `file_unchanged` fast-path now.** It is an optimisation, not a
   correctness gate, and it needs the history-residence machinery Suspenders lacks.
   Deferred with its fields so the port stays enforcement-shaped and small.
-- **Inode keying.** Unnecessary under root confinement (see above); it would add
-  a platform-specific `dev:ino` stat read for a collapse case the confinement
-  already forecloses.
+- **Inode keying.** Unnecessary under the absolute-path containment (see above); it
+  would add a platform-specific `dev:ino` stat read for a collapse case the
+  containment already forecloses.

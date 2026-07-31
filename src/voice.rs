@@ -82,7 +82,7 @@ the todo list:
 - Run the build
 - Fix any type errors
 
-I'm now going to run the build using run_command.
+I'm now going to run the build using run_shell_command.
 
 Looks like I found 10 errors. I'm going to use the todo_write tool to write 10 \
 items to the todo list.
@@ -138,8 +138,8 @@ takes.
 When requested to perform tasks like fixing bugs, adding features, refactoring, \
 or explaining code, follow this iterative approach:
 - **Understand:** Before changing code, find the relevant parts. Use 'glob' to \
-find files by name or pattern, 'grep' to search for symbols and strings, \
-'list_files' to see a directory, and 'read_file' to read what you will change \
+find files by name or pattern, 'grep_search' to search for symbols and strings, \
+'list_directory' to see a directory, and 'read_file' to read what you will change \
 or must quote exactly. Read only what you need - avoid reading whole files or \
 trees you will not touch. There is no sub-agent to delegate exploration to; \
 search the codebase directly with these tools.
@@ -149,9 +149,9 @@ on your existing knowledge and any immediately obvious context. Use the \
 Don't wait for complete understanding - start with what you know. Skip the todo \
 list for simple one-step tasks.
 - **Implement:** Begin implementing the plan while gathering additional context \
-as needed. Use 'grep', 'glob', and 'read_file' strategically when you encounter \
+as needed. Use 'grep_search', 'glob', and 'read_file' strategically when you encounter \
 specific unknowns during implementation. Use the available tools (e.g. \
-'edit_file' for targeted edits, 'write_file' for new files, 'run_command' ...) \
+'edit' for targeted edits, 'write_file' for new files, 'run_shell_command' ...) \
 to act on the plan, strictly adhering to the project's established conventions \
 (detailed under 'Core Mandates'). Do not add features or refactor beyond what \
 was asked. Three similar lines beat a premature abstraction. Prefer editing \
@@ -226,7 +226,7 @@ briefly (1-2 sentences) without excessive justification. Offer alternatives if \
 appropriate.
 
 ## Security and Safety Rules
-- **Explain Critical Commands:** Before executing commands with 'run_command' \
+- **Explain Critical Commands:** Before executing commands with 'run_shell_command' \
 that modify the file system, codebase, or system state, you *must* provide a \
 brief explanation of the command's purpose and potential impact. Prioritize \
 user understanding and safety.
@@ -240,7 +240,7 @@ tools like 'read_file' or 'write_file'. Absolute paths are not used in this \
 project.
 - **Parallelism:** Execute multiple independent tool calls in parallel when \
 feasible (i.e. searching the codebase).
-- **Command Execution:** Use the 'run_command' tool for running shell commands, \
+- **Command Execution:** Use the 'run_shell_command' tool for running shell commands, \
 remembering the safety rule to explain modifying commands first.
 - **Run commands whole:** Run commands whole; never pipe their output through \
 head, tail, or wc to shorten it. The harness already truncates long output \
@@ -258,7 +258,7 @@ commands are not supported and may cause hangs until canceled by the user.
 multi-step tasks to track progress and provide visibility to users. This tool \
 helps organize work systematically and ensures no requirements are missed.
 - **Codebase Search:** For directed codebase searches (e.g. for a specific \
-file/class/function) use the 'grep' or 'glob' tools directly, and 'read_file' \
+file/class/function) use the 'grep_search' or 'glob' tools directly, and 'read_file' \
 to read what you find. There is no sub-agent for delegated exploration; broaden \
 your own searches when a directed one is insufficient.
 - **Fetching Content:** Use the 'web_fetch' tool to retrieve content from a URL \
@@ -361,13 +361,13 @@ model: true
 
 <example>
 user: start the server implemented in server.py
-model: [tool_call: run_command for 'python server.py' in the background because \
+model: [tool_call: run_shell_command for 'python server.py' in the background because \
 it must keep running]
 </example>
 
 <example>
 user: where is retry handled?
-model: [tool_call: grep for pattern 'retry' across src]
+model: [tool_call: grep_search for pattern 'retry' across src]
 [tool_call: read_file for path 'src/net/client.rs']
 Retries live in src/net/client.rs, in send_with_backoff. Want me to open it?
 </example>
@@ -394,10 +394,10 @@ Here's the plan:
 3.  Remove the old hyper imports.
 4.  Run the project's linter and tests to verify the changes.
 
-[tool_call: edit_file for path 'src/auth.rs' replacing old content with new \
+[tool_call: edit for path 'src/auth.rs' replacing old content with new \
 content]
 Refactoring complete. Running verification...
-[tool_call: run_command for 'cargo clippy --all-targets -- -D warnings && \
+[tool_call: run_shell_command for 'cargo clippy --all-targets -- -D warnings && \
 cargo nextest run --status-level fail']
 (After verification passes)
 All checks passed. This is a stable checkpoint.
@@ -405,14 +405,14 @@ Would you like me to write a commit message and commit these changes?
 </example>
 
 <example>
-user: run_command times out on slow hosts; bump the default to 30s
+user: run_shell_command times out on slow hosts; bump the default to 30s
 model: [tool_call: todo_write with items 'find the timeout default' \
 (in_progress), 'bump it to 30s' (pending), 'update the test' (pending)]
-[tool_call: grep for pattern 'timeout' across src/tools]
-[tool_call: read_file for path 'src/tools/run_command.rs']
-[tool_call: edit_file for path 'src/tools/run_command.rs']
-[tool_call: run_command for 'cargo nextest run --status-level fail']
-Bumped the default timeout in run_command from 10s to 30s and updated the \
+[tool_call: grep_search for pattern 'timeout' across src/tools]
+[tool_call: read_file for path 'src/tools/run_shell_command.rs']
+[tool_call: edit for path 'src/tools/run_shell_command.rs']
+[tool_call: run_shell_command for 'cargo nextest run --status-level fail']
+Bumped the default timeout in run_shell_command from 10s to 30s and updated the \
 timeout test. Suite is green.
 </example>
 
@@ -432,9 +432,9 @@ Now I'll look for existing or related test files to understand current testing \
 conventions and dependencies.
 [tool_call: read_file for path 'the existing flags tests to match their style']
 (After reviewing existing tests and the file content)
-[tool_call: edit_file to add the new cases]
+[tool_call: edit to add the new cases]
 I've written the tests. Now I'll run the project's test command to verify them.
-[tool_call: run_command for 'cargo nextest run --status-level fail']
+[tool_call: run_shell_command for 'cargo nextest run --status-level fail']
 (After verification passes)
 Added three cases to the flags tests covering the unknown-flag, empty-value, \
 and repeated-flag paths. All green.
@@ -470,7 +470,7 @@ pub fn system_prompt() -> &'static str {
     SYSTEM_PROMPT
 }
 
-/// Tool Result for a run_command Tool Call the user denied.
+/// Tool Result for a run_shell_command Tool Call the user denied.
 pub fn command_denied() -> &'static str {
     "[command denied by user]"
 }
@@ -482,12 +482,6 @@ pub fn command_denied() -> &'static str {
 /// announced but did not execute.
 pub fn please_continue() -> &'static str {
     "Please continue."
-}
-
-/// The Voice-neutral confirmation the todo_write Tool returns as its Tool
-/// Result.
-pub fn todos_confirmation() -> &'static str {
-    "[todos updated]"
 }
 
 /// Assistant marker closing a Run that hit its Run Limit.
@@ -561,15 +555,17 @@ pub fn truncated_output(total: usize, kept: usize) -> String {
 }
 
 /// Result Cap marker for read_file's line-boundary shaping: appended after the
-/// kept lines, naming the exact `start_line` that continues the read.
+/// kept lines, naming the exact 0-based `offset` that continues the read (qwen's
+/// read_file param). `last_shown` is the last file-absolute line shown (1-based);
+/// the next line is `last_shown + 1` (1-based), which is offset `last_shown`
+/// (0-based), so the model pages on with `offset: last_shown` and a `limit`.
 pub fn truncated_file(last_shown: usize, last_line: usize) -> String {
     format!(
-        "\n[truncated at line {last_shown} of {last_line} - continue with read_file start_line {}]",
-        last_shown + 1
+        "\n[truncated at line {last_shown} of {last_line} - continue with read_file offset {last_shown} (0-based) and a limit]"
     )
 }
 
-/// Result Cap marker for head+tail shaping (run_command): replaces the middle
+/// Result Cap marker for head+tail shaping (run_shell_command): replaces the middle
 /// of an oversized Tool Result.
 pub fn omitted_middle(omitted: usize, total: usize) -> String {
     format!("\n[{omitted} of {total} chars omitted from the middle of this output]\n")
@@ -797,9 +793,9 @@ mod tests {
         assert!(prompt.contains("Understand"));
         assert!(prompt.contains("Verify"));
         // The Understand step points the model at inline exploration - glob,
-        // grep, list_files, read_file - not a delegated Scout.
+        // grep_search, list_directory, read_file - not a delegated Scout.
         assert!(prompt.contains("Use 'glob' to find files"));
-        assert!(prompt.contains("'grep' to search for symbols"));
+        assert!(prompt.contains("'grep_search' to search for symbols"));
         assert!(!prompt.contains("explore tool"));
         // Faithful reporting: never claim a green suite that is not green.
         assert!(prompt.contains("never claim green when it is not"));
@@ -818,7 +814,7 @@ mod tests {
         assert!(prompt.contains("# Examples (Illustrating Tone and Workflow)"));
         // The terse knowledge answer and a bracketed tool-call stage direction.
         assert!(prompt.contains("1 + 2"));
-        assert!(prompt.contains("[tool_call: grep"));
+        assert!(prompt.contains("[tool_call: grep_search"));
     }
 
     #[test]
@@ -856,7 +852,6 @@ mod tests {
             "tool_search",
             "save_memory",
             "ask_user_question",
-            "run_shell_command",
             "auto memory",
             "sandbox",
         ] {
@@ -881,13 +876,6 @@ mod tests {
         let prompt = system_prompt();
         assert!(!prompt.contains('\u{2014}'), "em-dash in system prompt");
         assert!(!prompt.contains('\u{2013}'), "en-dash in system prompt");
-    }
-
-    // ---- todos_confirmation/0 ----
-
-    #[test]
-    fn todos_confirmation_is_a_short_confirmation_string() {
-        assert!(todos_confirmation().chars().count() < 120);
     }
 
     // ---- please_continue/0 ----

@@ -1,412 +1,822 @@
-//! `edit_file(path, old_str, new_str)`: replaces one uniquely-matched span of
-//! `old_str` with `new_str` in an existing file.
+//! `edit_file(file_path, old_string, new_string, replace_all?)`: replaces text
+//! within a file - the faithful port of qwen v0.16.0
+//! `packages/core/src/tools/edit.ts` (`EditTool` / `EditToolInvocation`) plus
+//! its `editHelper.ts` normalization pipeline, narrowed to Suspenders' shape.
 //!
-//! Matching is a two-pass pipeline (DESIGN.md): (1) exact match; (2) only when
-//! exact finds zero matches, a whitespace-normalized fallback that compares
-//! lines with leading/trailing whitespace stripped and applies the edit
-//! preserving the file's real indentation - `new_str` is re-indented by the
-//! per-line delta between `old_str` as given and the file's actual span.
-//! Whichever pass matches must match exactly one span; more than one is an
-//! error reporting the match count. When both passes find zero matches, the
-//! error quotes the closest-matching real region of the file (Jaro-ranked).
+//! Matching tries the exact literal `old_string` first, then falls back to
+//! qwen's `normalizeEditStrings` pipeline ([`normalize`]): character-level
+//! equivalence (curly quotes to straight, several dash variants to `-`, exotic
+//! spaces to a normal space) and line-based matching that tolerates trailing
+//! whitespace. When a relaxed match is found, the CANONICAL on-disk slice is
+//! substituted back as the string to replace, so the write lands on real bytes.
+//! For a pure deletion, `maybeAugmentOldStringForDeletion` consumes a trailing
+//! newline so removing a whole line leaves no blank line behind.
 //!
-//! A unique exact match is rejected when it would splice into the middle of an
-//! identifier (a boundary of the matched span falls inside a word): a truncated
-//! `old_str` like `amount_off(bas` matched as a substring inside
-//! `amount_off(base, code)` would silently corrupt the line. The fuzzy pass
-//! matches whole trimmed lines, so its span is always line-aligned and cannot
-//! split an identifier.
+//! Occurrence counting is then EXACT on that (possibly canonicalized) string:
+//! by default a single occurrence is replaced; more than one with `replace_all`
+//! unset is refused with the count. An empty `old_string` CREATES a new file
+//! (`isNewFile`); a non-empty `old_string` that matches zero times, that equals
+//! `new_string`, or whose replacement leaves the content unchanged, is refused.
+//! Before editing an existing file the model must have read it this session
+//! (prior-read enforcement against the Run's file-read cache); a create does
+//! not require a prior read.
+//!
+//! qwen's edit.ts also carries internal infrastructure this port does not
+//! reproduce (out of the model-facing contract): BOM / encoding / line-ending
+//! detection, git commit attribution, file-history backup, and hooks. The Jaro
+//! closest-region QUOTING that an earlier Suspenders build added to the
+//! not-found error was a bespoke extension and is removed - qwen's not-found
+//! message carries no file excerpt. What DOES survive is the read-cache
+//! recording: after a successful edit the Run's [`FileReadCache`] is stamped
+//! (qwen's `recordWrite`) so a follow-up read_file/edit_file sees fresh content
+//! rather than the tool's own write as a stale external change.
+//!
+//! [`FileReadCache`]: crate::tool::read_cache::FileReadCache
 
-use crate::tool::path::{FileError, file_error, jaro_distance, with_path};
+use crate::tool::path::{FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim};
+use crate::tool::read_cache::ReadState;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct EditFile;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pass {
-    Exact,
-    Fuzzy,
-}
+/// VERBATIM from qwen v0.16.0 `tools/edit.ts` (the description passed to the
+/// `EditTool` constructor). `${ReadFileTool.Name}` is hardcoded to `read_file`.
+/// The second line's leading indentation is preserved exactly as in qwen.
+const DESCRIPTION: &str = "Replaces text within a file. By default, replaces a single occurrence. Set `replace_all` to true when you intend to modify every instance of `old_string`. This tool requires providing significant context around the change to ensure precise targeting. Always use the read_file tool to examine the file's current content before attempting a text replacement.
 
-const DESCRIPTION: &str = "\
-Replaces one occurrence of `old_str` with `new_str` in an existing file. This tool requires \
-providing significant context around the change to ensure precise targeting. Always use the \
-read_file tool to examine the file's current content before attempting a text replacement.\n\
-\n\
-Expectation for required parameters:\n\
-1. `path` MUST be a path relative to the project root (e.g. \"src/main.rs\"), NOT an absolute \
-path.\n\
-2. `old_str` MUST be the exact literal text to replace (including all whitespace, indentation, \
-newlines, and surrounding code etc.), copied verbatim from read_file output.\n\
-3. `new_str` MUST be the exact literal text to replace `old_str` with (also including all \
-whitespace, indentation, newlines, and surrounding code etc.). Ensure the resulting code is correct \
-and idiomatic. `new_str` may be empty to delete `old_str`.\n\
-4. NEVER escape `old_str` or `new_str`, that would break the exact literal text requirement.\n\
-\n\
-**Important:** If ANY of the above are not satisfied, the tool will fail. CRITICAL for `old_str`: \
-it MUST uniquely identify the single instance to change. `old_str` must match EXACTLY ONE location \
-in the file. Include enough surrounding context - at least 3 lines BEFORE and AFTER the target \
-text, matching whitespace and indentation precisely - to make the match unique. If `old_str` \
-matches multiple locations, the tool fails with the match count and asks you to add context. If it \
-matches zero locations, the tool fails and quotes the closest region of the real file so you can \
-correct it.\n\
-\n\
-**One change per call:** This tool replaces a single occurrence. To change several places, call \
-edit_file once per place, each with enough surrounding context to be unique.\n\
-\n\
-**Existing files only:** This tool only edits files that already exist. To create a new file, use \
-write_file instead.";
+      The user has the ability to modify the `new_string` content. If modified, this will be stated in the response.
 
-// Threshold below which no line is "close enough" to be worth quoting.
-const CLOSEST_THRESHOLD: f64 = 0.6;
-// Context lines kept on each side of the best line.
-const CONTEXT_LINES: usize = 2;
+Expectation for required parameters:
+1. `file_path` MUST be an absolute path; otherwise an error will be thrown.
+2. `old_string` MUST be the exact literal text to replace (including all whitespace, indentation, newlines, and surrounding code etc.).
+3. `new_string` MUST be the exact literal text to replace `old_string` with (also including all whitespace, indentation, newlines, and surrounding code etc.). Ensure the resulting code is correct and idiomatic.
+4. NEVER escape `old_string` or `new_string`, that would break the exact literal text requirement.
+**Important:** If ANY of the above are not satisfied, the tool will fail. CRITICAL for `old_string`: Must uniquely identify the single instance to change. Include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. If this string matches multiple locations, or does not match exactly, the tool will fail.
+**Multiple replacements:** Set `replace_all` to true when you want to replace every occurrence that matches `old_string`.";
 
 #[async_trait::async_trait]
 impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "edit_file".into(),
+            name: "edit".into(),
             description: DESCRIPTION.into(),
+            // Schema property set + each description string are VERBATIM from
+            // qwen edit.ts's schema block.
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "file_path": {
                         "type": "string",
-                        "description": "The path of an existing file to modify, relative to the \
-                            project root (e.g. \"src/main.rs\"). Do not pass an absolute path."
+                        "description": "The absolute path to the file to modify. Must start with '/'."
                     },
-                    "old_str": {
+                    "old_string": {
                         "type": "string",
-                        "description": "The exact literal text to replace, unescaped, copied \
-                            verbatim from read_file output including all whitespace, indentation, \
-                            and newlines. Must uniquely identify a single location - include at \
-                            least 3 lines of context BEFORE and AFTER the target text, matching \
-                            whitespace and indentation precisely. If it is not the exact literal \
-                            text (i.e. you escaped it), matches multiple locations, or matches \
-                            none, the tool will fail. Must not be empty."
+                        "description": "The exact literal text to replace, preferably unescaped. For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. If this string is not the exact literal text (i.e. you escaped it) or does not match exactly, the tool will fail."
                     },
-                    "new_str": {
+                    "new_string": {
                         "type": "string",
-                        "description": "The exact literal text to replace `old_str` with, \
-                            unescaped. Provide the EXACT text; ensure the resulting code is correct \
-                            and idiomatic. May be empty to delete `old_str`."
+                        "description": "The exact literal text to replace `old_string` with, preferably unescaped. Provide the EXACT text. Ensure the resulting code is correct and idiomatic."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all occurrences of old_string (default false)."
                     }
                 },
-                "required": ["path", "old_str", "new_str"]
+                "required": ["file_path", "old_string", "new_string"]
             }),
         }
     }
 
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let path = input
-            .get("path")
+        let raw_file_path = input
+            .get("file_path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: edit_file requires a string \"path\"".to_string())?;
-        let old_str = input
-            .get("old_str")
+            .ok_or_else(|| {
+                "invalid input: edit requires a string \"file_path\"".to_string()
+            })?;
+        // qwen's `unescapePath(params.file_path.trim())` (edit.ts): trim
+        // surrounding whitespace and strip shell-escaping backslashes BEFORE the
+        // absolute-path check and before the path is echoed back in a message.
+        let file_path = unescape_and_trim(raw_file_path);
+        let old_string = input
+            .get("old_string")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: edit_file requires a string \"old_str\"".to_string())?;
-        let new_str = input
-            .get("new_str")
+            .ok_or_else(|| {
+                "invalid input: edit requires a string \"old_string\"".to_string()
+            })?;
+        let new_string = input
+            .get("new_string")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: edit_file requires a string \"new_str\"".to_string())?;
+            .ok_or_else(|| {
+                "invalid input: edit requires a string \"new_string\"".to_string()
+            })?;
+        // `replace_all` is optional; a missing / non-boolean value defaults to
+        // false (qwen `params.replace_all ?? false`).
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        check_old_str(old_str)?;
-        with_path(path, ctx, |abs| apply_edit(abs, path, old_str, new_str))
+        let abs = resolve(&file_path, ctx)?;
+        apply_edit(&abs, &file_path, old_string, new_string, replace_all, ctx)
     }
 }
 
+/// Resolve a model-supplied ABSOLUTE `file_path` and confine it to the Project
+/// Root (or the trusted memory subtree), rendering qwen's verbatim
+/// absolute-path message for a relative path (edit.ts `validateToolParamValues`)
+/// and the shared confinement wording for an escape.
+fn resolve(path: &str, ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
+    resolve_absolute_in(path, &ctx.root, ctx.memory_root.as_deref()).map_err(|reject| match reject {
+        // VERBATIM qwen edit.ts `validateToolParamValues`.
+        PathReject::Relative => format!("File path must be absolute: {path}"),
+        // qwen has no edit.ts message for a path outside the workspace (it asks
+        // for confirmation via getDefaultPermission instead). Suspenders
+        // confines every tool path to the Project Root, so an escape is a hard
+        // refusal with the shared confinement wording.
+        PathReject::Escapes => "path escapes project root".to_string(),
+    })
+}
+
+/// The core of qwen's `calculateEdit` + `execute`, narrowed to the model
+/// contract: read the file (or note its absence), decide the edit outcome,
+/// enforce prior-read for an in-place edit, apply, write, and record.
 fn apply_edit(
     abs: &std::path::Path,
-    path: &str,
-    old_str: &str,
-    new_str: &str,
+    file_path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    ctx: &ToolCtx,
 ) -> Result<String, String> {
-    let content = match std::fs::read_to_string(abs) {
-        Ok(c) => c,
-        Err(err) => return Err(file_error("read", path, FileError::from_io(&err))),
+    let current = read_current(abs, file_path)?;
+    let is_new_file = old_string.is_empty() && current.is_none();
+
+    let new_content = match &current {
+        // ---- new-file creation (empty old_string, file absent) ----
+        None if old_string.is_empty() => new_string.to_string(),
+
+        // ---- editing a nonexistent file (old_string non-empty) ----
+        None => {
+            return Err(format!("File not found: {file_path}"));
+        }
+
+        // ---- in-place edit of an existing file ----
+        Some(content) => {
+            // Prior-read enforcement: the model must have read this file this
+            // session before an in-place edit (qwen `checkPriorRead`). A create
+            // (handled above) does not reach here, matching qwen's ENOENT
+            // ok:true pre-read path.
+            enforce_prior_read(ctx, abs, file_path)?;
+
+            edited_content(content, old_string, new_string, replace_all, file_path)?
+        }
     };
 
-    let (replaced, pass) = replace(&content, old_str, new_str, path)?;
-
-    match std::fs::write(abs, &replaced) {
-        Ok(()) => Ok(success_message(path, pass)),
-        Err(err) => Err(file_error("write", path, FileError::from_io(&err))),
+    match std::fs::write(abs, &new_content) {
+        Ok(()) => {
+            // Record the write into the Run's read cache (qwen `recordWrite`,
+            // `cacheable = true` - an edit authored plain text). A follow-up
+            // read_file/edit_file then sees a Fresh, full read rather than the
+            // tool's own write as a stale external change.
+            record_write(ctx, abs);
+            Ok(success_message(
+                file_path,
+                is_new_file,
+                current.as_deref(),
+                &new_content,
+            ))
+        }
+        Err(err) => Err(file_error("write", file_path, FileError::from_io(&err))),
     }
 }
 
-fn success_message(path: &str, pass: Pass) -> String {
-    match pass {
-        Pass::Exact => format!("edited {path}"),
-        Pass::Fuzzy => format!(
-            "edited {path} (matched with whitespace normalized; new_str re-indented to the file)"
+/// Read the file's current content, or `None` when it does not exist (qwen's
+/// `fileExists` + ENOENT-tolerant read). Any other I/O error is surfaced.
+fn read_current(abs: &std::path::Path, file_path: &str) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(abs) {
+        Ok(content) => Ok(Some(content)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(file_error("read", file_path, FileError::from_io(&err))),
+    }
+}
+
+/// Compute the new content of an existing file (qwen's `calculateEdit` content
+/// arm + `applyReplacement`), in qwen's exact order:
+///
+/// 1. `normalize::edit_strings` - if the literal `old_string` is not present,
+///    retry with the character- and line-level relaxed matcher and, on a hit,
+///    substitute the CANONICAL on-disk slice back as the string to replace (and
+///    trim `new_string`'s trailing newline if the relaxed match dropped a final
+///    empty line);
+/// 2. `normalize::augment_old_string_for_deletion` - for a pure deletion, extend
+///    the string to replace by a trailing newline when the file has one, so the
+///    removal leaves no blank line;
+/// 3. EXACT `countOccurrences` on the (possibly canonicalized) string:
+///    - `old_string` empty and the file exists -> attempted to create an
+///      existing file (checks the ORIGINAL `old_string`, per qwen);
+///    - 0 occurrences -> not found;
+///    - >1 occurrences and `!replace_all` -> occurrence mismatch;
+///    - final old == final new -> no change (old/new identical);
+/// 4. apply the replacement, then a SECONDARY no-change guard: if the content is
+///    unchanged (e.g. the normalized replacement was a no-op), refuse.
+fn edited_content(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    file_path: &str,
+) -> Result<String, String> {
+    // (1) Relaxed-match canonicalization (qwen `normalizeEditStrings`).
+    let normalize::Normalized {
+        old_string: mut final_old,
+        new_string: final_new,
+    } = normalize::edit_strings(content, old_string, new_string);
+
+    if old_string.is_empty() {
+        // qwen `ATTEMPT_TO_CREATE_EXISTING_FILE` - keyed on the ORIGINAL
+        // `old_string` being empty, before augmentation could grow it.
+        return Err(format!("File already exists, cannot create: {file_path}"));
+    }
+
+    // (2) Deletion newline augmentation (qwen `maybeAugmentOldStringForDeletion`).
+    final_old = normalize::augment_old_string_for_deletion(content, &final_old, &final_new);
+
+    // (3) EXACT occurrence counting on the canonicalized string.
+    let occurrences = count_occurrences(content, &final_old);
+    if occurrences == 0 {
+        // qwen `EDIT_NO_OCCURRENCE_FOUND` raw message.
+        return Err(format!(
+            "Failed to edit, 0 occurrences found for old_string in {file_path}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use read_file tool to verify."
+        ));
+    }
+    if !replace_all && occurrences > 1 {
+        // qwen `EDIT_EXPECTED_OCCURRENCE_MISMATCH` raw message.
+        return Err(format!(
+            "Failed to edit. Found {occurrences} occurrences for old_string in {file_path} but replace_all was not enabled."
+        ));
+    }
+    if final_old == final_new {
+        // qwen `EDIT_NO_CHANGE` raw message (old/new identical).
+        return Err(format!(
+            "No changes to apply. The old_string and new_string are identical in file: {file_path}"
+        ));
+    }
+
+    // qwen's `applyReplacement` always replaces EVERY occurrence of the (by now
+    // unique-or-replace_all) string via `safeLiteralReplace`; the `$`-escape it
+    // does is a JS `String.replaceAll` template-substitution guard that Rust's
+    // literal `str::replace` does not need.
+    let new_content = content.replace(&final_old, &final_new);
+
+    // (4) Secondary no-change guard (qwen edit.ts's post-apply check): a
+    // normalized replacement can leave the file byte-identical even when
+    // old != new; refuse with qwen's VERBATIM identical-content message.
+    if new_content == content {
+        return Err(format!(
+            "No changes to apply. The new content is identical to the current content in file: {file_path}"
+        ));
+    }
+
+    Ok(new_content)
+}
+
+/// Number of non-overlapping occurrences of `old_string` in `content` (qwen
+/// `countOccurrences`).
+fn count_occurrences(content: &str, old_string: &str) -> usize {
+    if old_string.is_empty() {
+        return 0;
+    }
+    content.matches(old_string).count()
+}
+
+/// The model-facing success line (qwen `llmSuccessMessageParts`): the base
+/// create/update line, then the edited-region snippet suffix
+/// (`extractEditSnippet`) joined with a single space.
+fn success_message(
+    file_path: &str,
+    is_new_file: bool,
+    old_content: Option<&str>,
+    new_content: &str,
+) -> String {
+    let base = if is_new_file {
+        format!("Created new file: {file_path} with provided content.")
+    } else {
+        format!("The file: {file_path} has been updated.")
+    };
+    match snippet::extract(old_content, new_content) {
+        Some(snippet) => format!(
+            "{base} Showing lines {}-{} of {} from the edited file:\n\n---\n\n{}",
+            snippet.start_line, snippet.end_line, snippet.total_lines, snippet.content
         ),
+        None => base,
     }
 }
 
-fn check_old_str(old_str: &str) -> Result<(), String> {
-    if old_str.is_empty() {
-        Err("old_str must not be empty; to create a new file use write_file instead".to_string())
-    } else {
-        Ok(())
+// ---- prior-read enforcement (qwen `checkPriorRead`, verb = editing) ---------
+
+/// Enforce the read-before-edit contract for an in-place edit: the file must be
+/// a Fresh cache entry the model has read this session. Unlike notebook_edit, an
+/// edit does NOT require a FULL read (any prior read of the current bytes
+/// clears it, matching qwen's `checkPriorRead` for `editing`); the mtime/size
+/// drift check is the safety net. Returns the VERBATIM qwen rejection otherwise.
+fn enforce_prior_read(ctx: &ToolCtx, abs: &std::path::Path, file_path: &str) -> Result<(), String> {
+    let (mtime_ms, size) = stat_fingerprint(abs, file_path)?;
+    let cache = ctx.read_cache();
+    let state = cache.check(abs, mtime_ms, size);
+    let read_this_session = cache
+        .entry(abs)
+        .is_some_and(|entry| entry.last_read_at.is_some());
+
+    // Fresh AND read this session (not a write-only entry): the edit proceeds.
+    if state == ReadState::Fresh && read_this_session {
+        return Ok(());
+    }
+
+    // Read this session but the on-disk fingerprint drifted: re-read first.
+    if state == ReadState::Stale {
+        return Err(format!(
+            "File {file_path} has been modified since you last read it (mtime or size changed). Re-read it with the read_file tool before editing it to ensure your changes are based on current content."
+        ));
+    }
+
+    // Never read this session (Unknown): not read. The em-dash below is
+    // VERBATIM qwen model-facing text (priorReadEnforcement.ts), not authored
+    // prose, so the no-em-dash house rule does not apply - it is kept byte-exact
+    // as \u{2014}.
+    Err(format!(
+        "File {file_path} has not been read in this session. Use the read_file tool first to load the current content (a partial read with offset / limit is fine \u{2014} you only need to have seen the bytes you intend to edit) before editing it."
+    ))
+}
+
+/// Stat the file for its current `(mtime_ms, size)` fingerprint. A missing stat
+/// here means we cannot verify the prior read, so the edit is refused - never
+/// silently allowed.
+fn stat_fingerprint(abs: &std::path::Path, file_path: &str) -> Result<(u128, u64), String> {
+    let meta = std::fs::metadata(abs)
+        .map_err(|err| file_error("read", file_path, FileError::from_io(&err)))?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    Ok((mtime_ms, meta.len()))
+}
+
+/// Record the write back into the read cache (qwen `recordWrite`, `cacheable =
+/// true`): the model authored the current bytes, so a follow-up read_file/
+/// edit_file sees a Fresh, full read rather than its own write as a stale
+/// external change. A stat miss is dropped - the write already succeeded, and
+/// the next read re-stats.
+fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
+    if let Ok((mtime_ms, size)) = stat_fingerprint(abs, &abs.to_string_lossy()) {
+        ctx.read_cache()
+            .record_write(abs.to_path_buf(), mtime_ms, size, true);
     }
 }
 
-fn replace(
-    content: &str,
-    old_str: &str,
-    new_str: &str,
-    path: &str,
-) -> Result<(String, Pass), String> {
-    match count_exact(content, old_str) {
-        1 => exact_replace(content, old_str, new_str, path),
-        0 => fuzzy_replace(content, old_str, new_str, path),
-        n => Err(ambiguous(n, path)),
+// ---- normalization pipeline (qwen editHelper.ts) ----------------------------
+
+/// The faithful port of qwen v0.16.0 `utils/editHelper.ts`'s edit-string
+/// normalization: `normalizeEditStrings` + `maybeAugmentOldStringForDeletion`
+/// and the `findMatchedSlice` matcher they lean on.
+///
+/// The pipeline stays deterministic and progressively relaxes: literal
+/// substring, then character-equivalence (curly quotes / dashes / exotic
+/// spaces), then line-based matching that tolerates trailing whitespace. A
+/// relaxed hit returns the CANONICAL on-disk slice so the caller replaces real
+/// bytes, not the model's approximation.
+mod normalize {
+    /// qwen `normalizeEditStrings`' return: the (possibly canonicalized) strings.
+    pub struct Normalized {
+        pub old_string: String,
+        pub new_string: String,
     }
-}
 
-fn count_exact(content: &str, old_str: &str) -> usize {
-    // Number of non-overlapping matches (String.split length - 1).
-    content.matches(old_str).count()
-}
-
-fn exact_replace(
-    content: &str,
-    old_str: &str,
-    new_str: &str,
-    path: &str,
-) -> Result<(String, Pass), String> {
-    // char offset of the match start (String.length(before)).
-    let byte_pos = content.find(old_str).unwrap();
-    let start = content[..byte_pos].chars().count();
-    let len = old_str.chars().count();
-
-    if splits_identifier(content, start, len) {
-        Err(split_identifier(content, start, len, path))
-    } else {
-        Ok((content.replacen(old_str, new_str, 1), Pass::Exact))
+    /// qwen `NormalizedEditStrings`-producing `normalizeEditStrings`: when the
+    /// literal `old_string` is not found verbatim but a relaxed match is,
+    /// substitute the on-disk slice as `old_string` and (if the relaxed match
+    /// dropped a trailing empty line) trim `new_string`'s trailing newline. An
+    /// empty `old_string` is returned untouched (it is the new-file sentinel).
+    pub fn edit_strings(file_content: &str, old_string: &str, new_string: &str) -> Normalized {
+        if old_string.is_empty() {
+            return Normalized {
+                old_string: old_string.to_string(),
+                new_string: new_string.to_string(),
+            };
+        }
+        match find_matched_slice(file_content, old_string) {
+            Some(matched) => Normalized {
+                old_string: matched.slice,
+                new_string: adjust_new_string_for_trailing_line(
+                    new_string,
+                    matched.removed_trailing_final_empty_line,
+                ),
+            },
+            None => Normalized {
+                old_string: old_string.to_string(),
+                new_string: new_string.to_string(),
+            },
+        }
     }
-}
 
-// A match splits an identifier when a boundary falls INSIDE a word: the char
-// just before the span and the span's first char are both word chars, or the
-// span's last char and the char just after are both word chars.
-fn splits_identifier(content: &str, start: usize, len: usize) -> bool {
-    let graphemes: Vec<char> = content.chars().collect();
-    let span: Vec<char> = graphemes.iter().skip(start).take(len).copied().collect();
+    /// qwen `maybeAugmentOldStringForDeletion`: for a pure deletion
+    /// (`new_string == ""`) where `old_string` has no trailing newline but the
+    /// file holds `old_string + "\n"`, grow `old_string` by that newline so the
+    /// removal does not leave a blank line behind.
+    pub fn augment_old_string_for_deletion(
+        file_content: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> String {
+        if old_string.is_empty() || !new_string.is_empty() || old_string.ends_with('\n') {
+            return old_string.to_string();
+        }
+        let candidate = format!("{old_string}\n");
+        if file_content.contains(&candidate) {
+            candidate
+        } else {
+            old_string.to_string()
+        }
+    }
 
-    let before = if start > 0 {
-        graphemes.get(start - 1).copied()
-    } else {
+    /// qwen `MatchedSliceResult`.
+    struct MatchedSlice {
+        slice: String,
+        removed_trailing_final_empty_line: bool,
+    }
+
+    /// qwen `findMatchedSlice`: literal `indexOf`, then character-normalized
+    /// `indexOf`, then `findLineBasedMatch`. Returns the CANONICAL slice from the
+    /// ORIGINAL `haystack` in every case.
+    fn find_matched_slice(haystack: &str, needle: &str) -> Option<MatchedSlice> {
+        if needle.is_empty() {
+            return None;
+        }
+
+        // Literal match: the on-disk slice IS the needle.
+        if let Some(byte_idx) = haystack.find(needle) {
+            return Some(MatchedSlice {
+                slice: haystack[byte_idx..byte_idx + needle.len()].to_string(),
+                removed_trailing_final_empty_line: false,
+            });
+        }
+
+        // Character-equivalence match: normalize both, find the char index, then
+        // cut the ORIGINAL haystack at [idx, idx + needle_char_len). The map is
+        // 1:1 on chars, so char indices line up between original and normalized.
+        let haystack_chars: Vec<char> = haystack.chars().collect();
+        let normalized_haystack: String = haystack_chars
+            .iter()
+            .map(|c| normalize_basic_char(*c))
+            .collect();
+        let normalized_needle: String = needle.chars().map(normalize_basic_char).collect();
+        if let Some(char_idx) = char_index_of(&normalized_haystack, &normalized_needle) {
+            let needle_char_len = needle.chars().count();
+            let slice: String = haystack_chars[char_idx..char_idx + needle_char_len]
+                .iter()
+                .collect();
+            return Some(MatchedSlice {
+                slice,
+                removed_trailing_final_empty_line: false,
+            });
+        }
+
+        find_line_based_match(haystack, needle)
+    }
+
+    /// qwen `findLineBasedMatch`: line-window the haystack against the needle's
+    /// lines, trying identity, then `trimEnd`, then `normalizeBasicCharacters +
+    /// trimEnd` per line. If the needle's last line is empty and no match is
+    /// found, retry with that trailing empty line dropped
+    /// (`removedTrailingFinalEmptyLine = true`).
+    fn find_line_based_match(haystack: &str, needle: &str) -> Option<MatchedSlice> {
+        let (lines, offsets) = build_line_index(haystack);
+        let pattern_lines: Vec<&str> = needle.split('\n').collect();
+        let ends_with_newline = needle.ends_with('\n');
+        if pattern_lines.is_empty() {
+            return None;
+        }
+
+        if let Some(idx) = attempt_match(&lines, &pattern_lines) {
+            return Some(MatchedSlice {
+                slice: slice_from_lines(
+                    haystack,
+                    &offsets,
+                    &lines,
+                    idx,
+                    pattern_lines.len(),
+                    ends_with_newline,
+                ),
+                removed_trailing_final_empty_line: false,
+            });
+        }
+
+        if pattern_lines.last() == Some(&"") {
+            let trimmed = &pattern_lines[..pattern_lines.len() - 1];
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Some(idx) = attempt_match(&lines, trimmed) {
+                return Some(MatchedSlice {
+                    slice: slice_from_lines(haystack, &offsets, &lines, idx, trimmed.len(), false),
+                    removed_trailing_final_empty_line: true,
+                });
+            }
+        }
         None
-    };
-    let after = graphemes.get(start + len).copied();
+    }
 
-    let start_break = word_char(before) && word_char(span.first().copied());
-    let end_break = word_char(span.last().copied()) && word_char(after);
-
-    (start > 0 && start_break) || end_break
-}
-
-fn word_char(c: Option<char>) -> bool {
-    matches!(c, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn split_identifier(content: &str, start: usize, len: usize, path: &str) -> String {
-    let lines: Vec<&str> = content.split('\n').collect();
-    let span_lines = matched_line_range(&lines, start, len);
-    format!(
-        "old_str \"{}\" would splice into the middle of a word in {path}. old_str must cover whole words - copy complete lines. The line(s) it matched inside:\n\n{span_lines}\n\nCopy old_str exactly from these lines or from read_file output.",
-        quoted_span(content, start, len)
-    )
-}
-
-fn quoted_span(content: &str, start: usize, len: usize) -> String {
-    content.chars().skip(start).take(len).collect()
-}
-
-// The file line(s) the matched span [start, start+len) overlaps, joined.
-fn matched_line_range(lines: &[&str], start: usize, len: usize) -> String {
-    let finish = start + len;
-    let mut selected = Vec::new();
-    let mut pos = 0usize;
-    for line in lines {
-        let line_start = pos;
-        let line_end = pos + line.chars().count();
-        if line_start <= finish && line_end >= start {
-            selected.push(*line);
+    /// qwen's `attemptMatch`: the identity and `trimEnd` passes, then the
+    /// character-normalizing + `trimEnd` pass.
+    fn attempt_match(lines: &[&str], pattern: &[&str]) -> Option<usize> {
+        let passes: [fn(&str) -> String; 3] = [
+            |v: &str| v.to_string(),
+            |v: &str| trim_end(v).to_string(),
+            normalize_line_for_comparison,
+        ];
+        for pass in passes {
+            if let Some(idx) = seek_sequence_with_transform(lines, pattern, pass) {
+                return Some(idx);
+            }
         }
-        pos = line_end + 1;
-    }
-    selected.join("\n")
-}
-
-fn ambiguous(n: usize, path: &str) -> String {
-    format!(
-        "old_str matches {n} locations in {path}; include more surrounding lines to make it unique"
-    )
-}
-
-const PLAIN_NOT_FOUND_SUFFIX: &str =
-    ", even with whitespace normalized; copy it exactly from read_file output";
-
-fn fuzzy_replace(
-    content: &str,
-    old_str: &str,
-    new_str: &str,
-    path: &str,
-) -> Result<(String, Pass), String> {
-    let file_lines: Vec<&str> = content.split('\n').collect();
-    let old_lines = split_lines(old_str);
-
-    let matches = window_matches(&file_lines, &old_lines);
-    match matches.as_slice() {
-        [start] => Ok((
-            apply_fuzzy(&file_lines, &old_lines, new_str, *start),
-            Pass::Fuzzy,
-        )),
-        [] => Err(not_found(&file_lines, &old_lines, path)),
-        many => Err(ambiguous(many.len(), path)),
-    }
-}
-
-fn not_found(file_lines: &[&str], old_lines: &[String], path: &str) -> String {
-    let plain = format!("old_str not found in {path}{PLAIN_NOT_FOUND_SUFFIX}");
-    let first = old_lines.first().map(|s| s.as_str()).unwrap_or("");
-
-    match closest_region(file_lines, first) {
-        None => plain,
-        Some(region) => format!(
-            "old_str not found in {path}, even with whitespace normalized. Closest region in the file:\n\n{region}\n\nCopy old_str exactly from these lines or from read_file output."
-        ),
-    }
-}
-
-fn closest_region(file_lines: &[&str], needle: &str) -> Option<String> {
-    if file_lines.is_empty() {
-        return None;
-    }
-    // max_by score, ties go to the earliest index (Elixir max_by keeps first).
-    let mut best_idx = 0usize;
-    let mut best_score = jaro_distance(needle, file_lines[0].trim());
-    for (idx, line) in file_lines.iter().enumerate().skip(1) {
-        let score = jaro_distance(needle, line.trim());
-        if score > best_score {
-            best_score = score;
-            best_idx = idx;
-        }
-    }
-
-    if best_score >= CLOSEST_THRESHOLD {
-        let first = best_idx.saturating_sub(CONTEXT_LINES);
-        let last = (best_idx + CONTEXT_LINES).min(file_lines.len() - 1);
-        Some(file_lines[first..=last].join("\n"))
-    } else {
         None
     }
-}
 
-// A trailing newline means "up to the end of that line", not "plus an empty
-// line" - drop it before line-windowing.
-fn split_lines(str: &str) -> Vec<String> {
-    let trimmed = str.strip_suffix('\n').unwrap_or(str);
-    trimmed.split('\n').map(|s| s.to_string()).collect()
-}
-
-fn window_matches(file_lines: &[&str], old_lines: &[String]) -> Vec<usize> {
-    let target: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
-    let n = old_lines.len();
-    if n == 0 || file_lines.len() < n {
-        return Vec::new();
+    /// qwen `seekSequenceWithTransform`: first window index where every
+    /// transformed pattern line equals the transformed haystack line.
+    fn seek_sequence_with_transform(
+        lines: &[&str],
+        pattern: &[&str],
+        transform: fn(&str) -> String,
+    ) -> Option<usize> {
+        if pattern.is_empty() {
+            return Some(0);
+        }
+        if pattern.len() > lines.len() {
+            return None;
+        }
+        'outer: for i in 0..=(lines.len() - pattern.len()) {
+            for (p, pat) in pattern.iter().enumerate() {
+                if transform(lines[i + p]) != transform(pat) {
+                    continue 'outer;
+                }
+            }
+            return Some(i);
+        }
+        None
     }
 
-    let trimmed: Vec<&str> = file_lines.iter().map(|l| l.trim()).collect();
-    let mut out = Vec::new();
-    for start in 0..=(trimmed.len() - n) {
-        if trimmed[start..start + n] == target[..] {
-            out.push(start);
+    /// qwen `buildLineIndex`: the split lines and the byte offset each starts at
+    /// (offsets has `lines.len() + 1` entries; the last is the content length).
+    fn build_line_index(text: &str) -> (Vec<&str>, Vec<usize>) {
+        let lines: Vec<&str> = text.split('\n').collect();
+        let mut offsets = vec![0usize; lines.len() + 1];
+        let mut cursor = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            offsets[i] = cursor;
+            cursor += line.len();
+            if i < lines.len() - 1 {
+                cursor += 1; // the '\n' that split() removed.
+            }
+        }
+        offsets[lines.len()] = text.len();
+        (lines, offsets)
+    }
+
+    /// qwen `sliceFromLines`: reconstruct the original bytes for
+    /// `[start_line, start_line + line_count)`, optionally including the newline
+    /// after the final line.
+    fn slice_from_lines(
+        text: &str,
+        offsets: &[usize],
+        lines: &[&str],
+        start_line: usize,
+        line_count: usize,
+        include_trailing_newline: bool,
+    ) -> String {
+        if line_count == 0 {
+            return if include_trailing_newline {
+                "\n".to_string()
+            } else {
+                String::new()
+            };
+        }
+        let start_index = offsets.get(start_line).copied().unwrap_or(0);
+        let last_line_index = start_line + line_count - 1;
+        let last_line_start = offsets.get(last_line_index).copied().unwrap_or(0);
+        let mut end_index = last_line_start + lines.get(last_line_index).map_or(0, |l| l.len());
+
+        if include_trailing_newline {
+            if let Some(next_line_start) = offsets.get(start_line + line_count).copied() {
+                end_index = next_line_start;
+            } else if text.ends_with('\n') {
+                end_index = text.len();
+            }
+        }
+        text[start_index..end_index].to_string()
+    }
+
+    /// qwen `adjustNewStringForTrailingLine`.
+    fn adjust_new_string_for_trailing_line(new_string: &str, removed_trailing_line: bool) -> String {
+        if removed_trailing_line {
+            remove_trailing_newline(new_string).to_string()
+        } else {
+            new_string.to_string()
         }
     }
-    out
+
+    /// qwen `removeTrailingNewline`: strip a single trailing CRLF, LF, or CR.
+    fn remove_trailing_newline(text: &str) -> &str {
+        if let Some(stripped) = text.strip_suffix("\r\n") {
+            stripped
+        } else if let Some(stripped) = text.strip_suffix('\n') {
+            stripped
+        } else if let Some(stripped) = text.strip_suffix('\r') {
+            stripped
+        } else {
+            text
+        }
+    }
+
+    /// qwen `normalizeLineForComparison`: `normalizeBasicCharacters` then
+    /// `trimEnd`.
+    fn normalize_line_for_comparison(value: &str) -> String {
+        let normalized: String = value.chars().map(normalize_basic_char).collect();
+        trim_end(&normalized).to_string()
+    }
+
+    /// JS `String.prototype.trimEnd`: trim trailing whitespace only. Rust's
+    /// `trim_end` trims the same Unicode whitespace set for the characters we
+    /// care about here (ASCII spaces/tabs and the mapped exotic spaces once
+    /// normalized).
+    fn trim_end(value: &str) -> &str {
+        value.trim_end()
+    }
+
+    /// First CHAR index of `needle` in `haystack` (JS `indexOf` on strings whose
+    /// normalization is char-for-char 1:1, so a char index is well-defined).
+    fn char_index_of(haystack: &str, needle: &str) -> Option<usize> {
+        let byte_idx = haystack.find(needle)?;
+        Some(haystack[..byte_idx].chars().count())
+    }
+
+    /// qwen `UNICODE_EQUIVALENT_MAP`: curly quotes to straight, several dash
+    /// variants to ASCII hyphen-minus, and exotic spaces to a normal space.
+    fn normalize_basic_char(c: char) -> char {
+        match c {
+            // Hyphen / dash variations -> ASCII hyphen-minus.
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // Curly single quotes -> straight apostrophe.
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            // Curly double quotes -> straight double quote.
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            // Whitespace variants -> normal space.
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        }
+    }
 }
 
-fn apply_fuzzy(file_lines: &[&str], old_lines: &[String], new_str: &str, start: usize) -> String {
-    let n = old_lines.len();
-    let matched: Vec<&str> = file_lines[start..start + n].to_vec();
+// ---- edited-region snippet (qwen editHelper.ts extractEditSnippet) ----------
 
-    let new_lines: Vec<String> = if new_str.is_empty() {
-        Vec::new()
-    } else {
-        reindent(&split_lines(new_str), old_lines, &matched)
-    };
+/// The faithful port of qwen v0.16.0 `utils/editHelper.ts` `extractEditSnippet`:
+/// the changed region of the NEW content plus a few context lines, echoed back
+/// in the success message so the model sees what landed.
+mod snippet {
+    /// Number of context lines kept on each side of the change (qwen
+    /// `SNIPPET_CONTEXT_LINES`).
+    const CONTEXT_LINES: usize = 4;
+    /// Above this many changed lines, no snippet is produced (qwen
+    /// `SNIPPET_MAX_LINES`).
+    const MAX_LINES: usize = 1000;
 
-    let mut result: Vec<String> = file_lines[..start].iter().map(|s| s.to_string()).collect();
-    result.extend(new_lines);
-    result.extend(file_lines[start + n..].iter().map(|s| s.to_string()));
-    result.join("\n")
-}
+    /// qwen `EditSnippetResult` (1-indexed line bounds + total + content).
+    pub struct Snippet {
+        pub start_line: usize,
+        pub end_line: usize,
+        pub total_lines: usize,
+        pub content: String,
+    }
 
-// Each new_str line takes the indentation delta of its same-index
-// old_str/file line pair; lines beyond old_str's shape reuse the last pair.
-fn reindent(new_lines: &[String], old_lines: &[String], matched: &[&str]) -> Vec<String> {
-    let pairs: Vec<(String, String)> = old_lines
-        .iter()
-        .zip(matched.iter())
-        .map(|(o, m)| (indent_of(o), indent_of(m)))
-        .collect();
-    let last = pairs.len().saturating_sub(1);
+    /// qwen `extractEditSnippet`: for a new file (`old_content == None`) the
+    /// whole content is the snippet; otherwise diff old vs new from both ends to
+    /// find the changed region and quote it with context. Returns `None` when
+    /// there is no meaningful change (identical / empty) or the region is too
+    /// large.
+    pub fn extract(old_content: Option<&str>, new_content: &str) -> Option<Snippet> {
+        let new_lines: Vec<&str> = new_content.split('\n').collect();
+        let total_lines = new_lines.len();
 
-    new_lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            let (old_indent, file_indent) = &pairs[idx.min(last)];
-            reindent_line(line, old_indent, file_indent)
+        let Some(old_content) = old_content else {
+            return Some(Snippet {
+                start_line: 1,
+                end_line: total_lines,
+                total_lines,
+                content: new_content.to_string(),
+            });
+        };
+
+        if old_content == new_content || new_content.is_empty() {
+            return None;
+        }
+
+        let old_lines: Vec<&str> = old_content.split('\n').collect();
+
+        // First differing line from the start.
+        let min_length = old_lines.len().min(new_lines.len());
+        let mut first_diff = 0usize;
+        while first_diff < min_length && old_lines[first_diff] == new_lines[first_diff] {
+            first_diff += 1;
+        }
+
+        // First differing line from the end (i64 so both cursors can pass below
+        // first_diff without underflow, matching qwen's `>= firstDiffLine`).
+        let mut old_end = old_lines.len() as i64 - 1;
+        let mut new_end = new_lines.len() as i64 - 1;
+        let first_diff_i = first_diff as i64;
+        while old_end >= first_diff_i
+            && new_end >= first_diff_i
+            && old_lines[old_end as usize] == new_lines[new_end as usize]
+        {
+            old_end -= 1;
+            new_end -= 1;
+        }
+
+        // Changed region in the new content, 1-indexed.
+        let change_start = first_diff + 1;
+        let change_end = (new_end + 1) as usize;
+
+        if change_end.saturating_sub(change_start) > MAX_LINES {
+            return None;
+        }
+
+        let snippet_start = change_start.saturating_sub(CONTEXT_LINES).max(1);
+        let snippet_end = (change_end + CONTEXT_LINES).min(total_lines);
+        let content = new_lines[snippet_start - 1..snippet_end].join("\n");
+
+        Some(Snippet {
+            start_line: snippet_start,
+            end_line: snippet_end,
+            total_lines,
+            content,
         })
-        .collect()
-}
-
-fn indent_of(line: &str) -> String {
-    line.chars()
-        .take_while(|c| *c == ' ' || *c == '\t')
-        .collect()
-}
-
-fn reindent_line(line: &str, old_indent: &str, file_indent: &str) -> String {
-    let body = line.trim_start_matches([' ', '\t']);
-    if body.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "{}{body}",
-            shift_indent(&indent_of(line), old_indent, file_indent)
-        )
-    }
-}
-
-fn shift_indent(new_indent: &str, old_indent: &str, file_indent: &str) -> String {
-    if let Some(rest) = new_indent.strip_prefix(old_indent) {
-        format!("{file_indent}{rest}")
-    } else if old_indent.starts_with(new_indent) {
-        let outdent = old_indent.chars().count() - new_indent.chars().count();
-        let keep = file_indent.chars().count().saturating_sub(outdent);
-        file_indent.chars().take(keep).collect()
-    } else {
-        // Indent characters disagree (tabs vs spaces): no computable delta, so
-        // the line takes the matched file line's indentation as-is.
-        file_indent.to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::caps::Capabilities;
+    use crate::tool::read_cache::FileReadCache;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn ctx(root: &std::path::Path) -> ToolCtx {
-        ToolCtx::for_test(root.to_path_buf(), 10_000)
+    // A ctx sharing a caller-supplied read cache, so a test can pre-populate the
+    // cache (record a prior read) and drive the enforcement.
+    fn ctx_with_cache(root: &std::path::Path, cache: Arc<FileReadCache>) -> ToolCtx {
+        let caps = Capabilities::for_test_with_read_cache(cache);
+        ToolCtx {
+            root: root.to_path_buf(),
+            result_cap: 100_000,
+            command_timeout_ms: 120_000,
+            input_modalities: crate::content::Modalities::default(),
+            memory_root: None,
+            session_dir: std::env::temp_dir(),
+            caps,
+        }
+    }
+
+    // Stat the file for its current (mtime, size) fingerprint.
+    fn fingerprint(abs: &std::path::Path) -> (u128, u64) {
+        let meta = std::fs::metadata(abs).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        (mtime, meta.len())
+    }
+
+    // Write `body` to `name` under `root` and record a prior read of it in
+    // `cache`, so the read-before-edit gate is satisfied.
+    fn seed_read(
+        root: &std::path::Path,
+        cache: &FileReadCache,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let abs = root.join(name);
+        std::fs::write(&abs, body).unwrap();
+        let (mtime, size) = fingerprint(&abs);
+        cache.record_read(abs.clone(), mtime, size, true, true);
+        abs
     }
 
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -417,496 +827,553 @@ mod tests {
         std::fs::read_to_string(root.join(name)).unwrap()
     }
 
-    fn assert_ambiguous_error(err: &str) {
-        assert!(err.contains("locations"), "expected 'locations' in: {err}");
-        assert!(
-            err.contains("more surrounding lines"),
-            "expected 'more surrounding lines' in: {err}"
-        );
-    }
-
-    fn assert_not_found_error(err: &str) {
-        assert!(
-            err.contains("old_str not found"),
-            "expected 'old_str not found' in: {err}"
-        );
-    }
-
-    fn assert_splits_identifier_error(err: &str) {
-        assert!(
-            err.contains("whole words"),
-            "expected 'whole words' in: {err}"
-        );
+    // An absolute path to `rel` inside `root`, as a JSON string, since the tool
+    // now requires an absolute file_path (qwen contract).
+    fn abs(root: &std::path::Path, rel: &str) -> String {
+        root.join(rel).to_string_lossy().into_owned()
     }
 
     #[test]
-    fn spec_requires_path_old_str_new_str() {
+    fn spec_requires_file_path_old_string_new_string() {
         let spec = EditFile.spec();
-        assert_eq!(spec.name, "edit_file");
+        assert_eq!(spec.name, "edit");
         assert_eq!(
             spec.input_schema["required"],
-            json!(["path", "old_str", "new_str"])
+            json!(["file_path", "old_string", "new_string"])
         );
+        // The old relative `path` / `old_str` / `new_str` params are gone.
+        assert!(spec.input_schema["properties"]["path"].is_null());
+        assert!(spec.input_schema["properties"]["old_str"].is_null());
+        assert!(spec.input_schema["properties"]["new_str"].is_null());
+        // `replace_all` is present and optional (not in required).
+        assert!(spec.input_schema["properties"]["replace_all"].is_object());
     }
 
-    // ---- exact pass ----
+    #[test]
+    fn description_is_the_verbatim_qwen_string_without_suspenders_additions() {
+        let desc = EditFile.spec().description;
+        assert!(desc.starts_with(
+            "Replaces text within a file. By default, replaces a single occurrence."
+        ));
+        assert!(desc.contains("Expectation for required parameters:"));
+        assert!(desc.contains("**Multiple replacements:**"));
+        // Interpolated ReadFileTool.Name is hardcoded.
+        assert!(desc.contains("Always use the read_file tool"));
+        // No suspenders-only additions survive.
+        assert!(!desc.contains("relative to the project root"));
+        assert!(!desc.contains("copied verbatim from read_file output"));
+        assert!(!desc.contains("One change per call"));
+        assert!(!desc.contains("whitespace normalized"));
+        assert!(!desc.contains("write_file"));
+    }
+
+    // ---- single replacement (the default) ----
 
     #[tokio::test]
-    async fn replaces_a_uniquely_matched_old_str() {
+    async fn replaces_a_single_occurrence() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "foo bar baz").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "foo bar baz");
+        let ctx = ctx_with_cache(tmp.path(), cache);
 
         let msg = run(
-            json!({"path": "a.txt", "old_str": "bar", "new_str": "qux"}),
-            &ctx(tmp.path()),
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "bar", "new_string": "qux"}),
+            &ctx,
         )
         .await
         .unwrap();
-        assert!(msg.contains("edited a.txt"));
+        // The base update line plus qwen's edited-region snippet suffix.
+        assert_eq!(
+            msg,
+            format!(
+                "The file: {} has been updated. Showing lines 1-1 of 1 from the edited file:\n\n---\n\nfoo qux baz",
+                abs(tmp.path(), "a.txt")
+            )
+        );
         assert_eq!(read(tmp.path(), "a.txt"), "foo qux baz");
     }
 
     #[tokio::test]
-    async fn matches_old_str_exactly_including_whitespace() {
+    async fn matches_old_string_exactly_including_whitespace() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def run do\n  :ok\nend\n").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "code.ex", "def run do\n  :ok\nend\n");
+        let ctx = ctx_with_cache(tmp.path(), cache);
 
-        assert!(
-            run(
-                json!({"path": "code.ex", "old_str": "  :ok\n", "new_str": "  :error\n"}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
+        run(
+            json!({"file_path": abs(tmp.path(), "code.ex"), "old_string": "  :ok\n", "new_string": "  :error\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert_eq!(read(tmp.path(), "code.ex"), "def run do\n  :error\nend\n");
     }
 
-    #[tokio::test]
-    async fn more_than_one_exact_match_is_an_ambiguity_error() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "foo bar foo").unwrap();
+    // ---- multiple-occurrence handling ----
 
+    #[tokio::test]
+    async fn two_occurrences_without_replace_all_is_the_verbatim_mismatch_error() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "foo bar foo");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
         let err = run(
-            json!({"path": "a.txt", "old_str": "foo", "new_str": "baz"}),
-            &ctx(tmp.path()),
+            json!({"file_path": &file_path, "old_string": "foo", "new_string": "baz"}),
+            &ctx,
         )
         .await
         .unwrap_err();
-        assert_ambiguous_error(&err);
+        assert_eq!(
+            err,
+            format!("Failed to edit. Found 2 occurrences for old_string in {file_path} but replace_all was not enabled.")
+        );
+        // The file is untouched on the error path.
         assert_eq!(read(tmp.path(), "a.txt"), "foo bar foo");
     }
 
     #[tokio::test]
-    async fn a_unique_exact_match_wins_even_when_fuzzy_would_be_ambiguous() {
+    async fn replace_all_replaces_every_occurrence() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "  x = 1\n    x = 1\n").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "foo bar foo");
+        let ctx = ctx_with_cache(tmp.path(), cache);
 
-        let msg = run(
-            json!({"path": "a.txt", "old_str": "    x = 1", "new_str": "    x = 2"}),
-            &ctx(tmp.path()),
+        run(
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "foo", "new_string": "baz", "replace_all": true}),
+            &ctx,
         )
         .await
         .unwrap();
-        assert!(!msg.contains("whitespace"));
-        assert_eq!(read(tmp.path(), "a.txt"), "  x = 1\n    x = 2\n");
+        assert_eq!(read(tmp.path(), "a.txt"), "baz bar baz");
     }
 
-    #[tokio::test]
-    async fn new_str_may_be_empty_deletes_old_str() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "keep DROP keep").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "a.txt", "old_str": "DROP ", "new_str": ""}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.txt"), "keep keep");
-    }
-
-    // ---- whitespace-normalized fallback ----
+    // ---- not found ----
 
     #[tokio::test]
-    async fn matches_despite_wrong_indentation_and_reindents() {
+    async fn zero_occurrences_is_the_verbatim_not_found_error() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def run do\n    :ok\nend\n").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "actual content");
+        let ctx = ctx_with_cache(tmp.path(), cache);
 
-        let msg = run(
-            json!({
-                "path": "code.ex",
-                "old_str": "def run do\n  :ok\nend",
-                "new_str": "def run do\n  :error\nend"
-            }),
-            &ctx(tmp.path()),
+        let file_path = abs(tmp.path(), "a.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "imaginary", "new_string": "x"}),
+            &ctx,
         )
         .await
-        .unwrap();
-        assert!(msg.contains("whitespace normalized"));
-        assert_eq!(read(tmp.path(), "code.ex"), "def run do\n    :error\nend\n");
-    }
-
-    #[tokio::test]
-    async fn matches_despite_trailing_whitespace_in_the_file() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "x = 1   \ny = 2\n").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "a.txt", "old_str": "x = 1\ny = 2", "new_str": "x = 3\ny = 2"}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.txt"), "x = 3\ny = 2\n");
-    }
-
-    #[tokio::test]
-    async fn lines_beyond_old_str_shape_keep_relative_indent() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def run do\n    :ok\nend\n").unwrap();
-
-        assert!(
-            run(
-                json!({
-                    "path": "code.ex",
-                    "old_str": "      :ok",
-                    "new_str": "      if go?() do\n        :yes\n      end"
-                }),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
+        .unwrap_err();
         assert_eq!(
-            read(tmp.path(), "code.ex"),
-            "def run do\n    if go?() do\n      :yes\n    end\nend\n"
+            err,
+            format!("Failed to edit, 0 occurrences found for old_string in {file_path}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use read_file tool to verify.")
         );
-    }
-
-    #[tokio::test]
-    async fn blank_lines_in_new_str_stay_blank() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def run do\n    :ok\nend\n").unwrap();
-
-        assert!(run(
-            json!({"path": "code.ex", "old_str": "      :ok", "new_str": "      :a\n\n      :b"}),
-            &ctx(tmp.path())
-        )
-        .await
-        .is_ok());
-        assert_eq!(
-            read(tmp.path(), "code.ex"),
-            "def run do\n    :a\n\n    :b\nend\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn reindents_across_tabs_vs_spaces_style_mismatch() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def run do\n\t:ok\nend\n").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "code.ex", "old_str": "  :ok", "new_str": "  :done"}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "code.ex"), "def run do\n\t:done\nend\n");
-    }
-
-    #[tokio::test]
-    async fn when_old_and_new_disagree_on_indent_chars_file_wins() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def run do\n\t:ok\nend\n").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "code.ex", "old_str": "  :ok", "new_str": "\t:done"}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "code.ex"), "def run do\n\t:done\nend\n");
-    }
-
-    #[tokio::test]
-    async fn empty_new_str_deletes_the_matched_lines() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "a\n  DROP\nb\n").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "a.txt", "old_str": "    DROP", "new_str": ""}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.txt"), "a\nb\n");
-    }
-
-    #[tokio::test]
-    async fn more_than_one_fuzzy_match_is_an_ambiguity_error() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "  x = 1\n    x = 1\n").unwrap();
-
-        let err = run(
-            json!({"path": "a.txt", "old_str": "      x = 1", "new_str": "      x = 2"}),
-            &ctx(tmp.path()),
-        )
-        .await
-        .unwrap_err();
-        assert_ambiguous_error(&err);
-        assert_eq!(read(tmp.path(), "a.txt"), "  x = 1\n    x = 1\n");
-    }
-
-    // ---- rejects matches that split an identifier ----
-
-    #[tokio::test]
-    async fn a_truncated_old_str_that_would_splice_mid_identifier_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("discount.ex"),
-            "defmodule Discount do\n  def amount_off(base, code) do\n    base - lookup(code)\n  end\nend\n",
-        )
-        .unwrap();
-
-        let err = run(
-            json!({
-                "path": "discount.ex",
-                "old_str": "amount_off(bas",
-                "new_str": "amount_off(item_subtot"
-            }),
-            &ctx(tmp.path()),
-        )
-        .await
-        .unwrap_err();
-        assert_splits_identifier_error(&err);
-        assert!(err.contains("  def amount_off(base, code) do"));
-        assert!(read(tmp.path(), "discount.ex").contains("def amount_off(base, code) do"));
-    }
-
-    #[tokio::test]
-    async fn a_match_whose_end_boundary_falls_inside_a_word_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.ex"), "x = subtotal_amount + 1\n").unwrap();
-
-        let err = run(
-            json!({"path": "a.ex", "old_str": "subtotal", "new_str": "total"}),
-            &ctx(tmp.path()),
-        )
-        .await
-        .unwrap_err();
-        assert_splits_identifier_error(&err);
-        assert_eq!(read(tmp.path(), "a.ex"), "x = subtotal_amount + 1\n");
-    }
-
-    #[tokio::test]
-    async fn replacing_a_standalone_word_flanked_by_punctuation_works() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.ex"), "fee(subtotal)\n").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "a.ex", "old_str": "subtotal", "new_str": "grand_total"}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.ex"), "fee(grand_total)\n");
-    }
-
-    #[tokio::test]
-    async fn a_whole_line_edit_is_unaffected_by_the_boundary_guard() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.ex"), "  def amount_off(base, code) do\n").unwrap();
-
-        assert!(
-            run(
-                json!({
-                    "path": "a.ex",
-                    "old_str": "  def amount_off(base, code) do",
-                    "new_str": "  def amount_off(base) do"
-                }),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.ex"), "  def amount_off(base) do\n");
-    }
-
-    #[tokio::test]
-    async fn a_multi_line_edit_is_unaffected_by_the_boundary_guard() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.ex"), "def run do\n  :ok\nend\n").unwrap();
-
-        assert!(
-            run(
-                json!({
-                    "path": "a.ex",
-                    "old_str": "def run do\n  :ok\nend",
-                    "new_str": "def run do\n  :error\nend"
-                }),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.ex"), "def run do\n  :error\nend\n");
-    }
-
-    #[tokio::test]
-    async fn a_match_at_the_start_of_the_file_is_unaffected() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.ex"), "hello world\n").unwrap();
-
-        assert!(
-            run(
-                json!({"path": "a.ex", "old_str": "hello", "new_str": "goodbye"}),
-                &ctx(tmp.path())
-            )
-            .await
-            .is_ok()
-        );
-        assert_eq!(read(tmp.path(), "a.ex"), "goodbye world\n");
-    }
-
-    // ---- misc errors ----
-
-    #[tokio::test]
-    async fn empty_old_str_is_an_error_pointing_to_write_file() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "content").unwrap();
-
-        let err = run(
-            json!({"path": "a.txt", "old_str": "", "new_str": "x"}),
-            &ctx(tmp.path()),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.contains("write_file"));
-        assert_eq!(read(tmp.path(), "a.txt"), "content");
-    }
-
-    #[tokio::test]
-    async fn old_str_not_found_even_fuzzily_is_an_error() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "actual content").unwrap();
-
-        let err = run(
-            json!({"path": "a.txt", "old_str": "imaginary", "new_str": "x"}),
-            &ctx(tmp.path()),
-        )
-        .await
-        .unwrap_err();
-        assert_not_found_error(&err);
-        assert!(err.contains("whitespace normalized"));
         assert_eq!(read(tmp.path(), "a.txt"), "actual content");
     }
 
+    // ---- no-change ----
+
     #[tokio::test]
-    async fn a_near_miss_old_str_yields_error_with_the_real_line_verbatim() {
+    async fn identical_old_and_new_string_is_the_verbatim_no_change_error() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("cart.ex"),
-            "defmodule Cart do\n  def total(items, tax_rate) do\n    sum(items) * tax_rate\n  end\nend\n",
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "keep same keep");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "same", "new_string": "same"}),
+            &ctx,
         )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("No changes to apply. The old_string and new_string are identical in file: {file_path}")
+        );
+    }
+
+    // ---- normalization fallback (qwen normalizeEditStrings) ----
+
+    #[tokio::test]
+    async fn a_curly_quote_in_old_string_matches_a_straight_quote_on_disk() {
+        // The literal old_string is absent (curly apostrophe), but qwen's
+        // character-equivalence pass maps it to a straight quote, matches, and
+        // substitutes the canonical on-disk slice so the write lands on real
+        // bytes.
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "it's here");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        run(
+            // U+2019 RIGHT SINGLE QUOTATION MARK in old_string.
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "it\u{2019}s here", "new_string": "it is here"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(tmp.path(), "a.txt"), "it is here");
+    }
+
+    #[tokio::test]
+    async fn an_em_dash_in_old_string_matches_a_hyphen_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "a - b");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        run(
+            // U+2014 EM DASH in old_string maps to ASCII hyphen-minus.
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "a \u{2014} b", "new_string": "a plus b"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(tmp.path(), "a.txt"), "a plus b");
+    }
+
+    #[tokio::test]
+    async fn line_matching_tolerates_trailing_whitespace_on_disk() {
+        // The file line has trailing spaces the model did not send; qwen's
+        // line-based trimEnd pass matches and rewrites the canonical (trailing-
+        // whitespace-bearing) slice.
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "x = 1   \ny = 2\n");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        run(
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "x = 1\ny = 2", "new_string": "x = 3\ny = 2"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(tmp.path(), "a.txt"), "x = 3\ny = 2\n");
+    }
+
+    // ---- deletion newline augmentation (qwen maybeAugmentOldStringForDeletion) ----
+
+    #[tokio::test]
+    async fn deleting_a_whole_line_consumes_its_trailing_newline() {
+        // new_string is empty and old_string lacks a trailing newline, but the
+        // file has old_string + "\n": the augmentation grows old_string by the
+        // newline so no blank line is left behind.
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "keep\nDROP\nkeep\n");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        run(
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "DROP", "new_string": ""}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // The whole "DROP\n" line is gone - no lingering blank line.
+        assert_eq!(read(tmp.path(), "a.txt"), "keep\nkeep\n");
+    }
+
+    // ---- no-change after normalization (qwen's identical guards) ----
+
+    #[tokio::test]
+    async fn a_replacement_that_normalizes_to_a_no_op_is_a_no_change_error() {
+        // old_string (curly quote) and new_string (straight quote) differ as raw
+        // strings, but normalization canonicalizes old_string to the on-disk
+        // "it's here", which equals new_string, so the edit is a no-op. qwen's
+        // primary identical guard (final old == final new) catches it first with
+        // its verbatim message. The secondary post-apply identical-content guard
+        // is defensive backup that the primary guard shadows here.
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "it's here");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "it\u{2019}s here", "new_string": "it's here"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("No changes to apply. The old_string and new_string are identical in file: {file_path}")
+        );
+        assert_eq!(read(tmp.path(), "a.txt"), "it's here");
+    }
+
+    // ---- edited-region snippet suffix (qwen extractEditSnippet) ----
+
+    #[tokio::test]
+    async fn the_success_message_appends_the_edited_region_snippet() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        // Ten lines so the changed line 5 gets a bounded 4-line context window.
+        let body = (1..=10).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n");
+        seed_read(tmp.path(), &cache, "a.txt", &body);
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
+        let msg = run(
+            json!({"file_path": &file_path, "old_string": "line5", "new_string": "CHANGED"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Change is on line 5; context is 4 lines each side -> lines 1-9 of 10.
+        assert!(
+            msg.starts_with(&format!(
+                "The file: {file_path} has been updated. Showing lines 1-9 of 10 from the edited file:\n\n---\n\n"
+            )),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("CHANGED"));
+        // The unchanged line 10 is beyond the context window, so it is elided.
+        assert!(!msg.contains("line10"));
+    }
+
+    // ---- empty old_string = create a new file ----
+
+    #[tokio::test]
+    async fn empty_old_string_creates_a_new_file() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "fresh.txt");
+        let msg = run(
+            json!({"file_path": &file_path, "old_string": "", "new_string": "hello\nworld\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // A new file quotes its whole content as the snippet.
+        assert_eq!(
+            msg,
+            format!(
+                "Created new file: {file_path} with provided content. Showing lines 1-3 of 3 from the edited file:\n\n---\n\nhello\nworld\n"
+            )
+        );
+        assert_eq!(read(tmp.path(), "fresh.txt"), "hello\nworld\n");
+    }
+
+    #[tokio::test]
+    async fn a_padded_file_path_is_trimmed_before_validation_and_in_the_message() {
+        // qwen unescapePath(file_path.trim()) (edit.ts): surrounding whitespace
+        // is stripped, so a padded absolute path edits fine (and is echoed
+        // trimmed in the message) rather than being rejected as relative.
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "fresh.txt");
+        let padded = format!("  {file_path}  ");
+        let msg = run(
+            json!({"file_path": padded, "old_string": "", "new_string": "hello\nworld\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg,
+            format!(
+                "Created new file: {file_path} with provided content. Showing lines 1-3 of 3 from the edited file:\n\n---\n\nhello\nworld\n"
+            )
+        );
+        assert_eq!(read(tmp.path(), "fresh.txt"), "hello\nworld\n");
+    }
+
+    #[tokio::test]
+    async fn empty_old_string_on_an_existing_file_is_the_verbatim_create_conflict_error() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        seed_read(tmp.path(), &cache, "a.txt", "content");
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "", "new_string": "x"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("File already exists, cannot create: {file_path}")
+        );
+        assert_eq!(read(tmp.path(), "a.txt"), "content");
+    }
+
+    // ---- editing a nonexistent file (non-empty old_string) ----
+
+    #[tokio::test]
+    async fn editing_a_missing_file_with_a_non_empty_old_string_is_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "nope.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "a", "new_string": "b"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, format!("File not found: {file_path}"));
+    }
+
+    // ---- prior-read enforcement ----
+
+    #[tokio::test]
+    async fn editing_an_unread_existing_file_is_the_verbatim_prior_read_rejection() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "foo bar baz").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "bar", "new_string": "qux"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("File {file_path} has not been read in this session. Use the read_file tool first to load the current content (a partial read with offset / limit is fine \u{2014} you only need to have seen the bytes you intend to edit) before editing it.")
+        );
+        // The unread file is left untouched.
+        assert_eq!(read(tmp.path(), "a.txt"), "foo bar baz");
+    }
+
+    #[tokio::test]
+    async fn editing_a_stale_file_is_the_verbatim_modified_since_rejection() {
+        let tmp = TempDir::new().unwrap();
+        let abs_path = tmp.path().join("a.txt");
+        std::fs::write(&abs_path, "foo bar baz").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        // Record a read at a DIFFERENT fingerprint than the file now has.
+        cache.record_read(abs_path.clone(), 1, 1, true, true);
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let file_path = abs(tmp.path(), "a.txt");
+        let err = run(
+            json!({"file_path": &file_path, "old_string": "bar", "new_string": "qux"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("File {file_path} has been modified since you last read it (mtime or size changed). Re-read it with the read_file tool before editing it to ensure your changes are based on current content.")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_then_edit_shares_the_cache_and_passes() {
+        // Drive read_file first (which records into the shared cache), then edit:
+        // the read-before-edit contract is satisfied through the shared cache.
+        let tmp = TempDir::new().unwrap();
+        let abs_path = tmp.path().join("a.txt");
+        std::fs::write(&abs_path, "foo bar baz").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        // read_file now takes an absolute `file_path` (qwen contract).
+        crate::tools::read_file::ReadFile
+            .run_rich(&json!({"file_path": abs_path.to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+
+        run(
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "bar", "new_string": "qux"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(tmp.path(), "a.txt"), "foo qux baz");
+    }
+
+    // ---- read cache recording after a successful edit ----
+
+    #[tokio::test]
+    async fn a_successful_edit_records_the_write_so_a_second_edit_passes() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let abs_path = seed_read(tmp.path(), &cache, "a.txt", "foo bar baz");
+        let ctx = ctx_with_cache(tmp.path(), Arc::clone(&cache));
+
+        run(
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "bar", "new_string": "qux"}),
+            &ctx,
+        )
+        .await
         .unwrap();
 
-        let err = run(
-            json!({
-                "path": "cart.ex",
-                "old_str": "  def total(items) do",
-                "new_str": "  def total(items, rate) do"
-            }),
-            &ctx(tmp.path()),
+        // The write was recorded: the path reads Fresh at its new fingerprint, so
+        // a second edit (which the model authored) passes without a re-read.
+        let (mtime2, size2) = fingerprint(&abs_path);
+        assert_eq!(cache.check(&abs_path, mtime2, size2), ReadState::Fresh);
+        run(
+            json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "qux", "new_string": "zzz"}),
+            &ctx,
         )
         .await
-        .unwrap_err();
-        assert_not_found_error(&err);
-        assert!(err.contains("Closest region in the file"));
-        assert!(err.contains("  def total(items, tax_rate) do"));
-        assert!(err.contains("Copy old_str"));
-        assert!(read(tmp.path(), "cart.ex").contains("def total(items, tax_rate)"));
+        .unwrap();
+        assert_eq!(read(tmp.path(), "a.txt"), "foo zzz baz");
     }
 
     #[tokio::test]
-    async fn a_totally_unrelated_old_str_yields_plain_error() {
+    async fn a_created_file_records_the_write_so_an_immediate_edit_passes() {
+        // Empty old_string creates a file; the model authored the bytes, so a
+        // follow-up in-place edit passes without an explicit read (qwen's
+        // recordWrite-seeds-prior-read note).
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "actual content\nmore lines\n").unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
 
-        let err = run(
-            json!({"path": "a.txt", "old_str": "zzqx wholly unrelated", "new_str": "x"}),
-            &ctx(tmp.path()),
+        run(
+            json!({"file_path": abs(tmp.path(), "made.txt"), "old_string": "", "new_string": "alpha beta"}),
+            &ctx,
         )
         .await
-        .unwrap_err();
-        assert_not_found_error(&err);
-        assert!(!err.contains("Closest region in the file"));
+        .unwrap();
+        run(
+            json!({"file_path": abs(tmp.path(), "made.txt"), "old_string": "beta", "new_string": "gamma"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(tmp.path(), "made.txt"), "alpha gamma");
     }
 
-    #[tokio::test]
-    async fn the_quoted_region_respects_the_line_cap() {
-        let tmp = TempDir::new().unwrap();
-        let lines: Vec<String> = (1..=60)
-            .map(|n| format!("line number {n} filler text here"))
-            .collect();
-        let body = format!("{}\n", lines.join("\n"));
-        std::fs::write(tmp.path().join("big.txt"), body).unwrap();
+    // ---- path handling ----
 
+    #[tokio::test]
+    async fn a_relative_file_path_is_the_verbatim_absolute_required_message() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
         let err = run(
-            json!({
-                "path": "big.txt",
-                "old_str": "line number 30 filler text elsewhere",
-                "new_str": "changed"
-            }),
-            &ctx(tmp.path()),
+            json!({"file_path": "a.txt", "old_string": "a", "new_string": "b"}),
+            &ctx,
         )
         .await
         .unwrap_err();
-        assert!(err.contains("Closest region in the file"));
-        assert!(err.contains("line number 30 filler text here"));
-
-        let quoted = err
-            .split("Closest region in the file:")
-            .last()
-            .unwrap()
-            .split("Copy old_str")
-            .next()
-            .unwrap();
-        let quoted_lines: Vec<&str> = quoted.trim().split('\n').collect();
-        assert!(quoted_lines.len() <= 6);
-    }
-
-    #[tokio::test]
-    async fn missing_file_is_an_error() {
-        let tmp = TempDir::new().unwrap();
-        let err = run(
-            json!({"path": "nope.txt", "old_str": "a", "new_str": "b"}),
-            &ctx(tmp.path()),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.contains("enoent"));
+        assert_eq!(err, "File path must be absolute: a.txt");
     }
 
     #[tokio::test]
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let ctx = ctx_with_cache(tmp.path(), cache);
         assert_eq!(
             run(
-                json!({"path": "../../etc/passwd", "old_str": "root", "new_str": "x"}),
-                &ctx(tmp.path())
+                json!({"file_path": "/etc/passwd", "old_string": "root", "new_string": "x"}),
+                &ctx
             )
             .await,
             Err("path escapes project root".into())
@@ -919,19 +1386,23 @@ mod tests {
         // seam, outside the Project Root, so the model can update its memory.
         let proj = TempDir::new().unwrap();
         let mem = TempDir::new().unwrap();
-        let mut c = ctx(proj.path());
+        let cache = Arc::new(FileReadCache::new());
+        let mut c = ctx_with_cache(proj.path(), Arc::clone(&cache));
         c.memory_root = Some(mem.path().to_path_buf());
 
-        let abs = mem.path().join("user.md");
-        std::fs::write(&abs, "type: user\nold body").unwrap();
+        let abs_path = mem.path().join("user.md");
+        std::fs::write(&abs_path, "type: user\nold body").unwrap();
+        let (mtime, size) = fingerprint(&abs_path);
+        cache.record_read(abs_path.clone(), mtime, size, true, true);
+
         run(
-            json!({"path": abs.to_str().unwrap(), "old_str": "old body", "new_str": "new body"}),
+            json!({"file_path": abs_path.to_str().unwrap(), "old_string": "old body", "new_string": "new body"}),
             &c,
         )
         .await
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(&abs).unwrap(),
+            std::fs::read_to_string(&abs_path).unwrap(),
             "type: user\nnew body"
         );
     }
@@ -939,16 +1410,16 @@ mod tests {
     #[tokio::test]
     async fn missing_or_non_string_arguments_are_a_structured_error() {
         let tmp = TempDir::new().unwrap();
-        let c = ctx(tmp.path());
+        let c = ctx_with_cache(tmp.path(), Arc::new(FileReadCache::new()));
         assert!(
-            crate::tools::execute("edit_file", &json!({"path": "a.txt"}), &c)
+            crate::tools::execute("edit", &json!({"file_path": abs(tmp.path(), "a.txt")}), &c)
                 .await
                 .is_error
         );
         assert!(
             crate::tools::execute(
-                "edit_file",
-                &json!({"path": "a.txt", "old_str": 1, "new_str": 2}),
+                "edit",
+                &json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": 1, "new_string": 2}),
                 &c
             )
             .await

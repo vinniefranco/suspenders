@@ -35,8 +35,8 @@ pub struct Diff {
 /// Builds a human-readable title for a diff block.
 ///
 /// ```text
-/// title("edit_file", %{path: "lib/foo.ex", added: 3, removed: 1, created: false})
-/// // => "edit_file lib/foo.ex (+3 -1)"
+/// title("edit", %{path: "lib/foo.ex", added: 3, removed: 1, created: false})
+/// // => "edit lib/foo.ex (+3 -1)"
 /// title("write_file", %{path: "new.ex", added: 5, removed: 0, created: true})
 /// // => "write_file new.ex (new file, +5)"
 /// ```
@@ -131,7 +131,7 @@ mod tests {
             removed: 1,
             created: false,
         };
-        assert_eq!(title("edit_file", &diff), "edit_file lib/x.ex (+3 -1)");
+        assert_eq!(title("edit", &diff), "edit lib/x.ex (+3 -1)");
     }
 
     #[test]

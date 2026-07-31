@@ -358,7 +358,7 @@ mod tests {
                 block_delta(json!(0), json!({ "type": "input_json_delta", "partial_json": "{\"pa" })),
                 block_delta(json!(0), json!({ "type": "input_json_delta", "partial_json": "th\": \"x\"}" })),
                 block_stop(json!(0)),
-                block_start(json!(1), json!({ "type": "tool_use", "id": "toolu_2", "name": "list_files", "input": {} })),
+                block_start(json!(1), json!({ "type": "tool_use", "id": "toolu_2", "name": "list_directory", "input": {} })),
                 block_stop(json!(1)),
                 message_delta("tool_use", json!({ "output_tokens": 9 })),
                 message_stop(),
@@ -373,7 +373,7 @@ mod tests {
             result.content,
             vec![
                 ContentBlock::tool_use("toolu_1", "read_file", json!({ "path": "x" })),
-                ContentBlock::tool_use("toolu_2", "list_files", json!({})),
+                ContentBlock::tool_use("toolu_2", "list_directory", json!({})),
             ]
         );
         assert_eq!(result.stop_reason, StopReason::ToolUse);
@@ -400,7 +400,7 @@ mod tests {
                 block_stop(Value::Null),
                 block_start(
                     Value::Null,
-                    json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+                    json!({ "type": "tool_use", "id": "t1", "name": "list_directory" }),
                 ),
                 block_delta(
                     Value::Null,
@@ -421,7 +421,7 @@ mod tests {
             result.content,
             vec![
                 ContentBlock::text("Let me check."),
-                ContentBlock::tool_use("t1", "list_files", json!({ "path": "." })),
+                ContentBlock::tool_use("t1", "list_directory", json!({ "path": "." })),
             ]
         );
     }
@@ -436,7 +436,7 @@ mod tests {
                 message_start(json!({})),
                 block_start(
                     json!(0),
-                    json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+                    json!({ "type": "tool_use", "id": "t1", "name": "list_directory" }),
                 ),
                 block_delta(
                     json!(0),
@@ -457,7 +457,7 @@ mod tests {
             result.content,
             vec![ContentBlock::tool_use(
                 "t1",
-                "list_files",
+                "list_directory",
                 malformed_input_marker(malformed)
             )]
         );

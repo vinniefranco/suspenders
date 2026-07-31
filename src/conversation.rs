@@ -342,17 +342,24 @@ pub fn extract_file_ops(messages: &[Message]) -> FileOps {
 
     for msg in messages {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { name, input, .. } = block
-                && let Some(path) = input.get("path").and_then(|p| p.as_str())
-            {
-                match name.as_str() {
-                    "read_file" | "list_files" => {
-                        reads.insert(path.to_string());
+            if let ContentBlock::ToolUse { name, input, .. } = block {
+                // read_file/write_file/edit name their path arg "file_path";
+                // list_directory still uses "path".
+                let key = match name.as_str() {
+                    "read_file" | "write_file" | "edit" => "file_path",
+                    "list_directory" => "path",
+                    _ => continue,
+                };
+                if let Some(path) = input.get(key).and_then(|p| p.as_str()) {
+                    match name.as_str() {
+                        "read_file" | "list_directory" => {
+                            reads.insert(path.to_string());
+                        }
+                        "write_file" | "edit" => {
+                            modifies.insert(path.to_string());
+                        }
+                        _ => {}
                     }
-                    "write_file" | "edit_file" => {
-                        modifies.insert(path.to_string());
-                    }
-                    _ => {}
                 }
             }
         }
@@ -539,7 +546,7 @@ mod tests {
     fn add_tool_results_appends_all_results_as_one_user_message() {
         let results = vec![tool_result("t1", "one"), tool_result_err("t2", "two", true)];
         let mut conv = started_conv();
-        conv.add_assistant_blocks(vec![tool_use("t1", "grep"), tool_use("t2", "grep")]);
+        conv.add_assistant_blocks(vec![tool_use("t1", "grep_search"), tool_use("t2", "grep_search")]);
         conv.add_tool_results(results.clone(), vec![]);
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.messages.last().unwrap(), &Message::user(results));
@@ -587,7 +594,7 @@ mod tests {
         let mut with_blocks = base.clone();
         with_blocks.add_assistant_blocks(vec![tool_use_input(
             "t1",
-            "grep",
+            "grep_search",
             json!({"pattern": "x"}),
         )]);
         with_blocks.add_tool_results(vec![tool_result("t1", &"r".repeat(40))], vec![]);
@@ -927,12 +934,12 @@ mod tests {
     fn extract_file_ops_extracts_read_and_write_ops() {
         let messages = vec![
             Message::user(vec![
-                tool_use_input("_", "read_file", json!({"path": "foo.ex"})),
-                tool_use_input("_", "write_file", json!({"path": "bar.ex"})),
+                tool_use_input("_", "read_file", json!({"file_path": "foo.ex"})),
+                tool_use_input("_", "write_file", json!({"file_path": "bar.ex"})),
             ]),
             Message::user(vec![
-                tool_use_input("_", "edit_file", json!({"path": "bar.ex"})),
-                tool_use_input("_", "list_files", json!({"path": "lib/"})),
+                tool_use_input("_", "edit", json!({"file_path": "bar.ex"})),
+                tool_use_input("_", "list_directory", json!({"path": "lib/"})),
             ]),
         ];
 
@@ -948,8 +955,8 @@ mod tests {
     #[test]
     fn extract_file_ops_deduplicates() {
         let messages = vec![Message::user(vec![
-            tool_use_input("_", "read_file", json!({"path": "foo.ex"})),
-            tool_use_input("_", "read_file", json!({"path": "foo.ex"})),
+            tool_use_input("_", "read_file", json!({"file_path": "foo.ex"})),
+            tool_use_input("_", "read_file", json!({"file_path": "foo.ex"})),
         ])];
         let ops = extract_file_ops(&messages);
         assert_eq!(ops.read_files, vec!["foo.ex"]);

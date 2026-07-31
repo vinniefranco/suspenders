@@ -349,7 +349,7 @@ mod tests {
                 }] })),
                 delta_frame(json!({ "tool_calls": [{
                     "index": 1, "id": "call_2", "type": "function",
-                    "function": { "name": "list_files", "arguments": "{}" }
+                    "function": { "name": "list_directory", "arguments": "{}" }
                 }] })),
                 finish_frame("tool_calls"),
                 done(),
@@ -364,7 +364,7 @@ mod tests {
             result.content,
             vec![
                 ContentBlock::tool_use("call_1", "read_file", json!({ "path": "x" })),
-                ContentBlock::tool_use("call_2", "list_files", json!({})),
+                ContentBlock::tool_use("call_2", "list_directory", json!({})),
             ]
         );
         assert_eq!(result.stop_reason, StopReason::ToolUse);
@@ -381,7 +381,7 @@ mod tests {
             sse_body(&[
                 delta_frame(json!({ "tool_calls": [{
                     "index": 0, "id": "c1",
-                    "function": { "name": "list_files", "arguments": malformed }
+                    "function": { "name": "list_directory", "arguments": malformed }
                 }] })),
                 finish_frame("tool_calls"),
                 done(),
@@ -397,7 +397,7 @@ mod tests {
             result.content,
             vec![ContentBlock::tool_use(
                 "c1",
-                "list_files",
+                "list_directory",
                 malformed_input_marker(malformed)
             )]
         );
@@ -412,7 +412,7 @@ mod tests {
             &server,
             sse_body(&[
                 delta_frame(json!({ "content": "I'll run the tests:\n\n" })),
-                delta_frame(json!({ "content": "<tool_call>\n<function=run_command>\n" })),
+                delta_frame(json!({ "content": "<tool_call>\n<function=run_shell_command>\n" })),
                 delta_frame(json!({ "content": "<parameter=command>\nmix test\n" })),
                 delta_frame(json!({ "content": "</parameter>\n</function>\n</tool_call>" })),
                 finish_frame("stop"),
@@ -431,7 +431,7 @@ mod tests {
                 ContentBlock::text("I'll run the tests:"),
                 ContentBlock::tool_use(
                     "text-call-0",
-                    "run_command",
+                    "run_shell_command",
                     json!({ "command": "mix test" })
                 ),
             ]

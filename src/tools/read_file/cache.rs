@@ -1,6 +1,8 @@
-//! read_file's read-cache recording (F6, ADR-0060) - the `(mtime, size)`
-//! fingerprint stamp a successful read leaves in the Run's file-read cache, so a
-//! later `notebook_edit` can verify the model saw the bytes it is editing. Split
+//! read_file's read-cache recording and the `file_unchanged` fast-path (F6,
+//! ADR-0060) - the `(mtime, size)` fingerprint a successful read leaves in the
+//! Run's file-read cache (so a later `notebook_edit` can verify the model saw
+//! the bytes it is editing), plus the qwen fast-path that serves an "unchanged"
+//! placeholder instead of re-reading a file already fully read this Run. Split
 //! out of `read_file.rs` so the dispatch module does not carry the stat/record
 //! plumbing inline.
 
@@ -18,6 +20,46 @@ pub(super) fn record_read(ctx: &ToolCtx, abs: &std::path::Path, full: bool, cach
         ctx.read_cache()
             .record_read(abs.to_path_buf(), mtime_ms, size, full, cacheable);
     }
+}
+
+/// qwen's `file_unchanged` fast-path (read-file.ts): when the model asks for a
+/// FULL read (no offset / limit / pages) of a file it already fully read this
+/// Run and the file has not changed on disk since, return a placeholder that
+/// quotes the prior read back rather than re-emitting the bytes. `None` means
+/// the fast-path did not fire (re-read normally).
+///
+/// The placeholder is faithful to qwen's `unchangedResult`: it is explicit that
+/// the full content was provided earlier in this conversation, and instructs the
+/// model to re-read with explicit offset/limit if it cannot retrieve that prior
+/// content (e.g. after compaction) or suspects an out-of-band mutation.
+pub(super) fn unchanged_placeholder(
+    ctx: &ToolCtx,
+    abs: &std::path::Path,
+    display_name: &str,
+) -> Option<ToolOutput> {
+    let (mtime_ms, size) = stat_fingerprint(abs)?;
+    if ctx.read_cache().is_unchanged_full_read(abs, mtime_ms, size) {
+        Some(ToolOutput::text(unchanged_message(display_name)))
+    } else {
+        None
+    }
+}
+
+/// The VERBATIM qwen `file_unchanged` placeholder text (read-file.ts
+/// `unchangedResult`), with `display_name` (the basename) standing in for
+/// qwen's shortened relative display path.
+fn unchanged_message(display_name: &str) -> String {
+    // VERBATIM from qwen read-file.ts `unchangedResult` (including its em-dash);
+    // a model-facing tool string, so it is copied byte-for-byte rather than
+    // house-styled.
+    format!(
+        "[File {display_name} unchanged since last read in this session \u{2014} \
+the full content was provided earlier in this conversation. \
+If you cannot retrieve that prior content (e.g. after context \
+compaction) or you suspect the file was modified outside the read/edit \
+tools (shell command, MCP tool, another process), re-read with \
+explicit offset/limit to fetch current content.]"
+    )
 }
 
 /// The `(mtime_ms, size)` fingerprint of `abs`, or `None` if it cannot be

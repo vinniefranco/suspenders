@@ -301,8 +301,8 @@ mod tests {
             conv.add_user_text("edit a file with many lines of content to fill budget");
             conv.add_assistant_blocks(vec![ContentBlock::tool_use(
                 "t1",
-                "edit_file",
-                serde_json::json!({"path": "lib/foo.ex"}),
+                "edit",
+                serde_json::json!({"file_path": "lib/foo.ex"}),
             )]);
             conv.add_tool_results(
                 vec![ContentBlock::tool_result("t1", "edited".repeat(100), false)],

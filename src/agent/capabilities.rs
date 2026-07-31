@@ -2,8 +2,10 @@
 //! ADR-0055, ADR-0057, ADR-0063). Each is a handle over the Agent's mpsc that a
 //! Run's [`crate::run::Capture`] carries into the Tool
 //! [`crate::tool::caps::Capabilities`]: the [`AgentApprover`] relays an Approval,
-//! the [`AgentQuestioner`] relays a question, and the [`AgentSubagentSpawner`]
-//! drives the foreground DIRECT spawn plus the two tx-backed background legs.
+//! the [`AgentQuestioner`] relays a question, the [`AgentSubagentSpawner`]
+//! drives the foreground DIRECT spawn plus the two tx-backed background legs, and
+//! the [`AgentBackgroundShellSpawner`] relays the two tx-backed background-shell
+//! legs (the Agent owns the detached process lifecycle, Phase 9, ADR-0063).
 //! Built by [`super::deps::AgentDeps::capture`] (the adapter that owns the
 //! channel), they live beside the deps rather than inside it - the deps keeps the
 //! `RunDeps` port; these keep the tool-facing capability seams.
@@ -179,12 +181,69 @@ impl crate::tool::caps::SubagentSpawner for AgentSubagentSpawner {
 
     async fn stop_background(&self, id: String) -> Result<String, String> {
         // Relay a StopBackground to the Agent and await the VERBATIM wording it
-        // replies (found/not-running/not-found). A closed channel yields the
+        // replies (found/not-running/not-found). This is the DUAL-REGISTRY leg the
+        // Agent resolves (subagent -> shell -> not-found), so `task_stop` reaches
+        // both registries through this one relay. A closed channel yields the
         // not-found wording (the safe answer the tool returns as content).
         let tx = self.tx.clone();
         let (reply, rx) = oneshot::channel();
         if tx
             .send(Msg::Run(RunMsg::StopBackground {
+                id: id.clone(),
+                reply,
+            }))
+            .is_err()
+        {
+            return Ok(format!("Error: No background task found with ID \"{id}\"."));
+        }
+        Ok(rx
+            .await
+            .unwrap_or_else(|_| format!("Error: No background task found with ID \"{id}\".")))
+    }
+}
+
+/// The tx-backed [`BackgroundShellSpawner`](crate::tool::caps::BackgroundShellSpawner):
+/// the Agent's fulfilment of the tool-initiated background-shell seam (Phase 9,
+/// ADR-0063). The Agent owns the detached process lifecycle + the shell registry
+/// (both Agent-owned mutable state, ADR-0017), so both legs are tx-backed: they
+/// relay a `SpawnBackgroundShell`/`StopBackgroundShell` over the same mpsc the
+/// Approver/Questioner use and await the reply. Built by
+/// [`super::deps::AgentDeps::capture`] and carried on the Run's
+/// [`crate::run::Capture`] into the Tool [`crate::tool::caps::Capabilities`].
+pub(super) struct AgentBackgroundShellSpawner {
+    pub(super) tx: mpsc::UnboundedSender<Msg>,
+}
+
+#[async_trait::async_trait]
+impl crate::tool::caps::BackgroundShellSpawner for AgentBackgroundShellSpawner {
+    async fn spawn_background(&self, command: String, cwd: String) -> Result<String, String> {
+        // Relay a SpawnBackgroundShell to the Agent (it mints the id, spawns the
+        // detached child, registers it) and await the id it replies. A closed
+        // channel is the degraded launch failure (the tool folds it).
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::SpawnBackgroundShell {
+                command,
+                cwd,
+                reply,
+            }))
+            .is_err()
+        {
+            return Err("background shells are unavailable in this environment".into());
+        }
+        rx.await
+            .map_err(|_| "background shells are unavailable in this environment".into())
+    }
+
+    async fn stop_background(&self, id: String) -> Result<String, String> {
+        // The shell-only stop leg (the dual-registry resolution `task_stop` drives
+        // lives on `StopBackground`). Relay a `StopBackgroundShell` and await the
+        // VERBATIM wording. A closed channel yields the not-found wording.
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::StopBackgroundShell {
                 id: id.clone(),
                 reply,
             }))

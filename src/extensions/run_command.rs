@@ -47,7 +47,7 @@ mod keys {
 }
 
 /// The one tool this extension acts on.
-const TOOL: &str = "run_command";
+const TOOL: &str = "run_shell_command";
 
 /// The run_command exit-badge extension.
 pub struct RunCommand;

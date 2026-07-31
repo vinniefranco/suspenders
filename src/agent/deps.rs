@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::capabilities::{AgentApprover, AgentQuestioner, AgentSubagentSpawner};
+use crate::agent::capabilities::{
+    AgentApprover, AgentBackgroundShellSpawner, AgentQuestioner, AgentSubagentSpawner,
+};
 use crate::agent::{Msg, RunMsg};
 use crate::compaction::Compaction;
 use crate::content::Provenance;
@@ -145,6 +147,14 @@ impl AgentDeps {
                     registry: Arc::clone(&self.subagents),
                     subagent_run_limit: self.subagent_run_limit,
                 },
+                tx: self.tx.clone(),
+            }),
+            // The Background-Shell seam (Phase 9, ADR-0063): a tx-backed handle
+            // over this Agent's mpsc, like the Approver/Questioner. The Agent owns
+            // the detached process lifecycle + the shell registry (ADR-0017), so
+            // both legs relay a `SpawnBackgroundShell`/`StopBackgroundShell` to the
+            // Agent that owns them.
+            bg_shells: Arc::new(AgentBackgroundShellSpawner {
                 tx: self.tx.clone(),
             }),
         }

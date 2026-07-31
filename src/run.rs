@@ -37,7 +37,8 @@ use crate::session::Session;
 use crate::session::log::StopReason;
 use crate::tool::Tool;
 use crate::tool::caps::{
-    Capabilities, DecliningQuestioner, DenyingApprover, SubagentResult, UnavailableSubagentSpawner,
+    Capabilities, DecliningQuestioner, DenyingApprover, SubagentResult,
+    UnavailableBackgroundShellSpawner, UnavailableSubagentSpawner,
 };
 
 /// The Model + Llm a Run captured at spawn (ADR-0033): the Model snapshot every
@@ -75,6 +76,14 @@ pub struct Capture {
     /// carries an [`crate::tool::caps::UnavailableSubagentSpawner`] here instead
     /// - the recursion guard.
     pub subagents: Arc<dyn crate::tool::caps::SubagentSpawner>,
+    /// The Background-Shell effect seam (Phase 9, ADR-0063), built by the host
+    /// that owns the process lifecycle (the Agent builds a tx-backed
+    /// `AgentBackgroundShellSpawner`). The Run assembles it into the Tool
+    /// [`crate::tool::caps::Capabilities`] alongside the subagents spawner. A child
+    /// Run (spawned by `run_child`) carries an
+    /// [`crate::tool::caps::UnavailableBackgroundShellSpawner`] here instead - the
+    /// recursion guard (a subagent cannot background a shell).
+    pub bg_shells: Arc<dyn crate::tool::caps::BackgroundShellSpawner>,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -139,6 +148,11 @@ pub async fn run(
         // carries an UnavailableSubagentSpawner here instead - the recursion
         // guard.
         subagents: Arc::clone(&capture.subagents),
+        // The Background-Shell seam (Phase 9, ADR-0063): the Agent's tx-backed
+        // handle, threaded through the Capture like the subagents spawner. A child
+        // Run carries an UnavailableBackgroundShellSpawner here instead - the
+        // recursion guard.
+        bg_shells: Arc::clone(&capture.bg_shells),
     };
 
     // The Tool ctx: the Session's Root and timeout, the Result Cap derived from
@@ -241,6 +255,9 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
         side_query,
         questioner: Arc::new(DecliningQuestioner),
         subagents: Arc::new(UnavailableSubagentSpawner),
+        // The recursion guard: a subagent's own background-shell capability is
+        // degraded, so a subagent cannot background a shell (ADR-0063).
+        bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
     };
 
     let tool_ctx = session.tool_ctx(&req.model, caps);

@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! <tool_call>
-//! <function=run_command>
+//! <function=run_shell_command>
 //! <parameter=command>
 //! mix test
 //! </parameter>
@@ -213,7 +213,7 @@ mod tests {
 
     // The exact multi-parameter run_command fixture the loop tests use
     // (`run::loop_` at the markup fixtures).
-    const RUN_COMMAND: &str = "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>";
+    const RUN_COMMAND: &str = "<tool_call>\n<function=run_shell_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>";
 
     #[test]
     fn parses_the_exact_run_command_fixture() {
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(
             parse.calls,
             vec![ParsedCall {
-                name: "run_command".into(),
+                name: "run_shell_command".into(),
                 input: json!({ "command": "mix test" }),
             }]
         );
@@ -234,18 +234,18 @@ mod tests {
         let parse = extract_tool_calls(&text).expect("markup parses");
         assert_eq!(parse.preamble, "I need to update the file:");
         assert_eq!(parse.calls.len(), 1);
-        assert_eq!(parse.calls[0].name, "run_command");
+        assert_eq!(parse.calls[0].name, "run_shell_command");
     }
 
     #[test]
     fn multiple_sequential_calls_each_surface() {
-        let second = "<tool_call>\n<function=list_files>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let second = "<tool_call>\n<function=list_directory>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
         let text = format!("{RUN_COMMAND}\n{second}");
         let parse = extract_tool_calls(&text).expect("markup parses");
         assert_eq!(parse.calls.len(), 2);
-        assert_eq!(parse.calls[0].name, "run_command");
+        assert_eq!(parse.calls[0].name, "run_shell_command");
         assert_eq!(parse.calls[0].input, json!({ "command": "mix test" }));
-        assert_eq!(parse.calls[1].name, "list_files");
+        assert_eq!(parse.calls[1].name, "list_directory");
         assert_eq!(parse.calls[1].input, json!({ "path": "." }));
     }
 
@@ -264,14 +264,14 @@ mod tests {
 
     #[test]
     fn json_variant_without_arguments_maps_to_an_empty_object() {
-        let text = "<tool_call>{\"name\": \"list_files\"}</tool_call>";
+        let text = "<tool_call>{\"name\": \"list_directory\"}</tool_call>";
         let parse = extract_tool_calls(text).expect("markup parses");
         assert_eq!(parse.calls[0].input, json!({}));
     }
 
     #[test]
     fn multi_line_parameter_values_keep_their_interior_newlines() {
-        let text = "<tool_call>\n<function=edit_file>\n<parameter=content>\nline one\nline two\n</parameter>\n</function>\n</tool_call>";
+        let text = "<tool_call>\n<function=edit>\n<parameter=content>\nline one\nline two\n</parameter>\n</function>\n</tool_call>";
         let parse = extract_tool_calls(text).expect("markup parses");
         // Only the single surrounding newline is trimmed; the interior stays.
         assert_eq!(
@@ -292,19 +292,19 @@ mod tests {
         // `null`, `true`, numbers - a value that trims to bare text stays a
         // string unless it is genuine non-string JSON. A plain word is a
         // string.
-        let text = "<tool_call>\n<function=run_command>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+        let text = "<tool_call>\n<function=run_shell_command>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
         let parse = extract_tool_calls(text).expect("markup parses");
         assert_eq!(parse.calls[0].input, json!({ "command": "ls" }));
     }
 
     #[test]
     fn a_parameterless_function_yields_an_empty_input() {
-        let text = "<tool_call>\n<function=list_files>\n</function>\n</tool_call>";
+        let text = "<tool_call>\n<function=list_directory>\n</function>\n</tool_call>";
         let parse = extract_tool_calls(text).expect("markup parses");
         assert_eq!(
             parse.calls,
             vec![ParsedCall {
-                name: "list_files".into(),
+                name: "list_directory".into(),
                 input: json!({}),
             }]
         );
@@ -330,7 +330,7 @@ mod tests {
         // on its own line). The pre-check accepts it; the parse still needs a
         // <tool_call> opener to bound the body, so a bare function without the
         // wrapper yields no calls - None, not a panic.
-        let text = "<function=run_command>";
+        let text = "<function=run_shell_command>";
         assert_eq!(extract_tool_calls(text), None);
     }
 
@@ -339,9 +339,9 @@ mod tests {
         // A stream that died mid-markup: the opener is line-anchored, the close
         // never arrived. The partial body still yields the call rather than
         // vanishing.
-        let text = "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test";
+        let text = "<tool_call>\n<function=run_shell_command>\n<parameter=command>\nmix test";
         let parse = extract_tool_calls(text).expect("partial markup parses");
-        assert_eq!(parse.calls[0].name, "run_command");
+        assert_eq!(parse.calls[0].name, "run_shell_command");
         assert_eq!(parse.calls[0].input, json!({ "command": "mix test" }));
     }
 }

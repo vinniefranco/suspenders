@@ -468,7 +468,7 @@ mod tests {
         let r = fold(vec![
             bs(
                 0,
-                json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+                json!({ "type": "tool_use", "id": "t1", "name": "list_directory" }),
             ),
             bd(
                 0,
@@ -481,7 +481,7 @@ mod tests {
             r.content,
             vec![ContentBlock::tool_use(
                 "t1",
-                "list_files",
+                "list_directory",
                 malformed_input_marker(malformed)
             )]
         );
@@ -504,14 +504,14 @@ mod tests {
         let r = fold(vec![
             bs(
                 0,
-                json!({ "type": "tool_use", "id": "t1", "name": "list_files" }),
+                json!({ "type": "tool_use", "id": "t1", "name": "list_directory" }),
             ),
             bstop(0),
             md("tool_use", json!({})),
         ]);
         assert_eq!(
             r.content,
-            vec![ContentBlock::tool_use("t1", "list_files", json!({}))]
+            vec![ContentBlock::tool_use("t1", "list_directory", json!({}))]
         );
     }
 
@@ -531,7 +531,7 @@ mod tests {
             nm("content_block_stop", json!({})),
             nm(
                 "content_block_start",
-                json!({ "content_block": { "type": "tool_use", "id": "t1", "name": "list_files" } }),
+                json!({ "content_block": { "type": "tool_use", "id": "t1", "name": "list_directory" } }),
             ),
             nm(
                 "content_block_delta",
@@ -544,7 +544,7 @@ mod tests {
             r.content,
             vec![
                 ContentBlock::text("Let me "),
-                ContentBlock::tool_use("t1", "list_files", json!({ "path": "." })),
+                ContentBlock::tool_use("t1", "list_directory", json!({ "path": "." })),
             ]
         );
     }
