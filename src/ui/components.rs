@@ -549,10 +549,22 @@ fn pending_body_lines(
             false
         };
         // The rolling thought subject (Phase 6, qwen `thought?.subject ||
-        // currentLoadingPhrase`): the live reasoning head the spinner shows in
-        // place of the lull phrase while the Run reasons. Bound outside the `if`
-        // so its `String` outlives the borrow the `SpinnerState` takes.
-        let subject = t.transcript().thought_subject();
+        // currentLoadingPhrase`): the reasoning head the spinner shows in place of
+        // the lull phrase while the Run reasons. Bound outside the `if` so its
+        // `String` outlives the borrow the `SpinnerState` takes.
+        //
+        // Gated on compact mode to avoid DOUBLING the reasoning on screen: in
+        // non-compact the `✦ Thinking` tail above already shows the reasoning
+        // head, so the full ladder's last-line fallback would echo that exact
+        // line onto the spinner (the bug). There the spinner takes only a
+        // DISTINCT bold `**subject**`, else the lull phrase. Under compact the
+        // tail is suppressed, so the spinner is the sole reasoning surface and
+        // keeps the full head fallback.
+        let subject = if t.compact_mode {
+            t.transcript().thought_subject()
+        } else {
+            t.transcript().thought_subject_bold()
+        };
         let spinner = if t.status == Status::Running {
             // `subject` is the Phase-6 thought-subject seam (wins over the lull
             // phrase when `Some`); `tokens` is left `None` to avoid per-frame
@@ -1540,12 +1552,30 @@ impl PendingPeek<'_> {
     }
 }
 
-/// The total wrapped height the Ctrl-S peek blits at `content_width` (ADR-0046):
-/// the wrapped-row count of the FULL, unclamped pending body. `0` means the body
-/// is empty and the adapter has nothing to peek. Mirrors [`commit_slice_height`].
-pub fn pending_peek_height(peek: &mut PendingPeek<'_>, content_width: u16) -> u16 {
-    let lines = peek.lines(content_width);
-    u16::try_from(wrapped_count(lines, content_width)).unwrap_or(u16::MAX)
+/// The rows the Ctrl-S peek blits for a live viewport `area` (ADR-0046): the
+/// wrapped-row count of the FULL, unclamped pending body when it OVERFLOWS its
+/// body zone, else `0`. `area` is the inline viewport rect the live frame draws
+/// in - the peek measures the body at that width and gates on the SAME overflow
+/// condition the `… Ctrl-S to show more` marker uses ([`anchor_clip`]).
+///
+/// The `0` gate is the fix for the peek stacking duplicate copies into
+/// scrollback: when the body FITS the viewport nothing is top-clipped, so no
+/// marker shows and Ctrl-S has nothing to reveal. Without the gate every press
+/// re-blitted the whole (fully-visible) body, so holding Ctrl-S piled up
+/// identical copies. Mirrors [`commit_slice_height`]'s `0`-is-a-no-op contract.
+pub fn pending_peek_height(peek: &mut PendingPeek<'_>, area: Rect) -> u16 {
+    // The peek blits at FULL viewport width (its `insert_before` buffer is
+    // full-width), so measure the unclamped body there - the SAME width the live
+    // body zone draws at (the layout splits `area` vertically only).
+    let content_width = area.width.saturating_sub(2 * CONTENT_MARGIN);
+    let total = wrapped_count(peek.lines(content_width), content_width);
+    let view = peek.screen.composer().view();
+    let body_zone = pending_layout(area, &view, peek.screen).body;
+    if total > body_zone.height as usize {
+        u16::try_from(total).unwrap_or(u16::MAX)
+    } else {
+        0
+    }
 }
 
 /// Blits the FULL, UNCLAMPED pending body into `buf` (ADR-0046, the Ctrl-S peek's
@@ -9644,6 +9674,145 @@ mod tests {
         assert!(
             text.contains("weighing the tradeoffs"),
             "the spinner subject line stays present under compact:\n{text}"
+        );
+    }
+
+    /// Renders the FULL pending body for `screen` into a `width`x`height` buffer
+    /// at the whole area (no zone re-measure, so the spinner line is never
+    /// top-clipped out): the shape the duplication tests need to see the tail AND
+    /// the spinner line together.
+    fn draw_full_body(width: u16, height: u16, screen: &Screen) -> String {
+        let mut cache = RenderCache::new();
+        let terminal = draw_frame(width, height, |f| {
+            render_pending_body_at(
+                f,
+                f.area(),
+                &mut PendingBodyParams {
+                    screen,
+                    cache: &mut cache,
+                    anim: Anim::default(),
+                },
+                theme::dark(),
+                0,
+            );
+        });
+        buffer_text(&terminal)
+    }
+
+    // REGRESSION (bug: "the colored thinking indicator has the thought go through
+    // it"): while the model reasons, the live `✦ Thinking` tail shows the
+    // reasoning head AND the spinner line's subject fell back to that SAME head,
+    // so the exact line painted TWICE - once in the tail, once on the colored
+    // spinner line. With no distinct bold `**subject**`, the spinner must NOT echo
+    // the tail: the reasoning appears EXACTLY ONCE.
+    #[test]
+    fn the_spinner_does_not_duplicate_the_thinking_tail_head() {
+        let reasoning = "Evaluate the whole project structure carefully";
+        let (screen, _) = screen_with_notices(vec![]).apply_event(Event::run_started("r1"));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("t".to_string()),
+            vec![ContentBlock::Thinking {
+                text: reasoning.to_string(),
+            }],
+        ));
+        assert_eq!(screen.status, Status::Running, "the Run is Running");
+        assert!(!screen.compact_mode, "non-compact: the tail is visible");
+
+        let text = draw_full_body(80, 20, &screen);
+        let occurrences = text.matches(reasoning).count();
+        assert_eq!(
+            occurrences, 1,
+            "the reasoning head must render ONCE (tail only), not echoed on the \
+             spinner line:\n{text}"
+        );
+        // The tail is the surface that keeps it (the `✦ Thinking` header sits above).
+        assert!(
+            text.contains("✦ Thinking"),
+            "the thinking tail header:\n{text}"
+        );
+    }
+
+    // A DISTINCT bold `**subject**` is NOT the tail's head, so it still belongs on
+    // the spinner line even while the tail shows the fuller reasoning (qwen
+    // `parseThought`): the short subject shows, the tail keeps the raw line.
+    #[test]
+    fn a_distinct_bold_subject_still_shows_on_the_spinner() {
+        let (screen, _) = screen_with_notices(vec![]).apply_event(Event::run_started("r1"));
+        let (screen, _) = screen.apply_event(Event::message_start(1));
+        let (screen, _) = screen.apply_event(Event::message_update(
+            Delta::Thinking("t".to_string()),
+            vec![ContentBlock::Thinking {
+                text: "**Mapping the tree** now I walk each crate".to_string(),
+            }],
+        ));
+        let text = draw_full_body(80, 20, &screen);
+        // The bold subject shows on the spinner; the raw reasoning stays in the tail.
+        assert!(
+            text.contains("Mapping the tree"),
+            "the distinct bold subject shows on the spinner:\n{text}"
+        );
+        assert!(
+            text.contains("now I walk each crate"),
+            "the tail keeps the raw reasoning line:\n{text}"
+        );
+    }
+
+    // REGRESSION (bug: "when I use Ctrl+S the last message just keeps appending
+    // everything"): the Ctrl-S peek blitted the FULL pending body into scrollback
+    // on EVERY press, even when the body already fit the live viewport - so
+    // holding Ctrl-S stacked identical copies. When nothing is top-clipped the
+    // peek must reveal NOTHING (height 0), matching the `… Ctrl-S to show more`
+    // marker, which only shows on overflow.
+    #[test]
+    fn ctrl_s_peek_is_a_noop_when_the_pending_body_fits() {
+        let screen = screen_with_notices(vec!["a short notice".to_string()]);
+        let mut cache = RenderCache::new();
+        let mut peek = PendingPeek {
+            cache: &mut cache,
+            screen: &screen,
+            anim: Anim::default(),
+            theme: theme::dark(),
+        };
+        // A TALL viewport the small body fits inside: nothing top-clips.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+        };
+        assert_eq!(
+            pending_peek_height(&mut peek, area),
+            0,
+            "a body that fits the viewport reveals nothing on Ctrl-S"
+        );
+    }
+
+    // The complement: when the body genuinely OVERFLOWS a short viewport, Ctrl-S
+    // still reveals the FULL unclamped body (more rows than the whole viewport) so
+    // the top-clipped rows land in scrollback.
+    #[test]
+    fn ctrl_s_peek_reveals_the_full_body_on_overflow() {
+        let screen = screen_with_notices((0..30).map(|i| format!("notice number {i}")).collect());
+        let mut cache = RenderCache::new();
+        let mut peek = PendingPeek {
+            cache: &mut cache,
+            screen: &screen,
+            anim: Anim::default(),
+            theme: theme::dark(),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let height = pending_peek_height(&mut peek, area);
+        assert!(
+            height as usize > area.height as usize,
+            "an overflowing body reveals the full unclamped height ({height} rows), \
+             more than the {}-row viewport",
+            area.height
         );
     }
 

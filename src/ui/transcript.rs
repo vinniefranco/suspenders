@@ -359,6 +359,16 @@ impl Transcript {
         thought::thought_subject_of(&self.streaming.thinking())
     }
 
+    /// The spinner's thought subject RESTRICTED to a DISTINCT bold `**subject**`
+    /// (no last-line head fallback). The pending body uses this when the live
+    /// `✦ Thinking` tail is on screen (non-compact): the tail already shows the
+    /// reasoning head, so [`thought_subject`](Self::thought_subject)'s head
+    /// fallback would duplicate it onto the spinner line. `None` -> the spinner
+    /// shows the lull phrase instead of echoing the tail.
+    pub fn thought_subject_bold(&self) -> Option<String> {
+        thought::bold_subject_of(&self.streaming.thinking())
+    }
+
     /// Whether flipping compact mode would CHANGE what the frozen scrollback
     /// shows (qwen `compactToggleHasVisualEffect`, `mergeCompactToolGroups.ts`):
     /// `true` iff any COMMITTED item is one compact hides or reveals - a

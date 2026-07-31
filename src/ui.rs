@@ -813,11 +813,11 @@ fn peek_pending<B: Backend>(
     cache: &mut components::RenderCache,
     theme: &theme::Theme,
 ) -> anyhow::Result<()> {
-    let width = terminal
-        .size()
-        .map(|s| s.width)
-        .unwrap_or(FALLBACK_TERM_WIDTH);
-    let content_width = width.saturating_sub(2 * components::CONTENT_MARGIN);
+    // The inline viewport rect the live frame draws in (NOT the full terminal
+    // size): its capped height is what the pending body overflows, so it is the
+    // zone the peek gates on. `get_frame()` reads the current viewport area
+    // without drawing.
+    let area = terminal.get_frame().area();
     // The peek reads the SAME line set the live body draws (via `pending_body_lines`
     // at the live high-water mark), so it syncs the cache at the same content width
     // (measure == draw, ADR-0029). `Anim::default()` is fine: the spinner FRAME is
@@ -828,7 +828,9 @@ fn peek_pending<B: Backend>(
         anim: components::Anim::default(),
         theme,
     };
-    let height = components::pending_peek_height(&mut peek, content_width);
+    // `0` when the body FITS the viewport (nothing top-clipped): the peek no-ops
+    // so repeated Ctrl-S cannot stack duplicate copies into scrollback.
+    let height = components::pending_peek_height(&mut peek, area);
     if height > 0 {
         terminal.insert_before(height, |buf| {
             components::render_pending_peek(buf, &mut peek);
