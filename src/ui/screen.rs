@@ -343,6 +343,12 @@ pub enum Effect {
     Agent(AgentCommand),
     /// Move keyboard focus to the Approval modal.
     FocusModal,
+    /// Alert the operator that the app is now waiting on them - emitted with
+    /// `FocusModal` when an ask (Approval or Question) opens, so a backgrounded
+    /// terminal raises a desktop notification (and rings its bell). The String
+    /// is the notification body (e.g. the gated command or the question). Not
+    /// emitted for user-opened overlays (Help/menus), which are not asks.
+    Notify(String),
     /// Move keyboard focus back to the composer.
     FocusComposer,
     /// Persist a submitted prompt into the on-disk history file.
@@ -999,13 +1005,14 @@ impl Screen {
                     .newest_live_tool_name()
                     .map(ConfirmKind::from_tool_name)
                     .unwrap_or(ConfirmKind::Info);
+                let body = format!("Approval needed: {command}");
                 self.pending_approval = Some(PendingApproval {
                     approval_id,
                     command,
                     kind,
                     selection: SelectionList::new(APPROVAL_OPTION_COUNT),
                 });
-                (self, vec![Effect::FocusModal])
+                (self, vec![Effect::FocusModal, Effect::Notify(body)])
             }
 
             Event::ApprovalResolved { approval_id, .. } => match &self.pending_approval {
@@ -1041,8 +1048,12 @@ impl Screen {
                 question_id,
                 questions,
             } => {
+                let body = questions
+                    .first()
+                    .map(|q| q.question.clone())
+                    .unwrap_or_else(|| "A question is waiting".to_string());
                 self.pending_question = Some(PendingQuestion::new(question_id, questions));
-                (self, vec![Effect::FocusModal])
+                (self, vec![Effect::FocusModal, Effect::Notify(body)])
             }
 
             // The round-trip settled: the modal was cleared when the user
@@ -2289,7 +2300,13 @@ mod tests {
             command: a.command.clone(),
         });
         assert_eq!(t.pending_approval, Some(a));
-        assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::FocusModal,
+                Effect::Notify("Approval needed: rm -rf ./tmp".to_string()),
+            ]
+        );
     }
 
     // P2: a `run_command` approval derives `ConfirmKind::Exec` (not the Info
@@ -2621,7 +2638,13 @@ mod tests {
         // One radio per question, each options + 1 for the auto-"Other" row.
         assert_eq!(pending.per_question.len(), 1);
         assert_eq!(pending.per_question[0].len(), 3);
-        assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
+        assert_eq!(
+            sans_commit(effects),
+            vec![
+                Effect::FocusModal,
+                Effect::Notify("Pick for Library?".to_string()),
+            ]
+        );
     }
 
     #[test]

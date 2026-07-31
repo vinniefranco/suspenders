@@ -754,6 +754,12 @@ async fn run_effect(
         // focusable widget tree; the modal captures keys via the pure core's
         // pending_approval, and the composer is always the input target.
         Effect::FocusModal | Effect::FocusComposer => screen,
+        // An ask (Approval/Question) just opened: nudge the operator even when
+        // their terminal is backgrounded (see [`emit_ask_notification`]).
+        Effect::Notify(body) => {
+            emit_ask_notification(&body);
+            screen
+        }
         Effect::HistoryAppend(prompt) => persist_history(screen, state, prompt),
         // A committed Slash Command (ADR-0032/0033). The adapter routes it
         // through the single `command::run` seam - `is_handled` reflects exactly
@@ -782,6 +788,109 @@ async fn run_effect(
             );
             screen
         }
+    }
+}
+
+/// Makes an ask's text safe to carry inside an OSC 777 notification: strips the
+/// control bytes that would terminate or corrupt the escape sequence (BEL, ESC,
+/// the C1 String Terminator) and collapses newlines/tabs to spaces, then caps
+/// the length so a long command does not fill the notification. A terminal that
+/// ignores OSC 777 never sees this, but a well-behaved one gets a single clean
+/// line.
+fn sanitize_notification(body: &str) -> String {
+    const MAX: usize = 120;
+    let cleaned: String = body
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    match trimmed.char_indices().nth(MAX) {
+        Some((byte_idx, _)) => format!("{}…", trimmed[..byte_idx].trim_end()),
+        None => trimmed.to_string(),
+    }
+}
+
+/// How the detected terminal wants a desktop notification. There is no single
+/// escape sequence every POSIX terminal understands - the modern emulators split
+/// across three incompatible OSC families and the rest support none - so we
+/// detect the emulator ([`detect_notify_kind`]) and pick the one it speaks. The
+/// universal BEL always rides along ([`notification_bytes`]); it is the ONLY
+/// signal a bare xterm / Apple Terminal / VTE terminal can give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyKind {
+    /// iTerm2's `OSC 9 ; body`. iTerm2 (no separate title field, so we fold
+    /// `title: body` into one line).
+    Osc9,
+    /// rxvt's `OSC 777 ; notify ; title ; body`. Ghostty, WezTerm, foot, urxvt.
+    Osc777,
+    /// kitty's `OSC 99 ; ; body`. kitty implements neither OSC 9 nor OSC 777, so
+    /// it needs its own protocol (terminated by ST, not BEL).
+    Osc99,
+    /// No known desktop-notification OSC: rely on BEL alone. Covers xterm, st,
+    /// Apple Terminal, VTE terminals (gnome-terminal, tilix, kgx), and anything
+    /// under tmux/screen where a raw OSC would be stripped or mangled.
+    BelOnly,
+}
+
+/// Picks the [`NotifyKind`] for the current terminal from its environment. Takes
+/// the env reader as a closure so the (otherwise env-coupled) detection stays a
+/// pure, table-testable function. Order matters: multiplexers are checked first
+/// (they wrap whatever is inside), then emulators by their most specific marker.
+fn detect_notify_kind(env: impl Fn(&str) -> Option<String>) -> NotifyKind {
+    let term = env("TERM").unwrap_or_default();
+    let term_program = env("TERM_PROGRAM").unwrap_or_default();
+
+    // A multiplexer rewrites/strips OSC unless the user has enabled passthrough,
+    // which we cannot assume; BEL is the reliable signal there (tmux turns it
+    // into a bell/activity flag and forwards it to the outer terminal).
+    if env("TMUX").is_some() || term.starts_with("screen") || term.starts_with("tmux") {
+        return NotifyKind::BelOnly;
+    }
+    // kitty implements OSC 99 ONLY (a deliberate choice against OSC 9 / 777).
+    if env("KITTY_WINDOW_ID").is_some() || term.contains("kitty") {
+        return NotifyKind::Osc99;
+    }
+    // Ghostty (OSC 777, live-confirmed), WezTerm, foot, and urxvt all speak the
+    // rxvt sequence.
+    let is_ghostty =
+        env("GHOSTTY_RESOURCES_DIR").is_some() || term_program == "ghostty" || term.contains("ghostty");
+    let is_wezterm = env("WEZTERM_PANE").is_some() || env("WEZTERM_EXECUTABLE").is_some();
+    if is_ghostty || is_wezterm || term.starts_with("foot") || term.starts_with("rxvt-unicode") {
+        return NotifyKind::Osc777;
+    }
+    // iTerm2's own sequence.
+    if term_program == "iTerm.app" {
+        return NotifyKind::Osc9;
+    }
+    NotifyKind::BelOnly
+}
+
+/// Raises the ask notification on the current terminal: sanitize the body, pick
+/// the emulator's sequence, and write it straight to stdout (crossterm has no
+/// bell/notify command). Kept off [`run_effect`]'s dispatch so that stays pure
+/// integration - this is the one operation seam that composes the notification
+/// helpers and does the IO. It rides alongside the alt-screen rendering.
+fn emit_ask_notification(body: &str) {
+    use std::io::Write;
+    let body = sanitize_notification(body);
+    let kind = detect_notify_kind(|key| std::env::var(key).ok());
+    let seq = notification_bytes(kind, "Suspenders", &body);
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// Builds the notification byte string for a [`NotifyKind`]. Every variant trails
+/// a BEL so a popup-capable terminal also flashes its urgency hint and a
+/// `BelOnly` terminal still gets the one universal signal. Callers pass an
+/// already-[`sanitize_notification`]d `body`; `title` is a trusted constant.
+fn notification_bytes(kind: NotifyKind, title: &str, body: &str) -> String {
+    match kind {
+        NotifyKind::Osc9 => format!("\x1b]9;{title}: {body}\x07\x07"),
+        NotifyKind::Osc777 => format!("\x1b]777;notify;{title};{body}\x07\x07"),
+        // OSC 99 is ST-terminated (ESC \); the trailing BEL rings kitty's bell.
+        NotifyKind::Osc99 => format!("\x1b]99;;{title}: {body}\x1b\\\x07"),
+        NotifyKind::BelOnly => "\x07".to_string(),
     }
 }
 
@@ -986,6 +1095,139 @@ mod tests {
     // The composer-editing rules themselves (insert/backspace/modal gating)
     // live in the pure core and are tested there; these tests only guard the
     // crossterm→Key mapping the adapter owns.
+
+    // The notification body must never carry a byte that could terminate or
+    // corrupt the OSC 777 sequence: BEL, ESC, and the C1 String Terminator all
+    // collapse to spaces (as do newlines/tabs), so the ask text stays one clean
+    // line inside `ESC ] 777 ; notify ; title ; body BEL`.
+    #[test]
+    fn sanitize_notification_strips_terminating_control_bytes() {
+        let raw = "run\x07this\x1b]evil\nline\ttab";
+        let out = sanitize_notification(raw);
+        assert!(!out.contains('\x07'));
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\t'));
+        assert_eq!(out, "run this ]evil line tab");
+    }
+
+    // A long ask is capped with an ellipsis so it does not fill the whole
+    // notification popup.
+    #[test]
+    fn sanitize_notification_caps_a_long_body() {
+        let raw = "x".repeat(500);
+        let out = sanitize_notification(&raw);
+        assert!(out.ends_with('…'));
+        // 120 chars kept + the ellipsis.
+        assert_eq!(out.chars().count(), 121);
+    }
+
+    // Builds an env reader over a fixed table for the detection tests.
+    fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let table: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| table.get(key).cloned()
+    }
+
+    #[test]
+    fn detect_ghostty_and_wezterm_and_foot_and_urxvt_use_osc777() {
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM_PROGRAM", "ghostty")])),
+            NotifyKind::Osc777
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM", "xterm-ghostty")])),
+            NotifyKind::Osc777
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("WEZTERM_PANE", "0")])),
+            NotifyKind::Osc777
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM", "foot")])),
+            NotifyKind::Osc777
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM", "rxvt-unicode-256color")])),
+            NotifyKind::Osc777
+        );
+    }
+
+    #[test]
+    fn detect_kitty_uses_osc99() {
+        assert_eq!(
+            detect_notify_kind(env_of(&[("KITTY_WINDOW_ID", "1")])),
+            NotifyKind::Osc99
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM", "xterm-kitty")])),
+            NotifyKind::Osc99
+        );
+    }
+
+    #[test]
+    fn detect_iterm2_uses_osc9() {
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM_PROGRAM", "iTerm.app")])),
+            NotifyKind::Osc9
+        );
+    }
+
+    // A bare/unknown terminal, and Apple Terminal / VTE terminals with no
+    // notification OSC, degrade to BEL.
+    #[test]
+    fn detect_unknown_and_bare_terminals_degrade_to_bel() {
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM", "xterm-256color")])),
+            NotifyKind::BelOnly
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM_PROGRAM", "Apple_Terminal")])),
+            NotifyKind::BelOnly
+        );
+        assert_eq!(detect_notify_kind(env_of(&[])), NotifyKind::BelOnly);
+    }
+
+    // A multiplexer is checked BEFORE the emulator markers: even inside kitty,
+    // being under tmux means the OSC would be stripped, so we fall to BEL.
+    #[test]
+    fn detect_multiplexer_wins_over_inner_terminal() {
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TMUX", "/tmp/tmux-1000/default,1,0")])),
+            NotifyKind::BelOnly
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[
+                ("TMUX", "/tmp/tmux-1000/default,1,0"),
+                ("KITTY_WINDOW_ID", "1"),
+            ])),
+            NotifyKind::BelOnly
+        );
+        assert_eq!(
+            detect_notify_kind(env_of(&[("TERM", "screen-256color")])),
+            NotifyKind::BelOnly
+        );
+    }
+
+    // Every popup variant trails a BEL; BelOnly is exactly a BEL.
+    #[test]
+    fn notification_bytes_render_the_expected_sequences() {
+        assert_eq!(
+            notification_bytes(NotifyKind::Osc777, "Suspenders", "hi"),
+            "\x1b]777;notify;Suspenders;hi\x07\x07"
+        );
+        assert_eq!(
+            notification_bytes(NotifyKind::Osc9, "Suspenders", "hi"),
+            "\x1b]9;Suspenders: hi\x07\x07"
+        );
+        assert_eq!(
+            notification_bytes(NotifyKind::Osc99, "Suspenders", "hi"),
+            "\x1b]99;;Suspenders: hi\x1b\\\x07"
+        );
+        assert_eq!(notification_bytes(NotifyKind::BelOnly, "Suspenders", "hi"), "\x07");
+    }
 
     // Regression: Ctrl-T is RETIRED (ADR-0046/0052). It no longer maps to a
     // display toggle - it falls through to the generic Ctrl-chord arm as
