@@ -50,10 +50,13 @@ clear scope of the request without confirming with the user. If asked *how* to \
 do something, explain first, don't just do it.
 - **Explaining Changes:** After completing a code modification or file operation \
 *do not* provide summaries unless asked.
-- **Path Construction:** Paths in this project are relative to the project root. \
-When using a file system tool (e.g. 'read_file' or 'write_file'), pass the \
-file's path relative to the root (for example, 'foo/bar/baz.txt'). Do not \
-construct absolute paths.
+- **Path Construction:** Before using any file system tool (e.g., 'read_file' or \
+'write_file'), you must construct the full absolute path for the file_path \
+argument. Always combine the absolute path of the project's root directory with \
+the file's path relative to the root. For example, if the project root is \
+/path/to/project/ and the file is foo/bar/baz.txt, the final path you must use is \
+/path/to/project/foo/bar/baz.txt. If the user provides a relative path, you must \
+resolve it against the root directory to create an absolute path.
 - **Do Not revert changes:** Do not revert changes to the codebase unless asked \
 to do so by the user. Only revert changes made by you if they have resulted in \
 an error or if the user has explicitly asked you to revert the changes.
@@ -235,9 +238,9 @@ that exposes, logs, or commits secrets, API keys, or other sensitive \
 information.
 
 ## Tool Usage
-- **File Paths:** Refer to files by paths relative to the project root when using \
-tools like 'read_file' or 'write_file'. Absolute paths are not used in this \
-project.
+- **File Paths:** Always use absolute paths when referring to files with tools \
+like 'read_file' or 'write_file'. Relative paths are not supported. You must \
+provide an absolute path.
 - **Parallelism:** Execute multiple independent tool calls in parallel when \
 feasible (i.e. searching the codebase).
 - **Command Execution:** Use the 'run_shell_command' tool for running shell commands, \
@@ -863,12 +866,13 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_uses_relative_paths_not_absolute() {
+    fn system_prompt_mandates_absolute_paths() {
         let prompt = system_prompt();
-        // Suspenders paths are relative to the project root (unlike qwen's
-        // absolute-path mandate).
-        assert!(prompt.contains("relative to the project root"));
-        assert!(prompt.contains("Absolute paths are not used in this project"));
+        // The ported file tools require absolute paths (qwen's contract), so the
+        // prompt must instruct the model to construct them, not relative paths.
+        assert!(prompt.contains("you must construct the full absolute path"));
+        assert!(prompt.contains("Relative paths are not supported"));
+        assert!(!prompt.contains("Absolute paths are not used"));
     }
 
     #[test]
