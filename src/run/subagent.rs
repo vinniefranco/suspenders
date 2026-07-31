@@ -61,9 +61,20 @@ pub struct DirectSubagentSpawner {
     pub subagent_run_limit: usize,
 }
 
-#[async_trait::async_trait]
-impl SubagentSpawner for DirectSubagentSpawner {
-    async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, String> {
+impl DirectSubagentSpawner {
+    /// Resolves a [`SubagentRequest`] into the [`ChildRunRequest`] that drives
+    /// the child Run (P4/F4 + P4b/4c, ADR-0061, ADR-0063). The SHARED resolution
+    /// the foreground [`spawn`](DirectSubagentSpawner::spawn) AND the Agent's
+    /// background launch both go through, so the two can never drift on how a
+    /// def/Model/tool-subset is resolved. `sink` is `None` for the foreground
+    /// path (the child's whole run is invisible until it settles) and would carry
+    /// the live-output feed for a background launch (DEFERRED - background passes
+    /// `None` too today).
+    pub fn build_child_request(
+        &self,
+        request: SubagentRequest,
+        sink: Option<crate::run::child::ChildSink>,
+    ) -> Result<ChildRunRequest, String> {
         // 1. Resolve the def by name (case-insensitive). An unknown type is the
         //    verbatim qwen not-found wording, with the available names.
         let def = self.registry.get(&request.subagent_type).ok_or_else(|| {
@@ -91,10 +102,7 @@ impl SubagentSpawner for DirectSubagentSpawner {
         //    the excluded set).
         let tools = subagent_tools(&def.tools);
 
-        // 4. Drive the child Run to settlement (depth 1: the child's own
-        //    subagents capability is already degraded, so this is defence in
-        //    depth).
-        let result = run_child(ChildRunRequest {
+        Ok(ChildRunRequest {
             model,
             llm: Arc::clone(&self.llm),
             system_prompt: def.system_prompt.clone(),
@@ -105,12 +113,44 @@ impl SubagentSpawner for DirectSubagentSpawner {
             thinking_budget: self.thinking_budget,
             tool_call_style: self.tool_call_style,
             session: self.session.clone(),
-            sink: None,
+            sink,
+            // depth 1: the child's own subagents capability is already degraded,
+            // so this is defence in depth.
             depth: 1,
         })
-        .await;
+    }
+}
 
-        Ok(result)
+#[async_trait::async_trait]
+impl SubagentSpawner for DirectSubagentSpawner {
+    async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, String> {
+        // Resolve the def/Model/tool-subset into the child request (the shared
+        // path), then drive the child Run to settlement inline (foreground).
+        let child = self.build_child_request(request, None)?;
+        Ok(run_child(child).await)
+    }
+
+    async fn spawn_background(
+        &self,
+        _request: SubagentRequest,
+        _description: String,
+    ) -> Result<String, String> {
+        // The DIRECT spawner is foreground-only: it drives a child Run INLINE
+        // off the captured Llm and holds no Agent actor, so it has nowhere to
+        // register a detached task or queue a notification. The real background
+        // path is the tx-backed `AgentSubagentSpawner` (agent/deps.rs), which
+        // relays a `SpawnBackground` to the Agent that owns the registry. A host
+        // wired straight to the DIRECT spawner (a test) cannot background, so it
+        // returns the degraded Err.
+        Err("background subagents are unavailable in this environment".into())
+    }
+
+    async fn stop_background(&self, id: String) -> Result<String, String> {
+        // No registry here (foreground-only), so any id is not-found (the
+        // VERBATIM qwen wording). The real path is the tx-backed spawner.
+        Ok(format!(
+            "Error: No background task found with ID \"{id}\"."
+        ))
     }
 }
 

@@ -157,7 +157,35 @@ pub async fn run<D: RunDeps>(
     };
 
     conversation = maybe_compact_proactive(&mut state, conversation).await;
+    conversation = drain_notifications_at_run_start(&mut state, conversation).await;
     run_loop(&mut state, conversation).await
+}
+
+// Run-start notification drain (P4b, ADR-0063): a background child can settle
+// while the parent is idle (no Run in flight), so a `<task-notification>` sits
+// on the Agent's queue between Runs. `next_pass` only drains at a tool-answering
+// Pass, so a next Run that answers with pure text (no tool call) would never
+// deliver the queued note. Draining here, once at Run start, merges any pending
+// notifications into the FIRST request's user turn (the same trailing-text shape
+// `next_pass` uses for the tool-results message), so the model reads the
+// completion on its very NEXT Run regardless of whether that Run calls tools.
+// Drained-and-cleared once: the Agent empties the queue on this drain, so the
+// same note is never re-delivered by a later `next_pass`.
+async fn drain_notifications_at_run_start<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+) -> Conversation {
+    let notifications = state.deps.drain_notifications().await;
+    for text in notifications {
+        // Merge onto the trailing user message (the Run's prompt) without
+        // breaking role alternation, then announce it, exactly as `next_pass`
+        // does for a between-Passes drain.
+        state
+            .emitter
+            .emit(Event::background_notification(text.clone()));
+        conversation.merge_user_text(text);
+    }
+    conversation
 }
 
 // Proactive Compaction (ADR-0012): when the Conversation already exceeds the
@@ -517,14 +545,31 @@ async fn next_pass<D: RunDeps>(
 ) -> Flow {
     let steering = state.deps.drain_steering().await;
 
+    // Background subagent notifications (P4b, ADR-0063): the PARALLEL channel to
+    // Steering. A settled/cancelled background child queued its
+    // `<task-notification>` on the Agent; drain them here and merge each into the
+    // SAME tool-results user message Steering rides, so the model reads a
+    // completion on its very next request. Not steering (no user voice) - just
+    // trailing text blocks on the batch, and an operator-visible Event per note.
+    let notifications = state.deps.drain_notifications().await;
+
     // The batch enters stamped with the captured Model's Provenance
     // (ADR-0037): the request-shaping transform reads it to decide verbatim
     // replay vs cross-Provider normalization.
     conversation.add_assistant_response(response.content.clone(), state.deps.provenance());
-    conversation.add_tool_results(results, steering.clone());
+    // Steering and notifications ride the batch as trailing user-role text blocks
+    // (the same shape), Steering first then the notifications.
+    let mut trailing = steering.clone();
+    trailing.extend(notifications.iter().cloned());
+    conversation.add_tool_results(results, trailing);
 
     for text in &steering {
         state.emitter.emit(Event::steering_delivered(text.clone()));
+    }
+    for text in &notifications {
+        state
+            .emitter
+            .emit(Event::background_notification(text.clone()));
     }
 
     state.deps.checkpoint(&conversation);
@@ -962,6 +1007,91 @@ mod tests {
         );
         assert!(
             matches!(&last.content[1], ContentBlock::Text { text } if text == "also check the README")
+        );
+    }
+
+    // ---- background notifications (P4b, ADR-0063) -------------------------
+
+    #[tokio::test]
+    async fn drained_notification_rides_the_tool_results_message_and_is_announced() {
+        // A background `<task-notification>` that settles mid-Run merges into the
+        // next request's tool-results user message (the PARALLEL channel to
+        // Steering) and is announced as a BackgroundNotification event. The FIRST
+        // seeded batch is empty - the Run-start drain consumes it - so the note in
+        // the SECOND batch is the one the between-Passes drain (`next_pass`)
+        // delivers, which is the merge this test covers.
+        let root = root();
+        let session = session(root.path());
+        let note = "<task-notification>\n<task-id>scout-1</task-id>\n<status>completed</status>\n<summary>Agent \"explore\" completed.</summary>\n<result>found it</result>\n</task-notification>";
+        let deps = deps_for(
+            &session,
+            vec![
+                just(tool_use_result("t1", "list_files", json!({"path": "."}))),
+                just(text_end("done")),
+            ],
+        )
+        .with_notifications(vec![vec![], vec![note.to_string()]]);
+
+        let (outcome, deps) = run_with(&session, "look around", deps).await;
+        ok(&outcome);
+
+        // Announced as a BackgroundNotification event.
+        let evs = events(&deps);
+        assert!(evs.iter().any(
+            |e| matches!(e, Event::BackgroundNotification { text } if text == note)
+        ));
+
+        // The notification rides the next request's tool-results user message as
+        // a trailing text block (after the tool result).
+        let requests = deps.requests.lock().unwrap();
+        let last = requests[1].messages.last().unwrap();
+        assert!(matches!(&last.role, Role::User));
+        assert!(
+            matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")
+        );
+        assert!(
+            matches!(&last.content[1], ContentBlock::Text { text } if text == note)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_notification_reaches_a_pure_text_runs_first_request() {
+        // The delivery-gap fix (P4b, ADR-0063): a notification queued between
+        // Runs must reach the model even when the next Run's ONLY Pass is pure
+        // text (no tool call). `next_pass` never runs on a pure-text Run, so the
+        // Run-start drain is the only delivery point - it merges the note into
+        // the FIRST request's user turn.
+        let root = root();
+        let session = session(root.path());
+        let note = "<task-notification>\n<task-id>scout-1</task-id>\n<status>completed</status>\n<summary>Agent \"explore\" completed.</summary>\n<result>found it</result>\n</task-notification>";
+        // A single pure-text reply: the whole Run is one no-tool-call Pass.
+        let deps = deps_for(&session, vec![just(text_end("here is my answer"))])
+            .with_notifications(vec![vec![note.to_string()]]);
+
+        let (outcome, deps) = run_with(&session, "what did the agent find?", deps).await;
+        ok(&outcome);
+
+        // Announced as a BackgroundNotification event even though no tool ran.
+        let evs = events(&deps);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::BackgroundNotification { text } if text == note))
+        );
+
+        // The one-and-only request carried the note merged into the prompt's
+        // user message (a trailing text block), so the model read it on its
+        // very first request.
+        let requests = deps.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one pure-text Pass, one request");
+        let first = requests.last().unwrap();
+        let user = first.messages.last().unwrap();
+        assert!(matches!(&user.role, Role::User));
+        assert!(
+            user.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == note)),
+            "the queued note rode the first request's user turn: {:?}",
+            user.content
         );
     }
 

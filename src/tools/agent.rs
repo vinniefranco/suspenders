@@ -12,10 +12,12 @@
 //! ADR-0061), which drives a child Run to settlement and returns its result.
 //!
 //! The description scaffold is ported VERBATIM from qwen v0.16.0's
-//! `tools/agent/agent.ts` `baseDescription`, TRIMMED of the background /
-//! worktree / `run_in_background` usage notes and the `isolation` schema
-//! property (all DEFERRED with 4c/4d, ADR-0061) - so the schema exposes exactly
-//! `description`, `prompt`, and `subagent_type`.
+//! `tools/agent/agent.ts` `baseDescription`. P4b (4c) restores the ONE
+//! `run_in_background` usage bullet and the boolean `run_in_background` schema
+//! property; the `isolation`/`worktree` note and schema property stay TRIMMED
+//! (git-worktree isolation is DEFERRED, ADR-0061/ADR-0063) - so the schema
+//! exposes exactly `description`, `prompt`, `subagent_type`, and
+//! `run_in_background`.
 
 use std::sync::Arc;
 
@@ -66,10 +68,10 @@ impl AgentTool {
 impl Tool for AgentTool {
     fn spec(&self) -> ToolSpec {
         // The description scaffold, VERBATIM from qwen's `tools/agent/agent.ts`
-        // `baseDescription`, with the live available-subagents block spliced in
-        // and the background/worktree/run_in_background notes TRIMMED (deferred).
-        // qwen's `${ToolNames.*}` interpolations resolve to Suspenders' own tool
-        // names.
+        // `baseDescription`, with the live available-subagents block spliced in.
+        // P4b restores the ONE `run_in_background` usage bullet; the
+        // worktree/isolation note stays TRIMMED (deferred). qwen's
+        // `${ToolNames.*}` interpolations resolve to Suspenders' own tool names.
         let description = format!(
             "Launch a new agent to handle complex, multi-step tasks autonomously.
 The Agent tool launches specialized agents (subprocesses) that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
@@ -95,6 +97,7 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 - If the user specifies that they want you to run agents \"in parallel\", you MUST send a single message with multiple Agent tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
+- You can optionally set `run_in_background: true` to run the agent in the background. You will be notified when it completes. Use this when you have genuinely independent work to do in parallel and don't need the agent's results before you can proceed.
 
 Example usage:
 
@@ -132,9 +135,11 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
             self.subagent_descriptions()
         );
 
-        // The dynamic schema: `description`/`prompt`/`subagent_type` (qwen's
-        // initial schema TRIMMED of `run_in_background` and `isolation`). The
-        // `subagent_type` enum is the registry's names when non-empty.
+        // The dynamic schema: `description`/`prompt`/`subagent_type`/
+        // `run_in_background` (qwen's initial schema, P4b restoring the boolean
+        // `run_in_background`; the `isolation`/`worktree` property stays TRIMMED,
+        // deferred). The `subagent_type` enum is the registry's names when
+        // non-empty.
         let mut subagent_type = json!({
             "type": "string",
             "description": "The type of specialized agent to use for this task",
@@ -159,6 +164,10 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
                         "description": "The task for the agent to perform",
                     },
                     "subagent_type": subagent_type,
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "Set to true to run this agent in the background. You will be notified when it completes.",
+                    },
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false,
@@ -183,8 +192,8 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "Parameter \"description\" must be a non-empty string.".to_string())?;
-        let _ = description; // qwen carries it for the display; the child Run does not need it.
+            .ok_or_else(|| "Parameter \"description\" must be a non-empty string.".to_string())?
+            .to_string();
 
         let prompt = input
             .get("prompt")
@@ -217,6 +226,14 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
             None => DEFAULT_BUILTIN_SUBAGENT_TYPE.to_string(),
         };
 
+        // Whether the model asked to background this agent (P4b/4c, ADR-0063).
+        // Schema guarantees a boolean when present; absent defaults to false (the
+        // foreground path). Only `true` takes the background branch.
+        let run_in_background = input
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Reach the host through the SubagentSpawner capability (F4, ADR-0061).
         // `model: None` defers the per-subagent Model to the def's own choice.
         let request = SubagentRequest {
@@ -224,6 +241,23 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
             prompt,
             model: None,
         };
+
+        if run_in_background {
+            // Background (4c): launch a detached child Run and return immediately
+            // with the minted task id. The parent does NOT park - it carries on,
+            // and a `<task-notification>` reaches its next Run when the child
+            // settles. A launch failure folds the verbatim string as an error.
+            return match ctx
+                .caps
+                .subagents
+                .spawn_background(request, description)
+                .await
+            {
+                Ok(task_id) => Ok(background_launch_string(&task_id)),
+                Err(reason) => Err(reason),
+            };
+        }
+
         match ctx.caps.subagents.spawn(request).await {
             Ok(result) => Ok(format_result(result)),
             // A launch failure (unknown type, unresolvable Model, degraded host):
@@ -231,6 +265,22 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
             Err(reason) => Err(reason),
         }
     }
+}
+
+/// The background-launch content string (qwen's `tools/agent/agent.ts` ~2049,
+/// the `Background agent launched successfully.` block), TRIMMED of the deferred
+/// lines: the `output_file:` line and the `read_file`/`shell tail`-on-the-output
+/// tail (there is no live-output file yet, ADR-0063), plus the `send_message`
+/// clause of the agentId line (send_message is not ported). The `task_stop`
+/// reference stays - that tool IS ported (4d). qwen's em-dashes are hyphenated to
+/// the house style. `task_id` is the minted `{subagent_type}-{n}`.
+fn background_launch_string(task_id: &str) -> String {
+    format!(
+        "Background agent launched successfully.\n\
+         agentId: {task_id} (internal ID - do not mention to the user. Use task_stop to cancel.)\n\
+         The agent is working in the background. You will be notified automatically when it completes.\n\
+         Do not duplicate this agent's work - avoid working with the same files or topics it is using. Work on non-overlapping tasks, or briefly tell the user what you launched and end your response."
+    )
 }
 
 /// Formats a settled [`SubagentResult`](crate::tool::caps::SubagentResult) into
@@ -285,9 +335,14 @@ mod tests {
         let spec = t.spec();
         assert!(spec.description.contains("- **general-purpose**:"));
         assert!(spec.description.contains("- **Explore**:"));
-        // Deferred usage notes are trimmed.
-        assert!(!spec.description.contains("run_in_background"));
+        // P4b restores the run_in_background bullet AND the schema property.
+        assert!(spec.description.contains("run_in_background: true"));
+        assert!(
+            spec.input_schema["properties"]["run_in_background"]["type"] == "boolean"
+        );
+        // The worktree/isolation note stays trimmed (deferred).
         assert!(!spec.description.contains("worktree"));
+        assert!(spec.input_schema["properties"]["isolation"].is_null());
         assert!(!t.should_defer());
     }
 
@@ -302,9 +357,24 @@ mod tests {
     }
 
     // A spawner that records the request it received and returns a fixed result.
+    // `bg_seen` records background launches as `(subagent_type, prompt,
+    // description)` and `bg_id` is the task id `spawn_background` returns.
     struct RecordingSpawner {
         seen: Arc<Mutex<Vec<(String, String)>>>,
         result: SubagentResult,
+        bg_seen: Arc<Mutex<Vec<(String, String, String)>>>,
+        bg_id: String,
+    }
+
+    impl RecordingSpawner {
+        fn new(seen: Arc<Mutex<Vec<(String, String)>>>, result: SubagentResult) -> Self {
+            RecordingSpawner {
+                seen,
+                result,
+                bg_seen: Arc::new(Mutex::new(Vec::new())),
+                bg_id: "general-purpose-1".into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -319,6 +389,23 @@ mod tests {
                 result: self.result.result.clone(),
             })
         }
+
+        async fn spawn_background(
+            &self,
+            request: SubagentRequest,
+            description: String,
+        ) -> Result<String, String> {
+            self.bg_seen.lock().unwrap().push((
+                request.subagent_type,
+                request.prompt,
+                description,
+            ));
+            Ok(self.bg_id.clone())
+        }
+
+        async fn stop_background(&self, id: String) -> Result<String, String> {
+            Ok(format!("Error: No background task found with ID \"{id}\"."))
+        }
     }
 
     fn ctx_with(spawner: Arc<dyn SubagentSpawner>) -> ToolCtx {
@@ -331,13 +418,10 @@ mod tests {
     #[tokio::test]
     async fn run_spawns_the_resolved_request_and_returns_the_goal_result() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let spawner = Arc::new(RecordingSpawner {
-            seen: Arc::clone(&seen),
-            result: SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(Arc::clone(&seen), SubagentResult {
                 terminate_reason: "GOAL".into(),
                 result: "the findings".into(),
-            },
-        });
+            }));
         let out = tool()
             .run(
                 &json!({
@@ -361,13 +445,10 @@ mod tests {
     #[tokio::test]
     async fn run_defaults_the_subagent_type_to_general_purpose() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let spawner = Arc::new(RecordingSpawner {
-            seen: Arc::clone(&seen),
-            result: SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(Arc::clone(&seen), SubagentResult {
                 terminate_reason: "GOAL".into(),
                 result: "ok".into(),
-            },
-        });
+            }));
         tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -381,13 +462,10 @@ mod tests {
     #[tokio::test]
     async fn run_error_empty_result_is_the_verbatim_execution_failed_message() {
         // qwen foreground: ERROR + empty finalText -> "Subagent execution failed."
-        let spawner = Arc::new(RecordingSpawner {
-            seen: Arc::new(Mutex::new(Vec::new())),
-            result: SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
                 terminate_reason: "ERROR".into(),
                 result: String::new(),
-            },
-        });
+            }));
         let out = tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -402,13 +480,10 @@ mod tests {
     async fn run_error_non_empty_result_surfaces_the_bare_partial_text() {
         // qwen foreground: ERROR + non-empty finalText -> the raw finalText, no
         // synthetic message.
-        let spawner = Arc::new(RecordingSpawner {
-            seen: Arc::new(Mutex::new(Vec::new())),
-            result: SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
                 terminate_reason: "ERROR".into(),
                 result: "got this far".into(),
-            },
-        });
+            }));
         let out = tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -424,13 +499,10 @@ mod tests {
         // qwen foreground: a non-ERROR terminate (MAX_TURNS) with an empty
         // finalText surfaces the bare (empty) text, NOT the background
         // `Agent terminated with mode: ...` string.
-        let spawner = Arc::new(RecordingSpawner {
-            seen: Arc::new(Mutex::new(Vec::new())),
-            result: SubagentResult {
+        let spawner = Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
                 terminate_reason: "MAX_TURNS".into(),
                 result: String::new(),
-            },
-        });
+            }));
         let out = tool()
             .run(
                 &json!({"description": "do it", "prompt": "the task"}),
@@ -446,13 +518,10 @@ mod tests {
         let err = tool()
             .run(
                 &json!({"description": "d", "prompt": "p", "subagent_type": "nope"}),
-                &ctx_with(Arc::new(RecordingSpawner {
-                    seen: Arc::new(Mutex::new(Vec::new())),
-                    result: SubagentResult {
+                &ctx_with(Arc::new(RecordingSpawner::new(Arc::new(Mutex::new(Vec::new())), SubagentResult {
                         terminate_reason: "GOAL".into(),
                         result: String::new(),
-                    },
-                })),
+                    }))),
             )
             .await
             .unwrap_err();
@@ -473,5 +542,62 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, "subagents are unavailable in this environment");
+    }
+
+    #[tokio::test]
+    async fn run_in_background_true_calls_spawn_background_and_returns_the_launch_string() {
+        // 4c: run_in_background: true routes to spawn_background (NOT spawn), and
+        // the tool returns the VERBATIM launch string carrying the minted id.
+        let spawner = Arc::new(RecordingSpawner::new(
+            Arc::new(Mutex::new(Vec::new())),
+            SubagentResult {
+                terminate_reason: "GOAL".into(),
+                result: "unused".into(),
+            },
+        ));
+        let bg_seen = Arc::clone(&spawner.bg_seen);
+        let out = tool()
+            .run(
+                &json!({
+                    "description": "find the bug",
+                    "prompt": "investigate the panic",
+                    "subagent_type": "general-purpose",
+                    "run_in_background": true,
+                }),
+                &ctx_with(spawner),
+            )
+            .await
+            .unwrap();
+        // The launch string names the minted id and does NOT carry the subagent's
+        // result (the parent parks on nothing - it carries on).
+        assert!(out.starts_with("Background agent launched successfully."));
+        assert!(out.contains("agentId: general-purpose-1"));
+        assert!(out.contains("Use task_stop to cancel."));
+        assert!(!out.contains("unused"));
+        // The background launch received the resolved request + description; the
+        // foreground `spawn` was never called.
+        let bg = bg_seen.lock().unwrap();
+        assert_eq!(
+            bg[0],
+            (
+                "general-purpose".to_string(),
+                "investigate the panic".to_string(),
+                "find the bug".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn spec_schema_has_run_in_background_boolean() {
+        let spec = tool().spec();
+        assert_eq!(
+            spec.input_schema["properties"]["run_in_background"]["type"],
+            "boolean"
+        );
+        // run_in_background is optional (not required) and worktree/isolation
+        // stays absent.
+        let required = spec.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|r| r == "run_in_background"));
+        assert!(spec.input_schema["properties"]["isolation"].is_null());
     }
 }

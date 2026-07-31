@@ -7,8 +7,10 @@ the parent as the tool result. The subagent runs headless (no user interaction),
 its whole reasoning loop is invisible to the parent's transcript, and only its
 result crosses back. P4 (4a + 4b) ports this for the FOREGROUND case: the parent
 calls `agent`, the child Run runs inline, and the parent parks on the tool call
-until the child settles. The background case (4c) and `task_stop` (4d) are
-DEFERRED (see below).
+until the child settles. P4b LANDED the background case (4c) and `task_stop`
+(4d): the background subagent task registry and its `<task-notification>`
+envelope live in ADR-0063; this ADR is amended below where the two touch its
+foreground design.
 
 ## RunDeps is the isolation seam
 
@@ -141,21 +143,41 @@ depth:
 3. `ChildRunRequest.depth` rides at `depth = 1` for a foreground subagent - a
    belt-and-braces record a future nesting policy can read.
 
-## Deferral of 4c (background) and 4d (task_stop), without foreclosure
+## 4c (background) and 4d (task_stop) LANDED (P4b), additively
 
-Foreground only, on purpose. The deferral does not foreclose the background path:
+The foreground design above is untouched. P4b added the background path as pure
+additions, with the registry design in ADR-0063:
 
-- **4c background.** `run_child` is already identical for a background caller -
-  it takes the same `ChildRunRequest`, differing only by a `Some(sink)` for the
-  live-output feed. `SubagentSpawner` gains a `spawn_detached` method ADDITIVELY
-  (the existing `spawn` is untouched), and the Agent grows a task registry that
-  owns the detached `JoinHandle`s and posts completion notifications back over
-  its mpsc - none of which touches the foreground path built here.
-- **4d task_stop.** `task_stop` is already a deferred tool name in
-  `EXCLUDED_TOOLS_FOR_SUBAGENTS` (so a subagent can never stop tasks) and would
-  land as an Agent-owned tool over that same background task registry. It has no
-  foreground analog (a foreground subagent settles synchronously), so its absence
-  here is complete, not partial.
+- **`SubagentSpawner` grew two methods, additively.** `spawn_background(request,
+  description) -> Result<String, String>` (Ok = the minted task id) and
+  `stop_background(id) -> Result<String, String>` join the trait; the existing
+  foreground `spawn` is byte-for-byte unchanged. Every impl gained the two: the
+  degraded `UnavailableSubagentSpawner` errs / not-founds (and stays the
+  recursion guard - a child cannot background either), and the foreground-only
+  `DirectSubagentSpawner` errs / not-founds too (it holds no Agent, so it cannot
+  register a detached task).
+- **`AgentSubagentSpawner` is the two-channel split.** The Agent's `capture()`
+  now builds an `AgentSubagentSpawner` (replacing the bare `DirectSubagentSpawner`
+  P4a put on the Run's caps) whose FOREGROUND `spawn` is still the DIRECT
+  Llm-boundary path (it holds and delegates to a `DirectSubagentSpawner`, driving
+  the child Run inline), while its BACKGROUND `spawn_background`/`stop_background`
+  are tx-backed (like the Approver/Questioner): they relay a `SpawnBackground`/
+  `StopBackground` `RunMsg` to the Agent, because the detached child Run and the
+  task registry ARE Agent-owned mutable state (ADR-0017). Two channels, one
+  terminus - foreground straight to the Llm, background through the Agent.
+- **`drain_notifications` is a PARALLEL channel to steering, not steering.**
+  `RunDeps` gains a defaulted `drain_notifications` (empty by default, so
+  `ChildDeps` inherits it); `AgentDeps` overrides it to relay a
+  `DrainNotifications` `RunMsg`. The Loop drains it right after `drain_steering`
+  and merges each queued `<task-notification>` into the SAME tool-results user
+  message steering rides. It is a separate queue and a separate Event
+  (`BackgroundNotification`), never conflated with the user's steering voice.
+- **4d task_stop LANDED as a deferred, subagent-excluded tool.** `task_stop` was
+  already a deferred name in `EXCLUDED_TOOLS_FOR_SUBAGENTS` (so a subagent can
+  never stop tasks - the recursion guard); it now ships as an Agent-owned tool
+  over the background registry, reaching the Agent through the same
+  `stop_background` capability. It has no foreground analog (a foreground
+  subagent settles synchronously), so it is background-only, by design.
 
 ## Considered and rejected
 

@@ -837,7 +837,9 @@ impl Screen {
 
             event @ (Event::SessionLogError { .. }
             | Event::Retry { .. }
-            | Event::LoopStall { .. }) => self.apply_voice(event),
+            | Event::LoopStall { .. }
+            | Event::BackgroundNotification { .. }
+            | Event::BackgroundTaskFinished { .. }) => self.apply_voice(event),
 
             event @ (Event::RunFinished { .. } | Event::RunCancelled | Event::RunError { .. }) => {
                 self.apply_settlement(event)
@@ -1104,6 +1106,22 @@ impl Screen {
                 );
                 (self, vec![])
             }
+
+            // A background subagent reached a terminal state (P4b, ADR-0063): an
+            // operator-visible info line noting the task and its lifecycle word.
+            // The full envelope reaches the model on its next Run via the queued
+            // notification; this is the "it finished" marker for the operator.
+            Event::BackgroundTaskFinished { task_id, status } => {
+                self.transcript
+                    .info(format!("background agent {task_id} {status}"));
+                (self, vec![])
+            }
+
+            // The queued notification's envelope (P4b, ADR-0063): already surfaced
+            // by the BackgroundTaskFinished info line, and it enters the model's
+            // Conversation as a user-role message on the next Run - so nothing
+            // extra to render here, but the arm keeps the match exhaustive.
+            Event::BackgroundNotification { .. } => (self, vec![]),
 
             _ => (self, vec![]),
         }

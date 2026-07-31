@@ -1551,3 +1551,224 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
     let ev = recv_match(&mut rx, is_run_finished).await;
     assert_eq!(finished_budget(&ev), Some(16_000), "the captured window");
 }
+
+// ===========================================================================
+// Background subagent registry (P4b/4c/4d, ADR-0063). These drive the Agent's
+// registry handlers directly on an `AgentState::for_test`, so the mint/notify/
+// abort mechanics are observable without wiring a whole Run through the mpsc.
+// ===========================================================================
+
+use crate::tool::caps::{SubagentRequest, SubagentResult};
+
+fn bg_request(subagent_type: &str) -> SubagentRequest {
+    SubagentRequest {
+        subagent_type: subagent_type.into(),
+        prompt: "do the task".into(),
+        model: None,
+    }
+}
+
+#[tokio::test]
+async fn spawn_background_mints_the_id_and_registers_running() {
+    let dir = TempDir::new().unwrap();
+    // A FakeLlm the detached child will settle against (a plain final text).
+    let fake = FakeLlm::script(vec![Entry::just(text_end("done"))]);
+    let (mut state, _rx) = super::AgentState::for_test(session_in(&dir), Arc::new(fake));
+
+    let id = super::spawn_background(&mut state, bg_request("general-purpose"), "find the bug".into());
+    assert_eq!(id, "general-purpose-1", "the minted id is {{type}}-{{n}}");
+    assert!(state.background.contains_key("general-purpose-1"));
+    // A second launch increments the per-Session counter.
+    let id2 = super::spawn_background(&mut state, bg_request("Explore"), "explore".into());
+    assert_eq!(id2, "Explore-2");
+}
+
+#[tokio::test]
+async fn a_child_settlement_queues_the_completed_notification() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    // Register a Running entry by hand (a spawned never-firing task for the abort
+    // handle), then feed a GOAL settlement.
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.background.insert(
+        "general-purpose-1".into(),
+        super::background::BackgroundTask {
+            abort: handle.abort_handle(),
+            status: super::background::BackgroundStatus::Running,
+            description: "find the bug".into(),
+        },
+    );
+
+    super::background_done(
+        &mut state,
+        "general-purpose-1".into(),
+        SubagentResult {
+            terminate_reason: "GOAL".into(),
+            result: "the findings".into(),
+        },
+    );
+
+    assert_eq!(state.notifications.len(), 1);
+    let note = &state.notifications[0];
+    assert!(note.contains("<task-id>general-purpose-1</task-id>"));
+    assert!(note.contains("<status>completed</status>"));
+    assert!(note.contains("<summary>Agent \"find the bug\" completed.</summary>"));
+    assert!(note.contains("<result>the findings</result>"));
+}
+
+#[tokio::test]
+async fn stop_background_aborts_the_running_child_and_sets_stopped() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let abort = handle.abort_handle();
+    state.background.insert(
+        "scout-1".into(),
+        super::background::BackgroundTask {
+            abort,
+            status: super::background::BackgroundStatus::Running,
+            description: "explore api".into(),
+        },
+    );
+
+    let wording = super::stop_background(&mut state, "scout-1".into());
+    assert_eq!(
+        wording,
+        "Cancellation requested for background agent \"scout-1\". A final \
+         task-notification carrying the agent's last result will follow.\n\
+         Description: explore api"
+    );
+    // The entry is now Stopped and the child task was aborted.
+    assert!(matches!(
+        state.background.get("scout-1").unwrap().status,
+        super::background::BackgroundStatus::Stopped
+    ));
+    // Yield so the abort lands on the child task before asserting it finished.
+    tokio::task::yield_now().await;
+    assert!(handle.is_finished());
+    // The `was cancelled` notification was queued synchronously.
+    assert!(state.notifications[0].contains("<summary>Agent \"explore api\" was cancelled.</summary>"));
+}
+
+#[tokio::test]
+async fn stop_background_unknown_id_is_the_not_found_wording() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let wording = super::stop_background(&mut state, "ghost-9".into());
+    assert_eq!(wording, "Error: No background task found with ID \"ghost-9\".");
+}
+
+#[tokio::test]
+async fn stop_background_of_a_settled_task_is_the_not_running_wording() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let handle = tokio::spawn(async {});
+    state.background.insert(
+        "scout-1".into(),
+        super::background::BackgroundTask {
+            abort: handle.abort_handle(),
+            status: super::background::BackgroundStatus::Done,
+            description: "explore api".into(),
+        },
+    );
+    let wording = super::stop_background(&mut state, "scout-1".into());
+    assert_eq!(
+        wording,
+        "Error: Background agent \"scout-1\" is not running (status: completed)."
+    );
+}
+
+#[tokio::test]
+async fn a_settlement_for_a_stopped_task_is_dropped_no_double_notify() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let handle = tokio::spawn(async {});
+    state.background.insert(
+        "scout-1".into(),
+        super::background::BackgroundTask {
+            abort: handle.abort_handle(),
+            status: super::background::BackgroundStatus::Stopped,
+            description: "explore api".into(),
+        },
+    );
+    // The child's late BackgroundDone lands after the stop: it must be dropped,
+    // not queued as a second notification (idle-completion no panic).
+    super::background_done(
+        &mut state,
+        "scout-1".into(),
+        SubagentResult {
+            terminate_reason: "GOAL".into(),
+            result: "partial".into(),
+        },
+    );
+    assert!(state.notifications.is_empty(), "a Stopped entry drops the racing result");
+}
+
+#[tokio::test]
+async fn abort_all_aborts_every_running_child_at_loop_exit() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let h1 = tokio::spawn(async { std::future::pending::<()>().await });
+    let h2 = tokio::spawn(async { std::future::pending::<()>().await });
+    state.background.insert(
+        "a-1".into(),
+        super::background::BackgroundTask {
+            abort: h1.abort_handle(),
+            status: super::background::BackgroundStatus::Running,
+            description: "one".into(),
+        },
+    );
+    state.background.insert(
+        "b-2".into(),
+        super::background::BackgroundTask {
+            abort: h2.abort_handle(),
+            status: super::background::BackgroundStatus::Running,
+            description: "two".into(),
+        },
+    );
+
+    super::abort_all_background(&mut state);
+    assert!(state.background.is_empty());
+    // Yield so the aborts land, then both child tasks are finished.
+    tokio::task::yield_now().await;
+    assert!(h1.is_finished());
+    assert!(h2.is_finished());
+}
+
+#[tokio::test]
+async fn spawn_background_settles_through_the_mpsc_and_queues_the_notification() {
+    // The end-to-end detached path: spawn_background spawns a real child Run over
+    // the FakeLlm; when it settles it posts a BackgroundDone over self_tx, which
+    // background_done then queues as a notification.
+    let dir = TempDir::new().unwrap();
+    let fake = FakeLlm::script(vec![Entry::just(text_end("the findings"))]);
+    let (mut state, mut rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(fake));
+
+    let id = super::spawn_background(&mut state, bg_request("general-purpose"), "find the bug".into());
+    assert_eq!(id, "general-purpose-1");
+
+    // Await the child's BackgroundDone off the mpsc, then drive it into the
+    // handler (the actor loop would do this).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(Msg::Run(RunMsg::BackgroundDone { id, result }))) => {
+                super::background_done(&mut state, id, result);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("mpsc closed"),
+            Err(_) => panic!("timed out waiting for BackgroundDone"),
+        }
+    }
+    assert_eq!(state.notifications.len(), 1);
+    assert!(state.notifications[0].contains("<result>the findings</result>"));
+}

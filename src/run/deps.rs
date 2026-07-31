@@ -109,6 +109,17 @@ pub trait RunDeps: Send {
     /// Drains any queued Steering, yielding the texts in order.
     fn drain_steering(&mut self) -> impl Future<Output = Vec<String>> + Send;
 
+    /// Drains any queued background `<task-notification>` envelopes (P4b,
+    /// ADR-0063), yielding the texts in order. The PARALLEL channel to
+    /// [`drain_steering`](RunDeps::drain_steering) - a settled background subagent
+    /// queues its notification on the Agent and the Loop merges each into the next
+    /// request's tool-results user message, exactly as it does Steering. Defaulted
+    /// to empty: a child Run ([`crate::run::child::ChildDeps`]) has no background
+    /// registry, so it takes the default.
+    fn drain_notifications(&mut self) -> impl Future<Output = Vec<String>> + Send {
+        async { Vec::new() }
+    }
+
     /// Requests the user's Approval for a command Tool Call; blocks until the
     /// user answers. `id` is the per-call reference (baud's `make_ref()`).
     fn request_approval(

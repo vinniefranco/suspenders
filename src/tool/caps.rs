@@ -330,6 +330,27 @@ pub trait SubagentSpawner: Send + Sync {
     /// unknown subagent type, an unresolvable Model) - the `agent` tool folds the
     /// `Err` into its own error result.
     async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, String>;
+
+    /// Launches the subagent in the BACKGROUND (P4b/4c, ADR-0061, ADR-0063): the
+    /// spawner registers a detached child Run and returns immediately with the
+    /// minted task id (`{subagent_type}-{n}`). The parent does NOT park - it
+    /// carries on while the child runs, and a `<task-notification>` reaches the
+    /// next Run when the child settles. `description` is the model's 3-5 word
+    /// summary, carried for the notification envelope. The `Err` is the same
+    /// launch-failure shape as [`spawn`](SubagentSpawner::spawn) (unknown type,
+    /// unresolvable Model, degraded host).
+    async fn spawn_background(
+        &self,
+        request: SubagentRequest,
+        description: String,
+    ) -> Result<String, String>;
+
+    /// Requests cancellation of a background agent by its task id (P4b/4d,
+    /// ADR-0061, ADR-0063), yielding the VERBATIM qwen `task_stop` wording: the
+    /// running-agent stop confirmation, the not-running error, or the not-found
+    /// error. Never an `Err` - `task_stop` returns the wording as its content
+    /// either way, so the whole result is the `Ok(String)`.
+    async fn stop_background(&self, id: String) -> Result<String, String>;
 }
 
 /// The degraded [`SubagentSpawner`]: a host with no subagent channel (a headless
@@ -348,6 +369,27 @@ pub struct UnavailableSubagentSpawner;
 impl SubagentSpawner for UnavailableSubagentSpawner {
     async fn spawn(&self, _request: SubagentRequest) -> Result<SubagentResult, String> {
         Err("subagents are unavailable in this environment".into())
+    }
+
+    async fn spawn_background(
+        &self,
+        _request: SubagentRequest,
+        _description: String,
+    ) -> Result<String, String> {
+        // Degraded (headless) AND the recursion guard: a child Run's own
+        // subagents capability is this, so a subagent that tried to launch a
+        // background subagent gets the same Err a headless host would - a
+        // subagent cannot recurse, foreground or background.
+        Err("subagents are unavailable in this environment".into())
+    }
+
+    async fn stop_background(&self, id: String) -> Result<String, String> {
+        // No registry here, so any id is not-found (the VERBATIM qwen wording).
+        // A child Run reaching for `task_stop` (the exclusion should have kept it
+        // off the wire) sees the same answer a headless host would.
+        Ok(format!(
+            "Error: No background task found with ID \"{id}\"."
+        ))
     }
 }
 
@@ -578,6 +620,18 @@ mod tests {
                 result: self.result.clone(),
             })
         }
+
+        async fn spawn_background(
+            &self,
+            _request: SubagentRequest,
+            _description: String,
+        ) -> Result<String, String> {
+            Ok("general-purpose-1".into())
+        }
+
+        async fn stop_background(&self, id: String) -> Result<String, String> {
+            Ok(format!("Error: No background task found with ID \"{id}\"."))
+        }
     }
 
     #[tokio::test]
@@ -592,6 +646,30 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, "subagents are unavailable in this environment");
+    }
+
+    #[tokio::test]
+    async fn unavailable_subagent_spawner_background_errs() {
+        let spawner = UnavailableSubagentSpawner;
+        let err = spawner
+            .spawn_background(
+                SubagentRequest {
+                    subagent_type: "general-purpose".into(),
+                    prompt: "do a thing".into(),
+                    model: None,
+                },
+                "do a thing".into(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, "subagents are unavailable in this environment");
+    }
+
+    #[tokio::test]
+    async fn unavailable_subagent_spawner_stop_is_not_found() {
+        let spawner = UnavailableSubagentSpawner;
+        let out = spawner.stop_background("scout-1".into()).await.unwrap();
+        assert_eq!(out, "Error: No background task found with ID \"scout-1\".");
     }
 
     #[tokio::test]

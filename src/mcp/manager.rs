@@ -58,6 +58,18 @@ pub struct McpManager {
     failures: Vec<(String, String)>,
 }
 
+impl Default for McpManager {
+    /// An empty manager (no connections, no failures): the same shape
+    /// [`McpManager::connect`] yields for an empty server map, for tests that
+    /// need an [`crate::agent`] state without attaching any MCP server.
+    fn default() -> Self {
+        McpManager {
+            conns: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
 impl McpManager {
     /// Attaches every configured MCP server, fail-open, and returns the manager
     /// plus the discovered [`McpTool`](crate::mcp::adapter::McpTool)s (already

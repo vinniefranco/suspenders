@@ -16,6 +16,7 @@ pub mod read_file;
 pub mod run_command;
 pub mod shaping;
 pub mod skill;
+pub mod task_stop;
 pub mod todo_write;
 pub mod tool_search;
 pub mod web_fetch;
@@ -47,6 +48,9 @@ pub(crate) fn tools() -> Vec<Box<dyn Tool>> {
         Box::new(run_command::RunCommand),
         Box::new(web_fetch::WebFetch),
         Box::new(ask_user_question::AskUserQuestion),
+        // task_stop trails with tool_search: both are deferred (discovered via
+        // `tool_search`), so neither rides the base wire list (P4b, ADR-0063).
+        Box::new(task_stop::TaskStop),
         Box::new(tool_search::ToolSearch),
     ]
 }
@@ -132,7 +136,9 @@ mod tests {
 
     #[test]
     fn returns_every_tool_in_prompt_order_todo_write_first() {
-        assert_eq!(tools().len(), 12);
+        // 13 built-ins: task_stop (P4b, ADR-0063) joined the set, but it is
+        // deferred so it does NOT appear on the base wire list (`specs()`).
+        assert_eq!(tools().len(), 13);
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
     }
@@ -144,13 +150,14 @@ mod tests {
     }
 
     #[test]
-    fn deferred_append_is_a_no_op_for_the_builtin_set() {
-        // P1a defers nothing, so the Agent's Deferred Tools append
-        // (`deferred_tools_section(&deferred_summary())`) must add nothing to
-        // the system prompt. Proves the seam is inert until a phase flips
-        // `should_defer`.
-        assert!(deferred_summary().is_empty());
-        assert!(crate::context_files::deferred_tools_section(&deferred_summary()).is_empty());
+    fn task_stop_is_the_deferred_builtin() {
+        // task_stop (P4b, ADR-0063) is the first deferred built-in: it appears in
+        // the Deferred Tools summary (so the model can discover it via
+        // `tool_search`) but NOT on the base wire list (`specs()`).
+        let summary = deferred_summary();
+        assert!(summary.iter().any(|(name, _)| name == "task_stop"));
+        assert!(!crate::context_files::deferred_tools_section(&summary).is_empty());
+        assert!(!specs().iter().any(|s| s.name == "task_stop"));
     }
 
     #[test]

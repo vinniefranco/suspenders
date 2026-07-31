@@ -121,24 +121,30 @@ impl AgentDeps {
             // The Session-stable tool set (F8, ADR-0056): the Run's registry
             // shares it via `with_shared`, so MCP tools ride every Run.
             tools: Arc::clone(&self.session_tools),
-            // The Subagent seam (P4/F4, ADR-0061): the DIRECT (Llm-boundary,
-            // non-mpsc) DirectSubagentSpawner, built here from the Agent-owned
-            // handles (the Llm, the captured Model, the Session's request
-            // settings, the parent Session, the subagent registry). A `Scoped`
-            // subagent Model resolves through the Session's own `resolve_model`,
-            // so no separate Provider slice is threaded. Like the SideQuery, it
-            // wires straight to the captured Llm - a foreground subagent touches
-            // no Agent/Conversation state - so the Agent builds it here rather
-            // than as a tx-backed handle.
-            subagents: Arc::new(crate::run::subagent::DirectSubagentSpawner {
-                llm: Arc::clone(&self.llm),
-                parent_model: self.model.clone(),
-                temperature: self.temperature,
-                thinking_budget: self.thinking_budget,
-                tool_call_style: self.tool_call_style,
-                session: self.session.clone(),
-                registry: Arc::clone(&self.subagents),
-                subagent_run_limit: self.subagent_run_limit,
+            // The Subagent seam (P4/F4 + P4b, ADR-0061, ADR-0063): the
+            // two-channel `AgentSubagentSpawner`. Its FOREGROUND `spawn` is still
+            // the DIRECT (Llm-boundary, non-mpsc) path - it holds the same
+            // `DirectSubagentSpawner` handles and drives a child Run inline, a
+            // foreground subagent touching no Agent/Conversation state. Its
+            // BACKGROUND `spawn_background`/`stop_background` are tx-backed (like
+            // the Approver/Questioner): they relay a `SpawnBackground`/
+            // `StopBackground` to the Agent that owns the registry, because a
+            // detached child Run and the task registry ARE Agent-owned mutable
+            // state (ADR-0017). A `Scoped` subagent Model resolves through the
+            // Session's own `resolve_model`, so no separate Provider slice is
+            // threaded.
+            subagents: Arc::new(AgentSubagentSpawner {
+                direct: crate::run::subagent::DirectSubagentSpawner {
+                    llm: Arc::clone(&self.llm),
+                    parent_model: self.model.clone(),
+                    temperature: self.temperature,
+                    thinking_budget: self.thinking_budget,
+                    tool_call_style: self.tool_call_style,
+                    session: self.session.clone(),
+                    registry: Arc::clone(&self.subagents),
+                    subagent_run_limit: self.subagent_run_limit,
+                },
+                tx: self.tx.clone(),
             }),
         }
     }
@@ -193,6 +199,24 @@ impl RunDeps for AgentDeps {
         async move {
             let (reply, rx) = oneshot::channel();
             if tx.send(Msg::Run(RunMsg::DrainSteering(reply))).is_err() {
+                return Vec::new();
+            }
+            rx.await.unwrap_or_default()
+        }
+    }
+
+    fn drain_notifications(&mut self) -> impl Future<Output = Vec<String>> + Send {
+        // The parallel channel to `drain_steering` (P4b, ADR-0063): ask the Agent
+        // (which owns the background registry) for its queued
+        // `<task-notification>` envelopes and empty the queue. A closed channel
+        // yields none - the same safe answer as `drain_steering`.
+        let tx = self.tx.clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            if tx
+                .send(Msg::Run(RunMsg::DrainNotifications(reply)))
+                .is_err()
+            {
                 return Vec::new();
             }
             rx.await.unwrap_or_default()
@@ -377,4 +401,83 @@ fn mint_question_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     format!("question-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The two-channel [`SubagentSpawner`] the Agent builds (P4b, ADR-0063). Its
+/// FOREGROUND `spawn` is the DIRECT (Llm-boundary, non-mpsc) path - it delegates
+/// to the held [`crate::run::subagent::DirectSubagentSpawner`], driving a child
+/// Run inline (a foreground subagent touches no Agent/Conversation state). Its
+/// BACKGROUND `spawn_background`/`stop_background` are tx-backed: a detached
+/// child Run and the task registry are Agent-owned mutable state (ADR-0017), so
+/// they relay a `SpawnBackground`/`StopBackground` over the same mpsc the
+/// Approver/Questioner use and await the reply. Two channels, one terminus - the
+/// foreground straight to the Llm, the background through the Agent that owns the
+/// registry.
+///
+/// Built by [`AgentDeps::capture`] and carried on the Run's
+/// [`crate::run::Capture`] into the Tool [`crate::tool::caps::Capabilities`],
+/// replacing the bare `DirectSubagentSpawner` P4a put there.
+struct AgentSubagentSpawner {
+    /// The foreground DIRECT spawner: `spawn` delegates to it unchanged.
+    direct: crate::run::subagent::DirectSubagentSpawner,
+    /// The Agent's mpsc: `spawn_background`/`stop_background` relay over it.
+    tx: mpsc::UnboundedSender<Msg>,
+}
+
+#[async_trait::async_trait]
+impl crate::tool::caps::SubagentSpawner for AgentSubagentSpawner {
+    async fn spawn(
+        &self,
+        request: crate::tool::caps::SubagentRequest,
+    ) -> Result<crate::tool::caps::SubagentResult, String> {
+        // Foreground: the DIRECT path, unchanged - drive the child Run inline off
+        // the captured Llm (the held DirectSubagentSpawner holds the handles).
+        self.direct.spawn(request).await
+    }
+
+    async fn spawn_background(
+        &self,
+        request: crate::tool::caps::SubagentRequest,
+        description: String,
+    ) -> Result<String, String> {
+        // Background: relay a SpawnBackground to the Agent (it mints the id,
+        // spawns the detached child, registers it) and await the id it replies.
+        // A closed channel is the degraded launch failure (the tool folds it).
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::SpawnBackground {
+                request,
+                description,
+                reply,
+            }))
+            .is_err()
+        {
+            return Err("background subagents are unavailable in this environment".into());
+        }
+        rx.await
+            .map_err(|_| "background subagents are unavailable in this environment".into())
+    }
+
+    async fn stop_background(&self, id: String) -> Result<String, String> {
+        // Relay a StopBackground to the Agent and await the VERBATIM wording it
+        // replies (found/not-running/not-found). A closed channel yields the
+        // not-found wording (the safe answer the tool returns as content).
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::StopBackground {
+                id: id.clone(),
+                reply,
+            }))
+            .is_err()
+        {
+            return Ok(format!(
+                "Error: No background task found with ID \"{id}\"."
+            ));
+        }
+        Ok(rx
+            .await
+            .unwrap_or_else(|_| format!("Error: No background task found with ID \"{id}\".")))
+    }
 }

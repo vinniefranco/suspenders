@@ -239,6 +239,24 @@ pub enum Event {
         suggestions: Vec<FileSuggestion>,
     },
 
+    // ---- Background subagents (P4b, ADR-0063) ----
+    /// A background subagent settled (or was cancelled) and its
+    /// `<task-notification>` envelope was queued for the next Run to drain: this
+    /// carries the same envelope text to the UI immediately, so the operator sees
+    /// the completion now even though the model only reads it on its next Run.
+    /// The text is already the assembled, XML-escaped envelope.
+    BackgroundNotification {
+        text: String,
+    },
+    /// A background subagent reached a terminal lifecycle state (P4b, ADR-0063):
+    /// the operator-visible marker carrying the task id and the lifecycle word
+    /// (`completed`/`failed`/`cancelled`). Display-side only - the durable fact
+    /// rides the queued notification's user-role log entry.
+    BackgroundTaskFinished {
+        task_id: String,
+        status: String,
+    },
+
     // ---- Settlement ----
     RunFinished {
         stop_reason: StopReason,
@@ -387,6 +405,22 @@ impl Event {
             generation,
             query: query.into(),
             suggestions,
+        }
+    }
+
+    // ---- Background subagents (P4b, ADR-0063) ----
+
+    pub fn background_notification(text: impl Into<String>) -> Self {
+        Event::BackgroundNotification { text: text.into() }
+    }
+
+    pub fn background_task_finished(
+        task_id: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Self {
+        Event::BackgroundTaskFinished {
+            task_id: task_id.into(),
+            status: status.into(),
         }
     }
 
