@@ -94,7 +94,11 @@ pub(super) fn text_end(text: &str) -> Response {
 
 pub(super) fn tool_use_result(id: &str, name: &str, input: Value) -> Response {
     Response {
-        content: vec![ContentBlock::tool_use(id, name, input)],
+        content: vec![ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }],
         stop_reason: StopReason::ToolUse,
         usage: Usage::default(),
         error: None,

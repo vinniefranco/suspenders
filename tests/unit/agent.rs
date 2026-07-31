@@ -70,7 +70,11 @@ fn text_end(text: &str) -> Response {
 
 fn tool_use_result(id: &str, name: &str, input: Value) -> Response {
     Response {
-        content: vec![ContentBlock::tool_use(id, name, input)],
+        content: vec![ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }],
         stop_reason: RStop::ToolUse,
         usage: Usage::default(),
         error: None,
@@ -1057,11 +1061,11 @@ async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
     drop(first);
 
     let path = log::latest(&session_dir).expect("a log file");
-    let resumed = AgentHandle::start(
-        StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+    let resumed = AgentHandle::start(StartOpts {
+        resume: Some(Resume::Path(path.clone())),
+        ..StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
             .with_system_prompt("You are a test agent.")
-            .with_resume(Resume::Path(path.clone())),
-    )
+    })
     .expect("resumes");
 
     assert_eq!(resumed.conversation().await.messages, live.messages);
@@ -1126,11 +1130,11 @@ async fn a_run_that_carried_riders_resumes_byte_for_byte() {
     drop(agent);
 
     let path = log::latest(&session_dir).expect("a log file");
-    let resumed = AgentHandle::start(
-        StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+    let resumed = AgentHandle::start(StartOpts {
+        resume: Some(Resume::Path(path)),
+        ..StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
             .with_system_prompt("You are a test agent.")
-            .with_resume(Resume::Path(path)),
-    )
+    })
     .expect("resumes");
 
     // The reconstructed Conversation carries the same bytes the model
@@ -1157,11 +1161,11 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
     drop(first);
 
     let path = log::latest(&session_dir).expect("a log file");
-    let resumed = AgentHandle::start(
-        StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+    let resumed = AgentHandle::start(StartOpts {
+        resume: Some(Resume::Path(path)),
+        ..StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
             .with_system_prompt("You are a test agent.")
-            .with_resume(Resume::Path(path)),
-    )
+    })
     .expect("resumes");
 
     assert_eq!(resumed.plan().await.as_deref(), Some("◐ do Y"));
@@ -1298,11 +1302,11 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
     assert_eq!(compacted[0]["original_task"], "step 1");
 
     // Resume folds to the COMPACTED view, not the raw pre-compaction msgs.
-    let resumed = AgentHandle::start(
-        StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
+    let resumed = AgentHandle::start(StartOpts {
+        resume: Some(Resume::Path(path)),
+        ..StartOpts::new(session, Arc::new(FakeLlm::script(vec![])))
             .with_system_prompt("You are a test agent.")
-            .with_resume(Resume::Path(path)),
-    )
+    })
     .expect("resumes");
     let resumed_msgs = resumed.conversation().await.messages;
     let resumed_head: String = resumed_msgs[0]
@@ -1352,11 +1356,11 @@ async fn resume_from_a_different_project_root_fails_init_loudly() {
     )
     .unwrap();
 
-    let result = AgentHandle::start(
-        StartOpts::new(other, Arc::new(FakeLlm::script(vec![])))
+    let result = AgentHandle::start(StartOpts {
+        resume: Some(Resume::Path(path)),
+        ..StartOpts::new(other, Arc::new(FakeLlm::script(vec![])))
             .with_system_prompt("You are a test agent.")
-            .with_resume(Resume::Path(path)),
-    );
+    });
     assert!(matches!(result, Err(StartError::ResumeRootMismatch(_))));
 }
 
@@ -1449,12 +1453,12 @@ async fn set_model_changes_what_active_model_returns() {
 
     // Seeded from the Session's launch-resolved Model (the scoped config id).
     assert_eq!(
-        agent.active_model().await,
+        agent.active_model().await.unwrap(),
         SessionConfig::test_defaults().model
     );
 
     agent.set_model("local/picked-model".into()).await.unwrap();
-    assert_eq!(agent.active_model().await, "local/picked-model");
+    assert_eq!(agent.active_model().await.unwrap(), "local/picked-model");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -134,19 +134,6 @@ impl ContentBlock {
         ContentBlock::Text { text: text.into() }
     }
 
-    // qual:test_helper
-    pub fn tool_use(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        input: serde_json::Value,
-    ) -> Self {
-        ContentBlock::ToolUse {
-            id: id.into(),
-            name: name.into(),
-            input,
-        }
-    }
-
     /// A Tool Result carrying a single Text block - the common case, so every
     /// existing construction site (a text result) reads unchanged. Media results
     /// use [`ContentBlock::tool_result_blocks`].
@@ -271,15 +258,6 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// A usage carrying only `input_tokens`.
-    // qual:test_helper
-    pub fn with_input_tokens(input_tokens: u64) -> Self {
-        Usage {
-            input_tokens: Some(input_tokens),
-            ..Usage::default()
-        }
-    }
-
     /// The size of the previous request as the server reported it: the sum
     /// of all four figures, absent ones counted as 0. A lower bound for the
     /// token estimate (ADR-0036). `None` when `input_tokens` is absent - a
@@ -295,38 +273,5 @@ impl Usage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---- context_floor/1 ----
-
-    #[test]
-    fn context_floor_sums_all_four_figures() {
-        let usage = Usage {
-            input_tokens: Some(200),
-            output_tokens: Some(300),
-            cache_read_input_tokens: Some(90_000),
-            cache_creation_input_tokens: Some(1_500),
-        };
-        assert_eq!(usage.context_floor(), Some(92_000));
-    }
-
-    #[test]
-    fn context_floor_counts_absent_figures_as_zero() {
-        assert_eq!(Usage::with_input_tokens(200).context_floor(), Some(200));
-    }
-
-    #[test]
-    fn context_floor_is_none_without_input_tokens() {
-        // A usage map without input_tokens is no signal, not a zero floor -
-        // even when the cache figures are present.
-        assert_eq!(Usage::default().context_floor(), None);
-        let cache_only = Usage {
-            input_tokens: None,
-            output_tokens: Some(300),
-            cache_read_input_tokens: Some(90_000),
-            cache_creation_input_tokens: Some(1_500),
-        };
-        assert_eq!(cache_only.context_floor(), None);
-    }
-}
+#[path = "../tests/unit/content.rs"]
+mod tests;

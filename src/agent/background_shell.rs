@@ -79,6 +79,10 @@ pub enum ShellStatus {
 /// completed/failed. `exit_code` is the process exit status (`None` if killed by a
 /// signal or never spawned); `signalled` is whether a signal terminated it;
 /// `spawn_error` carries the OS error text when the child could not start at all.
+///
+/// `Default` represents a spawn failure with no additional context (no exit
+/// code, no signal, no spawn error string), used as the struct-update base.
+#[derive(Default)]
 pub struct ShellOutcome {
     pub exit_code: Option<i32>,
     pub signalled: bool,
@@ -222,9 +226,7 @@ impl AgentState {
         let entry = self.background_shells.get_mut(&id)?;
         if !matches!(entry.status, ShellStatus::Running) {
             let status = shell_status_word(&entry.status);
-            return Some(format!(
-                "Error: Background agent \"{id}\" is not running (status: {status})."
-            ));
+            return Some(super::background_not_running_error(&id, status));
         }
 
         // Signal the whole process group so the child + its grandchildren die, not
@@ -239,14 +241,7 @@ impl AgentState {
         // Queue the terminal `was cancelled` notification synchronously with an
         // EMPTY result (no `<result>` tag) - the killpg means no
         // `BackgroundShellDone` will arrive to carry an outcome.
-        let notification = task_notification(&id, "cancelled", &command, "");
-        self.notifications.push(notification.clone());
-        super::log_entry(self, LogEntry::UserText(notification.clone()));
-        super::broadcast(self, Event::background_notification(notification));
-        super::broadcast(
-            self,
-            Event::background_task_finished(id.clone(), "cancelled"),
-        );
+        super::emit_cancelled_notification(self, &id, &command);
 
         Some(format!(
             "Cancellation requested for background agent \"{id}\". A final \
@@ -407,9 +402,8 @@ fn spawn_detached_shell(
                 }
             }
             Err(err) => ShellOutcome {
-                exit_code: None,
-                signalled: false,
                 spawn_error: Some(err.to_string()),
+                ..Default::default()
             },
         };
 
@@ -436,12 +430,5 @@ fn spawn_detached_shell(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mint_shell_id_is_bg_n() {
-        assert_eq!(mint_shell_id(1), "bg_1");
-        assert_eq!(mint_shell_id(7), "bg_7");
-    }
-}
+#[path = "../../tests/unit/agent/background_shell.rs"]
+mod tests;
