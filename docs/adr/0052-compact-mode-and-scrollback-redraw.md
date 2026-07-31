@@ -31,7 +31,16 @@ effect on each item, faithful to qwen:
 - **ToolCall / ToolResult / User / Assistant / Info / Marker**: untouched (they
   are single header/text rows already, or not a tool result body).
 
-### The scrollback-redraw seam (`Effect::RedrawScrollback`)
+### The scrollback-redraw seam (`Effect::RedrawScrollback`) — RETIRED
+
+> **Retired by the fullscreen model (ADR-0046).** The whole seam below exists only
+> because the inline port froze committed rows in native scrollback. Under the
+> fullscreen alt-screen model the app redraws the ENTIRE transcript from the model
+> every frame, so flipping `Screen::compact_mode` re-renders every item at the new
+> compact for free - there is no frozen prefix, no `Effect::RedrawScrollback`, no
+> degraded fallback, and no upstream ratatui blocker. `Effect::RedrawScrollback`
+> and `ui::redraw_scrollback` are DELETED. The rest of this section and the SPIKE
+> below are kept as historical record of the abandoned inline design.
 
 Committed Thinking/tool rows are frozen in native scrollback (ADR-0046's
 `insert_before`); a compact toggle can't un-draw them, which would split-brain the
@@ -98,7 +107,12 @@ exists in crossterm).
   down by roughly one segment's width (a test threshold moved 70 → 66 cols).
 - **Revised in place:** ADR-0046 (Ctrl-T retirement completed; thought-subject
   fallback divergence recorded).
-- The committed==pending identity (ADR-0046) is extended with a compact variant:
-  both paths hide/fold through the same `message_lines` compact branch, so a
-  RedrawScrollback re-blit at the new compact matches the pending region
-  cell-for-cell in WHAT it chooses to draw.
+- **Retired by ADR-0046's fullscreen model:** `Effect::RedrawScrollback`,
+  `ui::redraw_scrollback`, and `Transcript::compact_toggle_has_visual_effect()`.
+  Flipping `compact_mode` needs no effect - the next full-frame redraw renders the
+  whole transcript at the new compact. The `Toggles { compact }` cache key and the
+  per-item compact effects (Thinking hidden, tool result bodies folded) are
+  UNCHANGED; only the scrollback-reconciliation seam is gone.
+- The compact item-effects still flow through the ONE `message_lines` →
+  `RenderCache` → `grouped_rows` path the whole-transcript render draws, so compact
+  is applied uniformly to every item each frame by construction.
