@@ -241,12 +241,26 @@ pub(crate) fn decode_tool_input(json: &str) -> Value {
     }
 }
 
-/// Parses a models-list response body into `data[].id` (ADR-0002 amendment).
-/// The wire shape (`{"data": [{"id": …}]}`) is common to the Anthropic and
-/// OpenAI REST APIs, so one parse serves both adapters; entries without a
-/// string `id` are skipped leniently, and missing or empty `data` is
-/// `Ok(vec![])`. A body that isn't JSON is an `Err`.
-pub(crate) fn models_from_body(body: &str) -> Result<Vec<String>, String> {
+/// One model a Provider's models endpoint reported (ADR-0037): its bare id and,
+/// when the host surfaces it, its live context window (`meta.n_ctx`). llama.cpp
+/// and LM Studio report the REAL loaded window here, so a custom Provider's Model
+/// can take its window from the server rather than a config guess. `None` when
+/// the host omits `meta.n_ctx` (most cloud hosts do), and the config/fallback
+/// window covers that case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub context_window: Option<u64>,
+}
+
+/// Parses a models-list response body into its [`DiscoveredModel`]s (ADR-0002
+/// amendment, ADR-0037): each entry's `data[].id` and, when present,
+/// `data[].meta.n_ctx`. The wire shape (`{"data": [{"id": …, "meta": {"n_ctx":
+/// …}}]}`) is common to the Anthropic and OpenAI REST APIs, so one parse serves
+/// both adapters; entries without a string `id` are skipped leniently, order is
+/// preserved, and missing or empty `data` is `Ok(vec![])`. A body that isn't JSON
+/// is an `Err`.
+pub(crate) fn models_from_body(body: &str) -> Result<Vec<DiscoveredModel>, String> {
     let value: Value = serde_json::from_str(body).map_err(|e| format!("request_failed: {e}"))?;
     Ok(value
         .get("data")
@@ -254,8 +268,17 @@ pub(crate) fn models_from_body(body: &str) -> Result<Vec<String>, String> {
         .map(|entries| {
             entries
                 .iter()
-                .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
-                .map(str::to_string)
+                .filter_map(|e| {
+                    let id = e.get("id").and_then(|id| id.as_str())?;
+                    let context_window = e
+                        .get("meta")
+                        .and_then(|m| m.get("n_ctx"))
+                        .and_then(|n| n.as_u64());
+                    Some(DiscoveredModel {
+                        id: id.to_string(),
+                        context_window,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default())
@@ -294,8 +317,9 @@ pub trait Llm: Send + Sync {
         on_event: &mut OnEvent<'_>,
     ) -> Response;
 
-    /// Lists the model identifiers `provider` offers
-    /// (`GET {base_url}/models`).
+    /// Lists the models `provider` offers (`GET {base_url}/models`) as
+    /// [`DiscoveredModel`]s - each bare id plus its server-reported window when
+    /// the host surfaces one.
     ///
     /// Unlike [`complete`], this RETURNS a `Result` rather than folding failure
     /// into a Response (ADR-0002 amendment, ADR-0033): it is a discrete,
@@ -306,7 +330,7 @@ pub trait Llm: Send + Sync {
     /// response with no `data` is `Ok(vec![])`.
     ///
     /// [`complete`]: Llm::complete
-    async fn list_models(&self, provider: &Provider) -> Result<Vec<String>, String>;
+    async fn list_models(&self, provider: &Provider) -> Result<Vec<DiscoveredModel>, String>;
 }
 
 /// The total cap on one [`Llm::list_models`] request. Discovery is a
@@ -415,7 +439,13 @@ pub async fn offerings(llm: &dyn Llm, providers: &[Provider]) -> Vec<ProviderMod
     for p in providers {
         if p.custom {
             match llm.list_models(p).await {
-                Ok(models) => listings.push(ProviderModels::listed(&p.id, models)),
+                // The picker needs only the ids; the server-reported window rides
+                // discovery for the launch/swap enrichment (ADR-0037), not the
+                // selector rows.
+                Ok(models) => {
+                    let ids = models.into_iter().map(|m| m.id).collect();
+                    listings.push(ProviderModels::listed(&p.id, ids));
+                }
                 Err(_) => listings.push(ProviderModels::unreachable(&p.id)),
             }
         } else if !p.token.is_empty() {
@@ -488,7 +518,7 @@ impl Llm for Dispatcher {
         }
     }
 
-    async fn list_models(&self, provider: &Provider) -> Result<Vec<String>, String> {
+    async fn list_models(&self, provider: &Provider) -> Result<Vec<DiscoveredModel>, String> {
         match provider.api {
             Api::AnthropicMessages => anthropic_messages::list_models(provider).await,
             Api::OpenaiCompletions => openai_completions::list_models(provider).await,
@@ -522,6 +552,15 @@ mod tests {
 
     fn model(provider: &str, api: Api) -> Model {
         Model::new(provider, "m", api, 64_000, 100)
+    }
+
+    /// A windowless [`DiscoveredModel`] - the common scripted case where a test
+    /// only cares about the id the picker shows.
+    fn disc(id: &str) -> DiscoveredModel {
+        DiscoveredModel {
+            id: id.to_string(),
+            context_window: None,
+        }
     }
 
     fn no_op() -> impl FnMut(&StreamEvent) + Send {
@@ -562,8 +601,8 @@ mod tests {
     async fn offerings_discovers_customs_live_and_lists_credentialed_builtins_from_the_catalog() {
         use crate::test_support::FakeLlm;
 
-        let fake = FakeLlm::script(std::iter::empty())
-            .with_models(vec![Ok(vec!["m1".to_string(), "m2".to_string()])]);
+        let fake =
+            FakeLlm::script(std::iter::empty()).with_models(vec![Ok(vec![disc("m1"), disc("m2")])]);
         let providers = vec![
             provider("local", Api::AnthropicMessages),
             builtin("anthropic", "sk-test"),
@@ -644,7 +683,7 @@ mod tests {
         // what it can, and the down host stays visible as unavailable rather
         // than vanishing silently (ADR-0037 Stage F).
         let fake = FakeLlm::script(std::iter::empty())
-            .with_models(vec![Err("down".to_string()), Ok(vec!["m1".to_string()])]);
+            .with_models(vec![Err("down".to_string()), Ok(vec![disc("m1")])]);
         let providers = vec![
             provider("a-local", Api::AnthropicMessages),
             provider("b-local", Api::AnthropicMessages),
@@ -712,7 +751,44 @@ mod tests {
             r#"{ "data": [{ "id": "a" }, { "id": 7 }, { "name": "no-id" }, { "id": "b" }] }"#;
         assert_eq!(
             models_from_body(body),
-            Ok(vec!["a".to_string(), "b".to_string()])
+            Ok(vec![
+                DiscoveredModel {
+                    id: "a".to_string(),
+                    context_window: None,
+                },
+                DiscoveredModel {
+                    id: "b".to_string(),
+                    context_window: None,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn models_from_body_reads_the_server_window_from_meta_n_ctx() {
+        // llama.cpp/LM Studio surface the loaded window here; a missing meta or
+        // n_ctx leaves the window None (the config/fallback covers it).
+        let body = r#"{ "data": [
+            { "id": "a", "meta": { "n_ctx": 145664, "n_ctx_train": 262144 } },
+            { "id": "b", "meta": {} },
+            { "id": "c" }
+        ] }"#;
+        assert_eq!(
+            models_from_body(body),
+            Ok(vec![
+                DiscoveredModel {
+                    id: "a".to_string(),
+                    context_window: Some(145_664),
+                },
+                DiscoveredModel {
+                    id: "b".to_string(),
+                    context_window: None,
+                },
+                DiscoveredModel {
+                    id: "c".to_string(),
+                    context_window: None,
+                },
+            ])
         );
     }
 
@@ -785,15 +861,12 @@ mod tests {
         use crate::test_support::FakeLlm;
 
         let fake = FakeLlm::script(std::iter::empty()).with_models(vec![
-            Ok(vec!["m1".to_string(), "m2".to_string()]),
+            Ok(vec![disc("m1"), disc("m2")]),
             Err("boom".to_string()),
         ]);
         let p = provider("local", Api::AnthropicMessages);
 
-        assert_eq!(
-            fake.list_models(&p).await,
-            Ok(vec!["m1".to_string(), "m2".to_string()])
-        );
+        assert_eq!(fake.list_models(&p).await, Ok(vec![disc("m1"), disc("m2")]));
         assert_eq!(fake.list_models(&p).await, Err("boom".to_string()));
         // Exhausted queue falls back to the benign empty list.
         assert_eq!(fake.list_models(&p).await, Ok(vec![]));

@@ -25,7 +25,9 @@ use crate::llm::model::Model;
 use crate::llm::provider::Provider;
 use crate::llm::response::Response;
 use crate::llm::throttle::{Decision, Throttle, monotonic_ms};
-use crate::llm::{Delta, LlmRequest, OnEvent, StreamEvent, emit, models_from_body};
+use crate::llm::{
+    Delta, DiscoveredModel, LlmRequest, OnEvent, StreamEvent, emit, models_from_body,
+};
 use stream::{SseEvent, StreamState};
 
 /// Minimum ms between streaming updates. At ~30fps the UI stays responsive to
@@ -109,7 +111,7 @@ pub(super) async fn complete(
 /// The models-list shape is common to the Anthropic and OpenAI REST APIs
 /// (`{"data": [{"id": …}]}`); the Anthropic headers ride because this adapter
 /// owns them.
-pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, String> {
+pub(super) async fn list_models(provider: &Provider) -> Result<Vec<DiscoveredModel>, String> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
 
     // The discovery cap (see [`super::DISCOVERY_TIMEOUT`]): a blackholed
@@ -779,6 +781,15 @@ mod tests {
             .await;
     }
 
+    /// A windowless [`DiscoveredModel`] - the shape a host reports when it omits
+    /// `meta.n_ctx` (the common case for these adapter tests).
+    fn disc(id: &str) -> DiscoveredModel {
+        DiscoveredModel {
+            id: id.to_string(),
+            context_window: None,
+        }
+    }
+
     #[tokio::test]
     async fn list_models_returns_ids_in_order() {
         let server = MockServer::start().await;
@@ -792,7 +803,32 @@ mod tests {
         let result = dispatcher_for(&server)
             .list_models(&provider_for(&server))
             .await;
-        assert_eq!(result, Ok(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(result, Ok(vec![disc("a"), disc("b")]));
+    }
+
+    #[tokio::test]
+    async fn list_models_reads_the_server_window_from_meta_n_ctx() {
+        let server = MockServer::start().await;
+        serve_models(
+            &server,
+            200,
+            json!({ "data": [{ "id": "a", "meta": { "n_ctx": 145664 } }, { "id": "b" }] }),
+        )
+        .await;
+
+        let result = dispatcher_for(&server)
+            .list_models(&provider_for(&server))
+            .await;
+        assert_eq!(
+            result,
+            Ok(vec![
+                DiscoveredModel {
+                    id: "a".to_string(),
+                    context_window: Some(145_664),
+                },
+                disc("b"),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -830,7 +866,7 @@ mod tests {
         let result = dispatcher_for(&server)
             .list_models(&provider_for(&server))
             .await;
-        assert_eq!(result, Ok(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(result, Ok(vec![disc("a"), disc("b")]));
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use wiremock::MockServer;
 use crate::content::ContentBlock;
 use crate::llm::model::Model;
 use crate::llm::response::{Response, StopReason};
-use crate::llm::{Dispatcher, Llm, LlmRequest, StreamEvent};
+use crate::llm::{DiscoveredModel, Dispatcher, Llm, LlmRequest, StreamEvent};
 
 /// Runs `req` through `dispatcher` collecting streaming events, returns them
 /// together with the final Response.
@@ -57,7 +57,7 @@ pub fn assert_complete_is_error(result: Response) {
 
 /// Asserts the list_models error contract: the result is an Err containing
 /// the `request_failed` tag, matching the error algebra (ADR-0002 amendment).
-pub fn assert_list_models_request_failed(result: Result<Vec<String>, String>) {
+pub fn assert_list_models_request_failed(result: Result<Vec<DiscoveredModel>, String>) {
     assert!(result.is_err(), "expected Err, got {result:?}");
     assert!(result.unwrap_err().contains("request_failed"));
 }

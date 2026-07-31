@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use crate::llm::model::Model;
 use crate::llm::provider::Provider;
 use crate::llm::response::Response;
-use crate::llm::{Llm, LlmRequest, OnEvent};
+use crate::llm::{DiscoveredModel, Llm, LlmRequest, OnEvent};
 
 /// The sink the new running total (in dollars) is pushed through after every
 /// priced call.
@@ -65,7 +65,7 @@ impl Llm for Metered {
         response
     }
 
-    async fn list_models(&self, provider: &Provider) -> Result<Vec<String>, String> {
+    async fn list_models(&self, provider: &Provider) -> Result<Vec<DiscoveredModel>, String> {
         self.inner.list_models(provider).await
     }
 }

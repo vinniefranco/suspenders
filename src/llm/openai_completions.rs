@@ -27,7 +27,9 @@ use crate::llm::model::Model;
 use crate::llm::provider::Provider;
 use crate::llm::response::Response;
 use crate::llm::throttle::{Decision, Throttle, monotonic_ms};
-use crate::llm::{Delta, LlmRequest, OnEvent, StreamEvent, emit, models_from_body};
+use crate::llm::{
+    Delta, DiscoveredModel, LlmRequest, OnEvent, StreamEvent, emit, models_from_body,
+};
 use stream::{SseEvent, StreamState};
 
 /// Minimum ms between streaming updates. At ~30fps the UI stays responsive to
@@ -119,7 +121,7 @@ pub(super) async fn complete(
 /// The read-only models listing (`GET {base_url}/models`, ADR-0002 amendment)
 /// with Bearer auth. The response shape is the one both REST APIs share;
 /// [`models_from_body`] owns the parse.
-pub(super) async fn list_models(provider: &Provider) -> Result<Vec<String>, String> {
+pub(super) async fn list_models(provider: &Provider) -> Result<Vec<DiscoveredModel>, String> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
 
     // The discovery cap (see [`super::DISCOVERY_TIMEOUT`]): a blackholed
@@ -727,7 +729,19 @@ mod tests {
         let result = dispatcher_for(&server)
             .list_models(&provider_for(&server))
             .await;
-        assert_eq!(result, Ok(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            result,
+            Ok(vec![
+                DiscoveredModel {
+                    id: "a".to_string(),
+                    context_window: None,
+                },
+                DiscoveredModel {
+                    id: "b".to_string(),
+                    context_window: None,
+                },
+            ])
+        );
 
         let received = &server.received_requests().await.unwrap()[0];
         assert_eq!(

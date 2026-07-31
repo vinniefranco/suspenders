@@ -80,12 +80,14 @@ on the run-limit marker. No new bound is introduced.
 ### The skip flag
 
 `skip_next_speaker` (session fact, `SUSPENDERS_SKIP_NEXT_SPEAKER`, file
-`skip_next_speaker`, default `false` = the check runs) mirrors qwen-code's
-`getSkipNextSpeakerCheck`. When `true` a no-tool-call Pass finishes immediately
-with no check and no side-query - the pre-check behavior. The test config
-(`SessionConfig::test_defaults`) sets it `true` so the loop and agent tests
-exercise the tool loop without a side-query firing on every text reply; the
-check's own behavior is covered by the tests that opt back in.
+`skip_next_speaker`, default `true` = the check is skipped) mirrors qwen-code's
+`getSkipNextSpeakerCheck`, which defaults to `true`. When `true` a no-tool-call
+Pass finishes immediately with no check and no side-query - the pre-check
+behavior. When `false` the check runs (the mechanic this ADR describes). The
+test config (`SessionConfig::test_defaults`) also has it `true` so the loop and
+agent tests exercise the tool loop without a side-query firing on every text
+reply; the check's own behavior is covered by the tests that opt back in with
+`skip_next_speaker: Some(false)`.
 
 ## Consequences
 

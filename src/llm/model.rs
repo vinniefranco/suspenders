@@ -165,6 +165,21 @@ fn wire_output_cap(reported: u64, context_window: u64) -> u64 {
     reported.min(context_window / 2)
 }
 
+/// Rebuilds `model` on a server-reported context window (ADR-0037: the server's
+/// live `n_ctx` is authoritative for a custom Provider's Model, above config and
+/// fallback). The `max_tokens` invariant is re-established against the new
+/// window: it is derived from `reported_max_tokens` (the config `max_tokens`
+/// knob, the same reported ceiling `resolve` fed [`wire_output_cap`]) so it still
+/// leaves prompt room inside the window. Every other Model fact is preserved -
+/// only the window and its dependent cap move.
+pub(crate) fn with_server_window(model: &Model, window: u64, reported_max_tokens: u64) -> Model {
+    Model {
+        context_window: window,
+        max_tokens: wire_output_cap(reported_max_tokens, window),
+        ..model.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +344,24 @@ mod tests {
         );
         let api: Api = serde_json::from_str("\"anthropic-messages\"").unwrap();
         assert_eq!(api, Api::AnthropicMessages);
+    }
+
+    // ---- with_server_window ----
+
+    #[test]
+    fn with_server_window_overrides_the_window_and_rederives_the_cap() {
+        // The host's live window replaces the resolved one; the dependent
+        // output cap re-derives against it (still leaving prompt room).
+        let base = Model::new("local", "m", Api::AnthropicMessages, 64_000, 8_000);
+
+        // A wide window leaves a comfortably small reported cap untouched.
+        let wide = with_server_window(&base, 145_664, 8_000);
+        assert_eq!(wide.context_window, 145_664);
+        assert_eq!(wide.max_tokens, 8_000); // 8000 <= 145664/2
+
+        // A narrow window clamps the cap to half the window.
+        let narrow = with_server_window(&base, 10_000, 8_000);
+        assert_eq!(narrow.context_window, 10_000);
+        assert_eq!(narrow.max_tokens, 5_000); // 10000/2
     }
 }

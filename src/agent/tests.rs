@@ -1501,8 +1501,16 @@ async fn list_models_discovers_each_custom_provider_live() {
     // assertion pins only the custom listing (the hermetic Ok/Err matrix
     // lives with `offerings` itself).
     let dir = TempDir::new().unwrap();
-    let fake =
-        FakeLlm::script(vec![]).with_models(vec![Ok(vec!["a/model".into(), "b/model".into()])]);
+    let fake = FakeLlm::script(vec![]).with_models(vec![Ok(vec![
+        crate::llm::DiscoveredModel {
+            id: "a/model".into(),
+            context_window: None,
+        },
+        crate::llm::DiscoveredModel {
+            id: "b/model".into(),
+            context_window: None,
+        },
+    ])]);
     let agent = start(session_in(&dir), fake);
 
     let listings = agent.list_models().await.unwrap();

@@ -91,8 +91,9 @@ A Provider is data - no subclassing, one shared shape:
 - **Custom Providers** are declared in the `providers` table and discover
   their models live via `GET {base_url}/models` (the ADR-0002 amendment
   machinery, now per Provider), synthesizing Models whose window comes from
-  config. Host variance within an Api is expressed as per-Model compat
-  facts, following pi's compat-flag design.
+  the server's reported `meta.n_ctx` when the host surfaces it (see the
+  window precedence below), else from config. Host variance within an Api is
+  expressed as per-Model compat facts, following pi's compat-flag design.
 
 The Catalog is generated from models.dev by a committed generator binary
 (`cargo run --bin generate-models`), filtered to Providers whose models
@@ -137,10 +138,26 @@ Model it captured; nothing swaps mid-flight. Compaction runs on the same
 captured figures.
 
 The precedence (implemented in Stage E): a Model's window is the Catalog's
-figure for a known built-in model, else its Provider's config
-`context_window` (the per-provider entry beats the global figure for that
-Provider's models), else the config `context_budget` figure, else the
-64K default. The effective Context Budget for a Run is then
+figure for a known built-in model, else - for a custom Provider - the
+server-reported live window, else its Provider's config `context_window`
+(the per-provider entry beats the global figure for that Provider's models),
+else the config `context_budget` figure, else the 64K default.
+
+The server-reported window is authoritative for a custom Provider's Model
+("server wins, period"): the models endpoint surfaces each model's real
+loaded window at `data[].meta.n_ctx` (llama.cpp and LM Studio both do), and
+that live figure overrides even an explicitly-set config `context_window` -
+the config was always a guess, the server knows. Discovery is a network
+call, so it cannot run in the sync `model::resolve`/`Session::resolve_model`
+path; instead an async enrichment layer (`Session::enrich_model_window`)
+runs at every point the Active Model is captured - launch, a `/model` swap,
+and a subagent spawn - re-deriving the wire output cap against the new
+window so the prompt-room invariant below still holds. A discovery failure
+(or a host that reports no `n_ctx` for the id) is never fatal: the
+sync-resolved config/fallback window stands, so a down host still runs. The
+base config ships the local Provider with NO `context_window` so nothing
+shadows the server value; the fallback covers the server-silent case. The
+effective Context Budget for a Run is then
 `min(context_budget, window)` when the config key is set, and the window
 alone when it is not - the key is a cap and a fallback, never the budget
 itself. A Provider is trusted to report whatever output ceiling it likes -
