@@ -48,3 +48,19 @@ What is superseded: "the wire protocol" singular, and `complete` taking
 wire JSON built outside the trait - each adapter now owns its wire format
 end to end, and callers speak only typed domain structs. `list_models`
 becomes per-Provider, serving custom Providers' live discovery.
+
+## Amendment (ADR-0059): tool_result content is a block array
+
+A Tool Result's content is now a `Vec<ResultBlock>` (ADR-0059), and its
+Anthropic wire form is an ARRAY - `{type:"text",text}` /
+`{type:"image",source:{type:"base64",media_type,data}}` /
+`{type:"document",source:{...}}` - not a string. The internal `ResultBlock`
+enum's serde form (`{type:"image",data}`) is NOT the wire shape, so
+`wire_message` no longer serializes a ToolResult through the derive: it
+special-cases the block and builds the array through an explicit
+`wire_tool_result_content` visitor. This is the same discipline the rest of
+the boundary already follows - typed domain structs in, wire JSON built by
+the adapter, never a leaky derive. Media only rides here when the target
+Model's `input_modalities` accept it; the degrade pass (ADR-0037 amendment,
+ADR-0059) has already replaced unsupported media with a text placeholder
+upstream.

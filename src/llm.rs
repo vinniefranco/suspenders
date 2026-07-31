@@ -43,8 +43,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::content::{ContentBlock, Message};
-use crate::tool::ToolSpec;
+use crate::content::{ContentBlock, Message, ToolSpec};
 use model::{Api, Model};
 use provider::Provider;
 use response::Response;
@@ -473,6 +472,12 @@ impl Llm for Dispatcher {
         // matches `model` replays verbatim; the rest is normalized to the
         // target Api's tool-id rules with orphaned Tool Calls answered.
         let request = transform::normalize_request(request, model);
+        // The media-degrade pass (ADR-0059), run right after normalize so both
+        // adapters get it for free: a Tool Result image/PDF block the target
+        // Model cannot accept becomes the verbatim unsupported-modality
+        // placeholder. The cross-Model-history safety net (read-time degrade in
+        // read_file is P3 3b).
+        let request = transform::degrade_unsupported_media(request, model);
         match model.api {
             Api::AnthropicMessages => {
                 anthropic_messages::complete(&request, model, provider, on_event).await

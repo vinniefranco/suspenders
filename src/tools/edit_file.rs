@@ -406,11 +406,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx(root: &std::path::Path) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), 10_000)
     }
 
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -914,6 +910,29 @@ mod tests {
             )
             .await,
             Err("path escapes project root".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn edits_a_file_inside_the_trusted_memory_root() {
+        // P5, ADR-0062: edit_file reaches a memory file through the shared path
+        // seam, outside the Project Root, so the model can update its memory.
+        let proj = TempDir::new().unwrap();
+        let mem = TempDir::new().unwrap();
+        let mut c = ctx(proj.path());
+        c.memory_root = Some(mem.path().to_path_buf());
+
+        let abs = mem.path().join("user.md");
+        std::fs::write(&abs, "type: user\nold body").unwrap();
+        run(
+            json!({"path": abs.to_str().unwrap(), "old_str": "old body", "new_str": "new body"}),
+            &c,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            "type: user\nnew body"
         );
     }
 

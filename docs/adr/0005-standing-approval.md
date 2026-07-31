@@ -10,4 +10,6 @@ Considered and rejected:
 - **Prefix or glob matching** (`cargo test*` covers `cargo test --seed 0 && rm -rf /`). Every widening rule is a place where the model can compose an unapproved command out of an approved stem. String equality is the only rule with no such seam.
 - **Persisting Standing Approvals across Sessions.** A Session-scoped grant matches the Session-scoped Conversation; persistence adds a config surface and a stale-trust problem (the project's test alias may have changed since the grant).
 
+Tool-initiated Approval path (ADR-0055): the batch gate is not the only way an Approval can originate. A later phase lets a Tool Call initiate its own Approval through the `Approver` capability on the `ToolCtx`; it relays over the same Agent mpsc and shows the same exact `command` string, so Standing Approval matching (string equality) is identical on both paths. The gate policy here is unchanged - P1b lands the `Approver` seam but does not alter approval behavior; the batch gate remains the sole approval path until that later phase.
+
 Consequence: users approve each distinct command string once per Session, including trivially different variants. That repetition is the accepted cost of a matching rule with no widening seam.

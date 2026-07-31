@@ -1107,6 +1107,13 @@ async fn run_agent_command(
             screen.approval_mode = agent.cycle_approval_mode().await;
             screen
         }
+        AgentCommand::AnswerQuestion(id, answers) => {
+            // Forward the user's picks (or the decline) to the parked tool call's
+            // reply oneshot (ADR-0057). Fire-and-forget like Approve; the Agent
+            // emits `question_resolved` once the tool reads the reply.
+            agent.answer_question(id, answers).await;
+            screen
+        }
         AgentCommand::Cancel => {
             agent.cancel().await;
             screen

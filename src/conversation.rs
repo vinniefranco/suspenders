@@ -400,7 +400,7 @@ fn message_chars(msg: &Message) -> usize {
 fn block_chars(block: &ContentBlock) -> usize {
     match block {
         ContentBlock::Text { text } => text.chars().count(),
-        ContentBlock::ToolResult { content, .. } => content.chars().count(),
+        ContentBlock::ToolResult { content, .. } => content.iter().map(result_block_chars).sum(),
         ContentBlock::ToolUse { name, input, .. } => {
             name.chars().count()
                 + serde_json::to_string(input)
@@ -409,6 +409,20 @@ fn block_chars(block: &ContentBlock) -> usize {
                     .count()
         }
         ContentBlock::Thinking { .. } => 0,
+    }
+}
+
+/// The char cost of one Tool Result block for the context/compaction estimate.
+/// A Text block counts its own chars; a media block counts its base64 `data`
+/// length - the real wire payload is multi-MB base64, so counting the short
+/// `[image: mime]` text projection would wildly under-estimate context once
+/// media flows (latent today: the Catalog's modalities are all-false, so media
+/// degrades to text before the wire, but the estimate must be right by shape).
+fn result_block_chars(block: &crate::content::ResultBlock) -> usize {
+    use crate::content::ResultBlock;
+    match block {
+        ResultBlock::Text { text } => text.chars().count(),
+        ResultBlock::Image { data, .. } | ResultBlock::Document { data, .. } => data.len(),
     }
 }
 

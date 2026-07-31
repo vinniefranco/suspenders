@@ -12,9 +12,10 @@
 use serde_json::{Map, Value, json};
 
 use crate::content::Message;
+use crate::content::ToolSpec;
+use crate::content::{ContentBlock, ResultBlock};
 use crate::llm::LlmRequest;
 use crate::llm::model::Model;
-use crate::tool::ToolSpec;
 
 /// Builds the complete Anthropic Messages API payload as JSON.
 ///
@@ -83,15 +84,66 @@ pub fn wire_tool(spec: &ToolSpec) -> Value {
     })
 }
 
-/// Converts one message to a wire-format map: role plus content blocks, whose
-/// serde shapes (the `#[serde(tag = "type")]` content-block enum) match the
-/// Anthropic wire exactly. Built field by field, NOT by serializing the whole
-/// [`Message`]: Provenance (ADR-0037) is a Suspenders fact and never rides
-/// the wire.
+/// Converts one message to a wire-format map: role plus content blocks. Text,
+/// tool_use, and thinking blocks match the `#[serde(tag = "type")]` derive
+/// exactly, but a ToolResult's `content` is our internal [`ResultBlock`] list
+/// (ADR-0059) whose media variants serialize as `{type:"image",data}` - NOT the
+/// Anthropic `source.base64` shape. So ToolResult is special-cased through the
+/// explicit [`wire_tool_result_content`] visitor (ADR-0002); the other blocks
+/// pass through the derive. Built field by field, NOT by serializing the whole
+/// [`Message`]: Provenance (ADR-0037) is a Suspenders fact and never rides the
+/// wire.
 pub fn wire_message(message: &Message) -> Value {
+    let content: Vec<Value> = message.content.iter().map(wire_block).collect();
     json!({
         "role": message.role,
-        "content": message.content,
+        "content": content,
+    })
+}
+
+/// One content block on the Anthropic wire. Every variant but ToolResult matches
+/// the derive; ToolResult's block-list content is built explicitly so media
+/// reaches the wire in the `source.base64` shape.
+fn wire_block(block: &ContentBlock) -> Value {
+    match block {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "is_error": is_error,
+            "content": wire_tool_result_content(content),
+        }),
+        other => serde_json::to_value(other).expect("content block serializes to JSON"),
+    }
+}
+
+/// The Anthropic `tool_result.content` array (ADR-0002, ADR-0059): each
+/// [`ResultBlock`] as a wire block. A Text block is `{type:"text",text}`; media
+/// rides as `{type,source:{type:"base64",media_type,data}}` - image as `image`,
+/// PDF as `document`. The wire-build-time degrade pass ([`crate::llm::transform`])
+/// has already replaced any media the target Model cannot accept with a Text
+/// placeholder, so a media block reaching here is one the Model supports.
+pub fn wire_tool_result_content(blocks: &[ResultBlock]) -> Value {
+    Value::Array(
+        blocks
+            .iter()
+            .map(|block| match block {
+                ResultBlock::Text { text } => json!({ "type": "text", "text": text }),
+                ResultBlock::Image { mime, data } => base64_media("image", mime, data),
+                ResultBlock::Document { mime, data } => base64_media("document", mime, data),
+            })
+            .collect(),
+    )
+}
+
+// One base64 media block in the Anthropic `source` shape.
+fn base64_media(block_type: &str, mime: &str, data: &str) -> Value {
+    json!({
+        "type": block_type,
+        "source": { "type": "base64", "media_type": mime, "data": data },
     })
 }
 
@@ -161,6 +213,8 @@ mod tests {
 
     #[test]
     fn wire_message_tool_result_block() {
+        // ADR-0059: tool_result content is a block ARRAY, a single Text block in
+        // the common case - the explicit visitor, not the derive.
         let msg = Message::user(vec![ContentBlock::tool_result("tu_1", "done", false)]);
         assert_eq!(
             wire_message(&msg),
@@ -169,10 +223,42 @@ mod tests {
                 "content": [{
                     "type": "tool_result",
                     "tool_use_id": "tu_1",
-                    "content": "done",
-                    "is_error": false
+                    "is_error": false,
+                    "content": [{ "type": "text", "text": "done" }]
                 }]
             })
+        );
+    }
+
+    #[test]
+    fn wire_tool_result_media_rides_as_anthropic_source_base64() {
+        // ADR-0002/0059: an image block reaches the wire as the Anthropic
+        // `source.base64` shape (image), a PDF as `document`; our internal
+        // `{type,data}` form never rides.
+        let blocks = vec![
+            ResultBlock::text("here it is"),
+            ResultBlock::Image {
+                mime: "image/png".into(),
+                data: "AAAA".into(),
+            },
+            ResultBlock::Document {
+                mime: "application/pdf".into(),
+                data: "BBBB".into(),
+            },
+        ];
+        assert_eq!(
+            wire_tool_result_content(&blocks),
+            json!([
+                { "type": "text", "text": "here it is" },
+                {
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" }
+                },
+                {
+                    "type": "document",
+                    "source": { "type": "base64", "media_type": "application/pdf", "data": "BBBB" }
+                }
+            ])
         );
     }
 

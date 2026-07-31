@@ -81,6 +81,12 @@ pub struct Session {
     pub skip_next_speaker: bool,
     pub command_timeout_ms: u64,
     pub session_dir: String,
+    /// The managed-auto-memory root (P5, ADR-0062): where the model's memory
+    /// files live, resolved once at launch via [`default_memory_root`]. Threaded
+    /// into every [`ToolCtx`] so the shared path seam extends confinement to
+    /// this subtree (the trust-path allowance), and read by `init_agent` to
+    /// build the memory prompt suffix and mkdir the dir.
+    pub memory_root: String,
     /// The resolved Provider set (ADR-0037): custom Providers from config,
     /// built-ins from the generated Catalog with their environment credentials.
     pub providers: Vec<Provider>,
@@ -113,6 +119,13 @@ pub struct Session {
     /// The output cap for Models the Catalog does not know (the config knob):
     /// the synthesis fallback when a scoped id resolves at `/model` time.
     pub max_tokens: u64,
+    /// The configured MCP servers, keyed by user-chosen name (F8, ADR-0056):
+    /// each an external tool server the Agent attaches once at startup. A
+    /// file-only map like `providers` (structure the env cannot express). Empty
+    /// when the user configures none. Each entry's transport is validated at
+    /// build (a malformed entry is a LOUD launch failure); the attach itself is
+    /// fail-open (a server that will not connect is skipped, not fatal).
+    pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
 }
 
 /// Raised (returned) when a Session's fixed facts fail validation. The message
@@ -130,6 +143,9 @@ pub struct SessionConfig {
     /// the env cannot express. A custom entry shadows a built-in with the
     /// same id.
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// The MCP servers, keyed by user-chosen name (F8, ADR-0056): a file-only
+    /// map like `providers`. Default empty; overlaid (replace) by the file.
+    pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
     /// The scoped `provider/model-id` the launch Model resolves from.
     pub model: String,
     /// The configured Theme name (ADR-0038): a built-in (`dark`, `light`) or a
@@ -229,6 +245,9 @@ impl SessionConfig {
                     token: None,
                 },
             )]),
+            // No MCP servers out of the box (F8, ADR-0056): the user adds them
+            // by hand. Empty means the Agent attaches none.
+            mcp_servers: BTreeMap::new(),
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             theme: "dark".into(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -358,6 +377,10 @@ impl SessionConfig {
             // Per-provider tokens are deliberately absent from base(): the
             // template never persists a secret.
             providers: Some(base.providers),
+            // The MCP servers map (F8, ADR-0056): base ships none, so this is an
+            // empty map in the template - the key is present + self-documenting,
+            // the user fills it with `command`/`http_url` entries by hand.
+            mcp_servers: Some(base.mcp_servers),
             model: Some(base.model),
             theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
@@ -509,6 +532,11 @@ pub struct ProviderConfig {
 pub(crate) struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     providers: Option<BTreeMap<String, ProviderConfig>>,
+    /// The MCP servers map (F8, ADR-0056): the Suspenders-native snake_case key
+    /// is `mcp_servers`. qwen-code names the same map `mcpServers` (camelCase);
+    /// the divergence is deliberate - a config port stays in Suspenders' idiom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_servers: Option<BTreeMap<String, crate::mcp::McpServerConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -557,6 +585,7 @@ impl FileConfig {
     /// through `validate()` on the built [`Session`].
     fn apply(&self, cfg: &mut SessionConfig) {
         overlay(&self.providers, &mut cfg.providers);
+        overlay(&self.mcp_servers, &mut cfg.mcp_servers);
         overlay(&self.model, &mut cfg.model);
         overlay(&self.theme, &mut cfg.theme);
         overlay(&self.max_tokens, &mut cfg.max_tokens);
@@ -814,8 +843,14 @@ impl Session {
             .map_err(SessionError)?,
         };
 
+        // The Project Root resolves first: the memory root (P5, ADR-0062)
+        // derives from it, so both land as fixed facts here.
+        let root = opts.root.unwrap_or_else(default_root);
+        let memory_root = default_memory_root(&root);
+
         let session = Session {
-            root: opts.root.unwrap_or_else(default_root),
+            root,
+            memory_root,
             llm_module: opts.llm_module.unwrap_or_else(|| config.llm_module.clone()),
             extensions: opts.extensions.unwrap_or_else(|| config.extensions.clone()),
             context_budget,
@@ -838,6 +873,10 @@ impl Session {
             thinking_budget: opts.thinking_budget.unwrap_or(config.thinking_budget),
             tool_call_style: opts.tool_call_style.unwrap_or(config.tool_call_style),
             max_tokens: config.max_tokens,
+            // The MCP servers ride from config verbatim (F8, ADR-0056): a
+            // file-only map like `providers`, no opts override. Each entry's
+            // transport is validated below.
+            mcp_servers: config.mcp_servers.clone(),
         };
 
         validate(&session)?;
@@ -913,7 +952,7 @@ impl Session {
     /// The ctx every Tool Call executes with: the Project Root, the Result
     /// Cap derived from `model` - the one the Run captured (ADR-0037) - and
     /// the command timeout.
-    pub fn tool_ctx(&self, model: &Model) -> ToolCtx {
+    pub fn tool_ctx(&self, model: &Model, caps: crate::tool::caps::Capabilities) -> ToolCtx {
         ToolCtx {
             root: std::path::PathBuf::from(&self.root),
             result_cap: crate::tools::shaping::cap_for(
@@ -921,6 +960,16 @@ impl Session {
                 self.reply_reserve_for(model),
             ),
             command_timeout_ms: self.command_timeout_ms,
+            // The captured Model's input modalities (ADR-0059): a copied fact,
+            // stamped here like the Result Cap so read_file (P3 3b) can gate media
+            // on it without reaching the llm layer.
+            input_modalities: model.input_modalities,
+            // The trusted memory subtree (P5, ADR-0062): stamped here like the
+            // Result Cap so the shared path seam lets write_file/edit_file/
+            // read_file reach memory files without per-tool duplication. A
+            // resolved subtree, NOT a general escape.
+            memory_root: Some(std::path::PathBuf::from(&self.memory_root)),
+            caps,
         }
     }
 }
@@ -963,14 +1012,7 @@ fn default_root() -> String {
 // XDG spec, a set-but-empty var is treated as unset (else the path degrades to
 // `/suspenders/sessions`).
 fn default_session_dir() -> String {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/.local/share")
-        });
-    format!("{base}/suspenders/sessions")
+    format!("{}/suspenders/sessions", xdg_data_base())
 }
 
 // The user config file lives beside the Session Logs (ADR-0031): XDG config
@@ -986,6 +1028,84 @@ pub fn default_themes_dir() -> String {
     format!("{}/suspenders/themes", xdg_config_base())
 }
 
+/// The user skills directory (ADR-0058): `skills/` beside `config.json` in the
+/// XDG config home, the user-level counterpart to the project's
+/// `.suspenders/skills/`. Resolved at the launch edge like the themes dir; a
+/// missing directory just means no user skills.
+pub fn default_user_skills_dir() -> String {
+    format!("{}/suspenders/skills", xdg_config_base())
+}
+
+/// The managed-auto-memory root for `project_root` (P5, ADR-0062; qwen
+/// `getAutoMemoryRoot`): where the model's `MEMORY.md` index and topic files
+/// live. Two shapes, both resolved once at the launch edge like the dirs above:
+///
+/// * `SUSPENDERS_MEMORY_LOCAL=1` -> in-root `<project_root>/.suspenders/memory`
+///   (qwen's `QWEN_CODE_MEMORY_LOCAL` -> `<root>/.qwen/memory`).
+/// * otherwise the GLOBAL, project-keyed default:
+///   `<base>/projects/<slug(canonical_git_root)>/memory`, where `base` is the
+///   XDG data home (`memory_base()`, `SUSPENDERS_MEMORY_BASE_DIR` overriding for
+///   tests), the canonical git root is the `.git`-bearing ancestor of
+///   `project_root` (falling back to `project_root` itself when none), and the
+///   slug replaces every `[^a-zA-Z0-9]` with `-` (qwen `sanitizeCwd`).
+///
+/// Global-by-default keeps memory out of the working tree (it is not the
+/// user's code) while still keying it to the project, so two checkouts of the
+/// same repo share one memory.
+pub fn default_memory_root(project_root: &str) -> String {
+    if std::env::var("SUSPENDERS_MEMORY_LOCAL").as_deref() == Ok("1") {
+        return format!("{project_root}/.suspenders/memory");
+    }
+    let canonical = canonical_git_root(project_root).unwrap_or_else(|| project_root.to_string());
+    format!(
+        "{}/projects/{}/memory",
+        memory_base(),
+        sanitize_cwd(&canonical)
+    )
+}
+
+// The base directory for the global, project-keyed memory store (qwen
+// `getMemoryBaseDir`): the XDG data home, mirroring `default_session_dir`, with
+// SUSPENDERS_MEMORY_BASE_DIR overriding it (the test seam, empty var == unset).
+fn memory_base() -> String {
+    if let Some(base) = std::env::var("SUSPENDERS_MEMORY_BASE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return base;
+    }
+    format!("{}/suspenders", xdg_data_base())
+}
+
+// The project identifier slug (qwen `sanitizeCwd`): every non-alphanumeric char
+// becomes `-`, so a filesystem path becomes one safe directory-name segment.
+fn sanitize_cwd(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+// The canonical git root of `start` (qwen `findCanonicalGitRoot`, simplified):
+// walk up for the first ancestor holding a `.git` entry. qwen additionally
+// resolves a worktree's `.git` FILE (a `gitdir:` pointer) back to the main
+// checkout so sibling worktrees of one repo share a memory; Suspenders takes the
+// DOCUMENTED simplification of returning the worktree's own root (its `.git` is
+// a file, `Path::exists` still finds it), so each worktree keys its own memory.
+// That is a conservative, safe divergence: worktrees get separate memory rather
+// than a mis-shared one, and the common non-worktree case is identical.
+fn canonical_git_root(start: &str) -> Option<String> {
+    let mut current = std::path::Path::new(start).to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_string_lossy().into_owned());
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
 // The XDG config home both paths above hang off (empty var == unset, per XDG).
 fn xdg_config_base() -> String {
     std::env::var("XDG_CONFIG_HOME")
@@ -994,6 +1114,19 @@ fn xdg_config_base() -> String {
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             format!("{home}/.config")
+        })
+}
+
+// The XDG data home the Session Logs and the memory store hang off (empty var
+// == unset, per XDG). The data-home counterpart to `xdg_config_base`, so the
+// `XDG_DATA_HOME` -> `~/.local/share` fallback lives once for both callers.
+fn xdg_data_base() -> String {
+    std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.local/share")
         })
 }
 
@@ -1022,6 +1155,11 @@ fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionE
 fn validate(s: &Session) -> Result<(), SessionError> {
     validate_scalars(s)?;
     validate_providers(s)?;
+    // An MCP server entry's transport (F8, ADR-0056) is now a sum type resolved
+    // AT PARSE TIME: a malformed entry - both `command` and `http_url`, or
+    // neither - is a loud deserialize error when the config is parsed, so there
+    // is no separate transport-validation pass here. A server that resolves but
+    // will not connect is still skipped at attach (fail-open), not rejected.
     // The per-Model budget invariants, applied to the launch Model here; the
     // Agent re-applies them to every `/model` pick (ADR-0037).
     s.validate_model_budget(&s.model).map_err(SessionError)?;
@@ -1506,7 +1644,7 @@ mod tests {
             &cfg(),
         )
         .unwrap();
-        let ctx = session.tool_ctx(&session.model);
+        let ctx = session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test());
         assert_eq!(
             ctx.result_cap,
             shaping::cap_for(5_000, session.model.max_tokens)
@@ -1794,7 +1932,7 @@ mod tests {
             &cfg(),
         )
         .unwrap();
-        let ctx = session.tool_ctx(&session.model);
+        let ctx = session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test());
         assert_eq!(ctx.root, std::path::PathBuf::from("/tmp"));
         assert_eq!(
             ctx.result_cap,
@@ -1875,6 +2013,73 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn file_config_parses_an_mcp_servers_block_stdio_and_http() {
+        // A stdio entry and an HTTP entry round-trip through FileConfig, keyed
+        // by the snake_case `mcp_servers` key (F8, ADR-0056).
+        let fc = FileConfig::parse(
+            r#"{"mcp_servers": {
+                "fs": {
+                    "command": "mcp-fs",
+                    "args": ["--root", "/tmp"],
+                    "env": {"LOG": "debug"},
+                    "exclude_tools": ["delete"]
+                },
+                "remote": {
+                    "http_url": "https://mcp.example.test/mcp",
+                    "headers": {"Authorization": "Bearer x"},
+                    "trust": true
+                }
+            }}"#,
+        )
+        .unwrap();
+        let servers = fc.mcp_servers.clone().unwrap();
+
+        let fs = &servers["fs"];
+        assert_eq!(fs.exclude_tools, vec!["delete".to_string()]);
+        // The flat `command`/`args`/`env` keys fold into the stdio sum-type at
+        // parse time - the both/neither illegal states are unrepresentable here.
+        assert!(matches!(
+            &fs.transport,
+            crate::mcp::McpTransport::Stdio { command, args, env, .. }
+                if command == "mcp-fs"
+                    && *args == vec!["--root".to_string(), "/tmp".to_string()]
+                    && env["LOG"] == "debug"
+        ));
+
+        let remote = &servers["remote"];
+        assert_eq!(remote.trust, Some(true));
+        assert!(matches!(
+            &remote.transport,
+            crate::mcp::McpTransport::Http { url, headers }
+                if url == "https://mcp.example.test/mcp"
+                    && headers["Authorization"] == "Bearer x"
+        ));
+    }
+
+    #[test]
+    fn file_config_mcp_server_entry_rejects_an_unknown_key() {
+        // Each server entry is deny_unknown_fields too - a typo'd key is a loud
+        // parse error (ADR-0056).
+        assert!(
+            FileConfig::parse(r#"{"mcp_servers": {"x": {"command": "cmd", "bogus": 1}}}"#,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn file_config_rejects_a_malformed_mcp_server_transport() {
+        // A malformed entry (both transports) is a LOUD PARSE failure now that the
+        // transport is a sum type resolved at deserialize time - the illegal state
+        // is unrepresentable, so it never reaches build (ADR-0056). This replaces
+        // the old build-time transport-validation pass.
+        let err = FileConfig::parse(
+            r#"{"mcp_servers": {"broken": {"command": "cmd", "http_url": "https://x.test"}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("both"));
     }
 
     #[test]
@@ -2381,5 +2586,91 @@ mod tests {
         assert_eq!(cfg.theme, "from-env");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- default_memory_root (P5, ADR-0062) ----
+    //
+    // These tests mutate the process environment (SUSPENDERS_MEMORY_*), so they
+    // set-then-clear within one test body. Safe under both nextest
+    // (process-per-test) and `--test-threads=1` (serial, one process): each test
+    // clears the two vars before it reads them and after it is done, and spawns
+    // no threads, so nothing reads them concurrently.
+
+    fn clear_memory_env() {
+        // SAFETY: process-per-test / serial single-threaded (see above).
+        unsafe {
+            std::env::remove_var("SUSPENDERS_MEMORY_LOCAL");
+            std::env::remove_var("SUSPENDERS_MEMORY_BASE_DIR");
+        }
+    }
+
+    #[test]
+    fn default_memory_root_slugs_the_project_under_a_projects_dir() {
+        clear_memory_env();
+        set_env("SUSPENDERS_MEMORY_BASE_DIR", "/tmp/mem-base");
+
+        // A non-git tmp dir (no `.git` ancestor up to /tmp): the canonical root
+        // falls back to the project root itself, and the slug replaces every
+        // non-alphanumeric char with `-`.
+        let proj = std::env::temp_dir().join("suspenders_mem_root_test_no_git");
+        let _ = std::fs::create_dir_all(&proj);
+        let proj = proj.to_string_lossy().into_owned();
+
+        let root = default_memory_root(&proj);
+        let expected_slug = sanitize_cwd(&proj);
+        assert_eq!(
+            root,
+            format!("/tmp/mem-base/projects/{expected_slug}/memory")
+        );
+        // Every path separator and dot became a hyphen (qwen sanitizeCwd).
+        assert!(!expected_slug.contains('/'));
+        assert!(!expected_slug.contains('.'));
+
+        let _ = std::fs::remove_dir_all(&proj);
+        clear_memory_env();
+    }
+
+    #[test]
+    fn default_memory_root_local_override_places_it_in_root() {
+        clear_memory_env();
+        set_env("SUSPENDERS_MEMORY_LOCAL", "1");
+
+        assert_eq!(
+            default_memory_root("/some/project"),
+            "/some/project/.suspenders/memory"
+        );
+
+        clear_memory_env();
+    }
+
+    #[test]
+    fn sanitize_cwd_replaces_every_non_alphanumeric_with_a_hyphen() {
+        assert_eq!(
+            sanitize_cwd("/home/vinnie/Proj_1.2"),
+            "-home-vinnie-Proj-1-2"
+        );
+        assert_eq!(sanitize_cwd("abcXYZ123"), "abcXYZ123");
+    }
+
+    #[test]
+    fn canonical_git_root_walks_up_to_the_dot_git_bearing_ancestor() {
+        // A tmp tree with a `.git` at the top and a nested subdir: the walk
+        // finds the `.git`-bearing root, not the leaf.
+        let top = std::env::temp_dir().join(format!(
+            "suspenders_git_root_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = top.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+
+        let found = canonical_git_root(&nested.to_string_lossy());
+        assert_eq!(found, Some(top.to_string_lossy().into_owned()));
+
+        let _ = std::fs::remove_dir_all(&top);
     }
 }

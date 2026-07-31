@@ -12,7 +12,8 @@
 //!   before every call: required fields present, string-typed fields are
 //!   strings, unknown fields rejected.
 //! * **Model-supplied paths go through [`with_path`]**, which confines them to
-//!   the Project Root.
+//!   the Project Root - or the trusted managed-auto-memory subtree the ctx
+//!   carries (P5, ADR-0062).
 //! * **Failed file operations are worded by [`file_error`]**, which formats the
 //!   POSIX reason and appends closest-match suggestions on ENOENT.
 //! * **Errors return, never raise.**
@@ -20,18 +21,64 @@
 
 use std::path::PathBuf;
 
+pub mod caps;
 pub mod path;
+pub mod read_cache;
+pub mod registry;
 
-/// A tool's spec in Anthropic tool format: a name, a description, and a JSON
-/// Schema `input_schema` (an open edge, so it stays a `serde_json::Value`).
-/// Mirrors baud's `Baud.Tool.spec/0` shape. Serializes to exactly its wire
-/// shape, so the Conversation's tool-spec overhead estimate counts what a
-/// request carries without reaching into an adapter.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
+/// The tool's wire spec, re-exported from the [`crate::content`] leaf where it
+/// lives alongside the other wire tool-shapes. Kept re-exported here so the tool
+/// authoring contract still reads as one home (`crate::tool::ToolSpec`) - the
+/// type moved out only to break the `tool <-> llm` cycle the P2b SideQuery
+/// capability (which names `Model`) would otherwise close (see ADR-0055).
+pub use crate::content::ToolSpec;
+
+use crate::content::{Modalities, ResultBlock};
+
+/// A Tool Result: the content that enters the Conversation and whether it was
+/// an error. Mirrors baud's `Baud.Tools.result/0`. Lives with the Tool
+/// authoring contract (it is what a Tool's `run` ultimately becomes), so the
+/// Registry can dispatch to a result without depending on the concrete tool
+/// set - which keeps the tool -> tool_registry -> tools module graph acyclic.
+///
+/// `content` is a [`ResultBlock`] list (ADR-0059): the common case is a single
+/// Text block, media reaches it only from a tool that overrides
+/// [`Tool::run_rich`] (P3 3b's read_file). Text tools return `Result<String, _>`
+/// through [`Tool::run`] and become one Text block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub content: Vec<ResultBlock>,
+    pub is_error: bool,
+}
+
+/// The rich output a Tool may produce (ADR-0059): an ordered block list. A text
+/// tool's `String` return becomes one Text block through [`From<String>`]; only
+/// a tool overriding [`Tool::run_rich`] yields more (P3 3b's read_file, whose
+/// media blocks ride when the Model supports the modality). Named in `tool.rs`
+/// (not `content`) so the tool authoring contract carries its own return shape;
+/// its blocks are the shared [`ResultBlock`] leaf, so no `tool -> llm` edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    pub blocks: Vec<ResultBlock>,
+}
+
+impl ToolOutput {
+    /// A single Text block output - the common case.
+    pub fn text(s: impl Into<String>) -> Self {
+        ToolOutput {
+            blocks: vec![ResultBlock::text(s)],
+        }
+    }
+}
+
+// qual:allow(dry, boilerplate) reason: "not derivable - this wraps the String in
+// a single ResultBlock::Text inside the `blocks` Vec, not a newtype passthrough;
+// a derive macro would move the String verbatim into the field."
+impl From<String> for ToolOutput {
+    /// A text tool's `String` return becomes one Text block.
+    fn from(s: String) -> Self {
+        ToolOutput::text(s)
+    }
 }
 
 /// The authoring contract a Suspenders tool implements (baud's `Baud.Tool`
@@ -47,15 +94,129 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
     async fn run(&self, input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, String>;
+
+    /// The rich variant of [`run`](Tool::run) (ADR-0059): the block-list output a
+    /// tool produces. The default delegates to `run` and wraps the `String` in one
+    /// Text block, so every text tool is unchanged. Only a tool that emits media -
+    /// P3 3b's read_file, which reads an image or PDF and gates it on the Model's
+    /// modalities via [`ToolCtx::input_modalities`] - overrides this. The default
+    /// lives here so the Registry dispatches through one method.
+    async fn run_rich(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, String> {
+        self.run(input, ctx).await.map(ToolOutput::from)
+    }
+
+    /// When true, the tool is hidden from the wire list the model sees at the
+    /// start of a Run - it is discovered on demand via `tool_search`, which
+    /// reveals its full schema into the next request. qwen carries `shouldDefer`
+    /// as a constructor field; Suspenders' tools are unit structs, so the flag
+    /// rides a default-provided trait method instead (behaviourally identical).
+    fn should_defer(&self) -> bool {
+        false
+    }
+
+    /// When true, the tool stays in the wire list even where deferral is the
+    /// default. Used for meta tools like `tool_search` itself. Mirrors qwen's
+    /// `alwaysLoad`.
+    fn always_load(&self) -> bool {
+        false
+    }
+
+    /// Optional space-separated keywords `tool_search`'s keyword scoring folds
+    /// in alongside the tool's name and description. Mirrors qwen's `searchHint`.
+    fn search_hint(&self) -> Option<&str> {
+        None
+    }
+
+    /// When true, the tool was discovered from an MCP server (F8, ADR-0056), so
+    /// `tool_search` weighs it slightly higher - it is always deferred, and
+    /// discovery is the only way the model reaches it. Every built-in tool
+    /// answers false; only [`crate::mcp::adapter::McpTool`] overrides it.
+    fn is_mcp(&self) -> bool {
+        false
+    }
 }
 
 /// The ctx every Tool Call executes with: the Session's Project Root, the
-/// Result Cap, and the command timeout.
+/// Result Cap, the command timeout, and the [`caps::Capabilities`] carrier - the
+/// Run-scoped [`ToolRegistry`] plus the `dyn` effect seams a tool reaches its
+/// host through (F1, ADR-0055). `tool_search` reaches through the registry to
+/// reveal deferred tools; every other tool ignores it. The [`ToolRegistry`] is
+/// not `Debug`-derivable, but [`caps::Capabilities`] hand-writes its own `Debug`,
+/// so this stays on `#[derive(Debug)]`.
 #[derive(Clone, Debug)]
 pub struct ToolCtx {
     pub root: PathBuf,
     pub result_cap: usize,
     pub command_timeout_ms: u64,
+    /// The input modalities the Run's captured Model accepts (ADR-0059): a copied
+    /// fact, stamped at ctx-build like `result_cap`. read_file (P3 3b) reads it to
+    /// decide whether an image/PDF rides as media or degrades to a text
+    /// placeholder at read time; every other tool ignores it.
+    pub input_modalities: Modalities,
+    /// The trusted managed-auto-memory subtree (P5, ADR-0062): when `Some`, the
+    /// shared path seam ([`path::resolve_path`]) confines a model-supplied path
+    /// to the Project Root OR this subtree, so the memory-writing tools reach
+    /// memory files uniformly. `None` (tests) keeps the Project-Root-only
+    /// confinement; child Runs / subagents build their ctx through
+    /// `Session::tool_ctx`, which stamps `Some(...)`, so they inherit the parent
+    /// Session's memory root. A resolved subtree, never a general escape.
+    pub memory_root: Option<PathBuf>,
+    pub caps: caps::Capabilities,
+}
+
+impl ToolCtx {
+    /// The Run-scoped Tool Registry, read through the carrier. The three
+    /// registry-reading tools (`tool_search`, the Tools dispatch, the Loop's wire
+    /// list) go through this accessor rather than the carrier field, so the field
+    /// path stays an internal detail of the carrier.
+    pub fn registry(&self) -> &std::sync::Arc<crate::tool_registry::ToolRegistry> {
+        &self.caps.registry
+    }
+
+    /// The Run-scoped file-read cache, read through the carrier (F6, ADR-0060).
+    /// read_file records a successful read into it; notebook_edit checks it for
+    /// a prior FULL read before mutating a notebook. Every other tool ignores it,
+    /// like the registry.
+    pub fn read_cache(&self) -> &std::sync::Arc<read_cache::FileReadCache> {
+        &self.caps.read_cache
+    }
+}
+
+#[cfg(test)]
+impl ToolCtx {
+    /// A ctx over the full built-in tool registry and a denying Approver, for
+    /// tests. The single test construction site, so a future ctx field touches
+    /// one place rather than every tool test helper.
+    pub fn for_test(root: PathBuf, result_cap: usize) -> ToolCtx {
+        ToolCtx {
+            root,
+            result_cap,
+            command_timeout_ms: 120_000,
+            input_modalities: Modalities::default(),
+            // Tests get Project-Root-only confinement by default; the memory
+            // trust-path tests opt in explicitly by setting this field.
+            memory_root: None,
+            caps: caps::Capabilities::for_test(),
+        }
+    }
+
+    /// A test ctx whose captured Model accepts the given input modalities, so
+    /// read_file's read-time media path (P3 3b) is exercisable: an image/PDF
+    /// rides as a media block only when the matching modality is true.
+    pub fn for_test_with_modalities(
+        root: PathBuf,
+        result_cap: usize,
+        input_modalities: Modalities,
+    ) -> ToolCtx {
+        ToolCtx {
+            input_modalities,
+            ..ToolCtx::for_test(root, result_cap)
+        }
+    }
 }
 
 /// Validates the model-supplied input against a tool's JSON Schema. Returns

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::agent::capabilities::{AgentApprover, AgentQuestioner, AgentSubagentSpawner};
 use crate::agent::{Msg, RunMsg};
 use crate::compaction::Compaction;
 use crate::content::Provenance;
@@ -47,9 +48,29 @@ pub(crate) struct AgentDeps {
     /// closes over it and, on success, notifies the Agent to log + update state
     /// (baud's compact_fn, ADR-0012).
     compaction: Compaction,
+    /// The Session-stable tool set (F8, ADR-0056): built-ins plus any MCP tools
+    /// the Agent discovered at startup. Threaded into each Run's [`Capture`] so
+    /// the Run's registry shares it (fresh reveal state per Run).
+    session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+    /// The subagent definitions (P4/F4, ADR-0061): the built-in registry the
+    /// Agent built once at startup. Threaded into each Run's [`Capture`] so the
+    /// Run's `DirectSubagentSpawner` can resolve a subagent def by name.
+    subagents: Arc<crate::subagents::SubagentRegistry>,
+    /// The parent [`Session`] the child Run derives its Root/timeout/budget knobs
+    /// from (P4/F4, ADR-0061). Cloned once at Run spawn.
+    session: crate::session::Session,
+    /// The child Run's turn bound (qwen's per-subagent run cap): the Session's
+    /// own `run_limit`, so a subagent runs the same bound a top-level Run does.
+    subagent_run_limit: usize,
 }
 
 impl AgentDeps {
+    // Each argument is a distinct Agent-owned value the Run captures at spawn
+    // (the channel, the Llm, the Model, the three request settings, the
+    // Compaction state, and now the Session-stable tool set). A Parameter Object
+    // would only rename the same bundle, so the targeted allow is clearer than
+    // the indirection.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tx: mpsc::UnboundedSender<Msg>,
         llm: Arc<dyn Llm>,
@@ -58,7 +79,11 @@ impl AgentDeps {
         thinking_budget: Option<u64>,
         tool_call_style: ToolCallStyle,
         compaction: Compaction,
+        session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+        subagents: Arc<crate::subagents::SubagentRegistry>,
+        session: crate::session::Session,
     ) -> Self {
+        let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
             tx,
             llm,
@@ -67,6 +92,10 @@ impl AgentDeps {
             thinking_budget,
             tool_call_style,
             compaction,
+            session_tools,
+            subagents,
+            session,
+            subagent_run_limit,
         }
     }
 
@@ -77,6 +106,47 @@ impl AgentDeps {
         crate::run::Capture {
             model: self.model.clone(),
             llm: Arc::clone(&self.llm),
+            // The tool-initiated Approval seam (F1, ADR-0055): a tx-backed handle
+            // over this Agent's mpsc. The Run assembles it into the Tool
+            // Capabilities; the Agent owns the channel, so it builds the handle.
+            approver: Arc::new(AgentApprover {
+                tx: self.tx.clone(),
+            }),
+            // The tool-initiated Question seam (P2a, ADR-0057): a tx-backed
+            // handle over this Agent's mpsc, like the Approver but with no
+            // Standing-Approval / auto path. The Run assembles it into the Tool
+            // Capabilities; the Agent owns the channel, so it builds the handle.
+            questioner: Arc::new(AgentQuestioner {
+                tx: self.tx.clone(),
+            }),
+            // The Session-stable tool set (F8, ADR-0056): the Run's registry
+            // shares it via `with_shared`, so MCP tools ride every Run.
+            tools: Arc::clone(&self.session_tools),
+            // The Subagent seam (P4/F4 + P4b, ADR-0061, ADR-0063): the
+            // two-channel `AgentSubagentSpawner`. Its FOREGROUND `spawn` is still
+            // the DIRECT (Llm-boundary, non-mpsc) path - it holds the same
+            // `DirectSubagentSpawner` handles and drives a child Run inline, a
+            // foreground subagent touching no Agent/Conversation state. Its
+            // BACKGROUND `spawn_background`/`stop_background` are tx-backed (like
+            // the Approver/Questioner): they relay a `SpawnBackground`/
+            // `StopBackground` to the Agent that owns the registry, because a
+            // detached child Run and the task registry ARE Agent-owned mutable
+            // state (ADR-0017). A `Scoped` subagent Model resolves through the
+            // Session's own `resolve_model`, so no separate Provider slice is
+            // threaded.
+            subagents: Arc::new(AgentSubagentSpawner {
+                direct: crate::run::subagent::DirectSubagentSpawner {
+                    llm: Arc::clone(&self.llm),
+                    parent_model: self.model.clone(),
+                    temperature: self.temperature,
+                    thinking_budget: self.thinking_budget,
+                    tool_call_style: self.tool_call_style,
+                    session: self.session.clone(),
+                    registry: Arc::clone(&self.subagents),
+                    subagent_run_limit: self.subagent_run_limit,
+                },
+                tx: self.tx.clone(),
+            }),
         }
     }
 
@@ -130,6 +200,24 @@ impl RunDeps for AgentDeps {
         async move {
             let (reply, rx) = oneshot::channel();
             if tx.send(Msg::Run(RunMsg::DrainSteering(reply))).is_err() {
+                return Vec::new();
+            }
+            rx.await.unwrap_or_default()
+        }
+    }
+
+    fn drain_notifications(&mut self) -> impl Future<Output = Vec<String>> + Send {
+        // The parallel channel to `drain_steering` (P4b, ADR-0063): ask the Agent
+        // (which owns the background registry) for its queued
+        // `<task-notification>` envelopes and empty the queue. A closed channel
+        // yields none - the same safe answer as `drain_steering`.
+        let tx = self.tx.clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            if tx
+                .send(Msg::Run(RunMsg::DrainNotifications(reply)))
+                .is_err()
+            {
                 return Vec::new();
             }
             rx.await.unwrap_or_default()

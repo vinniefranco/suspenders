@@ -58,13 +58,13 @@ impl Middleware for RunCommand {
             return token;
         }
         let content = match token.result.as_ref() {
-            Some(result) => result.content.as_str(),
+            Some(result) => result.text_of(),
             None => return token,
         };
-        if run_command::parse_timed_out(content) {
+        if run_command::parse_timed_out(&content) {
             return token.put_artifact(keys::TIMED_OUT, true);
         }
-        match run_command::parse_exit_code(content) {
+        match run_command::parse_exit_code(&content) {
             Some(code) => token.put_artifact(keys::EXIT_CODE, code as i64),
             None => token,
         }
@@ -132,19 +132,12 @@ mod tests {
     use serde_json::json;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            root: "/nowhere".into(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test("/nowhere".into(), 10_000)
     }
 
     fn token_with(tool: &str, content: &str, is_error: bool) -> Token {
         let mut token = Token::new(tool, json!({"command": "cargo test"}), ctx());
-        token.result = Some(TokenResult {
-            content: content.to_string(),
-            is_error,
-        });
+        token.result = Some(TokenResult::text(content, is_error));
         token
     }
 
@@ -183,7 +176,7 @@ mod tests {
     fn post_run_never_mutates_model_facing_content() {
         let token = run("output\n[exit code: 0]", false);
         assert_eq!(
-            token.result.as_ref().unwrap().content,
+            token.result.as_ref().unwrap().text_of(),
             "output\n[exit code: 0]"
         );
     }

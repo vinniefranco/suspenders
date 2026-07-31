@@ -61,3 +61,7 @@ signal the operator must keep seeing). Labels are qwen-verbatim: `plan mode`(gre
 - The `expire(now)` timeout hook on `SelectionList` (ADR-0049) is host-driven and
   never fires for the 3-row approval; the tick wiring lands with Phase 5's longer
   dialogs.
+
+## Revision (P5, ADR-0062): memory-dir writes/edits auto-approved
+
+Managed auto-memory (ADR-0062) writes and edits into the trusted memory subtree must not prompt (qwen flips its default permission to 'allow' for a memory write). In Suspenders this is INHERENT, not a new branch: `write_file`/`edit_file` are already ungated here (the gate policy covers only code-execution `run_command` and outbound `web_fetch`), so a write into the memory dir - like any write - carries no gate at all, while `run_command` still gates. The auto-approval of memory writes is therefore a property of the ungated write path; a test in `approvals.rs` pins that a memory-dir write does not gate while code-execution still does.

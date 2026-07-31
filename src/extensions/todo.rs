@@ -110,11 +110,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx(root: &std::path::Path) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), 10_000)
     }
 
     fn extensions() -> Vec<Registered> {

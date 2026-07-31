@@ -164,6 +164,9 @@ mod tests {
 
     #[test]
     fn an_unreadable_root_yields_no_files() {
-        assert_eq!(walk_files(Path::new("/no/such/dir/anywhere")), Vec::<PathBuf>::new());
+        assert_eq!(
+            walk_files(Path::new("/no/such/dir/anywhere")),
+            Vec::<PathBuf>::new()
+        );
     }
 }

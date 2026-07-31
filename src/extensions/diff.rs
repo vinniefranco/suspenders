@@ -192,10 +192,12 @@ fn maybe_ground_model(
     }
     let compact = hunks::to_unified(computed, MODEL_DIFF_LINES);
     if let Some(result) = token.result.as_mut() {
-        result.content = format!(
+        let annotated = format!(
             "{}\n[the match was fuzzy - what was actually written:]\n{}",
-            result.content, compact
+            result.text_of(),
+            compact
         );
+        result.set_text(annotated);
     }
     token
 }
@@ -257,11 +259,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx(root: &std::path::Path) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), 10_000)
     }
 
     fn extensions() -> Vec<Registered> {
@@ -302,7 +300,7 @@ mod tests {
         let result = run("edit_file", input, &ctx).await;
 
         assert!(!result.is_error);
-        assert_eq!(result.content, format!("edited {path}"));
+        assert_eq!(result.text(), format!("edited {path}"));
 
         let diff = diff_of(&result);
         assert_eq!(diff.path, path);
@@ -348,11 +346,11 @@ mod tests {
 
         assert!(
             result
-                .content
+                .text()
                 .contains("[the match was fuzzy - what was actually written:]")
         );
-        assert!(result.content.contains("-  x = 1"));
-        assert!(result.content.contains("+  y = 2"));
+        assert!(result.text().contains("-  x = 1"));
+        assert!(result.text().contains("+  y = 2"));
 
         let diff = diff_of(&result);
         assert_eq!(diff.added, 1);
@@ -386,7 +384,7 @@ mod tests {
         let result = run("write_file", input, &ctx).await;
 
         assert!(!result.is_error);
-        assert!(result.content.contains("created fresh.txt"));
+        assert!(result.text().contains("created fresh.txt"));
 
         let diff = diff_of(&result);
         assert_eq!(diff.added, 2);
@@ -447,7 +445,7 @@ mod tests {
         let result = run("write_file", input, &ctx).await;
 
         assert!(result.is_error);
-        assert!(result.content.contains("edit_file"));
+        assert!(result.text().contains("edit_file"));
         assert!(result.artifacts.is_empty());
         // The file is untouched.
         assert_eq!(

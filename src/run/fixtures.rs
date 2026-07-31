@@ -75,7 +75,7 @@ pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
 }
 
 pub(super) fn tool_ctx(session: &Session) -> ToolCtx {
-    session.tool_ctx(&session.model)
+    session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test())
 }
 
 // Response builders mirroring baud's text_result / tool_use_result.
@@ -233,6 +233,10 @@ pub(super) struct FakeDeps {
     /// empty.
     steering: Arc<Mutex<VecDeque<Vec<String>>>>,
 
+    /// Canned background-notification batches, one popped per
+    /// `drain_notifications` (P4b, ADR-0063). Exhausted ⇒ empty.
+    notifications: Arc<Mutex<VecDeque<Vec<String>>>>,
+
     after_pass: Option<AfterPassFn>,
     compact: Option<CompactFn>,
 }
@@ -251,6 +255,7 @@ impl FakeDeps {
             approvals: Arc::new(Mutex::new(VecDeque::new())),
             approval_tx: None,
             steering: Arc::new(Mutex::new(VecDeque::new())),
+            notifications: Arc::new(Mutex::new(VecDeque::new())),
             after_pass: None,
             compact: None,
         }
@@ -265,6 +270,13 @@ impl FakeDeps {
     /// Seeds the canned Steering batches (one popped per `drain_steering`).
     pub fn with_steering(mut self, batches: impl IntoIterator<Item = Vec<String>>) -> Self {
         self.steering = Arc::new(Mutex::new(batches.into_iter().collect()));
+        self
+    }
+
+    /// Seeds the canned background-notification batches (one popped per
+    /// `drain_notifications`, P4b, ADR-0063).
+    pub fn with_notifications(mut self, batches: impl IntoIterator<Item = Vec<String>>) -> Self {
+        self.notifications = Arc::new(Mutex::new(batches.into_iter().collect()));
         self
     }
 
@@ -329,6 +341,14 @@ impl RunDeps for FakeDeps {
 
     async fn drain_steering(&mut self) -> Vec<String> {
         self.steering
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default()
+    }
+
+    async fn drain_notifications(&mut self) -> Vec<String> {
+        self.notifications
             .lock()
             .unwrap()
             .pop_front()

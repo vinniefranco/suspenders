@@ -71,7 +71,8 @@ impl Middleware for Condense {
             return token;
         }
         if let Some(result) = token.result.as_mut() {
-            result.content = condense(&result.content);
+            let condensed = condense(&result.text_of());
+            result.set_text(condensed);
         }
         token
     }
@@ -146,19 +147,12 @@ mod tests {
     use serde_json::json;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            root: "/nowhere".into(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test("/nowhere".into(), 10_000)
     }
 
     fn token_with(tool: &str, content: &str, is_error: bool) -> Token {
         let mut token = Token::new(tool, json!({"command": "cargo test"}), ctx());
-        token.result = Some(TokenResult {
-            content: content.to_string(),
-            is_error,
-        });
+        token.result = Some(TokenResult::text(content, is_error));
         token
     }
 
@@ -167,7 +161,7 @@ mod tests {
             .post_run(token_with(TOOL, content, is_error), &json!({}))
             .result
             .unwrap()
-            .content
+            .text_of()
     }
 
     #[test]
@@ -306,7 +300,7 @@ mod tests {
             test e ... ok";
         let token = Condense.post_run(token_with("read_file", noisy, false), &json!({}));
 
-        assert_eq!(token.result.unwrap().content, noisy);
+        assert_eq!(token.result.unwrap().text_of(), noisy);
     }
 
     #[test]

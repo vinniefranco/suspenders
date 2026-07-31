@@ -91,11 +91,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx(root: &std::path::Path) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: 10_000,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), 10_000)
     }
 
     async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -202,6 +198,41 @@ mod tests {
                 &ctx(tmp.path())
             )
             .await,
+            Err("path escapes project root".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_into_the_trusted_memory_root_outside_the_project_root() {
+        // P5, ADR-0062: a memory-dir write is reachable through the shared path
+        // seam, even though the memory root sits outside the Project Root.
+        let proj = TempDir::new().unwrap();
+        let mem = TempDir::new().unwrap();
+        let mut ctx = ctx(proj.path());
+        ctx.memory_root = Some(mem.path().to_path_buf());
+
+        let abs = mem.path().join("MEMORY.md");
+        let msg = run(
+            json!({"path": abs.to_str().unwrap(), "content": "- [X](x.md) - hook"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("created"));
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "- [X](x.md) - hook");
+    }
+
+    #[tokio::test]
+    async fn a_write_outside_both_the_project_and_memory_roots_is_refused() {
+        let proj = TempDir::new().unwrap();
+        let mem = TempDir::new().unwrap();
+        let mut ctx = ctx(proj.path());
+        ctx.memory_root = Some(mem.path().to_path_buf());
+
+        // A sibling of the memory root that merely shares its string prefix.
+        let evil = format!("{}-evil/x.md", mem.path().to_str().unwrap());
+        assert_eq!(
+            run(json!({"path": evil, "content": "x"}), &ctx).await,
             Err("path escapes project root".into())
         );
     }

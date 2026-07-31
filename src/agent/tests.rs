@@ -8,6 +8,7 @@
 // The busy/steer/cancel handshakes use the FakeLlm `Barrier` entry: the test
 // observes the Run parked mid-`complete`, then releases (or aborts) it.
 // ===========================================================================
+use super::background::BackgroundStatus;
 use super::*;
 use crate::approvals::ApprovalMode;
 use crate::content::{ContentBlock, Message, Role, Usage};
@@ -164,6 +165,73 @@ fn approval_id(ev: Event) -> String {
         Event::ApprovalRequest { approval_id, .. } => approval_id,
         _ => panic!("expected ApprovalRequest, got {ev:?}"),
     }
+}
+
+// Reads the latest session log and returns every JSONL entry whose `e` kind
+// matches - the one place the tests parse the log file (settled/compacted).
+fn log_entries_of(session_dir: &str, kind: &str) -> Vec<Value> {
+    let path = log::latest(session_dir).expect("a log file");
+    let content = std::fs::read_to_string(&path).unwrap();
+    content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["e"] == kind)
+        .collect()
+}
+
+// Waits for the successful ToolResult carrying `id` (the non-error tool return
+// the tests assert after an approval/run). Returns the event for content checks.
+async fn recv_tool_ok(rx: &mut broadcast::Receiver<Event>, id: &str) -> Event {
+    recv_match(
+        rx,
+        |e| matches!(e, Event::ToolResult { id: got, is_error: false, .. } if got == id),
+    )
+    .await
+}
+
+// A steering harness: the FIRST scripted call parks (a barrier), the SECOND
+// captures the LlmRequest it saw (over `req_rx`) so a test can inspect the
+// boundary request the Run built - e.g. the drained steering riding the
+// tool-result message. Submits `prompt`, awaits the parked first call, and
+// hands back its `release` (drop the returned dir to end the test).
+struct Steering {
+    _dir: TempDir,
+    agent: AgentHandle,
+    rx: broadcast::Receiver<Event>,
+    req_rx: mpsc::UnboundedReceiver<LlmRequest>,
+    release: oneshot::Sender<Release>,
+}
+
+async fn steering_harness(prompt: &str, reply: &'static str) -> Steering {
+    let (barrier, mut inflight) = Entry::barrier();
+    let (req_tx, req_rx) = mpsc::unbounded_channel::<LlmRequest>();
+    let (dir, agent, rx) = harness(vec![
+        barrier,
+        Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
+            let _ = req_tx.send(req.clone());
+            text_end(reply)
+        }),
+    ]);
+    agent.submit(prompt).await.unwrap();
+    let InFlight { release, .. } = inflight.recv().await.expect("first call parked");
+    Steering {
+        _dir: dir,
+        agent,
+        rx,
+        req_rx,
+        release,
+    }
+}
+
+// Waits for the SteeringQueued event carrying `text` (the observable that the
+// steered text was accepted mid-Run before the drain delivers it).
+async fn recv_steering_queued(rx: &mut broadcast::Receiver<Event>, text: &str) {
+    recv_match(
+        rx,
+        |e| matches!(e, Event::SteeringQueued { text: t } if t == text),
+    )
+    .await;
 }
 
 // ---- subscribe + submit happy path -----------------------------------
@@ -375,7 +443,8 @@ async fn denied_run_command_is_never_executed_and_yields_the_denial_tool_result(
             && m.content.iter().any(|b| {
                 matches!(b,
                 ContentBlock::ToolResult { tool_use_id, is_error: true, content }
-                    if tool_use_id == "tu_run" && content == "[command denied by user]")
+                    if tool_use_id == "tu_run"
+                        && crate::content::result_blocks_text(content) == "[command denied by user]")
             })
     }));
 }
@@ -406,13 +475,121 @@ async fn approved_run_command_executes_and_returns_its_output() {
         matches!(e, Event::ApprovalResolved { approval_id, approved: true } if *approval_id == id)
     })
     .await;
+    let result = recv_tool_ok(&mut rx, "tu_run").await;
+    if let Event::ToolResult { content, .. } = result {
+        assert!(content.contains("hi"));
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
+// ---- ask_user_question (ADR-0057) -------------------------------------
+
+// A Run whose model calls `ask_user_question`: assert a QuestionRequest is
+// broadcast, answer it, and assert the tool result is the VERBATIM formatted
+// string. Mirrors the approval integration test (request event -> resolve ->
+// tool result), but through the question round-trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_user_question_opens_the_modal_and_formats_the_answer() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "tu_ask",
+            "ask_user_question",
+            json!({
+                "questions": [{
+                    "question": "Which library should we use?",
+                    "header": "Library",
+                    "options": [
+                        { "label": "serde", "description": "the standard" },
+                        { "label": "miniserde", "description": "smaller" }
+                    ]
+                }]
+            }),
+        )),
+        Entry::just(text_end("using serde then")),
+    ]);
+
+    agent.submit("pick a library").await.unwrap();
+
+    // The tool opened the modal: a QuestionRequest carrying the question id and
+    // the shaped questions.
+    let req = recv_match(&mut rx, |e| matches!(e, Event::QuestionRequest { .. })).await;
+    let (id, questions) = match req {
+        Event::QuestionRequest {
+            question_id,
+            questions,
+        } => (question_id, questions),
+        other => panic!("expected a QuestionRequest, got {other:?}"),
+    };
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].header, "Library");
+
+    // Answer it as the UI would (row 0 = "serde").
+    agent
+        .answer_question(id.clone(), Ok(vec![(0, "serde".to_string())]))
+        .await;
+
+    // The Agent emits QuestionResolved once the tool reads the reply.
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::QuestionResolved { question_id } if *question_id == id),
+    )
+    .await;
+
+    // The tool result is the VERBATIM formatted answer string.
+    let result = recv_tool_ok(&mut rx, "tu_ask").await;
+    if let Event::ToolResult { content, .. } = result {
+        assert_eq!(
+            content,
+            "User has provided the following answers:\n\n**Library**: serde"
+        );
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
+// The decline path: answering with the VERBATIM decline string yields it as the
+// tool result content (an ordinary, non-error result - qwen returns it as both
+// llmContent and display).
+#[tokio::test(flavor = "multi_thread")]
+async fn declining_a_question_yields_the_verbatim_decline_string() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "tu_ask",
+            "ask_user_question",
+            json!({
+                "questions": [{
+                    "question": "Which library should we use?",
+                    "header": "Library",
+                    "options": [
+                        { "label": "serde", "description": "the standard" },
+                        { "label": "miniserde", "description": "smaller" }
+                    ]
+                }]
+            }),
+        )),
+        Entry::just(text_end("okay, skipping")),
+    ]);
+
+    agent.submit("pick a library").await.unwrap();
+
+    let id = match recv_match(&mut rx, |e| matches!(e, Event::QuestionRequest { .. })).await {
+        Event::QuestionRequest { question_id, .. } => question_id,
+        other => panic!("expected a QuestionRequest, got {other:?}"),
+    };
+
+    agent
+        .answer_question(
+            id.clone(),
+            Err("User declined to answer the questions.".to_string()),
+        )
+        .await;
+
     let result = recv_match(
         &mut rx,
-        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "tu_run"),
+        |e| matches!(e, Event::ToolResult { id, .. } if id == "tu_ask"),
     )
     .await;
     if let Event::ToolResult { content, .. } = result {
-        assert!(content.contains("hi"));
+        assert_eq!(content, "User declined to answer the questions.");
     }
     recv_match(&mut rx, is_run_finished).await;
 }
@@ -450,11 +627,7 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
         matches!(e, Event::ApprovalResolved { approval_id, approved: true } if *approval_id == id)
     })
     .await;
-    recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r1"),
-    )
-    .await;
+    recv_tool_ok(&mut rx, "r1").await;
 
     // The identical second command: no modal, an approval_auto, still runs.
     recv_match(
@@ -462,11 +635,7 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
         |e| matches!(e, Event::ApprovalAuto { command } if command == "echo hi"),
     )
     .await;
-    let r2 = recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r2"),
-    )
-    .await;
+    let r2 = recv_tool_ok(&mut rx, "r2").await;
     if let Event::ToolResult { content, .. } = r2 {
         assert!(content.contains("hi"));
     }
@@ -499,11 +668,7 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
         .await,
     );
     agent.approve(id1, Decision::ApproveAlways).await;
-    recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "r1"),
-    )
-    .await;
+    recv_tool_ok(&mut rx, "r1").await;
 
     // Two spaces is a different command: the modal comes back.
     let id2 = approval_id(
@@ -587,11 +752,7 @@ async fn yolo_mode_auto_runs_a_gated_command_without_a_modal() {
 
     // The gated command runs with no ApprovalRequest: the ToolResult arrives
     // directly. (A raced ApprovalRequest would fail this by never matching.)
-    let result = recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "y1"),
-    )
-    .await;
+    let result = recv_tool_ok(&mut rx, "y1").await;
     if let Event::ToolResult { content, .. } = result {
         assert!(content.contains("yolo"));
     }
@@ -608,26 +769,17 @@ async fn steer_while_idle_is_idle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned() {
-    let (barrier, mut inflight) = Entry::barrier();
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel::<LlmRequest>();
-    let (_dir, agent, mut rx) = harness(vec![
-        barrier,
-        Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
-            let _ = second_tx.send(req.clone());
-            text_end("done")
-        }),
-    ]);
-
-    agent.submit("look around").await.unwrap();
+    let Steering {
+        agent,
+        mut rx,
+        mut req_rx,
+        release,
+        ..
+    } = steering_harness("look around", "done").await;
 
     // First call is parked; steer, then release into a tool_use.
-    let InFlight { release, .. } = inflight.recv().await.expect("first call parked");
     agent.steer("also check the README").await.unwrap();
-    recv_match(
-        &mut rx,
-        |e| matches!(e, Event::SteeringQueued { text } if text == "also check the README"),
-    )
-    .await;
+    recv_steering_queued(&mut rx, "also check the README").await;
 
     release
         .send(Release {
@@ -643,7 +795,7 @@ async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned()
     .await;
 
     // Unadorned, riding the SAME user message as the tool results.
-    let request = second_rx.recv().await.expect("second request");
+    let request = req_rx.recv().await.expect("second request");
     let last = request.messages.last().unwrap();
     assert_eq!(last.role, Role::User);
     assert!(matches!(
@@ -657,19 +809,14 @@ async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rollover_steering_the_run_never_drained_auto_submits_the_next_run() {
-    let (barrier, mut inflight) = Entry::barrier();
-    let (roll_tx, mut roll_rx) = mpsc::unbounded_channel::<LlmRequest>();
-    let (_dir, agent, mut rx) = harness(vec![
-        barrier,
-        Entry::dynamic(vec![], move |req: &LlmRequest, _model: &Model| {
-            let _ = roll_tx.send(req.clone());
-            text_end("second done")
-        }),
-    ]);
+    let Steering {
+        agent,
+        mut rx,
+        mut req_rx,
+        release,
+        ..
+    } = steering_harness("first thing", "second done").await;
 
-    agent.submit("first thing").await.unwrap();
-
-    let InFlight { release, .. } = inflight.recv().await.expect("first call parked");
     // No tool batch ever runs, so this steering misses its Run.
     agent.steer("and then this").await.unwrap();
     release
@@ -682,7 +829,7 @@ async fn rollover_steering_the_run_never_drained_auto_submits_the_next_run() {
     recv_match(&mut rx, is_run_finished).await;
     recv_match(&mut rx, is_run_started).await;
 
-    let request = roll_rx.recv().await.expect("rollover request");
+    let request = req_rx.recv().await.expect("rollover request");
     let last = request.messages.last().unwrap();
     assert_eq!(last.role, Role::User);
     assert_eq!(last.content[0], ContentBlock::text("and then this"));
@@ -759,11 +906,7 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
     agent.submit("explore then hang").await.unwrap();
 
     // The tool ran; only then cancel (its result is on disk/in the conv).
-    recv_match(
-        &mut rx,
-        |e| matches!(e, Event::ToolResult { id, is_error: false, .. } if id == "t1"),
-    )
-    .await;
+    recv_tool_ok(&mut rx, "t1").await;
     let _inflight = inflight.recv().await.expect("second call parked");
     agent.cancel().await;
 
@@ -861,14 +1004,7 @@ async fn a_run_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error
     .await;
     assert_eq!(agent.status().await, Status::Idle);
 
-    let path = log::latest(&session_dir).expect("a log file");
-    let content = std::fs::read_to_string(&path).unwrap();
-    let settled: Vec<Value> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["e"] == "settled")
-        .collect();
+    let settled = log_entries_of(&session_dir, "settled");
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0]["outcome"], "failed");
     assert_eq!(settled[0]["stop_reason"], "error");
@@ -1034,19 +1170,33 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
             // Guidelines, Executing-with-care, Git-as-source-of-truth, worked
             // Examples, Final Reminder - grew the system prompt from ~5k to
             // ~22.6k chars, about +5.0k tokens on every request's estimate)
-            // moved it from 13786).
+            // moved it from 13786; the managed-auto-memory prompt suffix (P5,
+            // ADR-0062: the `# auto memory` section - type blocks, save
+            // protocol, recall + persistence guidance, ~13k chars plus the
+            // interpolated memory_dir - about +7.5k tokens appended to every
+            // request's system prompt) moved it from 20950).
             //
             // Retune mechanism: `Compaction::proactive` fires when
             // `token_estimate > compaction_target`, with `compaction_target =
             // budget - reserve(200) - trunc(0.3 * budget) ~= 0.7*budget - 200`.
             // The estimate is `ceil((overhead + system_prompt + messages)/3.5)`
             // and is INDEPENDENT of `budget`, so `budget` is the free knob that
-            // slides the target. Measured estimates here are run2 ~14283 tokens
-            // and run3 ~14642; budget 20950 puts the target at 14465, which sits
-            // between them so exactly the third Run crosses.
-            context_budget: Some(20_950),
+            // slides the target. With the memory suffix the estimates here are
+            // run2 ~21757 tokens and run3 ~22118; budget 31620 puts the target
+            // at ~21934, which sits between them so exactly the third Run crosses.
+            //
+            // `compaction_keep` tracks the budget: the Keep amount is
+            // `trunc(keep * (budget - reserve))`, and the cutoff walk measures it
+            // in raw chars against the fixed ~1250-char replies, so the ABSOLUTE
+            // Keep (not the fraction) is what decides how much survives. The
+            // original tuning kept ~2075 chars at budget 20950/keep 0.1; raising
+            // the budget to 31620 for the memory suffix would balloon the Keep to
+            // ~3140 and retain the WHOLE conversation (compaction becomes a
+            // no-op). Dropping keep to 0.066 restores the ~2073-char absolute
+            // Keep, so the third Run still cuts to a summary head.
+            context_budget: Some(31_620),
             compaction_slack: Some(0.3),
-            compaction_keep: Some(0.1),
+            compaction_keep: Some(0.066),
             ..Default::default()
         },
         &SessionConfig::test_defaults(),
@@ -1092,13 +1242,7 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
     drop(agent);
 
     let path = log::latest(&session_dir).expect("a log file");
-    let content = std::fs::read_to_string(&path).unwrap();
-    let compacted: Vec<Value> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["e"] == "compacted")
-        .collect();
+    let compacted = log_entries_of(&session_dir, "compacted");
     assert_eq!(compacted.len(), 1);
     assert!(
         compacted[0]["summary"]
@@ -1420,4 +1564,203 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
     agent.submit("second").await.unwrap();
     let ev = recv_match(&mut rx, is_run_finished).await;
     assert_eq!(finished_budget(&ev), Some(16_000), "the captured window");
+}
+
+// ===========================================================================
+// Background subagent registry (P4b/4c/4d, ADR-0063). These drive the Agent's
+// registry handlers directly on an `AgentState::for_test`, so the mint/notify/
+// abort mechanics are observable without wiring a whole Run through the mpsc.
+// ===========================================================================
+
+use crate::tool::caps::{SubagentRequest, SubagentResult};
+
+fn bg_request(subagent_type: &str) -> SubagentRequest {
+    SubagentRequest {
+        subagent_type: subagent_type.into(),
+        prompt: "do the task".into(),
+        model: None,
+    }
+}
+
+// Builds a registered BackgroundTask over a never-firing spawned child, tagged
+// with the given status + description. Returns the JoinHandle too so a test can
+// assert the child was aborted (`handle.is_finished()`) after a stop.
+fn bg_task(
+    status: BackgroundStatus,
+    description: &str,
+) -> (BackgroundTask, tokio::task::JoinHandle<()>) {
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let task = BackgroundTask {
+        abort: handle.abort_handle(),
+        status,
+        description: description.into(),
+    };
+    (task, handle)
+}
+
+#[tokio::test]
+async fn spawn_background_mints_the_id_and_registers_running() {
+    let dir = TempDir::new().unwrap();
+    // A FakeLlm the detached child will settle against (a plain final text).
+    let fake = FakeLlm::script(vec![Entry::just(text_end("done"))]);
+    let (mut state, _rx) = super::AgentState::for_test(session_in(&dir), Arc::new(fake));
+
+    let id = state.spawn_background(bg_request("general-purpose"), "find the bug".into());
+    assert_eq!(id, "general-purpose-1", "the minted id is {{type}}-{{n}}");
+    assert!(state.background.contains_key("general-purpose-1"));
+    // A second launch increments the per-Session counter.
+    let id2 = state.spawn_background(bg_request("Explore"), "explore".into());
+    assert_eq!(id2, "Explore-2");
+}
+
+#[tokio::test]
+async fn a_child_settlement_queues_the_completed_notification() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    // Register a Running entry by hand (a spawned never-firing task for the abort
+    // handle), then feed a GOAL settlement.
+    let (task, _handle) = bg_task(BackgroundStatus::Running, "find the bug");
+    state.background.insert("general-purpose-1".into(), task);
+
+    state.background_done(
+        "general-purpose-1".into(),
+        SubagentResult {
+            terminate_reason: "GOAL".into(),
+            result: "the findings".into(),
+        },
+    );
+
+    assert_eq!(state.notifications.len(), 1);
+    let note = &state.notifications[0];
+    assert!(note.contains("<task-id>general-purpose-1</task-id>"));
+    assert!(note.contains("<status>completed</status>"));
+    assert!(note.contains("<summary>Agent \"find the bug\" completed.</summary>"));
+    assert!(note.contains("<result>the findings</result>"));
+}
+
+#[tokio::test]
+async fn stop_background_aborts_the_running_child_and_sets_stopped() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let (task, handle) = bg_task(BackgroundStatus::Running, "explore api");
+    state.background.insert("scout-1".into(), task);
+
+    let wording = state.stop_background("scout-1".into());
+    assert_eq!(
+        wording,
+        "Cancellation requested for background agent \"scout-1\". A final \
+         task-notification carrying the agent's last result will follow.\n\
+         Description: explore api"
+    );
+    // The entry is now Stopped and the child task was aborted.
+    assert!(matches!(
+        state.background.get("scout-1").unwrap().status,
+        super::background::BackgroundStatus::Stopped
+    ));
+    // Yield so the abort lands on the child task before asserting it finished.
+    tokio::task::yield_now().await;
+    assert!(handle.is_finished());
+    // The `was cancelled` notification was queued synchronously.
+    assert!(
+        state.notifications[0].contains("<summary>Agent \"explore api\" was cancelled.</summary>")
+    );
+}
+
+#[tokio::test]
+async fn stop_background_unknown_id_is_the_not_found_wording() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let wording = state.stop_background("ghost-9".into());
+    assert_eq!(
+        wording,
+        "Error: No background task found with ID \"ghost-9\"."
+    );
+}
+
+#[tokio::test]
+async fn stop_background_of_a_settled_task_is_the_not_running_wording() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let (task, _handle) = bg_task(BackgroundStatus::Done, "explore api");
+    state.background.insert("scout-1".into(), task);
+    let wording = state.stop_background("scout-1".into());
+    assert_eq!(
+        wording,
+        "Error: Background agent \"scout-1\" is not running (status: completed)."
+    );
+}
+
+#[tokio::test]
+async fn a_settlement_for_a_stopped_task_is_dropped_no_double_notify() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let (task, _handle) = bg_task(BackgroundStatus::Stopped, "explore api");
+    state.background.insert("scout-1".into(), task);
+    // The child's late BackgroundDone lands after the stop: it must be dropped,
+    // not queued as a second notification (idle-completion no panic).
+    state.background_done(
+        "scout-1".into(),
+        SubagentResult {
+            terminate_reason: "GOAL".into(),
+            result: "partial".into(),
+        },
+    );
+    assert!(
+        state.notifications.is_empty(),
+        "a Stopped entry drops the racing result"
+    );
+}
+
+#[tokio::test]
+async fn abort_all_aborts_every_running_child_at_loop_exit() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    let (task_a, h1) = bg_task(BackgroundStatus::Running, "one");
+    let (task_b, h2) = bg_task(BackgroundStatus::Running, "two");
+    state.background.insert("a-1".into(), task_a);
+    state.background.insert("b-2".into(), task_b);
+
+    state.abort_all_background();
+    assert!(state.background.is_empty());
+    // Yield so the aborts land, then both child tasks are finished.
+    tokio::task::yield_now().await;
+    assert!(h1.is_finished());
+    assert!(h2.is_finished());
+}
+
+#[tokio::test]
+async fn spawn_background_settles_through_the_mpsc_and_queues_the_notification() {
+    // The end-to-end detached path: spawn_background spawns a real child Run over
+    // the FakeLlm; when it settles it posts a BackgroundDone over self_tx, which
+    // background_done then queues as a notification.
+    let dir = TempDir::new().unwrap();
+    let fake = FakeLlm::script(vec![Entry::just(text_end("the findings"))]);
+    let (mut state, mut rx) = super::AgentState::for_test(session_in(&dir), Arc::new(fake));
+
+    let id = state.spawn_background(bg_request("general-purpose"), "find the bug".into());
+    assert_eq!(id, "general-purpose-1");
+
+    // Await the child's BackgroundDone off the mpsc, then drive it into the
+    // handler (the actor loop would do this).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(Msg::Run(RunMsg::BackgroundDone { id, result }))) => {
+                state.background_done(id, result);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("mpsc closed"),
+            Err(_) => panic!("timed out waiting for BackgroundDone"),
+        }
+    }
+    assert_eq!(state.notifications.len(), 1);
+    assert!(state.notifications[0].contains("<result>the findings</result>"));
 }

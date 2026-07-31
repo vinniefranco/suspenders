@@ -5,32 +5,37 @@
 //! a tool can never crash the Run. [`run`] adds Shaping on top - the
 //! extension-free dispatch path.
 
+pub mod agent;
+pub mod ask_user_question;
 pub mod edit_file;
 pub mod glob;
 pub mod grep;
 pub mod list_files;
+pub mod notebook_edit;
 pub mod read_file;
 pub mod run_command;
 pub mod shaping;
+pub mod skill;
+pub mod task_stop;
 pub mod todo_write;
+pub mod tool_search;
 pub mod web_fetch;
 pub mod write_file;
 
-use crate::tool::{Tool, ToolCtx, ToolSpec, validate};
+use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::Value;
 
-/// A Tool Result: the content that enters the Conversation and whether it was
-/// an error. Mirrors baud's `Baud.Tools.result/0`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResult {
-    pub content: String,
-    pub is_error: bool,
-}
+/// Re-exported so existing `crate::tools::ToolResult` references keep resolving;
+/// the type itself now lives with the Tool contract in [`crate::tool`].
+pub use crate::tool::ToolResult;
 
-// The registry, in prompt order. The todo_write Tool leads so a small model
-// sees it first and records its task list early (CONTEXT.md: Plan). Boxed trait
-// objects so the async `run` stays object-safe (async-trait).
-fn tools() -> Vec<Box<dyn Tool>> {
+// The registry builder, in prompt order. The todo_write Tool leads so a small
+// model sees it first and records its task list early (CONTEXT.md: Plan). The
+// tool_search Tool trails: it is the on-demand discovery seam and is always on
+// the wire list (`always_load`). Boxed trait objects so the async `run` stays
+// object-safe (async-trait). `pub(crate)` because the ToolRegistry is the one
+// that owns this set at runtime; only the Run builds it.
+pub(crate) fn tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(todo_write::TodoWriteTool),
         Box::new(read_file::ReadFile),
@@ -39,60 +44,61 @@ fn tools() -> Vec<Box<dyn Tool>> {
         Box::new(grep::Grep),
         Box::new(edit_file::EditFile),
         Box::new(write_file::WriteFile),
+        Box::new(notebook_edit::NotebookEdit),
         Box::new(run_command::RunCommand),
         Box::new(web_fetch::WebFetch),
+        Box::new(ask_user_question::AskUserQuestion),
+        // task_stop trails with tool_search: both are deferred (discovered via
+        // `tool_search`), so neither rides the base wire list (P4b, ADR-0063).
+        Box::new(task_stop::TaskStop),
+        Box::new(tool_search::ToolSearch),
     ]
 }
 
-/// All tool specs, in prompt order.
+/// The BASE (non-revealed) wire list, in prompt order: every tool EXCEPT
+/// deferred, non-always-load tools (which the model discovers on demand via
+/// `tool_search`). Used for the Agent's one-time tool-spec overhead estimate,
+/// where zero tools are revealed - the wire list a request would carry at Run
+/// start. The Run's live, reveal-aware list comes off the `ToolRegistry`.
 pub fn specs() -> Vec<ToolSpec> {
-    tools().iter().map(|t| t.spec()).collect()
+    tools()
+        .iter()
+        .filter(|t| !(t.should_defer() && !t.always_load()))
+        .map(|t| t.spec())
+        .collect()
+}
+
+/// The `{name, description}` summary of every built-in tool the model must
+/// discover on demand (deferred, non-always-load), sorted by name. Feeds the
+/// "Deferred Tools" system-prompt section, computed once at Run launch. Empty
+/// until a later phase flips `should_defer`.
+///
+/// Sources the built-in set only - the built-in deferred floor. F8 (MCP) landed
+/// (ADR-0056): the Agent now sources its live Deferred Tools section from a
+/// per-session [`crate::tool_registry::ToolRegistry::with_shared`] registry over
+/// the built-ins PLUS the discovered `mcp__*` tools
+/// ([`crate::agent`]'s `init_agent`), so the section the model actually sees
+/// includes MCP tools. This free fn stays as the built-in floor these tests
+/// document; production reads the live registry instead.
+pub fn deferred_summary() -> Vec<(String, String)> {
+    crate::tool_registry::ToolRegistry::new(tools()).deferred_summary()
 }
 
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
-/// result to the Result Cap: the extension-free dispatch path.
+/// result to the Result Cap: the extension-free dispatch path. Delegates
+/// validation + dispatch to the Run's [`ToolRegistry`] (on the ctx).
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     let mut result = execute(name, input, ctx).await;
-    result.content = shaping::shape(name, input, &result.content, ctx.result_cap);
+    result.content = shaping::shape(name, input, result.content, ctx.result_cap);
     result
 }
 
-/// Runs the named tool WITHOUT Shaping - the raw result. Input is validated
-/// against the tool's JSON Schema before execution; an unknown tool name and an
-/// `Err` return both come back as `is_error` results.
+/// Runs the named tool WITHOUT Shaping - the raw result. A thin delegator to
+/// the ctx's [`ToolRegistry::execute`], which validates the input against the
+/// tool's JSON Schema before dispatch; an unknown tool name and an `Err` return
+/// both come back as `is_error` results.
 pub async fn execute(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
-    let all = tools();
-    let tool = match all.iter().find(|t| t.spec().name == name) {
-        Some(t) => t,
-        None => {
-            return ToolResult {
-                content: format!("unknown tool: {name:?}"),
-                is_error: true,
-            };
-        }
-    };
-
-    // Validate against the tool's own schema before dispatch. The empty-map
-    // case is handled by using an empty object when input is not an object.
-    let empty = serde_json::Map::new();
-    let input_map = input.as_object().unwrap_or(&empty);
-    if let Err(reason) = validate(&tool.spec().input_schema, input_map) {
-        return ToolResult {
-            content: reason,
-            is_error: true,
-        };
-    }
-
-    match tool.run(input, ctx).await {
-        Ok(content) => ToolResult {
-            content,
-            is_error: false,
-        },
-        Err(reason) => ToolResult {
-            content: reason,
-            is_error: true,
-        },
-    }
+    ctx.registry().execute(name, input, ctx).await
 }
 
 #[cfg(test)]
@@ -109,23 +115,30 @@ mod tests {
         "grep",
         "edit_file",
         "write_file",
+        "notebook_edit",
         "run_command",
         "web_fetch",
+        "ask_user_question",
+        "tool_search",
     ];
 
     fn ctx(root: &std::path::Path, cap: usize) -> ToolCtx {
-        ToolCtx {
-            root: root.to_path_buf(),
-            result_cap: cap,
-            command_timeout_ms: 120_000,
-        }
+        ToolCtx::for_test(root.to_path_buf(), cap)
+    }
+
+    // The text projection of a Tool Result's block list (ADR-0059) - the common
+    // single-Text-block case, so these result-content assertions read as before.
+    fn text_of(result: &ToolResult) -> String {
+        crate::content::result_blocks_text(&result.content)
     }
 
     // ---- all/specs ----
 
     #[test]
     fn returns_every_tool_in_prompt_order_todo_write_first() {
-        assert_eq!(tools().len(), 9);
+        // 13 built-ins: task_stop (P4b, ADR-0063) joined the set, but it is
+        // deferred so it does NOT appear on the base wire list (`specs()`).
+        assert_eq!(tools().len(), 13);
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
     }
@@ -134,6 +147,17 @@ mod tests {
     fn specs_returns_one_spec_per_tool_in_registry_order() {
         let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, EXPECTED_NAMES);
+    }
+
+    #[test]
+    fn task_stop_is_the_deferred_builtin() {
+        // task_stop (P4b, ADR-0063) is the first deferred built-in: it appears in
+        // the Deferred Tools summary (so the model can discover it via
+        // `tool_search`) but NOT on the base wire list (`specs()`).
+        let summary = deferred_summary();
+        assert!(summary.iter().any(|(name, _)| name == "task_stop"));
+        assert!(!crate::context_files::deferred_tools_section(&summary).is_empty());
+        assert!(!specs().iter().any(|s| s.name == "task_stop"));
     }
 
     #[test]
@@ -179,7 +203,7 @@ mod tests {
         )
         .await;
         assert!(!result.is_error);
-        assert_eq!(result.content, "a".repeat(500));
+        assert_eq!(text_of(&result), "a".repeat(500));
     }
 
     #[tokio::test]
@@ -187,7 +211,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = execute("bogus_tool", &json!({}), &ctx(tmp.path(), 100)).await;
         assert!(result.is_error);
-        assert!(result.content.contains("unknown tool"));
+        assert!(text_of(&result).contains("unknown tool"));
     }
 
     // ---- run ----
@@ -197,8 +221,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = run("bogus_tool", &json!({}), &ctx(tmp.path(), 10_000)).await;
         assert!(result.is_error);
-        assert!(result.content.contains("unknown tool"));
-        assert!(result.content.contains("bogus_tool"));
+        assert!(text_of(&result).contains("unknown tool"));
+        assert!(text_of(&result).contains("bogus_tool"));
     }
 
     #[tokio::test]
@@ -212,7 +236,7 @@ mod tests {
         )
         .await;
         assert!(!result.is_error);
-        assert!(result.content.contains("present.txt"));
+        assert!(text_of(&result).contains("present.txt"));
     }
 
     #[tokio::test]
@@ -225,7 +249,7 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
-        assert!(result.content.contains("enoent"));
+        assert!(text_of(&result).contains("enoent"));
     }
 
     #[tokio::test]
@@ -255,7 +279,7 @@ mod tests {
         .await;
         assert!(!result.is_error);
         assert_eq!(
-            result.content,
+            text_of(&result),
             format!(
                 "{}\n[truncated: output is 500 chars, showing the first 100]",
                 "a".repeat(100)
@@ -273,12 +297,8 @@ mod tests {
         )
         .await;
         assert!(!result.is_error);
-        assert!(result.content.contains("START"));
-        assert!(
-            result
-                .content
-                .contains("chars omitted from the middle of this output")
-        );
-        assert!(result.content.contains("[exit code: 0]"));
+        assert!(text_of(&result).contains("START"));
+        assert!(text_of(&result).contains("chars omitted from the middle of this output"));
+        assert!(text_of(&result).contains("[exit code: 0]"));
     }
 }

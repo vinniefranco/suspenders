@@ -143,7 +143,11 @@ pub(crate) fn spawn(
         let suggestions = tokio::task::spawn_blocking(move || search(&cache, &root, &query))
             .await
             .unwrap_or_default();
-        let _ = tx.send(Event::file_search_ready(generation, query_echo, suggestions));
+        let _ = tx.send(Event::file_search_ready(
+            generation,
+            query_echo,
+            suggestions,
+        ));
     });
 }
 
@@ -192,7 +196,10 @@ mod tests {
         let cache = WalkCache::new();
         let out = search(&cache, tmp.path(), "");
         assert_eq!(out[0].label, "my notes.md");
-        assert_eq!(out[0].value, "my\\ notes.md", "spaces are escaped for insert");
+        assert_eq!(
+            out[0].value, "my\\ notes.md",
+            "spaces are escaped for insert"
+        );
     }
 
     #[test]

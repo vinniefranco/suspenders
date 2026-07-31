@@ -24,7 +24,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::content::{ContentBlock, Message, Provenance};
+use crate::content::{
+    ContentBlock, Message, Provenance, ResultBlock, unsupported_modality_placeholder,
+};
 use crate::llm::LlmRequest;
 use crate::llm::model::{Api, Model};
 use crate::voice;
@@ -48,6 +50,44 @@ pub fn normalize_request(request: &LlmRequest, target: &Model) -> LlmRequest {
     let mut normalized = request.clone();
     normalized.messages = normalize(std::mem::take(&mut normalized.messages), target);
     normalized
+}
+
+/// The media-degrade pass (ADR-0059): replaces every Tool Result media block the
+/// target Model cannot accept with the VERBATIM unsupported-modality placeholder
+/// (a Text block). The cross-Model-history safety net - a request may carry media
+/// a previous, capable Model produced, so this fires at wire-build time for the
+/// Model actually receiving the request. A Model that supports the modality keeps
+/// its media untouched. Pure; runs after [`normalize_request`] in the Dispatcher.
+pub fn degrade_unsupported_media(mut request: LlmRequest, model: &Model) -> LlmRequest {
+    for message in &mut request.messages {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                degrade_blocks(content, model);
+            }
+        }
+    }
+    request
+}
+
+// Rewrites a Tool Result's block list in place: an Image block degrades unless
+// the Model accepts image; a Document (PDF) degrades unless it accepts pdf. The
+// placeholder names the mime as the display name (the wire has no filename).
+fn degrade_blocks(blocks: &mut [ResultBlock], model: &Model) {
+    let modalities = model.input_modalities;
+    for block in blocks.iter_mut() {
+        let placeholder = match block {
+            ResultBlock::Image { mime, .. } if !modalities.image => {
+                Some(unsupported_modality_placeholder("image", mime))
+            }
+            ResultBlock::Document { mime, .. } if !modalities.pdf => {
+                Some(unsupported_modality_placeholder("pdf", mime))
+            }
+            _ => None,
+        };
+        if let Some(text) = placeholder {
+            *block = ResultBlock::text(text);
+        }
+    }
 }
 
 /// Normalizes `messages` for the target Model. Assistant messages whose
@@ -474,7 +514,7 @@ mod tests {
         assert!(matches!(
             &out[2].content[1],
             ContentBlock::ToolResult { content, is_error: true, .. }
-                if content == voice::orphaned_call_answer()
+                if crate::content::result_blocks_text(content) == voice::orphaned_call_answer()
         ));
         assert!(matches!(&out[2].content[2], ContentBlock::Text { text } if text == "steering"));
     }
@@ -492,7 +532,8 @@ mod tests {
         assert!(matches!(
             &out[2].content[0],
             ContentBlock::ToolResult { tool_use_id, is_error: true, content }
-                if tool_use_id == "t1" && content == voice::orphaned_call_answer()
+                if tool_use_id == "t1"
+                    && crate::content::result_blocks_text(content) == voice::orphaned_call_answer()
         ));
     }
 
@@ -529,6 +570,97 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(use_ids(&out[0]), vec!["t_1"]);
         assert_eq!(result_ids(&out[1]), vec!["t_1"]);
+    }
+
+    // ---- degrade_unsupported_media (ADR-0059) ----
+
+    fn image_result(id: &str) -> ContentBlock {
+        ContentBlock::tool_result_blocks(
+            id,
+            vec![ResultBlock::Image {
+                mime: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+            false,
+        )
+    }
+
+    fn result_blocks(message: &Message) -> &[ResultBlock] {
+        match &message.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_image_degrades_to_the_verbatim_placeholder() {
+        // The target Model accepts text only (all-false modalities), so the image
+        // becomes the VERBATIM qwen unsupported-modality message.
+        let model = target(Api::AnthropicMessages);
+        let request = LlmRequest::new("s", vec![Message::user(vec![image_result("t1")])], vec![]);
+        let out = degrade_unsupported_media(request, &model);
+        match &result_blocks(&out.messages[0])[0] {
+            ResultBlock::Text { text } => assert_eq!(
+                text,
+                "[Unsupported image file: \"image/png\". This model does not \
+support image input. The read_file tool cannot process this type of file \
+either. To handle this file, try using skills if applicable, or any tools \
+installed at system wide, or let the user know you cannot process this type of \
+file.]"
+            ),
+            other => panic!("expected a degraded Text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_supported_modality_keeps_its_media_untouched() {
+        let mut model = target(Api::AnthropicMessages);
+        model.input_modalities = crate::content::Modalities {
+            image: true,
+            pdf: false,
+        };
+        let request = LlmRequest::new("s", vec![Message::user(vec![image_result("t1")])], vec![]);
+        let out = degrade_unsupported_media(request, &model);
+        assert!(matches!(
+            &result_blocks(&out.messages[0])[0],
+            ResultBlock::Image { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_pdf_degrades_but_a_supported_pdf_stays() {
+        let pdf = |id: &str| {
+            ContentBlock::tool_result_blocks(
+                id,
+                vec![ResultBlock::Document {
+                    mime: "application/pdf".into(),
+                    data: "BBBB".into(),
+                }],
+                false,
+            )
+        };
+
+        let text_only = target(Api::AnthropicMessages);
+        let request = LlmRequest::new("s", vec![Message::user(vec![pdf("t1")])], vec![]);
+        let out = degrade_unsupported_media(request, &text_only);
+        match &result_blocks(&out.messages[0])[0] {
+            ResultBlock::Text { text } => assert!(text.starts_with(
+                "[Unsupported pdf file: \"application/pdf\". This model does not support pdf input."
+            )),
+            other => panic!("expected a degraded Text block, got {other:?}"),
+        }
+
+        let mut pdf_model = target(Api::AnthropicMessages);
+        pdf_model.input_modalities = crate::content::Modalities {
+            image: false,
+            pdf: true,
+        };
+        let request = LlmRequest::new("s", vec![Message::user(vec![pdf("t1")])], vec![]);
+        let out = degrade_unsupported_media(request, &pdf_model);
+        assert!(matches!(
+            &result_blocks(&out.messages[0])[0],
+            ResultBlock::Document { .. }
+        ));
     }
 
     // ---- normalize_request ----

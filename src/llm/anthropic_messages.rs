@@ -578,7 +578,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool_spec = crate::tool::ToolSpec {
+        let tool_spec = crate::content::ToolSpec {
             name: "read_file".into(),
             description: "Reads the contents of a file.".into(),
             input_schema: json!({
@@ -664,7 +664,12 @@ mod tests {
         let m3 = msgs[2]["content"].as_array().unwrap();
         assert_eq!(
             m3[0],
-            json!({ "type": "tool_result", "tool_use_id": "toolu_1", "content": "defmodule ...", "is_error": false })
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "is_error": false,
+                "content": [{ "type": "text", "text": "defmodule ..." }]
+            })
         );
     }
 
