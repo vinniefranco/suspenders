@@ -23,20 +23,25 @@ struct Cli {
     prompts: Vec<String>,
 }
 
+/// Resolves the config target, writes the template, and reports the path.
+/// Extracted from `main` so `main` stays a pure integrator (IOSP).
+fn write_config(path: &str, force: bool) -> anyhow::Result<()> {
+    let resolved = suspenders::session::SessionConfig::resolve_template_path(path);
+    suspenders::session::SessionConfig::write_template(&resolved, force)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("wrote config template to {resolved}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // --write-config removes the hand-authoring friction (ADR-0031): resolve
-    // the target (empty = XDG default, a rule the config seam owns), write the
-    // base()-defaults template, and exit before any Session is built - works
-    // for both TUI and headless.
-    if let Some(path) = cli.write_config {
-        let path = suspenders::session::SessionConfig::resolve_template_path(&path);
-        suspenders::session::SessionConfig::write_template(&path, cli.force)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!("wrote config template to {path}");
-        return Ok(());
+    // --write-config removes the hand-authoring friction (ADR-0031): write the
+    // base()-defaults template and exit before any Session is built - works for
+    // both TUI and headless.
+    if let Some(ref path) = cli.write_config {
+        return write_config(path, cli.force);
     }
 
     if cli.headless {

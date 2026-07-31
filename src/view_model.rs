@@ -310,21 +310,4 @@ impl TranscriptItem {
             _ => false,
         }
     }
-
-    /// The title an item collapses TO under the global tools toggle (Ctrl-O):
-    /// the one-liner the view shows in place of the folded body. Kept beside
-    /// [`has_foldable_body`] so the collapse rule - predicate AND title - lives
-    /// entirely in the pure core (Stage 2 review C2 / S1): the view composes the
-    /// collapsed line from this accessor without matching on `Diff`, so a future
-    /// non-Diff foldable item collapses the same way. Today only a [`Diff`] has
-    /// a fold title.
-    ///
-    /// [`has_foldable_body`]: TranscriptItem::has_foldable_body
-    /// [`Diff`]: TranscriptItem::Diff
-    pub fn fold_title(&self) -> Option<&str> {
-        match self {
-            TranscriptItem::Diff { title, .. } => Some(title),
-            _ => None,
-        }
-    }
 }

@@ -53,6 +53,12 @@ impl Stage {
     }
 }
 
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One AT file-picker suggestion (qwen `useAtCompletion`'s `{label, value}`):
 /// the repo-relative `label` shown in the popup (and highlighted against the
 /// query) and the `value` INSERTED on accept - the same path with its spaces
@@ -457,12 +463,5 @@ impl Event {
 
     pub fn session_cost(total: f64) -> Self {
         Event::SessionCost { total }
-    }
-
-    // qual:test_helper
-    pub fn session_log_error(message: impl Into<String>) -> Self {
-        Event::SessionLogError {
-            message: message.into(),
-        }
     }
 }

@@ -45,13 +45,6 @@ fn handled(name: &str) -> Option<Handled> {
     }
 }
 
-/// Whether the adapter has a handler for `name`. Derived from [`handled`], so it
-/// can never drift past the router.
-// qual:test_helper - only the coverage test in this module calls it
-pub fn is_handled(name: &str) -> bool {
-    handled(name).is_some()
-}
-
 /// Routes a committed Slash Command to its adapter work (ADR-0032/0033). An
 /// unrecognized name is a visible no-op-with-info-line, not a silent drop. The
 /// [`Handled`] match is exhaustive, so a new command is a compile error here
@@ -94,26 +87,5 @@ pub(super) async fn choose(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ui::slash;
-
-    #[test]
-    fn model_and_theme_are_handled_and_an_unknown_name_is_not() {
-        assert!(is_handled("model"));
-        assert!(is_handled("theme"));
-        assert!(!is_handled("compact"));
-        assert!(!is_handled(""));
-    }
-
-    // Adding a COMMANDS entry without a `handled` mapping would otherwise fail
-    // silently (ADR-0032's extension seam): assert every registered command is
-    // handled. This drives the real classifier - the same one `run`/`choose`
-    // match exhaustively - so a registry entry cannot outrun its adapter arm.
-    #[test]
-    fn every_registry_command_is_handled() {
-        for c in slash::COMMANDS {
-            assert!(is_handled(c.name), "unhandled command: {}", c.name);
-        }
-    }
-}
+#[path = "../../tests/unit/ui/command.rs"]
+mod tests;

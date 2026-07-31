@@ -4,10 +4,21 @@
 # Thresholds are set to your current maximums + 20% headroom.
 # Tighten them over time as you improve code quality.
 
-# docs/** holds vendored tuning-fixture crates, not production code. Unlike the
-# old CRAP gate we do NOT exclude test files: rustqual analyzes test code on
-# purpose (the Test Quality dimension and the [tests] threshold overrides).
-exclude_files = ["docs/**"]
+# docs/** holds vendored tuning-fixture crates, not production code.
+#
+# We exclude test code from the gate entirely. Tests exist to tell a story, and
+# that story is allowed to repeat itself (DRY), sprawl (SRP file length), and
+# set up elaborate fixtures (complexity) in ways production code must not. The
+# relocated unit tests live under tests/** (in-crate #[cfg(test)] #[path]
+# submodules); the remaining src-resident entries are pure #[cfg(test)] test
+# support (helpers/fixtures), not production paths.
+exclude_files = [
+    "docs/**",
+    "tests/**",
+    "src/test_support.rs",
+    "src/llm/adapter_test_support.rs",
+    "src/run/fixtures.rs",
+]
 strict_closures = false
 strict_iterator_chains = false
 allow_recursion = false

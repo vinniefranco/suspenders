@@ -15,6 +15,14 @@ use tokio::sync::{mpsc, oneshot};
 use crate::agent::{Msg, RunMsg};
 use crate::event::Event;
 
+/// The VERBATIM "no background task found" wording (ADR-0063): returned by
+/// both stop legs (subagent and shell) when the channel is unavailable, so the
+/// two closed-channel fallbacks never drift from each other. `pub(super)` so the
+/// Agent's own StopBackground handlers share the one wording (never re-inline).
+pub(super) fn bg_not_found(id: &str) -> String {
+    format!("Error: No background task found with ID \"{id}\".")
+}
+
 /// The tx-backed [`Approver`](crate::tool::caps::Approver): the Agent's
 /// fulfilment of the tool-initiated Approval seam (F1, ADR-0055). It relays an
 /// Approval over the same mpsc the [`super::deps::AgentDeps::request_approval`]
@@ -194,11 +202,9 @@ impl crate::tool::caps::SubagentSpawner for AgentSubagentSpawner {
             }))
             .is_err()
         {
-            return Ok(format!("Error: No background task found with ID \"{id}\"."));
+            return Ok(bg_not_found(&id));
         }
-        Ok(rx
-            .await
-            .unwrap_or_else(|_| format!("Error: No background task found with ID \"{id}\".")))
+        Ok(rx.await.unwrap_or_else(|_| bg_not_found(&id)))
     }
 }
 
@@ -249,10 +255,8 @@ impl crate::tool::caps::BackgroundShellSpawner for AgentBackgroundShellSpawner {
             }))
             .is_err()
         {
-            return Ok(format!("Error: No background task found with ID \"{id}\"."));
+            return Ok(bg_not_found(&id));
         }
-        Ok(rx
-            .await
-            .unwrap_or_else(|_| format!("Error: No background task found with ID \"{id}\".")))
+        Ok(rx.await.unwrap_or_else(|_| bg_not_found(&id)))
     }
 }

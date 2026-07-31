@@ -15,6 +15,14 @@ use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
+fn make_tool_use(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
+    ContentBlock::ToolUse {
+        id: id.into(),
+        name: name.into(),
+        input,
+    }
+}
+
 // ---- event_lines: one assertion per event kind -------------------------
 
 #[test]
@@ -39,7 +47,7 @@ fn message_end_lists_tool_names_and_the_joined_text() {
     let event = Event::MessageEnd {
         content: vec![
             ContentBlock::text("first"),
-            ContentBlock::tool_use("t1", "read_file", json!({})),
+            make_tool_use("t1", "read_file", json!({})),
             ContentBlock::text("second"),
         ],
         stop_reason: StopReason::ToolUse,
@@ -56,7 +64,7 @@ fn message_end_lists_tool_names_and_the_joined_text() {
 #[test]
 fn message_end_without_text_prints_only_the_tools_line() {
     let event = Event::MessageEnd {
-        content: vec![ContentBlock::tool_use("t1", "list_directory", json!({}))],
+        content: vec![make_tool_use("t1", "list_directory", json!({}))],
         stop_reason: StopReason::ToolUse,
     };
     assert_eq!(

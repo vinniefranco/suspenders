@@ -63,6 +63,7 @@ use deps::AgentDeps;
 use settle::{LoopOrDown, settle_event_to_event, to_settlement_outcome};
 
 #[cfg(test)]
+#[path = "../tests/unit/agent.rs"]
 mod tests;
 
 /// The default system prompt (baud's `Baud.Agent.system_prompt/0`). Public for
@@ -136,12 +137,6 @@ impl StartOpts {
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
-        self
-    }
-
-    // qual:test_helper
-    pub fn with_resume(mut self, resume: Resume) -> Self {
-        self.resume = Some(resume);
         self
     }
 }
@@ -309,7 +304,6 @@ pub enum Command {
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
     Conversation(oneshot::Sender<Conversation>),
-    SessionQuery(oneshot::Sender<Session>),
     Plan(oneshot::Sender<Option<String>>),
     ResumeInfoQuery(oneshot::Sender<Option<ResumeInfo>>),
 }
@@ -457,9 +451,12 @@ impl AgentHandle {
     }
 
     /// The Active Model identifier the next Run will call (ADR-0033), for a
-    /// caller marking "(current)".
-    pub async fn active_model(&self) -> String {
-        self.query(Command::ActiveModel).await.expect("agent alive")
+    /// caller marking "(current)". `None` when the actor is gone or the reply is
+    /// dropped - `run_loop` refreshes this on every input batch, so a dead Agent
+    /// mid-batch must degrade (keep the last-shown model) rather than panic the
+    /// TUI, exactly like [`AgentHandle::status`] and [`AgentHandle::list_models`].
+    pub async fn active_model(&self) -> Option<String> {
+        self.query(Command::ActiveModel).await
     }
 
     /// Lists every Provider's models for the `/model` selector (ADR-0033,
@@ -533,13 +530,6 @@ impl AgentHandle {
     /// The current Conversation (baud's `conversation/1`).
     pub async fn conversation(&self) -> Conversation {
         self.query(Command::Conversation)
-            .await
-            .expect("agent alive")
-    }
-
-    /// The Session's fixed facts (baud's `session/1`).
-    pub async fn session(&self) -> Session {
-        self.query(Command::SessionQuery)
             .await
             .expect("agent alive")
     }
@@ -773,9 +763,6 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         Command::Conversation(reply) => {
             let _ = reply.send(state.conversation.clone());
         }
-        Command::SessionQuery(reply) => {
-            let _ = reply.send(state.session.clone());
-        }
         Command::Plan(reply) => {
             let _ = reply.send(state.plan.clone());
         }
@@ -822,18 +809,28 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             tokens_before,
         } => {
             let entry = new_state.session_log_entry(skip_count as usize, tokens_before);
+            // The LogEntry::Compacted needs owned copies of the summary text and
+            // the original_task (which also lands back in state.compaction), and
+            // the file_ops (same). Clone them once for the log; the originals
+            // move into the refreshed state below.
             log_entry(
                 state,
                 LogEntry::Compacted {
-                    summary: entry.summary.unwrap_or_default(),
+                    summary: entry.summary.clone().unwrap_or_default(),
                     skip_count: entry.skip_count as u64,
                     tokens_before: entry.tokens_before,
-                    file_ops: entry.file_ops,
-                    original_task: entry.original_task,
+                    file_ops: entry.file_ops.clone(),
+                    original_task: entry.original_task.clone(),
                 },
             );
             broadcast(state, Event::compaction_progress("done"));
-            state.compaction = new_state;
+            // Move the entry fields into the live compaction state without an
+            // extra round-trip through session_log_entry.
+            state.compaction = Compaction {
+                previous_summary: entry.summary,
+                file_ops: entry.file_ops,
+                original_task: entry.original_task,
+            };
         }
         RunMsg::SpawnBackground {
             request,
@@ -854,7 +851,7 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             let wording = state
                 .stop_background(id.clone())
                 .or_else(|| state.stop_background_shell(id.clone()))
-                .unwrap_or_else(|| format!("Error: No background task found with ID \"{id}\"."));
+                .unwrap_or_else(|| capabilities::bg_not_found(&id));
             let _ = reply.send(wording);
         }
         RunMsg::SpawnBackgroundShell {
@@ -871,7 +868,7 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
         RunMsg::StopBackgroundShell { id, reply } => {
             let wording = state
                 .stop_background_shell(id.clone())
-                .unwrap_or_else(|| format!("Error: No background task found with ID \"{id}\"."));
+                .unwrap_or_else(|| capabilities::bg_not_found(&id));
             let _ = reply.send(wording);
         }
         RunMsg::DrainNotifications(reply) => {
@@ -1082,9 +1079,6 @@ fn spawn_run(state: &mut AgentState) {
         state.self_tx.clone(),
         Arc::clone(&state.llm),
         state.model.clone(),
-        state.session.temperature,
-        state.session.thinking_budget,
-        state.session.tool_call_style,
         state.compaction.clone(),
         Arc::clone(&state.session_tools),
         Arc::clone(&state.subagents),
@@ -1210,6 +1204,32 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
         Rollover::Submit(prompt) => start_run(state, prompt),
         Rollover::None => {}
     }
+}
+
+// ---- Background stop helpers -----------------------------------------------
+
+/// The VERBATIM qwen "not running" error the two background stop handlers share
+/// (ADR-0063): `Error: Background agent "{id}" is not running (status: {status}).`
+/// Centralised so the two registries (subagent + shell) produce identical wording
+/// with no string-sniffing risk if one drifts.
+fn background_not_running_error(id: &str, status: &str) -> String {
+    format!("Error: Background agent \"{id}\" is not running (status: {status}).")
+}
+
+/// Queue the `was cancelled` notification and broadcast the matching events:
+/// shared by both background stop handlers (the subagent registry and the shell
+/// registry). `description` is the human-readable label the notification
+/// `<summary>` carries (the agent's 3-5 word summary, or the shell command).
+fn emit_cancelled_notification(state: &mut AgentState, id: &str, description: &str) {
+    use crate::session::log::Entry as LogEntry;
+    let notification = background::task_notification(id, "cancelled", description, "");
+    state.notifications.push(notification.clone());
+    log_entry(state, LogEntry::UserText(notification.clone()));
+    broadcast(state, Event::background_notification(notification));
+    broadcast(
+        state,
+        Event::background_task_finished(id.to_owned(), "cancelled"),
+    );
 }
 
 // ---- Resume ----------------------------------------------------------------
