@@ -89,7 +89,7 @@ pub struct CellOutput {
 /// A notebook cell (qwen `NotebookCell`). `cell_type` is `code | markdown | raw`
 /// on well-formed notebooks; kept a `String` so an unknown type still parses and
 /// formats through the default arm.
-// qual:allow(srp, god_struct) reason: "serde ipynb wire DTO - fields are independent JSON keys preserved verbatim for notebook round-trip; splitting breaks fidelity"
+// qual:allow(srp, god_struct) reason: "faithful representation of the external Jupyter .ipynb cell schema - the fields (cell_type/source/metadata/outputs/execution_count/id + the `#[serde(flatten)] extra` catch-all) are defined by nbformat, not our design; the LCOM4=2 reflects that the format's own keys serve different cell kinds (code vs markdown), and restructuring would misrepresent the wire or break the verbatim parse -> edit -> serialize round-trip notebook_edit depends on"
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Cell {
     pub cell_type: String,
@@ -180,7 +180,7 @@ pub struct Kernelspec {
 
 /// The top-level notebook (qwen `NotebookContent`). `cells` is required for a
 /// valid notebook; everything else is optional.
-// qual:allow(srp, god_struct) reason: "serde ipynb wire DTO - fields are independent JSON keys preserved verbatim for notebook round-trip; splitting breaks fidelity"
+// qual:allow(srp, god_struct) reason: "faithful representation of the external Jupyter .ipynb top-level schema - the fields (cells/metadata/nbformat/nbformat_minor + the `#[serde(flatten)] extra` catch-all) are defined by nbformat, not our design; splitting them would misrepresent the wire or break the verbatim parse -> edit -> serialize round-trip notebook_edit depends on"
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Notebook {
     #[serde(default)]

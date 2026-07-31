@@ -1155,22 +1155,14 @@ fn load_file_overlay(cfg: &mut SessionConfig, path: &str) -> Result<(), SessionE
 fn validate(s: &Session) -> Result<(), SessionError> {
     validate_scalars(s)?;
     validate_providers(s)?;
-    validate_mcp_servers(s)?;
+    // An MCP server entry's transport (F8, ADR-0056) is now a sum type resolved
+    // AT PARSE TIME: a malformed entry - both `command` and `http_url`, or
+    // neither - is a loud deserialize error when the config is parsed, so there
+    // is no separate transport-validation pass here. A server that resolves but
+    // will not connect is still skipped at attach (fail-open), not rejected.
     // The per-Model budget invariants, applied to the launch Model here; the
     // Agent re-applies them to every `/model` pick (ADR-0037).
     s.validate_model_budget(&s.model).map_err(SessionError)?;
-    Ok(())
-}
-
-// Each MCP server entry must resolve a transport (F8, ADR-0056): a malformed
-// entry - both `command` and `http_url`, or neither - is a LOUD launch failure
-// here, distinct from the fail-open connect path (a server that resolves but
-// will not connect is skipped at attach, not rejected here).
-fn validate_mcp_servers(s: &Session) -> Result<(), SessionError> {
-    for (name, cfg) in &s.mcp_servers {
-        cfg.transport()
-            .map_err(|reason| SessionError(format!("mcp_server {name:?}: {reason}")))?;
-    }
     Ok(())
 }
 
@@ -2046,25 +2038,24 @@ mod tests {
         let servers = fc.mcp_servers.clone().unwrap();
 
         let fs = &servers["fs"];
-        assert_eq!(fs.command.as_deref(), Some("mcp-fs"));
-        assert_eq!(fs.args, vec!["--root".to_string(), "/tmp".to_string()]);
-        assert_eq!(fs.env["LOG"], "debug");
         assert_eq!(fs.exclude_tools, vec!["delete".to_string()]);
+        // The flat `command`/`args`/`env` keys fold into the stdio sum-type at
+        // parse time - the both/neither illegal states are unrepresentable here.
         assert!(matches!(
-            fs.transport(),
-            Ok(crate::mcp::McpTransport::Stdio { .. })
+            &fs.transport,
+            crate::mcp::McpTransport::Stdio { command, args, env, .. }
+                if command == "mcp-fs"
+                    && *args == vec!["--root".to_string(), "/tmp".to_string()]
+                    && env["LOG"] == "debug"
         ));
 
         let remote = &servers["remote"];
-        assert_eq!(
-            remote.http_url.as_deref(),
-            Some("https://mcp.example.test/mcp")
-        );
-        assert_eq!(remote.headers["Authorization"], "Bearer x");
         assert_eq!(remote.trust, Some(true));
         assert!(matches!(
-            remote.transport(),
-            Ok(crate::mcp::McpTransport::Http { .. })
+            &remote.transport,
+            crate::mcp::McpTransport::Http { url, headers }
+                if url == "https://mcp.example.test/mcp"
+                    && headers["Authorization"] == "Bearer x"
         ));
     }
 
@@ -2079,21 +2070,16 @@ mod tests {
     }
 
     #[test]
-    fn session_build_rejects_a_malformed_mcp_server_transport() {
-        // A malformed entry (both transports) is a LOUD launch failure at build,
-        // distinct from the fail-open connect path (ADR-0056).
-        let mut cfg = cfg();
-        cfg.mcp_servers.insert(
-            "broken".to_string(),
-            crate::mcp::McpServerConfig {
-                command: Some("cmd".into()),
-                http_url: Some("https://x.test".into()),
-                ..Default::default()
-            },
-        );
-        let err = Session::build(SessionOpts::default(), &cfg).unwrap_err();
-        assert!(err.0.contains("mcp_server"));
-        assert!(err.0.contains("broken"));
+    fn file_config_rejects_a_malformed_mcp_server_transport() {
+        // A malformed entry (both transports) is a LOUD PARSE failure now that the
+        // transport is a sum type resolved at deserialize time - the illegal state
+        // is unrepresentable, so it never reaches build (ADR-0056). This replaces
+        // the old build-time transport-validation pass.
+        let err = FileConfig::parse(
+            r#"{"mcp_servers": {"broken": {"command": "cmd", "http_url": "https://x.test"}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("both"));
     }
 
     #[test]

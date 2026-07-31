@@ -6,63 +6,57 @@
 //! `mcp_servers` and every field is snake_case. qwen-code names the same map
 //! `mcpServers` (camelCase); the divergence is deliberate - a config port stays
 //! in Suspenders' idiom, not the source's.
+//!
+//! The wire shape stays FLAT (qwen fidelity): a user writes `{command, args,
+//! ...}` XOR `{http_url, headers}` at the top level, alongside the common
+//! `timeout_ms`/`trust`/`include_tools`/`exclude_tools`. But the in-memory model
+//! makes the transport a SUM TYPE ([`McpTransport`]) so the "both `command` and
+//! `http_url`" and "neither" states are UNREPRESENTABLE, not a deferred runtime
+//! check. The flat wire and the sum type are bridged by a hand-written
+//! [`Deserialize`]/[`Serialize`] on [`McpServerConfig`]: parse reads the known
+//! flat keys, rejects an unknown key (`deny_unknown_fields` parity) and the
+//! command-XOR-http_url ambiguity AT PARSE TIME (with field context), then folds
+//! the transport fields into the sum type; serialize writes the same flat shape
+//! back.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// One MCP server's config entry. A stdio server carries `command` (+ optional
-/// `args`/`env`/`cwd`); an HTTP server carries `http_url` (+ optional
-/// `headers`). Exactly one of the two transports must be expressed - see
-/// [`transport`](McpServerConfig::transport). `deny_unknown_fields` like the
-/// rest of the config schema, so a typo'd key is a loud parse error.
-// qual:allow(srp, god_struct) reason: "untagged serde config DTO - stdio and http fields are mutually-exclusive clusters that mirror qwen's flat MCPServerConfig; an enum would diverge from the ported wire shape"
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// One MCP server's config entry. The [`transport`](McpServerConfig::transport)
+/// is a sum type - stdio XOR HTTP, never both or neither - so a malformed entry
+/// cannot be constructed or parsed; the rest is the common cross-transport
+/// config (timeout, trust, the tool filter). The wire shape is flat (see the
+/// module docs); construct one from a [`McpTransport`] via [`McpServerConfig::new`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
-    /// The stdio server's executable. Present => a stdio transport (spawn
-    /// `command` with `args`/`env`/`cwd`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    /// The stdio server's arguments.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<String>,
-    /// Extra environment for the spawned stdio server, layered over the
-    /// inherited environment.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// The working directory for the spawned stdio server; absent inherits the
-    /// Agent's cwd.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    /// The HTTP server's endpoint. Present => a streamable-HTTP transport.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_url: Option<String>,
-    /// Static headers sent with every HTTP request (OAuth is out of scope,
-    /// ADR-0056 - a bearer token is a `headers` entry the user writes by hand).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
+    /// The resolved transport - exactly one of stdio or HTTP. The flat wire keys
+    /// (`command`/`args`/`env`/`cwd` or `http_url`/`headers`) fold into this at
+    /// parse time; the both/neither ambiguity is a parse error, not a stored
+    /// illegal state.
+    pub transport: McpTransport,
     /// The per-server connect + call timeout in milliseconds; absent uses the
     /// transport default (30s stdio, 5s HTTP).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Whether the user trusts this server's tools (parsed + stored for
     /// ADR-0056 parity; gates nothing in P1c - MCP-call approval is out of
     /// scope).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<bool>,
     /// An allowlist: when `Some`, ONLY these tool names are admitted (before
     /// exclusion). Absent admits every discovered tool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_tools: Option<Vec<String>>,
     /// A denylist: these tool names are always dropped, even if included.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_tools: Vec<String>,
 }
 
-/// A resolved transport: exactly one of the two the config expresses. The
-/// manager builds the concrete rmcp transport from this (the only place the
-/// wire crate is touched), so the resolution rule stays pure and unit-tested.
+/// A resolved transport: exactly one of the two shapes a server config
+/// expresses. The manager builds the concrete rmcp transport from this (the only
+/// place the wire crate is touched), so the resolution stays pure and
+/// unit-tested. Modelling it as a sum type (rather than a bag of `Option`s) is
+/// what makes "both transports" and "neither" unrepresentable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpTransport {
     /// A stdio server: spawn `command` with `args`, `env` layered over the
@@ -82,30 +76,16 @@ pub enum McpTransport {
 }
 
 impl McpServerConfig {
-    /// Resolves the config's transport, or `Err` naming the ambiguity. A
-    /// command-only entry is stdio; an http_url-only entry is HTTP; both or
-    /// neither is a malformed config (a LOUD launch failure, distinct from the
-    /// fail-open connect path - see [`crate::mcp::manager`]).
-    pub fn transport(&self) -> Result<McpTransport, String> {
-        match (&self.command, &self.http_url) {
-            (Some(command), None) => Ok(McpTransport::Stdio {
-                command: command.clone(),
-                args: self.args.clone(),
-                env: self.env.clone(),
-                cwd: self.cwd.clone(),
-            }),
-            (None, Some(url)) => Ok(McpTransport::Http {
-                url: url.clone(),
-                headers: self.headers.clone(),
-            }),
-            (Some(_), Some(_)) => Err(
-                "both `command` and `http_url` set - an MCP server is either stdio (command) or HTTP (http_url), not both"
-                    .to_string(),
-            ),
-            (None, None) => Err(
-                "neither `command` nor `http_url` set - an MCP server needs one transport"
-                    .to_string(),
-            ),
+    /// Builds a config from a resolved [`McpTransport`] and the default (empty)
+    /// common config. Tests and the manager construct through this instead of a
+    /// struct literal so the flat wire fields never leak back as public state.
+    pub fn new(transport: McpTransport) -> McpServerConfig {
+        McpServerConfig {
+            transport,
+            timeout_ms: None,
+            trust: None,
+            include_tools: None,
+            exclude_tools: Vec::new(),
         }
     }
 
@@ -127,62 +107,324 @@ impl McpServerConfig {
     }
 }
 
+/// The flat wire keys a server entry may carry. `deny_unknown_fields` parity: a
+/// key outside this set is a parse error, so a typo stays loud.
+const FIELDS: &[&str] = &[
+    "command",
+    "args",
+    "env",
+    "cwd",
+    "http_url",
+    "headers",
+    "timeout_ms",
+    "trust",
+    "include_tools",
+    "exclude_tools",
+];
+
+/// Deserializes the FLAT wire shape into the sum-type config. The transport keys
+/// (`command`/`args`/`env`/`cwd` and `http_url`/`headers`) are read into locals;
+/// the command-XOR-http_url rule is enforced HERE, so "both" and "neither" are
+/// parse errors with the field context rather than a deferred runtime check. An
+/// unknown key errors (`deny_unknown_fields` parity).
+impl<'de> Deserialize<'de> for McpServerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<McpServerConfig, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ConfigVisitor;
+
+        impl<'de> Visitor<'de> for ConfigVisitor {
+            type Value = McpServerConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an MCP server config (a `command` or `http_url` entry)")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<McpServerConfig, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut command: Option<String> = None;
+                let mut args: Option<Vec<String>> = None;
+                let mut env: Option<BTreeMap<String, String>> = None;
+                let mut cwd: Option<String> = None;
+                let mut http_url: Option<String> = None;
+                let mut headers: Option<BTreeMap<String, String>> = None;
+                let mut timeout_ms: Option<u64> = None;
+                let mut trust: Option<bool> = None;
+                let mut include_tools: Option<Vec<String>> = None;
+                let mut exclude_tools: Option<Vec<String>> = None;
+
+                // Read a value into its slot, erroring on a duplicate key (serde
+                // derive's behaviour, kept so a repeated flat key stays a loud
+                // parse error). Inlined as a macro rather than a helper fn so it
+                // reads as part of the visitor's own body.
+                macro_rules! set_once {
+                    ($slot:ident) => {{
+                        if $slot.is_some() {
+                            return Err(de::Error::duplicate_field(stringify!($slot)));
+                        }
+                        $slot = Some(map.next_value()?);
+                    }};
+                }
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "command" => set_once!(command),
+                        "args" => set_once!(args),
+                        "env" => set_once!(env),
+                        "cwd" => set_once!(cwd),
+                        "http_url" => set_once!(http_url),
+                        "headers" => set_once!(headers),
+                        "timeout_ms" => set_once!(timeout_ms),
+                        "trust" => set_once!(trust),
+                        "include_tools" => set_once!(include_tools),
+                        "exclude_tools" => set_once!(exclude_tools),
+                        // deny_unknown_fields parity: a typo'd key is a loud error.
+                        other => return Err(de::Error::unknown_field(other, FIELDS)),
+                    }
+                }
+
+                // The transport rule, enforced at parse time: command XOR
+                // http_url. "both" and "neither" become deserialize errors (with
+                // the offending shape named) rather than a stored illegal state.
+                // Each arm also rejects the OTHER transport's keys, so a key that
+                // does not belong to the chosen shape is a loud error rather than
+                // a value that silently round-trips away.
+                let transport = match (command, http_url) {
+                    (Some(command), None) => {
+                        if headers.is_some() {
+                            return Err(de::Error::custom(
+                                "`headers` set on a stdio server (`command`) - headers belong to an HTTP server (`http_url`)",
+                            ));
+                        }
+                        McpTransport::Stdio {
+                            command,
+                            args: args.unwrap_or_default(),
+                            env: env.unwrap_or_default(),
+                            cwd,
+                        }
+                    }
+                    (None, Some(url)) => {
+                        if args.is_some() || env.is_some() || cwd.is_some() {
+                            return Err(de::Error::custom(
+                                "`args`/`env`/`cwd` set on an HTTP server (`http_url`) - those belong to a stdio server (`command`)",
+                            ));
+                        }
+                        McpTransport::Http {
+                            url,
+                            headers: headers.unwrap_or_default(),
+                        }
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(de::Error::custom(
+                            "both `command` and `http_url` set - an MCP server is either stdio (command) or HTTP (http_url), not both",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(de::Error::custom(
+                            "neither `command` nor `http_url` set - an MCP server needs one transport",
+                        ));
+                    }
+                };
+
+                Ok(McpServerConfig {
+                    transport,
+                    timeout_ms,
+                    trust,
+                    include_tools,
+                    exclude_tools: exclude_tools.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ConfigVisitor)
+    }
+}
+
+/// Serializes back to the FLAT wire shape: the transport's fields are written at
+/// the top level (matching what the user wrote), alongside the common keys.
+/// `skip_serializing_if`-equivalent guards keep an empty collection / absent
+/// option off the wire, so a parse -> serialize round-trip is faithful.
+impl Serialize for McpServerConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Count the fields to emit so `serialize_struct`'s hint is right.
+        let mut len = 0;
+        match &self.transport {
+            McpTransport::Stdio { args, env, cwd, .. } => {
+                len += 1; // command
+                len += usize::from(!args.is_empty());
+                len += usize::from(!env.is_empty());
+                len += usize::from(cwd.is_some());
+            }
+            McpTransport::Http { headers, .. } => {
+                len += 1; // http_url
+                len += usize::from(!headers.is_empty());
+            }
+        }
+        len += usize::from(self.timeout_ms.is_some());
+        len += usize::from(self.trust.is_some());
+        len += usize::from(self.include_tools.is_some());
+        len += usize::from(!self.exclude_tools.is_empty());
+
+        let mut s = serializer.serialize_struct("McpServerConfig", len)?;
+        match &self.transport {
+            McpTransport::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
+                s.serialize_field("command", command)?;
+                if !args.is_empty() {
+                    s.serialize_field("args", args)?;
+                }
+                if !env.is_empty() {
+                    s.serialize_field("env", env)?;
+                }
+                if let Some(cwd) = cwd {
+                    s.serialize_field("cwd", cwd)?;
+                }
+            }
+            McpTransport::Http { url, headers } => {
+                s.serialize_field("http_url", url)?;
+                if !headers.is_empty() {
+                    s.serialize_field("headers", headers)?;
+                }
+            }
+        }
+        if let Some(timeout_ms) = &self.timeout_ms {
+            s.serialize_field("timeout_ms", timeout_ms)?;
+        }
+        if let Some(trust) = &self.trust {
+            s.serialize_field("trust", trust)?;
+        }
+        if let Some(include_tools) = &self.include_tools {
+            s.serialize_field("include_tools", include_tools)?;
+        }
+        if !self.exclude_tools.is_empty() {
+            s.serialize_field("exclude_tools", &self.exclude_tools)?;
+        }
+        s.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn stdio() -> McpServerConfig {
-        McpServerConfig {
-            command: Some("my-server".into()),
+        McpServerConfig::new(McpTransport::Stdio {
+            command: "my-server".into(),
             args: vec!["--flag".into()],
-            ..Default::default()
-        }
+            env: BTreeMap::new(),
+            cwd: None,
+        })
     }
 
     #[test]
-    fn transport_resolves_a_command_only_entry_to_stdio() {
-        let cfg = stdio();
+    fn parses_a_command_only_entry_to_stdio() {
+        let cfg: McpServerConfig =
+            serde_json::from_str(r#"{"command":"my-server","args":["--flag"]}"#).unwrap();
         assert_eq!(
-            cfg.transport(),
-            Ok(McpTransport::Stdio {
+            cfg.transport,
+            McpTransport::Stdio {
                 command: "my-server".into(),
                 args: vec!["--flag".into()],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+            }
         );
     }
 
     #[test]
-    fn transport_resolves_an_http_url_only_entry_to_http() {
-        let cfg = McpServerConfig {
-            http_url: Some("https://example.test/mcp".into()),
-            headers: BTreeMap::from([("Authorization".into(), "Bearer x".into())]),
-            ..Default::default()
-        };
+    fn parses_an_http_url_only_entry_to_http() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"http_url":"https://example.test/mcp","headers":{"Authorization":"Bearer x"}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            cfg.transport(),
-            Ok(McpTransport::Http {
+            cfg.transport,
+            McpTransport::Http {
                 url: "https://example.test/mcp".into(),
                 headers: BTreeMap::from([("Authorization".into(), "Bearer x".into())]),
-            })
+            }
         );
     }
 
     #[test]
-    fn transport_rejects_both_transports() {
-        let cfg = McpServerConfig {
-            command: Some("cmd".into()),
-            http_url: Some("https://x.test".into()),
-            ..Default::default()
-        };
-        assert!(cfg.transport().unwrap_err().contains("both"));
+    fn rejects_both_transports_at_parse_time() {
+        let err = serde_json::from_str::<McpServerConfig>(
+            r#"{"command":"cmd","http_url":"https://x.test"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("both"));
     }
 
     #[test]
-    fn transport_rejects_neither_transport() {
-        let cfg = McpServerConfig::default();
-        assert!(cfg.transport().unwrap_err().contains("neither"));
+    fn rejects_neither_transport_at_parse_time() {
+        let err = serde_json::from_str::<McpServerConfig>(r#"{"trust":true}"#).unwrap_err();
+        assert!(err.to_string().contains("neither"));
+    }
+
+    #[test]
+    fn rejects_an_unknown_key() {
+        // deny_unknown_fields parity: a typo'd key stays a loud parse error.
+        let err =
+            serde_json::from_str::<McpServerConfig>(r#"{"command":"cmd","bogus":1}"#).unwrap_err();
+        assert!(err.to_string().contains("bogus") || err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_a_duplicate_key() {
+        let err = serde_json::from_str::<McpServerConfig>(r#"{"command":"a","command":"b"}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("command"));
+    }
+
+    #[test]
+    fn rejects_stdio_only_keys_on_an_http_entry() {
+        // `args`/`env`/`cwd` under an http_url would round-trip away; that is a
+        // shape error, not a silent drop.
+        let err = serde_json::from_str::<McpServerConfig>(
+            r#"{"http_url":"https://x.test","args":["--flag"]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("args"));
+    }
+
+    #[test]
+    fn rejects_headers_on_a_stdio_entry() {
+        let err =
+            serde_json::from_str::<McpServerConfig>(r#"{"command":"cmd","headers":{"X":"y"}}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("headers"));
+    }
+
+    #[test]
+    fn round_trips_the_flat_stdio_wire_shape() {
+        let raw = r#"{"command":"srv","args":["--x"],"env":{"LOG":"debug"},"cwd":"/tmp","timeout_ms":1000,"trust":true,"exclude_tools":["delete"]}"#;
+        let cfg: McpServerConfig = serde_json::from_str(raw).unwrap();
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            back,
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()
+        );
+    }
+
+    #[test]
+    fn round_trips_the_flat_http_wire_shape() {
+        let raw = r#"{"http_url":"https://x.test/mcp","headers":{"Authorization":"Bearer x"},"include_tools":["keep"]}"#;
+        let cfg: McpServerConfig = serde_json::from_str(raw).unwrap();
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            back,
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()
+        );
     }
 
     #[test]
@@ -193,11 +435,8 @@ mod tests {
 
     #[test]
     fn admits_treats_include_as_an_allowlist() {
-        let cfg = McpServerConfig {
-            command: Some("cmd".into()),
-            include_tools: Some(vec!["keep".into()]),
-            ..Default::default()
-        };
+        let mut cfg = stdio();
+        cfg.include_tools = Some(vec!["keep".into()]);
         assert!(cfg.admits("keep"));
         assert!(!cfg.admits("drop"));
     }
@@ -205,11 +444,8 @@ mod tests {
     #[test]
     fn admits_treats_a_paren_prefixed_include_entry_as_the_tool() {
         // qwen's paren form: `foo(...)` in the allowlist admits the tool `foo`.
-        let cfg = McpServerConfig {
-            command: Some("cmd".into()),
-            include_tools: Some(vec!["keep(a, b)".into()]),
-            ..Default::default()
-        };
+        let mut cfg = stdio();
+        cfg.include_tools = Some(vec!["keep(a, b)".into()]);
         assert!(cfg.admits("keep"));
         assert!(!cfg.admits("keeper")); // a longer name is NOT a paren match
         assert!(!cfg.admits("drop"));
@@ -217,12 +453,9 @@ mod tests {
 
     #[test]
     fn admits_always_removes_excluded_even_when_included() {
-        let cfg = McpServerConfig {
-            command: Some("cmd".into()),
-            include_tools: Some(vec!["keep".into(), "banned".into()]),
-            exclude_tools: vec!["banned".into()],
-            ..Default::default()
-        };
+        let mut cfg = stdio();
+        cfg.include_tools = Some(vec!["keep".into(), "banned".into()]);
+        cfg.exclude_tools = vec!["banned".into()];
         assert!(cfg.admits("keep"));
         assert!(!cfg.admits("banned"));
     }

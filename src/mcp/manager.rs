@@ -149,7 +149,7 @@ fn assemble(attached: Vec<Attached<'_>>) -> Assembled {
 /// over a shared [`RmcpConn`] for each admitted tool. Any await error is an
 /// `Err(reason)` the caller records + skips (fail-open).
 async fn connect_one(name: &str, cfg: &McpServerConfig) -> Result<ServerAttach, String> {
-    let transport = cfg.transport()?;
+    let transport = cfg.transport.clone();
     let default_timeout = match &transport {
         McpTransport::Stdio { .. } => DEFAULT_STDIO_TIMEOUT_MS,
         McpTransport::Http { .. } => DEFAULT_HTTP_TIMEOUT_MS,
@@ -345,27 +345,6 @@ mod tests {
         assert_eq!(manager.conn_count(), 0);
         assert!(manager.failures().is_empty());
         assert!(tools.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_config_invalid_server_is_recorded_and_skipped_without_touching_rmcp() {
-        // Both transports set => `transport()` errs BEFORE any rmcp code runs.
-        // The server is recorded as a failure and skipped; no connection is made.
-        let mut servers = BTreeMap::new();
-        servers.insert(
-            "broken".to_string(),
-            McpServerConfig {
-                command: Some("cmd".into()),
-                http_url: Some("https://x.test".into()),
-                ..Default::default()
-            },
-        );
-        let (manager, tools) = McpManager::connect(&servers).await;
-        assert_eq!(manager.conn_count(), 0);
-        assert!(tools.is_empty());
-        assert_eq!(manager.failures().len(), 1);
-        assert_eq!(manager.failures()[0].0, "broken");
-        assert!(manager.failures()[0].1.contains("both"));
     }
 
     /// A tiny [`McpConn`] the assembly test can hand a real (if inert) conn, so
