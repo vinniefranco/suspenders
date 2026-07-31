@@ -12,11 +12,10 @@
 use std::sync::OnceLock;
 
 use ratatui::Frame;
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxSet;
 
@@ -255,10 +254,10 @@ pub struct FrameCtx<'a> {
     pub theme: &'a Theme,
 }
 
-/// Splits the inline frame `area` into the three vertical zones the pending
-/// region draws into: `[pending_body, footer, composer]` (ADR-0046). There
-/// is no scroll state and no geometry return - native scrollback owns history,
-/// so the pending body is simply bottom-anchored + top-clipped in the top zone.
+/// Splits the fullscreen frame `area` into the three vertical zones the body
+/// draws into: `[transcript_body, footer, composer]` (ADR-0046). The body is
+/// bottom-anchored + top-clipped in the top zone, lifted by the app-owned scroll
+/// intent when the view is detached from the tail (Stage 2, [`scrolled_clip`]).
 ///
 /// The Composer GROWS with its draft: its height is the wrapped row count
 /// (hard newlines and width-wrapping both), capped by
@@ -291,16 +290,17 @@ fn capped_composer_height(layout: &ComposerLayout, frame_height: usize) -> usize
     draft + COMPOSER_CHROME_ROWS
 }
 
-/// Renders the inline PENDING region (ADR-0046): the uncommitted transcript
-/// tail (`cache.settled()[hw..]` plus the live reasoning tail, streaming answer,
-/// and lull row), the flat footer, the Composer, and any open overlay/approval.
-/// Committed items are NOT drawn here - they were frozen into native scrollback
-/// by [`render_committed_slice`] via the adapter's `insert_before`.
+/// Renders the FULLSCREEN frame (ADR-0046): the WHOLE transcript body (every
+/// settled item plus the live reasoning tail, streaming answer, and lull row),
+/// the flat footer, the Composer, and any open overlay/approval. The app owns
+/// the entire alt-screen viewport and redraws it from the model each frame, so
+/// nothing lives in native scrollback and resize simply re-wraps everything.
 ///
 /// The transcript body is BOTTOM-ANCHORED in its zone and TOP-CLIPPED on
 /// overflow (qwen's `MaxSizedBox overflowDirection:"top"`): the newest rows
-/// always show, older rows drop off the top. There is no scroll state and no
-/// scrollbar - native scrollback owns history.
+/// always show, older rows drop off the top. The app owns scrolling (Stage 2): a
+/// detached view ([`Screen::follow_tail`] false) lifts the window up through the
+/// clipped rows, clamped to the live viewport each frame ([`scrolled_clip`]).
 pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ctx: FrameCtx) {
     let FrameCtx { conn, anim, theme } = ctx;
     let area = frame.area();
@@ -330,8 +330,7 @@ pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ct
     }
     render_sticky_slot(frame, plan.sticky_box, plan.sticky_items, theme);
     // The flat footer (ADR-0053): a single row, model | context% | cost on the
-    // right, the AutoAcceptIndicator or `? for shortcuts` on the left. Native
-    // scrollback owns history (ADR-0046), so there is no scroll position to report.
+    // right, the AutoAcceptIndicator or `? for shortcuts` on the left.
     render_footer(frame, plan.status, FooterCtx { screen: t, conn }, theme);
     render_composer(frame, plan.composer, t, &plan.draft, theme);
     render_composer_popup_slot(frame, plan.popup_top, area, &composer_view.overlay, theme);
@@ -369,9 +368,10 @@ fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> Pen
         area.width.saturating_sub(2) as usize,
     );
     let composer_height = capped_composer_height(&draft, area.height as usize);
-    // The sticky box DERIVES from the latest committed Todo item; a pending or
-    // all-completed list, or a frame too short to also hold the box, drops it
-    // (costs no rows). The `.filter` is the measure == draw guard: reserving a
+    // The sticky box DERIVES from the latest Todo item once it is no longer the
+    // transcript tail; a tail, all-completed, or empty list, or a frame too short
+    // to also hold the box, drops it (costs no rows). The `.filter` is the measure
+    // == draw guard: reserving a
     // zone we cannot fully draw would paint a headless fragment over the
     // composer.
     //
@@ -381,12 +381,7 @@ fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> Pen
     // view. A visible approval takes priority over the sticky list, so we reserve
     // NO sticky zone while `pending_approval.is_some()`.
     let sticky_items = (t.pending_approval.is_none() && t.pending_question.is_none())
-        .then(|| {
-            sticky_todos(
-                t.transcript().latest_todo(),
-                t.transcript().committed_high_water(),
-            )
-        })
+        .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
         .flatten()
         .filter(|items| {
             sticky_fits(
@@ -406,6 +401,17 @@ fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> Pen
         draft,
         popup_top: chunks[2].y,
     }
+}
+
+/// The transcript BODY zone height for a frame of size `area` (ADR-0046, Stage
+/// 2): the wrapped-row page the pure [`Screen`]'s PageUp/PageDown step by. Runs
+/// the same pure [`pending_layout`] the render uses, so the page matches the drawn
+/// body exactly (measure == draw). The adapter calls this each frame and records
+/// it via [`crate::ui::screen::Screen::note_body_height`]; the core stays
+/// geometry-free.
+pub fn body_height(area: Rect, t: &Screen) -> usize {
+    let view = t.composer().view();
+    pending_layout(area, &view, t).body.height as usize
 }
 
 /// The sticky "Current tasks" slot: draws the box when the plan reserved one
@@ -442,32 +448,29 @@ pub struct PendingBodyParams<'a> {
     pub anim: Anim,
 }
 
-/// Draws the pending transcript body into `area`, bottom-anchored and
-/// top-clipped (ADR-0046). Returns the total wrapped-row count of the pending
-/// stack (before clipping) so the caller can label the status bar. The assembly
-/// is the pending pipeline - cache sync, the collapsed-run fold over the
-/// full items, the three live entries - but slices the settled tail from the
-/// high-water mark ([`assemble_pending`]) and anchors to the bottom instead of
-/// consulting a [`Viewport`].
+/// Draws the whole transcript body into `area`, bottom-anchored and top-clipped
+/// (ADR-0046). Returns the total wrapped-row count of the stack (before clipping)
+/// so the caller can label the status bar. The assembly is the body pipeline -
+/// cache sync, the collapsed-run fold over the full items, the three live entries
+/// - starting at item 0 and anchored to the bottom of the zone.
 fn render_pending_body(
     frame: &mut Frame,
     area: Rect,
     params: &mut PendingBodyParams<'_>,
     theme: &Theme,
 ) -> usize {
-    let hw = params.screen.transcript().committed_high_water();
-    render_pending_body_at(frame, area, params, theme, hw)
+    // Fullscreen renderer (ADR-0046): the whole transcript renders each frame,
+    // so the body starts at item 0 (no committed prefix in native scrollback).
+    render_pending_body_at(frame, area, params, theme, 0)
 }
 
-/// Assembles the FULL, UNCLAMPED pending body line set at content `width` and
-/// high-water mark `hw` (ADR-0046): the uncommitted settled tail `items[hw..]`
-/// through the SAME [`grouped_rows`] fold the commit blit uses (so pending and
-/// committed stay byte-identical), then the live entries newest-last (the
-/// reasoning tail, the streaming answer, the spinner). This is the PRE-CLIP line
-/// set `render_pending_body_at` anchors/clips for the live viewport, AND the exact
-/// content Ctrl-S's peek ([`Effect::PeekPending`]) blits into scrollback unclamped.
-/// Syncs the cache as a side effect (the settled tail's lines come from it); no
-/// frame access, no anchor/clip math (IOSP).
+/// Assembles the FULL, UNCLAMPED body line set at content `width` starting from
+/// item `hw` (ADR-0046): the settled tail `items[hw..]` through [`grouped_rows`],
+/// then the live entries newest-last (the reasoning tail, the streaming answer,
+/// the spinner). The fullscreen renderer passes `hw = 0` so the WHOLE transcript
+/// renders. This is the PRE-CLIP line set `render_pending_body_at` anchors/clips
+/// to the body zone. Syncs the cache as a side effect (the settled tail's lines
+/// come from it); no frame access, no anchor/clip math (IOSP).
 fn pending_body_lines(
     params: &mut PendingBodyParams<'_>,
     theme: &Theme,
@@ -510,11 +513,9 @@ fn pending_body_lines(
             call_index,
         })
     });
-    // FULL-CONTENT pending body (ADR-0046): the uncommitted settled tail renders
-    // through the SAME [`grouped_rows`] fold `render_committed_slice` blits with,
-    // so committed and pending are byte-identical and nothing reflows at the
-    // commit seam (qwen's `<Static>` prints history un-clamped; the ONLY overflow
-    // reduction is the bottom-anchor + top-clip the caller applies).
+    // FULL-CONTENT body (ADR-0046): the whole settled transcript renders through
+    // the [`grouped_rows`] fold (qwen's `<Static>` prints history un-clamped; the
+    // ONLY overflow reduction is the bottom-anchor + top-clip the caller applies).
     let mut lines = grouped_rows_with_approval(&GroupedRows {
         cache,
         items,
@@ -594,14 +595,11 @@ fn pending_body_lines(
     lines
 }
 
-/// Draws the pending body starting AT an explicit high-water mark `hw`: it emits
-/// the uncommitted settled tail `items[hw..]` plus the live stream, bottom-
-/// anchored and top-clipped (ADR-0046). [`render_pending_body`] calls this with
-/// the store's live
-/// [`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water)
-/// (committed items are already in native scrollback); passing `0` draws the
-/// WHOLE settled transcript, which is what a headless test wants to see on a
-/// TestBackend that has no real scrollback.
+/// Draws the body starting AT an explicit item index `hw`: it emits the settled
+/// tail `items[hw..]` plus the live stream, bottom-anchored and top-clipped
+/// (ADR-0046). [`render_pending_body`] calls this with `hw = 0` so the WHOLE
+/// transcript renders in the fullscreen viewport; the parameter is kept so tests
+/// can render a partial tail.
 fn render_pending_body_at(
     frame: &mut Frame,
     area: Rect,
@@ -611,18 +609,27 @@ fn render_pending_body_at(
 ) -> usize {
     let content_area = Rect {
         x: area.x + CONTENT_MARGIN,
-        width: area.width.saturating_sub(2 * CONTENT_MARGIN),
+        width: content_width(area.width),
         ..area
     };
-    // Operation (IOSP): assemble the FULL, unclamped pending body once; the draw
-    // below only anchors/clips it. Ctrl-S's peek blits this SAME line set
-    // (ADR-0046, [`pending_body_lines`]).
+    // Operation (IOSP): assemble the FULL, unclamped body once; the draw below
+    // only anchors/clips it (ADR-0046, [`pending_body_lines`]).
     let lines = pending_body_lines(params, theme, hw, content_area.width);
 
     // Integration (IOSP): compute the anchor/clip geometry in the pure
-    // [`anchor_clip`] operation, then only issue the draw calls.
+    // [`scrolled_clip`] operation against the app-owned scroll intent (ADR-0046,
+    // Stage 2), then only issue the draw calls. Following the tail is byte-identical
+    // to Stage 1's bottom-anchor; a detached view lifts the window UP, clamped there.
     let total = wrapped_count(lines.clone(), content_area.width);
-    let clip = anchor_clip(total, area, content_area);
+    let clip = scrolled_clip(
+        total,
+        area,
+        content_area,
+        ScrollIntent {
+            follow_tail: params.screen.follow_tail,
+            lines: params.screen.scroll_lines,
+        },
+    );
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -671,19 +678,75 @@ struct PendingClip {
 /// stack overflows, keep the LAST `height` rows (drop from the top, qwen's
 /// `overflowDirection:"top"`) and reserve the top row for the overflow marker; when
 /// it fits, bottom-anchor it via `pad_top`. No frame access, no side effects.
+///
+/// Bottom-anchored (Stage 1 / help) - equivalent to [`scrolled_clip`] with a zero
+/// scroll intent. Kept as the thin wrapper the help overlay draws through.
 fn anchor_clip(total_lines: usize, area: Rect, content_area: Rect) -> PendingClip {
+    scrolled_clip(total_lines, area, content_area, ScrollIntent::FOLLOW)
+}
+
+/// The transcript's app-owned scroll INTENT (ADR-0046, Stage 2), passed from the
+/// pure [`Screen`] to the render clamp: `follow_tail` pins to the bottom (the
+/// Stage 1 default), else `lines` is how many wrapped rows the view is scrolled UP
+/// from the bottom (`usize::MAX` = as far up as possible). Geometry-free - the
+/// clamp turns it into a valid top-clip against the live viewport each frame.
+#[derive(Clone, Copy)]
+struct ScrollIntent {
+    follow_tail: bool,
+    lines: usize,
+}
+
+impl ScrollIntent {
+    /// The bottom-anchored, tail-following default (Stage 1 behavior).
+    const FOLLOW: ScrollIntent = ScrollIntent {
+        follow_tail: true,
+        lines: 0,
+    };
+}
+
+/// Operation (IOSP): the anchor/clip math generalized to an app-owned scroll
+/// INTENT (ADR-0046, Stage 2). Following the tail bottom-anchors exactly as Stage
+/// 1 did; a detached `intent` lifts the window UP by `intent.lines`, CLAMPED here
+/// to the valid range so the pure core stays geometry-free: `max_scroll =
+/// total - height` (0 when the stack fits, so scroll is a no-op), and the effective
+/// lift is `min(intent.lines, max_scroll)` - an over-scroll or `usize::MAX` (Home)
+/// simply pins to the oldest row, and a grown terminal auto-re-clamps. No frame
+/// access, no side effects.
+fn scrolled_clip(
+    total_lines: usize,
+    area: Rect,
+    content_area: Rect,
+    intent: ScrollIntent,
+) -> PendingClip {
     let height = area.height as usize;
     let overflowed = total_lines > height;
 
+    // The rows scrolled up from the bottom, clamped to what the stack allows.
+    // `follow_tail` (or a stack that fits) means no lift.
+    let max_scroll = total_lines.saturating_sub(height);
+    let effective = if intent.follow_tail {
+        0
+    } else {
+        intent.lines.min(max_scroll)
+    };
+    // The rows still hidden ABOVE the viewport once the lift is applied: the
+    // overflow marker (`…`) shows only while some remain (so Home, fully scrolled
+    // up, reveals the oldest row instead of hiding it under the marker).
+    let clipped_above = max_scroll - effective;
+    let has_marker = overflowed && clipped_above > 0;
+
     let (top, drawn_rows, pad_top) = if overflowed {
-        (total_lines - height + 1, height, 0)
+        // Bottom-origin top-clip lifted by `effective` (qwen's
+        // `overflowDirection:"top"`): drop `clipped_above` rows from the top, plus
+        // one more for the marker row when it shows.
+        (clipped_above + has_marker as usize, height, 0)
     } else {
         (0, total_lines, height - total_lines)
     };
 
-    // On overflow the top visible row is the marker, so the content starts one
+    // When the marker shows, the top visible row is it, so the content starts one
     // row down and loses that row of height.
-    let content_top_pad: u16 = if overflowed { 1 } else { 0 };
+    let content_top_pad: u16 = if has_marker { 1 } else { 0 };
     let draw_height = drawn_rows.saturating_sub(content_top_pad as usize) as u16;
     let y_off = pad_top as u16 + content_top_pad;
 
@@ -695,7 +758,7 @@ fn anchor_clip(total_lines: usize, area: Rect, content_area: Rect) -> PendingCli
             height: draw_height,
             ..content_area
         },
-        marker_draw: overflowed.then_some(Rect {
+        marker_draw: has_marker.then_some(Rect {
             y: area.y + pad_top as u16,
             height: 1,
             ..area
@@ -703,21 +766,15 @@ fn anchor_clip(total_lines: usize, area: Rect, content_area: Rect) -> PendingCli
     }
 }
 
-/// Draws the `… Ctrl-S to show more` overflow marker (ADR-0046, qwen's
-/// `ShowMoreLines`) on the reserved top row. Ctrl-S is wired: it blits the FULL,
-/// unclamped body into scrollback as a non-committing peek ([`Effect::PeekPending`]
-/// / [`render_pending_peek`]) - the fixed inline viewport cannot grow, so the
-/// clipped rows are revealed ABOVE the live region rather than in place.
-///
-/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
+/// Draws the `…` overflow marker on the reserved top row when rows are clipped
+/// ABOVE the viewport (ADR-0046): the "more above" affordance the app-owned scroll
+/// (Stage 2) reveals - wheel/PageUp/Ctrl-S walk up into those rows, and the marker
+/// clears once the view reaches the very top.
 fn draw_overflow_marker(frame: &mut Frame, area: Rect, theme: &Theme) {
     let marker_style = Style::default()
         .fg(tui_color(theme.muted))
         .add_modifier(Modifier::ITALIC);
-    frame.render_widget(
-        Paragraph::new(Line::styled("… Ctrl-S to show more", marker_style)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::styled("…", marker_style)), area);
 }
 
 /// Computes the bounding rect for the Composer overlay popup: body rows plus
@@ -1423,175 +1480,6 @@ const COST_HIDDEN: f64 = 0.0;
 /// tick is `TICK_MS` ms) into an elapsed-seconds figure for the lull timer.
 const MILLIS_PER_SEC: u64 = 1_000;
 
-/// Brings the [`RenderCache`] up to date with `screen`'s Transcript at
-/// `content_width` (ADR-0046): the adapter's public door onto the cache's
-/// (crate-private) sync, so [`commit_items`](crate::ui::commit_items) can sync
-/// at the SAME content width the committed slice draws at (frame width minus
-/// the two `CONTENT_MARGIN` columns) before measuring and blitting - keeping
-/// measure == draw
-/// (ADR-0029). The [`Toggles`] mirror the Screen's Ctrl+O compact flag.
-pub fn sync_commit_cache(
-    cache: &mut RenderCache,
-    screen: &Screen,
-    content_width: u16,
-    theme: &Theme,
-) {
-    cache.sync(
-        screen.transcript(),
-        Toggles {
-            compact: screen.compact_mode,
-        },
-        content_width,
-        theme,
-    );
-}
-
-/// The total wrapped height (visual rows) the committed slice `[hw, hw + count)`
-/// draws to at `width` (ADR-0046): the wrapped-row count of the SAME
-/// [`grouped_rows`] fold the pending body and [`render_committed_slice`] draw, so
-/// the box borders + `marginTop:1` separators + gaps are counted (measure ==
-/// draw, ADR-0029). A tall commit overflows into native scrollback, never
-/// clamped. `slice.items` must be bounded to `hw + count`; `content_width` is the
-/// width the cache was synced at (the frame width minus the two [`CONTENT_MARGIN`]
-/// columns).
-pub fn commit_slice_height(slice: &CommittedSlice<'_>, content_width: u16) -> u16 {
-    let lines = grouped_rows(
-        slice.cache,
-        slice.items,
-        slice.hw,
-        content_width,
-        slice.theme,
-    );
-    u16::try_from(wrapped_count(lines, content_width)).unwrap_or(u16::MAX)
-}
-
-/// The committed slice `[hw, hw + count)` to freeze into scrollback (ADR-0046):
-/// the cache to draw from, the item list (BOUNDED to `hw + count` by the caller so
-/// [`grouped_rows`] stops a tool group at the slice edge), and the ACTIVE `theme`
-/// the frozen rows bake. Bundled so [`render_committed_slice`] and
-/// [`commit_slice_height`] take a single source arg. `count` is retained for the
-/// caller's bookkeeping; the fold stops at `items.len()`.
-pub struct CommittedSlice<'a> {
-    pub cache: &'a RenderCache,
-    pub items: &'a [TranscriptItem],
-    pub hw: usize,
-    pub count: usize,
-    pub theme: &'a Theme,
-}
-
-/// Blits the committed slice `[hw, hw + count)` into `buf` (ADR-0046, the inline
-/// `insert_before` seam): the SAME [`grouped_rows`] fold the pending body draws -
-/// prose items with baked prefixes, tool runs boxed, `marginTop:1` separators -
-/// so a committed item is byte-identical to the live one before it froze. The
-/// content sits [`CONTENT_MARGIN`] columns in (matching qwen `marginLeft:2`); the
-/// caller sizes `buf` to [`commit_slice_height`], and a slice taller than the
-/// terminal scrolls whole into native scrollback (no clamp, qwen `<Static>`).
-pub fn render_committed_slice(buf: &mut Buffer, slice: &CommittedSlice<'_>) {
-    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
-    let lines = grouped_rows(
-        slice.cache,
-        slice.items,
-        slice.hw,
-        content_width,
-        slice.theme,
-    );
-    blit_body_lines(buf, lines);
-}
-
-/// Renders an already-assembled body line set into `buf`'s content column
-/// ([`CONTENT_MARGIN`] columns in, matching qwen `marginLeft:2`), sized to its own
-/// wrapped height so a stack taller than `buf` scrolls whole into native
-/// scrollback (no clamp, qwen `<Static>`). The ONE `insert_before` blit shared by
-/// the committed freeze ([`render_committed_slice`]) and the Ctrl-S peek
-/// ([`render_pending_peek`]) - both hand it their `grouped_rows` output, so the
-/// content-column geometry + wrap live in one place.
-fn blit_body_lines(buf: &mut Buffer, lines: Vec<Line<'static>>) {
-    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
-    let height = wrapped_count(lines.clone(), content_width) as u16;
-    let content_area = Rect {
-        x: buf.area.x + CONTENT_MARGIN,
-        y: buf.area.y,
-        width: content_width,
-        height,
-    };
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(content_area, buf);
-}
-
-/// The Ctrl-S peek (ADR-0046, [`Effect::PeekPending`]): the whole pending body
-/// blitted UNCLAMPED into scrollback so the user can read the rows the live
-/// viewport top-clips away. Bundles the mutable cache the body's settled tail
-/// draws from, the `Screen` the pending items + live snapshot come from, the
-/// animation counters (so the reasoning/spinner match the live frame), and the
-/// ACTIVE theme the frozen rows bake. It renders at the LIVE high-water mark
-/// ([`committed_high_water`](crate::ui::transcript::Transcript::committed_high_water),
-/// the same `hw` the live draw uses), so the peek is the live stack plus its
-/// clipped-off top, never the already-committed prefix (which is in scrollback).
-///
-/// [`Effect::PeekPending`]: crate::ui::screen::Effect::PeekPending
-pub struct PendingPeek<'a> {
-    pub cache: &'a mut RenderCache,
-    pub screen: &'a Screen,
-    pub anim: Anim,
-    pub theme: &'a Theme,
-}
-
-impl PendingPeek<'_> {
-    /// The full, unclamped pending body lines at content `width` and the live
-    /// high-water mark. Syncs the cache as a side effect (the settled tail draws
-    /// from it), exactly as the live body does.
-    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
-        let hw = self.screen.transcript().committed_high_water();
-        let mut params = PendingBodyParams {
-            screen: self.screen,
-            cache: self.cache,
-            anim: self.anim,
-        };
-        pending_body_lines(&mut params, self.theme, hw, width)
-    }
-}
-
-/// The rows the Ctrl-S peek blits for a live viewport `area` (ADR-0046): the
-/// wrapped-row count of the FULL, unclamped pending body when it OVERFLOWS its
-/// body zone, else `0`. `area` is the inline viewport rect the live frame draws
-/// in - the peek measures the body at that width and gates on the SAME overflow
-/// condition the `… Ctrl-S to show more` marker uses ([`anchor_clip`]).
-///
-/// The `0` gate is the fix for the peek stacking duplicate copies into
-/// scrollback: when the body FITS the viewport nothing is top-clipped, so no
-/// marker shows and Ctrl-S has nothing to reveal. Without the gate every press
-/// re-blitted the whole (fully-visible) body, so holding Ctrl-S piled up
-/// identical copies. Mirrors [`commit_slice_height`]'s `0`-is-a-no-op contract.
-pub fn pending_peek_height(peek: &mut PendingPeek<'_>, area: Rect) -> u16 {
-    // The peek blits at FULL viewport width (its `insert_before` buffer is
-    // full-width), so measure the unclamped body there - the SAME width the live
-    // body zone draws at (the layout splits `area` vertically only).
-    let content_width = area.width.saturating_sub(2 * CONTENT_MARGIN);
-    let total = wrapped_count(peek.lines(content_width), content_width);
-    let view = peek.screen.composer().view();
-    let body_zone = pending_layout(area, &view, peek.screen).body;
-    if total > body_zone.height as usize {
-        u16::try_from(total).unwrap_or(u16::MAX)
-    } else {
-        0
-    }
-}
-
-/// Blits the FULL, UNCLAMPED pending body into `buf` (ADR-0046, the Ctrl-S peek's
-/// `insert_before` seam): the SAME line set the live body draws, but WITHOUT the
-/// `anchor_clip` top-clip, so every row the live viewport hides lands in
-/// scrollback for the user to scroll up to. The content sits `CONTENT_MARGIN`
-/// columns in (matching the live body + committed blit); the caller sizes `buf` to
-/// [`pending_peek_height`]. A PEEK, not a commit: the caller does NOT advance the
-/// high-water mark, so the same body redraws (clipped) in the live viewport next
-/// frame. Mirrors [`render_committed_slice`].
-pub fn render_pending_peek(buf: &mut Buffer, peek: &mut PendingPeek<'_>) {
-    let content_width = buf.area.width.saturating_sub(2 * CONTENT_MARGIN);
-    let lines = peek.lines(content_width);
-    blit_body_lines(buf, lines);
-}
-
 /// The rolling reasoning tail shown while a Run streams: an animated
 /// `✦ Thinking ⠋` header (the braille [`SPINNER`] advanced by the adapter's
 /// tick - motion lives HERE at the reasoning header, not the status bar), then
@@ -1745,9 +1633,9 @@ fn spinner_line(
 
 // ---------------------------------------------------------------------------
 // The sticky "Current tasks" box (qwen `StickyTodoList.tsx` + `todoSnapshot.ts`,
-// ADR-0048). A LIVE overlay (uncached, pending-only, never in grouped_rows/the
-// committed slice - like the lull row): it DERIVES from the Transcript's latest
-// `Todo` item, so it and the committed inline copy read one source of truth.
+// ADR-0048). A LIVE overlay (uncached, never in grouped_rows - like the lull
+// row): it DERIVES from the Transcript's latest `Todo` item, so it and the
+// inline copy in the body read one source of truth.
 // ---------------------------------------------------------------------------
 
 /// The most sticky-todo rows shown before the overflow line (qwen
@@ -1779,18 +1667,19 @@ fn ordered_sticky_todos(items: &[TodoItem]) -> Vec<(usize, &TodoItem)> {
 
 /// Whether the sticky "Current tasks" box shows this frame, and the items it
 /// draws (qwen `getStickyTodos`, todoSnapshot.ts:120, ADR-0048): the latest
-/// `Todo`'s items show iff the list is NON-EMPTY, NOT all-completed, AND the
-/// item has COMMITTED (`latest_index < high_water`). The high-water gate
-/// collapses qwen's pending/recent guards onto the ADR-0046 commit fact: while
-/// the todo is still pending it renders inline above the composer, so the sticky
-/// box would double it; once it commits to scrollback the inline copy scrolls
-/// away and the sticky box takes over. Pure - a testable predicate, no frame.
-fn sticky_todos(latest: Option<(usize, &[TodoItem])>, high_water: usize) -> Option<&[TodoItem]> {
+/// `Todo`'s items show iff the list is NON-EMPTY, NOT all-completed, AND the item
+/// is NOT the newest transcript item (`latest_index + 1 < total`). In the
+/// fullscreen model everything renders inline, so the "not the newest item" gate
+/// stands in for qwen's pending/recent guards: while the todo IS the tail it
+/// renders inline just above the composer and the sticky box would double it;
+/// once newer content follows, the inline copy scrolls up under the anchor and
+/// the sticky box takes over. Pure - a testable predicate, no frame.
+fn sticky_todos(latest: Option<(usize, &[TodoItem])>, total: usize) -> Option<&[TodoItem]> {
     let (index, items) = latest?;
     let non_empty = !items.is_empty();
     let all_completed = non_empty && items.iter().all(|i| i.status == TodoStatus::Completed);
-    let committed = index < high_water;
-    (non_empty && !all_completed && committed).then_some(items)
+    let not_the_tail = index + 1 < total;
+    (non_empty && !all_completed && not_the_tail).then_some(items)
 }
 
 /// The vertical rows the sticky box occupies for `visible` shown items and
@@ -2074,9 +1963,26 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// The content side margin (columns): qwen `HistoryItemDisplay` wraps every item
 /// in `marginLeft:2, marginRight:2` (HistoryItemDisplay.tsx:64), so content is
 /// the frame width minus a 2-col left AND 2-col right margin. `pub(crate)` so the
-/// adapter sizes the committed-slice content width (ADR-0046) at the same margin
-/// the pending region uses.
+/// adapter shares the same margin the pending region uses.
 pub(crate) const CONTENT_MARGIN: u16 = 2;
+
+/// The widest readable content is drawn (columns), matching qwen's
+/// `mainAreaWidth = min(terminalWidth - 4, 100)` (AppContainer.tsx): on an
+/// ultrawide terminal, prose/diffs/tool output stay legible left-aligned at 100
+/// columns instead of stretching edge to edge. Full-width chrome (the footer rule)
+/// is sized separately and is NOT bound by this cap.
+const MAX_CONTENT_WIDTH: u16 = 100;
+
+/// The readable-content width for a zone `area_width`: the frame width minus both
+/// [`CONTENT_MARGIN`]s, capped at [`MAX_CONTENT_WIDTH`] (qwen `mainAreaWidth`).
+/// The ONE place the cap lives, so a zone's measure and draw agree (measure==draw,
+/// ADR-0029). Below the cap it is exactly `area_width - 2*CONTENT_MARGIN`, so
+/// narrow terminals are unchanged.
+fn content_width(area_width: u16) -> u16 {
+    area_width
+        .saturating_sub(2 * CONTENT_MARGIN)
+        .min(MAX_CONTENT_WIDTH)
+}
 
 /// The blank `marginTop:1` separator row between committed items (qwen
 /// `HistoryItemDisplay.tsx:64`; continuation types get `marginTop:0`). Emitted at
@@ -2085,15 +1991,13 @@ fn separator_row() -> Line<'static> {
     Line::default()
 }
 
-/// Folds the settled items `[hw..]` into the flat committed body every render
-/// path draws (ADR-0046 + the render-time tool-group ADR): a non-tool item passes
-/// through as its cached lines; a MAXIMAL contiguous run of tool items
-/// (ToolCall/ToolResult/Diff) is boxed by [`render_tool_group`]; a blank
-/// [`separator_row`] sits between items (qwen `marginTop:1`). BOTH the pending
-/// body and [`render_committed_slice`] call this, so committed == pending is
-/// byte-identical. `items` is the FULL item list; only `[hw..]` is emitted (the
-/// prefix is already frozen into scrollback). `width` is the content width the
-/// cache was synced at.
+/// Folds the settled items `[hw..]` into the flat body via the collapsed-run fold
+/// with NO open approval - the convenience wrapper the assembly tests measure
+/// against. The production path is [`grouped_rows_with_approval`] (the pending
+/// body always passes its approving state); this drops that arg so a test can
+/// render a plain item slice. `items` is the FULL item list; only `[hw..]` is
+/// emitted. `width` is the content width the cache was synced at.
+#[cfg(test)]
 fn grouped_rows(
     cache: &RenderCache,
     items: &[TranscriptItem],
@@ -2446,10 +2350,10 @@ mod render_cache {
     use crate::ui::theme::{self, Theme};
     use crate::ui::transcript::Transcript;
 
-    /// Per-item render state for the inline pending body and the committed-slice
-    /// blit (ADR-0046), owned by the adapter's run loop and threaded through
-    /// [`super::render_pending`] and [`super::render_committed_slice`]. Holds
-    /// ratatui [`Line`]s, so it lives HERE, not in the pure modules (ADR-0019).
+    /// Per-item render state for the fullscreen transcript body (ADR-0046), owned
+    /// by the adapter's run loop and threaded through [`super::render_pending`].
+    /// Holds ratatui [`Line`]s, so it lives HERE, not in the pure modules
+    /// (ADR-0019).
     pub struct RenderCache {
         /// The text width everything below was built/measured at.
         width: u16,
@@ -3591,7 +3495,7 @@ const HELP_SHORTCUTS: &[(&str, &str)] = &[
     ("Alt+Enter", "Insert a newline"),
     ("Esc", "Cancel a running turn / close a menu"),
     ("Ctrl+O", "Toggle compact mode"),
-    ("Ctrl+S", "Peek the full pending output into scrollback"),
+    ("Ctrl+S", "Scroll up a page through the transcript"),
     ("Ctrl+C", "Quit"),
     ("Shift+Tab", "Cycle approval mode"),
     ("Tab", "Accept the highlighted suggestion"),
@@ -3606,7 +3510,7 @@ const HELP_SHORTCUTS: &[(&str, &str)] = &[
 fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
     let content_area = Rect {
         x: area.x + CONTENT_MARGIN,
-        width: area.width.saturating_sub(2 * CONTENT_MARGIN),
+        width: content_width(area.width),
         ..area
     };
     let lines = help_panel_lines(content_area.width, theme);
@@ -7119,9 +7023,10 @@ mod tests {
         assert_eq!(hunk_line_numbers(&hunk), vec![20, 11, 21, 22, 23]);
     }
 
-    // (The Ctrl-O viewport-stability test is retired: there is no adapter-side
-    // viewport now - native scrollback owns history, ADR-0046. Ctrl-O's effect
-    // on the cached line counts is still covered by the cache toggle tests.)
+    // (The Ctrl-O viewport-stability test is retired: the app now owns the whole
+    // fullscreen viewport and redraws the transcript from the model each frame, so
+    // there is no frozen scrollback prefix to keep stable. Ctrl-O's effect on the
+    // cached line counts is still covered by the cache toggle tests.)
 
     #[test]
     fn per_item_wrapped_counts_sum_to_the_whole_paragraph_measure() {
@@ -7161,6 +7066,8 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
 
     use crate::content::ContentBlock;
     use crate::event::Event;
@@ -7189,6 +7096,20 @@ mod tests {
         let buf = terminal.backend().buffer();
         (0..buf.area.height)
             .map(|y| row_text(terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A whole [`Buffer`] as newline-joined rows of symbols (the `Buffer`
+    /// counterpart of [`buffer_text`], used by the assembly tests that render
+    /// `grouped_rows` into a bare buffer).
+    fn commit_buffer_text(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -7319,300 +7240,6 @@ mod tests {
             append_live(&mut lines, tail);
         }
         wrapped_count(lines, content_width)
-    }
-
-    // --- render_committed_slice (ADR-0046, the inline `insert_before` seam) ---
-
-    /// A whole [`Buffer`] as newline-joined rows of symbols.
-    fn commit_buffer_text(buf: &Buffer) -> String {
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Blits `[hw, hw + count)` of `cache` into `buf` under the dark theme - the
-    /// one place these tests spell the [`CommittedSlice`] bundle, so each case
-    /// reads as the `(hw, count)` window it exercises.
-    fn blit_slice(
-        buf: &mut Buffer,
-        cache: &RenderCache,
-        items: &[TranscriptItem],
-        hw: usize,
-        count: usize,
-    ) {
-        render_committed_slice(
-            buf,
-            &CommittedSlice {
-                cache,
-                items,
-                hw,
-                count,
-                theme: theme::dark(),
-            },
-        );
-    }
-
-    /// The committed-slice height at the dark theme + content width (test helper):
-    /// the new [`commit_slice_height`] shape that folds the SAME grouped rows the
-    /// blit draws. `content_width` is the frame width minus both margins.
-    fn slice_height(
-        cache: &RenderCache,
-        items: &[TranscriptItem],
-        hw: usize,
-        count: usize,
-        content_width: u16,
-    ) -> u16 {
-        commit_slice_height(
-            &CommittedSlice {
-                cache,
-                items,
-                hw,
-                count,
-                theme: theme::dark(),
-            },
-            content_width,
-        )
-    }
-
-    // A committed slice blits each item's cached content through the grouped fold,
-    // 2-col margin in (qwen `marginLeft:2`). Golden against the exact rows the
-    // pending body draws for the same items (see the seam-identity test).
-    #[test]
-    fn render_committed_slice_blits_prefixed_content() {
-        // Author a tiny run directly on a bare store: an info line, a User
-        // prompt, then one agent answer line.
-        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
-        t.info("opening");
-        t.user("do a thing");
-        t.push(TranscriptItem::Assistant {
-            text: "sure".into(),
-        });
-
-        let items: Vec<TranscriptItem> = t.items().to_vec();
-        let count = items.len();
-
-        // Sync the cache at the SAME content width the slice draws at.
-        let width: u16 = 40;
-        let content_width = width - 2 * CONTENT_MARGIN;
-        let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), content_width, theme::dark());
-
-        let height = slice_height(&cache, &items, 0, count, content_width);
-        assert!(height >= 3, "info + user + answer are at least 3 rows");
-
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
-        blit_slice(&mut buf, &cache, &items, 0, count);
-
-        let text = commit_buffer_text(&buf);
-        // The content landed with its qwen prefixes, 2-col margin in.
-        assert!(text.contains("● opening"), "info prefix drawn:\n{text}");
-        assert!(text.contains("> do a thing"), "user caret drawn:\n{text}");
-        assert!(text.contains("✦ sure"), "assistant marker drawn:\n{text}");
-    }
-
-    // MEASURE == DRAW (ADR-0029/0046): `commit_slice_height` (what the adapter
-    // sizes the `insert_before` buffer to) must equal the number of NON-BLANK
-    // rows `render_committed_slice` actually writes into an OVERSIZED buffer. If
-    // measure and draw drifted (a width mismatch, a wrap discrepancy), the freeze
-    // would clip content or leave a gap; this pins them together. `Screen::demo`
-    // exercises every item kind (thoughts, machinery, markers, an error,
-    // wrapping assistant text, code) so the agreement holds across them all.
-    #[test]
-    fn commit_slice_height_agrees_with_the_rows_render_committed_slice_writes() {
-        let screen = Screen::demo();
-        let width: u16 = 100;
-        let count = screen.transcript().items().len();
-
-        let content_width = width - 2 * CONTENT_MARGIN;
-        let mut cache = RenderCache::new();
-        cache.sync(
-            screen.transcript(),
-            Toggles::default(),
-            content_width,
-            theme::dark(),
-        );
-        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
-
-        let measured = slice_height(&cache, &items, 0, count, content_width);
-        assert!(measured > 0, "the demo run has content");
-
-        // Draw into a buffer TALLER than the measurement, then count the rows
-        // that actually got content. A blank row past the content proves nothing
-        // overflowed the measured height; a blank row WITHIN it would mean the
-        // draw under-filled what it measured.
-        let oversized = measured + 5;
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, oversized));
-        blit_slice(&mut buf, &cache, &items, 0, count);
-
-        let text = commit_buffer_text(&buf);
-        let non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
-        // The demo has interior blank rows (code fences, spacing), so compare the
-        // LAST non-blank row's index + 1 against the measured height: the draw
-        // occupies exactly `[0, measured)` and writes nothing at/after `measured`.
-        let last_non_blank = text
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| !l.trim().is_empty())
-            .map(|(i, _)| i)
-            .max()
-            .expect("some content drew");
-        assert!(
-            (last_non_blank as u16) < measured,
-            "draw wrote past the measured height ({last_non_blank} >= {measured})"
-        );
-        assert!(
-            non_blank > 0 && non_blank <= measured as usize,
-            "non-blank rows ({non_blank}) fit within the measured height ({measured})"
-        );
-        // No content leaked into the oversized tail rows `[measured, oversized)`.
-        for y in measured..oversized {
-            let row = row_symbols(&buf, y);
-            assert!(
-                row.trim().is_empty(),
-                "row {y} past the measured height must be blank: {row:?}"
-            );
-        }
-    }
-
-    /// One buffer row as its concatenated symbols (test helper for the
-    /// measure==draw agreement check).
-    fn row_symbols(buf: &Buffer, y: u16) -> String {
-        (0..buf.area.width)
-            .map(|x| buf.cell((x, y)).expect("cell in area").symbol())
-            .collect()
-    }
-
-    // The committed slice honors the high-water offset: committing only the tail
-    // `[hw, hw + count)` draws that tail and nothing before it.
-    #[test]
-    fn render_committed_slice_draws_only_the_requested_range() {
-        let mut t = crate::ui::transcript::Transcript::new(Vec::new());
-        t.info("EARLIER");
-        t.info("LATER");
-
-        let items: Vec<TranscriptItem> = t.items().to_vec();
-        let width: u16 = 40;
-        let content_width = width - 2 * CONTENT_MARGIN;
-        let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), content_width, theme::dark());
-
-        // Skip EARLIER (hw = 1), commit only LATER (count = 1).
-        let hw = items.len() - 1;
-        let height = slice_height(&cache, &items, hw, 1, content_width);
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
-        blit_slice(&mut buf, &cache, &items, hw, 1);
-
-        let text = commit_buffer_text(&buf);
-        assert!(text.contains("LATER"), "the requested tail drew:\n{text}");
-        assert!(
-            !text.contains("EARLIER"),
-            "items before the high-water mark are not redrawn:\n{text}"
-        );
-    }
-
-    // THE identity guarantee (ADR-0046): the committed slice for a whole run,
-    // and the pending body's rendering of that SAME prefix, produce the
-    // IDENTICAL rows - gutter and content - so nothing reflows when an item
-    // crosses the commit seam. This is the property `run_fold`'s retirement buys:
-    // both paths read the SAME cache lines (no collapse, no window) and paint the
-    // SAME two-plane gutter. Uses `Screen::demo()` so the run has thoughts,
-    // machinery, markers, an error, closing text and code - every item kind.
-    #[test]
-    fn the_committed_slice_equals_the_pending_body_for_the_same_prefix() {
-        let screen = Screen::demo();
-        let width: u16 = 100;
-        let count = screen.transcript().items().len();
-
-        // (a) The committed slice `[0, count)` blitted into a bare buffer.
-        let content_width = width - 2 * CONTENT_MARGIN;
-        let mut commit_cache = RenderCache::new();
-        commit_cache.sync(
-            screen.transcript(),
-            Toggles::default(),
-            content_width,
-            theme::dark(),
-        );
-        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
-        let height = slice_height(&commit_cache, &items, 0, count, content_width);
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
-        blit_slice(&mut buf, &commit_cache, &items, 0, count);
-        let committed = commit_buffer_text(&buf);
-
-        // (b) The pending body (hw = 0) drawn TOP-aligned into a zone exactly as
-        // tall as the content, so the two are directly comparable row-for-row.
-        let terminal = draw_viewport(width, height, &screen);
-        let pending: String = (0..height)
-            .map(|y| row_text(&terminal, y).trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let committed_trimmed: String = committed
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            committed_trimmed, pending,
-            "committed and pending must render the same prefix identically (no seam reflow)"
-        );
-    }
-
-    // The identity holds UNDER COMPACT too (ADR-0052): with compact on, both the
-    // committed blit and the pending body hide thoughts + fold tool bodies through
-    // the SAME `message_lines` compact branch, so a RedrawScrollback re-blit at the
-    // new compact matches the pending region cell-for-cell (no split-brain in what
-    // each path chooses to draw).
-    #[test]
-    fn the_committed_slice_equals_the_pending_body_under_compact() {
-        // A compact Screen (Ctrl+O flipped on). `demo()` carries thoughts + a tool
-        // run, so compact actually changes the rows both paths emit.
-        let (screen, _) = Screen::demo().handle_key(crate::ui::screen::Key::ToggleCompact);
-        assert!(screen.compact_mode, "the demo screen is now compact");
-        let width: u16 = 100;
-        let count = screen.transcript().items().len();
-
-        // (a) The committed slice `[0, count)` at compact = true.
-        let content_width = width - 2 * CONTENT_MARGIN;
-        let mut commit_cache = RenderCache::new();
-        commit_cache.sync(
-            screen.transcript(),
-            Toggles { compact: true },
-            content_width,
-            theme::dark(),
-        );
-        let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
-        let height = slice_height(&commit_cache, &items, 0, count, content_width);
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
-        blit_slice(&mut buf, &commit_cache, &items, 0, count);
-        let committed = commit_buffer_text(&buf);
-
-        // (b) The pending body (which reads `screen.compact_mode`) over the same
-        // prefix, top-aligned.
-        let terminal = draw_viewport(width, height.max(1), &screen);
-        let pending: String = (0..height.max(1))
-            .map(|y| row_text(&terminal, y).trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let committed_trimmed: String = committed
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            committed_trimmed, pending,
-            "committed and pending must match under compact (no seam reflow)"
-        );
-        // Compact genuinely hid the thoughts: the demo's reasoning text is gone.
-        assert!(
-            !committed_trimmed.contains("The user wants me to evaluate"),
-            "compact hid the settled thoughts:\n{committed_trimmed}"
-        );
     }
 
     // --- tool-group box (ADR-0047): grouping fold + border rigidity ----------
@@ -7793,44 +7420,15 @@ mod tests {
         }
     }
 
-    /// The `(symbol, fg, bg, add_modifier)` cells of the box rows of `buf`,
-    /// starting at the first `╭` row and spanning `box_rows` rows - so a committed
-    /// blit (box at row 0) and a pending render (box after a committed prefix +
-    /// separator) can be aligned on the box and compared window-for-window.
-    fn box_cells(buf: &Buffer, box_rows: u16) -> Vec<(String, Color, Color, Modifier)> {
-        let top = (0..buf.area.height)
-            .find(|&y| buf.cell((CONTENT_MARGIN, y)).map(|c| c.symbol()) == Some("╭"))
-            .expect("a box top row");
-        (top..top + box_rows)
-            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .map(|(x, y)| {
-                let cell = buf.cell((x, y)).expect("cell in area");
-                let style = cell.style();
-                (
-                    cell.symbol().to_string(),
-                    style.fg.unwrap_or(Color::Reset),
-                    style.bg.unwrap_or(Color::Reset),
-                    style.add_modifier,
-                )
-            })
-            .collect()
-    }
-
-    // The committed==pending identity (ADR-0046/0048): a Todo item flows the SAME
-    // message_lines -> cache -> grouped_rows path, so its committed BLIT is
-    // cell-for-cell identical to its pending render - same glyphs AND same styling
-    // (fg/bg/modifier), so nothing reflows or recolours at the commit seam. The
-    // committed side goes through the REAL blit (`render_committed_slice`) at a
-    // NON-ZERO high-water (an `info` line committed first, so the Todo box is at
-    // row 0 of the slice); the pending side draws the WHOLE transcript from hw=0
-    // (info + separator + Todo box) as the pending body does. Two distinct draw
-    // paths over distinct windows, aligned on the box top and compared cell-for-
-    // cell - not a self-comparison of one `grouped_rows` call.
+    // A Todo item renders as a bordered circle list through the SAME grouped fold
+    // the fullscreen body draws (ADR-0048): one rounded box, the clean header, and
+    // the three status glyphs. The prefix line ahead of it proves the box lands
+    // below settled content, not just at row 0.
     #[test]
-    fn a_todo_renders_cell_for_cell_identically_committed_and_pending() {
+    fn a_todo_renders_as_a_bordered_circle_list() {
         use TodoStatus::{Completed, InProgress, Pending};
         let mut t = crate::ui::transcript::Transcript::new(Vec::new());
-        t.info("a committed prefix line"); // index 0, committed (hw = 1)
+        t.info("a prefix line");
         t.push(todo_item(vec![
             todo("read", Completed),
             todo("edit", InProgress),
@@ -7843,28 +7441,9 @@ mod tests {
         let mut cache = RenderCache::new();
         cache.sync(&t, Toggles::default(), content_width, theme::dark());
 
-        // The Todo box's own height (border + header + 3 circle rows = 5), so the
-        // aligned window spans exactly the box on both sides.
-        let box_rows = grouped_rows(&cache, &items, 1, content_width, theme::dark()).len() as u16;
-
-        // Committed: the REAL blit of the Todo slice [1, 2) at high-water 1.
-        let mut committed = Buffer::empty(Rect::new(0, 0, width, height));
-        render_committed_slice(
-            &mut committed,
-            &CommittedSlice {
-                cache: &cache,
-                items: &items,
-                hw: 1,
-                count: 1,
-                theme: theme::dark(),
-            },
-        );
-
-        // Pending: the WHOLE transcript (info + separator + Todo) drawn as the
-        // pending body draws it (grouped_rows from hw=0 + the margin-inset
-        // Paragraph). The Todo box lands below the committed prefix, so we align on
-        // the box top.
-        let mut pending = Buffer::empty(Rect::new(0, 0, width, height));
+        // Draw the WHOLE transcript (info + separator + Todo box) as the fullscreen
+        // body does: grouped_rows from hw=0 + the margin-inset Paragraph.
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         let lines = grouped_rows(&cache, &items, 0, content_width, theme::dark());
         let content_area = Rect {
             x: CONTENT_MARGIN,
@@ -7874,20 +7453,9 @@ mod tests {
         };
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .render(content_area, &mut pending);
+            .render(content_area, &mut buf);
 
-        // Cell-for-cell over the box window: symbol AND fg/bg/modifier match.
-        assert_eq!(
-            box_cells(&committed, box_rows),
-            box_cells(&pending, box_rows),
-            "committed blit diverged from the pending render:\ncommitted:\n{}\npending:\n{}",
-            commit_buffer_text(&committed),
-            commit_buffer_text(&pending),
-        );
-
-        // And the box wraps the circle list: one rounded box, the header + three
-        // circle rows inside the border.
-        let text = commit_buffer_text(&committed);
+        let text = commit_buffer_text(&buf);
         assert_eq!(text.matches('╭').count(), 1, "one box:\n{text}");
         assert!(text.contains("todo_write"), "clean header:\n{text}");
         assert!(text.contains("●  read"), "completed glyph:\n{text}");
@@ -7924,27 +7492,27 @@ mod tests {
     }
 
     #[test]
-    fn sticky_todos_shows_only_a_committed_non_empty_incomplete_list() {
+    fn sticky_todos_shows_only_a_non_tail_non_empty_incomplete_list() {
         use TodoStatus::{Completed, InProgress, Pending};
         let items = vec![todo("read", InProgress), todo("edit", Pending)];
 
-        // Non-empty, incomplete, committed (index 2 < high_water 3): shows.
-        assert_eq!(sticky_todos(Some((2, &items)), 3), Some(items.as_slice()));
+        // Non-empty, incomplete, NOT the tail (index 2 of 4 items): shows.
+        assert_eq!(sticky_todos(Some((2, &items)), 4), Some(items.as_slice()));
 
-        // Still pending (index 3 >= high_water 3, not yet committed): the inline
-        // copy is on screen, so the sticky box defers.
-        assert_eq!(sticky_todos(Some((3, &items)), 3), None);
+        // IS the tail (index 3 is the last of 4 items): the inline copy is the
+        // active tail on screen, so the sticky box defers.
+        assert_eq!(sticky_todos(Some((3, &items)), 4), None);
 
         // No todo at all: nothing.
-        assert_eq!(sticky_todos(None, 3), None);
+        assert_eq!(sticky_todos(None, 4), None);
 
         // Empty list: nothing.
         let empty: Vec<TodoItem> = vec![];
-        assert_eq!(sticky_todos(Some((0, &empty)), 3), None);
+        assert_eq!(sticky_todos(Some((0, &empty)), 4), None);
 
         // All completed: the run is done, so the box hides.
         let done = vec![todo("read", Completed), todo("edit", Completed)];
-        assert_eq!(sticky_todos(Some((0, &done)), 3), None);
+        assert_eq!(sticky_todos(Some((0, &done)), 4), None);
     }
 
     #[test]
@@ -8258,67 +7826,6 @@ mod tests {
         assert_every_box_row_is_exactly_width(&t, Toggles::default(), &[30]);
     }
 
-    /// Renders `store_with_a_tool_run` through BOTH the committed path (a
-    /// `blit_slice` into a bare buffer) and the pending path (the SAME
-    /// `grouped_rows` fold, drawn `CONTENT_MARGIN` in, top-aligned) into two
-    /// same-size buffers, so a caller can compare them glyph- and cell-wise.
-    fn committed_and_pending_tool_group_buffers() -> (Buffer, Buffer, u16, u16) {
-        let t = store_with_a_tool_run();
-        let items: Vec<TranscriptItem> = t.items().to_vec();
-        let count = items.len();
-        let width: u16 = 60;
-        let content_width = width - 2 * CONTENT_MARGIN;
-
-        let mut cache = RenderCache::new();
-        cache.sync(&t, Toggles::default(), content_width, theme::dark());
-
-        // (a) The committed slice `[0, count)` blitted into a bare buffer.
-        let height = slice_height(&cache, &items, 0, count, content_width);
-        let mut committed_buf = Buffer::empty(Rect::new(0, 0, width, height));
-        blit_slice(&mut committed_buf, &cache, &items, 0, count);
-
-        // (b) The pending body's line assembly (`grouped_rows`, the SAME fold),
-        // drawn CONTENT_MARGIN in and top-aligned into a same-size buffer.
-        let lines = grouped_rows(&cache, &items, 0, content_width, theme::dark());
-        let mut pending_buf = Buffer::empty(Rect::new(0, 0, width, height));
-        Paragraph::new(lines).wrap(Wrap { trim: false }).render(
-            Rect::new(CONTENT_MARGIN, 0, content_width, height),
-            &mut pending_buf,
-        );
-
-        (committed_buf, pending_buf, width, height)
-    }
-
-    #[test]
-    fn a_committed_tool_group_is_byte_and_style_identical_to_the_pending_one() {
-        // The committed==pending identity (ADR-0046) over a tool GROUP: BOTH
-        // paths assemble the settled tail through the SAME `grouped_rows` fold,
-        // so a group is identical live vs frozen - and the guarantee is a STYLE
-        // identity, not just a glyph one. Assert (a) the glyph text matches
-        // byte-for-byte, then (b) every cell's symbol AND full style (fg/bg/
-        // modifier) matches, so a colour/modifier-only divergence still fails.
-        let (committed_buf, pending_buf, width, height) =
-            committed_and_pending_tool_group_buffers();
-
-        assert_eq!(
-            commit_buffer_text(&committed_buf),
-            commit_buffer_text(&pending_buf),
-            "committed and pending render the tool group identically"
-        );
-
-        for y in 0..height {
-            for x in 0..width {
-                let c = committed_buf.cell((x, y)).expect("committed cell");
-                let p = pending_buf.cell((x, y)).expect("pending cell");
-                assert_eq!(
-                    (c.symbol(), c.style().fg, c.style().bg, c.modifier),
-                    (p.symbol(), p.style().fg, p.style().bg, p.modifier),
-                    "committed vs pending diverge at ({x},{y})"
-                );
-            }
-        }
-    }
-
     // The fg colour of an item's FIRST span (the prefix glyph): the role a Phase-2
     // committed prefix wears. Asserted against the style HELPERS (not raw hexes) so
     // the Phase-7 slot remap moves in lockstep.
@@ -8469,6 +7976,22 @@ mod tests {
         assert_eq!(capped_composer_height(&one_line, 30), 3);
     }
 
+    // The fullscreen viewport hands `capped_composer_height` the WHOLE terminal
+    // height, so a tall draft grows the Composer zone toward its 8-row cap on a
+    // taller terminal instead of the fixed ~5 the old inline cap allowed. The
+    // `max_visible_rows` third-of-the-terminal rule lifts as the frame grows.
+    #[test]
+    fn capped_composer_height_grows_with_the_full_screen_height() {
+        // A draft taller than the 8-row cap so the frame height is the binding
+        // constraint (12 hard-wrapped rows).
+        let tall = composer::layout("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl", 0, 40);
+        assert_eq!(tall.rows.len(), 12);
+        // Short terminal: max_visible_rows(12) = 4 draft rows + 2 chrome.
+        assert_eq!(capped_composer_height(&tall, 12), 4 + COMPOSER_CHROME_ROWS);
+        // Tall terminal: max_visible_rows(60) saturates at 8 draft rows + 2 chrome.
+        assert_eq!(capped_composer_height(&tall, 60), 8 + COMPOSER_CHROME_ROWS);
+    }
+
     // A short pending stack is anchored to the BOTTOM of its zone: the top rows
     // of the body zone are blank and the content sits just above the status bar.
     #[test]
@@ -8496,9 +8019,126 @@ mod tests {
         assert!(body.contains("Tips:"), "the tips line drew:\n{body}");
     }
 
+    // Readable content caps at MAX_CONTENT_WIDTH so an ultrawide terminal keeps
+    // prose legible (qwen `mainAreaWidth = min(width - 4, 100)`); the footer rule
+    // is sized separately and still spans the full width.
+    #[test]
+    fn readable_content_caps_at_100_columns_but_the_footer_stays_full_width() {
+        // The helper: clamps at the cap, plain margin below it (narrow unchanged).
+        assert_eq!(content_width(200), MAX_CONTENT_WIDTH);
+        assert_eq!(content_width(104), MAX_CONTENT_WIDTH); // 104 - 4 == 100, the cap
+        assert_eq!(content_width(103), 99); // below the cap: width - 2*margin
+        assert_eq!(content_width(50), 46);
+
+        // End to end on a 200-col terminal: the header content is capped at 100, so
+        // the SideBySide tier (needs >= 129) can't apply - the header STACKS and its
+        // info-panel brand sits near the left margin instead of to the right of the
+        // 83-col logo.
+        let screen = Screen::new(ScreenOpts::default());
+        let terminal = draw_pending(200, 30, &screen);
+        let brand_row = (0..30)
+            .map(|y| row_text(&terminal, y))
+            .find(|r| r.contains(">_ suspenders"))
+            .expect("the header brand drew");
+        // Byte index -> column: every cell left of the brand is a width-1 box/space
+        // glyph, so the char count is the column.
+        let brand_col = brand_row
+            .find(">_")
+            .map(|b| brand_row[..b].chars().count())
+            .unwrap();
+        assert!(
+            brand_col < 10,
+            "capped body: the brand is left-aligned (stacked), not beside the 83-col logo; col {brand_col} in {brand_row:?}"
+        );
+
+        // The footer is NOT bound by the cap: its row carries content past the
+        // 102-col content edge (right-aligned segments reach toward the terminal
+        // edge), while the body above never does.
+        let footer_row = (0..30)
+            .map(|y| row_text(&terminal, y))
+            .find(|r| r.contains("shortcuts"))
+            .expect("the footer drew");
+        assert!(
+            footer_row.trim_end().chars().count() > 102,
+            "footer spans past the 100-col content cap: {footer_row:?}"
+        );
+    }
+
+    // --- scrolled_clip: the app-owned scroll clamp (ADR-0046, Stage 2) -------
+    //
+    // `scrolled_clip` is the render-time clamp: it turns the pure Screen's scroll
+    // INTENT into a valid top-clip against the live viewport. A body zone `area`
+    // of height 10 with a 40-row stack has `max_scroll = 30`.
+
+    // Following the tail is byte-identical to Stage 1's bottom-anchor: the window
+    // sits at the bottom (content scroll = max_scroll + 1, the +1 for the marker),
+    // with the overflow marker present because rows remain clipped above.
+    #[test]
+    fn scrolled_clip_following_the_tail_bottom_anchors() {
+        let area = Rect::new(0, 0, 40, 10);
+        let content = Rect::new(0, 0, 40, 10);
+        let clip = scrolled_clip(40, area, content, ScrollIntent::FOLLOW);
+        // max_scroll(30) + 1 marker row = 31.
+        assert_eq!(clip.scroll, 31);
+        assert!(clip.marker_draw.is_some(), "rows remain clipped above");
+        // Identical to the bottom-anchoring `anchor_clip` wrapper.
+        assert_eq!(clip.scroll, anchor_clip(40, area, content).scroll);
+    }
+
+    // Scrolling UP lifts the window: each scrolled row drops one from the content
+    // offset, revealing older rows. The marker stays while any remain above.
+    #[test]
+    fn scrolled_clip_scrolls_up_and_clamps_below_the_top() {
+        let area = Rect::new(0, 0, 40, 10);
+        let content = Rect::new(0, 0, 40, 10);
+        let intent = ScrollIntent {
+            follow_tail: false,
+            lines: 5,
+        };
+        let clip = scrolled_clip(40, area, content, intent);
+        // clipped_above = 30 - 5 = 25, + 1 marker = 26.
+        assert_eq!(clip.scroll, 26);
+        assert!(clip.marker_draw.is_some(), "25 rows still clipped above");
+    }
+
+    // An over-scroll (or Home's `usize::MAX`) CLAMPS to the very top: the oldest
+    // row shows and the "more above" marker clears (nothing is clipped above).
+    #[test]
+    fn scrolled_clip_over_scroll_pins_to_the_top_with_no_marker() {
+        let area = Rect::new(0, 0, 40, 10);
+        let content = Rect::new(0, 0, 40, 10);
+        for lines in [30, 999, usize::MAX] {
+            let intent = ScrollIntent {
+                follow_tail: false,
+                lines,
+            };
+            let clip = scrolled_clip(40, area, content, intent);
+            assert_eq!(clip.scroll, 0, "the top row (0) is shown for lines={lines}");
+            assert!(
+                clip.marker_draw.is_none(),
+                "no more-above marker at the very top for lines={lines}"
+            );
+        }
+    }
+
+    // When the transcript is SHORTER than the viewport the scroll is a no-op: the
+    // stack bottom-anchors with no clip and no marker, whatever the intent.
+    #[test]
+    fn scrolled_clip_is_a_no_op_when_the_stack_fits() {
+        let area = Rect::new(0, 0, 40, 10);
+        let content = Rect::new(0, 0, 40, 10);
+        let intent = ScrollIntent {
+            follow_tail: false,
+            lines: 5,
+        };
+        let clip = scrolled_clip(6, area, content, intent);
+        assert_eq!(clip.scroll, 0, "a fitting stack never clips");
+        assert!(clip.marker_draw.is_none(), "nothing overflows, no marker");
+    }
+
     // An overflowing pending stack is top-clipped: the NEWEST rows survive and
-    // the oldest drop off the top (qwen's overflowDirection:"top"), with the
-    // `… Ctrl-S to show more` marker on the top row.
+    // the oldest drop off the top (qwen's overflowDirection:"top"), with the `…`
+    // overflow marker on the top row.
     #[test]
     fn render_pending_top_clips_an_overflowing_stack() {
         // Many notice lines overflow a short terminal.
@@ -8517,8 +8157,8 @@ mod tests {
         );
         // The overflow marker is on the top row of the body zone (ADR-0046).
         assert!(
-            text.contains("Ctrl-S to show more"),
-            "the overflow marker draws:\n{text}"
+            text.lines().next().map(str::trim) == Some("…"),
+            "the overflow marker draws on the top row:\n{text}"
         );
     }
 
@@ -8639,7 +8279,7 @@ mod tests {
     fn help_defaults_to_a_single_untruncated_column_at_width_100() {
         let lines = help_panel_lines(100, theme::dark());
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let longest = "Peek the full pending output into scrollback";
+        let longest = "Scroll up a page through the transcript";
         assert!(
             texts.iter().any(|t| t.contains(longest)),
             "the longest description renders in full at width 100: {texts:?}"
@@ -9192,8 +8832,8 @@ mod tests {
         );
     }
 
-    /// The whole demo run rendered through the FULL committed slice (no top-clip,
-    /// qwen `<Static>`), as newline-joined rows - the golden-shape seam these
+    /// The whole demo run rendered through the FULL grouped fold (no top-clip,
+    /// qwen `<Static>`), as newline-joined rows - the golden-shape body these
     /// tests inspect without the pending body's overflow clip.
     fn demo_committed_text(width: u16) -> String {
         let screen = Screen::demo();
@@ -9206,10 +8846,13 @@ mod tests {
             theme::dark(),
         );
         let items: Vec<TranscriptItem> = screen.transcript().items().to_vec();
-        let count = items.len();
-        let height = slice_height(&cache, &items, 0, count, content_width);
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height.max(1)));
-        blit_slice(&mut buf, &cache, &items, 0, count);
+        let lines = grouped_rows(&cache, &items, 0, content_width, theme::dark());
+        let height = wrapped_count(lines.clone(), content_width).max(1) as u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        Paragraph::new(lines).wrap(Wrap { trim: false }).render(
+            Rect::new(CONTENT_MARGIN, 0, content_width, height),
+            &mut buf,
+        );
         commit_buffer_text(&buf)
     }
 
@@ -9758,64 +9401,6 @@ mod tests {
         );
     }
 
-    // REGRESSION (bug: "when I use Ctrl+S the last message just keeps appending
-    // everything"): the Ctrl-S peek blitted the FULL pending body into scrollback
-    // on EVERY press, even when the body already fit the live viewport - so
-    // holding Ctrl-S stacked identical copies. When nothing is top-clipped the
-    // peek must reveal NOTHING (height 0), matching the `… Ctrl-S to show more`
-    // marker, which only shows on overflow.
-    #[test]
-    fn ctrl_s_peek_is_a_noop_when_the_pending_body_fits() {
-        let screen = screen_with_notices(vec!["a short notice".to_string()]);
-        let mut cache = RenderCache::new();
-        let mut peek = PendingPeek {
-            cache: &mut cache,
-            screen: &screen,
-            anim: Anim::default(),
-            theme: theme::dark(),
-        };
-        // A TALL viewport the small body fits inside: nothing top-clips.
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 40,
-        };
-        assert_eq!(
-            pending_peek_height(&mut peek, area),
-            0,
-            "a body that fits the viewport reveals nothing on Ctrl-S"
-        );
-    }
-
-    // The complement: when the body genuinely OVERFLOWS a short viewport, Ctrl-S
-    // still reveals the FULL unclamped body (more rows than the whole viewport) so
-    // the top-clipped rows land in scrollback.
-    #[test]
-    fn ctrl_s_peek_reveals_the_full_body_on_overflow() {
-        let screen = screen_with_notices((0..30).map(|i| format!("notice number {i}")).collect());
-        let mut cache = RenderCache::new();
-        let mut peek = PendingPeek {
-            cache: &mut cache,
-            screen: &screen,
-            anim: Anim::default(),
-            theme: theme::dark(),
-        };
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 6,
-        };
-        let height = pending_peek_height(&mut peek, area);
-        assert!(
-            height as usize > area.height as usize,
-            "an overflowing body reveals the full unclamped height ({height} rows), \
-             more than the {}-row viewport",
-            area.height
-        );
-    }
-
     #[test]
     fn the_reasoning_tail_shows_only_the_last_rows_under_the_header() {
         // The rolling tail is the last THINKING_TAIL_ROWS source rows; older
@@ -9955,24 +9540,19 @@ mod tests {
                 ]
             }),
         );
-        let (mut s, _) = s.apply_event(Event::ToolResult {
+        let (s, _) = s.apply_event(Event::ToolResult {
             id: "todo-call".into(),
             name: "todo_write".into(),
             content: "ok".into(),
             is_error: false,
             artifacts,
         });
-        // Confirm a Todo item landed and freeze the whole prefix (commit it into
-        // scrollback), so `latest_todo` reads a COMMITTED list -> sticky reserves.
+        // Confirm a Todo item landed. The second run_command below appends newer
+        // content after it, so the Todo is no longer the transcript tail and the
+        // sticky box qualifies (ADR-0048, fullscreen: not-the-tail gate).
         assert!(
             s.transcript().latest_todo().is_some(),
             "the todo Extension promoted a Todo item"
-        );
-        s.mark_committed(s.transcript().committable_upto());
-        assert!(
-            s.transcript().latest_todo().map(|(i, _)| i)
-                < Some(s.transcript().committed_high_water()),
-            "the Todo is committed (index below the high-water mark)"
         );
         // Now a second, live run_command gated on an open approval.
         let (s, _) = s.apply_event(Event::tool_call(
@@ -10023,10 +9603,10 @@ mod tests {
         assert!(
             sticky_todos(
                 screen.transcript().latest_todo(),
-                screen.transcript().committed_high_water(),
+                screen.transcript().items().len(),
             )
             .is_some(),
-            "the committed Todo would reserve a sticky box absent an approval"
+            "the non-tail Todo would reserve a sticky box absent an approval"
         );
         // But with the approval open, pending_layout drops it.
         let view = screen.composer().view();
@@ -10043,9 +9623,10 @@ mod tests {
 
     // A Screen carrying a COMMITTED Todo list (so the sticky "Current tasks" box
     // would show) with NO approval open - the regression counterpart to
-    // [`screen_committed_todo_then_confirming`]. Same committed-Todo setup, minus
-    // the second confirming Run: the Run has SETTLED (message_end), so the sticky
-    // box is the only thing driving the frame.
+    // [`screen_committed_todo_then_confirming`]. Same Todo setup, then a settling
+    // assistant answer follows it so the Todo is no longer the transcript tail
+    // (the fullscreen not-the-tail gate) - the sticky box is the only thing
+    // driving the frame.
     fn screen_committed_todo_no_approval() -> Screen {
         let opts = ScreenOpts {
             extensions: crate::extensions::configured(&["todo".to_string()]),
@@ -10070,14 +9651,27 @@ mod tests {
                 ]
             }),
         );
-        let (mut s, _) = s.apply_event(Event::ToolResult {
+        let (s, _) = s.apply_event(Event::ToolResult {
             id: "todo-call".into(),
             name: "todo_write".into(),
             content: "ok".into(),
             is_error: false,
             artifacts,
         });
-        s.mark_committed(s.transcript().committable_upto());
+        // A settling answer follows the Todo, so the Todo is no longer the tail.
+        let (s, _) = s.apply_event(Event::message_start(1));
+        let (s, _) = s.apply_event(Event::message_update(
+            Delta::Text("done".into()),
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        ));
+        let (s, _) = s.apply_event(Event::message_end(
+            vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            StopReason::EndTurn,
+        ));
         s
     }
 
@@ -10150,14 +9744,14 @@ mod tests {
     #[test]
     fn no_approval_still_renders_the_sticky_current_tasks_box() {
         let screen = screen_committed_todo_no_approval();
-        // Sanity: the committed, non-empty, incomplete list qualifies for a box.
+        // Sanity: the non-tail, non-empty, incomplete list qualifies for a box.
         assert!(
             sticky_todos(
                 screen.transcript().latest_todo(),
-                screen.transcript().committed_high_water(),
+                screen.transcript().items().len(),
             )
             .is_some(),
-            "the committed Todo qualifies for a sticky box"
+            "the non-tail Todo qualifies for a sticky box"
         );
         let terminal = draw_pending(60, 24, &screen);
         let text = buffer_text(&terminal);
