@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use crate::llm::model::{Api, Model};
 use crate::llm::provider::Provider;
 use crate::llm::response::{Response, StopReason};
-use crate::llm::{Delta, Llm, LlmRequest, OnEvent, StreamEvent};
+use crate::llm::{Delta, DiscoveredModel, Llm, LlmRequest, OnEvent, StreamEvent};
 
 /// A callback that inspects the outgoing typed request (and the Model it is
 /// bound for) and produces a [`Response`]. The extension point for
@@ -117,9 +117,9 @@ impl Entry {
     }
 }
 
-/// One scripted `list_models` answer: `Ok(ids)` or `Err(reason)`, mirroring the
-/// boundary's `Result<Vec<String>, String>`.
-pub type ModelsResult = Result<Vec<String>, String>;
+/// One scripted `list_models` answer: `Ok(models)` or `Err(reason)`, mirroring
+/// the boundary's `Result<Vec<DiscoveredModel>, String>`.
+pub type ModelsResult = Result<Vec<DiscoveredModel>, String>;
 
 /// A per-instance scripted LLM. Pops one [`Entry`] per `complete` call and one
 /// [`ModelsResult`] per `list_models` call.
@@ -227,7 +227,7 @@ impl Llm for FakeLlm {
         }
     }
 
-    async fn list_models(&self, _provider: &Provider) -> Result<Vec<String>, String> {
+    async fn list_models(&self, _provider: &Provider) -> Result<Vec<DiscoveredModel>, String> {
         // An unseeded queue answers with an empty list (the benign default);
         // scripted entries drive the Ok/Err paths tests want to exercise.
         self.models

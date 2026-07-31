@@ -77,7 +77,7 @@ pub struct Session {
     /// Skips the next-speaker check (ADR-0043, qwen-code's
     /// `getSkipNextSpeakerCheck`): when `true`, a no-tool-call Pass finishes the
     /// Run as it did before the check existed - no continuation, no side-query.
-    /// Default `false` (the check runs).
+    /// Default `true` (the check is skipped), matching qwen-code's default.
     pub skip_next_speaker: bool,
     pub command_timeout_ms: u64,
     pub session_dir: String,
@@ -180,10 +180,6 @@ pub struct SessionConfig {
 
 // ---- Base-config defaults (named constants so magic numbers appear once) ----
 
-/// The default local Provider's context window (tokens). A custom local
-/// server typically operates at this size out of the box.
-const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 64_000;
-
 /// The default output cap (max_tokens) every request sends.
 const DEFAULT_MAX_TOKENS: u64 = 8_000;
 
@@ -241,7 +237,12 @@ impl SessionConfig {
                 ProviderConfig {
                     base_url: "http://localhost:8888/v1".into(),
                     api: Api::AnthropicMessages,
-                    context_window: Some(DEFAULT_LOCAL_CONTEXT_WINDOW),
+                    // No shipped window: the local server reports its REAL
+                    // loaded window at discovery, and enrichment (ADR-0037)
+                    // makes that authoritative. Force-setting a figure here
+                    // would shadow the server value; `fallback_window` still
+                    // covers the server-silent case.
+                    context_window: None,
                     token: None,
                 },
             )]),
@@ -268,9 +269,10 @@ impl SessionConfig {
             run_limit: DEFAULT_RUN_LIMIT,
             loop_stall_limit: DEFAULT_LOOP_STALL_LIMIT,
             malformed_retry_budget: DEFAULT_MALFORMED_RETRY_BUDGET,
-            // The next-speaker check runs by default (ADR-0043): a no-tool-call
-            // Pass consults it before ending the Run.
-            skip_next_speaker: false,
+            // The next-speaker check is SKIPPED by default (ADR-0043, matching
+            // qwen-code's `skipNextSpeakerCheck` default of true): a no-tool-call
+            // Pass finishes the Run without the side-query.
+            skip_next_speaker: true,
             extensions: vec![
                 "diff".into(),
                 "run_shell_command".into(),
@@ -282,10 +284,12 @@ impl SessionConfig {
     }
 
     /// The config the test env resolves to: fakes injected, empty extension
-    /// list, tmp session dir. The next-speaker check is OFF here (ADR-0043) so
-    /// the loop and agent tests exercise the tool loop without a side-query
-    /// firing on every text reply; the check's own behavior is covered by the
-    /// tests that opt back in (`skip_next_speaker: Some(false)`).
+    /// list, tmp session dir. The next-speaker check is skipped here (ADR-0043,
+    /// now the base default too) so the loop and agent tests exercise the tool
+    /// loop without a side-query firing on every text reply; the check's own
+    /// behavior is covered by the tests that opt back in
+    /// (`skip_next_speaker: Some(false)`). Set explicitly so the intent stays
+    /// legible even though it matches `base`.
     pub fn test_defaults() -> Self {
         let mut cfg = SessionConfig::base();
         cfg.providers
@@ -949,6 +953,45 @@ impl Session {
         crate::llm::provider::find(&self.providers, &model.provider)
     }
 
+    /// Overlays the server-reported context window onto a custom Provider's
+    /// Model (ADR-0037: "server wins, period"). The sync [`resolve_model`] and
+    /// [`Session::build`] cannot reach the network, so they seed a Model's
+    /// window from config or the fallback; this async layer runs at every point
+    /// the Active Model is captured (launch, `/model` swap, subagent) to let the
+    /// host's live `n_ctx` override even an explicit config `context_window`.
+    ///
+    /// A Catalog-known built-in Model is left untouched - its window is the
+    /// Catalog's fact, never discovered. A custom Model whose host reports an
+    /// `n_ctx` for its id is rebuilt on that window with `max_tokens` re-derived
+    /// ([`model::with_server_window`], keeping the prompt-room invariant). If the
+    /// Provider is unreachable, or the host reports no window for the id, the
+    /// sync-resolved Model rides through unchanged - the config/fallback window
+    /// stands. Discovery failure is never fatal here: a down host still runs on
+    /// its guessed window.
+    ///
+    /// [`resolve_model`]: Session::resolve_model
+    pub async fn enrich_model_window(&self, llm: &dyn crate::llm::Llm, model: Model) -> Model {
+        // The Catalog's window is authoritative for a built-in Model; only a
+        // custom Provider's Model takes the server's live figure.
+        let Some(provider) = self.provider_of(&model) else {
+            return model;
+        };
+        if !provider.custom {
+            return model;
+        }
+        let Ok(discovered) = llm.list_models(provider).await else {
+            return model;
+        };
+        match discovered
+            .iter()
+            .find(|d| d.id == model.id)
+            .and_then(|d| d.context_window)
+        {
+            Some(window) => model::with_server_window(&model, window, self.max_tokens),
+            None => model,
+        }
+    }
+
     /// The ctx every Tool Call executes with: the Project Root, the Result
     /// Cap derived from `model` - the one the Run captured (ADR-0037) - and
     /// the command timeout.
@@ -1304,7 +1347,88 @@ mod tests {
         let local = session.provider_of(&session.model).expect("local resolves");
         assert_eq!(local.base_url, "http://localhost:0/v1");
         assert_eq!(local.api, Api::AnthropicMessages);
-        assert_eq!(local.context_window, Some(64_000));
+        // The base config ships NO window for `local` (ADR-0037): the server
+        // reports its real window at discovery and enrichment makes it
+        // authoritative, so a shipped figure would only shadow it. The
+        // sync-resolved Model still gets a window from the fallback figure.
+        assert_eq!(local.context_window, None);
+        assert_eq!(session.model.context_window, FALLBACK_WINDOW);
+    }
+
+    // ---- enrich_model_window (server window is authoritative, ADR-0037) ----
+
+    #[tokio::test]
+    async fn enrich_gives_a_custom_model_the_server_window_over_config() {
+        // "Server wins, period": a custom Provider's Model takes the host's
+        // reported window (meta.n_ctx), and the dependent output cap re-derives
+        // against it.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let model = session.model.clone();
+        let server_window = 145_664;
+        let fake = crate::test_support::FakeLlm::script([]).with_models([Ok(vec![
+            crate::llm::DiscoveredModel {
+                id: model.id.clone(),
+                context_window: Some(server_window),
+            },
+        ])]);
+
+        let enriched = session.enrich_model_window(&fake, model).await;
+        assert_eq!(enriched.context_window, server_window);
+        assert_eq!(
+            enriched.max_tokens,
+            session.max_tokens.min(server_window / 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_keeps_the_resolved_window_when_the_host_reports_none() {
+        // The host lists the Model but reports no n_ctx: the sync-resolved
+        // window stands.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let model = session.model.clone();
+        let resolved = model.context_window;
+        let fake = crate::test_support::FakeLlm::script([]).with_models([Ok(vec![
+            crate::llm::DiscoveredModel {
+                id: model.id.clone(),
+                context_window: None,
+            },
+        ])]);
+
+        let enriched = session.enrich_model_window(&fake, model).await;
+        assert_eq!(enriched.context_window, resolved);
+    }
+
+    #[tokio::test]
+    async fn enrich_keeps_the_resolved_window_when_discovery_fails() {
+        // A down host is not fatal: a failed listing is data, not a panic (the
+        // error algebra), so enrichment falls back to the resolved window.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let model = session.model.clone();
+        let resolved = model.context_window;
+        let fake =
+            crate::test_support::FakeLlm::script([]).with_models([Err("host_down".to_string())]);
+
+        let enriched = session.enrich_model_window(&fake, model).await;
+        assert_eq!(enriched.context_window, resolved);
+    }
+
+    #[tokio::test]
+    async fn enrich_leaves_a_builtin_model_untouched() {
+        // A Catalog-backed Model's window is authoritative; enrichment never
+        // queries the host for it, so the scripted answer stays unconsumed.
+        let session = Session::build(opts(), &cfg()).unwrap();
+        let builtin = session.resolve_model("anthropic/claude-fable-5").unwrap();
+        let cataloged = builtin.context_window;
+        let fake = crate::test_support::FakeLlm::script([]).with_models([Ok(vec![
+            crate::llm::DiscoveredModel {
+                id: builtin.id.clone(),
+                context_window: Some(1),
+            },
+        ])]);
+
+        let enriched = session.enrich_model_window(&fake, builtin).await;
+        assert_eq!(enriched.context_window, cataloged);
+        assert_ne!(enriched.context_window, 1);
     }
 
     #[test]
@@ -1509,10 +1633,12 @@ mod tests {
     // ---- skip_next_speaker (the next-speaker-check knob, ADR-0043) ----
 
     #[test]
-    fn skip_next_speaker_defaults_off_in_base_and_on_in_test_defaults() {
-        // Production ships with the check running (base()); the test env turns
-        // it off so the loop/agent tests don't fire a side-query on every reply.
-        assert!(!SessionConfig::base().skip_next_speaker);
+    fn skip_next_speaker_defaults_on_in_base_and_test_defaults() {
+        // Both ship with the check skipped, matching qwen-code's
+        // `skipNextSpeakerCheck` default (ADR-0043): a no-tool-call Pass finishes
+        // the Run without a side-query. Tests that want the check opt back in
+        // with `skip_next_speaker: Some(false)`.
+        assert!(SessionConfig::base().skip_next_speaker);
         assert!(SessionConfig::test_defaults().skip_next_speaker);
     }
 

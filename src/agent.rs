@@ -323,6 +323,10 @@ pub enum Msg {
     Settle(LoopOutcome),
     /// The Run task panicked or was aborted (baud's `:DOWN` with no reply).
     RunDown(Reason),
+    /// The off-actor window enrichment for a `/model` swap finished (ADR-0037):
+    /// the Model rebuilt on the server's live window, folded back onto the
+    /// Active Model when it is still the pick that spawned the enrichment.
+    EnrichedModel(Model),
 }
 
 /// The handle callers hold (baud's `GenServer.server()`): an mpsc sender for
@@ -708,6 +712,7 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
             Msg::Run(run) => handle_run(&mut state, run),
             Msg::Settle(outcome) => settle(&mut state, LoopOrDown::Loop(outcome)),
             Msg::RunDown(reason) => settle(&mut state, LoopOrDown::Down(reason)),
+            Msg::EnrichedModel(model) => apply_enriched_model(&mut state, model),
         }
     }
     // The actor loop ended (every handle dropped): the Session is over, so any
@@ -891,8 +896,37 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
 fn swap_active_model(state: &mut AgentState, scoped: &str) -> Result<(), String> {
     let model = state.session.resolve_model(scoped)?;
     state.session.validate_model_budget(&model)?;
-    state.model = model;
+    state.model = model.clone();
+    // The picked Model resolved sync from config/fallback; enrich its window
+    // from the server OFF the actor (ADR-0037, ADR-0011/0017: never block the
+    // loop on the network). The Active Model applies now on its guessed window;
+    // the enriched window folds in when the reply lands - guarded on the pick
+    // still being active (see `apply_enriched_model`).
+    spawn_model_enrichment(state, model);
     Ok(())
+}
+
+// The off-actor window enrichment for a `/model` swap (ADR-0037): clone the
+// boundary and the Session, discover the server window, and message the enriched
+// Model back to the actor. A discovery failure yields the sync-resolved Model
+// unchanged, so the swap always lands.
+fn spawn_model_enrichment(state: &AgentState, model: Model) {
+    let llm = Arc::clone(&state.llm);
+    let session = state.session.clone();
+    let self_tx = state.self_tx.clone();
+    tokio::spawn(async move {
+        let enriched = session.enrich_model_window(llm.as_ref(), model).await;
+        let _ = self_tx.send(Msg::EnrichedModel(enriched));
+    });
+}
+
+// Folds an off-actor enriched Model back onto the Active Model (ADR-0037). Guards
+// on the scoped id still matching: a second `/model` swap between the spawn and
+// this reply must win, so a stale enrichment for the superseded pick is dropped.
+fn apply_enriched_model(state: &mut AgentState, model: Model) {
+    if state.model.scoped_id() == model.scoped_id() {
+        state.model = model;
+    }
 }
 
 // The ListModels fetch, OFF the actor (ADR-0011/0017: never block the actor

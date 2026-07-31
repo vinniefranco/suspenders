@@ -124,9 +124,16 @@ impl DirectSubagentSpawner {
 #[async_trait::async_trait]
 impl SubagentSpawner for DirectSubagentSpawner {
     async fn spawn(&self, request: SubagentRequest) -> Result<SubagentResult, String> {
-        // Resolve the def/Model/tool-subset into the child request (the shared
-        // path), then drive the child Run to settlement inline (foreground).
-        let child = self.build_child_request(request, None)?;
+        // Resolve the def/Model/tool-subset into the child request (the shared,
+        // sync path), enrich the child Model's window from the server (ADR-0037:
+        // the server's live n_ctx wins for a custom Provider - the same layer the
+        // launch/`/model`-swap paths use), then drive the child Run to settlement
+        // inline (foreground).
+        let mut child = self.build_child_request(request, None)?;
+        child.model = self
+            .session
+            .enrich_model_window(self.llm.as_ref(), child.model)
+            .await;
         Ok(run_child(child).await)
     }
 

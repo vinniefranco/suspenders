@@ -63,7 +63,8 @@ async fn start_and_run(
     let context = crate::context_files::load(&session.root);
     let mut launch_notices: Vec<String> = context.skipped.iter().map(|s| s.info_line()).collect();
     launch_notices.extend(theme_notice);
-    let agent = start_agent(session.clone(), resume, context.system_prompt)?;
+    let (session, llm) = boundary_and_enriched_session(session).await;
+    let agent = start_agent(session.clone(), llm, resume, context.system_prompt)?;
     crate::ui::run(agent, &session, launch_notices, themes).await
 }
 
@@ -132,7 +133,8 @@ pub async fn run_headless(
     let session = build_session(root)?;
     let root_label = session.root.clone();
     let system_prompt = headless_context(&session.root);
-    let agent = start_agent(session, resume, system_prompt)?;
+    let (session, llm) = boundary_and_enriched_session(session).await;
+    let agent = start_agent(session, llm, resume, system_prompt)?;
     drive(&agent, &root_label, prompts, &mut |line| println!("{line}")).await
 }
 
@@ -222,12 +224,27 @@ fn build_session(root: Option<PathBuf>) -> anyhow::Result<Session> {
 /// Starts the Agent with the real `Dispatcher` boundary (ADR-0020, ADR-0037)
 /// over the Session's resolved Provider set, and the context-file-assembled
 /// system prompt, resuming a prior Session Log when asked.
+/// Builds the real `Dispatcher` boundary over the Session's Provider set and
+/// enriches the launch Model's context window from the server (ADR-0037): the
+/// sync-resolved window is a config/fallback guess; for a custom Provider the
+/// host's live `n_ctx` is authoritative. The enriched `session` and the built
+/// boundary come back together so the Agent AND the UI both read the true
+/// window (the UI's initial Context Budget reads `session.model`). A down host
+/// leaves the guessed window - discovery failure is never fatal.
+async fn boundary_and_enriched_session(mut session: Session) -> (Session, Arc<Dispatcher>) {
+    let llm = Arc::new(Dispatcher::new(session.providers.clone()));
+    session.model = session
+        .enrich_model_window(llm.as_ref(), session.model.clone())
+        .await;
+    (session, llm)
+}
+
 fn start_agent(
     session: Session,
+    llm: Arc<Dispatcher>,
     resume: Option<String>,
     system_prompt: String,
 ) -> anyhow::Result<AgentHandle> {
-    let llm = Arc::new(Dispatcher::new(session.providers.clone()));
     let mut opts = StartOpts::new(session, llm).with_system_prompt(system_prompt);
     if let Some(resume) = resume {
         opts.resume = Some(parse_resume(&resume));
