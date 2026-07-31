@@ -20,7 +20,7 @@ const THOUGHT_DELIMITER: &str = "**";
 /// does not reliably emit `**bold**` subjects, so the spinner falls back to the
 /// lull phrase).
 pub(super) fn thought_subject_of(thinking: &str) -> Option<String> {
-    if let Some(subject) = parse_thought_subject(thinking) {
+    if let Some(subject) = bold_subject_of(thinking) {
         return Some(subject);
     }
     thinking
@@ -28,6 +28,17 @@ pub(super) fn thought_subject_of(thinking: &str) -> Option<String> {
         .rev()
         .find(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_string())
+}
+
+/// The spinner's thought subject RESTRICTED to a DISTINCT bold `**subject**`
+/// (qwen `parseThought`), with NO last-line head fallback. Used when the live
+/// `✦ Thinking` tail is on screen (non-compact): the tail already shows the
+/// reasoning head, so the head fallback [`thought_subject_of`] uses would render
+/// the SAME text twice - once in the tail, once on the spinner line. `None` when
+/// there is no bold subject, so the spinner falls back to the lull phrase rather
+/// than echoing the tail.
+pub(super) fn bold_subject_of(thinking: &str) -> Option<String> {
+    parse_thought_subject(thinking)
 }
 
 /// qwen `parseThought` (core `thoughtUtils.ts`): the trimmed text between the
