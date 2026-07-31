@@ -287,7 +287,11 @@ mod tests {
         let two_gated_pass = Response {
             content: vec![
                 ContentBlock::tool_use("g1", "run_shell_command", json!({"command": "echo first"})),
-                ContentBlock::tool_use("g2", "run_shell_command", json!({"command": "echo second"})),
+                ContentBlock::tool_use(
+                    "g2",
+                    "run_shell_command",
+                    json!({"command": "echo second"}),
+                ),
             ],
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),

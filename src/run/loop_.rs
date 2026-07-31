@@ -644,7 +644,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("tu_1", "list_directory", json!({"path": dir}))),
+                just(tool_use_result(
+                    "tu_1",
+                    "list_directory",
+                    json!({"path": dir}),
+                )),
                 just(text_end("Here are the files.")),
             ],
         );
@@ -774,7 +778,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         );
@@ -933,7 +941,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         );
@@ -967,7 +979,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         );
@@ -987,7 +1003,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         )
@@ -1028,7 +1048,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         )
@@ -1133,7 +1157,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         )
@@ -1459,8 +1487,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_directory", json!({"path": "lib"}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
+                just(tool_use_result(
+                    "t2",
+                    "list_directory",
+                    json!({"path": "lib"}),
+                )),
             ],
         );
         let (outcome, _deps) = run_with(&session, "explore", deps).await;
@@ -1488,9 +1524,21 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_directory", json!({"path": "."}))),
-                just(tool_use_result("t3", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
+                just(tool_use_result(
+                    "t2",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
+                just(tool_use_result(
+                    "t3",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 // A fourth model reply must never be requested.
                 just(text_end("should never be reached")),
             ],
@@ -1523,7 +1571,13 @@ mod tests {
         let session = session_with(root.path(), opts);
 
         // The same call, Pass after Pass: three identical batches trip the cap.
-        let same = || just(tool_use_result("t1", "list_directory", json!({"path": "."})));
+        let same = || {
+            just(tool_use_result(
+                "t1",
+                "list_directory",
+                json!({"path": "."}),
+            ))
+        };
         let deps = deps_for(
             &session,
             vec![
@@ -1595,10 +1649,26 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_directory", json!({"path": "src"}))),
-                just(tool_use_result("t3", "list_directory", json!({"path": "lib"}))),
-                just(tool_use_result("t4", "list_directory", json!({"path": "docs"}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
+                just(tool_use_result(
+                    "t2",
+                    "list_directory",
+                    json!({"path": "src"}),
+                )),
+                just(tool_use_result(
+                    "t3",
+                    "list_directory",
+                    json!({"path": "lib"}),
+                )),
+                just(tool_use_result(
+                    "t4",
+                    "list_directory",
+                    json!({"path": "docs"}),
+                )),
                 just(text_end("done exploring")),
             ],
         );
@@ -1621,8 +1691,16 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
-                just(tool_use_result("t2", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
+                just(tool_use_result(
+                    "t2",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         );
@@ -2045,7 +2123,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": dir}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": dir}),
+                )),
                 just(text_end("ok")),
             ],
         );
@@ -2082,7 +2164,11 @@ mod tests {
         let deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": dir}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": dir}),
+                )),
                 just(text_end("ok")),
             ],
         );
@@ -2162,7 +2248,11 @@ mod tests {
         let mut deps = deps_for(
             &session,
             vec![
-                just(tool_use_result("t1", "list_directory", json!({"path": "."}))),
+                just(tool_use_result(
+                    "t1",
+                    "list_directory",
+                    json!({"path": "."}),
+                )),
                 just(text_end("done")),
             ],
         )

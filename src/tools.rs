@@ -197,7 +197,12 @@ mod tests {
         std::fs::write(tmp.path().join("big.txt"), "a".repeat(500)).unwrap();
 
         let target = tmp.path().join("big.txt").to_string_lossy().into_owned();
-        let result = execute("read_file", &json!({"file_path": target}), &ctx(tmp.path(), 100)).await;
+        let result = execute(
+            "read_file",
+            &json!({"file_path": target}),
+            &ctx(tmp.path(), 100),
+        )
+        .await;
         assert!(!result.is_error);
         assert_eq!(text_of(&result), "a".repeat(500));
     }
@@ -245,7 +250,12 @@ mod tests {
             .join("definitely_missing.txt")
             .to_string_lossy()
             .into_owned();
-        let result = run("read_file", &json!({"file_path": target}), &ctx(tmp.path(), 10_000)).await;
+        let result = run(
+            "read_file",
+            &json!({"file_path": target}),
+            &ctx(tmp.path(), 10_000),
+        )
+        .await;
         assert!(result.is_error);
         assert!(text_of(&result).contains("enoent"));
     }
@@ -255,7 +265,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let c = ctx(tmp.path(), 10_000);
         assert!(run("read_file", &json!({}), &c).await.is_error);
-        assert!(run("read_file", &json!({"file_path": 42}), &c).await.is_error);
+        assert!(
+            run("read_file", &json!({"file_path": 42}), &c)
+                .await
+                .is_error
+        );
         assert!(
             run("edit", &json!({"path": 1, "old_str": 2}), &c)
                 .await
@@ -270,7 +284,12 @@ mod tests {
         std::fs::write(tmp.path().join("big.txt"), "a".repeat(500)).unwrap();
 
         let target = tmp.path().join("big.txt").to_string_lossy().into_owned();
-        let result = run("read_file", &json!({"file_path": target}), &ctx(tmp.path(), 100)).await;
+        let result = run(
+            "read_file",
+            &json!({"file_path": target}),
+            &ctx(tmp.path(), 100),
+        )
+        .await;
         assert!(!result.is_error);
         assert_eq!(
             text_of(&result),

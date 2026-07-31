@@ -546,7 +546,10 @@ mod tests {
     fn add_tool_results_appends_all_results_as_one_user_message() {
         let results = vec![tool_result("t1", "one"), tool_result_err("t2", "two", true)];
         let mut conv = started_conv();
-        conv.add_assistant_blocks(vec![tool_use("t1", "grep_search"), tool_use("t2", "grep_search")]);
+        conv.add_assistant_blocks(vec![
+            tool_use("t1", "grep_search"),
+            tool_use("t2", "grep_search"),
+        ]);
         conv.add_tool_results(results.clone(), vec![]);
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.messages.last().unwrap(), &Message::user(results));

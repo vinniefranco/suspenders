@@ -33,7 +33,9 @@
 //!
 //! [`FileReadCache`]: crate::tool::read_cache::FileReadCache
 
-use crate::tool::path::{FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim};
+use crate::tool::path::{
+    FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim,
+};
 use crate::tool::read_cache::ReadState;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
@@ -92,9 +94,7 @@ impl Tool for EditFile {
         let raw_file_path = input
             .get("file_path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                "invalid input: edit requires a string \"file_path\"".to_string()
-            })?;
+            .ok_or_else(|| "invalid input: edit requires a string \"file_path\"".to_string())?;
         // qwen's `unescapePath(params.file_path.trim())` (edit.ts): trim
         // surrounding whitespace and strip shell-escaping backslashes BEFORE the
         // absolute-path check and before the path is echoed back in a message.
@@ -102,15 +102,11 @@ impl Tool for EditFile {
         let old_string = input
             .get("old_string")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                "invalid input: edit requires a string \"old_string\"".to_string()
-            })?;
+            .ok_or_else(|| "invalid input: edit requires a string \"old_string\"".to_string())?;
         let new_string = input
             .get("new_string")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                "invalid input: edit requires a string \"new_string\"".to_string()
-            })?;
+            .ok_or_else(|| "invalid input: edit requires a string \"new_string\"".to_string())?;
         // `replace_all` is optional; a missing / non-boolean value defaults to
         // false (qwen `params.replace_all ?? false`).
         let replace_all = input
@@ -128,15 +124,17 @@ impl Tool for EditFile {
 /// absolute-path message for a relative path (edit.ts `validateToolParamValues`)
 /// and the shared confinement wording for an escape.
 fn resolve(path: &str, ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
-    resolve_absolute_in(path, &ctx.root, ctx.memory_root.as_deref()).map_err(|reject| match reject {
-        // VERBATIM qwen edit.ts `validateToolParamValues`.
-        PathReject::Relative => format!("File path must be absolute: {path}"),
-        // qwen has no edit.ts message for a path outside the workspace (it asks
-        // for confirmation via getDefaultPermission instead). Suspenders
-        // confines every tool path to the Project Root, so an escape is a hard
-        // refusal with the shared confinement wording.
-        PathReject::Escapes => "path escapes project root".to_string(),
-    })
+    resolve_absolute_in(path, &ctx.root, ctx.memory_root.as_deref()).map_err(
+        |reject| match reject {
+            // VERBATIM qwen edit.ts `validateToolParamValues`.
+            PathReject::Relative => format!("File path must be absolute: {path}"),
+            // qwen has no edit.ts message for a path outside the workspace (it asks
+            // for confirmation via getDefaultPermission instead). Suspenders
+            // confines every tool path to the Project Root, so an escape is a hard
+            // refusal with the shared confinement wording.
+            PathReject::Escapes => "path escapes project root".to_string(),
+        },
+    )
 }
 
 /// The core of qwen's `calculateEdit` + `execute`, narrowed to the model
@@ -620,7 +618,10 @@ mod normalize {
     }
 
     /// qwen `adjustNewStringForTrailingLine`.
-    fn adjust_new_string_for_trailing_line(new_string: &str, removed_trailing_line: bool) -> String {
+    fn adjust_new_string_for_trailing_line(
+        new_string: &str,
+        removed_trailing_line: bool,
+    ) -> String {
         if removed_trailing_line {
             remove_trailing_newline(new_string).to_string()
         } else {
@@ -852,9 +853,11 @@ mod tests {
     #[test]
     fn description_is_the_verbatim_qwen_string_without_suspenders_additions() {
         let desc = EditFile.spec().description;
-        assert!(desc.starts_with(
-            "Replaces text within a file. By default, replaces a single occurrence."
-        ));
+        assert!(
+            desc.starts_with(
+                "Replaces text within a file. By default, replaces a single occurrence."
+            )
+        );
         assert!(desc.contains("Expectation for required parameters:"));
         assert!(desc.contains("**Multiple replacements:**"));
         // Interpolated ReadFileTool.Name is hardcoded.
@@ -927,7 +930,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            format!("Failed to edit. Found 2 occurrences for old_string in {file_path} but replace_all was not enabled.")
+            format!(
+                "Failed to edit. Found 2 occurrences for old_string in {file_path} but replace_all was not enabled."
+            )
         );
         // The file is untouched on the error path.
         assert_eq!(read(tmp.path(), "a.txt"), "foo bar foo");
@@ -967,7 +972,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            format!("Failed to edit, 0 occurrences found for old_string in {file_path}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use read_file tool to verify.")
+            format!(
+                "Failed to edit, 0 occurrences found for old_string in {file_path}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use read_file tool to verify."
+            )
         );
         assert_eq!(read(tmp.path(), "a.txt"), "actual content");
     }
@@ -990,7 +997,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            format!("No changes to apply. The old_string and new_string are identical in file: {file_path}")
+            format!(
+                "No changes to apply. The old_string and new_string are identical in file: {file_path}"
+            )
         );
     }
 
@@ -1099,7 +1108,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            format!("No changes to apply. The old_string and new_string are identical in file: {file_path}")
+            format!(
+                "No changes to apply. The old_string and new_string are identical in file: {file_path}"
+            )
         );
         assert_eq!(read(tmp.path(), "a.txt"), "it's here");
     }
@@ -1111,7 +1122,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = Arc::new(FileReadCache::new());
         // Ten lines so the changed line 5 gets a bounded 4-line context window.
-        let body = (1..=10).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=10)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         seed_read(tmp.path(), &cache, "a.txt", &body);
         let ctx = ctx_with_cache(tmp.path(), cache);
 
@@ -1242,7 +1256,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            format!("File {file_path} has not been read in this session. Use the read_file tool first to load the current content (a partial read with offset / limit is fine \u{2014} you only need to have seen the bytes you intend to edit) before editing it.")
+            format!(
+                "File {file_path} has not been read in this session. Use the read_file tool first to load the current content (a partial read with offset / limit is fine \u{2014} you only need to have seen the bytes you intend to edit) before editing it."
+            )
         );
         // The unread file is left untouched.
         assert_eq!(read(tmp.path(), "a.txt"), "foo bar baz");
@@ -1267,7 +1283,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            format!("File {file_path} has been modified since you last read it (mtime or size changed). Re-read it with the read_file tool before editing it to ensure your changes are based on current content.")
+            format!(
+                "File {file_path} has been modified since you last read it (mtime or size changed). Re-read it with the read_file tool before editing it to ensure your changes are based on current content."
+            )
         );
     }
 

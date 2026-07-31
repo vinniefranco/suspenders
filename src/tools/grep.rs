@@ -35,9 +35,9 @@
 //! relative to the project root (qwen's relative-to-target-dir handling), not as
 //! required-absolute.
 
+use crate::glob_match;
 use crate::tool::path::{FileError, file_error, resolve_path, with_path};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
-use crate::glob_match;
 use crate::walk::{qwenignore, walk_files};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
@@ -57,8 +57,7 @@ const BINARY_PROBE_BYTES: usize = 8_192;
 const DESCRIPTION: &str = "A powerful search tool built on ripgrep\n\n  Usage:\n  - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n  - Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n  - Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\")\n  - Use Agent tool for open-ended searches requiring multiple rounds\n  - Pattern syntax: Uses ripgrep (not grep) - special regex characters need escaping (use `interface\\{\\}` to find `interface{}` in Go code)\n";
 
 /// The verbatim `pattern` property description (qwen ripGrep.ts:503-504).
-const PATTERN_DESCRIPTION: &str =
-    "The regular expression pattern to search for in file contents";
+const PATTERN_DESCRIPTION: &str = "The regular expression pattern to search for in file contents";
 
 /// The verbatim `glob` property description (qwen ripGrep.ts:508-509).
 const GLOB_DESCRIPTION: &str =
@@ -151,12 +150,19 @@ impl Tool for Grep {
                 resolve_path(path.unwrap_or("."), &ctx.root).unwrap_or_else(|_| abs.to_path_buf());
 
             let (files, root) = if abs.is_file() {
-                let parent = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved.clone());
+                let parent = resolved
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or(resolved.clone());
                 (vec![abs.to_path_buf()], parent)
             } else if abs.is_dir() {
                 (walk_files(abs), resolved)
             } else {
-                return Err(file_error("grep_search", path.unwrap_or("."), FileError::Enoent));
+                return Err(file_error(
+                    "grep_search",
+                    path.unwrap_or("."),
+                    FileError::Enoent,
+                ));
             };
 
             // qwen's verbatim location clause (ripGrep.ts:195-199): a given
@@ -247,7 +253,9 @@ fn search(
 
     // qwen's effective line limit: min(truncateToolOutputLines, limit ?? inf)
     // (ripGrep.ts:292-295).
-    let line_limit = limit.map(|l| l.min(DEFAULT_LINE_LIMIT)).unwrap_or(DEFAULT_LINE_LIMIT);
+    let line_limit = limit
+        .map(|l| l.min(DEFAULT_LINE_LIMIT))
+        .unwrap_or(DEFAULT_LINE_LIMIT);
     let truncated = total > line_limit;
     let shown = if truncated {
         &all_lines[..line_limit]
@@ -297,7 +305,13 @@ fn matches_in(file: &Path, regex: &Regex, relative: &str) -> Vec<String> {
     body.split('\n')
         .enumerate()
         .filter(|(_, line)| regex.is_match(line))
-        .map(|(i, line)| format!("{relative}:{}:{}", i + 1, line.strip_suffix('\r').unwrap_or(line)))
+        .map(|(i, line)| {
+            format!(
+                "{relative}:{}:{}",
+                i + 1,
+                line.strip_suffix('\r').unwrap_or(line)
+            )
+        })
         .collect()
 }
 
@@ -350,8 +364,14 @@ mod tests {
             spec.input_schema["properties"]["limit"]["description"],
             json!(LIMIT_DESCRIPTION)
         );
-        assert!(spec.description.starts_with("A powerful search tool built on ripgrep"));
-        assert!(spec.description.contains("Use Agent tool for open-ended searches"));
+        assert!(
+            spec.description
+                .starts_with("A powerful search tool built on ripgrep")
+        );
+        assert!(
+            spec.description
+                .contains("Use Agent tool for open-ended searches")
+        );
     }
 
     #[tokio::test]
@@ -427,7 +447,11 @@ mod tests {
         std::fs::write(tmp.path().join("other/b.ex"), "needle\n").unwrap();
 
         assert_eq!(
-            run(json!({"pattern": "needle", "path": "lib"}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "needle", "path": "lib"}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("Found 1 match for pattern \"needle\" in path \"lib\":\n---\na.ex:1:needle".into())
         );
     }
@@ -449,9 +473,12 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
         std::fs::write(tmp.path().join("b.txt"), "needle\n").unwrap();
 
-        let out = run(json!({"pattern": "needle", "glob": "*.rs"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"pattern": "needle", "glob": "*.rs"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out,
             "Found 1 match for pattern \"needle\" in the workspace directory (filter: \"*.rs\"):\n---\na.rs:1:needle"
@@ -465,9 +492,12 @@ mod tests {
         std::fs::write(tmp.path().join("src/net/client.rs"), "needle\n").unwrap();
         std::fs::write(tmp.path().join("top.txt"), "needle\n").unwrap();
 
-        let out = run(json!({"pattern": "needle", "glob": "**/*.rs"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"pattern": "needle", "glob": "**/*.rs"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert!(out.contains("src/net/client.rs:1:needle"));
         assert!(!out.contains("top.txt"));
     }
@@ -481,9 +511,12 @@ mod tests {
         std::fs::write(tmp.path().join("src/nested/a.rs"), "needle\n").unwrap();
         std::fs::write(tmp.path().join("b.txt"), "needle\n").unwrap();
 
-        let out = run(json!({"pattern": "needle", "glob": "*.rs"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"pattern": "needle", "glob": "*.rs"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert!(out.contains("src/nested/a.rs:1:needle"));
         assert!(!out.contains("b.txt"));
     }
@@ -572,9 +605,12 @@ mod tests {
         std::fs::write(tmp.path().join("build/top.txt"), "needle\n").unwrap();
         std::fs::write(tmp.path().join("sub/build/nested.txt"), "needle\n").unwrap();
 
-        let out = run(json!({"pattern": "needle", "path": "sub"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run(
+            json!({"pattern": "needle", "path": "sub"}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         // Root-anchored: the nested build survives (it is not the top-level one).
         assert!(out.contains("build/nested.txt:1:needle"));
 
@@ -614,12 +650,11 @@ mod tests {
             .unwrap();
         // Header shows the REAL total (10); the body is capped at 4 lines; the
         // trailer names the 6 omitted lines.
-        assert!(out.starts_with("Found 10 matches for pattern \"needle\" in the workspace directory:\n---\n"));
+        assert!(out.starts_with(
+            "Found 10 matches for pattern \"needle\" in the workspace directory:\n---\n"
+        ));
         assert!(out.ends_with("\n---\n[6 lines truncated] ..."));
-        let body = out
-            .split("\n---\n")
-            .nth(1)
-            .unwrap();
+        let body = out.split("\n---\n").nth(1).unwrap();
         assert_eq!(body.split('\n').count(), 4);
         assert!(body.starts_with("many.txt:1:needle 1"));
     }
@@ -662,7 +697,10 @@ mod tests {
                 &ctx(tmp.path())
             )
             .await,
-            Ok("No matches found for pattern \"needle\" in path \"lib\" (filter: \"*.rs\").".into())
+            Ok(
+                "No matches found for pattern \"needle\" in path \"lib\" (filter: \"*.rs\")."
+                    .into()
+            )
         );
     }
 
@@ -709,7 +747,11 @@ mod tests {
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            run(json!({"pattern": "root", "path": "../.."}), &ctx(tmp.path())).await,
+            run(
+                json!({"pattern": "root", "path": "../.."}),
+                &ctx(tmp.path())
+            )
+            .await,
             Err("path escapes project root".into())
         );
     }
@@ -718,7 +760,11 @@ mod tests {
     async fn missing_or_non_string_pattern_is_a_structured_error() {
         let tmp = TempDir::new().unwrap();
         let c = ctx(tmp.path());
-        assert!(crate::tools::execute("grep_search", &json!({}), &c).await.is_error);
+        assert!(
+            crate::tools::execute("grep_search", &json!({}), &c)
+                .await
+                .is_error
+        );
         assert!(
             crate::tools::execute("grep_search", &json!({"pattern": 42}), &c)
                 .await

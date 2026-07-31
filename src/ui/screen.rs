@@ -687,7 +687,12 @@ impl Screen {
             text: "I'll evaluate this project by exploring its structure, dependencies, and code quality. Let me start by getting an overview.".into(),
         });
         t.push(thought("The user wants me to evaluate this project. Let me start by understanding what kind of project this is and its structure before forming an evaluation, then look at dependencies and code quality."));
-        t.push(tool("list_directory", ".", ".claude/ (+19 more lines)", false));
+        t.push(tool(
+            "list_directory",
+            ".",
+            ".claude/ (+19 more lines)",
+            false,
+        ));
         t.push(tool(
             "grep_search",
             "fn main|pub fn run",
@@ -708,8 +713,18 @@ impl Screen {
             false,
         ));
         t.push(thought("Let me continue exploring the project structure to understand the codebase more thoroughly."));
-        t.push(tool("list_directory", "src", "agent/ (+32 more lines)", false));
-        t.push(tool("list_directory", "docs", "adr/ (+2 more lines)", false));
+        t.push(tool(
+            "list_directory",
+            "src",
+            "agent/ (+32 more lines)",
+            false,
+        ));
+        t.push(tool(
+            "list_directory",
+            "docs",
+            "adr/ (+2 more lines)",
+            false,
+        ));
         t.marker("» [reading file after file fills your context - grep for the symbol you actually need first instead; then read only what you will change]", Tone::Aid);
         t.push(thought("Let me explore more of the project structure to understand the codebase depth, test coverage, and ADRs."));
         t.push(tool(
@@ -733,7 +748,12 @@ impl Screen {
             false,
         ));
         t.push(thought("Let me check the build health and test coverage."));
-        t.push(tool("run_shell_command", "cargo build 2>&1", "√ exit 0", false));
+        t.push(tool(
+            "run_shell_command",
+            "cargo build 2>&1",
+            "√ exit 0",
+            false,
+        ));
         t.push(tool(
             "run_shell_command",
             "cargo test --lib -- --quiet 2>&1",
@@ -3120,7 +3140,11 @@ mod tests {
         // Header commits; the gated ToolCall stays pending.
         let (t, header) = fold_and_commit(
             fresh(),
-            Event::tool_call("t1", "run_shell_command", serde_json::json!({"command": "ls"})),
+            Event::tool_call(
+                "t1",
+                "run_shell_command",
+                serde_json::json!({"command": "ls"}),
+            ),
         );
         assert_eq!(header, Some(1));
 

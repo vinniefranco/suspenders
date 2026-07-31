@@ -243,7 +243,10 @@ impl AgentState {
         self.notifications.push(notification.clone());
         super::log_entry(self, LogEntry::UserText(notification.clone()));
         super::broadcast(self, Event::background_notification(notification));
-        super::broadcast(self, Event::background_task_finished(id.clone(), "cancelled"));
+        super::broadcast(
+            self,
+            Event::background_task_finished(id.clone(), "cancelled"),
+        );
 
         Some(format!(
             "Cancellation requested for background agent \"{id}\". A final \

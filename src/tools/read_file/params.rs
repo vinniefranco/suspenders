@@ -58,7 +58,12 @@ pub(super) fn file_path(input: &Value) -> Result<String, String> {
 /// `validateToolParamValues`): "Offset must be a non-negative number" (offset
 /// < 0) and "Limit must be a positive number" (limit <= 0).
 pub(super) fn window(input: &Value) -> Result<Window, String> {
-    let offset = optional_number("offset", input, "Offset must be a non-negative number", false)?;
+    let offset = optional_number(
+        "offset",
+        input,
+        "Offset must be a non-negative number",
+        false,
+    )?;
     let limit = optional_number("limit", input, "Limit must be a positive number", true)?;
     Ok(Window { offset, limit })
 }
@@ -166,9 +171,11 @@ Notebooks are always read in full with structured cell output."
         match detect::detect(path, &head) {
             FileType::Image => {
                 if windowed {
-                    return Err("offset and limit are not supported for image files. Images \
+                    return Err(
+                        "offset and limit are not supported for image files. Images \
 are read in full."
-                        .to_string());
+                            .to_string(),
+                    );
                 }
                 if pages.is_some() {
                     return Err("pages is only supported for PDF files.".to_string());

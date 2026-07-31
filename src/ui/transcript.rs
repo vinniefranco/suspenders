@@ -811,7 +811,11 @@ mod tests {
         assert_eq!(key_arg("run_shell_command", &json!({"command": ""})), None);
         // The live call line then falls back to summarize_input, not a blank arg.
         let mut t = fresh();
-        t.tool_call("t1".into(), "run_shell_command".into(), &json!({"command": ""}));
+        t.tool_call(
+            "t1".into(),
+            "run_shell_command".into(),
+            &json!({"command": ""}),
+        );
         assert_eq!(
             t.items(),
             vec![tool_call_item("t1", "run_shell_command", "command=")]
@@ -872,7 +876,13 @@ mod tests {
     #[test]
     fn tool_result_appends_summary_with_error_flag() {
         let mut t = fresh();
-        t.tool_result("t1", "grep_search".into(), "a\nb\nc", false, &HashMap::new());
+        t.tool_result(
+            "t1",
+            "grep_search".into(),
+            "a\nb\nc",
+            false,
+            &HashMap::new(),
+        );
         assert_eq!(
             t.items(),
             vec![tool_result_item("grep_search", "a (+2 more lines)", false)]
@@ -915,8 +925,15 @@ mod tests {
     #[test]
     fn an_in_flight_call_renders_alone_without_bumping_revision() {
         let mut t = fresh();
-        t.tool_call("t1".into(), "run_shell_command".into(), &json!({"command": "ls"}));
-        assert_eq!(t.items(), vec![tool_call_item("t1", "run_shell_command", "ls")]);
+        t.tool_call(
+            "t1".into(),
+            "run_shell_command".into(),
+            &json!({"command": "ls"}),
+        );
+        assert_eq!(
+            t.items(),
+            vec![tool_call_item("t1", "run_shell_command", "ls")]
+        );
         assert_eq!(t.revision(), 0);
     }
 
@@ -968,7 +985,13 @@ mod tests {
             "run_shell_command".into(),
             &json!({"command": "cargo test"}),
         );
-        t.tool_result("t1", "run_shell_command".into(), "boom", true, &HashMap::new());
+        t.tool_result(
+            "t1",
+            "run_shell_command".into(),
+            "boom",
+            true,
+            &HashMap::new(),
+        );
         assert_eq!(
             t.items(),
             vec![tool_result_merged(
@@ -1185,13 +1208,7 @@ mod tests {
     #[test]
     fn extension_replaces_tool_result_summary_using_artifacts() {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
-        t.tool_result(
-            "t1",
-            "edit".into(),
-            "edited x",
-            false,
-            &diff_artifacts(),
-        );
+        t.tool_result("t1", "edit".into(), "edited x", false, &diff_artifacts());
         assert_eq!(t.items(), vec![diff_item("edit")]);
     }
 
@@ -1199,10 +1216,7 @@ mod tests {
     fn without_matching_artifact_default_summary_survives() {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
         t.tool_result("t1", "edit".into(), "edited x", false, &HashMap::new());
-        assert_eq!(
-            t.items(),
-            vec![tool_result_item("edit", "edited x", false)]
-        );
+        assert_eq!(t.items(), vec![tool_result_item("edit", "edited x", false)]);
     }
 
     #[test]
@@ -1215,13 +1229,7 @@ mod tests {
     #[test]
     fn crashing_present_falls_back_to_default_with_info_line() {
         let mut t = Transcript::new(vec![reg("PresentCrasher", Box::new(PresentCrasher))]);
-        t.tool_result(
-            "t1",
-            "edit".into(),
-            "edited x",
-            false,
-            &diff_artifacts(),
-        );
+        t.tool_result("t1", "edit".into(), "edited x", false, &diff_artifacts());
         let items = t.items();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0], tool_result_item("edit", "edited x", false));
@@ -1258,11 +1266,7 @@ mod tests {
     #[test]
     fn a_diff_stands_alone_after_the_paired_call_is_removed() {
         let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
-        t.tool_call(
-            "t1".into(),
-            "edit".into(),
-            &json!({"path": "src/x.rs"}),
-        );
+        t.tool_call("t1".into(), "edit".into(), &json!({"path": "src/x.rs"}));
         t.tool_result("t1", "edit".into(), "edited", false, &diff_artifacts());
         // Only the Diff remains - the redundant call line is gone.
         assert_eq!(t.items(), vec![diff_item("edit")]);
@@ -1312,11 +1316,15 @@ mod tests {
             ),
             (
                 "tool_call",
-                Box::new(|t| t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}))),
+                Box::new(|t| {
+                    t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}))
+                }),
             ),
             (
                 "tool_result",
-                Box::new(|t| t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())),
+                Box::new(|t| {
+                    t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())
+                }),
             ),
             (
                 "extension_failure",
@@ -1402,11 +1410,15 @@ mod tests {
             ),
             (
                 "tool_call",
-                Box::new(|t| t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}))),
+                Box::new(|t| {
+                    t.tool_call("t1".into(), "grep_search".into(), &json!({"pattern": "x"}))
+                }),
             ),
             (
                 "tool_result",
-                Box::new(|t| t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())),
+                Box::new(|t| {
+                    t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())
+                }),
             ),
             (
                 "extension_failure",

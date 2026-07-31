@@ -6606,7 +6606,10 @@ mod tests {
             key_arg: Some("cargo test".to_string()),
         };
         let lines = message_lines(&item, false, 80, theme::dark());
-        assert_eq!(line_text(&lines[0]), "x  run_shell_command cargo test · exit 1");
+        assert_eq!(
+            line_text(&lines[0]),
+            "x  run_shell_command cargo test · exit 1"
+        );
     }
 
     #[test]
@@ -8026,8 +8029,8 @@ mod tests {
         // A single lone tool item is one group; the surrounding prose passes
         // through. A run at the START (index 0) and one at the very END both box.
         let items = [
-            tool_call("read_file"),     // 0  (run at slice start)
-            assistant("prose"),         // 1
+            tool_call("read_file"),           // 0  (run at slice start)
+            assistant("prose"),               // 1
             tool_call("run_shell_command"),   // 2  (run at the very end)
             tool_result("run_shell_command"), // 3
         ];
@@ -8047,12 +8050,12 @@ mod tests {
         // results (a mid-batch extension error / standing approval) SPLITS the run
         // into two tool groups with the Info as its own singleton between them.
         let items = [
-            assistant("on it"),         // 0
-            tool_call("edit"),     // 1
-            tool_result("edit"),   // 2
-            info("auto-approved"),      // 3  (splits the batch)
+            assistant("on it"),               // 0
+            tool_call("edit"),                // 1
+            tool_result("edit"),              // 2
+            info("auto-approved"),            // 3  (splits the batch)
             tool_result("run_shell_command"), // 4
-            assistant("done"),          // 5
+            assistant("done"),                // 5
         ];
         assert_eq!(
             group_segments(&items, 0),

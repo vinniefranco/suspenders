@@ -276,7 +276,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("hello.txt"), "hi there\n").unwrap();
         assert_eq!(
-            run(json!({"file_path": abs(tmp.path(), "hello.txt")}), &ctx(tmp.path())).await,
+            run(
+                json!({"file_path": abs(tmp.path(), "hello.txt")}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("hi there\n".into())
         );
     }
@@ -328,7 +332,11 @@ mod tests {
         let content = "a".repeat(50_123);
         std::fs::write(tmp.path().join("big.txt"), &content).unwrap();
         assert_eq!(
-            run(json!({"file_path": abs(tmp.path(), "big.txt")}), &ctx(tmp.path())).await,
+            run(
+                json!({"file_path": abs(tmp.path(), "big.txt")}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok(content)
         );
     }
@@ -336,9 +344,12 @@ mod tests {
     #[tokio::test]
     async fn missing_file_is_an_error() {
         let tmp = TempDir::new().unwrap();
-        let err = run(json!({"file_path": abs(tmp.path(), "nope.txt")}), &ctx(tmp.path()))
-            .await
-            .unwrap_err();
+        let err = run(
+            json!({"file_path": abs(tmp.path(), "nope.txt")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("nope.txt"));
         assert!(err.contains("enoent"));
     }
@@ -347,9 +358,12 @@ mod tests {
     async fn reading_a_directory_is_an_error() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("somedir")).unwrap();
-        let err = run(json!({"file_path": abs(tmp.path(), "somedir")}), &ctx(tmp.path()))
-            .await
-            .unwrap_err();
+        let err = run(
+            json!({"file_path": abs(tmp.path(), "somedir")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("somedir"));
     }
 
@@ -436,7 +450,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("lines.txt"), "one\ntwo\n").unwrap();
         assert_eq!(
-            run(json!({"file_path": abs(tmp.path(), "lines.txt")}), &ctx(tmp.path())).await,
+            run(
+                json!({"file_path": abs(tmp.path(), "lines.txt")}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("one\ntwo\n".into())
         );
     }
@@ -467,7 +485,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("ws.txt"), "one  \ntwo\t\nthree\n").unwrap();
         assert_eq!(
-            run(json!({"file_path": abs(tmp.path(), "ws.txt")}), &ctx(tmp.path())).await,
+            run(
+                json!({"file_path": abs(tmp.path(), "ws.txt")}),
+                &ctx(tmp.path())
+            )
+            .await,
             Ok("one\ntwo\nthree\n".into())
         );
     }
@@ -538,9 +560,12 @@ mod tests {
     async fn run_rich_on_text_is_one_text_block() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("hi.txt"), "hello\n").unwrap();
-        let out = run_rich(json!({"file_path": abs(tmp.path(), "hi.txt")}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"file_path": abs(tmp.path(), "hi.txt")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.blocks, vec![ResultBlock::text("hello\n")]);
     }
 
@@ -550,9 +575,12 @@ mod tests {
     async fn svg_is_read_as_a_text_block() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("i.svg"), "<svg>hi</svg>").unwrap();
-        let out = run_rich(json!({"file_path": abs(tmp.path(), "i.svg")}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"file_path": abs(tmp.path(), "i.svg")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.blocks, vec![ResultBlock::text("<svg>hi</svg>")]);
     }
 
@@ -564,9 +592,12 @@ mod tests {
             "a".repeat(media::svg_max_size_bytes() as usize + 10)
         );
         std::fs::write(tmp.path().join("big.svg"), big).unwrap();
-        let out = run_rich(json!({"file_path": abs(tmp.path(), "big.svg")}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"file_path": abs(tmp.path(), "big.svg")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out.blocks,
             vec![ResultBlock::text(
@@ -585,9 +616,12 @@ mod tests {
             r##"{"cells":[{"cell_type":"markdown","source":"# Hi"}]}"##,
         )
         .unwrap();
-        let out = run_rich(json!({"file_path": abs(tmp.path(), "nb.ipynb")}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"file_path": abs(tmp.path(), "nb.ipynb")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         match &out.blocks[0] {
             ResultBlock::Text { text } => {
                 assert!(text.contains("Jupyter Notebook (python, 1 cells)"));
@@ -652,9 +686,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("pic.png"), PNG_1X1).unwrap();
         // Default ctx has image=false.
-        let out = run_rich(json!({"file_path": abs(tmp.path(), "pic.png")}), &ctx(tmp.path()))
-            .await
-            .unwrap();
+        let out = run_rich(
+            json!({"file_path": abs(tmp.path(), "pic.png")}),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out.blocks,
             vec![ResultBlock::text(unsupported_modality_placeholder(
@@ -734,7 +771,11 @@ mod tests {
     async fn pdf_without_pdf_modality_takes_the_text_path() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("doc.pdf"), b"%PDF-1.7\n").unwrap();
-        let out = run_rich(json!({"file_path": abs(tmp.path(), "doc.pdf")}), &ctx(tmp.path())).await;
+        let out = run_rich(
+            json!({"file_path": abs(tmp.path(), "doc.pdf")}),
+            &ctx(tmp.path()),
+        )
+        .await;
         // pdf=false so no Document block; text path (Ok text or Failed error).
         match out {
             Ok(o) => assert!(matches!(o.blocks[0], ResultBlock::Text { .. })),
