@@ -117,7 +117,7 @@ impl ConfirmKind {
     /// empty block.
     pub fn from_tool_name(name: &str) -> ConfirmKind {
         match name {
-            "run_command" => ConfirmKind::Exec,
+            "run_shell_command" => ConfirmKind::Exec,
             _ => ConfirmKind::Info,
         }
     }
@@ -538,7 +538,7 @@ fn rust_edit_diff() -> TranscriptItem {
         diff_line(DiffSide::Context, "}"),
     ];
     TranscriptItem::Diff {
-        title: "edit_file src/lexer.rs (+4 -2)".into(),
+        title: "edit src/lexer.rs (+4 -2)".into(),
         lang: Some("rs".into()),
         hunks: vec![DiffHunk {
             header: Some("@@ -1,6 +1,8 @@".into()),
@@ -687,9 +687,9 @@ impl Screen {
             text: "I'll evaluate this project by exploring its structure, dependencies, and code quality. Let me start by getting an overview.".into(),
         });
         t.push(thought("The user wants me to evaluate this project. Let me start by understanding what kind of project this is and its structure before forming an evaluation, then look at dependencies and code quality."));
-        t.push(tool("list_files", ".", ".claude/ (+19 more lines)", false));
+        t.push(tool("list_directory", ".", ".claude/ (+19 more lines)", false));
         t.push(tool(
-            "grep",
+            "grep_search",
             "fn main|pub fn run",
             "src/main.rs:12 (+29 more lines)",
             false,
@@ -708,18 +708,18 @@ impl Screen {
             false,
         ));
         t.push(thought("Let me continue exploring the project structure to understand the codebase more thoroughly."));
-        t.push(tool("list_files", "src", "agent/ (+32 more lines)", false));
-        t.push(tool("list_files", "docs", "adr/ (+2 more lines)", false));
+        t.push(tool("list_directory", "src", "agent/ (+32 more lines)", false));
+        t.push(tool("list_directory", "docs", "adr/ (+2 more lines)", false));
         t.marker("» [reading file after file fills your context - grep for the symbol you actually need first instead; then read only what you will change]", Tone::Aid);
         t.push(thought("Let me explore more of the project structure to understand the codebase depth, test coverage, and ADRs."));
         t.push(tool(
-            "list_files",
+            "list_directory",
             "docs/adr",
             "0001-ratatui-for-the-tui.md (+39 more lines)",
             false,
         ));
         t.push(tool(
-            "list_files",
+            "list_directory",
             "src/turn",
             "governor/ (+7 more lines)",
             false,
@@ -733,9 +733,9 @@ impl Screen {
             false,
         ));
         t.push(thought("Let me check the build health and test coverage."));
-        t.push(tool("run_command", "cargo build 2>&1", "√ exit 0", false));
+        t.push(tool("run_shell_command", "cargo build 2>&1", "√ exit 0", false));
         t.push(tool(
-            "run_command",
+            "run_shell_command",
             "cargo test --lib -- --quiet 2>&1",
             "× [command denied by user]",
             true,
@@ -2277,7 +2277,7 @@ mod tests {
                 Event::run_started("r1"),
                 Event::tool_call(
                     "t1",
-                    "run_command",
+                    "run_shell_command",
                     serde_json::json!({"command": "cargo test"}),
                 ),
                 Event::approval_request("approval-0", "cargo test"),
@@ -3120,7 +3120,7 @@ mod tests {
         // Header commits; the gated ToolCall stays pending.
         let (t, header) = fold_and_commit(
             fresh(),
-            Event::tool_call("t1", "run_command", serde_json::json!({"command": "ls"})),
+            Event::tool_call("t1", "run_shell_command", serde_json::json!({"command": "ls"})),
         );
         assert_eq!(header, Some(1));
 
@@ -3143,14 +3143,14 @@ mod tests {
         // The result supersedes the call → a terminal ToolResult, which commits.
         let (t, committed) = fold_and_commit(
             t,
-            Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
+            Event::tool_result("t1", "run_shell_command", "ok", false, HashMap::new()),
         );
         assert_eq!(committed, Some(1), "the resolved call commits as a result");
         // The committed item is a plain ToolResult - no approval trace.
         assert_eq!(
             items(&t),
             vec![TranscriptItem::ToolResult {
-                name: "run_command".into(),
+                name: "run_shell_command".into(),
                 summary: "ok".into(),
                 is_error: false,
                 key_arg: Some("ls".into()),
@@ -3167,7 +3167,7 @@ mod tests {
             fresh(),
             Event::tool_call(
                 "t1",
-                "run_command",
+                "run_shell_command",
                 serde_json::json!({"command": "cargo test"}),
             ),
         );
@@ -3176,7 +3176,7 @@ mod tests {
         // it now commits (count 1 - the header was already committed).
         let (_t, second) = fold_and_commit(
             t,
-            Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
+            Event::tool_result("t1", "run_shell_command", "ok", false, HashMap::new()),
         );
         assert_eq!(second, Some(1));
     }
@@ -3287,7 +3287,7 @@ mod tests {
             vec![
                 Event::tool_call(
                     "t1",
-                    "run_command",
+                    "run_shell_command",
                     serde_json::json!({"command": "echo one"}),
                 ),
                 Event::tool_call("t2", "web_fetch", serde_json::json!({"url": "https://x"})),
@@ -3308,14 +3308,14 @@ mod tests {
                 HashMap::new(),
             )],
         );
-        assert_eq!(t.newest_live_tool_name(), Some("run_command"));
+        assert_eq!(t.newest_live_tool_name(), Some("run_shell_command"));
 
         // With no live ToolCall at all (t1 also resolved), it is None.
         let t = fold(
             t,
             vec![Event::tool_result(
                 "t1",
-                "run_command",
+                "run_shell_command",
                 "ok",
                 false,
                 HashMap::new(),
@@ -3347,10 +3347,10 @@ mod tests {
             vec![
                 Event::tool_call(
                     "t1",
-                    "run_command",
+                    "run_shell_command",
                     serde_json::json!({"command": "cargo test"}),
                 ),
-                Event::tool_result("t1", "run_command", "ok", false, HashMap::new()),
+                Event::tool_result("t1", "run_shell_command", "ok", false, HashMap::new()),
             ],
         );
         let items = items(&t);
@@ -3362,7 +3362,7 @@ mod tests {
                 key_arg,
                 ..
             } => {
-                assert_eq!(name, "run_command");
+                assert_eq!(name, "run_shell_command");
                 assert!(!is_error);
                 assert_eq!(key_arg.as_deref(), Some("cargo test"));
             }

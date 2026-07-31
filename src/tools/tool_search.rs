@@ -657,6 +657,7 @@ mod tests {
             command_timeout_ms: 120_000,
             input_modalities: crate::content::Modalities::default(),
             memory_root: None,
+            session_dir: std::env::temp_dir(),
             caps: crate::tool::caps::Capabilities::for_test_with_registry(registry),
         }
     }

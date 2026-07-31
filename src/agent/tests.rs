@@ -406,7 +406,7 @@ async fn denied_run_command_is_never_executed_and_yields_the_denial_tool_result(
     let script = vec![
         Entry::just(tool_use_result(
             "tu_run",
-            "run_command",
+            "run_shell_command",
             json!({ "command": format!("touch {}", marker.display()) }),
         )),
         Entry::just(text_end("understood")),
@@ -454,7 +454,7 @@ async fn approved_run_command_executes_and_returns_its_output() {
     let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "tu_run",
-            "run_command",
+            "run_shell_command",
             json!({ "command": "echo hi" }),
         )),
         Entry::just(text_end("it said hi")),
@@ -601,13 +601,13 @@ async fn approve_always_records_the_command_the_identical_command_is_auto_approv
     let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "r1",
-            "run_command",
+            "run_shell_command",
             json!({ "command": "echo hi" }),
         )),
-        Entry::just(tool_use_result("ls", "list_files", json!({ "path": "." }))),
+        Entry::just(tool_use_result("ls", "list_directory", json!({ "path": "." }))),
         Entry::just(tool_use_result(
             "r2",
-            "run_command",
+            "run_shell_command",
             json!({ "command": "echo hi" }),
         )),
         Entry::just(text_end("done")),
@@ -647,12 +647,12 @@ async fn a_standing_approval_never_widens_beyond_the_identical_string() {
     let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "r1",
-            "run_command",
+            "run_shell_command",
             json!({ "command": "echo hi" }),
         )),
         Entry::just(tool_use_result(
             "r2",
-            "run_command",
+            "run_shell_command",
             json!({ "command": "echo  hi" }),
         )),
         Entry::just(text_end("done")),
@@ -728,7 +728,7 @@ async fn yolo_mode_auto_runs_a_gated_command_without_a_modal() {
     let (_dir, agent, mut rx) = harness(vec![
         Entry::just(tool_use_result(
             "y1",
-            "run_command",
+            "run_shell_command",
             json!({ "command": "echo yolo" }),
         )),
         Entry::just(text_end("done")),
@@ -784,7 +784,7 @@ async fn steer_mid_run_is_drained_after_the_tool_batch_and_delivered_unadorned()
     release
         .send(Release {
             deltas: vec![],
-            response: tool_use_result("t1", "list_files", json!({ "path": "." })),
+            response: tool_use_result("t1", "list_directory", json!({ "path": "." })),
         })
         .ok();
 
@@ -898,10 +898,18 @@ async fn cancel_when_idle_is_a_no_op() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
     let (barrier, mut inflight) = Entry::barrier();
-    let (_dir, agent, mut rx) = harness(vec![
-        Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
-        barrier,
-    ]);
+    // list_files requires an ABSOLUTE path (qwen ls contract); build the dir
+    // first so the tool_use can carry its absolute path.
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let path = dir.path().to_string_lossy().into_owned();
+    let (agent, mut rx) = session_harness(
+        session,
+        vec![
+            Entry::just(tool_use_result("t1", "list_directory", json!({ "path": path }))),
+            barrier,
+        ],
+    );
 
     agent.submit("explore then hang").await.unwrap();
 
@@ -960,7 +968,7 @@ async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_ma
 #[tokio::test(flavor = "multi_thread")]
 async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_marker() {
     let (_dir, session, agent, mut rx) = harness_with_session(vec![
-        Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
+        Entry::just(tool_use_result("t1", "list_directory", json!({ "path": "." }))),
         Entry::error("boom"),
     ]);
     let provenance = session.model.provenance();
@@ -1021,7 +1029,7 @@ async fn a_run_failing_with_an_llm_error_logs_a_settled_entry_carrying_the_error
 #[tokio::test(flavor = "multi_thread")]
 async fn a_settled_session_resumes_into_a_new_agent_conversation_rebuilt() {
     let (_dir, session, first, mut rx) = harness_with_session(vec![
-        Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
+        Entry::just(tool_use_result("t1", "list_directory", json!({ "path": "." }))),
         Entry::just(text_end("Nothing here.")),
     ]);
     let session_dir = session.session_dir.clone();
@@ -1069,9 +1077,9 @@ fn rider_session(dir: &TempDir) -> Session {
 // carried Conversation resumes byte-for-byte.
 fn exploring_script() -> Vec<Entry> {
     vec![
-        Entry::just(tool_use_result("t1", "list_files", json!({ "path": "." }))),
-        Entry::just(tool_use_result("t2", "list_files", json!({ "path": "." }))),
-        Entry::just(tool_use_result("t3", "list_files", json!({ "path": "." }))),
+        Entry::just(tool_use_result("t1", "list_directory", json!({ "path": "." }))),
+        Entry::just(tool_use_result("t2", "list_directory", json!({ "path": "." }))),
+        Entry::just(tool_use_result("t3", "list_directory", json!({ "path": "." }))),
         Entry::just(text_end("done")),
     ]
 }
@@ -1108,7 +1116,7 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
         Entry::just(tool_use_result(
             "p1",
             "todo_write",
-            json!({ "todos": [{ "content": "do Y", "status": "in_progress" }] }),
+            json!({ "todos": [{ "id": "1", "content": "do Y", "status": "in_progress" }] }),
         )),
         Entry::just(text_end("planned")),
     ]);
@@ -1135,67 +1143,73 @@ async fn the_plan_survives_a_run_boundary_and_is_restored_on_resume() {
 async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_through_resume() {
     let dir = TempDir::new().unwrap();
     let model = Model::new("local", "test-model", Api::AnthropicMessages, 64_000, 200);
+
+    // The proactive-compaction target rides the per-request token estimate, which
+    // includes tool-spec + system-prompt overhead - a figure that shifts whenever
+    // a tool description changes. Rather than hardcode a budget that needs
+    // re-tuning on every prompt edit, PROBE the settled estimates after Run 2 and
+    // Run 3 with a budget so large compaction never fires, then derive the real
+    // budget so the target lands strictly between them (only the third Run
+    // crosses). estimate = ceil((overhead + system + messages)/3.5); the target is
+    // budget - reserve(200) - trunc(0.3*budget), i.e. about 0.7*budget - 200, so
+    // budget = (target + 200) / 0.7 recovers the knob from a chosen target.
+    let reply = "word ".repeat(250);
+    let probe_dir = TempDir::new().unwrap();
+    let probe = start_voiced(
+        Session::build(
+            SessionOpts {
+                root: Some(probe_dir.path().to_string_lossy().into_owned()),
+                session_dir: Some(
+                    probe_dir.path().join("sessions").to_string_lossy().into_owned(),
+                ),
+                model: Some(model.clone()),
+                // Under the 64k model window and far above any run estimate, so
+                // the probe never compacts and measures clean settled estimates.
+                context_budget: Some(60_000),
+                compaction_slack: Some(0.3),
+                compaction_keep: Some(0.066),
+                ..Default::default()
+            },
+            &SessionConfig::test_defaults(),
+        )
+        .expect("probe session builds"),
+        FakeLlm::script(vec![
+            Entry::just(text_end(&format!("{reply} 1"))),
+            Entry::just(text_end(&format!("{reply} 2"))),
+            Entry::just(text_end(&format!("{reply} 3"))),
+        ]),
+    );
+    let mut prx = probe.subscribe();
+    let mut est = [0u64; 3];
+    for (n, slot) in est.iter_mut().enumerate() {
+        probe.submit(format!("step {}", n + 1)).await.unwrap();
+        if let Event::RunFinished { token_estimate, .. } =
+            recv_match(&mut prx, is_run_finished).await
+        {
+            *slot = token_estimate;
+        }
+    }
+    drop(probe);
+    // Midpoint target between the post-Run2 and post-Run3 estimates, inverted
+    // through target ~= 0.7*budget - 200 to recover the budget knob.
+    let budget = ((est[1] + est[2]) / 2 + 200) * 10 / 7;
+
     let session = Session::build(
         SessionOpts {
             root: Some(dir.path().to_string_lossy().into_owned()),
             session_dir: Some(dir.path().join("sessions").to_string_lossy().into_owned()),
             model: Some(model),
-            // Tuned so THREE small Runs cross the Compaction Target and
-            // two do not: the tool-spec overhead rides the estimate, so
-            // this number tracks the registry (web_fetch, ADR-0024, moved
-            // it from 4000; run_command's pipefail description moved it
-            // from 4200; the no-invented-line-numbers Voice rule moved it
-            // from 4230; the grow-in-verified-steps Voice rule moved it
-            // from 4320; the run-commands-whole Voice rule moved it from
-            // 4480; the quiet-flags Voice rule and run_command description
-            // moved it from 4640; the qwen-structured system prompt rewrite
-            // (Core Mandates + Workflow + Tone + worked Examples) roughly
-            // doubled the prompt and moved it from 4800; the Scout removal
-            // (Group E: dropped the explore tool spec and reworded the
-            // Understand step to inline grep/list_files/read_file) shrank both
-            // the prompt and the tool-spec overhead and moved it from 5900;
-            // Stage 4a (added the glob tool spec and rewrote every tool
-            // description in qwen-code's concrete style) grew the tool-spec
-            // overhead and moved it from 5750; Stage 4b (replaced the flat
-            // one-string `plan` tool with the nested `todos` array `todo_write`
-            // spec and reworded the Plan Workflow step) grew the tool-spec
-            // overhead again and moved it from 6480; the faithful qwen-code
-            // tool-description port (Stage 4c: each of the 8 tool descriptions
-            // rewritten to carry qwen-code's full depth - todo_write alone
-            // ~9.3k chars, run_command ~4.2k, edit_file ~1.8k - grew the
-            // serialized tool-spec overhead from ~7.9k to ~25.3k chars, about
-            // +5.0k tokens on every request's estimate) moved it from 6900; the
-            // faithful qwen-code system-prompt port (Core Mandates, Task
-            // Management, the Understand->Verify workflow, Operational
-            // Guidelines, Executing-with-care, Git-as-source-of-truth, worked
-            // Examples, Final Reminder - grew the system prompt from ~5k to
-            // ~22.6k chars, about +5.0k tokens on every request's estimate)
-            // moved it from 13786; the managed-auto-memory prompt suffix (P5,
-            // ADR-0062: the `# auto memory` section - type blocks, save
-            // protocol, recall + persistence guidance, ~13k chars plus the
-            // interpolated memory_dir - about +7.5k tokens appended to every
-            // request's system prompt) moved it from 20950).
-            //
-            // Retune mechanism: `Compaction::proactive` fires when
-            // `token_estimate > compaction_target`, with `compaction_target =
-            // budget - reserve(200) - trunc(0.3 * budget) ~= 0.7*budget - 200`.
-            // The estimate is `ceil((overhead + system_prompt + messages)/3.5)`
-            // and is INDEPENDENT of `budget`, so `budget` is the free knob that
-            // slides the target. With the memory suffix the estimates here are
-            // run2 ~21757 tokens and run3 ~22118; budget 31620 puts the target
-            // at ~21934, which sits between them so exactly the third Run crosses.
-            //
-            // `compaction_keep` tracks the budget: the Keep amount is
-            // `trunc(keep * (budget - reserve))`, and the cutoff walk measures it
-            // in raw chars against the fixed ~1250-char replies, so the ABSOLUTE
-            // Keep (not the fraction) is what decides how much survives. The
-            // original tuning kept ~2075 chars at budget 20950/keep 0.1; raising
-            // the budget to 31620 for the memory suffix would balloon the Keep to
-            // ~3140 and retain the WHOLE conversation (compaction becomes a
-            // no-op). Dropping keep to 0.066 restores the ~2073-char absolute
-            // Keep, so the third Run still cuts to a summary head.
-            context_budget: Some(31_620),
+            // Derived from the probe above: the budget slides the Compaction
+            // Target (~0.7*budget - 200) to sit between the post-Run2 and
+            // post-Run3 estimates, so exactly the third Run crosses. Replaces a
+            // hand-tuned constant that drifted on every tool-description / prompt
+            // edit (the estimate carries the tool-spec + system-prompt overhead).
+            context_budget: Some(budget),
             compaction_slack: Some(0.3),
+            // `compaction_keep` is the fraction of `budget - reserve` kept as raw
+            // chars past the cut. At keep 0.066 over these ~1250-char replies the
+            // absolute Keep (~2k chars) survives roughly one reply, so the third
+            // Run still cuts to a summary head rather than retaining everything.
             compaction_keep: Some(0.066),
             ..Default::default()
         },
@@ -1209,7 +1223,6 @@ async fn a_proactive_compaction_is_written_to_the_session_log_and_round_trips_th
     // entries ride ONE script up front - three small Runs to build history
     // past the compaction target, then the proactive summarization call
     // (popped FIRST on the next submit) and that Run's own reply.
-    let reply = "word ".repeat(250);
     let entries = vec![
         Entry::just(text_end(&format!("{reply} 1"))),
         Entry::just(text_end(&format!("{reply} 2"))),
@@ -1368,7 +1381,7 @@ async fn tool_use_during_streaming_steer_then_unblock_no_crash() {
                 Delta::Text("Thinking".into()),
                 Delta::Text(" carefully".into()),
             ],
-            response: tool_use_result("t1", "list_files", json!({ "path": "." })),
+            response: tool_use_result("t1", "list_directory", json!({ "path": "." })),
         })
         .ok();
 
@@ -1647,7 +1660,7 @@ async fn stop_background_aborts_the_running_child_and_sets_stopped() {
     let (task, handle) = bg_task(BackgroundStatus::Running, "explore api");
     state.background.insert("scout-1".into(), task);
 
-    let wording = state.stop_background("scout-1".into());
+    let wording = state.stop_background("scout-1".into()).unwrap();
     assert_eq!(
         wording,
         "Cancellation requested for background agent \"scout-1\". A final \
@@ -1669,15 +1682,13 @@ async fn stop_background_aborts_the_running_child_and_sets_stopped() {
 }
 
 #[tokio::test]
-async fn stop_background_unknown_id_is_the_not_found_wording() {
+async fn stop_background_unknown_id_returns_none_for_the_dual_registry_fallthrough() {
     let dir = TempDir::new().unwrap();
     let (mut state, _rx) =
         super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
-    let wording = state.stop_background("ghost-9".into());
-    assert_eq!(
-        wording,
-        "Error: No background task found with ID \"ghost-9\"."
-    );
+    // An id no SUBAGENT owns yields `None`, so the dual-registry handler can fall
+    // through to the shell registry before synthesizing the verbatim not-found.
+    assert_eq!(state.stop_background("ghost-9".into()), None);
 }
 
 #[tokio::test]
@@ -1687,7 +1698,7 @@ async fn stop_background_of_a_settled_task_is_the_not_running_wording() {
         super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
     let (task, _handle) = bg_task(BackgroundStatus::Done, "explore api");
     state.background.insert("scout-1".into(), task);
-    let wording = state.stop_background("scout-1".into());
+    let wording = state.stop_background("scout-1".into()).unwrap();
     assert_eq!(
         wording,
         "Error: Background agent \"scout-1\" is not running (status: completed)."
@@ -1763,4 +1774,274 @@ async fn spawn_background_settles_through_the_mpsc_and_queues_the_notification()
     }
     assert_eq!(state.notifications.len(), 1);
     assert!(state.notifications[0].contains("<result>the findings</result>"));
+}
+
+// ===========================================================================
+// Background SHELL registry (Phase 9, ADR-0063). Drive the Agent's shell handlers
+// directly on an `AgentState::for_test`, gated behind #[cfg(unix)] for the process
+// tests. Deterministic: no wall-clock sleeps - long-running shells gate on a MARKER
+// FILE and settlements are awaited off the mpsc with a bounded tokio timeout.
+// ===========================================================================
+
+// Awaits a single BackgroundShellDone off the mpsc (bounded), returning the id +
+// outcome so a test can drive it into the handler.
+#[cfg(unix)]
+async fn recv_shell_done(
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+) -> (String, super::background_shell::ShellOutcome) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5000);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(Msg::Run(RunMsg::BackgroundShellDone { id, outcome }))) => return (id, outcome),
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("mpsc closed"),
+            Err(_) => panic!("timed out waiting for BackgroundShellDone"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_background_shell_runs_and_settles_completed_with_captured_output() {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let root = session.root.clone();
+    let (mut state, mut rx) =
+        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+
+    let id = state.spawn_background_shell("echo hi".into(), root);
+    assert_eq!(id, "bg_1", "the minted id is bg_{{n}}");
+    // Synchronously Running, registered.
+    assert!(matches!(
+        state.background_shells.get("bg_1").unwrap().status,
+        super::background_shell::ShellStatus::Running
+    ));
+    let output_path = state
+        .background_shells
+        .get("bg_1")
+        .unwrap()
+        .output_path
+        .clone();
+
+    // Await the child's exit off the mpsc, then drive it into the handler.
+    let (done_id, outcome) = recv_shell_done(&mut rx).await;
+    assert_eq!(done_id, "bg_1");
+    state.background_shell_done(done_id, outcome);
+
+    // Completed: exactly one notification, status completed.
+    assert!(matches!(
+        state.background_shells.get("bg_1").unwrap().status,
+        super::background_shell::ShellStatus::Completed
+    ));
+    assert_eq!(state.notifications.len(), 1);
+    assert!(state.notifications[0].contains("<status>completed</status>"));
+    // The capture file holds the (ANSI-stripped) output.
+    let captured = std::fs::read_to_string(&output_path).unwrap();
+    assert!(captured.contains("hi"), "capture file: {captured:?}");
+}
+
+// Regression for the pipe-deadlock (Phase 9): a child that writes a large burst
+// (> the ~64KB pipe buffer) to STDERR ONLY while STDOUT stays open-and-idle. A
+// sequential drain loop deadlocks here (the idle-stdout read parks, the full-stderr
+// pipe blocks the child, the shell never settles); the concurrent `select!` drain
+// keeps reading stderr and the child settles. `recv_shell_done` is bounded by a
+// tokio timeout, so a regression fails-by-timeout, it does NOT hang forever.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_large_stderr_only_burst_does_not_deadlock_the_drain() {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let root = session.root.clone();
+    let (mut state, mut rx) =
+        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+
+    // 200000 bytes (>> 64KB) to stderr only; stdout is left open (bash keeps it
+    // open for the duration) and idle. `head -c` from /dev/zero, redirected to fd 2.
+    let id = state.spawn_background_shell("head -c 200000 /dev/zero 1>&2".into(), root);
+    assert_eq!(id, "bg_1");
+    let output_path = state
+        .background_shells
+        .get("bg_1")
+        .unwrap()
+        .output_path
+        .clone();
+
+    // Bounded await: with the old sequential loop this times out (deadlock); with
+    // `select!` the child settles Completed.
+    let (done_id, outcome) = recv_shell_done(&mut rx).await;
+    assert_eq!(done_id, "bg_1");
+    state.background_shell_done(done_id, outcome);
+    assert!(matches!(
+        state.background_shells.get("bg_1").unwrap().status,
+        super::background_shell::ShellStatus::Completed
+    ));
+
+    // The whole burst reached the capture file (well past the 64KB pipe buffer).
+    let captured = std::fs::read(&output_path).unwrap();
+    assert_eq!(
+        captured.len(),
+        200000,
+        "the full stderr burst was drained, not frozen at the pipe buffer"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_background_shell_cancels_synchronously_and_drops_the_late_done() {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let root = session.root.clone();
+    let (mut state, mut rx) =
+        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+
+    // A long-running shell gated on a marker file (no wall-clock sleep): it spins
+    // until the marker appears, which the test never creates, so a `task_stop`
+    // killpg is what ends it.
+    let marker = dir.path().join("marker");
+    let cmd = format!("until [ -f {} ]; do :; done", marker.display());
+    let id = state.spawn_background_shell(cmd, root);
+    assert_eq!(id, "bg_1");
+    assert!(matches!(
+        state.background_shells.get("bg_1").unwrap().status,
+        super::background_shell::ShellStatus::Running
+    ));
+
+    // Stop it: synchronous Cancelled + a `<status>cancelled</status>` notification
+    // with NO `<result>` tag.
+    let wording = state.stop_background_shell("bg_1".into()).unwrap();
+    assert!(wording.starts_with("Cancellation requested for background agent \"bg_1\"."));
+    assert!(matches!(
+        state.background_shells.get("bg_1").unwrap().status,
+        super::background_shell::ShellStatus::Cancelled
+    ));
+    assert_eq!(state.notifications.len(), 1);
+    assert!(state.notifications[0].contains("<status>cancelled</status>"));
+    assert!(
+        !state.notifications[0].contains("<result>"),
+        "a cancelled shell carries no result tag"
+    );
+
+    // The stop aborts the watcher, so no `BackgroundShellDone` will arrive. But if
+    // one raced the abort (the child exited on its own just before the killpg), the
+    // Cancelled entry must DROP it - no second notification. Drive that path
+    // directly with a synthetic done.
+    state.background_shell_done(
+        "bg_1".into(),
+        super::background_shell::ShellOutcome {
+            exit_code: Some(0),
+            signalled: false,
+            spawn_error: None,
+        },
+    );
+    assert_eq!(
+        state.notifications.len(),
+        1,
+        "a Cancelled entry drops the racing done"
+    );
+    // No `BackgroundShellDone` reaches the mpsc (the watcher was aborted).
+    let none = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+    assert!(
+        none.is_err() || !matches!(none, Ok(Some(Msg::Run(RunMsg::BackgroundShellDone { .. })))),
+        "the aborted watcher posts no done"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_background_shell_of_a_settled_shell_is_the_not_running_wording() {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let (mut state, _rx) =
+        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+    // Register a settled (Completed) shell by hand over a never-firing task.
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.background_shells.insert(
+        "bg_1".into(),
+        super::background_shell::BackgroundShell {
+            abort: handle.abort_handle(),
+            pgid: None,
+            status: super::background_shell::ShellStatus::Completed,
+            command: "echo hi".into(),
+            output_path: dir.path().join("bg_1.output"),
+        },
+    );
+    let wording = state.stop_background_shell("bg_1".into()).unwrap();
+    assert_eq!(
+        wording,
+        "Error: Background agent \"bg_1\" is not running (status: completed)."
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_background_shell_unknown_id_returns_none() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+    assert_eq!(state.stop_background_shell("ghost".into()), None);
+}
+
+// The dual-registry resolution the `StopBackground` handler drives (Phase 9): a
+// subagent id hits the subagent wording, a shell id hits the shell wording, and an
+// unknown id synthesizes the verbatim not-found ONCE - no string sniffing.
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_background_dual_registry_routes_by_id_space() {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let root = session.root.clone();
+    let (mut state, mut rx) =
+        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+
+    // A running subagent and a running shell live side by side.
+    let (task, _h) = bg_task(BackgroundStatus::Running, "explore api");
+    state.background.insert("scout-1".into(), task);
+    let marker = dir.path().join("marker");
+    let cmd = format!("until [ -f {} ]; do :; done", marker.display());
+    state.spawn_background_shell(cmd, root);
+
+    // The handler's dual-registry resolution, replicated: subagent -> shell -> not-found.
+    let resolve = |state: &mut AgentState, id: String| -> String {
+        state
+            .stop_background(id.clone())
+            .or_else(|| state.stop_background_shell(id.clone()))
+            .unwrap_or_else(|| format!("Error: No background task found with ID \"{id}\"."))
+    };
+
+    // Subagent id -> the subagent wording.
+    let sub = resolve(&mut state, "scout-1".into());
+    assert!(sub.starts_with("Cancellation requested for background agent \"scout-1\"."));
+    assert!(sub.contains("Description: explore api"));
+    // Shell id -> the shell wording (its Description is the command).
+    let shell = resolve(&mut state, "bg_1".into());
+    assert!(shell.starts_with("Cancellation requested for background agent \"bg_1\"."));
+    assert!(shell.contains("until [ -f"));
+    // Unknown id -> the verbatim not-found, synthesized once.
+    assert_eq!(
+        resolve(&mut state, "nope".into()),
+        "Error: No background task found with ID \"nope\"."
+    );
+
+    // Drain any late shell done so the mpsc doesn't leak the child.
+    let _ = tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn abort_all_background_shells_clears_the_registry_at_loop_exit() {
+    let dir = TempDir::new().unwrap();
+    let session = session_in(&dir);
+    let root = session.root.clone();
+    let (mut state, mut rx) =
+        super::AgentState::for_test(session, Arc::new(FakeLlm::script(vec![])));
+    let marker = dir.path().join("marker");
+    let cmd = format!("until [ -f {} ]; do :; done", marker.display());
+    state.spawn_background_shell(cmd, root);
+    assert_eq!(state.background_shells.len(), 1);
+
+    state.abort_all_background_shells();
+    assert!(state.background_shells.is_empty());
+    // Drain any late done.
+    let _ = tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await;
 }

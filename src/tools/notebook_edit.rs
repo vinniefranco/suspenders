@@ -1,5 +1,5 @@
-//! `notebook_edit(path, cell_id?, new_source?, cell_type?, edit_mode?)`: edits a
-//! Jupyter notebook (`.ipynb`) safely at the cell level - the VERBATIM port of
+//! `notebook_edit(notebook_path, cell_id?, new_source?, cell_type?, edit_mode?)`:
+//! edits a Jupyter notebook (`.ipynb`) safely at the cell level - the VERBATIM port of
 //! qwen v0.16.0 `packages/core/src/tools/notebook-edit.ts` (`NotebookEditTool` /
 //! `NotebookEditInvocation`), narrowed to Suspenders' shape.
 //!
@@ -30,7 +30,7 @@
 //! consumer of the read cache; `edit_file`/`write_file` do not yet consult it
 //! (DEFERRED, ADR-0060).
 
-use crate::tool::path::{FileError, file_error};
+use crate::tool::path::{FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim};
 use crate::tool::read_cache::ReadState;
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
@@ -42,7 +42,7 @@ pub use apply::{CellType, EditMode, NotebookEditParams};
 pub struct NotebookEdit;
 
 const DESCRIPTION: &str = "\
-Edits a Jupyter notebook (.ipynb) safely at the cell level. Use this instead of edit_file or \
+Edits a Jupyter notebook (.ipynb) safely at the cell level. Use this instead of edit or \
 write_file for notebook cells. Supports replacing, inserting, and deleting cells. Always read the \
 notebook first with read_file; then use the cell IDs shown in that output.";
 
@@ -55,11 +55,10 @@ impl Tool for NotebookEdit {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "notebook_path": {
                         "type": "string",
-                        "description": "The path of the Jupyter notebook (.ipynb) to edit, \
-                            relative to the project root (e.g. \"notebooks/run.ipynb\"). Do not \
-                            pass an absolute path. Must end with .ipynb."
+                        "description": "Absolute path to the Jupyter notebook file to edit. \
+                            Must end with .ipynb."
                     },
                     "cell_id": {
                         "type": "string",
@@ -84,13 +83,17 @@ impl Tool for NotebookEdit {
                         "enum": ["replace", "insert", "delete"]
                     }
                 },
-                "required": ["path"]
+                "required": ["notebook_path"]
             }),
         }
     }
 
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let path = read_path(input)?;
+        // qwen's `unescapePath(params.notebook_path.trim())` (notebook-edit.ts:764),
+        // applied BEFORE the absolute check and BEFORE any message echoes the path:
+        // trim, then strip shell-escaping backslashes. The trimmed/unescaped form is
+        // what is validated, resolved, and displayed.
+        let path = unescape_and_trim(read_path(input)?);
         if !path.to_ascii_lowercase().ends_with(".ipynb") {
             return Err(
                 "File must be a Jupyter notebook (.ipynb). Use the edit tool for other file types."
@@ -99,14 +102,22 @@ impl Tool for NotebookEdit {
         }
         let params = decode_params(input)?;
 
-        // Resolve + confine the path to the Project Root, then read the raw text.
-        let abs = crate::tool::path::resolve_path(path, &ctx.root)?;
-        let raw = read_notebook_text(&abs, path)?;
+        // qwen REQUIRES an absolute path and confines it to the workspace
+        // (or the trusted managed-memory subtree). A relative path is refused
+        // with qwen's verbatim message (notebook-edit.ts:771); an escaping
+        // absolute path with the project-wide confinement message.
+        let abs = resolve_absolute_in(&path, &ctx.root, ctx.memory_root.as_deref()).map_err(
+            |reject| match reject {
+                PathReject::Relative => format!("Notebook path must be absolute: {path}"),
+                PathReject::Escapes => "path escapes project root".to_string(),
+            },
+        )?;
+        let raw = read_notebook_text(&abs, &path)?;
 
         // Read-before-edit enforcement against the Run's file-read cache: the
         // notebook must have been FULLY read this session, and not changed on
         // disk since (F6, ADR-0060). VERBATIM qwen rejections.
-        enforce_prior_read(ctx, &abs, path)?;
+        enforce_prior_read(ctx, &abs, &path)?;
 
         // Apply the pure cell edit, then write the result atomically. A normal
         // edit records the write back into the cache so a follow-up edit does
@@ -116,14 +127,14 @@ impl Tool for NotebookEdit {
         // so the model must re-read before it can target a cell again, or a
         // second edit would land on the wrong cell.
         let result = apply::apply_notebook_edit(&raw, &params)?;
-        write_notebook(&abs, path, &result.updated_content)?;
+        write_notebook(&abs, &path, &result.updated_content)?;
         if result.requires_read_after_write {
             ctx.read_cache().invalidate(&abs);
         } else {
             record_write(ctx, &abs);
         }
 
-        Ok(edit_summary(path, &result, &params))
+        Ok(edit_summary(&path, &result, &params))
     }
 }
 
@@ -131,9 +142,11 @@ impl Tool for NotebookEdit {
 
 fn read_path(input: &Value) -> Result<&str, String> {
     input
-        .get("path")
+        .get("notebook_path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "invalid input: notebook_edit requires a string \"path\"".to_string())
+        .ok_or_else(|| {
+            "invalid input: notebook_edit requires a string \"notebook_path\"".to_string()
+        })
 }
 
 /// Decode the edit params from the wire (the JSON Schema `enum`s are validated
@@ -240,8 +253,12 @@ fn write_notebook(abs: &std::path::Path, path: &str, content: &str) -> Result<()
 /// the write already succeeded, and the next read re-stats.
 fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
     if let Ok((mtime_ms, size)) = stat_fingerprint(abs) {
+        // `cacheable = false`: the notebook writer produced a structured payload
+        // the model must re-materialize before it can target a cell, so a repeat
+        // read must NOT be short-circuited to the unchanged placeholder (qwen
+        // `notebook-edit.ts recordWrite({ cacheable: false })`).
         ctx.read_cache()
-            .record_write(abs.to_path_buf(), mtime_ms, size);
+            .record_write(abs.to_path_buf(), mtime_ms, size, false);
     }
 }
 
@@ -305,6 +322,7 @@ mod tests {
             command_timeout_ms: 120_000,
             input_modalities: crate::content::Modalities::default(),
             memory_root: None,
+            session_dir: std::env::temp_dir(),
             caps,
         }
     }
@@ -332,10 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn spec_requires_only_the_path() {
+    fn spec_requires_only_the_notebook_path() {
         let spec = NotebookEdit.spec();
         assert_eq!(spec.name, "notebook_edit");
-        assert_eq!(spec.input_schema["required"], json!(["path"]));
+        assert_eq!(spec.input_schema["required"], json!(["notebook_path"]));
+        assert_eq!(
+            spec.input_schema["properties"]["notebook_path"]["description"],
+            "Absolute path to the Jupyter notebook file to edit. Must end with .ipynb."
+        );
         assert_eq!(
             spec.input_schema["properties"]["cell_type"]["enum"],
             json!(["code", "markdown"])
@@ -350,8 +372,9 @@ mod tests {
     async fn a_non_ipynb_path_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let cache = Arc::new(FileReadCache::new());
+        let abs = tmp.path().join("notes.txt");
         let err = run(
-            json!({"path": "notes.txt", "cell_id": "c", "new_source": "x"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "c", "new_source": "x"}),
             &ctx_with_cache(tmp.path(), cache),
         )
         .await
@@ -362,18 +385,21 @@ mod tests {
     #[tokio::test]
     async fn editing_an_unread_notebook_is_the_verbatim_rejection() {
         let tmp = TempDir::new().unwrap();
-        write_fixture(&tmp);
+        let abs = write_fixture(&tmp);
         let cache = Arc::new(FileReadCache::new());
         let err = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "print('bye')\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx_with_cache(tmp.path(), cache),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err,
-            "Notebook nb.ipynb has not been fully read in this session. Use the read_file tool \
-first, without offset or limit, before editing cells."
+            format!(
+                "Notebook {} has not been fully read in this session. Use the read_file tool \
+first, without offset or limit, before editing cells.",
+                abs.display()
+            )
         );
     }
 
@@ -385,15 +411,18 @@ first, without offset or limit, before editing cells."
         // Record a FULL read at a DIFFERENT fingerprint than the file now has.
         cache.record_read(abs.clone(), 1, 1, true, true);
         let err = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "print('bye')\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx_with_cache(tmp.path(), cache),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err,
-            "Notebook nb.ipynb has been modified since you last read it. Re-read it with the \
-read_file tool before editing it."
+            format!(
+                "Notebook {} has been modified since you last read it. Re-read it with the \
+read_file tool before editing it.",
+                abs.display()
+            )
         );
     }
 
@@ -407,16 +436,19 @@ read_file tool before editing it."
         // truncated when read).
         cache.record_read(abs.clone(), mtime, size, false, true);
         let err = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "print('bye')\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx_with_cache(tmp.path(), cache),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err,
-            "Notebook nb.ipynb is too large for cell-level editing because its rendered output \
+            format!(
+                "Notebook {} is too large for cell-level editing because its rendered output \
 was truncated when read. Reduce the notebook output size or split the notebook before editing \
-cells."
+cells.",
+                abs.display()
+            )
         );
     }
 
@@ -430,7 +462,7 @@ cells."
 
         let ctx = ctx_with_cache(tmp.path(), Arc::clone(&cache));
         let msg = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "print('bye')\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx,
         )
         .await
@@ -455,19 +487,23 @@ cells."
         // Drive read_file first (which records into the shared cache), then edit:
         // the read-before-edit contract is satisfied through the shared cache.
         let tmp = TempDir::new().unwrap();
-        write_fixture(&tmp);
+        let nb_abs = write_fixture(&tmp);
         let cache = Arc::new(FileReadCache::new());
         let ctx = ctx_with_cache(tmp.path(), cache);
 
         // A full read_file records a Fresh, full entry for the notebook.
+        // read_file now takes an absolute `file_path` (qwen contract).
         crate::tools::read_file::ReadFile
-            .run_rich(&json!({"path": "nb.ipynb"}), &ctx)
+            .run_rich(
+                &json!({"file_path": nb_abs.to_string_lossy()}),
+                &ctx,
+            )
             .await
             .unwrap();
 
         // The edit now applies without a prior-read rejection.
         let msg = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "print('bye')\n"}),
+            json!({"notebook_path": nb_abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx,
         )
         .await
@@ -480,11 +516,11 @@ cells."
         // The inverse of the sharing test: without driving read_file, the shared
         // cache is empty, so the edit is rejected.
         let tmp = TempDir::new().unwrap();
-        write_fixture(&tmp);
+        let abs = write_fixture(&tmp);
         let cache = Arc::new(FileReadCache::new());
         let ctx = ctx_with_cache(tmp.path(), cache);
         let err = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "x\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "x\n"}),
             &ctx,
         )
         .await
@@ -501,7 +537,7 @@ cells."
         cache.record_read(abs.clone(), mtime, size, true, true);
         let ctx = ctx_with_cache(tmp.path(), cache);
         let msg = run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "edit_mode": "delete"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "edit_mode": "delete"}),
             &ctx,
         )
         .await
@@ -541,7 +577,7 @@ cells."
 
         // First edit: insert after cell-0.
         run(
-            json!({"path": "nb.ipynb", "cell_id": "cell-0", "new_source": "inserted\n", "edit_mode": "insert"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "cell-0", "new_source": "inserted\n", "edit_mode": "insert"}),
             &ctx,
         )
         .await
@@ -552,7 +588,7 @@ cells."
         let (mtime2, size2) = fingerprint(&abs);
         assert_eq!(cache.check(&abs, mtime2, size2), ReadState::Unknown);
         let err = run(
-            json!({"path": "nb.ipynb", "cell_id": "cell-0", "new_source": "again\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "cell-0", "new_source": "again\n"}),
             &ctx,
         )
         .await
@@ -574,7 +610,7 @@ cells."
         let ctx = ctx_with_cache(tmp.path(), Arc::clone(&cache));
 
         run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "x\n", "edit_mode": "insert"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "x\n", "edit_mode": "insert"}),
             &ctx,
         )
         .await
@@ -584,7 +620,7 @@ cells."
         let (mtime2, size2) = fingerprint(&abs);
         assert_eq!(cache.check(&abs, mtime2, size2), ReadState::Fresh);
         run(
-            json!({"path": "nb.ipynb", "cell_id": "run", "new_source": "y\n"}),
+            json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "y\n"}),
             &ctx,
         )
         .await
@@ -592,15 +628,54 @@ cells."
     }
 
     #[tokio::test]
-    async fn a_path_escaping_the_root_is_refused() {
+    async fn an_absolute_path_escaping_the_root_is_refused() {
+        // An absolute path outside the Project Root is the escapes case.
         let tmp = TempDir::new().unwrap();
         let cache = Arc::new(FileReadCache::new());
         let err = run(
-            json!({"path": "../escape.ipynb", "cell_id": "c", "new_source": "x"}),
+            json!({"notebook_path": "/etc/escape.ipynb", "cell_id": "c", "new_source": "x"}),
             &ctx_with_cache(tmp.path(), cache),
         )
         .await
         .unwrap_err();
         assert_eq!(err, "path escapes project root");
+    }
+
+    #[tokio::test]
+    async fn a_relative_notebook_path_is_refused_with_the_verbatim_absolute_message() {
+        // qwen REQUIRES an absolute notebook_path (notebook-edit.ts:770-772): a
+        // relative path is refused with the verbatim message, echoing the
+        // trimmed/unescaped value.
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(FileReadCache::new());
+        let err = run(
+            json!({"notebook_path": "nb.ipynb", "cell_id": "run", "new_source": "x"}),
+            &ctx_with_cache(tmp.path(), cache),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "Notebook path must be absolute: nb.ipynb");
+    }
+
+    #[tokio::test]
+    async fn a_padded_notebook_path_is_trimmed_before_resolution() {
+        // qwen's `unescapePath(notebook_path.trim())` (notebook-edit.ts:764) runs
+        // first: a surrounding-whitespace path resolves to the same file, so a
+        // full prior read lets the padded edit apply.
+        let tmp = TempDir::new().unwrap();
+        let abs = write_fixture(&tmp);
+        let cache = Arc::new(FileReadCache::new());
+        let (mtime, size) = fingerprint(&abs);
+        cache.record_read(abs.clone(), mtime, size, true, true);
+        let ctx = ctx_with_cache(tmp.path(), cache);
+
+        let padded = format!("  {}  ", abs.to_string_lossy());
+        let msg = run(
+            json!({"notebook_path": padded, "cell_id": "run", "new_source": "print('bye')\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("replace cell run"));
     }
 }

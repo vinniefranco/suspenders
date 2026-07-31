@@ -4,13 +4,19 @@
 //! It tracks which files the model has Read or written in THIS Run, plus the
 //! `(mtime, size)` snapshot at that operation, so a mutating tool can verify the
 //! model is editing bytes it has actually seen and that those bytes have not
-//! drifted on disk since. P3 3c lands enforcement ONLY: `notebook_edit` is the
-//! sole consumer, and it consults [`FileReadCache::check`] plus the
-//! [`FileReadEntry::last_read_was_full`] flag before mutating a notebook. The
-//! qwen `file_unchanged` read fast-path (short-circuit a repeated full read) is
-//! DEFERRED and NOT ported here (ADR-0060), so the fast-path-only fields
-//! (`readResidentInHistory`, the FIFO eviction, `markReadEvictedFromHistory`)
-//! are left out with it.
+//! drifted on disk since. Two consumers:
+//!
+//!  - `notebook_edit` (enforcement): consults [`FileReadCache::check`] plus the
+//!    [`FileReadEntry::last_read_was_full`] flag before mutating a notebook.
+//!  - `read_file` (the `file_unchanged` fast-path): consults
+//!    [`FileReadCache::is_unchanged_full_read`] to serve qwen's unchanged
+//!    placeholder instead of re-reading a file it already fully read this Run.
+//!
+//! qwen's fast-path additionally gates on `readResidentInHistory` (the prior
+//! content still being present in the transcript after idle micro-compaction)
+//! and carries a FIFO history eviction. Those are transcript-lifecycle concerns
+//! outside this port's model contract; the placeholder itself instructs the
+//! model to re-read after compaction, so they are left out (ADR-0060).
 //!
 //! ## Path-keyed, not inode-keyed (the Suspenders simplification)
 //!
@@ -148,11 +154,16 @@ impl FileReadCache {
     /// model authored the current bytes the mutating tool produced, so for
     /// prior-read enforcement it has now "seen" them: the fingerprint refreshes
     /// to the post-write stat (else the next check would read the tool's OWN
-    /// write as a stale external change), read metadata is refreshed alongside
-    /// (`last_read_was_full = true`), and `last_read_cacheable` is set `false`
-    /// because the notebook writer produces a structured payload, matching qwen's
-    /// `notebook-edit.ts` `recordWrite({ cacheable: false })`.
-    pub fn record_write(&self, path: PathBuf, mtime_ms: u128, size: u64) {
+    /// write as a stale external change), and read metadata is refreshed
+    /// alongside (`last_read_was_full = true`).
+    ///
+    /// `cacheable` mirrors qwen's `recordWrite({ cacheable })` (default `true`):
+    /// a plain-text writer (`write_file`) passes `true`, so a following full
+    /// `read_file` can serve the `file_unchanged` placeholder; the notebook
+    /// writer passes `false` because it produces a structured payload the model
+    /// must re-materialize, matching `notebook-edit.ts recordWrite({ cacheable:
+    /// false })`.
+    pub fn record_write(&self, path: PathBuf, mtime_ms: u128, size: u64, cacheable: bool) {
         let mut by_path = self.lock();
         let now = now_ms();
         let entry = by_path
@@ -163,7 +174,7 @@ impl FileReadCache {
         entry.last_write_at = Some(now);
         entry.last_read_at = Some(now);
         entry.last_read_was_full = true;
-        entry.last_read_cacheable = false;
+        entry.last_read_cacheable = cacheable;
     }
 
     /// Compare the cached fingerprint for `path` against the current
@@ -198,6 +209,45 @@ impl FileReadCache {
     /// [`Unknown`]: ReadState::Unknown
     pub fn invalidate(&self, path: &std::path::Path) {
         self.lock().remove(path);
+    }
+
+    /// Whether a repeat full Read of `path` at the current `(mtime_ms, size)`
+    /// can be served from cache with qwen's `file_unchanged` placeholder instead
+    /// of re-reading the bytes (qwen `read-file.ts`'s fast-path predicate,
+    /// narrowed). All must hold:
+    ///
+    /// - the fingerprint is [`Fresh`] (mtime + size match what we last saw), and
+    /// - the last Read produced the WHOLE current content
+    ///   ([`FileReadEntry::last_read_was_full`]), and
+    /// - the last Read produced plain text ([`FileReadEntry::last_read_cacheable`]);
+    ///   a media / native-PDF / notebook payload cannot be quoted back as
+    ///   "unchanged text", and
+    /// - the Read is not older than the last write to this path
+    ///   (`last_read_at > last_write_at`) - a write since the read means the
+    ///   model has not seen the current bytes.
+    ///
+    /// qwen also gates on `readResidentInHistory` (the prior content still being
+    /// present in the transcript after idle micro-compaction). That flag is a
+    /// compaction concern out of this port's model contract; the placeholder
+    /// itself tells the model to re-read if it cannot retrieve the prior content
+    /// (e.g. after compaction), so omitting the flag is safe here (ADR-0060).
+    ///
+    /// [`Fresh`]: ReadState::Fresh
+    pub fn is_unchanged_full_read(
+        &self,
+        path: &std::path::Path,
+        mtime_ms: u128,
+        size: u64,
+    ) -> bool {
+        let by_path = self.lock();
+        by_path.get(path).is_some_and(|entry| {
+            entry.mtime_ms == mtime_ms
+                && entry.size_bytes == size
+                && entry.last_read_was_full
+                && entry.last_read_cacheable
+                && entry.last_read_at.is_some()
+                && entry.last_read_at >= entry.last_write_at
+        })
     }
 
     /// The entry for `path`, cloned. notebook_edit reads it after a [`Fresh`]
@@ -305,19 +355,29 @@ mod tests {
     }
 
     #[test]
-    fn record_write_refreshes_fingerprint_and_marks_full_noncacheable() {
+    fn record_write_refreshes_fingerprint_and_honors_cacheable() {
         let cache = FileReadCache::new();
         cache.record_read(p("/a"), 10, 20, true, true);
-        // The write lands at a new fingerprint (a rewrite bumped mtime + size).
-        cache.record_write(p("/a"), 30, 40);
+        // A cacheable (write_file) write lands at a new fingerprint (a rewrite
+        // bumped mtime + size).
+        cache.record_write(p("/a"), 30, 40, true);
         // The tool's own write is not seen as a stale external change.
         assert_eq!(cache.check(&p("/a"), 30, 40), ReadState::Fresh);
         let entry = cache.entry(&p("/a")).unwrap();
         assert!(entry.last_write_at.is_some());
         assert!(entry.last_read_at.is_some());
         assert!(entry.last_read_was_full);
-        // A notebook write is a structured payload: not text-cacheable.
-        assert!(!entry.last_read_cacheable);
+        // write_file is text-cacheable, so a following full read serves the
+        // unchanged placeholder.
+        assert!(entry.last_read_cacheable);
+        assert!(cache.is_unchanged_full_read(&p("/a"), 30, 40));
+
+        // A notebook write (cacheable = false) refreshes the fingerprint but must
+        // NOT serve the fast-path: it produced a structured payload the model
+        // re-materializes.
+        cache.record_write(p("/b"), 30, 40, false);
+        assert!(!cache.entry(&p("/b")).unwrap().last_read_cacheable);
+        assert!(!cache.is_unchanged_full_read(&p("/b"), 30, 40));
     }
 
     #[test]
@@ -335,9 +395,47 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_full_cacheable_read_serves_the_unchanged_fast_path() {
+        let cache = FileReadCache::new();
+        cache.record_read(p("/a"), 10, 20, true, true);
+        assert!(cache.is_unchanged_full_read(&p("/a"), 10, 20));
+    }
+
+    #[test]
+    fn the_unchanged_fast_path_declines_on_every_disqualifier() {
+        let cache = FileReadCache::new();
+        // Untracked path: no fast-path.
+        assert!(!cache.is_unchanged_full_read(&p("/a"), 10, 20));
+        // A drifted fingerprint declines.
+        cache.record_read(p("/a"), 10, 20, true, true);
+        assert!(!cache.is_unchanged_full_read(&p("/a"), 11, 20));
+        // A partial (non-full) read declines.
+        cache.record_read(p("/b"), 10, 20, false, true);
+        assert!(!cache.is_unchanged_full_read(&p("/b"), 10, 20));
+        // A non-cacheable (media / notebook) read declines.
+        cache.record_read(p("/c"), 10, 20, true, false);
+        assert!(!cache.is_unchanged_full_read(&p("/c"), 10, 20));
+    }
+
+    #[test]
+    fn a_cacheable_write_serves_the_unchanged_fast_path_the_model_authored_the_bytes() {
+        let cache = FileReadCache::new();
+        cache.record_read(p("/a"), 10, 20, true, true);
+        // A cacheable write lands after the read: record_write sets last_read_at
+        // == last_write_at (both `now`), so the read-is-not-older guard (`>=`)
+        // permits it. That is correct - the model authored the current bytes, so
+        // quoting them back as "unchanged" is sound (this is qwen's file_unchanged
+        // path after write_file).
+        cache.record_write(p("/a"), 30, 40, true);
+        let entry = cache.entry(&p("/a")).unwrap();
+        assert!(entry.last_read_at >= entry.last_write_at);
+        assert!(cache.is_unchanged_full_read(&p("/a"), 30, 40));
+    }
+
+    #[test]
     fn record_write_on_a_fresh_path_creates_the_entry() {
         let cache = FileReadCache::new();
-        cache.record_write(p("/a"), 30, 40);
+        cache.record_write(p("/a"), 30, 40, true);
         assert_eq!(cache.check(&p("/a"), 30, 40), ReadState::Fresh);
         assert!(cache.entry(&p("/a")).unwrap().last_read_at.is_some());
     }

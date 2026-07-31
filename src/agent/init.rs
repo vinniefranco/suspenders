@@ -226,5 +226,7 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         background: HashMap::new(),
         notifications: Vec::new(),
         background_counter: 0,
+        background_shells: HashMap::new(),
+        background_shell_counter: 0,
     }
 }

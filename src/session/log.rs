@@ -1103,7 +1103,7 @@ mod tests {
         log.append(Entry::UserText("list the files".into()));
         log.append(Entry::assistant_blocks(vec![
             text("Let me look."),
-            tool_use("t1", "list_files", json!({"path": "."})),
+            tool_use("t1", "list_directory", json!({"path": "."})),
         ]));
         log.append(Entry::ToolResult(tool_result("t1", "a.txt\nb.txt")));
         log.append(Entry::Steering("also check the README".into()));
@@ -1123,7 +1123,7 @@ mod tests {
                 user_message(vec![text("list the files")]),
                 Message::assistant(vec![
                     text("Let me look."),
-                    tool_use("t1", "list_files", json!({"path": "."})),
+                    tool_use("t1", "list_directory", json!({"path": "."})),
                 ]),
                 user_message(vec![
                     tool_result("t1", "a.txt\nb.txt"),
@@ -1290,7 +1290,7 @@ mod tests {
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![
             text("thinking..."),
-            tool_use("t1", "grep", json!({})),
+            tool_use("t1", "grep_search", json!({})),
         ]));
         // No tool_result, no settled: the app died mid-batch.
 
@@ -1312,7 +1312,7 @@ mod tests {
         log.append(Entry::UserText("go".into()));
         log.append(Entry::assistant_blocks(vec![tool_use(
             "t1",
-            "grep",
+            "grep_search",
             json!({}),
         )]));
         log.append(Entry::ToolResult(tool_result("t1", "hits")));
@@ -1874,7 +1874,7 @@ mod tests {
         let stamp = Provenance::new("anthropic", "claude-fable-5");
         log.append(Entry::UserText("go".into()));
         log.append(Entry::AssistantBlocks {
-            blocks: vec![tool_use("t1", "grep", json!({}))],
+            blocks: vec![tool_use("t1", "grep_search", json!({}))],
             provenance: Some(stamp.clone()),
         });
         log.append(Entry::ToolResult(tool_result("t1", "hits")));

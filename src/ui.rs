@@ -2576,7 +2576,7 @@ mod tests {
         let (core, _) = core.apply_event(Event::run_started("r1"));
         let (core, _) = core.apply_event(Event::tool_call(
             "t1",
-            "run_command",
+            "run_shell_command",
             serde_json::json!({"command": "echo peek-me"}),
         ));
         // Freeze everything committable (the header), leaving the live call

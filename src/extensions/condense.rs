@@ -25,7 +25,7 @@ use serde_json::Value;
 use crate::middleware::{Middleware, Token};
 
 /// The one tool this extension acts on.
-const TOOL: &str = "run_command";
+const TOOL: &str = "run_shell_command";
 
 /// Minimum run length that collapses. Below 5 the first-line-plus-marker pair
 /// saves two lines at most - not worth trading real output for a marker.

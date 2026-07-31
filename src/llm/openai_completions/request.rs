@@ -209,7 +209,7 @@ mod tests {
     fn build_assembles_complete_request() {
         let messages = vec![Message::user(vec![ContentBlock::text("hi")])];
         let tools = vec![ToolSpec {
-            name: "list_files".into(),
+            name: "list_directory".into(),
             description: "Lists files.".into(),
             input_schema: json!({"type": "object"}),
         }];

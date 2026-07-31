@@ -25,11 +25,11 @@ Scaffolding is fail-open, exactly like the MCP attach and skill discovery (ADR-0
 
 ## The trust-path allowance: Project Root OR the resolved memory subtree
 
-The shared path seam (`tool::path::resolve_path_in`, reached by `with_path`) now confines a model-supplied path to the Project Root OR the trusted memory subtree carried on the `ToolCtx`. The allowance is NARROW and SECURITY-CRITICAL: both boundaries use the same normalized-containment discipline (lexical `..`-collapse, then `== boundary` OR `starts_with(boundary <> SEP)`). The trailing separator is what refuses a `<memory_root>-evil` sibling that merely shares the string prefix (the `isAutoMemPath` shape), and the memory root is normalized too, so a `..` inside it cannot widen the allowance. The allowance lives once in the shared seam, so `write_file` / `edit_file` / `read_file` reach memory uniformly - no per-tool `isAutoMemPath` duplication.
+The shared path seam (`tool::path::resolve_absolute_in`) requires an ABSOLUTE model-supplied path and confines it to the Project Root OR the trusted memory subtree carried on the `ToolCtx`. The allowance is NARROW and SECURITY-CRITICAL: both boundaries use the same normalized-containment discipline (lexical `..`-collapse, then `== boundary` OR `starts_with(boundary <> SEP)`). The trailing separator is what refuses a `<memory_root>-evil` sibling that merely shares the string prefix (the `isAutoMemPath` shape), and the memory root is normalized too, so a `..` inside it cannot widen the allowance. The allowance lives once in the shared seam, so `write_file` / `edit_file` / `read_file` reach memory uniformly - no per-tool `isAutoMemPath` duplication.
 
 ## Auto-approval of memory writes
 
-qwen flips its default permission to 'allow' for a memory write so autonomous memory does not prompt. In Suspenders, `write_file` / `edit_file` are UNGATED by design (ADR-0050 gates only code-execution and outbound-fetch), so a write into the memory dir - like any write - carries no gate at all, while `run_command` still gates. The auto-approval of memory writes is therefore inherent in the ungated write path, not a per-path branch; a test pins that invariant.
+qwen flips its default permission to 'allow' for a memory write so autonomous memory does not prompt. In Suspenders, `write_file` / `edit_file` are UNGATED by design (ADR-0050 gates only code-execution and outbound-fetch), so a write into the memory dir - like any write - carries no gate at all, while `run_shell_command` still gates. The auto-approval of memory writes is therefore inherent in the ungated write path, not a per-path branch; a test pins that invariant.
 
 ## Deferred (OUT of this port)
 

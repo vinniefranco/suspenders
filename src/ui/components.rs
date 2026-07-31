@@ -3988,7 +3988,7 @@ fn tool_marker(marker: ToolMarker, name: &str, theme: &Theme) -> Span<'static> {
 /// Whether a tool name is a shell command (qwen `SHELL_COMMAND_NAME`/`SHELL_NAME`)
 /// - shell tools border their group + colour their marker with `ui.symbol` (grey).
 fn is_shell_tool(name: &str) -> bool {
-    matches!(name, "run_command" | "shell" | "Shell")
+    matches!(name, "run_shell_command" | "shell" | "Shell")
 }
 
 /// A Marker's prefix glyph + style, chosen by its [`Tone`] (qwen `StatusMessages`
@@ -6287,7 +6287,7 @@ mod tests {
         // Separators are added at assembly, not baked per item.
         let mut t = fresh_transcript();
         t.push(diff_item(
-            "edit_file src/foo.rs",
+            "edit src/foo.rs",
             vec![
                 DiffLine::new(DiffSide::Added, "added line"),
                 DiffLine::new(DiffSide::Removed, "removed line"),
@@ -6300,14 +6300,14 @@ mod tests {
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]).trim_start(),
-            "edit_file src/foo.rs · ^O expand"
+            "edit src/foo.rs · ^O expand"
         );
         // The default (compact=false) shows the full body.
         cache.sync(&t, Toggles::default(), 80, theme::dark());
         // The tool header row + both diff body rows.
         let expanded = cache.settled().next().unwrap().0;
         assert_eq!(expanded.len(), 3);
-        assert!(line_text(&expanded[0]).contains("edit_file src/foo.rs"));
+        assert!(line_text(&expanded[0]).contains("edit src/foo.rs"));
     }
 
     /// Every fg across the cache's first settled item, in order: each line's
@@ -6384,13 +6384,13 @@ mod tests {
         // No key_arg (governor-injected result): the description is the bare
         // summary (no arg to set off).
         let item = TranscriptItem::ToolResult {
-            name: "run_command".to_string(),
+            name: "run_shell_command".to_string(),
             summary: "injected".to_string(),
             is_error: false,
             key_arg: None,
         };
         let lines = message_lines(&item, false, 80, theme::dark());
-        assert_eq!(line_text(&lines[0]), "✓  run_command injected");
+        assert_eq!(line_text(&lines[0]), "✓  run_shell_command injected");
     }
 
     // --- The startup Header banner (qwen `AppHeader`) ----------------------
@@ -6600,19 +6600,19 @@ mod tests {
         // A failed result reads the `x` U+0078 ERROR marker (0.16.0 ASCII, NOT
         // `✗`), then the name + `arg · summary` description.
         let item = TranscriptItem::ToolResult {
-            name: "run_command".to_string(),
+            name: "run_shell_command".to_string(),
             summary: "exit 1".to_string(),
             is_error: true,
             key_arg: Some("cargo test".to_string()),
         };
         let lines = message_lines(&item, false, 80, theme::dark());
-        assert_eq!(line_text(&lines[0]), "x  run_command cargo test · exit 1");
+        assert_eq!(line_text(&lines[0]), "x  run_shell_command cargo test · exit 1");
     }
 
     #[test]
     fn a_failing_result_without_an_arg_shows_the_bare_summary() {
         let item = TranscriptItem::ToolResult {
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "old_str not found".to_string(),
             is_error: true,
             key_arg: Some("src/foo.rs".to_string()),
@@ -6620,7 +6620,7 @@ mod tests {
         let lines = message_lines(&item, false, 80, theme::dark());
         assert_eq!(
             line_text(&lines[0]),
-            "x  edit_file src/foo.rs · old_str not found"
+            "x  edit src/foo.rs · old_str not found"
         );
     }
 
@@ -6662,7 +6662,7 @@ mod tests {
     #[test]
     fn has_foldable_body_is_true_only_for_a_non_empty_diff() {
         // A non-empty Diff folds under Ctrl-O.
-        let diff = diff_item("edit_file x", vec![DiffLine::new(DiffSide::Added, "a")]);
+        let diff = diff_item("edit x", vec![DiffLine::new(DiffSide::Added, "a")]);
         assert!(diff.has_foldable_body());
 
         // A one-line merged ToolResult has no body to fold.
@@ -6685,7 +6685,7 @@ mod tests {
         // collapse it to its one-line title - the semantic fold predicate keys
         // on the Diff's foldable body, unaffected by the merge.
         let diff = diff_item(
-            "edit_file src/foo.rs (+1 -1)",
+            "edit src/foo.rs (+1 -1)",
             vec![
                 DiffLine::new(DiffSide::Added, "new"),
                 DiffLine::new(DiffSide::Removed, "old"),
@@ -6697,7 +6697,7 @@ mod tests {
         assert_eq!(collapsed.len(), 1);
         assert_eq!(
             line_text(&collapsed[0]).trim_start(),
-            "edit_file src/foo.rs (+1 -1) · ^O expand"
+            "edit src/foo.rs (+1 -1) · ^O expand"
         );
         // Default (compact=false): the tool header row + both body rows.
         let expanded = message_lines(&diff, false, 80, theme::dark());
@@ -6713,7 +6713,7 @@ mod tests {
     // through, so the `TranscriptItem::Diff { … }` literal lives in one place.
     fn diff_of(lang: Option<&str>, header: Option<&str>, lines: Vec<DiffLine>) -> TranscriptItem {
         TranscriptItem::Diff {
-            title: "edit_file foo".to_string(),
+            title: "edit foo".to_string(),
             lang: lang.map(str::to_string),
             hunks: vec![DiffHunk {
                 header: header.map(str::to_string),
@@ -8028,8 +8028,8 @@ mod tests {
         let items = [
             tool_call("read_file"),     // 0  (run at slice start)
             assistant("prose"),         // 1
-            tool_call("run_command"),   // 2  (run at the very end)
-            tool_result("run_command"), // 3
+            tool_call("run_shell_command"),   // 2  (run at the very end)
+            tool_result("run_shell_command"), // 3
         ];
         assert_eq!(
             group_segments(&items, 0),
@@ -8048,10 +8048,10 @@ mod tests {
         // into two tool groups with the Info as its own singleton between them.
         let items = [
             assistant("on it"),         // 0
-            tool_call("edit_file"),     // 1
-            tool_result("edit_file"),   // 2
+            tool_call("edit"),     // 1
+            tool_result("edit"),   // 2
             info("auto-approved"),      // 3  (splits the batch)
-            tool_result("run_command"), // 4
+            tool_result("run_shell_command"), // 4
             assistant("done"),          // 5
         ];
         assert_eq!(
@@ -8071,9 +8071,9 @@ mod tests {
         // A `Diff` is a tool item, so it stays in the surrounding run's box rather
         // than breaking it (the diff renders inside the group box).
         let items = [
-            tool_call("edit_file"),
-            diff_item("edit_file foo", vec![DiffLine::new(DiffSide::Added, "a")]),
-            tool_result("edit_file"),
+            tool_call("edit"),
+            diff_item("edit foo", vec![DiffLine::new(DiffSide::Added, "a")]),
+            tool_result("edit"),
         ];
         assert_eq!(group_segments(&items, 0), vec![Segment::ToolGroup(0, 3)]);
     }
@@ -8147,7 +8147,7 @@ mod tests {
     #[test]
     fn every_boxed_row_is_exactly_the_box_width_the_right_border_aligns() {
         // A long tool description (truncate-end) must not spill the right border.
-        let t = store_with_one_result("run_command", "a very long description ".repeat(10));
+        let t = store_with_one_result("run_shell_command", "a very long description ".repeat(10));
         assert_every_box_row_is_exactly_width(&t, Toggles::default(), &[30, 50, 72]);
     }
 
@@ -8167,7 +8167,7 @@ mod tests {
         // line - must be exactly the box width, not just the header/border rows.
         let mut t = crate::ui::transcript::Transcript::new(Vec::new());
         t.push(TranscriptItem::Diff {
-            title: "edit_file 世界.rs".into(),
+            title: "edit 世界.rs".into(),
             lang: Some("txt".into()),
             hunks: vec![DiffHunk {
                 header: Some("@@ -1,2 +1,2 @@".into()),
@@ -8196,7 +8196,7 @@ mod tests {
             key_arg: Some("src/foo.rs".into()),
         });
         t.push(TranscriptItem::ToolResult {
-            name: "run_command".into(),
+            name: "run_shell_command".into(),
             summary: "ok".into(),
             is_error: false,
             key_arg: Some("cargo build".into()),
@@ -9125,7 +9125,7 @@ mod tests {
             "the request:\n{expanded}"
         );
         for title in [
-            "edit_file src/lexer.rs",
+            "edit src/lexer.rs",
             "src/greet.js",
             "package.json",
             "src/generated.js",
@@ -9150,7 +9150,7 @@ mod tests {
         let (compact_screen, _) = Screen::demo_diffs().handle_key(Key::ToggleCompact);
         let folded = buffer_text(&draw_viewport(100, 70, &compact_screen));
         assert!(
-            folded.contains("edit_file src/lexer.rs"),
+            folded.contains("edit src/lexer.rs"),
             "the fold title stays:\n{folded}"
         );
         assert!(
@@ -9205,10 +9205,10 @@ mod tests {
             text.contains('╭') && text.contains('╰'),
             "tool box:\n{text}"
         );
-        assert!(text.contains("list_files"), "a tool row:\n{text}");
+        assert!(text.contains("list_directory"), "a tool row:\n{text}");
         // The error tool result reads the `x` ERROR marker.
         assert!(
-            text.contains("run_command") && text.contains("command denied"),
+            text.contains("run_shell_command") && text.contains("command denied"),
             "the error result:\n{text}"
         );
         // Assistant closing text + code fence.
@@ -9805,7 +9805,7 @@ mod tests {
         // Now a second, live run_command gated on an open approval.
         let (s, _) = s.apply_event(Event::tool_call(
             "t1",
-            "run_command",
+            "run_shell_command",
             serde_json::json!({"command": "cargo test"}),
         ));
         let (s, _) = s.apply_event(Event::approval_request(
@@ -9922,7 +9922,7 @@ mod tests {
     #[test]
     fn short_terminal_keeps_the_approval_question_visible() {
         let screen = screen_confirming(
-            "run_command",
+            "run_shell_command",
             serde_json::json!({"command": "cargo test"}),
             "cargo test",
         );
@@ -10013,7 +10013,7 @@ mod tests {
 
         // Approval OPEN (Running, gated run_command): the spinner is suppressed.
         let confirming = screen_confirming(
-            "run_command",
+            "run_shell_command",
             serde_json::json!({"command": "cargo test"}),
             "cargo test",
         );
@@ -10096,7 +10096,7 @@ mod tests {
     #[test]
     fn drawn_inline_approval_marks_only_the_active_option_row() {
         let screen = screen_confirming(
-            "run_command",
+            "run_shell_command",
             serde_json::json!({"command": "cargo test"}),
             "cargo test",
         );
@@ -10140,7 +10140,7 @@ mod tests {
     #[test]
     fn inline_exec_approval_renders_the_question_and_all_three_options() {
         let screen = screen_confirming(
-            "run_command",
+            "run_shell_command",
             serde_json::json!({"command": "cargo test"}),
             "cargo test",
         );
@@ -10290,7 +10290,7 @@ mod tests {
         );
         // Shell always wins, even confirming.
         assert_eq!(
-            group_border_style(&[call("run_command")], true, theme),
+            group_border_style(&[call("run_shell_command")], true, theme),
             symbol_style(theme)
         );
     }

@@ -86,8 +86,8 @@ default, Inherit, all tools) and the read-only `Explore` (Inherit for now, whose
 allowlist is qwen's Explore tool set - READ_FILE, GREP, GLOB, SHELL, LS,
 WEB_FETCH, TODO_WRITE, MEMORY, SKILL, LSP, ASK_USER_QUESTION - intersected with
 the tools that exist here and then minus the exclusions, so
-read_file/grep/glob/run_command/list_files/web_fetch/todo_write; this grant backs
-its verbatim prompt, which tells the model to use read-only run_command and to
+read_file/grep_search/glob/run_shell_command/list_directory/web_fetch/todo_write; this grant backs
+its verbatim prompt, which tells the model to use read-only run_shell_command and to
 fetch the web). qwen's third built-in, `statusline-setup`, edits
 `~/.qwen/settings.json` and has no Suspenders analog, so it is not ported. Both
 system prompts and descriptions are copied VERBATIM from qwen (em-dashes rendered

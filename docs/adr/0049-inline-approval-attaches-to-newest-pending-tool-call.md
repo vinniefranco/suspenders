@@ -21,7 +21,7 @@ unresolved). The render finds it with `items.rposition(ToolCall)` - the same
 newest-match identity the transcript already uses to pair results. No `tool_use`
 id is added to the event, no new Dep is plumbed.
 
-**The `ConfirmKind` derives from that call's name.** `run_command` → `Exec` (the
+**The `ConfirmKind` derives from that call's name.** `run_shell_command` → `Exec` (the
 command is arbitrary code, question `Allow execution of: '{command}'?`);
 everything else, incl. `web_fetch`, → `Info` (the generic `Do you want to
 proceed?`). Only those two tools gate today (`approvals::GATED`); a future gated
@@ -45,7 +45,7 @@ approval, so committed and pending stay byte-identical.
 
 **Border precedence** (qwen `ToolGroupMessage.tsx:325`, with the Phase-4 branch):
 shell → `ui.symbol` (grey) > confirming → `status.warning` > `border.default`. A
-`run_command` group keeps its grey shell border even mid-approval (shell wins);
+`run_shell_command` group keeps its grey shell border even mid-approval (shell wins);
 the confirming marker still flips to `?`.
 
 **Keys are a SUPERSET of the old modal.** The arrow keys + Enter drive a shared

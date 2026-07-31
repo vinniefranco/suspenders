@@ -165,6 +165,12 @@ pub struct ToolCtx {
     /// `Session::tool_ctx`, which stamps `Some(...)`, so they inherit the parent
     /// Session's memory root. A resolved subtree, never a general escape.
     pub memory_root: Option<PathBuf>,
+    /// The Session's session directory (Phase 9, ADR-0063): where background-shell
+    /// capture files live (`<session_dir>/background-shells/<id>.output`). Stamped
+    /// at ctx-build like `root` so `run_command`'s background branch can name the
+    /// capture file in its "Background shell started." block. A copied Session
+    /// fact, not an effect.
+    pub session_dir: PathBuf,
     pub caps: caps::Capabilities,
 }
 
@@ -200,6 +206,9 @@ impl ToolCtx {
             // Tests get Project-Root-only confinement by default; the memory
             // trust-path tests opt in explicitly by setting this field.
             memory_root: None,
+            // Tests default the session dir to the OS temp dir; the run_command
+            // background tests only read this to name the capture file.
+            session_dir: std::env::temp_dir(),
             caps: caps::Capabilities::for_test(),
         }
     }

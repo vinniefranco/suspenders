@@ -1,22 +1,19 @@
 //! The first Extension (ADR-0007): diffs on file edits.
 //!
-//! Covers edit_file and write_file. For edit_file, [`pre_run`](Diff::pre_run)
-//! snapshots the target file; [`post_run`](Diff::post_run) on a successful edit
-//! re-reads the file, computes line hunks ([`hunks`]), and attaches the `diff`
-//! Artifact. write_file only creates (it refuses to overwrite), so it needs no
-//! snapshot: `post_run` on a successful write attaches an all-added created-file
-//! diff from the written content alone. [`present`](Diff::present) replaces the
-//! one-line Tool Result summary with a first-class [`TranscriptItem::Diff`] (the
-//! semantic display vocabulary, ADR-0008).
+//! Covers edit_file and write_file. Both snapshot the target file in
+//! [`pre_run`](Diff::pre_run); [`post_run`](Diff::post_run) on a successful
+//! operation re-reads the file, computes line hunks ([`hunks`]), and attaches
+//! the `diff` Artifact. write_file OVERWRITES (qwen's contract), so a write over
+//! an existing file renders an old->new diff; a write that creates a fresh file
+//! (no snapshot captured) renders an all-added created-file diff from the
+//! written content alone. [`present`](Diff::present) replaces the one-line Tool
+//! Result summary with a first-class [`TranscriptItem::Diff`] (the semantic
+//! display vocabulary, ADR-0008).
 //!
-//! The model-facing content is left alone with one exception: when edit_file's
-//! fuzzy re-indentation path landed something other than a naive exact
-//! old_str→new_str replacement of the snapshot, the model's picture of the file
-//! is wrong, so a compact unified diff is appended to the Tool Result. Detection
-//! is semantic (recompute the exact replacement and compare), never by matching
-//! the tool's message. write_file writes the model's content verbatim, so it
-//! never needs grounding. This is the "only on fuzzy match" policy: Context
-//! Budget is spent exactly where the model would otherwise be blind.
+//! The model-facing content is left alone: edit_file replaces EXACT literal
+//! text (qwen's contract) and write_file writes the model's content verbatim,
+//! so what landed on disk is what the model sent - neither needs a grounding
+//! diff appended to the Tool Result.
 //!
 //! This Extension composes both roles (ADR-0042): a Middleware
 //! (`pre_run` snapshots, `post_run` computes hunks and attaches the Artifact)
@@ -54,19 +51,18 @@ mod keys {
 }
 
 /// The tools the Diff extension acts on.
-const TOOLS: [&str; 2] = ["edit_file", "write_file"];
-
-/// Model-facing compact diff cap (lines); the Result Cap still applies on top.
-/// Display cap is looser - Artifacts cost no Context Budget.
-const MODEL_DIFF_LINES: usize = 40;
+const TOOLS: [&str; 2] = ["edit", "write_file"];
 
 /// The Diff extension (ADR-0007).
 pub struct Diff;
 
 impl Middleware for Diff {
     fn pre_run(&self, token: Token, _opts: &Value) -> Token {
-        // Only edit_file needs a before-snapshot; write_file only creates.
-        if token.tool != "edit_file" {
+        // Both edit_file and write_file need a before-snapshot: write_file now
+        // overwrites (qwen's contract), so an overwrite has an old->new diff. A
+        // fresh create has no readable target here, so no snapshot is captured
+        // and post_run renders the all-added created-file diff instead.
+        if !TOOLS.contains(&token.tool.as_str()) {
             return token;
         }
         match target(&token) {
@@ -82,7 +78,7 @@ impl Middleware for Diff {
         let is_error = token.result.as_ref().map(|r| r.is_error).unwrap_or(true);
 
         match token.tool.as_str() {
-            "edit_file" if !is_error => {
+            "edit" if !is_error => {
                 let abs = match target(&token) {
                     Some(abs) => abs,
                     None => return token,
@@ -95,7 +91,7 @@ impl Middleware for Diff {
                     Ok(c) => c,
                     Err(_) => return token,
                 };
-                diff(token, &before, &after_content)
+                edit_diff(token, &before, &after_content)
             }
             "write_file" if !is_error => {
                 let abs = match target(&token) {
@@ -106,7 +102,19 @@ impl Middleware for Diff {
                     Ok(c) => c,
                     Err(_) => return token,
                 };
-                created_diff(token, &content)
+                // An overwrite has a before-snapshot: render an old->new diff.
+                // A fresh create has none: render the all-added created-file diff.
+                // write_file writes the model's content verbatim either way, so
+                // neither path needs grounding.
+                let before = token
+                    .assigns
+                    .get(keys::BEFORE)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                match before {
+                    Some(before) => edit_diff(token, &before, &content),
+                    None => created_diff(token, &content),
+                }
             }
             _ => token,
         }
@@ -144,23 +152,24 @@ impl Presenter for Diff {
 
 // ---- post_run internals ----
 
-fn diff(token: Token, before: &str, after_content: &str) -> Token {
+// An old->new diff for an edit_file replacement or a write_file overwrite. Both
+// land exactly what the model sent (edit_file replaces exact literal text,
+// write_file writes verbatim), so the diff is purely for display - no grounding.
+// A change that produced no textual difference attaches no artifact.
+fn edit_diff(token: Token, before: &str, after_content: &str) -> Token {
     let computed = hunks::compute(before, after_content);
     if computed.is_empty() {
         return token;
     }
-
     let stats = hunks::stats(&computed);
     let artifact = DiffArtifact {
         path: path(&token),
-        hunks: computed.clone(),
+        hunks: computed,
         added: stats.added,
         removed: stats.removed,
         created: false,
     };
-
-    let token = put_diff(token, &artifact);
-    maybe_ground_model(token, before, after_content, &computed)
+    put_diff(token, &artifact)
 }
 
 // A created file is one all-added hunk; write_file writes the model's content
@@ -176,47 +185,6 @@ fn created_diff(token: Token, content: &str) -> Token {
         created: true,
     };
     put_diff(token, &artifact)
-}
-
-// Only edit_file's fuzzy re-indentation path can land something the model did
-// not send; when the applied edit differs from a naive exact replacement,
-// ground the model with a compact diff of what was written.
-fn maybe_ground_model(
-    mut token: Token,
-    before: &str,
-    after_content: &str,
-    computed: &[hunks::Hunk],
-) -> Token {
-    if exact_apply(before, &token.input).as_deref() == Some(after_content) {
-        return token;
-    }
-    let compact = hunks::to_unified(computed, MODEL_DIFF_LINES);
-    if let Some(result) = token.result.as_mut() {
-        let annotated = format!(
-            "{}\n[the match was fuzzy - what was actually written:]\n{}",
-            result.text_of(),
-            compact
-        );
-        result.set_text(annotated);
-    }
-    token
-}
-
-// What an exact single-occurrence replacement would have produced. A successful
-// edit with zero or 2+ exact occurrences can only have gone through the fuzzy
-// pass (edit_file errors on ambiguity), so `None` means fuzzy.
-fn exact_apply(before: &str, input: &Value) -> Option<String> {
-    let old_str = input.get("old_str").and_then(|v| v.as_str())?;
-    let new_str = input.get("new_str").and_then(|v| v.as_str())?;
-    if old_str.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = before.split(old_str).collect();
-    if parts.len() == 2 {
-        Some(format!("{}{}{}", parts[0], new_str, parts[1]))
-    } else {
-        None
-    }
 }
 
 // ---- artifact (de)serialization ----
@@ -235,18 +203,19 @@ fn read_diff_artifact(artifacts: &HashMap<String, Value>) -> Option<DiffArtifact
 
 // ---- shared ----
 
+// Both edit_file and write_file name their path parameter `file_path` (qwen's
+// absolute-path contract), so a single lookup serves both.
+fn path_param(token: &Token) -> Option<&str> {
+    token.input.get("file_path").and_then(|v| v.as_str())
+}
+
 fn target(token: &Token) -> Option<std::path::PathBuf> {
-    let path = token.input.get("path").and_then(|v| v.as_str())?;
-    resolve_path(path, &token.ctx.root).ok()
+    // `resolve_path` normalizes the absolute `file_path` both tools carry.
+    resolve_path(path_param(token)?, &token.ctx.root).ok()
 }
 
 fn path(token: &Token) -> String {
-    token
-        .input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    path_param(token).unwrap_or("").to_string()
 }
 
 #[cfg(test)]
@@ -285,6 +254,27 @@ mod tests {
         read_diff_artifact(&result.artifacts).expect("diff artifact present")
     }
 
+    // edit_file / write_file now take an absolute `file_path` (qwen contract).
+    fn abs(root: &std::path::Path, rel: &str) -> String {
+        root.join(rel).to_string_lossy().into_owned()
+    }
+
+    // Write `body` to `rel` under `ctx.root` and record a prior read of it, so
+    // edit_file's read-before-edit gate is satisfied.
+    fn seed_read(ctx: &ToolCtx, rel: &str, body: &str) {
+        let abs = ctx.root.join(rel);
+        std::fs::write(&abs, body).unwrap();
+        let meta = std::fs::metadata(&abs).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        ctx.read_cache()
+            .record_read(abs, mtime, meta.len(), true, true);
+    }
+
     // ============================================================
     // edit_file
     // ============================================================
@@ -293,17 +283,22 @@ mod tests {
     async fn edit_file_exact_match_diff_artifact_model_facing_content_stays_terse() {
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
-        let path = "sample.txt";
-        std::fs::write(tmp.path().join(path), "one\ntwo\nthree\n").unwrap();
+        seed_read(&ctx, "sample.txt", "one\ntwo\nthree\n");
+        let target = abs(tmp.path(), "sample.txt");
 
-        let input = json!({"path": path, "old_str": "two", "new_str": "TWO"});
-        let result = run("edit_file", input, &ctx).await;
+        let input = json!({"file_path": &target, "old_string": "two", "new_string": "TWO"});
+        let result = run("edit", input, &ctx).await;
 
         assert!(!result.is_error);
-        assert_eq!(result.text(), format!("edited {path}"));
+        // The model-facing content is qwen's base update line plus the
+        // edited-region snippet; the Diff extension appends no grounding.
+        assert!(result.text().starts_with(&format!(
+            "The file: {target} has been updated. Showing lines"
+        )));
+        assert!(!result.text().contains("the match was fuzzy"));
 
         let diff = diff_of(&result);
-        assert_eq!(diff.path, path);
+        assert_eq!(diff.path, target);
         assert_eq!(diff.added, 1);
         assert_eq!(diff.removed, 1);
         assert!(!diff.created);
@@ -327,30 +322,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_file_fuzzy_match_a_compact_diff_grounds_the_model() {
+    async fn edit_file_replacement_content_is_not_grounded_by_the_diff_extension() {
+        // The Diff extension no longer appends a "fuzzy" grounding block; the
+        // model-facing content is exactly edit_file's own success message (base
+        // update line + qwen's edited-region snippet).
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
-        let path = "code.ex";
-        std::fs::write(tmp.path().join(path), "def foo do\n  x = 1\nend\n").unwrap();
+        seed_read(&ctx, "code.ex", "def foo do\n  x = 1\nend\n");
+        let target = abs(tmp.path(), "code.ex");
 
-        // Wrong indentation forces the whitespace-normalized pass; the file keeps
-        // its real 2-space indent, which the model never sent.
-        let input = json!({"path": path, "old_str": "      x = 1", "new_str": "      y = 2"});
-        let result = run("edit_file", input, &ctx).await;
+        let input = json!({"file_path": &target, "old_string": "  x = 1", "new_string": "  y = 2"});
+        let result = run("edit", input, &ctx).await;
 
         assert!(!result.is_error);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join(path)).unwrap(),
+            std::fs::read_to_string(tmp.path().join("code.ex")).unwrap(),
             "def foo do\n  y = 2\nend\n"
         );
-
-        assert!(
-            result
-                .text()
-                .contains("[the match was fuzzy - what was actually written:]")
-        );
-        assert!(result.text().contains("-  x = 1"));
-        assert!(result.text().contains("+  y = 2"));
+        // No grounding annotation from the Diff extension.
+        assert!(!result.text().contains("the match was fuzzy"));
+        assert!(result.text().starts_with(&format!(
+            "The file: {target} has been updated. Showing lines"
+        )));
 
         let diff = diff_of(&result);
         assert_eq!(diff.added, 1);
@@ -361,11 +354,11 @@ mod tests {
     async fn edit_file_failed_edit_no_artifact_error_content_untouched() {
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
-        let path = "sample.txt";
-        std::fs::write(tmp.path().join(path), "one\n").unwrap();
+        seed_read(&ctx, "sample.txt", "one\n");
+        let target = abs(tmp.path(), "sample.txt");
 
-        let input = json!({"path": path, "old_str": "missing", "new_str": "x"});
-        let result = run("edit_file", input, &ctx).await;
+        let input = json!({"file_path": &target, "old_string": "missing", "new_string": "x"});
+        let result = run("edit", input, &ctx).await;
 
         assert!(result.is_error);
         assert!(result.artifacts.is_empty());
@@ -380,13 +373,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
 
-        let input = json!({"path": "fresh.txt", "content": "a\nb\n"});
+        let target = abs(tmp.path(), "fresh.txt");
+        let input = json!({"file_path": &target, "content": "a\nb\n"});
         let result = run("write_file", input, &ctx).await;
 
         assert!(!result.is_error);
-        assert!(result.text().contains("created fresh.txt"));
+        assert!(
+            result
+                .text()
+                .contains("Successfully created and wrote to new file:")
+        );
 
         let diff = diff_of(&result);
+        assert_eq!(diff.path, target);
         assert_eq!(diff.added, 2);
         assert_eq!(diff.removed, 0);
         assert!(diff.created);
@@ -411,20 +410,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_pre_run_takes_no_snapshot_creation_only_nothing_to_diff_against() {
-        // write_file never overwrites, so there is no before-content to snapshot;
+    async fn write_file_creation_takes_no_snapshot_and_renders_a_created_diff() {
+        // A fresh create has no readable target, so pre_run captures no snapshot;
         // the created diff is computed from the written file alone.
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
-        let path = "existing.txt";
-        std::fs::write(tmp.path().join(path), "old\n").unwrap();
+        let target = abs(tmp.path(), "fresh.txt");
 
         let regs = extensions();
         let (token, failures) = extensions::pre_run(
             &regs,
             Token::new(
                 "write_file",
-                json!({"path": path, "content": "x"}),
+                json!({"file_path": &target, "content": "x"}),
                 ctx.clone(),
             ),
         );
@@ -433,25 +431,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_refused_overwrite_error_result_no_diff_artifact() {
-        // write_file refuses to overwrite an existing file, so the Diff extension
-        // has nothing to diff - the error passes through with no artifact.
+    async fn write_file_overwrite_snapshots_and_renders_an_old_to_new_diff() {
+        // write_file now OVERWRITES (qwen's contract): pre_run snapshots the
+        // existing file and post_run renders an old->new diff, created:false.
         let tmp = TempDir::new().unwrap();
         let ctx = ctx(tmp.path());
-        let path = "config.txt";
-        std::fs::write(tmp.path().join(path), "keep\nold\n").unwrap();
+        let target = abs(tmp.path(), "config.txt");
+        std::fs::write(tmp.path().join("config.txt"), "keep\nold\n").unwrap();
 
-        let input = json!({"path": path, "content": "keep\nnew\n"});
+        let input = json!({"file_path": &target, "content": "keep\nnew\n"});
         let result = run("write_file", input, &ctx).await;
 
-        assert!(result.is_error);
-        assert!(result.text().contains("edit_file"));
-        assert!(result.artifacts.is_empty());
-        // The file is untouched.
+        assert!(!result.is_error);
+        assert!(result.text().contains("Successfully overwrote file:"));
+        // The file was overwritten.
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join(path)).unwrap(),
-            "keep\nold\n"
+            std::fs::read_to_string(tmp.path().join("config.txt")).unwrap(),
+            "keep\nnew\n"
         );
+
+        let diff = diff_of(&result);
+        assert_eq!(diff.path, target);
+        assert!(!diff.created);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+        let lines = &diff.hunks[0].lines;
+        assert!(lines.iter().any(|l| *l
+            == hunks::Line {
+                tag: hunks::Tag::Removed,
+                old: Some(2),
+                new: None,
+                text: "old".to_string()
+            }));
+        assert!(lines.iter().any(|l| *l
+            == hunks::Line {
+                tag: hunks::Tag::Added,
+                old: None,
+                new: Some(2),
+                text: "new".to_string()
+            }));
     }
 
     // ============================================================
@@ -464,7 +482,9 @@ mod tests {
         let ctx = ctx(tmp.path());
         std::fs::write(tmp.path().join("r.txt"), "hello").unwrap();
 
-        let result = run("read_file", json!({"path": "r.txt"}), &ctx).await;
+        // read_file now takes an absolute `file_path` (qwen contract).
+        let target = tmp.path().join("r.txt").to_string_lossy().into_owned();
+        let result = run("read_file", json!({"file_path": target}), &ctx).await;
 
         assert!(!result.is_error);
         assert!(result.artifacts.is_empty());
@@ -495,7 +515,7 @@ mod tests {
     #[test]
     fn present_replaces_a_successful_tool_result_with_a_diff_item() {
         let item = TranscriptItem::ToolResult {
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "edited lib/x.ex".to_string(),
             is_error: false,
             key_arg: None,
@@ -512,7 +532,7 @@ mod tests {
         else {
             panic!("expected a diff");
         };
-        assert_eq!(title, "edit_file lib/x.ex (+1 -1)");
+        assert_eq!(title, "edit lib/x.ex (+1 -1)");
         // "lib/x.ex" resolves its language from the extension.
         assert_eq!(lang.as_deref(), Some("ex"));
         assert_eq!(elided, 0);
@@ -584,18 +604,18 @@ mod tests {
     #[test]
     fn present_errors_other_items_and_missing_artifacts_pass_through() {
         let error_item = TranscriptItem::ToolResult {
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "old_str not found".to_string(),
             is_error: true,
             key_arg: None,
         };
         let call_item = TranscriptItem::ToolCall {
             id: "t1".to_string(),
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "path=x".to_string(),
         };
         let plain_item = TranscriptItem::ToolResult {
-            name: "edit_file".to_string(),
+            name: "edit".to_string(),
             summary: "edited x".to_string(),
             is_error: false,
             key_arg: None,

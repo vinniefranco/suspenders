@@ -5,6 +5,7 @@
 
 use base64::Engine;
 
+use super::params::Window;
 use super::pdf;
 use crate::content::{ResultBlock, unsupported_modality_placeholder};
 use crate::tool::path::{FileError, file_error};
@@ -20,31 +21,87 @@ const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
 
 // ---- text branch (String) ---------------------------------------------------
 
-pub(super) fn read_from(abs: &std::path::Path, path: &str, start: i64) -> Result<String, String> {
+/// Read a text file and apply qwen's `offset` / `limit` line window
+/// (`readFileWithLineAndLimit` in fileUtils.ts). When the window is not the
+/// whole file, prepend qwen's `"Showing lines X-Y of Z total lines."` notice
+/// (read-file.ts), so a partial read is self-describing. Returns the windowed
+/// content and whether it was a truncated (partial) read.
+pub(super) fn read_from(
+    abs: &std::path::Path,
+    path: &str,
+    window: Window,
+) -> Result<(String, bool), String> {
     match std::fs::read_to_string(abs) {
-        Ok(content) => slice_from(&content, start, path),
+        Ok(content) => Ok(slice_window(&content, window)),
         Err(err) => Err(file_error("read", path, FileError::from_io(&err))),
     }
 }
 
-fn slice_from(content: &str, start: i64, path: &str) -> Result<String, String> {
-    if start == 1 {
-        return Ok(content.to_string());
-    }
+/// qwen's text branch (`processSingleFileContent` case 'text' +
+/// `readFileWithLineAndLimit`) and the read-file.ts truncation notice, mirroring
+/// qwen's variable names so the byte-level result matches:
+///
+///  - `start_line` = `offset || 0` (pre-clamp; the notice's first number is
+///    `start_line + 1`).
+///  - The slice bounds are clamped: `actual_start = min(start_line, total)`,
+///    `end_line = min(start_line + limit, total)`. `readTextFile` slices
+///    `lines[actual_start .. end_line]`.
+///  - Every selected line is `trim_end`ed (qwen's
+///    `content.split('\n').map(line => line.trimEnd())`, fileUtils.ts:1029),
+///    stripping ALL trailing whitespace, not just newlines.
+///  - `lines_included = selected_lines.len()` (qwen's no-char-limit branch;
+///    the char cap is suspenders' Result Cap, applied later by Shaping, so this
+///    tool is always in qwen's `else` branch). `actual_end_line = start_line +
+///    lines_included`.
+///  - `linesShown = [start_line + 1, actual_end_line]` feeds the notice, so both
+///    numbers derive from the SAME clamp, not the raw slice bounds.
+///
+/// A read is truncated when `start_line > 0 || actual_end_line < total`
+/// (qwen's `contentRangeTruncated`); a truncated read is prefixed with
+/// `"Showing lines {start}-{end} of {total} total lines.\n\n---\n\n"`.
+fn slice_window(content: &str, window: Window) -> (String, bool) {
     let lines: Vec<&str> = content.split('\n').collect();
-    // A trailing newline splits into a final empty string that is not a line.
-    let count = if content.ends_with('\n') {
-        lines.len() - 1
-    } else {
-        lines.len()
-    } as i64;
+    // `content.split('\n')` matches qwen's `content.split('\n')`: a trailing
+    // newline yields a final empty element that IS counted in
+    // `originalLineCount`, exactly as qwen does.
+    let total = lines.len() as u64;
 
-    if start > count {
-        Err(format!(
-            "start_line {start} is past the end of {path} ({count} lines)"
-        ))
+    // The pre-clamp start (qwen `startLine = offset || 0`) drives the notice's
+    // first number; the clamp drives the slice.
+    let start_line = window.offset.unwrap_or(0);
+    let actual_start = start_line.min(total);
+    let end_line = match window.limit {
+        Some(limit) => start_line.saturating_add(limit).min(total),
+        None => total,
+    };
+
+    // qwen windows in TWO stages: `readTextFile` slices + joins the lines into a
+    // `content` string, THEN `processSingleFileContent` re-splits that string on
+    // '\n' and trims each line. The re-split matters at the empty-window edge:
+    // an empty slice joins to `""`, and `"".split('\n')` is `[""]` (length 1),
+    // not `[]` - so `lines_included` is 1 there, matching qwen's
+    // `selectedLines.length === 1`. Reproduce the same two stages.
+    let windowed = lines[actual_start as usize..end_line as usize].join("\n");
+    let selected: Vec<&str> = windowed.split('\n').map(|line| line.trim_end()).collect();
+    let body = selected.join("\n");
+
+    // qwen's no-char-limit branch: linesIncluded = selectedLines.length.
+    let lines_included = selected.len() as u64;
+    let actual_end_line = start_line.saturating_add(lines_included);
+
+    // Truncated iff the window does not cover the whole file (qwen's
+    // `contentRangeTruncated = startLine > 0 || actualEndLine < originalLineCount`).
+    let truncated = start_line > 0 || actual_end_line < total;
+    if truncated {
+        let notice = format!(
+            "Showing lines {}-{} of {} total lines.\n\n---\n\n",
+            start_line + 1,
+            actual_end_line,
+            total
+        );
+        (format!("{notice}{body}"), true)
     } else {
-        Ok(lines[(start - 1) as usize..].join("\n"))
+        (body, false)
     }
 }
 
@@ -55,14 +112,20 @@ pub(super) fn read_text(abs: &std::path::Path, path: &str) -> Result<String, Str
 // ---- svg branch (Text, 1MB cap) ---------------------------------------------
 
 /// SVG is read as text (qwen returns `'svg'` and reads it with the text reader),
-/// capped at 1MB (qwen `SVG_MAX_SIZE_BYTES`) with the verbatim skip message.
-pub(super) fn read_svg(abs: &std::path::Path, path: &str) -> Result<String, String> {
+/// capped at 1MB (qwen `SVG_MAX_SIZE_BYTES`) with the verbatim skip message. The
+/// skip message names the `display_name` (basename), matching qwen's
+/// display-path wording without leaking the absolute path.
+pub(super) fn read_svg(
+    abs: &std::path::Path,
+    path: &str,
+    display_name: &str,
+) -> Result<String, String> {
     let size = std::fs::metadata(abs)
         .map(|m| m.len())
         .map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
     if size > SVG_MAX_SIZE_BYTES {
         return Ok(format!(
-            "Cannot display content of SVG file larger than 1MB: {path}"
+            "Cannot display content of SVG file larger than 1MB: {display_name}"
         ));
     }
     read_text(abs, path)

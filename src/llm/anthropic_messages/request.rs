@@ -278,7 +278,7 @@ mod tests {
     fn build_assembles_complete_request() {
         let messages = vec![Message::user(vec![ContentBlock::text("hi")])];
         let tools = vec![ToolSpec {
-            name: "list_files".into(),
+            name: "list_directory".into(),
             description: "Lists files.".into(),
             input_schema: json!({}),
         }];
@@ -292,7 +292,7 @@ mod tests {
 
         let tools_arr = req["tools"].as_array().unwrap();
         assert_eq!(tools_arr.len(), 1);
-        assert_eq!(tools_arr[0]["name"], json!("list_files"));
+        assert_eq!(tools_arr[0]["name"], json!("list_directory"));
 
         let msgs = req["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);

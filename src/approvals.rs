@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// facts can never disagree. A gated Tool with the field missing or non-string
 /// still gates, reading the empty string - the gate is about the Tool, not the
 /// input's shape.
-const GATED: &[(&str, &str)] = &[("run_command", "command"), ("web_fetch", "url")];
+const GATED: &[(&str, &str)] = &[("run_shell_command", "command"), ("web_fetch", "url")];
 
 /// The single Approval-gate query over a Tool Call (name + input): `Some(text)`
 /// means the Call gates and `text` is exactly what the user reads (and what a
@@ -253,15 +253,15 @@ mod tests {
 
     #[test]
     fn gate_text_gates_run_command_and_web_fetch_and_nothing_else() {
-        assert!(gate_text("run_command", &json!({"command": "mix test"})).is_some());
+        assert!(gate_text("run_shell_command", &json!({"command": "mix test"})).is_some());
         assert!(gate_text("web_fetch", &json!({"url": "https://docs.rs/tokio"})).is_some());
 
         for name in [
             "plan",
             "read_file",
-            "list_files",
-            "grep",
-            "edit_file",
+            "list_directory",
+            "grep_search",
+            "edit",
             "write_file",
         ] {
             assert_eq!(gate_text(name, &json!({})), None, "{name} must not gate");
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn gate_text_is_the_command_for_run_command() {
         assert_eq!(
-            gate_text("run_command", &json!({"command": "mix test"})),
+            gate_text("run_shell_command", &json!({"command": "mix test"})),
             Some("mix test".to_string())
         );
     }
@@ -328,18 +328,18 @@ mod tests {
         );
         assert_eq!(
             gate_text(
-                "edit_file",
+                "edit",
                 &json!({"path": "/data/projects/slug/memory/user.md", "old_str": "a", "new_str": "b"})
             ),
             None
         );
         // A non-memory code-execution call still gates, unchanged.
-        assert!(gate_text("run_command", &json!({"command": "rm -rf /"})).is_some());
+        assert!(gate_text("run_shell_command", &json!({"command": "rm -rf /"})).is_some());
     }
 
     #[test]
     fn gate_text_falls_back_to_empty_when_the_field_is_missing_or_non_string() {
-        assert_eq!(gate_text("run_command", &json!({})), Some(String::new()));
+        assert_eq!(gate_text("run_shell_command", &json!({})), Some(String::new()));
         assert_eq!(
             gate_text("web_fetch", &json!({"url": 42})),
             Some(String::new())

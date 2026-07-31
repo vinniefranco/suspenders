@@ -10,8 +10,7 @@
 
 use crate::notebook::{Cell, CellOutput, Notebook, Source};
 
-mod ansi;
-use ansi::strip_ansi;
+use crate::text::strip_ansi;
 
 /// A single code cell's combined-output cut (qwen `LARGE_OUTPUT_THRESHOLD`).
 const LARGE_OUTPUT_THRESHOLD: usize = 10_000;

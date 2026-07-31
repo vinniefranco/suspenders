@@ -157,8 +157,8 @@ mod tests {
         let ctx = ctx(tmp.path());
         let input = json!({
             "todos": [
-                { "content": "read", "status": "completed" },
-                { "content": "edit", "status": "in_progress" },
+                { "id": "1", "content": "read", "status": "completed" },
+                { "id": "2", "content": "edit", "status": "in_progress" },
             ]
         });
         let result = run(TOOL, input, &ctx).await;
@@ -308,8 +308,8 @@ mod tests {
 
         let input = json!({
             "todos": [
-                { "content": "read", "status": "completed" },
-                { "content": "edit", "status": "in_progress" },
+                { "id": "1", "content": "read", "status": "completed" },
+                { "id": "2", "content": "edit", "status": "in_progress" },
             ]
         });
         let (token, failures) =

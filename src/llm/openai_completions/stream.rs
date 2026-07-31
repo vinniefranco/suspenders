@@ -407,7 +407,7 @@ mod tests {
     fn parallel_tool_calls_interleave_without_collapsing() {
         let r = fold(vec![
             tool_fragment(json!({ "index": 0, "id": "c1", "function": { "name": "read_file" } })),
-            tool_fragment(json!({ "index": 1, "id": "c2", "function": { "name": "list_files" } })),
+            tool_fragment(json!({ "index": 1, "id": "c2", "function": { "name": "list_directory" } })),
             tool_fragment(json!({ "index": 0, "function": { "arguments": "{\"path\": \"a\"}" } })),
             tool_fragment(json!({ "index": 1, "function": { "arguments": "{}" } })),
             finish("tool_calls"),
@@ -416,7 +416,7 @@ mod tests {
             r.content,
             vec![
                 ContentBlock::tool_use("c1", "read_file", json!({ "path": "a" })),
-                ContentBlock::tool_use("c2", "list_files", json!({})),
+                ContentBlock::tool_use("c2", "list_directory", json!({})),
             ]
         );
     }
@@ -427,7 +427,7 @@ mod tests {
             delta(json!({ "content": "Let me check." })),
             tool_fragment(json!({
                 "index": 0, "id": "c1",
-                "function": { "name": "list_files", "arguments": "{}" }
+                "function": { "name": "list_directory", "arguments": "{}" }
             })),
             finish("tool_calls"),
         ]);
@@ -435,7 +435,7 @@ mod tests {
             r.content,
             vec![
                 ContentBlock::text("Let me check."),
-                ContentBlock::tool_use("c1", "list_files", json!({})),
+                ContentBlock::tool_use("c1", "list_directory", json!({})),
             ]
         );
     }
@@ -463,7 +463,7 @@ mod tests {
         let r = fold(vec![
             tool_fragment(json!({
                 "index": 0, "id": "c1",
-                "function": { "name": "list_files", "arguments": malformed }
+                "function": { "name": "list_directory", "arguments": malformed }
             })),
             finish("tool_calls"),
         ]);
@@ -471,7 +471,7 @@ mod tests {
             r.content,
             vec![ContentBlock::tool_use(
                 "c1",
-                "list_files",
+                "list_directory",
                 malformed_input_marker(malformed)
             )]
         );
@@ -484,12 +484,12 @@ mod tests {
     #[test]
     fn empty_accumulated_arguments_become_an_empty_map() {
         let r = fold(vec![
-            tool_fragment(json!({ "index": 0, "id": "c1", "function": { "name": "list_files" } })),
+            tool_fragment(json!({ "index": 0, "id": "c1", "function": { "name": "list_directory" } })),
             finish("tool_calls"),
         ]);
         assert_eq!(
             r.content,
-            vec![ContentBlock::tool_use("c1", "list_files", json!({}))]
+            vec![ContentBlock::tool_use("c1", "list_directory", json!({}))]
         );
     }
 
@@ -628,7 +628,7 @@ mod tests {
         // finish_reason is "stop", yet a text-emitted call must finalize as
         // ToolUse. Auto (the default) recovers it.
         let r = fold(vec![
-            delta(json!({ "content": "<tool_call>\n<function=run_command>\n" })),
+            delta(json!({ "content": "<tool_call>\n<function=run_shell_command>\n" })),
             delta(json!({ "content": "<parameter=command>\nmix test\n" })),
             delta(json!({ "content": "</parameter>\n</function>\n</tool_call>" })),
             finish("stop"),
@@ -638,7 +638,7 @@ mod tests {
             r.content,
             vec![ContentBlock::tool_use(
                 "text-call-0",
-                "run_command",
+                "run_shell_command",
                 json!({ "command": "mix test" })
             )]
         );
@@ -651,7 +651,7 @@ mod tests {
         let r = fold(vec![
             delta(json!({ "content": "I need to run the tests:\n\n" })),
             delta(json!({
-                "content": "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>"
+                "content": "<tool_call>\n<function=run_shell_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>"
             })),
             finish("stop"),
         ]);
@@ -661,7 +661,7 @@ mod tests {
                 ContentBlock::text("I need to run the tests:"),
                 ContentBlock::tool_use(
                     "text-call-0",
-                    "run_command",
+                    "run_shell_command",
                     json!({ "command": "mix test" })
                 ),
             ]
@@ -675,7 +675,7 @@ mod tests {
         // markup stays plain text (never re-parsed into a second ToolUse).
         let r = fold(vec![
             delta(
-                json!({ "content": "<tool_call>\n<function=list_files>\n</function>\n</tool_call>" }),
+                json!({ "content": "<tool_call>\n<function=list_directory>\n</function>\n</tool_call>" }),
             ),
             tool_fragment(json!({
                 "index": 0, "id": "call_1", "type": "function",
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(
             r.content,
             vec![
-                ContentBlock::text("<tool_call>\n<function=list_files>\n</function>\n</tool_call>"),
+                ContentBlock::text("<tool_call>\n<function=list_directory>\n</function>\n</tool_call>"),
                 ContentBlock::tool_use("call_1", "read_file", json!({ "path": "x" })),
             ]
         );
@@ -700,7 +700,7 @@ mod tests {
             ToolCallStyle::Structured,
             vec![
                 delta(json!({
-                    "content": "<tool_call>\n<function=run_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>"
+                    "content": "<tool_call>\n<function=run_shell_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>"
                 })),
                 finish("stop"),
             ],
@@ -717,7 +717,7 @@ mod tests {
             ToolCallStyle::Text,
             vec![
                 delta(json!({
-                    "content": "<tool_call>\n<function=list_files>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+                    "content": "<tool_call>\n<function=list_directory>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
                 })),
                 finish("stop"),
             ],
@@ -726,7 +726,7 @@ mod tests {
             r.content,
             vec![ContentBlock::tool_use(
                 "text-call-0",
-                "list_files",
+                "list_directory",
                 json!({ "path": "." })
             )]
         );

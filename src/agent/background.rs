@@ -235,15 +235,18 @@ impl AgentState {
     /// A background-subagent stop request (P4b/4d, ADR-0063): abort the child, set
     /// the entry Stopped, queue the `was cancelled` notification SYNCHRONOUSLY
     /// (the terminal notification the parent still receives), and return the
-    /// VERBATIM qwen `task_stop` wording. Three legs, all VERBATIM: found+running
-    /// (stop confirmation), found+not-running (the not-running error), not-found.
-    pub(super) fn stop_background(&mut self, id: String) -> String {
-        let Some(entry) = self.background.get_mut(&id) else {
-            return format!("Error: No background task found with ID \"{id}\".");
-        };
+    /// VERBATIM qwen `task_stop` wording. The two HIT legs are VERBATIM:
+    /// found+running (stop confirmation) and found+not-running (the not-running
+    /// error). Returns `None` when no SUBAGENT owns the id, so the dual-registry
+    /// handler (Phase 9, ADR-0063) can fall through to the shell registry and then
+    /// synthesize the verbatim not-found ONCE (NO string-sniffing).
+    pub(super) fn stop_background(&mut self, id: String) -> Option<String> {
+        let entry = self.background.get_mut(&id)?;
         if !matches!(entry.status, BackgroundStatus::Running) {
             let status = background_status_word(&entry.status);
-            return format!("Error: Background agent \"{id}\" is not running (status: {status}).");
+            return Some(format!(
+                "Error: Background agent \"{id}\" is not running (status: {status})."
+            ));
         }
 
         // Abort the detached child at its next `.await`, then mark it Stopped so
@@ -265,11 +268,11 @@ impl AgentState {
             Event::background_task_finished(id.clone(), "cancelled"),
         );
 
-        format!(
+        Some(format!(
             "Cancellation requested for background agent \"{id}\". A final \
              task-notification carrying the agent's last result will follow.\n\
              Description: {description}"
-        )
+        ))
     }
 
     /// Abort every tracked background child at actor-loop exit (P4b, ADR-0063):

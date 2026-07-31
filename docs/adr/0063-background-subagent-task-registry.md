@@ -10,6 +10,12 @@ acknowledgement back immediately, and carries on; when the child settles a
 4d). This ADR records how the background task registry, its notification
 envelope, and the cancellation path fit the Agent.
 
+A SECOND, parallel background registry - detached shell processes launched by
+`run_shell_command` `is_background` - reuses this ADR's notification envelope and
+`notifications` queue and shares `task_stop` (dual-registry resolution), but is
+kept structurally separate because its records and lifecycle differ (OS process
+vs child Run). See ADR-0064.
+
 ## The Agent owns the registry (single owner, ADR-0017)
 
 A background child Run and the record tracking it are mutable Session state: a

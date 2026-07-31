@@ -4,11 +4,16 @@
 //!
 //! `Tools::run` shapes every Tool Result through here; individual tools carry
 //! no size logic. Callers pass the raw Tool Call input; Shaping owns the
-//! read_file resume-marker rule (reading `start_line` from the input so a
-//! cut's resume point is file-absolute). run_command keeps its start AND end
-//! (the exit code and last errors live at the end); read_file cuts at a line
-//! boundary and its marker names the exact `start_line` that continues the
-//! read; every other tool keeps the start.
+//! read_file resume-marker rule (reading `offset` from the input so a cut's
+//! resume point is file-absolute). run_command keeps its start AND end (the exit
+//! code and last errors live at the end); read_file cuts at a line boundary and
+//! its marker names the exact 0-based `offset` that continues the read (qwen's
+//! read_file param, ADR-0060); every other tool keeps the start.
+//!
+//! This Result-Cap fold is a suspenders concern with no qwen equivalent (qwen
+//! truncates by a per-line char limit inside the tool). The marker only needs to
+//! name the real qwen param the model would pass to continue: `offset` (0-based),
+//! plus `limit` to page a bounded window.
 
 use crate::content::ResultBlock;
 use crate::voice;
@@ -89,21 +94,16 @@ fn shape_text(tool_name: &str, input: &Value, content: &str, cap: usize) -> Stri
     if total <= cap {
         content.to_string()
     } else {
-        cut(
-            tool_name,
-            content,
-            cap,
-            total,
-            read_start_line(tool_name, input),
-        )
+        cut(tool_name, content, cap, total, read_offset(tool_name, input))
     }
 }
 
 // Only read_file's cut resumes at an absolute line; every other tool's input
-// carries nothing Shaping needs.
-fn read_start_line(tool_name: &str, input: &Value) -> Option<i64> {
+// carries nothing Shaping needs. read_file's window param is `offset` (0-based,
+// qwen's read_file param); a missing / non-integer offset is treated as 0.
+fn read_offset(tool_name: &str, input: &Value) -> Option<i64> {
     if tool_name == "read_file" {
-        input.get("start_line").and_then(|v| v.as_i64())
+        input.get("offset").and_then(|v| v.as_i64())
     } else {
         None
     }
@@ -114,10 +114,10 @@ fn cut(
     content: &str,
     cap: usize,
     total: usize,
-    start_line: Option<i64>,
+    offset: Option<i64>,
 ) -> String {
     match tool_name {
-        "run_command" => {
+        "run_shell_command" => {
             let head = cap / HEAD_QUARTER;
             let tail = cap - head;
             format!(
@@ -127,25 +127,31 @@ fn cut(
                 char_slice(content, total - tail, tail),
             )
         }
-        "read_file" => cut_read_file(content, cap, total, start_line),
+        "read_file" => cut_read_file(content, cap, total, offset),
         _ => head_cut(content, cap, total),
     }
 }
 
-// Cut at a line boundary and name the absolute resume line. A first line wider
-// than the whole cap falls back to the generic head cut.
-fn cut_read_file(content: &str, cap: usize, total: usize, start_line: Option<i64>) -> String {
+// Cut at a line boundary and name the absolute 0-based resume offset. A first
+// line wider than the whole cap falls back to the generic head cut. `offset` is
+// the read_file call's 0-based offset (qwen param); the shaped content's first
+// line is file-absolute line `offset + 1`.
+fn cut_read_file(content: &str, cap: usize, total: usize, offset: Option<i64>) -> String {
     let lines: Vec<&str> = content.split('\n').collect();
     let kept = whole_lines_within(&lines, cap);
 
     if kept == 0 {
         head_cut(content, cap, total)
     } else {
-        let start = resolve_start_line(start_line);
+        // Convert the 0-based offset to a 1-based start line for the file-
+        // absolute line numbers the marker displays.
+        let start = resolve_offset(offset) + 1;
         let last_shown = start + kept - 1;
         let last_line = start + line_count(content, &lines) - 1;
 
         let body = lines[..kept].join("\n");
+        // The marker names the 0-based offset that continues the read: line
+        // `last_shown + 1` (1-based) is offset `last_shown` (0-based).
         format!("{}{}", body, voice::truncated_file(last_shown, last_line))
     }
 }
@@ -183,10 +189,12 @@ fn line_count(content: &str, lines: &[&str]) -> usize {
     }
 }
 
-fn resolve_start_line(start_line: Option<i64>) -> usize {
-    match start_line {
-        Some(s) if s >= 1 => s as usize,
-        _ => 1,
+// The read_file call's 0-based `offset`, clamped to a non-negative usize. A
+// missing / negative / non-integer offset is a full read from the top (0).
+fn resolve_offset(offset: Option<i64>) -> usize {
+    match offset {
+        Some(o) if o >= 0 => o as usize,
+        _ => 0,
     }
 }
 
@@ -235,7 +243,7 @@ mod tests {
     #[test]
     fn content_within_the_cap_passes_through_untouched() {
         assert_eq!(st("read_file", &json!({}), "short", 100), "short");
-        assert_eq!(st("run_command", &json!({}), "short", 100), "short");
+        assert_eq!(st("run_shell_command", &json!({}), "short", 100), "short");
     }
 
     #[test]
@@ -248,7 +256,7 @@ mod tests {
     fn head_only_shaping_keeps_first_cap_chars_and_appends_marker() {
         let content = "a".repeat(250);
         assert_eq!(
-            st("grep", &json!({}), &content, 100),
+            st("grep_search", &json!({}), &content, 100),
             format!(
                 "{}\n[truncated: output is 250 chars, showing the first 100]",
                 "a".repeat(100)
@@ -267,45 +275,51 @@ mod tests {
 
         let shaped = st("read_file", &json!({}), &content, 100);
 
+        // Offset absent -> a full read from the top: line 10 is the last shown,
+        // and the resume offset is 10 (0-based), i.e. the next line (11, 1-based).
         assert!(shaped.ends_with(
-            "line-0010\n[truncated at line 10 of 30 - continue with read_file start_line 11]"
+            "line-0010\n[truncated at line 10 of 30 - continue with read_file offset 10 (0-based) and a limit]"
         ));
         assert!(!shaped.contains("line-0011"));
     }
 
     #[test]
-    fn read_file_shaping_keeps_line_numbers_file_absolute_via_start_line() {
+    fn read_file_shaping_keeps_line_numbers_file_absolute_via_offset() {
         let content = (1..=30)
             .map(|i| format!("line-{i:04}"))
             .collect::<Vec<_>>()
             .join("\n");
 
-        let shaped = st("read_file", &json!({"start_line": 21}), &content, 100);
+        // offset 20 (0-based) is file line 21; the content the tool returned is
+        // the slice from line 21 on, so its 10th line is file line 30, and the
+        // resume offset is 30 (0-based) = the next line (31, 1-based).
+        let shaped = st("read_file", &json!({"offset": 20}), &content, 100);
 
-        // The content is the slice from line 21 on, so its 10th line is 30.
-        assert!(
-            shaped.contains("[truncated at line 30 of 50 - continue with read_file start_line 31]")
-        );
+        assert!(shaped.contains(
+            "[truncated at line 30 of 50 - continue with read_file offset 30 (0-based) and a limit]"
+        ));
     }
 
     #[test]
-    fn read_file_shaping_treats_a_missing_or_non_numeric_start_line_as_one() {
+    fn read_file_shaping_treats_a_missing_or_non_numeric_offset_as_zero() {
         let content = (1..=30)
             .map(|i| format!("line-{i:04}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let resume = "[truncated at line 10 of 30 - continue with read_file start_line 11]";
+        let resume =
+            "[truncated at line 10 of 30 - continue with read_file offset 10 (0-based) and a limit]";
 
-        assert!(st("read_file", &json!({"path": "a.txt"}), &content, 100).contains(resume));
-        assert!(st("read_file", &json!({"start_line": "21"}), &content, 100).contains(resume));
-        assert!(st("read_file", &json!({"start_line": 0}), &content, 100).contains(resume));
+        assert!(st("read_file", &json!({"file_path": "/a.txt"}), &content, 100).contains(resume));
+        assert!(st("read_file", &json!({"offset": "20"}), &content, 100).contains(resume));
+        // A negative offset is a full read from the top (0).
+        assert!(st("read_file", &json!({"offset": -1}), &content, 100).contains(resume));
     }
 
     #[test]
-    fn non_read_file_tools_ignore_a_start_line_in_the_input() {
+    fn non_read_file_tools_ignore_an_offset_in_the_input() {
         let content = "a".repeat(250);
         assert_eq!(
-            st("grep", &json!({"start_line": 21}), &content, 100),
+            st("grep_search", &json!({"offset": 20}), &content, 100),
             format!(
                 "{}\n[truncated: output is 250 chars, showing the first 100]",
                 "a".repeat(100)
@@ -322,9 +336,9 @@ mod tests {
 
         let shaped = st("read_file", &json!({}), &content, 100);
 
-        assert!(
-            shaped.contains("[truncated at line 10 of 30 - continue with read_file start_line 11]")
-        );
+        assert!(shaped.contains(
+            "[truncated at line 10 of 30 - continue with read_file offset 10 (0-based) and a limit]"
+        ));
     }
 
     #[test]
@@ -342,7 +356,7 @@ mod tests {
     #[test]
     fn run_command_shaping_keeps_head_and_tail_with_omission_marker() {
         let content = format!("HEAD{}TAIL", "x".repeat(500));
-        let shaped = st("run_command", &json!({}), &content, 100);
+        let shaped = st("run_shell_command", &json!({}), &content, 100);
 
         // head = 25 chars, tail = 75 chars, 408 of 508 omitted.
         assert!(shaped.starts_with("HEAD"));

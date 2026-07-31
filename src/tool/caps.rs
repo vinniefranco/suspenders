@@ -115,6 +115,14 @@ pub struct Capabilities {
     /// Run's own subagents capability is degraded, so a subagent cannot spawn a
     /// subagent.
     pub subagents: Arc<dyn SubagentSpawner>,
+    /// The Background-Shell effect seam (Phase 9, ADR-0063): `run_command` with
+    /// `is_background: true` hands its processed command + cwd to the Agent, which
+    /// owns the detached process lifecycle. `dyn` and tx-backed like the Approver
+    /// (the Agent owns the mpsc + the background-shell registry, ADR-0017), so a
+    /// tool cannot own the process. The degraded impl
+    /// ([`UnavailableBackgroundShellSpawner`]) answers a host with no channel (a
+    /// headless run, a test, a child Run - a subagent cannot background a shell).
+    pub bg_shells: Arc<dyn BackgroundShellSpawner>,
 }
 
 impl std::fmt::Debug for Capabilities {
@@ -129,6 +137,7 @@ impl std::fmt::Debug for Capabilities {
             .field("side_query", &"<dyn>")
             .field("questioner", &"<dyn>")
             .field("subagents", &"<dyn>")
+            .field("bg_shells", &"<dyn>")
             .finish()
     }
 }
@@ -391,6 +400,54 @@ impl SubagentSpawner for UnavailableSubagentSpawner {
     }
 }
 
+/// The Background-Shell effect: `run_command` with `is_background: true` hands its
+/// already-processed command + resolved cwd to the host, which spawns the detached
+/// child, owns its wait+stream+capture-file, and settles a parallel background
+/// shell registry (Phase 9, ADR-0063). The Agent owns the process lifecycle, NOT
+/// the tool - a background shell is Agent-owned mutable state (ADR-0017) that must
+/// OUTLIVE the launching turn, so it cannot ride the tool's turn-scoped machinery.
+///
+/// Tx-backed like [`Approver`] (the real impl relays over the Agent's mpsc);
+/// `stop_background` is the leg `task_stop` reaches when the id names a shell
+/// rather than a subagent. Object-safe and `async_trait`-boxed for the same reason
+/// as the other `dyn` seams (RPITIT is not object-safe; see ADR-0055/ADR-0063).
+#[async_trait::async_trait]
+pub trait BackgroundShellSpawner: Send + Sync {
+    /// Spawns the (already-processed) `command` in `cwd` as a detached background
+    /// shell and returns the minted shell id (`bg_{n}`), or an `Err` describing
+    /// why it could not launch (a degraded host) - `run_command` folds the `Err`
+    /// into its own error result.
+    async fn spawn_background(&self, command: String, cwd: String) -> Result<String, String>;
+
+    /// Requests cancellation of a background shell by its id, yielding the VERBATIM
+    /// `task_stop` wording: the running-shell stop confirmation, the not-running
+    /// error, or the not-found error. Never an `Err` - the whole result is the
+    /// wording (see [`SubagentSpawner::stop_background`]).
+    async fn stop_background(&self, id: String) -> Result<String, String>;
+}
+
+/// The degraded [`BackgroundShellSpawner`]: a host with no channel (a headless
+/// run, a test, a child Run) cannot own a detached process, so every spawn is an
+/// `Err`. It is ALSO the recursion guard (ADR-0063): a child Run's Capabilities
+/// carry this, so a subagent cannot background a shell.
+///
+/// Mirrors [`UnavailableSubagentSpawner`] as the headless/test posture (ADR-0019):
+/// the degraded impl returns the safe answer - a plain spawn failure the tool
+/// folds, and the VERBATIM not-found wording for a stop - rather than panicking.
+pub struct UnavailableBackgroundShellSpawner;
+
+#[async_trait::async_trait]
+impl BackgroundShellSpawner for UnavailableBackgroundShellSpawner {
+    async fn spawn_background(&self, _command: String, _cwd: String) -> Result<String, String> {
+        Err("background shells are unavailable in this environment".into())
+    }
+
+    async fn stop_background(&self, id: String) -> Result<String, String> {
+        // No registry here, so any id is not-found (the VERBATIM qwen wording).
+        Ok(format!("Error: No background task found with ID \"{id}\"."))
+    }
+}
+
 #[cfg(test)]
 impl Capabilities {
     /// Capabilities over the full built-in registry and a denying Approver, for
@@ -405,6 +462,7 @@ impl Capabilities {
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         }
     }
 
@@ -420,6 +478,7 @@ impl Capabilities {
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         }
     }
 
@@ -435,6 +494,7 @@ impl Capabilities {
             side_query,
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         }
     }
 
@@ -451,6 +511,7 @@ impl Capabilities {
             side_query: Arc::new(DenyingSideQuery),
             questioner,
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         }
     }
 
@@ -467,6 +528,24 @@ impl Capabilities {
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
             subagents,
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+        }
+    }
+
+    /// Capabilities over a caller-supplied [`BackgroundShellSpawner`] (and the
+    /// full built-in registry + denying effect seams), for the `run_command`
+    /// background-branch tests that inject a scripted spawner and assert what it
+    /// received/returned. The single bg-shells construction site, so a future
+    /// consumer touches one place.
+    pub fn for_test_with_bg_shells(bg_shells: Arc<dyn BackgroundShellSpawner>) -> Self {
+        Capabilities {
+            registry: crate::tool_registry::test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
+            approver: Arc::new(DenyingApprover),
+            side_query: Arc::new(DenyingSideQuery),
+            questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells,
         }
     }
 
@@ -483,6 +562,7 @@ impl Capabilities {
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         }
     }
 }
@@ -539,6 +619,7 @@ mod tests {
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         };
         // The seam is proven with a live wire: the decision travels back through
         // the `Arc<dyn Approver>` the carrier holds.
@@ -593,6 +674,7 @@ mod tests {
             side_query: Arc::new(DenyingSideQuery),
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
         };
         let cloned = caps.clone();
         // The clone shares the same handles (Arc), and both print with the
@@ -604,7 +686,25 @@ mod tests {
         assert!(rendered.contains("side_query"));
         assert!(rendered.contains("questioner"));
         assert!(rendered.contains("subagents"));
+        assert!(rendered.contains("bg_shells"));
         assert!(rendered.contains("<dyn>"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_background_shell_spawner_errs_on_spawn() {
+        let spawner = UnavailableBackgroundShellSpawner;
+        let err = spawner
+            .spawn_background("echo hi".into(), "/tmp".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err, "background shells are unavailable in this environment");
+    }
+
+    #[tokio::test]
+    async fn unavailable_background_shell_spawner_stop_is_not_found() {
+        let spawner = UnavailableBackgroundShellSpawner;
+        let out = spawner.stop_background("bg_1".into()).await.unwrap();
+        assert_eq!(out, "Error: No background task found with ID \"bg_1\".");
     }
 
     /// A fake real [`SubagentSpawner`] that answers with a fixed result. Proves

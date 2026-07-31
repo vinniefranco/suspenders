@@ -1,17 +1,19 @@
 //! `task_stop(task_id)`: stops a background subagent by its task id (faithful to
 //! qwen v0.16.0's `tools/task-stop.ts`, ADR-0063).
 //!
-//! The model reaches for this to cancel a background agent it launched (via
-//! `agent` with `run_in_background: true`) - the task id came back in the launch
-//! string or a `<task-notification>`. The tool reaches the host through the
+//! The model reaches for this to cancel a background agent or shell it launched
+//! (via `agent` with `run_in_background: true`, or `run_shell_command` with
+//! `is_background: true`) - the id came back in the launch string or a
+//! `<task-notification>`. The tool reaches the host through the
 //! [`SubagentSpawner`](crate::tool::caps::SubagentSpawner) capability's
-//! `stop_background`, which relays to the Agent that owns the background registry:
-//! the Agent aborts the running child, sets the entry `Stopped`, queues the `was
-//! cancelled` notification, and returns the VERBATIM qwen wording. Suspenders
-//! ports only the AGENT registry leg of qwen's `task_stop` (the shell/monitor/
-//! memory registries are not ported), so the three outcomes are the running-agent
-//! stop confirmation, the not-running error, and the not-found error - all
-//! VERBATIM.
+//! `stop_background`, which relays to the Agent that owns the background
+//! registries. The Agent resolves the id across BOTH registries (ADR-0064): it
+//! tries the subagent registry, then falls through to the background-shell
+//! registry, aborting the running child/process, queuing the `was cancelled`
+//! notification, and returning the VERBATIM qwen wording. Suspenders ports the
+//! AGENT and SHELL registry legs of qwen's `task_stop` (the monitor/memory
+//! registries are not ported), so the three outcomes are the running stop
+//! confirmation, the not-running error, and the not-found error - all VERBATIM.
 //!
 //! Deferred (`should_defer: true`, qwen's `shouldDefer` - stopping tasks is
 //! infrequent), so the model discovers it via `tool_search`; excluded from every

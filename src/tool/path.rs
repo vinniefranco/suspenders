@@ -214,11 +214,104 @@ pub fn jaro_distance(s1: &str, s2: &str) -> f64 {
     (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / JARO_COMPONENT_COUNT
 }
 
+/// The shell metacharacters qwen's `unescapePath` un-escapes (paths.ts:47,
+/// `SHELL_SPECIAL_CHARS`): a backslash before any of these is a shell escape the
+/// model may have added, and qwen strips the backslash. Kept as a slice so
+/// [`unescape_and_trim`] and a reader both see the exact set.
+const SHELL_SPECIAL_CHARS: &[char] = &[
+    ' ', '\t', '(', ')', '[', ']', '{', '}', ';', '|', '*', '?', '$', '`', '\'', '"', '#', '&',
+    '<', '>', '!', '~',
+];
+
+/// qwen's `unescapePath(path.trim())` preprocessing (ls.ts:363, and the same
+/// step read_file / write_file / edit apply): trim surrounding whitespace, then
+/// remove a single escaping backslash before any shell-special character
+/// (`\(` -> `(`, `\ ` -> ` `). A trailing lone backslash is left as-is (there is
+/// nothing after it to un-escape). Windows-only qwen returns the path unchanged;
+/// suspenders targets Unix paths, so it always un-escapes - matching the
+/// non-Windows branch qwen runs.
+///
+/// SHARED because ls's absolute-path validation, and the file tools' path
+/// intake, all begin with this exact step in qwen; a single helper keeps them
+/// from drifting.
+pub fn unescape_and_trim(path: &str) -> String {
+    let trimmed = path.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                // A backslash before a shell-special char is a shell escape:
+                // drop the backslash, keep the char.
+                Some(&next) if SHELL_SPECIAL_CHARS.contains(&next) => {
+                    out.push(next);
+                    chars.next();
+                }
+                // A backslash before anything else (or at the end) is literal.
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Resolves a model-supplied path against the Project Root and refuses paths
 /// that escape it. A cheap guard, not a sandbox. The Project-Root-only form;
 /// [`resolve_path_in`] adds the trusted-memory allowance.
 pub fn resolve_path(path: &str, root: &Path) -> Result<PathBuf, String> {
     resolve_path_in(path, root, None)
+}
+
+/// Why [`resolve_absolute_in`] refused a model-supplied path. Typed - rather
+/// than a single error string - because qwen's tools each phrase the
+/// absolute-path requirement differently (read_file, edit, write_file,
+/// list_directory all word it their own way). The caller matches the variant and
+/// renders its tool's verbatim message, so the wording lives with the tool and
+/// no consumer parses an error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathReject {
+    /// The path was relative. qwen's file tools require an absolute path.
+    Relative,
+    /// The (absolute) path escaped the Project Root and the trusted memory
+    /// subtree - the confinement boundary [`resolve_path_in`] enforces.
+    Escapes,
+}
+
+/// Resolves a model-supplied ABSOLUTE path and confines it to the Project Root
+/// (or the trusted managed-memory subtree, ADR-0062) - qwen's file-tool path
+/// contract. Unlike [`resolve_path_in`], which joins a *relative* path against
+/// the root, this REFUSES a relative path outright ([`PathReject::Relative`]),
+/// matching qwen's "you must provide an absolute path" requirement. An absolute
+/// path that climbs out of both trusted subtrees is [`PathReject::Escapes`].
+///
+/// Shares the SAME [`confined`] containment predicate as [`resolve_path_in`], so
+/// the security properties - sibling-prefix refusal, filesystem-root memory
+/// boundary ignored - are identical by construction. Two things differ from
+/// `resolve_path_in`: the intake (relative is refused here, not joined) and the
+/// return type (a typed [`PathReject`], not an error string).
+///
+/// The boundary is LEXICAL: `..` and `.` are collapsed without touching the
+/// filesystem, but symlinks are NOT resolved. This matches qwen only up to its
+/// lexical check - qwen additionally `realpath`s the path in `isPathWithinWorkspace`.
+/// Suspenders defers symlink-escape defense to the FS-touching layer (the
+/// read-cache inode key), so this primitive is a lexical confinement guard, not
+/// a realpath sandbox.
+pub fn resolve_absolute_in(
+    path: &str,
+    root: &Path,
+    memory: Option<&Path>,
+) -> Result<PathBuf, PathReject> {
+    if !Path::new(path).is_absolute() {
+        return Err(PathReject::Relative);
+    }
+    let expanded = normalize(Path::new(path));
+    if confined(&expanded, root, memory) {
+        Ok(expanded)
+    } else {
+        Err(PathReject::Escapes)
+    }
 }
 
 /// Resolves a model-supplied path against the Project Root OR, when `memory`
@@ -243,19 +336,31 @@ pub fn resolve_path(path: &str, root: &Path) -> Result<PathBuf, String> {
 /// confinement to the ENTIRE filesystem. Cheaper to guard than to trust every
 /// future caller.
 pub fn resolve_path_in(path: &str, root: &Path, memory: Option<&Path>) -> Result<PathBuf, String> {
-    let root = expand(root);
-    let expanded = expand_against(path, &root);
+    let expanded = expand_against(path, &expand(root));
+    if confined(&expanded, root, memory) {
+        Ok(expanded)
+    } else {
+        Err("path escapes project root".to_string())
+    }
+}
 
-    if contained(&expanded, &root) {
-        return Ok(expanded);
+/// The single, security-load-bearing containment predicate shared by
+/// [`resolve_path_in`] and [`resolve_absolute_in`]: is an already-normalized
+/// absolute path inside the Project Root, or inside the trusted memory subtree
+/// (ADR-0062)? Factored to ONE site so the two intake paths (relative-joined vs
+/// absolute-required) can never drift on the boundary check itself. Purely
+/// lexical - symlinks are NOT resolved here (see [`resolve_absolute_in`]).
+fn confined(expanded: &Path, root: &Path, memory: Option<&Path>) -> bool {
+    if contained(expanded, &expand(root)) {
+        return true;
     }
-    if let Some(mem) = memory {
-        let mem = expand(mem);
-        if is_usable_memory_boundary(&mem) && contained(&expanded, &mem) {
-            return Ok(expanded);
+    match memory {
+        Some(mem) => {
+            let mem = expand(mem);
+            is_usable_memory_boundary(&mem) && contained(expanded, &mem)
         }
+        None => false,
     }
-    Err("path escapes project root".to_string())
 }
 
 /// The minimum normal-component count a memory boundary must have to widen
@@ -479,6 +584,105 @@ mod tests {
             resolve_path_in("/data/projects/slug/memory/../secret", root, Some(mem)),
             Err("path escapes project root".to_string())
         );
+    }
+
+    // ---- resolve_absolute_in: qwen's absolute-required contract ----
+
+    #[test]
+    fn resolve_absolute_refuses_a_relative_path() {
+        // qwen's file tools require an absolute path; a relative one is a typed
+        // Relative rejection the tool renders as its own verbatim message.
+        let root = Path::new("/proj");
+        assert_eq!(
+            resolve_absolute_in("sub/file.txt", root, None),
+            Err(PathReject::Relative)
+        );
+        assert_eq!(
+            resolve_absolute_in("./file.txt", root, None),
+            Err(PathReject::Relative)
+        );
+        // Empty string is relative, so it folds into Relative - callers need no
+        // separate non-empty guard before the absolute check.
+        assert_eq!(
+            resolve_absolute_in("", root, None),
+            Err(PathReject::Relative)
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_accepts_an_absolute_path_inside_the_root() {
+        let root = Path::new("/proj");
+        assert_eq!(
+            resolve_absolute_in("/proj/src/lib.rs", root, None),
+            Ok(PathBuf::from("/proj/src/lib.rs"))
+        );
+        // The root itself is contained.
+        assert_eq!(
+            resolve_absolute_in("/proj", root, None),
+            Ok(PathBuf::from("/proj"))
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_refuses_an_absolute_path_outside_the_root() {
+        let root = Path::new("/proj");
+        assert_eq!(
+            resolve_absolute_in("/etc/passwd", root, None),
+            Err(PathReject::Escapes)
+        );
+        // A sibling sharing the string prefix but not the component boundary.
+        assert_eq!(
+            resolve_absolute_in("/proj-evil/x", root, None),
+            Err(PathReject::Escapes)
+        );
+        // A `..` climb out of the root, detected lexically.
+        assert_eq!(
+            resolve_absolute_in("/proj/../etc/passwd", root, None),
+            Err(PathReject::Escapes)
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_honors_the_trusted_memory_subtree() {
+        let root = Path::new("/proj");
+        let mem = Path::new("/data/projects/slug/memory");
+        assert_eq!(
+            resolve_absolute_in("/data/projects/slug/memory/MEMORY.md", root, Some(mem)),
+            Ok(PathBuf::from("/data/projects/slug/memory/MEMORY.md"))
+        );
+        // A sibling of the memory root is still refused.
+        assert_eq!(
+            resolve_absolute_in("/data/projects/slug/memory-evil/x", root, Some(mem)),
+            Err(PathReject::Escapes)
+        );
+        // A filesystem-root memory boundary does not widen confinement.
+        assert_eq!(
+            resolve_absolute_in("/etc/passwd", root, Some(Path::new("/"))),
+            Err(PathReject::Escapes)
+        );
+    }
+
+    // ---- unescape_and_trim ----
+
+    #[test]
+    fn unescape_and_trim_strips_surrounding_whitespace() {
+        assert_eq!(unescape_and_trim("  /a/b  "), "/a/b");
+        assert_eq!(unescape_and_trim("\t/a/b\n"), "/a/b");
+    }
+
+    #[test]
+    fn unescape_and_trim_removes_shell_escapes() {
+        // A backslash before a shell-special char is dropped.
+        assert_eq!(unescape_and_trim(r"/a/my\ dir"), "/a/my dir");
+        assert_eq!(unescape_and_trim(r"/a/b\(1\)"), "/a/b(1)");
+        assert_eq!(unescape_and_trim(r"/a/\*star"), "/a/*star");
+    }
+
+    #[test]
+    fn unescape_and_trim_leaves_non_escape_backslashes() {
+        // A backslash before a non-special char (or at the end) is literal.
+        assert_eq!(unescape_and_trim(r"/a/b\c"), r"/a/b\c");
+        assert_eq!(unescape_and_trim(r"/a/b\"), r"/a/b\");
     }
 
     // ---- file_error/3 ----

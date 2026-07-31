@@ -2,6 +2,11 @@
 //! detection - the pure input-shaping half of the tool, split out of
 //! `read_file.rs` so the dispatch module stays focused on the block-emitting
 //! branches. Both `run` (text) and `run_rich` (multimodal) decode through here.
+//!
+//! The model-facing contract is qwen v0.16.0 `tools/read-file.ts`: an ABSOLUTE
+//! `file_path`, an optional 0-based `offset` line, an optional `limit` line
+//! count, and an optional PDF `pages` range. The verbatim validation messages
+//! this module returns are copied from that file's `validateToolParamValues`.
 
 use serde_json::Value;
 
@@ -12,25 +17,75 @@ use super::pdf;
 /// limit), enforced in [`pages`].
 const MAX_PDF_PAGES: u64 = 20;
 
-pub(super) fn read_path(input: &Value) -> Result<&str, String> {
-    input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "invalid input: read_file requires a string \"path\"".to_string())
+/// The decoded, validated read_file text-window request (qwen's `offset` /
+/// `limit`). `offset` is a 0-based start line; `limit` is a line count. Absent
+/// values leave the window open (read from the top / to the end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Window {
+    /// 0-based start line (qwen `offset`). `None` reads from the top.
+    pub offset: Option<u64>,
+    /// Maximum number of lines to read (qwen `limit`). `None` reads to the end.
+    pub limit: Option<u64>,
 }
 
-// The model may supply start_line; default 1, and reject non-positive/non-int.
-pub(super) fn start_line(input: &Value) -> Result<i64, String> {
-    match input.get("start_line") {
-        None | Some(Value::Null) => Ok(1),
-        // A number binds its `i64` in the arm (no `is_i64` + unwrap): a positive
-        // integer wins, and a non-integer or non-positive number falls to the
-        // error arm because its `as_i64()` is `None`/`< 1` and the guard fails.
-        Some(Value::Number(n)) if n.as_i64().is_some_and(|v| v >= 1) => {
-            Ok(n.as_i64().filter(|v| *v >= 1).unwrap_or(1))
-        }
+impl Window {
+    /// Whether this is a whole-file TEXT window (no offset, no limit). This is
+    /// the offset/limit axis ONLY; the PDF `pages` axis is a separate param the
+    /// text `Window` does not model. The text `run` path has no `pages`, so
+    /// `is_full` is the whole fullness there; the `run_rich` fast-path, which
+    /// serves the unchanged placeholder for the text/svg arms, ANDs
+    /// `pages.is_none()` at the call site to cover the PDF axis. Keeping the two
+    /// axes separate is deliberate: pages is not a line window.
+    pub fn is_full(self) -> bool {
+        self.offset.is_none() && self.limit.is_none()
+    }
+}
+
+pub(super) fn file_path(input: &Value) -> Result<String, String> {
+    let raw = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "invalid input: read_file requires a string \"file_path\"".to_string())?;
+    // qwen's `unescapePath(params.file_path.trim())` (read-file.ts): trim
+    // surrounding whitespace and strip shell-escaping backslashes BEFORE the
+    // absolute-path check and before the path is echoed back, so a padded or
+    // shell-escaped path validates and displays in its clean form.
+    Ok(crate::tool::path::unescape_and_trim(raw))
+}
+
+/// Decode the `offset` / `limit` window, rejecting non-integers and the
+/// out-of-range values with qwen's verbatim messages (read-file.ts
+/// `validateToolParamValues`): "Offset must be a non-negative number" (offset
+/// < 0) and "Limit must be a positive number" (limit <= 0).
+pub(super) fn window(input: &Value) -> Result<Window, String> {
+    let offset = optional_number("offset", input, "Offset must be a non-negative number", false)?;
+    let limit = optional_number("limit", input, "Limit must be a positive number", true)?;
+    Ok(Window { offset, limit })
+}
+
+/// Decode an optional non-negative integer param. A negative integer (offset) or
+/// a non-positive integer (limit, when `positive`) is rejected with `oob_msg`
+/// (qwen's per-param verbatim message); a non-integer number or a non-number is
+/// a structured input error. Absent / null yields `None`.
+fn optional_number(
+    key: &str,
+    input: &Value,
+    oob_msg: &str,
+    positive: bool,
+) -> Result<Option<u64>, String> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_u64() {
+            // `limit` must be strictly positive; `offset` may be 0.
+            Some(0) if positive => Err(oob_msg.to_string()),
+            Some(v) => Ok(Some(v)),
+            // A negative integer fails `as_u64` but parses as `i64` -> qwen's
+            // out-of-range message; a float fails both -> structured error.
+            None if n.as_i64().is_some() => Err(oob_msg.to_string()),
+            None => Err(format!("invalid input: {key} must be an integer, got {n}")),
+        },
         Some(other) => Err(format!(
-            "invalid input: start_line must be a positive integer, got {}",
+            "invalid input: {key} must be an integer, got {}",
             inspect(other)
         )),
     }
@@ -72,20 +127,23 @@ explicit end page within the 20-page limit (e.g. '3-22')."
 
 // ---- validation of media params against the file kind -----------------------
 
-/// Reject start_line/pages on kinds that do not window (qwen's ipynb rejections
-/// generalized to the media kinds): notebooks / images / PDFs are always read in
-/// full, so a windowing param on them is a hard error naming the reason.
+/// Reject offset/limit/pages on kinds that do not window the way text does.
+/// Notebooks are always read in full (qwen's `.ipynb` rejections, verbatim);
+/// images / PDFs do not read by line, so a window on them is a hard error naming
+/// the reason. `pages` is valid only for PDFs.
 pub(super) fn validate_media_params(
     path: &str,
     abs: &std::path::Path,
-    start: i64,
+    window: Window,
     pages: Option<&str>,
 ) -> Result<(), String> {
+    let windowed = window.offset.is_some() || window.limit.is_some();
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if ext == "ipynb" {
-        if start != 1 {
+        // qwen read-file.ts: the verbatim `.ipynb` rejections.
+        if windowed {
             return Err(
-                "start_line is not supported for Jupyter notebook (.ipynb) files. \
+                "offset and limit are not supported for Jupyter notebook (.ipynb) files. \
 Notebooks are always read in full with structured cell output."
                     .to_string(),
             );
@@ -100,16 +158,16 @@ Notebooks are always read in full with structured cell output."
         return Ok(());
     }
 
-    // For image / PDF, a start_line makes no sense (the file is not read by
+    // For image / PDF, a line window makes no sense (the file is not read by
     // line). Detect the kind from a head sample so a mislabeled binary is caught
     // too. `pages` is valid only for PDFs.
-    if start != 1 || pages.is_some() {
+    if windowed || pages.is_some() {
         let head = read_head(abs);
         match detect::detect(path, &head) {
             FileType::Image => {
-                if start != 1 {
-                    return Err("start_line is not supported for image files. Images are \
-read in full."
+                if windowed {
+                    return Err("offset and limit are not supported for image files. Images \
+are read in full."
                         .to_string());
                 }
                 if pages.is_some() {
@@ -117,9 +175,9 @@ read in full."
                 }
             }
             FileType::Pdf => {
-                if start != 1 {
+                if windowed {
                     return Err(
-                        "start_line is not supported for PDF files. Use the 'pages' \
+                        "offset and limit are not supported for PDF files. Use the 'pages' \
 parameter to read a specific page range as text."
                             .to_string(),
                     );
@@ -163,7 +221,7 @@ pub(super) fn basename(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-// Elixir `inspect/1` for the values start_line can carry: a quoted string, or
+// Elixir `inspect/1` for the values a param can carry: a quoted string, or
 // a JSON-ish rendering for anything else.
 fn inspect(value: &Value) -> String {
     match value {

@@ -1,72 +1,101 @@
-//! `grep(pattern, path?)`: regex search under a path (default `.`), returning
-//! `relative/path:line: text` lines. Walks through the shared
-//! [`crate::walk::walk_files`], so it respects `.gitignore`, skips well-known
-//! vendored/build directories, and never follows symlinks; also skips binary
-//! files; capped at 100 matches.
+//! `grep(pattern, path?, glob?, limit?)`: regex content search, a faithful port
+//! of qwen v0.16.0 `tools/ripGrep.ts` (`RipGrepTool`, the default GREP tool -
+//! `useRipgrep` defaults true). Returns matching lines as flat
+//! `path:line:content` entries under a verbatim `Found N match(es) ...:\n---\n`
+//! header, grouped only by qwen's join (one line per match, in walk order).
 //!
-//! A pattern that fails to compile as a regex is retried as literal text, with
-//! a note prefixed to the result - the same forgive-the-caller philosophy as
-//! edit_file's two-pass matching. Small models routinely emit `foo(bar`
-//! meaning the literal characters; bouncing that back costs a full model
-//! response on a slow local server.
+//! The engine stays IN-PROCESS: qwen shells out to the `rg` binary with
+//! `--ignore-case --regexp`, but suspenders keeps the Rust `regex` crate + the
+//! shared [`crate::walk::walk_files`] walker. The Rust regex syntax is close
+//! enough to ripgrep's that the model-facing "built on ripgrep" description
+//! holds. Search is always CASE-INSENSITIVE (qwen passes `--ignore-case`).
+//!
+//! Matching respects `.gitignore` (via the walker, qwen's default
+//! `respectGitIgnore`) and `.qwenignore` (via [`crate::walk::qwenignore`],
+//! qwen's default `respectQwenIgnore`), the latter anchored to the PROJECT ROOT
+//! (`ctx.root`), like glob (ripGrep.ts:404-435). Well-known vendored/build
+//! directories are skipped and symlinks are never followed; binary files are
+//! skipped.
+//!
+//! An invalid regex is REJECTED at validation with qwen's verbatim
+//! `"Invalid regular expression pattern: ..."` message (ripGrep.ts:544-549) -
+//! there is no literal-text fallback. The `glob` param filters walked files by
+//! a shell glob (qwen's `rg --glob`); `limit` caps the number of matching lines
+//! (qwen's `min(truncateToolOutputLines, limit)`), with a verbatim truncation
+//! trailer.
+//!
+//! CONFINEMENT (a deliberate divergence from qwen). qwen resolves `path` with
+//! `allowExternalPaths: true` and gates an out-of-workspace path behind a
+//! runtime ask-permission (`getDefaultPermission` returns `'ask'`,
+//! ripGrep.ts:146-159) rather than refusing it. Suspenders has no
+//! ask-permission seam, so it deliberately TIGHTENS to hard-refuse a `path`
+//! that climbs out of the Project Root (`with_path`, the sibling read-only
+//! tools' confinement) before the walk. This is the faithful-as-possible analog
+//! and it matches the project-wide confinement decision. Paths are resolved
+//! relative to the project root (qwen's relative-to-target-dir handling), not as
+//! required-absolute.
 
 use crate::tool::path::{FileError, file_error, resolve_path, with_path};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
-use crate::walk::walk_files;
-use regex::Regex;
+use crate::glob_match;
+use crate::walk::{qwenignore, walk_files};
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::path::Path;
 
 pub struct Grep;
 
-const MAX_MATCHES: usize = 100;
+/// The number of matching lines beyond which the output is truncated (qwen's
+/// default `truncateToolOutputLines`, config.ts:427). qwen's effective line
+/// limit is `min(truncateToolOutputLines, params.limit ?? Infinity)`
+/// (ripGrep.ts:292-295); with no `limit` this 1000-line cap is what binds.
+const DEFAULT_LINE_LIMIT: usize = 1000;
+
 const BINARY_PROBE_BYTES: usize = 8_192;
-const LITERAL_NOTE: &str = "[pattern is not valid regex - searched for it as literal text]\n";
+
+/// The verbatim tool description (qwen ripGrep.ts:497).
+const DESCRIPTION: &str = "A powerful search tool built on ripgrep\n\n  Usage:\n  - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n  - Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n  - Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\")\n  - Use Agent tool for open-ended searches requiring multiple rounds\n  - Pattern syntax: Uses ripgrep (not grep) - special regex characters need escaping (use `interface\\{\\}` to find `interface{}` in Go code)\n";
+
+/// The verbatim `pattern` property description (qwen ripGrep.ts:503-504).
+const PATTERN_DESCRIPTION: &str =
+    "The regular expression pattern to search for in file contents";
+
+/// The verbatim `glob` property description (qwen ripGrep.ts:508-509).
+const GLOB_DESCRIPTION: &str =
+    "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob";
+
+/// The verbatim `path` property description (qwen ripGrep.ts:513-514).
+const PATH_DESCRIPTION: &str =
+    "File or directory to search in (rg PATH). Defaults to current working directory.";
+
+/// The verbatim `limit` property description (qwen ripGrep.ts:518-519).
+const LIMIT_DESCRIPTION: &str =
+    "Limit output to first N lines/entries. Optional - shows all matches if not specified.";
 
 #[async_trait::async_trait]
 impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "grep".into(),
-            description: format!(
-                "A powerful content-search tool that scans file contents with a regular expression \
-                and returns matching lines as `path:line: text`.\n\
-                \n\
-                Usage:\n\
-                - ALWAYS use this grep tool for searching file contents. Do NOT invoke `grep` or \
-                `rg` through run_command - this tool is set up with the correct project confinement \
-                (it stays inside the project root, skips vendored/build directories, and never \
-                follows symlinks).\n\
-                - Supports full regular-expression syntax, e.g. \"log.*Error\", \"fn\\\\s+\\\\w+\", \
-                \"TODO|FIXME\". Special regex metacharacters need escaping to match them literally \
-                (use \"interface\\\\{{\\\\}}\" to find `interface{{}}` in Go code).\n\
-                - Forgiving fallback: a pattern that fails to compile as a regex is retried as \
-                literal text (with a note prefixed to the result) rather than erroring, so \
-                \"foo(bar\" finds the literal characters. Zero matches from a VALID regex is a real \
-                answer and never falls back.\n\
-                - Scope: searches recursively under `path` (default the project root); `path` may \
-                also be a single file. Respects .gitignore, skips .git, _build, deps, node_modules \
-                and other vendored/build directories, and skips binary files.\n\
-                - Output is capped at {MAX_MATCHES} matches; a trailer notes when the cap was \
-                reached. \"[no matches]\" is returned when nothing matches.\n\
-                - Use this to find where a symbol or string is defined or used before reading \
-                files. To find files by NAME rather than by content, use glob instead."
-            ),
+            name: "grep_search".into(),
+            description: DESCRIPTION.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "The regular expression to search for in file contents, \
-                            matched against each line, e.g. \"fn run\" or \"impl\\\\s+Tool\". A \
-                            pattern that is not valid regex is searched as literal text instead of \
-                            erroring."
+                        "description": PATTERN_DESCRIPTION
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": GLOB_DESCRIPTION
                     },
                     "path": {
                         "type": "string",
-                        "description": "The directory or file to search in, relative to the \
-                            project root (e.g. \"src/tools\"). Defaults to \".\" (the project \
-                            root). Do not pass an absolute path."
+                        "description": PATH_DESCRIPTION
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": LIMIT_DESCRIPTION
                     }
                 },
                 "required": ["pattern"]
@@ -79,67 +108,175 @@ impl Tool for Grep {
             .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "invalid input: grep requires a string \"pattern\"".to_string())?;
-        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        // path is optional (qwen: defaults to the search directory); a
+        // non-string path is an error.
+        let path = match input.get("path") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return Err("path must be a string".to_string()),
+        };
+        // glob is optional; a non-string glob is an error.
+        let glob = match input.get("glob") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return Err("glob must be a string".to_string()),
+        };
+        // limit is optional; a non-integer limit is an error. qwen caps the
+        // number of matching lines shown.
+        let limit = match input.get("limit") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(n) => Some(n as usize),
+                None => return Err("limit must be a number".to_string()),
+            },
+        };
 
-        let (regex, note) = compile(pattern);
+        // CASE-INSENSITIVE always (qwen `--ignore-case`). An invalid regex is
+        // rejected with qwen's verbatim message, no literal fallback.
+        let regex = compile(pattern)?;
+        // A glob filter, translated to a case-insensitive path regex by the
+        // shared helper (the same translation glob uses), or none.
+        let glob_regex = match glob {
+            Some(g) => Some(glob_match::compile(g)?),
+            None => None,
+        };
 
-        with_path(path, ctx, |abs| {
-            // Expanded the same way with_path expands it, so relative_to
-            // strips cleanly.
-            let root = resolve_path(".", &ctx.root).unwrap_or_else(|_| ctx.root.clone());
+        with_path(path.unwrap_or("."), ctx, |abs| {
+            // The search dir root, expanded the way with_path expands it so the
+            // reported relative paths strip cleanly. For a single-file target,
+            // `rg PATH` reports the file as passed; stripping against its PARENT
+            // yields the filename (stripping against the file itself would give
+            // an empty path).
+            let resolved =
+                resolve_path(path.unwrap_or("."), &ctx.root).unwrap_or_else(|_| abs.to_path_buf());
 
-            let result = if abs.is_file() {
-                search(&[abs.to_path_buf()], &regex, &root)
+            let (files, root) = if abs.is_file() {
+                let parent = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved.clone());
+                (vec![abs.to_path_buf()], parent)
             } else if abs.is_dir() {
-                search(&walk_files(abs), &regex, &root)
+                (walk_files(abs), resolved)
             } else {
-                Err(file_error("grep", path, FileError::Enoent))
+                return Err(file_error("grep_search", path.unwrap_or("."), FileError::Enoent));
             };
 
-            result.map(|out| format!("{note}{out}"))
+            // qwen's verbatim location clause (ripGrep.ts:195-199): a given
+            // `path` reads "in path \"P\""; the default reads "in the workspace
+            // directory". Suspenders has a single project root, so the
+            // multi-workspace clause never applies.
+            let location = match path {
+                Some(p) => format!("in path \"{p}\""),
+                None => "in the workspace directory".to_string(),
+            };
+
+            Ok(search(
+                &files,
+                &regex,
+                glob_regex.as_ref(),
+                &root,
+                &ctx.root,
+                pattern,
+                glob,
+                &location,
+                limit,
+            ))
         })
     }
 }
 
-// Two-pass, like edit_file: (1) compile as regex; (2) only when that fails,
-// escape and search the pattern as literal text, telling the model via the
-// note. Zero matches from a VALID regex is a real answer and never falls back.
-fn compile(pattern: &str) -> (Regex, String) {
-    match Regex::new(pattern) {
-        Ok(re) => (re, String::new()),
-        Err(_) => (
-            Regex::new(&regex::escape(pattern)).expect("escaped pattern always compiles"),
-            LITERAL_NOTE.to_string(),
-        ),
-    }
+// Compile the pattern as a CASE-INSENSITIVE regex (qwen `--ignore-case`). An
+// invalid regex is rejected with qwen's verbatim message (ripGrep.ts:548),
+// there is no literal-text fallback.
+fn compile(pattern: &str) -> Result<Regex, String> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| format!("Invalid regular expression pattern: {pattern}. Error: {e}"))
 }
 
-fn search(files: &[std::path::PathBuf], regex: &Regex, root: &Path) -> Result<String, String> {
-    let mut matches: Vec<String> = Vec::new();
-    let mut capped = false;
-
+// Walk the collected files, gathering `path:line:content` matches (in walk
+// order, one per matching line), filtered by the `.qwenignore` matcher and the
+// optional `glob`, capped at qwen's line limit, and rendered under qwen's
+// verbatim header (or the zero-match line).
+//
+// `rel_root` is the search dir: reported paths and the glob are matched against
+// each file's path relative to it (`rg` reports paths relative to its PATH arg,
+// and `--glob` matches those relative paths). `.qwenignore` is anchored to the
+// PROJECT ROOT (`project_root`), NOT the search dir, so a root-anchored pattern
+// means the same thing regardless of `path` (ripGrep.ts:404-435, mirroring
+// glob.rs).
+#[allow(clippy::too_many_arguments)]
+fn search(
+    files: &[std::path::PathBuf],
+    regex: &Regex,
+    glob_regex: Option<&Regex>,
+    rel_root: &Path,
+    project_root: &Path,
+    pattern: &str,
+    glob: Option<&str>,
+    location: &str,
+    limit: Option<usize>,
+) -> String {
+    let mut all_lines: Vec<String> = Vec::new();
     for file in files {
-        matches.extend(matches_in(file, regex, root));
-        if matches.len() > MAX_MATCHES {
-            matches.truncate(MAX_MATCHES);
-            capped = true;
-            break;
+        if qwenignore::is_ignored(project_root, file) {
+            continue;
         }
+        let relative = relative_to(file, rel_root);
+        if let Some(gr) = glob_regex
+            && !gr.is_match(&relative)
+        {
+            continue;
+        }
+        all_lines.extend(matches_in(file, regex, &relative));
     }
 
-    if matches.is_empty() {
-        Ok("[no matches]".to_string())
-    } else if capped {
-        Ok(format!(
-            "{}\n[capped at {MAX_MATCHES} matches]",
-            matches.join("\n")
-        ))
-    } else {
-        Ok(matches.join("\n"))
+    // The location + filter clauses that qwen appends to both the header and the
+    // zero-match message (ripGrep.ts:201-203, 289).
+    let filter = match glob {
+        Some(g) => format!(" (filter: \"{g}\")"),
+        None => String::new(),
+    };
+
+    if all_lines.is_empty() {
+        // VERBATIM qwen ripGrep.ts:207 (llmContent).
+        return format!("No matches found for pattern \"{pattern}\" {location}{filter}.");
     }
+
+    let total = all_lines.len();
+    let match_term = if total == 1 { "match" } else { "matches" };
+
+    // qwen's effective line limit: min(truncateToolOutputLines, limit ?? inf)
+    // (ripGrep.ts:292-295).
+    let line_limit = limit.map(|l| l.min(DEFAULT_LINE_LIMIT)).unwrap_or(DEFAULT_LINE_LIMIT);
+    let truncated = total > line_limit;
+    let shown = if truncated {
+        &all_lines[..line_limit]
+    } else {
+        &all_lines[..]
+    };
+
+    // VERBATIM qwen header (ripGrep.ts:289).
+    let mut message = format!(
+        "Found {total} {match_term} for pattern \"{pattern}\" {location}{filter}:\n---\n{}",
+        shown.join("\n")
+    );
+
+    if truncated {
+        // VERBATIM qwen truncation trailer (ripGrep.ts:349): omitted = total
+        // minus the number of lines actually included.
+        let omitted = total - shown.len();
+        let line_term = if omitted == 1 { "line" } else { "lines" };
+        message.push_str(&format!("\n---\n[{omitted} {line_term} truncated] ..."));
+    }
+
+    message
 }
 
-fn matches_in(file: &Path, regex: &Regex, root: &Path) -> Vec<String> {
+// Read a file and collect `path:line:content` for each line the regex matches.
+// A binary file (or an unreadable one) yields no matches. The trailing newline
+// is already stripped by the line split; content is NOT otherwise trimmed
+// (qwen only strips a trailing `\r?\n`, ripGrep.ts:232).
+fn matches_in(file: &Path, regex: &Regex, relative: &str) -> Vec<String> {
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(_) => return Vec::new(),
@@ -148,24 +285,28 @@ fn matches_in(file: &Path, regex: &Regex, root: &Path) -> Vec<String> {
         return Vec::new();
     }
     let content = String::from_utf8_lossy(&bytes);
-    matching_lines(&content, file, regex, root)
-}
-
-fn matching_lines(content: &str, file: &Path, regex: &Regex, root: &Path) -> Vec<String> {
-    let relative = relative_to(file, root);
-    content
-        .split('\n')
+    // Strip ONE trailing `\n` so a file ending in a newline does not split into
+    // a phantom trailing empty segment: `"a\nb\n".split('\n')` yields
+    // `["a", "b", ""]`, and an empty-matching regex (`^`, `.*`, `x*`) would
+    // otherwise count that empty tail as a match, inflating the total past what
+    // ripgrep reports. An empty file yields ZERO lines (not one empty line).
+    let body = content.strip_suffix('\n').unwrap_or(&content);
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split('\n')
         .enumerate()
         .filter(|(_, line)| regex.is_match(line))
-        .map(|(i, line)| format!("{relative}:{}: {line}", i + 1))
+        .map(|(i, line)| format!("{relative}:{}:{}", i + 1, line.strip_suffix('\r').unwrap_or(line)))
         .collect()
 }
 
-// Elixir's Path.relative_to/2: strip the root prefix, else return the path.
+// Strip the search-root prefix so paths report relative to the search dir
+// (qwen's `rg PATH`-relative paths), always with `/` separators.
 fn relative_to(file: &Path, root: &Path) -> String {
     match file.strip_prefix(root) {
-        Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => file.to_string_lossy().into_owned(),
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => file.to_string_lossy().replace('\\', "/"),
     }
 }
 
@@ -189,14 +330,32 @@ mod tests {
     }
 
     #[test]
-    fn spec_requires_pattern_only() {
+    fn spec_requires_pattern_only_and_carries_the_verbatim_strings() {
         let spec = Grep.spec();
-        assert_eq!(spec.name, "grep");
+        assert_eq!(spec.name, "grep_search");
         assert_eq!(spec.input_schema["required"], json!(["pattern"]));
+        assert_eq!(
+            spec.input_schema["properties"]["pattern"]["description"],
+            json!(PATTERN_DESCRIPTION)
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["glob"]["description"],
+            json!(GLOB_DESCRIPTION)
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["path"]["description"],
+            json!(PATH_DESCRIPTION)
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["limit"]["description"],
+            json!(LIMIT_DESCRIPTION)
+        );
+        assert!(spec.description.starts_with("A powerful search tool built on ripgrep"));
+        assert!(spec.description.contains("Use Agent tool for open-ended searches"));
     }
 
     #[tokio::test]
-    async fn returns_relative_path_line_text_matches() {
+    async fn returns_matches_under_the_verbatim_header() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
         std::fs::write(
@@ -208,19 +367,32 @@ mod tests {
 
         assert_eq!(
             run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
-            Ok("lib/a.ex:2:   # needle here".into())
+            Ok("Found 1 match for pattern \"needle\" in the workspace directory:\n---\nlib/a.ex:2:  # needle here".into())
         );
     }
 
     #[tokio::test]
-    async fn supports_regex_patterns() {
+    async fn plural_match_term_and_multiple_lines() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "foo1\nfoo2\nbar3\n").unwrap();
 
         assert_eq!(
             run(json!({"pattern": r"^foo\d$"}), &ctx(tmp.path())).await,
-            Ok("a.txt:1: foo1\na.txt:2: foo2".into())
+            Ok("Found 2 matches for pattern \"^foo\\d$\" in the workspace directory:\n---\na.txt:1:foo1\na.txt:2:foo2".into())
         );
+    }
+
+    #[tokio::test]
+    async fn search_is_case_insensitive() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "Needle here\nNEEDLE too\n").unwrap();
+
+        let out = run(json!({"pattern": "needle"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(out.contains("a.txt:1:Needle here"));
+        assert!(out.contains("a.txt:2:NEEDLE too"));
+        assert!(out.starts_with("Found 2 matches"));
     }
 
     #[cfg(unix)]
@@ -229,30 +401,25 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("real.txt"), "needle inside\n").unwrap();
-
-        // Cycle: a symlink back to the Project Root itself.
         symlink(".", tmp.path().join("loop")).unwrap();
-
-        // Escape: a symlink to a directory outside the Project Root.
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "needle outside\n").unwrap();
         symlink(outside.path(), tmp.path().join("escape")).unwrap();
-
-        // Symlinked file is skipped too.
         symlink(
             outside.path().join("secret.txt"),
             tmp.path().join("linked.txt"),
         )
         .unwrap();
 
-        assert_eq!(
-            run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
-            Ok("real.txt:1: needle inside".into())
-        );
+        let out = run(json!({"pattern": "needle"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(out.contains("real.txt:1:needle inside"));
+        assert!(!out.contains("outside"));
     }
 
     #[tokio::test]
-    async fn searches_only_under_the_given_path() {
+    async fn searches_only_under_the_given_path_and_reports_it() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
         std::fs::create_dir_all(tmp.path().join("other")).unwrap();
@@ -260,12 +427,8 @@ mod tests {
         std::fs::write(tmp.path().join("other/b.ex"), "needle\n").unwrap();
 
         assert_eq!(
-            run(
-                json!({"pattern": "needle", "path": "lib"}),
-                &ctx(tmp.path())
-            )
-            .await,
-            Ok("lib/a.ex:1: needle".into())
+            run(json!({"pattern": "needle", "path": "lib"}), &ctx(tmp.path())).await,
+            Ok("Found 1 match for pattern \"needle\" in path \"lib\":\n---\na.ex:1:needle".into())
         );
     }
 
@@ -275,13 +438,74 @@ mod tests {
         std::fs::write(tmp.path().join("single.txt"), "one needle\n").unwrap();
 
         assert_eq!(
-            run(
-                json!({"pattern": "needle", "path": "single.txt"}),
-                &ctx(tmp.path())
-            )
-            .await,
-            Ok("single.txt:1: one needle".into())
+            run(json!({"pattern": "needle", "path": "single.txt"}), &ctx(tmp.path())).await,
+            Ok("Found 1 match for pattern \"needle\" in path \"single.txt\":\n---\nsingle.txt:1:one needle".into())
         );
+    }
+
+    #[tokio::test]
+    async fn glob_filters_the_walked_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "needle\n").unwrap();
+
+        let out = run(json!({"pattern": "needle", "glob": "*.rs"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "Found 1 match for pattern \"needle\" in the workspace directory (filter: \"*.rs\"):\n---\na.rs:1:needle"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_can_cross_directories_with_double_star() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/net")).unwrap();
+        std::fs::write(tmp.path().join("src/net/client.rs"), "needle\n").unwrap();
+        std::fs::write(tmp.path().join("top.txt"), "needle\n").unwrap();
+
+        let out = run(json!({"pattern": "needle", "glob": "**/*.rs"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(out.contains("src/net/client.rs:1:needle"));
+        assert!(!out.contains("top.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_slash_free_glob_filter_matches_at_any_depth() {
+        // ripgrep --glob semantics: a slash-free `*.rs` filters files at ANY
+        // depth, so a deeply nested match survives the filter.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/nested")).unwrap();
+        std::fs::write(tmp.path().join("src/nested/a.rs"), "needle\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "needle\n").unwrap();
+
+        let out = run(json!({"pattern": "needle", "glob": "*.rs"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(out.contains("src/nested/a.rs:1:needle"));
+        assert!(!out.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_matching_regex_does_not_count_a_phantom_trailing_line() {
+        // A file ending in "\n" must NOT report a phantom match on the empty
+        // segment `split('\n')` produces after the final newline: `^` over
+        // "a\nb\n" is 2 matches (the two real lines), not 3.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "a\nb\n").unwrap();
+
+        let out = run(json!({"pattern": "^"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(
+            out.starts_with("Found 2 matches for pattern \"^\" in the workspace directory:\n---\n"),
+            "got: {out}"
+        );
+        assert!(out.contains("f.txt:1:a"));
+        assert!(out.contains("f.txt:2:b"));
+        assert!(!out.contains("f.txt:3:"));
     }
 
     #[tokio::test]
@@ -304,23 +528,62 @@ mod tests {
 
         assert_eq!(
             run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
-            Ok("visible.txt:1: needle".into())
+            Ok("Found 1 match for pattern \"needle\" in the workspace directory:\n---\nvisible.txt:1:needle".into())
         );
     }
 
     #[tokio::test]
     async fn respects_a_gitignore() {
         let tmp = TempDir::new().unwrap();
-        // The unification proof: grep no longer returns a match inside a
-        // .gitignore'd file, where the old SKIP_DIRS-only walk would have.
         std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(tmp.path().join("ignored.txt"), "needle\n").unwrap();
         std::fs::write(tmp.path().join("kept.txt"), "needle\n").unwrap();
 
         assert_eq!(
             run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
-            Ok("kept.txt:1: needle".into())
+            Ok("Found 1 match for pattern \"needle\" in the workspace directory:\n---\nkept.txt:1:needle".into())
         );
+    }
+
+    #[tokio::test]
+    async fn respects_a_qwenignore() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".qwenignore"), "secret.txt\n").unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "needle\n").unwrap();
+        std::fs::write(tmp.path().join("kept.txt"), "needle\n").unwrap();
+
+        assert_eq!(
+            run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
+            Ok("Found 1 match for pattern \"needle\" in the workspace directory:\n---\nkept.txt:1:needle".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_qwenignore_anchors_to_the_project_root_not_the_search_dir() {
+        // A ROOT-ANCHORED `.qwenignore` pattern (`/build/`) ignores only the
+        // top-level `build/`, not a nested `sub/build/`. Searching under
+        // `path: "sub"`, the ignore anchors to the PROJECT ROOT (ripGrep.ts
+        // loads .qwenignore from the workspace dirs): if it anchored to the
+        // search dir instead, `/build/` would over-match `sub/build/`.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".qwenignore"), "/build/\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("build")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub/build")).unwrap();
+        std::fs::write(tmp.path().join("build/top.txt"), "needle\n").unwrap();
+        std::fs::write(tmp.path().join("sub/build/nested.txt"), "needle\n").unwrap();
+
+        let out = run(json!({"pattern": "needle", "path": "sub"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        // Root-anchored: the nested build survives (it is not the top-level one).
+        assert!(out.contains("build/nested.txt:1:needle"));
+
+        // Cross-check: over the project root, the top-level build IS ignored.
+        let root_out = run(json!({"pattern": "needle"}), &ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(!root_out.contains("build/top.txt"));
+        assert!(root_out.contains("sub/build/nested.txt:1:needle"));
     }
 
     #[tokio::test]
@@ -333,92 +596,100 @@ mod tests {
 
         assert_eq!(
             run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
-            Ok("text.txt:1: needle".into())
+            Ok("Found 1 match for pattern \"needle\" in the workspace directory:\n---\ntext.txt:1:needle".into())
         );
     }
 
     #[tokio::test]
-    async fn caps_output_at_100_matches_with_a_trailer() {
+    async fn limit_caps_matches_with_the_verbatim_trailer() {
         let tmp = TempDir::new().unwrap();
-        let lines = (1..=150)
+        let lines = (1..=10)
             .map(|n| format!("needle {n}"))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(tmp.path().join("many.txt"), format!("{lines}\n")).unwrap();
 
-        let out = run(json!({"pattern": "needle"}), &ctx(tmp.path()))
+        let out = run(json!({"pattern": "needle", "limit": 4}), &ctx(tmp.path()))
             .await
             .unwrap();
-        let out_lines: Vec<&str> = out.split('\n').collect();
-        assert_eq!(out_lines.len(), 101);
-        assert_eq!(*out_lines.last().unwrap(), "[capped at 100 matches]");
-        assert_eq!(out_lines[0], "many.txt:1: needle 1");
-        assert_eq!(out_lines[99], "many.txt:100: needle 100");
+        // Header shows the REAL total (10); the body is capped at 4 lines; the
+        // trailer names the 6 omitted lines.
+        assert!(out.starts_with("Found 10 matches for pattern \"needle\" in the workspace directory:\n---\n"));
+        assert!(out.ends_with("\n---\n[6 lines truncated] ..."));
+        let body = out
+            .split("\n---\n")
+            .nth(1)
+            .unwrap();
+        assert_eq!(body.split('\n').count(), 4);
+        assert!(body.starts_with("many.txt:1:needle 1"));
     }
 
     #[tokio::test]
-    async fn exactly_100_matches_is_not_capped() {
+    async fn a_single_truncated_line_says_line_singular() {
         let tmp = TempDir::new().unwrap();
-        let lines = (1..=100)
+        let lines = (1..=3)
             .map(|n| format!("needle {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(tmp.path().join("hundred.txt"), format!("{lines}\n")).unwrap();
+        std::fs::write(tmp.path().join("f.txt"), format!("{lines}\n")).unwrap();
 
-        let out = run(json!({"pattern": "needle"}), &ctx(tmp.path()))
+        let out = run(json!({"pattern": "needle", "limit": 2}), &ctx(tmp.path()))
             .await
             .unwrap();
-        assert!(!out.contains("capped"));
-        assert_eq!(out.split('\n').count(), 100);
+        assert!(out.ends_with("\n---\n[1 line truncated] ..."));
     }
 
     #[tokio::test]
-    async fn no_matches_is_a_successful_explicit_result() {
+    async fn no_matches_is_the_verbatim_message() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "nothing\n").unwrap();
 
         assert_eq!(
             run(json!({"pattern": "needle"}), &ctx(tmp.path())).await,
-            Ok("[no matches]".into())
+            Ok("No matches found for pattern \"needle\" in the workspace directory.".into())
         );
     }
 
     #[tokio::test]
-    async fn a_pattern_that_fails_to_compile_is_searched_as_literal_text() {
+    async fn no_matches_message_includes_path_and_filter_clauses() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.ex"), "def foo(bar) do\n  :ok\nend\n").unwrap();
-
-        let out = run(json!({"pattern": "foo(bar"}), &ctx(tmp.path()))
-            .await
-            .unwrap();
-        assert!(
-            out.starts_with("[pattern is not valid regex - searched for it as literal text]\n")
-        );
-        assert!(out.contains("code.ex:1: def foo(bar) do"));
-    }
-
-    #[tokio::test]
-    async fn the_literal_fallback_with_zero_matches_keeps_note_and_marker() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "nothing\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("lib/a.rs"), "nothing\n").unwrap();
 
         assert_eq!(
-            run(json!({"pattern": "missing(thing"}), &ctx(tmp.path())).await,
-            Ok(
-                "[pattern is not valid regex - searched for it as literal text]\n[no matches]"
-                    .into()
+            run(
+                json!({"pattern": "needle", "path": "lib", "glob": "*.rs"}),
+                &ctx(tmp.path())
             )
+            .await,
+            Ok("No matches found for pattern \"needle\" in path \"lib\" (filter: \"*.rs\").".into())
         );
     }
 
     #[tokio::test]
-    async fn zero_matches_from_a_valid_regex_never_falls_back() {
+    async fn an_invalid_regex_is_rejected_with_the_verbatim_message() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("code.ex"), "def foo(bar) do\n").unwrap();
+
+        let err = run(json!({"pattern": "foo(bar"}), &ctx(tmp.path()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("Invalid regular expression pattern: foo(bar. Error:"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_matches_from_a_valid_regex_is_a_real_answer() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "x+y\n").unwrap();
 
+        // `x+y` is a valid regex (one-or-more x, then y) and does not match the
+        // literal `x+y`; qwen returns the no-matches message, never a fallback.
         assert_eq!(
             run(json!({"pattern": "x+y"}), &ctx(tmp.path())).await,
-            Ok("[no matches]".into())
+            Ok("No matches found for pattern \"x+y\" in the workspace directory.".into())
         );
     }
 
@@ -438,11 +709,7 @@ mod tests {
     async fn paths_escaping_the_project_root_are_refused() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            run(
-                json!({"pattern": "root", "path": "../.."}),
-                &ctx(tmp.path())
-            )
-            .await,
+            run(json!({"pattern": "root", "path": "../.."}), &ctx(tmp.path())).await,
             Err("path escapes project root".into())
         );
     }
@@ -451,9 +718,9 @@ mod tests {
     async fn missing_or_non_string_pattern_is_a_structured_error() {
         let tmp = TempDir::new().unwrap();
         let c = ctx(tmp.path());
-        assert!(crate::tools::execute("grep", &json!({}), &c).await.is_error);
+        assert!(crate::tools::execute("grep_search", &json!({}), &c).await.is_error);
         assert!(
-            crate::tools::execute("grep", &json!({"pattern": 42}), &c)
+            crate::tools::execute("grep_search", &json!({"pattern": 42}), &c)
                 .await
                 .is_error
         );
