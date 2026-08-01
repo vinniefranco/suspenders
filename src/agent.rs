@@ -63,6 +63,7 @@ use deps::AgentDeps;
 use settle::{LoopOrDown, settle_event_to_event, to_settlement_outcome};
 
 #[cfg(test)]
+#[path = "../tests/agent.rs"]
 mod tests;
 
 /// The default system prompt (baud's `Baud.Agent.system_prompt/0`). Public for
@@ -306,6 +307,35 @@ pub enum Command {
     /// call's reply oneshot. Mirrors [`Command::Approve`] but with no Standing-
     /// Approval fold - the reply map is the whole mechanic.
     AnswerQuestion(String, QuestionAnswers, oneshot::Sender<()>),
+    /// The `/mcp` dialog's read model (ADR-0065 Phase C): a clone of the manager's
+    /// per-server [`McpServerView`]s, server-name-sorted. Read-only, so it never
+    /// touches the tool set; the dialog polls it after every live op.
+    McpViews(oneshot::Sender<Vec<crate::mcp::McpServerView>>),
+    /// Re-attach one MCP server (ADR-0065 Phase C, the dialog's Reconnect action):
+    /// re-run its per-server attach and rebuild `session_tools` from the manager's
+    /// current adapters, so the NEXT Run sees the fresh tools. Always `Ok(())` for
+    /// a known server (a failed re-attach lands as a Disconnected view + a launch
+    /// notice, fail-open); an unknown server is a no-op that still replies `Ok`.
+    McpReconnect(String, oneshot::Sender<Result<(), String>>),
+    /// Enable or disable one MCP server (ADR-0065 Phase C, the dialog's
+    /// Enable/Disable action): persist the scope's `mcp.excluded` list, update the
+    /// Session + the manager, and rebuild `session_tools`. An `Err(reason)` when
+    /// the scope cannot be written (or the server is Extension-sourced, which qwen
+    /// cannot toggle); the bool is the DESIRED enabled state (`false` = disable).
+    McpSetEnabled(String, bool, oneshot::Sender<Result<(), String>>),
+    /// Authenticate one MCP server via OAuth (ADR-0065 Phase D, the dialog's
+    /// Authenticate action): run the browser flow for the server, store the token,
+    /// re-attach the server (so its tools re-discover under the fresh Bearer), and
+    /// rebuild `session_tools`. Progress lines (the copy-the-URL hint + the auth
+    /// URL) stream back over the Agent's `events` broadcast as
+    /// [`Event::McpAuthProgress`] while it runs. An `Err(reason)` when the server
+    /// is unknown, carries no OAuth config, or the flow failed.
+    McpAuthenticate(String, oneshot::Sender<Result<(), String>>),
+    /// Clear one MCP server's stored OAuth token (ADR-0065 Phase D, qwen
+    /// `handleClearAuth`): delete the credential, disconnect the server (dropping
+    /// its tools), and rebuild `session_tools`. An `Err(reason)` when the token
+    /// store cannot be written; an unknown server still clears any stray token.
+    McpClearAuth(String, oneshot::Sender<Result<(), String>>),
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
     Conversation(oneshot::Sender<Conversation>),
@@ -480,6 +510,67 @@ impl AgentHandle {
             .ok_or_else(|| "agent unavailable".to_string())
     }
 
+    /// The `/mcp` dialog's read model (ADR-0065 Phase C): the manager's per-server
+    /// [`McpServerView`]s, server-name-sorted. Cloned off the actor, so the dialog
+    /// re-polls it after every live op; a dead Agent answers an empty list.
+    pub async fn mcp_views(&self) -> Vec<crate::mcp::McpServerView> {
+        self.query(Command::McpViews).await.unwrap_or_default()
+    }
+
+    /// Reconnects one MCP server (ADR-0065 Phase C, the dialog's Reconnect action):
+    /// re-attach it and rebuild the Session tool set so the NEXT Run sees its
+    /// fresh tools; an in-flight Run is unaffected (the same rule as `set_model`).
+    /// A failed re-attach is fail-open (a Disconnected view), so this answers
+    /// `Ok(())` for any known server; a dead Agent answers `Err`.
+    pub async fn mcp_reconnect(&self, name: impl Into<String>) -> Result<(), String> {
+        let name = name.into();
+        self.query(move |reply| Command::McpReconnect(name, reply))
+            .await
+            .unwrap_or_else(|| Err("agent unavailable".to_string()))
+    }
+
+    /// Enables or disables one MCP server (ADR-0065 Phase C, the dialog's
+    /// Enable/Disable action): persist the `mcp.excluded` change to the server's
+    /// scope config, update the manager, and rebuild the Session tool set for the
+    /// next Run. `enabled` is the desired state (`false` disables). An `Err`
+    /// naming the reason when the scope cannot be written or the server is
+    /// Extension-sourced; a dead Agent answers `Err` too.
+    pub async fn mcp_set_enabled(
+        &self,
+        name: impl Into<String>,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let name = name.into();
+        self.query(move |reply| Command::McpSetEnabled(name, enabled, reply))
+            .await
+            .unwrap_or_else(|| Err("agent unavailable".to_string()))
+    }
+
+    /// Authenticates one MCP server via OAuth (ADR-0065 Phase D, the dialog's
+    /// Authenticate action): run the browser flow, store the token, re-attach the
+    /// server so its tools re-discover under the fresh Bearer, and rebuild the
+    /// Session tool set for the next Run. Progress lines stream back as
+    /// [`Event::McpAuthProgress`] over the events broadcast while it runs; the
+    /// `Result` settles when the flow finishes. An `Err` names the reason (unknown
+    /// server, no OAuth config, or a flow failure); a dead Agent answers `Err`.
+    pub async fn mcp_authenticate(&self, name: impl Into<String>) -> Result<(), String> {
+        let name = name.into();
+        self.query(move |reply| Command::McpAuthenticate(name, reply))
+            .await
+            .unwrap_or_else(|| Err("agent unavailable".to_string()))
+    }
+
+    /// Clears one MCP server's stored OAuth token (ADR-0065 Phase D, qwen
+    /// `handleClearAuth`): delete the credential, disconnect the server (dropping
+    /// its tools), and rebuild the Session tool set. An `Err` when the token store
+    /// cannot be written; a dead Agent answers `Err`.
+    pub async fn mcp_clear_auth(&self, name: impl Into<String>) -> Result<(), String> {
+        let name = name.into();
+        self.query(move |reply| Command::McpClearAuth(name, reply))
+            .await
+            .unwrap_or_else(|| Err("agent unavailable".to_string()))
+    }
+
     /// Resolves a pending run_command Approval (baud's `approve/3`).
     /// `ApproveAlways` records the exact command string as a Standing Approval.
     pub async fn approve(&self, approval_id: impl Into<String>, decision: Decision) {
@@ -620,9 +711,18 @@ struct AgentState {
     #[allow(dead_code)]
     mcp: crate::mcp::manager::McpManager,
     // The Session-stable tool set (F8, ADR-0056): built-ins plus discovered MCP
-    // tools, built once in `init_agent`. Threaded into each Run's Capture (via
-    // AgentDeps) so every Run's registry shares it.
+    // tools, built once in `init_agent` and REBUILT by the live `/mcp` ops
+    // (ADR-0065 Phase C, `rebuild_session_tools`) after a reconnect/enable/disable.
+    // Threaded into each Run's Capture (via AgentDeps) so every Run's registry
+    // shares it; the swap lands on the NEXT Run's capture, the in-flight Run keeps
+    // its own (the same rule as a `SetModel` swap).
     session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+    // The disk-skill manager (ADR-0058): discovered once in `init_agent`. The one
+    // `skill` tool holds a clone for its dynamic `<available_skills>` catalog; the
+    // Agent keeps this handle so the live `/mcp` ops can REBUILD `session_tools`
+    // (which must re-mint that same skill tool) without re-discovering skills
+    // (ADR-0065 Phase C).
+    skill_manager: Arc<crate::skills::SkillManager>,
     // The subagent definitions (P4/F4, ADR-0061): the built-in registry, built
     // once in `init_agent`. Held by the `agent` tool (on `session_tools`) for its
     // dynamic schema/description AND threaded into each Run's Capture (via
@@ -655,59 +755,30 @@ struct AgentState {
     background_shell_counter: u64,
 }
 
-#[cfg(test)]
-impl AgentState {
-    /// A minimal [`AgentState`] for the background-registry unit tests (P4b,
-    /// ADR-0063): a real Session/Model/Llm and the `self_tx` a detached child
-    /// posts `BackgroundDone` back over, everything else empty/default. Returns
-    /// the state alongside the receiver end of its own mpsc, so a test can drain
-    /// the `BackgroundDone` the child posts.
-    fn for_test(session: Session, llm: Arc<dyn Llm>) -> (AgentState, mpsc::UnboundedReceiver<Msg>) {
-        let model = session.model.clone();
-        let (self_tx, rx) = mpsc::unbounded_channel();
-        let (events, _rx0) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let subagents = Arc::new(crate::subagents::SubagentRegistry::new(
-            crate::subagents::builtins(),
-        ));
-        let conversation = Conversation::new(
-            "sys",
-            crate::conversation::ConversationOpts::new(10_000, 1_000),
-        );
-        let state = AgentState {
-            run_provenance: model.provenance(),
-            model,
-            llm,
-            conversation,
-            log: None,
-            resume_info: None,
-            plan: None,
-            events,
-            task: None,
-            cancel_flag: false,
-            settlement: Settlement::new(),
-            approvals: Approvals::new(),
-            approval_replies: HashMap::new(),
-            question_replies: HashMap::new(),
-            steering: Vec::new(),
-            compaction: Compaction::new(),
-            self_tx,
-            mcp: crate::mcp::manager::McpManager::default(),
-            session_tools: crate::tools::tools().into(),
-            subagents,
-            background: HashMap::new(),
-            notifications: Vec::new(),
-            background_counter: 0,
-            background_shells: HashMap::new(),
-            background_shell_counter: 0,
-            session,
-        };
-        (state, rx)
-    }
-}
-
 async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
+            // The live `/mcp` ops (ADR-0065 Phase C) re-attach a server and mutate
+            // the Agent's tool set, so they await INLINE on the actor loop (like a
+            // Run's own awaits, ADR-0017's single owner): the mutation is
+            // exclusive, and each is bounded by the per-server connect timeout the
+            // same as launch. The read-only `McpViews` rides the sync handler.
+            Msg::Command(Command::McpReconnect(name, reply)) => {
+                mcp_reconnect(&mut state, name).await;
+                let _ = reply.send(Ok(()));
+            }
+            Msg::Command(Command::McpSetEnabled(name, enabled, reply)) => {
+                let result = mcp_set_enabled(&mut state, name, enabled).await;
+                let _ = reply.send(result);
+            }
+            Msg::Command(Command::McpAuthenticate(name, reply)) => {
+                let result = mcp_authenticate(&mut state, name).await;
+                let _ = reply.send(result);
+            }
+            Msg::Command(Command::McpClearAuth(name, reply)) => {
+                let result = mcp_clear_auth(&mut state, name).await;
+                let _ = reply.send(result);
+            }
             Msg::Command(cmd) => handle_command(&mut state, cmd),
             Msg::Run(run) => handle_run(&mut state, run),
             Msg::Settle(outcome) => settle(&mut state, LoopOrDown::Loop(outcome)),
@@ -759,6 +830,28 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         Command::AnswerQuestion(id, answers, reply) => {
             answer_question(state, id, answers);
             let _ = reply.send(());
+        }
+        Command::McpViews(reply) => {
+            let _ = reply.send(state.mcp.views());
+        }
+        // The two live MCP ops (McpReconnect/McpSetEnabled) await, so `run_agent`
+        // intercepts them ahead of this sync handler - they never arrive here. The
+        // arms answer defensively (an Err the dialog surfaces) rather than panic,
+        // so a future dispatch change degrades safely instead of crashing the
+        // actor.
+        Command::McpReconnect(_, reply) => {
+            let _ = reply.send(Err("MCP reconnect was not dispatched".to_string()));
+        }
+        Command::McpSetEnabled(_, _, reply) => {
+            let _ = reply.send(Err("MCP enable/disable was not dispatched".to_string()));
+        }
+        // McpAuthenticate/McpClearAuth await too, so `run_agent` intercepts them
+        // ahead of this sync handler; the defensive arms mirror the two above.
+        Command::McpAuthenticate(_, reply) => {
+            let _ = reply.send(Err("MCP authenticate was not dispatched".to_string()));
+        }
+        Command::McpClearAuth(_, reply) => {
+            let _ = reply.send(Err("MCP clear-auth was not dispatched".to_string()));
         }
         Command::Cancel(reply) => {
             if let Some(abort) = &state.task {
@@ -884,6 +977,204 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             let _ = reply.send(drained);
         }
     }
+}
+
+/// Assembles the Session-stable tool set (F8, ADR-0056; ADR-0065 Phase C): the
+/// built-ins, then the discovered MCP `adapters`, then the one `skill` tool, then
+/// the one `agent` tool - the ONE order `init_agent` builds it in and every live
+/// `/mcp` op rebuilds it in, so a rebuild is order-identical to the launch set.
+/// The skill + agent tools are re-minted over the retained managers (their
+/// dynamic catalogs are unchanged), so only the MCP slice actually differs after
+/// a reconnect/enable/disable. The result is a fresh `Arc<[...]>`: swapping it on
+/// the Agent lands on the NEXT Run's capture, never an in-flight Run's.
+pub(crate) fn rebuild_session_tools(
+    adapters: Vec<Box<dyn crate::tool::Tool>>,
+    skill_manager: &Arc<crate::skills::SkillManager>,
+    subagents: &Arc<crate::subagents::SubagentRegistry>,
+) -> Arc<[Box<dyn crate::tool::Tool>]> {
+    let mut all = crate::tools::tools();
+    all.extend(adapters);
+    all.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
+        skill_manager,
+    ))));
+    all.push(Box::new(crate::tools::agent::AgentTool::new(Arc::clone(
+        subagents,
+    ))));
+    all.into()
+}
+
+// Rebuilds the Session-stable tool set from the manager's CURRENT MCP adapters
+// (ADR-0065 Phase C): the one line every live MCP op ends on. The manager has
+// already applied the reconnect/enable/disable, so `adapters()` reflects the new
+// connected set; `rebuild_session_tools` re-mints the built-ins + skill + agent
+// tools around them. Swapping `state.session_tools` lands on the NEXT Run's
+// capture - an in-flight Run keeps the `Arc` it already cloned (ADR-0033's swap
+// rule, ADR-0017's read-only guest).
+fn refresh_session_tools(state: &mut AgentState) {
+    let adapters = state.mcp.adapters();
+    state.session_tools = rebuild_session_tools(adapters, &state.skill_manager, &state.subagents);
+}
+
+// The Reconnect action (ADR-0065 Phase C, qwen `discoverToolsForServer`):
+// re-attach the named server and rebuild the tool set from the manager's fresh
+// adapters. A failed re-attach is fail-open (a Disconnected view + a launch
+// notice), so this always completes; an unknown server is a no-op the manager
+// absorbs. Runs INLINE on the actor loop, so the swap is exclusive and lands on
+// the next Run.
+async fn mcp_reconnect(state: &mut AgentState, name: String) {
+    state.mcp.reconnect(&name).await;
+    // Surface a fresh connect failure the same way `init_agent` does (ADR-0007's
+    // fail-open report seam): a reconnect that fails again is a visible skip.
+    for (server, reason) in state.mcp.failures() {
+        if server == name {
+            let _ = state.events.send(Event::extension_error(
+                format!("mcp server {server}"),
+                crate::event::Stage::PreRun,
+                format!("could not connect - {reason}"),
+            ));
+        }
+    }
+    refresh_session_tools(state);
+}
+
+// The Enable/Disable action (ADR-0065 Phase C, qwen `enable`/`disableServer`):
+// persist the target scope's `mcp.excluded` list, update the Session's merged
+// excluded set + the manager, and rebuild the tool set. `enabled` is the DESIRED
+// state, so a disable is `enabled == false`. The scope is the server's Source: a
+// User server writes the user config, a Workspace server the workspace config; an
+// Extension server cannot be toggled (qwen refuses it too), an `Err` the dialog
+// surfaces. Runs INLINE on the actor loop like `mcp_reconnect`.
+async fn mcp_set_enabled(
+    state: &mut AgentState,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    // The server must be one this Session knows (its Source picks the scope file).
+    let Some(source) = state.session.mcp_sources.get(&name).copied() else {
+        return Err(format!("unknown MCP server {name:?}"));
+    };
+    // qwen cannot enable/disable an extension-contributed server: it has no
+    // settings file to write the exclusion into.
+    let path = match source {
+        crate::mcp::McpSource::User => crate::session::default_config_path(),
+        crate::mcp::McpSource::Workspace => {
+            crate::session::workspace_config_path(&state.session.root)
+        }
+        crate::mcp::McpSource::Extension => {
+            return Err("extension MCP servers cannot be enabled or disabled".to_string());
+        }
+    };
+
+    // Fold the toggle into the Session's merged excluded set: a disable adds the
+    // name, an enable removes it. The set stays de-duplicated so a name persisted
+    // once is not written twice.
+    let disabled = !enabled;
+    let mut excluded: Vec<String> = state
+        .session
+        .mcp_excluded
+        .iter()
+        .filter(|n| *n != &name)
+        .cloned()
+        .collect();
+    if disabled {
+        excluded.push(name.clone());
+    }
+
+    // The scope file holds ONLY the exclusions whose Source is that scope (the
+    // merge CONCATENATES scopes, so each file owns its own names). Derive that
+    // slice from the new merged set + the recorded Sources, sorted for a stable
+    // on-disk order.
+    let mut scope_excluded: Vec<String> = excluded
+        .iter()
+        .filter(|n| state.session.mcp_sources.get(*n).copied() == Some(source))
+        .cloned()
+        .collect();
+    scope_excluded.sort();
+    scope_excluded.dedup();
+    crate::session::SessionConfig::persist_excluded(&path, &scope_excluded)
+        .map_err(|e| format!("could not persist MCP exclusion to {path}: {e}"))?;
+
+    // The write stuck, so update the in-memory Session + manager to match, then
+    // rebuild the tool set from the manager's fresh adapters.
+    state.session.mcp_excluded = excluded;
+    state.mcp.set_disabled(&name, disabled).await;
+    refresh_session_tools(state);
+    Ok(())
+}
+
+// The Authenticate action (ADR-0065 Phase D, qwen's Authenticate step): run the
+// OAuth browser flow for the named server, store the token, then re-attach the
+// server (reusing the reconnect path so tools re-discover under the fresh Bearer)
+// and rebuild the tool set. Progress lines (the copy-the-URL hint + the auth URL)
+// stream back over the events broadcast as they arrive, so the dialog (Phase E)
+// can render qwen's messages live. Runs INLINE on the actor loop like the other
+// live MCP ops, so the browser flow's await holds the loop for its duration (the
+// operator is mid-dialog, not mid-Run - the same exclusivity the reconnect takes).
+async fn mcp_authenticate(state: &mut AgentState, name: String) -> Result<(), String> {
+    // The server must be known and carry an OAuth block, and the manager must have
+    // a token store to save into (always so outside the empty test manager).
+    let (oauth, server_url) = state
+        .mcp
+        .oauth_target(&name)
+        .ok_or_else(|| format!("MCP server {name:?} has no OAuth configuration"))?;
+    let tokens_path = state
+        .mcp
+        .oauth_tokens_path()
+        .ok_or_else(|| "no MCP OAuth token store configured".to_string())?
+        .to_string();
+
+    // The progress sink forwards each OAuth signal onto the events broadcast as an
+    // `McpAuthProgress` (qwen's OauthDisplayMessage / OauthAuthUrl). A clone of the
+    // broadcast sender + the server name is moved into the boxed closure.
+    let events = state.events.clone();
+    let server = name.clone();
+    let sink: crate::mcp::oauth::ProgressSink = Box::new(move |progress| {
+        let event = match progress {
+            crate::mcp::oauth::OAuthProgress::Message(message) => {
+                Event::mcp_auth_message(server.clone(), message)
+            }
+            crate::mcp::oauth::OAuthProgress::AuthUrl(url) => {
+                Event::mcp_auth_url(server.clone(), url)
+            }
+        };
+        let _ = events.send(event);
+    });
+
+    // Run the flow through a provider over the SAME token store the connect-time
+    // injection reads (so a stored token lands where the next attach finds it).
+    let storage = crate::mcp::oauth::McpOAuthTokenStorage::new(tokens_path);
+    let provider = crate::mcp::oauth::McpOAuthProvider::new(storage);
+    provider
+        .authenticate(&name, &oauth, server_url.as_deref(), sink)
+        .await
+        .map_err(|reason| format!("OAuth authentication failed for {name:?}: {reason}"))?;
+
+    // Re-attach the server so its tools re-discover under the fresh Bearer (the
+    // token is now stored, so `connect_one`'s injection picks it up), then rebuild
+    // the tool set - the same path Reconnect takes.
+    mcp_reconnect(state, name).await;
+    Ok(())
+}
+
+// The Clear Authentication action (ADR-0065 Phase D, qwen `handleClearAuth`):
+// delete the server's stored OAuth token, disconnect it (dropping its
+// authenticated tools without disabling it), and rebuild the tool set. The
+// disconnect leaves the server enabled so a later Authenticate/Reconnect
+// re-attaches it. Runs INLINE like the other live MCP ops.
+async fn mcp_clear_auth(state: &mut AgentState, name: String) -> Result<(), String> {
+    let tokens_path = state
+        .mcp
+        .oauth_tokens_path()
+        .ok_or_else(|| "no MCP OAuth token store configured".to_string())?
+        .to_string();
+    crate::mcp::oauth::McpOAuthTokenStorage::new(tokens_path)
+        .delete(&name)
+        .map_err(|e| format!("could not clear MCP OAuth token for {name:?}: {e}"))?;
+    // Drop the authenticated conn + tools (the server stays enabled), then rebuild
+    // the tool set so the next Run no longer sees the server's tools.
+    state.mcp.disconnect(&name);
+    refresh_session_tools(state);
+    Ok(())
 }
 
 // The SetModel swap (ADR-0033 amendment): the whole Model swaps - the scoped

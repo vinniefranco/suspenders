@@ -26,7 +26,6 @@ use crate::llm::model::Model;
 use crate::run::settlement::Settlement;
 use crate::session::Session;
 use crate::session::log::Log;
-use crate::tools;
 
 /// The raw Session pieces `start` resolves synchronously and hands to the async
 /// [`init_agent`], which finishes assembly (MCP connect, the tool set, the
@@ -67,8 +66,16 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     } = init;
 
     // Attach the MCP servers once (fail-open). The discovered tools join the
-    // built-ins to form the Session-stable set every Run shares.
-    let (mcp, adapters) = crate::mcp::manager::McpManager::connect(&session.mcp_servers).await;
+    // built-ins to form the Session-stable set every Run shares. The plan map
+    // carries each server's Source scope + disabled flag (Phase B, ADR-0065), so
+    // a disabled server is shown but never attached.
+    let plans = session.mcp_plans();
+    // The MCP OAuth token store (ADR-0065 Phase D): the connect-time Bearer
+    // injection reads a stored token from here, and the live authenticate op
+    // writes to it. Resolved once at the launch edge like the config paths.
+    let oauth_tokens_path = crate::session::default_mcp_oauth_tokens_path();
+    let (mcp, adapters) =
+        crate::mcp::manager::McpManager::connect(&plans, Some(oauth_tokens_path)).await;
 
     // Surface each fail-open connect skip as a launch notice (ADR-0007's
     // fail-open report seam, the same line an Extension crash takes): a broken
@@ -118,15 +125,13 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         crate::subagents::builtins(),
     ));
 
-    let mut all = tools::tools();
-    all.extend(adapters);
-    all.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
-        &skill_manager,
-    ))));
-    all.push(Box::new(crate::tools::agent::AgentTool::new(Arc::clone(
-        &subagents,
-    ))));
-    let session_tools: Arc<[Box<dyn crate::tool::Tool>]> = all.into();
+    // The Session-stable tool set (F8, ADR-0056): built-ins + discovered MCP
+    // adapters + the skill tool + the agent tool. Assembled by the same
+    // `rebuild_session_tools` the live MCP ops (ADR-0065 Phase C) rebuild it with
+    // after a reconnect/enable/disable, so the launch set and every rebuilt set
+    // share one order. The initial adapters come straight off `connect`; a rebuild
+    // sources them from `mcp.adapters()` instead.
+    let session_tools = crate::agent::rebuild_session_tools(adapters, &skill_manager, &subagents);
 
     // A live per-session registry over the Session-stable set, used ONLY to
     // source the overhead + Deferred Tools section here at launch (the Runs
@@ -222,6 +227,7 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         self_tx,
         mcp,
         session_tools,
+        skill_manager,
         subagents,
         background: HashMap::new(),
         notifications: Vec::new(),

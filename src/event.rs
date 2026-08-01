@@ -27,6 +27,7 @@ use crate::approvals::ApprovalMode;
 use crate::content::ContentBlock;
 use crate::llm::Delta;
 use crate::llm::response::StopReason;
+use crate::mcp::McpServerView;
 use crate::tool::caps::Question;
 use crate::view_model::SelectorRow;
 
@@ -150,6 +151,63 @@ pub enum Event {
     /// operator-visible settlement marker, carrying only the `question_id`.
     QuestionResolved {
         question_id: String,
+    },
+
+    // ---- MCP OAuth (ADR-0065 Phase D) ----
+    /// A progress line from an in-flight `/mcp` Authenticate op (ADR-0065 Phase D,
+    /// qwen's `OauthDisplayMessage` / `OauthAuthUrl`): the operator-visible status
+    /// the AUTHENTICATE dialog step (Phase E) renders as the browser flow runs.
+    /// `server` names the server being authenticated; `message` is one display
+    /// line (the copy-the-URL hint, the auth URL itself, or an exchange note).
+    /// `is_url` marks the line that IS the authorization URL, so the dialog can
+    /// render it as a copyable/clickable link rather than wrapped prose. Display-
+    /// side only - it never enters the Conversation or the Session Log.
+    McpAuthProgress {
+        server: String,
+        message: String,
+        is_url: bool,
+    },
+
+    // ---- MCP management dialog (ADR-0065 Phase E) ----
+    /// The `/mcp` dialog's server views arrived: the adapter fetched them off the
+    /// loop (`Agent::mcp_views()`) and hands them back so the Composer's open
+    /// `McpDialog` overlay flips out of its Loading state and re-seeds the
+    /// SERVER_LIST (qwen's `reloadServers`). Re-posted after every live action so
+    /// the dialog reflects the change. `generation` echoes the activation counter
+    /// the opening [`Effect::McpCommand`](crate::ui::screen::Effect::McpCommand)
+    /// carried, so a stale fetch (from an earlier open) is dropped - exactly like
+    /// [`Event::SelectorReady`]. Display-side only; never enters the Conversation.
+    ///
+    /// There is no `McpDialogFailed` twin (unlike the selector's ready/failed
+    /// pair): `Agent::mcp_views()` fails OPEN to an empty list (a dead Agent
+    /// answers `[]`), and an empty server list already renders the "No MCP servers
+    /// configured." state - so the single ready event, carrying whatever the fetch
+    /// found, is the whole fill vocabulary.
+    McpDialogReady {
+        generation: u64,
+        servers: Vec<McpServerView>,
+    },
+
+    /// The footer's MCP health count (ADR-0065 Phase F, qwen `MCPHealthPill`):
+    /// how many managed servers are `Disconnected && !is_disabled`. The footer
+    /// renders synchronously, so the Screen holds this count and the pill reads
+    /// it; the adapter recomputes it from the fetched [`McpServerView`]s at
+    /// startup and whenever the `/mcp` dialog re-fetches, posting this to refresh
+    /// the field. Display-side only; never enters the Conversation. The live 30s
+    /// health loop qwen runs is DEFERRED - the count refreshes on fetch, not on a
+    /// timer.
+    McpHealth {
+        offline: usize,
+    },
+
+    /// The result of an `/mcp` AUTHENTICATE OSC52 copy attempt (ADR-0065 Phase E,
+    /// qwen `AuthenticateStep`'s `copyState`): `copied` is whether the escape
+    /// reached a TTY. The adapter posts it after
+    /// [`Effect::ClipboardOsc52`](crate::ui::screen::Effect::ClipboardOsc52)
+    /// writes, so the open dialog can flip the copy-feedback hint. Display-side
+    /// only; consumed by the Composer's open dialog and never surfaced elsewhere.
+    McpCopyResult {
+        copied: bool,
     },
 
     // ---- Extensions / Session Log / Context ----
@@ -419,6 +477,52 @@ impl Event {
             task_id: task_id.into(),
             status: status.into(),
         }
+    }
+
+    // ---- MCP OAuth (ADR-0065 Phase D) ----
+
+    /// A display-message progress line from an `/mcp` Authenticate op (qwen's
+    /// `OauthDisplayMessage`): `is_url` false.
+    pub fn mcp_auth_message(server: impl Into<String>, message: impl Into<String>) -> Self {
+        Event::McpAuthProgress {
+            server: server.into(),
+            message: message.into(),
+            is_url: false,
+        }
+    }
+
+    /// The authorization-URL progress line from an `/mcp` Authenticate op (qwen's
+    /// `OauthAuthUrl`): `is_url` true, so the dialog renders it as a link.
+    pub fn mcp_auth_url(server: impl Into<String>, url: impl Into<String>) -> Self {
+        Event::McpAuthProgress {
+            server: server.into(),
+            message: url.into(),
+            is_url: true,
+        }
+    }
+
+    // ---- MCP management dialog (ADR-0065 Phase E) ----
+
+    /// The `/mcp` dialog's fetched server views, tagged with the activation the
+    /// fill echoes (mirrors [`Event::selector_ready`]). No failed twin -
+    /// `mcp_views()` fails open to an empty list, which reads as the empty state.
+    pub fn mcp_dialog_ready(generation: u64, servers: Vec<McpServerView>) -> Self {
+        Event::McpDialogReady {
+            generation,
+            servers,
+        }
+    }
+
+    /// The footer MCP-health count (ADR-0065 Phase F): the number of servers that
+    /// are disconnected and not disabled ([`mcp_offline_count`]).
+    pub fn mcp_health(offline: usize) -> Self {
+        Event::McpHealth { offline }
+    }
+
+    /// The result of an `/mcp` OSC52 copy attempt (ADR-0065 Phase E): whether the
+    /// escape reached a TTY.
+    pub fn mcp_copy_result(copied: bool) -> Self {
+        Event::McpCopyResult { copied }
     }
 
     // ---- The rest ----
