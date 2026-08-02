@@ -11,6 +11,7 @@ pub mod conversation;
 pub mod env_context;
 pub mod event;
 pub(crate) mod glob_match;
+pub mod hooks;
 pub mod llm;
 pub mod mcp;
 pub mod memory;

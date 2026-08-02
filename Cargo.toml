@@ -53,6 +53,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # user theme files are TOML (ADR-0038); config.json stays serde_json
 toml = "0.8"
+# nested `hooks:` YAML block in SKILL.md frontmatter (ADR-0066); the flat
+# skill fields stay hand-rolled, only the nested hooks block parses via YAML.
+serde_yaml_ng = "0.10"
 
 # CLI + config seam (Session::new)
 clap = { version = "4", features = ["derive"] }
