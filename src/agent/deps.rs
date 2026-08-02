@@ -25,6 +25,41 @@ use crate::llm::response::Response;
 use crate::llm::{Llm, LlmRequest, StreamEvent, ToolCallStyle};
 use crate::run::deps::{CompactError, Emitter, RunDeps};
 
+/// The three per-request sampling settings the Session resolves once and every
+/// request this shell builds carries (ADR-0037: they ride the request). Grouped
+/// as one value because they are always resolved together, threaded together
+/// into both `complete` and the subagent spawner, and never vary independently -
+/// a cohesive cluster, not three loose knobs.
+#[derive(Clone)]
+pub(crate) struct RequestSettings {
+    /// The Session-resolved sampling temperature.
+    pub(crate) temperature: Option<f64>,
+    /// The Session-resolved extended-thinking budget (qwen-code parity). The
+    /// next-speaker side-query's `no_think` suppresses it at the wire, and
+    /// Compaction never receives it (it does not flow through `complete`).
+    pub(crate) thinking_budget: Option<u64>,
+    /// The Session-resolved Tool Call style (qwen parity).
+    pub(crate) tool_call_style: ToolCallStyle,
+}
+
+/// The Agent-owned values a Run captures at spawn (the Parameter Object for
+/// [`AgentDeps::new`], ADR-0011/0017): the wire (channel + Llm boundary), the
+/// captured Model, the per-request [`RequestSettings`], the Compaction state,
+/// and the three Session-stable registries the Run threads into its [`Capture`].
+/// Grouped so construction takes one cohesive value instead of a data clump of
+/// ten positional arguments; the caller ([`crate::agent::spawn_run`]) fills it
+/// from its `AgentState`.
+pub(crate) struct RunSpawn {
+    pub(crate) tx: mpsc::UnboundedSender<Msg>,
+    pub(crate) llm: Arc<dyn Llm>,
+    pub(crate) model: Model,
+    pub(crate) settings: RequestSettings,
+    pub(crate) compaction: Compaction,
+    pub(crate) session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
+    pub(crate) subagents: Arc<crate::subagents::SubagentRegistry>,
+    pub(crate) session: crate::session::Session,
+}
+
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
 /// Session's Llm.
 pub(crate) struct AgentDeps {
@@ -34,18 +69,9 @@ pub(crate) struct AgentDeps {
     /// request the Run makes travels to it, and a `/model` swap mid-flight
     /// never touches it.
     model: Model,
-    /// The Session-resolved sampling temperature, applied to every request
-    /// this shell builds (ADR-0037: temperature rides the request).
-    temperature: Option<f64>,
-    /// The Session-resolved extended-thinking budget (qwen-code parity),
-    /// applied to every request this shell builds - it rides the request like
-    /// temperature. The next-speaker side-query's `no_think` suppresses it at
-    /// the wire, and Compaction never receives it (it does not flow through
-    /// `complete`).
-    thinking_budget: Option<u64>,
-    /// The Session-resolved Tool Call style (qwen parity), applied to every
-    /// request this shell builds - it rides the request like temperature.
-    tool_call_style: ToolCallStyle,
+    /// The per-request sampling settings (temperature, thinking budget, Tool
+    /// Call style), applied to every request this shell builds.
+    settings: RequestSettings,
     /// The accumulated Compaction state captured at Run start; `compact`
     /// closes over it and, on success, notifies the Agent to log + update state
     /// (baud's compact_fn, ADR-0012).
@@ -67,32 +93,26 @@ pub(crate) struct AgentDeps {
 }
 
 impl AgentDeps {
-    // Each argument is a distinct Agent-owned value the Run captures at spawn
-    // (the channel, the Llm, the Model, the three request settings, the
-    // Compaction state, and now the Session-stable tool set). A Parameter Object
-    // would only rename the same bundle, so the targeted allow is clearer than
-    // the indirection.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        tx: mpsc::UnboundedSender<Msg>,
-        llm: Arc<dyn Llm>,
-        model: Model,
-        temperature: Option<f64>,
-        thinking_budget: Option<u64>,
-        tool_call_style: ToolCallStyle,
-        compaction: Compaction,
-        session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
-        subagents: Arc<crate::subagents::SubagentRegistry>,
-        session: crate::session::Session,
-    ) -> Self {
+    /// Builds the Run shell's deps from the [`RunSpawn`] Parameter Object: the
+    /// caller assembles the Agent-owned values it captures at spawn into one
+    /// value, and this derives the subagent run bound from the Session.
+    pub(crate) fn new(spawn: RunSpawn) -> Self {
+        let RunSpawn {
+            tx,
+            llm,
+            model,
+            settings,
+            compaction,
+            session_tools,
+            subagents,
+            session,
+        } = spawn;
         let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
             tx,
             llm,
             model,
-            temperature,
-            thinking_budget,
-            tool_call_style,
+            settings,
             compaction,
             session_tools,
             subagents,
@@ -140,9 +160,9 @@ impl AgentDeps {
                 direct: crate::run::subagent::DirectSubagentSpawner {
                     llm: Arc::clone(&self.llm),
                     parent_model: self.model.clone(),
-                    temperature: self.temperature,
-                    thinking_budget: self.thinking_budget,
-                    tool_call_style: self.tool_call_style,
+                    temperature: self.settings.temperature,
+                    thinking_budget: self.settings.thinking_budget,
+                    tool_call_style: self.settings.tool_call_style,
                     session: self.session.clone(),
                     registry: Arc::clone(&self.subagents),
                     subagent_run_limit: self.subagent_run_limit,
@@ -178,9 +198,9 @@ impl RunDeps for AgentDeps {
         // here, but its `no_think` request flag suppresses the thinking budget
         // at the Anthropic wire - the two are mutually exclusive there.
         let req = req
-            .with_temperature(self.temperature)
-            .with_thinking_budget(self.thinking_budget)
-            .with_tool_call_style(self.tool_call_style);
+            .with_temperature(self.settings.temperature)
+            .with_thinking_budget(self.settings.thinking_budget)
+            .with_tool_call_style(self.settings.tool_call_style);
         let llm = Arc::clone(&self.llm);
         let model = self.model.clone();
         async move {
@@ -287,7 +307,7 @@ impl RunDeps for AgentDeps {
         let tx = self.tx.clone();
         let llm = Arc::clone(&self.llm);
         let model = self.model.clone();
-        let temperature = self.temperature;
+        let temperature = self.settings.temperature;
         let compaction = self.compaction.clone();
         async move {
             let tokens_before = conversation.token_estimate();

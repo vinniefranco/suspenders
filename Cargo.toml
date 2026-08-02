@@ -2,6 +2,11 @@
 name = "suspenders"
 version = "0.1.0"
 edition = "2024"
+# Unit tests live under /tests but are wired back into their modules as in-crate
+# `#[cfg(test)] #[path=...] mod tests;` unit tests (NOT integration tests). Cargo
+# would otherwise auto-compile every `tests/*.rs` as a standalone integration
+# crate; disable that so the files are only the #[path]-included unit modules.
+autotests = false
 
 [dependencies]
 # async runtime
@@ -66,6 +71,14 @@ time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UT
 rmcp = { version = "3.0.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 http = "1"
 base64 = "0.23.0"
+# MCP OAuth (ADR-0065 Phase D): PKCE needs SHA-256 of the code verifier and a few
+# CSPRNG bytes for the verifier + state. `sha2` is the sole genuinely-new crate -
+# a tiny pure-Rust RustCrypto hash, no C dep; `rand` was already in the lock
+# (transitive via reqwest), so pinning it direct pulls no new copy. base64url is
+# `base64`'s URL_SAFE_NO_PAD engine (already a dep); the callback server is
+# hand-rolled on std::net (no web framework), and the token HTTP rides reqwest.
+sha2 = "0.10"
+rand = "0.8"
 
 # The Catalog data generator (ADR-0037): `cargo run --bin generate-models`
 # rewrites the committed src/llm/catalog/data/*.json from models.dev.

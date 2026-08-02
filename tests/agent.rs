@@ -13,6 +13,57 @@ use super::*;
 use crate::approvals::ApprovalMode;
 use crate::content::{ContentBlock, Message, Role, Usage};
 use crate::llm::model::Api;
+
+impl AgentState {
+    /// A minimal [`AgentState`] for the background-registry unit tests (P4b,
+    /// ADR-0063): a real Session/Model/Llm and the `self_tx` a detached child
+    /// posts `BackgroundDone` back over, everything else empty/default. Returns
+    /// the state alongside the receiver end of its own mpsc, so a test can drain
+    /// the `BackgroundDone` the child posts.
+    fn for_test(session: Session, llm: Arc<dyn Llm>) -> (AgentState, mpsc::UnboundedReceiver<Msg>) {
+        let model = session.model.clone();
+        let (self_tx, rx) = mpsc::unbounded_channel();
+        let (events, _rx0) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let subagents = Arc::new(crate::subagents::SubagentRegistry::new(
+            crate::subagents::builtins(),
+        ));
+        let skill_manager = Arc::new(crate::skills::SkillManager::default());
+        let conversation = Conversation::new(
+            "sys",
+            crate::conversation::ConversationOpts::new(10_000, 1_000),
+        );
+        let state = AgentState {
+            run_provenance: model.provenance(),
+            model,
+            llm,
+            conversation,
+            log: None,
+            resume_info: None,
+            plan: None,
+            events,
+            task: None,
+            cancel_flag: false,
+            settlement: Settlement::new(),
+            approvals: Approvals::new(),
+            approval_replies: HashMap::new(),
+            question_replies: HashMap::new(),
+            steering: Vec::new(),
+            compaction: Compaction::new(),
+            self_tx,
+            mcp: crate::mcp::manager::McpManager::default(),
+            session_tools: crate::tools::tools().into(),
+            skill_manager,
+            subagents,
+            background: HashMap::new(),
+            notifications: Vec::new(),
+            background_counter: 0,
+            background_shells: HashMap::new(),
+            background_shell_counter: 0,
+            session,
+        };
+        (state, rx)
+    }
+}
 use crate::llm::response::{Response, StopReason as RStop};
 use crate::llm::{Delta, LlmRequest};
 use crate::session::{Session, SessionConfig, SessionOpts};
@@ -888,7 +939,7 @@ async fn cancel_mid_run_emits_run_cancelled_and_records_the_cancellation() {
     );
     assert_eq!(
         conv.messages[n - 1],
-        Message::assistant(vec![ContentBlock::text(voice::run_cancelled_marker())])
+        Message::assistant(vec![ContentBlock::text(voice::Marker::RunCancelled.text())])
     );
 }
 
@@ -936,7 +987,7 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
         Message { role: Role::User, content, .. } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
     assert_eq!(
         tail[2],
-        Message::assistant(vec![ContentBlock::text(voice::run_cancelled_marker())])
+        Message::assistant(vec![ContentBlock::text(voice::Marker::RunCancelled.text())])
     );
 }
 
@@ -967,7 +1018,7 @@ async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_ma
     assert_eq!(
         conv.messages[n - 1],
         Message::assistant_from(
-            vec![ContentBlock::text(voice::run_failed_marker())],
+            vec![ContentBlock::text(voice::Marker::RunFailed.text())],
             provenance
         )
     );
@@ -1002,7 +1053,7 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_m
     assert_eq!(
         tail[2],
         Message::assistant_from(
-            vec![ContentBlock::text(voice::run_failed_marker())],
+            vec![ContentBlock::text(voice::Marker::RunFailed.text())],
             provenance
         )
     );
@@ -2085,4 +2136,69 @@ async fn abort_all_background_shells_clears_the_registry_at_loop_exit() {
     assert!(state.background_shells.is_empty());
     // Drain any late done.
     let _ = tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await;
+}
+
+// ---- live MCP ops (ADR-0065 Phase C) ----------------------------------
+
+// A session carrying one WORKSPACE-sourced MCP server `gh`, so the enable/disable
+// scope resolves to `<root>/.suspenders/config.json` (fully under the tmp dir, no
+// XDG env). The transport is a command that does not exist, so any attach fails
+// fast on spawn (no timeout wait) - the disable path never attaches anyway.
+fn session_with_workspace_mcp(dir: &TempDir) -> Session {
+    let mut session = session_in(dir);
+    let cfg = crate::mcp::McpServerConfig::new(crate::mcp::McpTransport::Stdio {
+        command: "suspenders-no-such-mcp-binary".to_string(),
+        args: Vec::new(),
+        env: Default::default(),
+        cwd: None,
+    });
+    session.mcp_servers.insert("gh".to_string(), cfg);
+    session
+        .mcp_sources
+        .insert("gh".to_string(), crate::mcp::McpSource::Workspace);
+    session
+}
+
+#[tokio::test]
+async fn mcp_set_enabled_false_persists_to_the_workspace_scope_and_disables_the_view() {
+    let dir = TempDir::new().unwrap();
+    let session = session_with_workspace_mcp(&dir);
+    let (agent, _rx) = session_harness(session, vec![]);
+
+    // Disabling a Workspace server writes the workspace config's mcp_excluded and
+    // marks the manager's view disabled (the next Run rebuilds without its tools).
+    agent
+        .mcp_set_enabled("gh", false)
+        .await
+        .expect("disable ok");
+
+    let workspace_config = dir.path().join(".suspenders").join("config.json");
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(&workspace_config).unwrap()).unwrap();
+    assert_eq!(written["mcp_excluded"], json!(["gh"]));
+
+    let views = agent.mcp_views().await;
+    let gh = views.iter().find(|v| v.name == "gh").expect("gh view");
+    assert!(gh.is_disabled);
+}
+
+#[tokio::test]
+async fn mcp_set_enabled_refuses_an_unknown_server() {
+    let (_dir, agent, _rx) = harness(vec![]);
+    // No such server is configured, so there is no scope to write - an Err, not a
+    // silent no-op.
+    let err = agent
+        .mcp_set_enabled("ghost", false)
+        .await
+        .expect_err("unknown server is refused");
+    assert!(err.contains("unknown MCP server"), "{err}");
+}
+
+#[tokio::test]
+async fn mcp_reconnect_of_an_unknown_server_is_a_no_op_ok() {
+    let (_dir, agent, _rx) = harness(vec![]);
+    // A reconnect of a name the manager does not hold is absorbed as Ok (the
+    // dialog only ever names a listed server; this is the defensive floor).
+    agent.mcp_reconnect("ghost").await.expect("no-op reconnect");
+    assert!(agent.mcp_views().await.is_empty());
 }

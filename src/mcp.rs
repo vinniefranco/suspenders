@@ -29,20 +29,28 @@
 //! because discovery is the only way the model reaches them). Their `is_mcp()`
 //! is true, which the tool-search scorer reads.
 //!
-//! ## Out of scope (ADR-0056)
+//! ## Out of scope (ADR-0056, narrowed by ADR-0065)
 //!
-//! MCP prompts + resources; SSE and websocket transports; OAuth (static headers
-//! only); MCP-call approval-gating (the `trust` flag is parsed + stored, gates
-//! nothing); inline multimodal tool-result data (media collapses to placeholder
-//! text per ADR-0039); live mid-session reconnect (a dropped server surfaces as
-//! an `is_error` Tool Result, not a re-attach).
+//! MCP prompts + resources; SSE and websocket transports; MCP-call
+//! approval-gating (the `trust` flag is parsed + stored, gates nothing); inline
+//! multimodal tool-result data (media collapses to placeholder text per
+//! ADR-0039). ADR-0065 brought OAuth (the [`oauth`] module: PKCE, discovery,
+//! dynamic registration, token storage, Bearer injection at connect) and live
+//! mid-session reconnect (the [`manager`] live ops) INTO scope; a dropped server
+//! still surfaces as an `is_error` Tool Result until a reconnect re-attaches it.
 
 pub mod adapter;
 pub mod config;
 pub mod manager;
+pub mod oauth;
 pub mod result;
+pub mod view;
 
-pub use config::{McpServerConfig, McpTransport};
+pub use config::{McpOAuthConfig, McpServerConfig, McpTransport};
+pub use view::{
+    McpServerStatus, McpServerView, McpSource, McpToolAnnotations, McpToolView, format_transport,
+    mcp_offline_count,
+};
 
 use serde_json::Value;
 

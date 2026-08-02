@@ -63,12 +63,14 @@ pub(super) fn next_speaker_verdict(speaker: &str) -> Response {
 pub(super) fn conversation(session: &Session, prompt: &str) -> Conversation {
     let mut conv = Conversation::new(
         "You are a test agent.",
-        crate::conversation::ConversationOpts::new(
-            session.context_budget_for(&session.model),
-            session.model.max_tokens,
-        )
-        .compaction_slack(session.compaction_slack)
-        .compaction_keep(session.compaction_keep),
+        crate::conversation::ConversationOpts {
+            compaction_slack: session.compaction_slack,
+            compaction_keep: session.compaction_keep,
+            ..crate::conversation::ConversationOpts::new(
+                session.context_budget_for(&session.model),
+                session.model.max_tokens,
+            )
+        },
     );
     conv.add_user_text(prompt);
     conv

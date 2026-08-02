@@ -39,4 +39,5 @@ pub mod walk;
 pub mod app;
 
 #[cfg(test)]
+#[path = "../tests/test_support.rs"]
 pub mod test_support;

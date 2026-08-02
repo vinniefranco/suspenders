@@ -50,6 +50,71 @@ pub struct McpServerConfig {
     pub include_tools: Option<Vec<String>>,
     /// A denylist: these tool names are always dropped, even if included.
     pub exclude_tools: Vec<String>,
+    /// The per-server OAuth 2.0 config (ADR-0065 Phase D, qwen's `oauth` block):
+    /// a nested object under the flat `oauth` wire key. Absent means the server
+    /// carries no OAuth (static headers only, ADR-0056); present drives the
+    /// [`oauth`](crate::mcp::oauth) provider + the Bearer-token injection at
+    /// connect.
+    pub oauth: Option<McpOAuthConfig>,
+}
+
+/// One MCP server's OAuth 2.0 config (ADR-0065 Phase D, qwen's `MCPOAuthConfig`):
+/// the nested `oauth` object a server entry may carry. Every field is snake_case
+/// (ADR-0031); the qwen names are camelCase (`clientId`, `authorizationUrl`, ...),
+/// the deliberate config-port divergence. All fields are optional - a minimal
+/// `{"enabled": true}` on an HTTP server lets the provider DISCOVER the
+/// authorization/token endpoints from the MCP server URL's `/.well-known/*`
+/// metadata and REGISTER a public client dynamically, so a user need supply
+/// nothing but the flag. Explicit fields short-circuit that discovery.
+///
+/// Every field is `skip_serializing_if` absent + `default` on parse, so a
+/// parse -> serialize round-trip writes back exactly the keys the user wrote (an
+/// absent field never round-trips as an explicit `null`), matching how the flat
+/// [`McpServerConfig`] keys behave.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpOAuthConfig {
+    /// Whether OAuth is enabled for this server (qwen `enabled`). Absent reads as
+    /// unset; the dialog's Authenticate action and the connect-time token
+    /// injection treat `Some(true)` as on.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub enabled: Option<bool>,
+    /// A pre-registered OAuth client id (qwen `clientId`). Absent triggers dynamic
+    /// client registration against the discovered/`registration_url` endpoint.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_id: Option<String>,
+    /// The client secret for a confidential client (qwen `clientSecret`); a public
+    /// client (the default, `token_endpoint_auth_method: none`) has none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_secret: Option<String>,
+    /// The authorization endpoint (qwen `authorizationUrl`); absent is discovered
+    /// from the MCP server's `/.well-known/*` metadata.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub authorization_url: Option<String>,
+    /// The token endpoint (qwen `tokenUrl`); absent is discovered alongside the
+    /// authorization endpoint.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub token_url: Option<String>,
+    /// The scopes to request (qwen `scopes`), space-joined onto the authorization
+    /// + token requests.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scopes: Option<Vec<String>>,
+    /// The audiences to request (qwen `audiences`), space-joined onto the
+    /// authorization + token requests.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub audiences: Option<Vec<String>>,
+    /// The redirect URI (qwen `redirectUri`); absent uses the hand-rolled
+    /// localhost callback (`http://localhost:<port><path>`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub redirect_uri: Option<String>,
+    /// For an SSE connection, the query-parameter name the access token rides as
+    /// (qwen `tokenParamName`) instead of an `Authorization` header.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub token_param_name: Option<String>,
+    /// The dynamic client registration endpoint (qwen `registrationUrl`); absent
+    /// is discovered from the authorization server metadata.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registration_url: Option<String>,
 }
 
 /// A resolved transport: exactly one of the two shapes a server config
@@ -86,6 +151,7 @@ impl McpServerConfig {
             trust: None,
             include_tools: None,
             exclude_tools: Vec::new(),
+            oauth: None,
         }
     }
 
@@ -120,6 +186,7 @@ const FIELDS: &[&str] = &[
     "trust",
     "include_tools",
     "exclude_tools",
+    "oauth",
 ];
 
 /// Deserializes the FLAT wire shape into the sum-type config. The transport keys
@@ -155,6 +222,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                 let mut trust: Option<bool> = None;
                 let mut include_tools: Option<Vec<String>> = None;
                 let mut exclude_tools: Option<Vec<String>> = None;
+                let mut oauth: Option<McpOAuthConfig> = None;
 
                 // Read a value into its slot, erroring on a duplicate key (serde
                 // derive's behaviour, kept so a repeated flat key stays a loud
@@ -181,6 +249,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                         "trust" => set_once!(trust),
                         "include_tools" => set_once!(include_tools),
                         "exclude_tools" => set_once!(exclude_tools),
+                        "oauth" => set_once!(oauth),
                         // deny_unknown_fields parity: a typo'd key is a loud error.
                         other => return Err(de::Error::unknown_field(other, FIELDS)),
                     }
@@ -235,6 +304,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                     trust,
                     include_tools,
                     exclude_tools: exclude_tools.unwrap_or_default(),
+                    oauth,
                 })
             }
         }
@@ -270,6 +340,7 @@ impl Serialize for McpServerConfig {
         len += usize::from(self.trust.is_some());
         len += usize::from(self.include_tools.is_some());
         len += usize::from(!self.exclude_tools.is_empty());
+        len += usize::from(self.oauth.is_some());
 
         let mut s = serializer.serialize_struct("McpServerConfig", len)?;
         match &self.transport {
@@ -309,154 +380,13 @@ impl Serialize for McpServerConfig {
         if !self.exclude_tools.is_empty() {
             s.serialize_field("exclude_tools", &self.exclude_tools)?;
         }
+        if let Some(oauth) = &self.oauth {
+            s.serialize_field("oauth", oauth)?;
+        }
         s.end()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn stdio() -> McpServerConfig {
-        McpServerConfig::new(McpTransport::Stdio {
-            command: "my-server".into(),
-            args: vec!["--flag".into()],
-            env: BTreeMap::new(),
-            cwd: None,
-        })
-    }
-
-    #[test]
-    fn parses_a_command_only_entry_to_stdio() {
-        let cfg: McpServerConfig =
-            serde_json::from_str(r#"{"command":"my-server","args":["--flag"]}"#).unwrap();
-        assert_eq!(
-            cfg.transport,
-            McpTransport::Stdio {
-                command: "my-server".into(),
-                args: vec!["--flag".into()],
-                env: BTreeMap::new(),
-                cwd: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_an_http_url_only_entry_to_http() {
-        let cfg: McpServerConfig = serde_json::from_str(
-            r#"{"http_url":"https://example.test/mcp","headers":{"Authorization":"Bearer x"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.transport,
-            McpTransport::Http {
-                url: "https://example.test/mcp".into(),
-                headers: BTreeMap::from([("Authorization".into(), "Bearer x".into())]),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_both_transports_at_parse_time() {
-        let err = serde_json::from_str::<McpServerConfig>(
-            r#"{"command":"cmd","http_url":"https://x.test"}"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("both"));
-    }
-
-    #[test]
-    fn rejects_neither_transport_at_parse_time() {
-        let err = serde_json::from_str::<McpServerConfig>(r#"{"trust":true}"#).unwrap_err();
-        assert!(err.to_string().contains("neither"));
-    }
-
-    #[test]
-    fn rejects_an_unknown_key() {
-        // deny_unknown_fields parity: a typo'd key stays a loud parse error.
-        let err =
-            serde_json::from_str::<McpServerConfig>(r#"{"command":"cmd","bogus":1}"#).unwrap_err();
-        assert!(err.to_string().contains("bogus") || err.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn rejects_a_duplicate_key() {
-        let err = serde_json::from_str::<McpServerConfig>(r#"{"command":"a","command":"b"}"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("command"));
-    }
-
-    #[test]
-    fn rejects_stdio_only_keys_on_an_http_entry() {
-        // `args`/`env`/`cwd` under an http_url would round-trip away; that is a
-        // shape error, not a silent drop.
-        let err = serde_json::from_str::<McpServerConfig>(
-            r#"{"http_url":"https://x.test","args":["--flag"]}"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("args"));
-    }
-
-    #[test]
-    fn rejects_headers_on_a_stdio_entry() {
-        let err =
-            serde_json::from_str::<McpServerConfig>(r#"{"command":"cmd","headers":{"X":"y"}}"#)
-                .unwrap_err();
-        assert!(err.to_string().contains("headers"));
-    }
-
-    #[test]
-    fn round_trips_the_flat_stdio_wire_shape() {
-        let raw = r#"{"command":"srv","args":["--x"],"env":{"LOG":"debug"},"cwd":"/tmp","timeout_ms":1000,"trust":true,"exclude_tools":["delete"]}"#;
-        let cfg: McpServerConfig = serde_json::from_str(raw).unwrap();
-        let back = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(
-            back,
-            serde_json::from_str::<serde_json::Value>(raw).unwrap()
-        );
-    }
-
-    #[test]
-    fn round_trips_the_flat_http_wire_shape() {
-        let raw = r#"{"http_url":"https://x.test/mcp","headers":{"Authorization":"Bearer x"},"include_tools":["keep"]}"#;
-        let cfg: McpServerConfig = serde_json::from_str(raw).unwrap();
-        let back = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(
-            back,
-            serde_json::from_str::<serde_json::Value>(raw).unwrap()
-        );
-    }
-
-    #[test]
-    fn admits_everything_with_no_filters() {
-        let cfg = stdio();
-        assert!(cfg.admits("anything"));
-    }
-
-    #[test]
-    fn admits_treats_include_as_an_allowlist() {
-        let mut cfg = stdio();
-        cfg.include_tools = Some(vec!["keep".into()]);
-        assert!(cfg.admits("keep"));
-        assert!(!cfg.admits("drop"));
-    }
-
-    #[test]
-    fn admits_treats_a_paren_prefixed_include_entry_as_the_tool() {
-        // qwen's paren form: `foo(...)` in the allowlist admits the tool `foo`.
-        let mut cfg = stdio();
-        cfg.include_tools = Some(vec!["keep(a, b)".into()]);
-        assert!(cfg.admits("keep"));
-        assert!(!cfg.admits("keeper")); // a longer name is NOT a paren match
-        assert!(!cfg.admits("drop"));
-    }
-
-    #[test]
-    fn admits_always_removes_excluded_even_when_included() {
-        let mut cfg = stdio();
-        cfg.include_tools = Some(vec!["keep".into(), "banned".into()]);
-        cfg.exclude_tools = vec!["banned".into()];
-        assert!(cfg.admits("keep"));
-        assert!(!cfg.admits("banned"));
-    }
-}
+#[path = "../../tests/mcp/config.rs"]
+mod tests;

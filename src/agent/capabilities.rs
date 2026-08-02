@@ -123,6 +123,13 @@ fn mint_question_id() -> String {
     format!("question-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The VERBATIM qwen `task_stop` not-found wording, the one template both
+/// background-stop capability legs fall back to on a closed channel (a dead
+/// Agent). Owned here so the two relays share one copy of the sentence.
+fn not_found(id: &str) -> String {
+    format!("Error: No background task found with ID \"{id}\".")
+}
+
 /// The two-channel [`SubagentSpawner`](crate::tool::caps::SubagentSpawner) the
 /// Agent builds (P4b, ADR-0063). Its FOREGROUND `spawn` is the DIRECT
 /// (Llm-boundary, non-mpsc) path - it delegates to the held
@@ -194,11 +201,9 @@ impl crate::tool::caps::SubagentSpawner for AgentSubagentSpawner {
             }))
             .is_err()
         {
-            return Ok(format!("Error: No background task found with ID \"{id}\"."));
+            return Ok(not_found(&id));
         }
-        Ok(rx
-            .await
-            .unwrap_or_else(|_| format!("Error: No background task found with ID \"{id}\".")))
+        Ok(rx.await.unwrap_or_else(|_| not_found(&id)))
     }
 }
 
@@ -249,10 +254,8 @@ impl crate::tool::caps::BackgroundShellSpawner for AgentBackgroundShellSpawner {
             }))
             .is_err()
         {
-            return Ok(format!("Error: No background task found with ID \"{id}\"."));
+            return Ok(not_found(&id));
         }
-        Ok(rx
-            .await
-            .unwrap_or_else(|_| format!("Error: No background task found with ID \"{id}\".")))
+        Ok(rx.await.unwrap_or_else(|_| not_found(&id)))
     }
 }
