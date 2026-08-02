@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::content::{ContentBlock, Role};
 use crate::llm::model::Api;

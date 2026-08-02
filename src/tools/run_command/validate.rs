@@ -3,10 +3,10 @@
 
 use serde_json::Value;
 
+use super::MAX_TIMEOUT_MS;
 use super::command_shape::{
     detect_blocked_sleep_pattern, has_top_level_trailing_background_operator, strip_shell_wrapper,
 };
-use super::MAX_TIMEOUT_MS;
 
 /// A `timeout` value must be a whole (integer) count of milliseconds; a fraction
 /// is rejected. `x.fract() == NO_FRACTION` is the "integer" test.

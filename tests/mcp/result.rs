@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn ok(content: Vec<McpBlock>) -> McpCallResult {

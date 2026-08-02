@@ -100,7 +100,11 @@ pub(super) fn header_tier(available: usize) -> HeaderTier {
 /// columns (the box rows funnelled through the same column-exact assembly as the
 /// tool-group box), so the viewport's `Wrap` never re-breaks it (measure==draw,
 /// ADR-0029).
-pub(super) fn header_lines(view: &HeaderView<'_>, content_width: u16, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn header_lines(
+    view: &HeaderView<'_>,
+    content_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let available = content_width as usize;
     let tier = header_tier(available);
 
@@ -137,7 +141,11 @@ pub(super) fn header_lines(view: &HeaderView<'_>, content_width: u16, theme: &Th
 /// [`box_row`] to the exact `inner` width, framed with a single-line top/bottom
 /// border - exactly `inner + 2` columns per row and 6 rows tall (1 top + 4 content
 /// + 1 bottom), so it lines up beside the 6-row logo in the two-column layout.
-pub(super) fn header_boxed_panel(view: &HeaderView<'_>, inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn header_boxed_panel(
+    view: &HeaderView<'_>,
+    inner: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let border = border_style(theme);
     frame_box(&header_panel_rows(view, inner, theme), inner, border)
 }
@@ -147,7 +155,11 @@ pub(super) fn header_boxed_panel(view: &HeaderView<'_>, inner: usize, theme: &Th
 /// spacer, the scoped model id with a ` (/model to change)` hint when it fits, and
 /// the tilde-shortened working directory. Borderless spans - [`header_two_column`]
 /// or the one-column path wraps them in the box.
-pub(super) fn header_panel_rows(view: &HeaderView<'_>, inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn header_panel_rows(
+    view: &HeaderView<'_>,
+    inner: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     // Title line: `>_ suspenders` bold accent, then ` (v<version>)` secondary.
     let title_line = {
         let mut spans: Vec<Span<'static>> = Vec::new();

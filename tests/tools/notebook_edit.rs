@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::notebook::Notebook;
 use crate::tool::caps::Capabilities;

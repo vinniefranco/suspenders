@@ -150,7 +150,12 @@ pub(super) fn draw_composer(
 /// Parks the terminal cursor at the draft cell when the chrome is `focused`,
 /// else leaves it (the Approval owns the keyboard). The focus branch lives HERE
 /// (IOSP).
-pub(super) fn place_composer_cursor(frame: &mut Frame, focused: bool, layout: &ComposerLayout, area: Rect) {
+pub(super) fn place_composer_cursor(
+    frame: &mut Frame,
+    focused: bool,
+    layout: &ComposerLayout,
+    area: Rect,
+) {
     if focused {
         frame.set_cursor_position(composer_cursor(layout, area));
     }

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::subagents::builtins;
 use crate::tool::caps::{Capabilities, SubagentRequest, SubagentResult, SubagentSpawner};

@@ -51,7 +51,11 @@ pub(super) fn selector_popup_title(command: &str) -> String {
 
 /// The body lines a status line spells: a Loading or Failed dialog draws one
 /// muted/error line. `Ready` returns `None` (the caller draws the rows). Pure.
-pub(super) fn dialog_status_line(status: &OverlayStatus, title: &str, theme: &Theme) -> Option<Line<'static>> {
+pub(super) fn dialog_status_line(
+    status: &OverlayStatus,
+    title: &str,
+    theme: &Theme,
+) -> Option<Line<'static>> {
     match status {
         OverlayStatus::Loading => Some(Line::styled(
             format!("loading {title}…"),
@@ -626,7 +630,10 @@ pub(super) fn with_ellipsis_suffix(s: &str) -> String {
 pub(super) fn elide_prefix(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() >= ELLIPSIS_LEN {
-        format!("{ELLIPSIS}{}", chars[ELLIPSIS_LEN..].iter().collect::<String>())
+        format!(
+            "{ELLIPSIS}{}",
+            chars[ELLIPSIS_LEN..].iter().collect::<String>()
+        )
     } else {
         ELLIPSIS.to_string()
     }
@@ -637,7 +644,11 @@ pub(super) fn elide_prefix(s: &str) -> String {
 pub(super) fn elide_suffix(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() >= ELLIPSIS_LEN {
-        with_ellipsis_suffix(&chars[..chars.len() - ELLIPSIS_LEN].iter().collect::<String>())
+        with_ellipsis_suffix(
+            &chars[..chars.len() - ELLIPSIS_LEN]
+                .iter()
+                .collect::<String>(),
+        )
     } else {
         ELLIPSIS.to_string()
     }

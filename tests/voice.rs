@@ -1,4 +1,3 @@
-
 use super::*;
 
 // ---- system_prompt/0 ----
@@ -319,7 +318,10 @@ fn completing_maps_each_stop_reason_to_its_close_marker() {
     );
     // Every other completion closes as an after-Pass stop.
     assert_eq!(Marker::completing(StopReason::EndTurn), Marker::RunStopped);
-    assert_eq!(Marker::completing(StopReason::MaxTokens), Marker::RunStopped);
+    assert_eq!(
+        Marker::completing(StopReason::MaxTokens),
+        Marker::RunStopped
+    );
 }
 
 // ---- Marker::is_run_close ----

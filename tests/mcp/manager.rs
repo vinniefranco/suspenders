@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::mcp::view::McpToolAnnotations;
 use crate::mcp::{McpCallResult, McpError};
@@ -308,4 +307,3 @@ fn oauth_target_returns_the_config_and_http_url_for_an_oauth_server() {
     // A plain (non-oauth) server has no target.
     assert!(manager.oauth_target("ghost").is_none());
 }
-

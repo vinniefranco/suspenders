@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn file(lines: &[&str]) -> String {
@@ -156,4 +155,3 @@ fn counts_every_added_and_removed_line_across_hunks() {
         }
     );
 }
-

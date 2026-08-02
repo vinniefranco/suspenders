@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::mcp::{McpServerStatus, McpServerView, McpSource, McpToolAnnotations, McpToolView};
 use serde_json::json;

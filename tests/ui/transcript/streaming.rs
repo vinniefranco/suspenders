@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn text_block(text: &str) -> ContentBlock {

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::conversation::{Conversation, ConversationOpts};
 use serde_json::json;

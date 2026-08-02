@@ -85,7 +85,6 @@ pub(super) fn text_rows(text: &str) -> Vec<String> {
         .collect()
 }
 
-
 /// Truncates `text` to at most `width` DISPLAY COLUMNS (a wide glyph counts 2),
 /// replacing the trimmed tail with a single `…`. The diff path's chrome uses
 /// this (not the char-based [`truncate_visual`]) so a CJK/emoji title or header

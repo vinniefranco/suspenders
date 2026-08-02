@@ -272,7 +272,11 @@ pub(super) fn help_shortcut_cell(
 
 /// One built-in command row (qwen `CommandsHelp` signature + description): the
 /// accent `/name`, then a secondary ` — help` on the same row, clipped to `inner`.
-pub(super) fn help_command_row(cmd: &slash::SlashCommand, inner: usize, theme: &Theme) -> Line<'static> {
+pub(super) fn help_command_row(
+    cmd: &slash::SlashCommand,
+    inner: usize,
+    theme: &Theme,
+) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let key_end = HELP_KEY_COL_WIDTH.min(inner);
     let mut used = push_cols(
@@ -305,7 +309,12 @@ pub(super) fn help_command_row(cmd: &slash::SlashCommand, inner: usize, theme: &
 /// (ADR-0046) so its footer meets the composer. The box lines are built once by
 /// the pure [`mcp_dialog_lines`] (measure==draw), so the viewport never
 /// re-breaks a row.
-pub(super) fn render_mcp_dialog(frame: &mut Frame, area: Rect, dialog: &McpDialogView, theme: &Theme) {
+pub(super) fn render_mcp_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &McpDialogView,
+    theme: &Theme,
+) {
     render_anchored_overlay(frame, area, theme, |width, theme| {
         mcp_dialog_lines(dialog, width, theme)
     });

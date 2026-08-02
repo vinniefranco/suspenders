@@ -64,10 +64,7 @@ pub(super) fn apply_enriched_model(state: &mut AgentState, model: Model) {
 // set, then answer the oneshot from the spawned task: `llm::offerings` walks
 // every Provider - live discovery for customs, the Catalog for built-ins
 // (ADR-0037).
-pub(super) fn spawn_list_models(
-    state: &AgentState,
-    reply: oneshot::Sender<Vec<ProviderModels>>,
-) {
+pub(super) fn spawn_list_models(state: &AgentState, reply: oneshot::Sender<Vec<ProviderModels>>) {
     let llm = Arc::clone(&state.llm);
     let providers = state.session.providers.clone();
     tokio::spawn(async move {

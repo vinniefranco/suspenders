@@ -237,7 +237,11 @@ pub(super) struct BoxBody<'a> {
 /// holding a ToolCall awaiting an Approval decision) reads warning UNLESS a shell
 /// tool in the group already claims the symbol colour - qwen's shell precedence
 /// wins, so `run_command` (a shell tool) keeps its grey border even mid-approval.
-pub(super) fn group_border_style(items: &[TranscriptItem], confirming: bool, theme: &Theme) -> Style {
+pub(super) fn group_border_style(
+    items: &[TranscriptItem],
+    confirming: bool,
+    theme: &Theme,
+) -> Style {
     if items.iter().any(is_group_shell) {
         symbol_style(theme)
     } else if confirming {
@@ -678,7 +682,11 @@ pub(super) fn tool_todo_lines(
 /// hung at [`STATUS_INDICATOR_WIDTH`] so the glyph column stays clear. The
 /// in_progress-green / completed-strikethrough treatment is applied HERE (the
 /// pure [`TodoStatus`] carries only the glyph, ADR-0019).
-pub(super) fn todo_item_rows(item: &TodoItem, content_width: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn todo_item_rows(
+    item: &TodoItem,
+    content_width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let style = match item.status {
         TodoStatus::InProgress => success_style(theme),
         TodoStatus::Completed => primary_style(theme).add_modifier(Modifier::CROSSED_OUT),
@@ -794,8 +802,6 @@ pub(super) fn tool_header_row(
     Line::from(spans)
 }
 
-
-
 /// A folded Diff's one-line row inside the box: the marker gutter, the title, and
 /// the `· ^O expand` affordance, truncate-end at `inner_width`.
 pub(super) fn tool_diff_fold_row(title: &str, inner_width: u16, theme: &Theme) -> Line<'static> {
@@ -868,7 +874,10 @@ pub(super) fn is_shell_tool(name: &str) -> bool {
 /// reads the `△` U+25B3 warning status; a Steering marker the `●` info glyph in
 /// the accent (the user's own voice reaching a running Run); everything else the
 /// `●` info glyph, secondary/muted. Tone alone decides, never the text.
-pub(super) fn marker_prefix_and_style(item: &TranscriptItem, theme: &Theme) -> (&'static str, Style) {
+pub(super) fn marker_prefix_and_style(
+    item: &TranscriptItem,
+    theme: &Theme,
+) -> (&'static str, Style) {
     match item {
         TranscriptItem::Marker {
             tone: Tone::Constrain,

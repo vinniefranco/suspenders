@@ -20,7 +20,6 @@ use crate::ui::screen::{Screen, Status};
 use crate::ui::theme::Theme;
 use crate::view_model::TranscriptItem;
 
-use super::{CONTENT_MARGIN, Toggles, wrapped_count};
 use super::approval::question_modal_lines;
 use super::composer_input::{COMPOSER_CHROME_ROWS, render_composer};
 use super::footer::{FooterCtx, render_footer};
@@ -35,6 +34,7 @@ use super::text::{text_rows, truncate_visual};
 use super::tool_group::{
     Approving, GroupedRows, grouped_rows, grouped_rows_with_approval, newest_live_tool_index,
 };
+use super::{CONTENT_MARGIN, Toggles, wrapped_count};
 
 /// The two connection facts the footer shows (ADR-0033): the fixed endpoint
 /// and the mutable Active Model. Both are adapter-carried - the pure Screen
@@ -112,7 +112,11 @@ pub struct FrameCtx<'a> {
 /// at the exact width the Composer is drawn at (the frame minus the 2-cell
 /// gutter), so the measured cursor cell is the drawn one. `composer_rows` is the
 /// already-capped Composer row count. Pure - no frame access.
-pub(super) fn frame_chunks(area: Rect, sticky_rows: usize, composer_rows: usize) -> std::rc::Rc<[Rect]> {
+pub(super) fn frame_chunks(
+    area: Rect,
+    sticky_rows: usize,
+    composer_rows: usize,
+) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -215,7 +219,11 @@ pub(super) struct PendingLayout<'a> {
 /// (ADR-0048) - reserved only when it fits alongside the status row, composer,
 /// and one body row (ADR-0029 measure == draw) - and splits `area` into the
 /// four zones. Pure: no frame access, no drawing.
-pub(super) fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Screen) -> PendingLayout<'a> {
+pub(super) fn pending_layout<'a>(
+    area: Rect,
+    view: &ComposerView<'_>,
+    t: &'a Screen,
+) -> PendingLayout<'a> {
     let draft = composer::layout(
         view.draft,
         view.cursor,
@@ -264,7 +272,12 @@ pub(super) fn pending_layout<'a>(area: Rect, view: &ComposerView<'_>, t: &'a Scr
 /// The sticky "Current tasks" slot: draws the box when the plan reserved one
 /// (`Some` items), else nothing. The presence branch lives HERE, so
 /// [`render_pending`] calls it unconditionally (IOSP).
-pub(super) fn render_sticky_slot(frame: &mut Frame, area: Rect, items: Option<&[TodoItem]>, theme: &Theme) {
+pub(super) fn render_sticky_slot(
+    frame: &mut Frame,
+    area: Rect,
+    items: Option<&[TodoItem]>,
+    theme: &Theme,
+) {
     if let Some(items) = items {
         render_sticky_todos(frame, area, items, theme);
     }
@@ -575,8 +588,6 @@ pub(super) fn draw_overflow_marker(frame: &mut Frame, area: Rect, theme: &Theme)
         area,
     );
 }
-
-
 
 /// The milliseconds-per-second divisor used when converting `quiet_ticks` (each
 /// tick is `TICK_MS` ms) into an elapsed-seconds figure for the lull timer.

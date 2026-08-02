@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::extensions::{self, Registered};
 use crate::plan::TodoStatus;

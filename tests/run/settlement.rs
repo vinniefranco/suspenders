@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::content::{ContentBlock, Message};
 use crate::conversation::{Conversation, ConversationOpts};

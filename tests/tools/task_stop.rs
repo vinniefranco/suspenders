@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::tool::caps::{Capabilities, SubagentRequest, SubagentResult, SubagentSpawner};
 use std::sync::Arc;

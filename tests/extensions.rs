@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::tool::ToolCtx;
 use crate::view_model::{DiffHunk, DiffLine, DiffSide, TranscriptItem};

@@ -50,8 +50,8 @@ pub use fold::compose_summary;
 // and the Resume fold entry (`resume`); the public surface is re-exported so
 // callers still reach it as `crate::session::log::…` (the split is invisible).
 pub use picker::{SessionEntry, latest, list};
-pub use resume::{Drift, ResumeError, plan, resume};
 pub(crate) use resume::resume_governed;
+pub use resume::{Drift, ResumeError, plan, resume};
 
 // ------------------------------------------------------------------
 // Terminal stop reason + settled outcome (shared with Run Settlement).
@@ -217,7 +217,6 @@ impl Entry {
             provenance: None,
         }
     }
-
 }
 
 // ------------------------------------------------------------------
@@ -321,7 +320,6 @@ fn header(session: &Session) -> Header {
         run_limit: session.run_limit,
     }
 }
-
 
 #[cfg(test)]
 #[path = "../../tests/session/log.rs"]

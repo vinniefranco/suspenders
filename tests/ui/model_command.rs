@@ -1,4 +1,3 @@
-
 use super::*;
 
 // --- applied_line (the three message branches) -------------------------

@@ -87,7 +87,6 @@ pub use pending::{
 /// the pending region uses.
 pub(crate) const CONTENT_MARGIN: u16 = 2;
 
-
 // ---------------------------------------------------------------------------
 // The per-item render cache + the visible-window math.
 //
@@ -130,18 +129,9 @@ fn wrapped_count(lines: Vec<Line<'static>>, width: u16) -> usize {
         .line_count(width)
 }
 
-
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
-
-
 
 #[cfg(test)]
 #[path = "../../tests/ui/components.rs"]

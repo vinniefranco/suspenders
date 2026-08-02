@@ -1,4 +1,3 @@
-
 use super::*;
 // The render code split into per-responsibility submodules of `components`
 // (the god-module split); these tests exercise their `pub(super)` items
@@ -15,8 +14,8 @@ use super::header::*;
 use super::overlay::*;
 use super::pending::*;
 use super::popup::*;
-use super::style::*;
 use super::sticky::*;
+use super::style::*;
 use super::text::*;
 use super::tool_group::*;
 

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::extensions::diff::hunks;
 

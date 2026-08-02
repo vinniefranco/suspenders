@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn span(text: &str, style: MdStyle) -> MdSpan {

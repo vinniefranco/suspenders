@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::content::{ContentBlock, Role, Usage};
 use crate::conversation::ConversationOpts;
@@ -20,7 +19,10 @@ fn ok_response(text: &str) -> Response {
 }
 
 fn opts() -> ConversationOpts {
-    ConversationOpts { compaction_slack: 0.0, ..ConversationOpts::new(2000, 500) }
+    ConversationOpts {
+        compaction_slack: 0.0,
+        ..ConversationOpts::new(2000, 500)
+    }
 }
 
 fn conversation_with_runs(count: u64) -> Conversation {
@@ -79,7 +81,13 @@ fn new_returns_fresh_state_with_no_summary_and_empty_file_ops() {
 
 #[test]
 fn fires_at_the_compaction_target_not_the_budget_target() {
-    let mut conv = Conversation::new("", ConversationOpts { compaction_slack: 0.3, ..ConversationOpts::new(1000, 200) });
+    let mut conv = Conversation::new(
+        "",
+        ConversationOpts {
+            compaction_slack: 0.3,
+            ..ConversationOpts::new(1000, 200)
+        },
+    );
     conv.add_user_text("a".repeat(2100));
 
     assert!(conv.token_estimate() > conv.compaction_target());
@@ -102,7 +110,13 @@ fn holds_at_the_target_exactly_and_fires_one_token_over() {
     // (`token_estimate` is the char estimate floored by the usage's
     // context floor), the binding term at Run start when the previous
     // Run's usage is on record.
-    let mut conv = Conversation::new("", ConversationOpts { compaction_slack: 0.0, ..ConversationOpts::new(1000, 200) });
+    let mut conv = Conversation::new(
+        "",
+        ConversationOpts {
+            compaction_slack: 0.0,
+            ..ConversationOpts::new(1000, 200)
+        },
+    );
     conv.add_user_text("short");
     assert_eq!(conv.compaction_target(), 800);
 

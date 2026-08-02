@@ -1,4 +1,3 @@
-
 use super::*;
 
 // qwen's bold subject wins: the trimmed text between the FIRST `**...**`

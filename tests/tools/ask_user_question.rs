@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::tool::caps::{Capabilities, Questioner};
 use std::sync::Arc;

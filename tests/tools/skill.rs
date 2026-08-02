@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::skills::SkillManager;
 use tempfile::TempDir;

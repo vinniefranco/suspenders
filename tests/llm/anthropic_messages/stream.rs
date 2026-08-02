@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::llm::{malformed_input_marker, malformed_tool_input};
 use serde_json::json;

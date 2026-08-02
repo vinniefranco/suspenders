@@ -60,7 +60,10 @@ pub(super) fn ordered_sticky_todos(items: &[TodoItem]) -> Vec<(usize, &TodoItem)
 /// the todo is still pending it renders inline above the composer, so the sticky
 /// box would double it; once it commits to scrollback the inline copy scrolls
 /// away and the sticky box takes over. Pure - a testable predicate, no frame.
-pub(super) fn sticky_todos(latest: Option<(usize, &[TodoItem])>, high_water: usize) -> Option<&[TodoItem]> {
+pub(super) fn sticky_todos(
+    latest: Option<(usize, &[TodoItem])>,
+    high_water: usize,
+) -> Option<&[TodoItem]> {
     let (index, items) = latest?;
     let non_empty = !items.is_empty();
     let all_completed = non_empty && items.iter().all(|i| i.status == TodoStatus::Completed);
@@ -87,7 +90,11 @@ pub(super) const STICKY_MIN_BODY_ROWS: usize = 1;
 /// the status row (1), the composer, and at least one body row. Pure predicate -
 /// the show/hide guard so a short terminal drops the box rather than letting
 /// Layout squeeze its zone below the measured height (ADR-0029 measure==draw).
-pub(super) fn sticky_fits(frame_height: usize, sticky_height: usize, composer_height: usize) -> bool {
+pub(super) fn sticky_fits(
+    frame_height: usize,
+    sticky_height: usize,
+    composer_height: usize,
+) -> bool {
     let reserved = sticky_height
         .saturating_add(1) // status bar
         .saturating_add(composer_height)
@@ -115,7 +122,12 @@ pub(super) fn sticky_box_area(zone: Rect) -> Rect {
 /// funneled through [`box_row`] to exactly the inner width so the box corners
 /// align (measure==draw, ADR-0029). `width` is the FULL box width (the frame
 /// less the marginX gutter the caller applied).
-pub(super) fn render_sticky_todos(frame: &mut Frame, area: Rect, items: &[TodoItem], theme: &Theme) {
+pub(super) fn render_sticky_todos(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[TodoItem],
+    theme: &Theme,
+) {
     // Integration (IOSP): the pure line-builder shapes every row; here we only
     // issue the draw call.
     let inner = (area.width as usize).saturating_sub(2); // the two `│` columns
@@ -199,7 +211,11 @@ pub(super) fn sticky_rows(
 /// the pre-computed [`sticky_columns`]), and the bottom border. Every content row
 /// is funneled through [`box_row`] to exactly `inner + 2` columns (measure==draw,
 /// ADR-0029). No arithmetic here - it only calls. Pure - no frame.
-pub(super) fn sticky_todos_lines(items: &[TodoItem], inner: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn sticky_todos_lines(
+    items: &[TodoItem],
+    inner: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let border = border_style(theme);
     let ordered = ordered_sticky_todos(items);
     let cols = sticky_columns(&ordered, inner);

@@ -178,7 +178,11 @@ impl Answer {
 
     /// An Approval denial (ADR-0005): the command never ran.
     fn denied() -> Self {
-        Answer::text(voice::Marker::CommandDenied.text(), true, Default::default())
+        Answer::text(
+            voice::Marker::CommandDenied.text(),
+            true,
+            Default::default(),
+        )
     }
 
     /// The Extension pipeline executed the call: the shaped block list rides

@@ -1,4 +1,3 @@
-
 use super::*;
 
 // A minimal nbformat-4.5 notebook fixture with two cells carrying stable ids

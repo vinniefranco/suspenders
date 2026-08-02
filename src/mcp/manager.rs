@@ -20,9 +20,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::mcp::McpConn;
 use crate::mcp::config::{McpOAuthConfig, McpServerConfig, McpTransport};
 use crate::mcp::view::{McpServerStatus, McpServerView, McpSource, McpToolView};
-use crate::mcp::McpConn;
 use crate::tool::Tool;
 
 mod connect;

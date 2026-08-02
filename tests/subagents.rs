@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn names_of(tools: &[Box<dyn Tool>]) -> Vec<String> {

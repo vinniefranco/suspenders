@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::llm::response::StopReason;
 

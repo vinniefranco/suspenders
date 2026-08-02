@@ -1,8 +1,8 @@
 use ratatui::text::Line;
 
-use super::{Toggles, wrapped_count};
 use super::diff::markdown_lines;
 use super::tool_group::message_lines;
+use super::{Toggles, wrapped_count};
 use crate::ui::theme::{self, Theme};
 use crate::ui::transcript::Transcript;
 
@@ -113,13 +113,7 @@ impl RenderCache {
     /// every settled line, so either clears too. The length check is
     /// cheap defense in kind: a store shorter than the cache (a swapped
     /// Transcript whose revision happens to coincide) cannot extend it.
-    fn needs_rebuild(
-        &self,
-        t: &Transcript,
-        toggles: Toggles,
-        width: u16,
-        theme: &Theme,
-    ) -> bool {
+    fn needs_rebuild(&self, t: &Transcript, toggles: Toggles, width: u16, theme: &Theme) -> bool {
         self.width != width
             || self.toggles != toggles
             || self.theme != *theme

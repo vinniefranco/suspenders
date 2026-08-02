@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::content::Usage;
 use crate::llm::response::StopReason;

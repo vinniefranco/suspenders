@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::tool::caps::{Capabilities, SideQuery};
 use std::sync::{Arc, Mutex};

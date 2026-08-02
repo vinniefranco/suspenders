@@ -1,6 +1,5 @@
-
-use super::*;
 use super::codec::decode_line;
+use super::*;
 use crate::content::Role;
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::voice;
@@ -555,7 +554,10 @@ async fn a_live_compaction_and_its_logged_fold_reconstruct_byte_identical_messag
     // The same ops feed the Session Log so the log mirrors the live events.
     let (_tmp, session, mut log) = open_log();
 
-    let opts = ConversationOpts { compaction_slack: 0.0, ..ConversationOpts::new(2000, 500) };
+    let opts = ConversationOpts {
+        compaction_slack: 0.0,
+        ..ConversationOpts::new(2000, 500)
+    };
     let mut conv = Conversation::new("You are Baud.", opts);
     for i in (1..=5).rev() {
         let body = format!("{}: turn {i}", "line ".repeat(50));

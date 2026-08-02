@@ -1,4 +1,3 @@
-
 use super::*;
 
 // `line_col` and `cursor_at` are exact inverses on every clamped cursor.

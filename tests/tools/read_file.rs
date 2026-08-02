@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::content::{Modalities, ResultBlock, unsupported_modality_placeholder};
 use base64::Engine;

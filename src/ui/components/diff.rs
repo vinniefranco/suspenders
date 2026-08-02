@@ -16,9 +16,7 @@ use crate::ui::markdown::{self, MdLine, MdStyle};
 use crate::ui::theme::{self, Theme};
 use crate::view_model::{DiffHunk, DiffSide};
 
-use super::style::{
-    diff_chrome_style, diff_side_fg, md_style, secondary_style, tui_color,
-};
+use super::style::{diff_chrome_style, diff_side_fg, md_style, secondary_style, tui_color};
 use super::text::{push_cols, truncate_cols};
 
 // ---------------------------------------------------------------------------
@@ -179,7 +177,6 @@ pub(super) fn md_line_text(line: &MdLine) -> String {
     line.spans.iter().map(|s| s.text.as_str()).collect()
 }
 
-
 /// Normalizes a diff line's raw code text for display: tabs become two spaces
 /// (consistent with [`text_rows`]); an empty line stays empty (the tint band
 /// fills it visibly, so no space-padding trick is needed as it was for a plain
@@ -251,7 +248,10 @@ pub(super) fn diff_lines(
 /// or after the last) - the flatten-with-separator the diff hunk rule needs
 /// without a branch inside the fold (qwen `═` U+2550 hunk rule, DiffRenderer.tsx
 /// :272). Pure.
-pub(super) fn join_blocks(blocks: Vec<Vec<Line<'static>>>, separator: Line<'static>) -> Vec<Line<'static>> {
+pub(super) fn join_blocks(
+    blocks: Vec<Vec<Line<'static>>>,
+    separator: Line<'static>,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for (i, block) in blocks.into_iter().enumerate() {
         if i > 0 {
@@ -314,7 +314,11 @@ pub(super) fn parse_hunk_header(header: Option<&str>) -> (u32, u32) {
 /// The muted `... last N lines hidden ...` tail a display-capped diff ends with,
 /// or nothing when the cap elided nothing (`elided == 0`). Worded to match qwen's
 /// overflow banner (DiffRenderer `MaxSizedBox` → `... N lines hidden ...`).
-pub(super) fn diff_elided_tail(elided: usize, content_width: u16, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn diff_elided_tail(
+    elided: usize,
+    content_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if elided == 0 {
         return Vec::new();
     }

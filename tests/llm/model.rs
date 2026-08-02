@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn custom(id: &str, window: u64) -> Provider {

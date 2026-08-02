@@ -7,7 +7,9 @@ use std::process::Stdio;
 
 use crate::tool::ToolCtx;
 
-use super::command_shape::{has_top_level_git_commit, strip_shell_wrapper, strip_trailing_background_amp};
+use super::command_shape::{
+    has_top_level_git_commit, strip_shell_wrapper, strip_trailing_background_amp,
+};
 
 #[cfg(unix)]
 pub(super) async fn spawn_and_wait(

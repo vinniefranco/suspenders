@@ -1,4 +1,3 @@
-
 use super::*;
 
 // The memory-subtree containment check lives in `tool::path` (its

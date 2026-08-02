@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::content::ContentBlock;
 use crate::event::Stage;
