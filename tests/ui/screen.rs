@@ -395,7 +395,13 @@ fn approval_request_stores_pending_and_focuses_modal() {
         command: a.command.clone(),
     });
     assert_eq!(t.pending_approval, Some(a));
-    assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::FocusModal,
+            Effect::Notify("Approval needed: rm -rf ./tmp".to_string()),
+        ]
+    );
 }
 
 // P2: a `run_command` approval derives `ConfirmKind::Exec` (not the Info
@@ -727,7 +733,13 @@ fn question_request_stores_pending_and_focuses_modal() {
     // One radio per question, each options + 1 for the auto-"Other" row.
     assert_eq!(pending.per_question.len(), 1);
     assert_eq!(pending.per_question[0].len(), 3);
-    assert_eq!(sans_commit(effects), vec![Effect::FocusModal]);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::FocusModal,
+            Effect::Notify("Pick for Library?".to_string()),
+        ]
+    );
 }
 
 #[test]

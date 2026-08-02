@@ -1181,3 +1181,146 @@ fn resize_re_renders_the_header_cleanly_at_the_new_width() {
         "the header wordmark re-renders at the narrow width:\n{narrow}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Ask notifications (PR: ring a desktop notification when an ask needs the
+// operator). The detection, rendering, and sanitization are pure functions
+// the adapter owns; the IO seam (`emit_ask_notification`) is untested by
+// design (it writes to the real stdout).
+// -----------------------------------------------------------------------
+
+// The notification body must never carry a byte that could terminate or
+// corrupt the OSC 777 sequence: BEL, ESC, and the C1 String Terminator all
+// collapse to spaces (as do newlines/tabs), so the ask text stays one clean
+// line inside `ESC ] 777 ; notify ; title ; body BEL`.
+#[test]
+fn sanitize_notification_strips_terminating_control_bytes() {
+    let raw = "run\x07this\x1b]evil\nline\ttab";
+    let out = sanitize_notification(raw);
+    assert!(!out.contains('\x07'));
+    assert!(!out.contains('\x1b'));
+    assert!(!out.contains('\n'));
+    assert!(!out.contains('\t'));
+    assert_eq!(out, "run this ]evil line tab");
+}
+
+// A long ask is capped with an ellipsis so it does not fill the whole
+// notification popup.
+#[test]
+fn sanitize_notification_caps_a_long_body() {
+    let raw = "x".repeat(500);
+    let out = sanitize_notification(&raw);
+    assert!(out.ends_with('…'));
+    // 120 chars kept + the ellipsis.
+    assert_eq!(out.chars().count(), 121);
+}
+
+// Builds an env reader over a fixed table for the detection tests.
+fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    let table: std::collections::HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    move |key: &str| table.get(key).cloned()
+}
+
+#[test]
+fn detect_ghostty_and_wezterm_and_foot_and_urxvt_use_osc777() {
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM_PROGRAM", "ghostty")])),
+        NotifyKind::Osc777
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM", "xterm-ghostty")])),
+        NotifyKind::Osc777
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("WEZTERM_PANE", "0")])),
+        NotifyKind::Osc777
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM", "foot")])),
+        NotifyKind::Osc777
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM", "rxvt-unicode-256color")])),
+        NotifyKind::Osc777
+    );
+}
+
+#[test]
+fn detect_kitty_uses_osc99() {
+    assert_eq!(
+        detect_notify_kind(env_of(&[("KITTY_WINDOW_ID", "1")])),
+        NotifyKind::Osc99
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM", "xterm-kitty")])),
+        NotifyKind::Osc99
+    );
+}
+
+#[test]
+fn detect_iterm2_uses_osc9() {
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM_PROGRAM", "iTerm.app")])),
+        NotifyKind::Osc9
+    );
+}
+
+// A bare/unknown terminal, and Apple Terminal / VTE terminals with no
+// notification OSC, degrade to BEL.
+#[test]
+fn detect_unknown_and_bare_terminals_degrade_to_bel() {
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM", "xterm-256color")])),
+        NotifyKind::BelOnly
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM_PROGRAM", "Apple_Terminal")])),
+        NotifyKind::BelOnly
+    );
+    assert_eq!(detect_notify_kind(env_of(&[])), NotifyKind::BelOnly);
+}
+
+// A multiplexer is checked BEFORE the emulator markers: even inside kitty,
+// being under tmux means the OSC would be stripped, so we fall to BEL.
+#[test]
+fn detect_multiplexer_wins_over_inner_terminal() {
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TMUX", "/tmp/tmux-1000/default,1,0")])),
+        NotifyKind::BelOnly
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[
+            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("KITTY_WINDOW_ID", "1"),
+        ])),
+        NotifyKind::BelOnly
+    );
+    assert_eq!(
+        detect_notify_kind(env_of(&[("TERM", "screen-256color")])),
+        NotifyKind::BelOnly
+    );
+}
+
+// Every popup variant trails a BEL; BelOnly is exactly a BEL.
+#[test]
+fn notification_bytes_render_the_expected_sequences() {
+    assert_eq!(
+        notification_bytes(NotifyKind::Osc777, "Suspenders", "hi"),
+        "\x1b]777;notify;Suspenders;hi\x07\x07"
+    );
+    assert_eq!(
+        notification_bytes(NotifyKind::Osc9, "Suspenders", "hi"),
+        "\x1b]9;Suspenders: hi\x07\x07"
+    );
+    assert_eq!(
+        notification_bytes(NotifyKind::Osc99, "Suspenders", "hi"),
+        "\x1b]99;;Suspenders: hi\x1b\\\x07"
+    );
+    assert_eq!(
+        notification_bytes(NotifyKind::BelOnly, "Suspenders", "hi"),
+        "\x07"
+    );
+}

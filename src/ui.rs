@@ -755,6 +755,12 @@ async fn run_effect(
         // focusable widget tree; the modal captures keys via the pure core's
         // pending_approval, and the composer is always the input target.
         Effect::FocusModal | Effect::FocusComposer => screen,
+        // An ask (Approval/Question) just opened: nudge the operator even when
+        // their terminal is backgrounded (see [`emit_ask_notification`]).
+        Effect::Notify(body) => {
+            emit_ask_notification(&body);
+            screen
+        }
         Effect::HistoryAppend(prompt) => persist_history(screen, state, prompt),
         // A committed Slash Command (ADR-0032/0033). The adapter routes it
         // through the single `command::run` seam - `is_handled` reflects exactly
@@ -805,6 +811,110 @@ async fn run_effect(
             let _ = ctx.selector_tx.send(Event::mcp_copy_result(copied));
             screen
         }
+    }
+}
+
+/// Makes an ask's text safe to carry inside an OSC 777 notification: strips the
+/// control bytes that would terminate or corrupt the escape sequence (BEL, ESC,
+/// the C1 String Terminator) and collapses newlines/tabs to spaces, then caps
+/// the length so a long command does not fill the notification. A terminal that
+/// ignores OSC 777 never sees this, but a well-behaved one gets a single clean
+/// line.
+fn sanitize_notification(body: &str) -> String {
+    const MAX: usize = 120;
+    let cleaned: String = body
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    match trimmed.char_indices().nth(MAX) {
+        Some((byte_idx, _)) => format!("{}…", trimmed[..byte_idx].trim_end()),
+        None => trimmed.to_string(),
+    }
+}
+
+/// How the detected terminal wants a desktop notification. There is no single
+/// escape sequence every POSIX terminal understands - the modern emulators split
+/// across three incompatible OSC families and the rest support none - so we
+/// detect the emulator ([`detect_notify_kind`]) and pick the one it speaks. The
+/// universal BEL always rides along ([`notification_bytes`]); it is the ONLY
+/// signal a bare xterm / Apple Terminal / VTE terminal can give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyKind {
+    /// iTerm2's `OSC 9 ; body`. iTerm2 (no separate title field, so we fold
+    /// `title: body` into one line).
+    Osc9,
+    /// rxvt's `OSC 777 ; notify ; title ; body`. Ghostty, WezTerm, foot, urxvt.
+    Osc777,
+    /// kitty's `OSC 99 ; ; body`. kitty implements neither OSC 9 nor OSC 777, so
+    /// it needs its own protocol (terminated by ST, not BEL).
+    Osc99,
+    /// No known desktop-notification OSC: rely on BEL alone. Covers xterm, st,
+    /// Apple Terminal, VTE terminals (gnome-terminal, tilix, kgx), and anything
+    /// under tmux/screen where a raw OSC would be stripped or mangled.
+    BelOnly,
+}
+
+/// Picks the [`NotifyKind`] for the current terminal from its environment. Takes
+/// the env reader as a closure so the (otherwise env-coupled) detection stays a
+/// pure, table-testable function. Order matters: multiplexers are checked first
+/// (they wrap whatever is inside), then emulators by their most specific marker.
+fn detect_notify_kind(env: impl Fn(&str) -> Option<String>) -> NotifyKind {
+    let term = env("TERM").unwrap_or_default();
+    let term_program = env("TERM_PROGRAM").unwrap_or_default();
+
+    // A multiplexer rewrites/strips OSC unless the user has enabled passthrough,
+    // which we cannot assume; BEL is the reliable signal there (tmux turns it
+    // into a bell/activity flag and forwards it to the outer terminal).
+    if env("TMUX").is_some() || term.starts_with("screen") || term.starts_with("tmux") {
+        return NotifyKind::BelOnly;
+    }
+    // kitty implements OSC 99 ONLY (a deliberate choice against OSC 9 / 777).
+    if env("KITTY_WINDOW_ID").is_some() || term.contains("kitty") {
+        return NotifyKind::Osc99;
+    }
+    // Ghostty (OSC 777, live-confirmed), WezTerm, foot, and urxvt all speak the
+    // rxvt sequence.
+    let is_ghostty = env("GHOSTTY_RESOURCES_DIR").is_some()
+        || term_program == "ghostty"
+        || term.contains("ghostty");
+    let is_wezterm = env("WEZTERM_PANE").is_some() || env("WEZTERM_EXECUTABLE").is_some();
+    if is_ghostty || is_wezterm || term.starts_with("foot") || term.starts_with("rxvt-unicode") {
+        return NotifyKind::Osc777;
+    }
+    // iTerm2's own sequence.
+    if term_program == "iTerm.app" {
+        return NotifyKind::Osc9;
+    }
+    NotifyKind::BelOnly
+}
+
+/// Raises the ask notification on the current terminal: sanitize the body, pick
+/// the emulator's sequence, and write it straight to stdout (crossterm has no
+/// bell/notify command). Kept off [`run_effect`]'s dispatch so that stays pure
+/// integration - this is the one operation seam that composes the notification
+/// helpers and does the IO. It rides alongside the alt-screen rendering.
+fn emit_ask_notification(body: &str) {
+    use std::io::Write;
+    let body = sanitize_notification(body);
+    let kind = detect_notify_kind(|key| std::env::var(key).ok());
+    let seq = notification_bytes(kind, "Suspenders", &body);
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// Builds the notification byte string for a [`NotifyKind`]. Every variant trails
+/// a BEL so a popup-capable terminal also flashes its urgency hint and a
+/// `BelOnly` terminal still gets the one universal signal. Callers pass an
+/// already-[`sanitize_notification`]d `body`; `title` is a trusted constant.
+fn notification_bytes(kind: NotifyKind, title: &str, body: &str) -> String {
+    match kind {
+        NotifyKind::Osc9 => format!("\x1b]9;{title}: {body}\x07\x07"),
+        NotifyKind::Osc777 => format!("\x1b]777;notify;{title};{body}\x07\x07"),
+        // OSC 99 is ST-terminated (ESC \); the trailing BEL rings kitty's bell.
+        NotifyKind::Osc99 => format!("\x1b]99;;{title}: {body}\x1b\\\x07"),
+        NotifyKind::BelOnly => "\x07".to_string(),
     }
 }
 
