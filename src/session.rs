@@ -149,7 +149,7 @@ pub struct Session {
 pub struct SessionError(pub String);
 
 /// The resolved config defaults a Session is built against.
-/// [`SessionConfig::load`] composes it (base → file → env) and tests pass
+/// [`SessionConfig::try_load`] composes it (base → file → env) and tests pass
 /// [`SessionConfig::test_defaults`] explicitly (no file/env reads).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
@@ -317,6 +317,7 @@ impl SessionConfig {
     /// behavior is covered by the tests that opt back in
     /// (`skip_next_speaker: Some(false)`). Set explicitly so the intent stays
     /// legible even though it matches `base`.
+    #[cfg(test)]
     pub fn test_defaults() -> Self {
         let mut cfg = SessionConfig::base();
         cfg.providers
@@ -333,19 +334,10 @@ impl SessionConfig {
         cfg
     }
 
-    /// The composition entry (ADR-0031): [`base`](Self::base) defaults overlaid
-    /// by the user's `config.json`, then by the `SUSPENDERS_*` environment.
-    /// [`try_load`](Self::try_load) is the fallible form; this is the panicking
-    /// convenience over it.
-    pub fn load() -> Self {
-        SessionConfig::try_load().expect("invalid suspenders configuration (file or SUSPENDERS_*)")
-    }
-
     /// The fallible composition entry over the user scope alone: `base()` →
     /// user `config.json` overlay → env overlay (ADR-0031). [`Session::new`]
     /// calls [`compose`](Self::compose) directly to add the workspace scope; this
-    /// stays the no-workspace convenience the panicking [`load`](Self::load) and
-    /// tests reach for.
+    /// stays the no-workspace convenience tests reach for.
     pub fn try_load() -> Result<Self, SessionError> {
         SessionConfig::compose(&default_config_path(), None)
     }

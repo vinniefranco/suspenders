@@ -171,6 +171,9 @@ pub async fn execute(extensions: &[Registered], token: Token) -> (PipelineResult
     // registration order for the caller.
     failures.reverse();
 
+    // Invariant: `token.result` is set unconditionally above (before the fold)
+    // and the `post_run` fold only rewrites it in place, never clears it - so it
+    // is always `Some` here.
     let result = token.result.expect("result set before post_run fold");
     let content = shaping::shape(
         &token.tool,
@@ -220,7 +223,7 @@ pub fn present(
                 failures.push(Failure {
                     extension: reg.name.clone(),
                     stage: Stage::Present,
-                    message: panic_message(&payload),
+                    message: panic_message(payload.as_ref()),
                 });
                 fallback
             }
@@ -251,7 +254,7 @@ impl ExtensionSpec {
     }
 
     /// A `{name, opts}` entry.
-    // qual:test_helper
+    #[cfg(test)]
     pub fn with_opts(name: impl Into<String>, opts: Value) -> Self {
         ExtensionSpec {
             name: name.into(),
@@ -354,7 +357,7 @@ where
             failures.push(Failure {
                 extension: reg.name.clone(),
                 stage: stage_name,
-                message: panic_message(&payload),
+                message: panic_message(payload.as_ref()),
             });
             fallback
         }
@@ -364,7 +367,7 @@ where
 /// Recovers a human-readable message from a caught panic payload, the way
 /// a raised exception surfaces its message. `panic!("msg")` and
 /// `panic!("{}", s)` both land as a `String` or `&str` in the payload.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

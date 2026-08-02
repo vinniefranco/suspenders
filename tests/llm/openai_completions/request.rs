@@ -131,7 +131,7 @@ fn an_error_result_is_prefixed_with_the_voices_marker() {
         out[0]["content"],
         json!(format!(
             "{} No such file: mix.exs",
-            crate::voice::tool_error_marker()
+            crate::voice::Marker::ToolError.text()
         ))
     );
 }
@@ -251,7 +251,10 @@ fn nil_top_p_omits_key_configured_one_rides() {
     assert!(req.as_object().unwrap().get("top_p").is_none());
 
     let with_top_p = build_request(
-        &LlmRequest::new("s", vec![], vec![]).with_top_p(Some(0.8)),
+        &LlmRequest {
+            top_p: Some(0.8),
+            ..LlmRequest::new("s", vec![], vec![])
+        },
         &model(),
     );
     assert_eq!(with_top_p["top_p"], json!(0.8));
@@ -263,7 +266,10 @@ fn nil_top_k_omits_key_configured_one_rides() {
     assert!(req.as_object().unwrap().get("top_k").is_none());
 
     let with_top_k = build_request(
-        &LlmRequest::new("s", vec![], vec![]).with_top_k(Some(20)),
+        &LlmRequest {
+            top_k: Some(20),
+            ..LlmRequest::new("s", vec![], vec![])
+        },
         &model(),
     );
     assert_eq!(with_top_k["top_k"], json!(20));

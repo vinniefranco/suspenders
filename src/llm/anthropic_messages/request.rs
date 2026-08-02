@@ -101,11 +101,22 @@ pub fn wire_message(message: &Message) -> Value {
     })
 }
 
-/// One content block on the Anthropic wire. Every variant but ToolResult matches
-/// the derive; ToolResult's block-list content is built explicitly so media
-/// reaches the wire in the `source.base64` shape.
+/// One content block on the Anthropic wire, built explicitly per variant (the
+/// same discipline ToolResult always used, now uniform): each block's wire
+/// shape is spelled out so the conversion is total and infallible - no
+/// serialize step that could fail and force a panic arm. ToolResult's block-list
+/// content routes through [`wire_tool_result_content`] so media reaches the wire
+/// in the `source.base64` shape.
 fn wire_block(block: &ContentBlock) -> Value {
     match block {
+        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { text } => json!({ "type": "thinking", "text": text }),
+        ContentBlock::ToolUse { id, name, input } => json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+        }),
         ContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -116,7 +127,6 @@ fn wire_block(block: &ContentBlock) -> Value {
             "is_error": is_error,
             "content": wire_tool_result_content(content),
         }),
-        other => serde_json::to_value(other).expect("content block serializes to JSON"),
     }
 }
 

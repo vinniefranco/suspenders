@@ -173,8 +173,9 @@ impl Settlement {
             // Cancellation needs both the flag and reason Shutdown.
             Outcome::Down(reason) if self.cancelled && reason == Reason::atom("shutdown") => {
                 let mut conversation = self.latest(base);
-                conversation
-                    .add_assistant_blocks(vec![ContentBlock::text(voice::run_cancelled_marker())]);
+                conversation.add_assistant_blocks(vec![ContentBlock::text(
+                    voice::Marker::RunCancelled.text(),
+                )]);
                 (conversation, Event::RunCancelled)
             }
             Outcome::Down(reason) => (failed(self.latest(base)), Event::RunError(reason)),
@@ -190,7 +191,7 @@ impl Settlement {
 
 // Close a failed Run with an assistant marker so roles keep alternating.
 fn failed(mut conversation: Conversation) -> Conversation {
-    conversation.add_assistant_blocks(vec![ContentBlock::text(voice::run_failed_marker())]);
+    conversation.add_assistant_blocks(vec![ContentBlock::text(voice::Marker::RunFailed.text())]);
     conversation
 }
 

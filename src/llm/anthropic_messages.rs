@@ -18,26 +18,46 @@
 pub mod request;
 pub mod stream;
 
-use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::llm::model::Model;
 use crate::llm::provider::Provider;
 use crate::llm::response::Response;
-use crate::llm::throttle::{Decision, Throttle, monotonic_ms};
-use crate::llm::{
-    Delta, DiscoveredModel, LlmRequest, OnEvent, StreamEvent, emit, models_from_body,
-};
+use crate::llm::transport::{self, SseProtocol, request_err};
+use crate::llm::{Delta, DiscoveredModel, LlmRequest, OnEvent};
 use stream::{SseEvent, StreamState};
 
-/// Minimum ms between streaming updates. At ~30fps the UI stays responsive to
-/// keyboard input; text rendering above this rate is imperceptible and only
-/// floods the channel.
-const STREAM_INTERVAL_MS: i64 = 33;
+/// This Api's SSE strategy for the shared [`transport`] driver: the frame
+/// parsing, delta extraction, and fold-state factory that make the Anthropic
+/// dialect concrete. The dialect has no `[DONE]` terminator (`message_stop`
+/// ends the stream), so [`is_done`](SseProtocol::is_done) is always `false`.
+struct AnthropicProtocol;
+
+impl SseProtocol for AnthropicProtocol {
+    type Fold = StreamState;
+
+    fn new_fold(&self) -> StreamState {
+        StreamState::new()
+    }
+
+    fn parse_frame(&self, name: &str, data: &str) -> SseEvent {
+        parse_frame(name, data)
+    }
+
+    fn delta_of(&self, event: &SseEvent) -> Option<Delta> {
+        delta_of(event)
+    }
+
+    fn is_done(&self, _event: &SseEvent) -> bool {
+        false
+    }
+}
 
 /// One streaming completion over `provider`'s endpoint. Honors the error
 /// algebra (ADR-0002): never `Err`, never panic - every failure is a Response
-/// with an `Error` stop reason and whatever partial content had streamed.
+/// with an `Error` stop reason and whatever partial content had streamed. The
+/// send/status/stream flow is the shared [`transport`] driver; this adapter
+/// supplies only the Anthropic request (URL + headers) and its SSE strategy.
 pub(super) async fn complete(
     req: &LlmRequest,
     model: &Model,
@@ -46,101 +66,38 @@ pub(super) async fn complete(
 ) -> Response {
     let payload = request::build_request(req, model);
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
-
-    let client = reqwest::Client::new();
-    let sent = client
-        .post(&url)
-        .header("x-api-key", &provider.token)
-        .header("anthropic-version", "2023-06-01")
+    let request = anthropic_headers(reqwest::Client::new().post(&url), provider)
         .header("content-type", "application/json")
-        .json(&payload)
-        .send()
-        .await;
-
-    let resp = match sent {
-        Ok(resp) => resp,
-        // Connection refused, DNS failure, etc. - no content streamed.
-        Err(e) => return Response::error(request_err(e)),
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Response::error(format!("request_failed: HTTP {status}: {body}"));
-    }
-
-    // Fold the SSE frames into the pure state machine, pacing `on_event`.
-    let mut state = StreamState::new();
-    let mut throttle = Throttle::new(STREAM_INTERVAL_MS);
-    let mut sse = resp.bytes_stream().eventsource();
-
-    while let Some(item) = sse.next().await {
-        match item {
-            Ok(event) => {
-                let sse_event = parse_frame(&event.event, &event.data);
-                // Extract any renderable delta BEFORE folding so we can
-                // snapshot the state AFTER folding this delta in.
-                let delta = delta_of(&sse_event);
-                state.handle_event(&sse_event);
-
-                if let Some(delta) = delta
-                    && throttle.tick(monotonic_ms()) == Decision::Emit
-                {
-                    emit(
-                        on_event,
-                        StreamEvent {
-                            delta,
-                            content: state.snapshot(),
-                        },
-                    );
-                }
-            }
-            // Mid-stream death (dropped connection, framing error): fold an
-            // error so partial content survives (the error algebra).
-            Err(e) => {
-                state.handle_event(&SseEvent::ParseError(format!("stream_error: {e}")));
-                break;
-            }
-        }
-    }
-
-    state.finalize()
+        .json(&payload);
+    transport::stream_completion(request, &AnthropicProtocol, on_event).await
 }
 
 /// The read-only models listing (`GET {base_url}/models`, ADR-0002 amendment).
 /// The models-list shape is common to the Anthropic and OpenAI REST APIs
 /// (`{"data": [{"id": …}]}`); the Anthropic headers ride because this adapter
-/// owns them.
+/// owns them. The send/status/parse flow is the shared [`transport`] driver.
 pub(super) async fn list_models(provider: &Provider) -> Result<Vec<DiscoveredModel>, String> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-
     // The discovery cap (see [`super::DISCOVERY_TIMEOUT`]): a blackholed
     // host times out into the same request_failed Err as any other failure.
     let client = reqwest::Client::builder()
         .timeout(super::DISCOVERY_TIMEOUT)
         .build()
         .map_err(request_err)?;
-    let sent = client
-        .get(&url)
+    let request = anthropic_headers(client.get(&url), provider);
+    transport::fetch_models(request).await
+}
+
+/// Attaches the Anthropic auth/version headers (`x-api-key`,
+/// `anthropic-version`) - the pair every request to this Api carries, typed
+/// once so `complete` and `list_models` cannot drift.
+fn anthropic_headers(
+    builder: reqwest::RequestBuilder,
+    provider: &Provider,
+) -> reqwest::RequestBuilder {
+    builder
         .header("x-api-key", &provider.token)
         .header("anthropic-version", "2023-06-01")
-        .send()
-        .await;
-
-    let resp = match sent {
-        Ok(resp) => resp,
-        // Connection refused, DNS failure, etc.
-        Err(e) => return Err(request_err(e)),
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("request_failed: HTTP {status}: {body}"));
-    }
-
-    let body = resp.text().await.map_err(request_err)?;
-    models_from_body(&body)
 }
 
 /// Runs a raw `event:`/`data:` frame into a parsed [`SseEvent`]. A data body
@@ -176,15 +133,6 @@ fn delta_of(event: &SseEvent) -> Option<Delta> {
         _ => None,
     }
 }
-
-/// Formats a `request_failed: {e}` error string. Shared by every failure arm
-/// in this adapter so the literal is typed once.
-fn request_err(e: impl std::fmt::Display) -> String {
-    format!("request_failed: {e}")
-}
-
-// `eventsource-stream`'s `Eventsource` trait extension on byte streams.
-use eventsource_stream::Eventsource;
 
 #[cfg(test)]
 #[path = "../../tests/llm/anthropic_messages.rs"]

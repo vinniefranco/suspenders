@@ -115,8 +115,30 @@ impl Tool for EditFile {
             .unwrap_or(false);
 
         let abs = resolve(&file_path, ctx)?;
-        apply_edit(&abs, &file_path, old_string, new_string, replace_all, ctx)
+        apply_edit(
+            EditPlan {
+                abs: &abs,
+                file_path: &file_path,
+                old_string,
+                new_string,
+                replace_all,
+            },
+            ctx,
+        )
     }
+}
+
+/// The cohesive inputs one edit needs (Parameter Object): the resolved absolute
+/// path `abs`, the model-supplied `file_path` (echoed in messages), the
+/// `old_string`/`new_string` to swap, and the `replace_all` flag. A recurring
+/// data clump made a first-class type so `apply_edit` takes the edit as one
+/// argument plus the `ctx` it acts through.
+struct EditPlan<'a> {
+    abs: &'a std::path::Path,
+    file_path: &'a str,
+    old_string: &'a str,
+    new_string: &'a str,
+    replace_all: bool,
 }
 
 /// Resolve a model-supplied ABSOLUTE `file_path` and confine it to the Project
@@ -140,14 +162,14 @@ fn resolve(path: &str, ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
 /// The core of qwen's `calculateEdit` + `execute`, narrowed to the model
 /// contract: read the file (or note its absence), decide the edit outcome,
 /// enforce prior-read for an in-place edit, apply, write, and record.
-fn apply_edit(
-    abs: &std::path::Path,
-    file_path: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
-    ctx: &ToolCtx,
-) -> Result<String, String> {
+fn apply_edit(plan: EditPlan<'_>, ctx: &ToolCtx) -> Result<String, String> {
+    let EditPlan {
+        abs,
+        file_path,
+        old_string,
+        new_string,
+        replace_all,
+    } = plan;
     let current = read_current(abs, file_path)?;
     let is_new_file = old_string.is_empty() && current.is_none();
 
@@ -491,23 +513,16 @@ mod normalize {
     /// found, retry with that trailing empty line dropped
     /// (`removedTrailingFinalEmptyLine = true`).
     fn find_line_based_match(haystack: &str, needle: &str) -> Option<MatchedSlice> {
-        let (lines, offsets) = build_line_index(haystack);
+        let index = build_line_index(haystack);
         let pattern_lines: Vec<&str> = needle.split('\n').collect();
         let ends_with_newline = needle.ends_with('\n');
         if pattern_lines.is_empty() {
             return None;
         }
 
-        if let Some(idx) = attempt_match(&lines, &pattern_lines) {
+        if let Some(idx) = attempt_match(&index.lines, &pattern_lines) {
             return Some(MatchedSlice {
-                slice: slice_from_lines(
-                    haystack,
-                    &offsets,
-                    &lines,
-                    idx,
-                    pattern_lines.len(),
-                    ends_with_newline,
-                ),
+                slice: slice_from_lines(&index, idx, pattern_lines.len(), ends_with_newline),
                 removed_trailing_final_empty_line: false,
             });
         }
@@ -517,9 +532,9 @@ mod normalize {
             if trimmed.is_empty() {
                 return None;
             }
-            if let Some(idx) = attempt_match(&lines, trimmed) {
+            if let Some(idx) = attempt_match(&index.lines, trimmed) {
                 return Some(MatchedSlice {
-                    slice: slice_from_lines(haystack, &offsets, &lines, idx, trimmed.len(), false),
+                    slice: slice_from_lines(&index, idx, trimmed.len(), false),
                     removed_trailing_final_empty_line: true,
                 });
             }
@@ -527,28 +542,45 @@ mod normalize {
         None
     }
 
-    /// qwen's `attemptMatch`: the identity and `trimEnd` passes, then the
-    /// character-normalizing + `trimEnd` pass.
-    fn attempt_match(lines: &[&str], pattern: &[&str]) -> Option<usize> {
-        let passes: [fn(&str) -> String; 3] = [
-            |v: &str| v.to_string(),
-            |v: &str| trim_end(v).to_string(),
-            normalize_line_for_comparison,
-        ];
-        for pass in passes {
-            if let Some(idx) = seek_sequence_with_transform(lines, pattern, pass) {
-                return Some(idx);
+    /// One line-comparison pass in qwen's `attemptMatch` relaxation ladder: the
+    /// identity pass, the `trimEnd` pass, then the `normalizeBasicCharacters +
+    /// trimEnd` pass. A first-class enum (rather than a function-pointer table)
+    /// so each transform is reached through a plain method call.
+    #[derive(Clone, Copy)]
+    enum LinePass {
+        Identity,
+        TrimEnd,
+        Normalize,
+    }
+
+    impl LinePass {
+        /// The three passes in relaxation order.
+        const LADDER: [LinePass; 3] = [LinePass::Identity, LinePass::TrimEnd, LinePass::Normalize];
+
+        /// Apply this pass' transform to one line.
+        fn apply(self, value: &str) -> String {
+            match self {
+                LinePass::Identity => value.to_string(),
+                LinePass::TrimEnd => trim_end(value).to_string(),
+                LinePass::Normalize => normalize_line_for_comparison(value),
             }
         }
-        None
+    }
+
+    /// qwen's `attemptMatch`: the identity and `trimEnd` passes, then the
+    /// character-normalizing + `trimEnd` pass, tried in order.
+    fn attempt_match(lines: &[&str], pattern: &[&str]) -> Option<usize> {
+        LinePass::LADDER
+            .into_iter()
+            .find_map(|pass| seek_sequence_with_transform(lines, pattern, pass))
     }
 
     /// qwen `seekSequenceWithTransform`: first window index where every
-    /// transformed pattern line equals the transformed haystack line.
+    /// pass-transformed pattern line equals the transformed haystack line.
     fn seek_sequence_with_transform(
         lines: &[&str],
         pattern: &[&str],
-        transform: fn(&str) -> String,
+        pass: LinePass,
     ) -> Option<usize> {
         if pattern.is_empty() {
             return Some(0);
@@ -558,7 +590,7 @@ mod normalize {
         }
         'outer: for i in 0..=(lines.len() - pattern.len()) {
             for (p, pat) in pattern.iter().enumerate() {
-                if transform(lines[i + p]) != transform(pat) {
+                if pass.apply(lines[i + p]) != pass.apply(pat) {
                     continue 'outer;
                 }
             }
@@ -567,9 +599,19 @@ mod normalize {
         None
     }
 
-    /// qwen `buildLineIndex`: the split lines and the byte offset each starts at
-    /// (offsets has `lines.len() + 1` entries; the last is the content length).
-    fn build_line_index(text: &str) -> (Vec<&str>, Vec<usize>) {
+    /// qwen `buildLineIndex`'s output as a first-class value: the text, its
+    /// `split('\n')` lines, and the byte offset each line starts at (`offsets`
+    /// has `lines.len() + 1` entries; the last is the content length). Groups the
+    /// `(text, lines, offsets)` clump `slice_from_lines` needed as three separate
+    /// positional arguments into one Parameter Object.
+    struct LineIndex<'a> {
+        text: &'a str,
+        lines: Vec<&'a str>,
+        offsets: Vec<usize>,
+    }
+
+    /// qwen `buildLineIndex`.
+    fn build_line_index(text: &str) -> LineIndex<'_> {
         let lines: Vec<&str> = text.split('\n').collect();
         let mut offsets = vec![0usize; lines.len() + 1];
         let mut cursor = 0usize;
@@ -581,16 +623,19 @@ mod normalize {
             }
         }
         offsets[lines.len()] = text.len();
-        (lines, offsets)
+        LineIndex {
+            text,
+            lines,
+            offsets,
+        }
     }
 
     /// qwen `sliceFromLines`: reconstruct the original bytes for
     /// `[start_line, start_line + line_count)`, optionally including the newline
-    /// after the final line.
+    /// after the final line. Takes the [`LineIndex`] Parameter Object so its
+    /// `(text, lines, offsets)` data clump travels as one argument.
     fn slice_from_lines(
-        text: &str,
-        offsets: &[usize],
-        lines: &[&str],
+        index: &LineIndex<'_>,
         start_line: usize,
         line_count: usize,
         include_trailing_newline: bool,
@@ -602,19 +647,20 @@ mod normalize {
                 String::new()
             };
         }
-        let start_index = offsets.get(start_line).copied().unwrap_or(0);
+        let start_index = index.offsets.get(start_line).copied().unwrap_or(0);
         let last_line_index = start_line + line_count - 1;
-        let last_line_start = offsets.get(last_line_index).copied().unwrap_or(0);
-        let mut end_index = last_line_start + lines.get(last_line_index).map_or(0, |l| l.len());
+        let last_line_start = index.offsets.get(last_line_index).copied().unwrap_or(0);
+        let mut end_index =
+            last_line_start + index.lines.get(last_line_index).map_or(0, |l| l.len());
 
         if include_trailing_newline {
-            if let Some(next_line_start) = offsets.get(start_line + line_count).copied() {
+            if let Some(next_line_start) = index.offsets.get(start_line + line_count).copied() {
                 end_index = next_line_start;
-            } else if text.ends_with('\n') {
-                end_index = text.len();
+            } else if index.text.ends_with('\n') {
+                end_index = index.text.len();
             }
         }
-        text[start_index..end_index].to_string()
+        index.text[start_index..end_index].to_string()
     }
 
     /// qwen `adjustNewStringForTrailingLine`.

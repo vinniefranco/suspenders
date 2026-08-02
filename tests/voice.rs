@@ -255,11 +255,11 @@ fn compaction_facts_handles_absent_task_and_empty_ops() {
     assert!(!facts.is_empty());
 }
 
-// ---- tool_error_marker/0 ----
+// ---- Marker::ToolError ----
 
 #[test]
 fn tool_error_marker_is_a_short_bracketed_marker() {
-    let marker = tool_error_marker();
+    let marker = Marker::ToolError.text();
     assert!(marker.starts_with('['));
     assert!(marker.ends_with(']'));
     assert!(marker.chars().count() < 40);
@@ -268,15 +268,69 @@ fn tool_error_marker_is_a_short_bracketed_marker() {
     assert!(!marker.contains('\u{2013}')); // en-dash
 }
 
-// ---- orphaned_call_answer/0 ----
+// ---- Marker::OrphanedCall ----
 
 #[test]
 fn orphaned_call_answer_is_a_bracketed_error_telling_the_model_to_reissue() {
-    let answer = orphaned_call_answer();
+    let answer = Marker::OrphanedCall.text();
     assert!(answer.starts_with('['));
     assert!(answer.ends_with(']'));
     assert!(answer.contains("model switch"));
     assert!(answer.contains("re-issue"));
     assert!(!answer.contains('\u{2014}')); // em-dash
     assert!(!answer.contains('\u{2013}')); // en-dash
+}
+
+// ---- Marker::text: every fixed marker is bracketed and dash-free ----
+
+#[test]
+fn every_fixed_marker_is_bracketed_and_dash_free() {
+    for marker in [
+        Marker::RunLimit,
+        Marker::LoopStall,
+        Marker::RunStopped,
+        Marker::Truncation,
+        Marker::EmptyResponse,
+        Marker::RunCancelled,
+        Marker::RunFailed,
+        Marker::ToolError,
+        Marker::OrphanedCall,
+        Marker::TruncatedCallReissue,
+        Marker::CommandDenied,
+    ] {
+        let text = marker.text();
+        assert!(text.starts_with('['), "{marker:?} not bracketed: {text:?}");
+        assert!(text.ends_with(']'), "{marker:?} not bracketed: {text:?}");
+        assert!(!text.contains('\u{2014}'), "{marker:?} has an em-dash");
+        assert!(!text.contains('\u{2013}'), "{marker:?} has an en-dash");
+    }
+}
+
+// ---- Marker::completing: the run-close classifier ----
+
+#[test]
+fn completing_maps_each_stop_reason_to_its_close_marker() {
+    use crate::session::log::StopReason;
+    // The Run Limit and loop-stall stops name themselves.
+    assert_eq!(Marker::completing(StopReason::RunLimit), Marker::RunLimit);
+    assert_eq!(
+        Marker::completing(StopReason::RunLimitStuck),
+        Marker::LoopStall
+    );
+    // Every other completion closes as an after-Pass stop.
+    assert_eq!(Marker::completing(StopReason::EndTurn), Marker::RunStopped);
+    assert_eq!(Marker::completing(StopReason::MaxTokens), Marker::RunStopped);
+}
+
+// ---- Marker::is_run_close ----
+
+#[test]
+fn is_run_close_recognizes_the_run_close_markers_only() {
+    assert!(Marker::is_run_close(Marker::RunLimit.text()));
+    assert!(Marker::is_run_close(Marker::LoopStall.text()));
+    assert!(Marker::is_run_close(Marker::EmptyResponse.text()));
+    // Answers (not run-close markers) and plain text are not close markers.
+    assert!(!Marker::is_run_close(Marker::OrphanedCall.text()));
+    assert!(!Marker::is_run_close(Marker::CommandDenied.text()));
+    assert!(!Marker::is_run_close("some model reply"));
 }

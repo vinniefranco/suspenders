@@ -157,34 +157,3 @@ fn counts_every_added_and_removed_line_across_hunks() {
     );
 }
 
-// ---- to_unified/2 ----
-
-#[test]
-fn renders_headers_and_prefixed_lines() {
-    let before = file(&["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10"]);
-    let changed = file(&["l1", "l2", "l3", "l4", "L5", "l6", "l7", "l8", "l9", "l10"]);
-
-    let unified = to_unified(&compute(&before, &changed), 100);
-
-    assert_eq!(
-        unified,
-        "@@ -2,7 +2,7 @@\n l2\n l3\n l4\n-l5\n+L5\n l6\n l7\n l8"
-    );
-}
-
-#[test]
-fn caps_at_max_lines_with_an_elision_note() {
-    let before: String = (1..=30)
-        .map(|i| format!("line{i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let changed: String = (1..=30)
-        .map(|i| format!("LINE{i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let unified = to_unified(&compute(&before, &changed), 5);
-
-    assert_eq!(unified.split('\n').count(), 6);
-    assert!(unified.contains("more diff lines)"));
-}

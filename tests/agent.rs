@@ -939,7 +939,7 @@ async fn cancel_mid_run_emits_run_cancelled_and_records_the_cancellation() {
     );
     assert_eq!(
         conv.messages[n - 1],
-        Message::assistant(vec![ContentBlock::text(voice::run_cancelled_marker())])
+        Message::assistant(vec![ContentBlock::text(voice::Marker::RunCancelled.text())])
     );
 }
 
@@ -987,7 +987,7 @@ async fn cancel_after_a_tool_ran_keeps_the_partial_run() {
         Message { role: Role::User, content, .. } if matches!(&content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1")));
     assert_eq!(
         tail[2],
-        Message::assistant(vec![ContentBlock::text(voice::run_cancelled_marker())])
+        Message::assistant(vec![ContentBlock::text(voice::Marker::RunCancelled.text())])
     );
 }
 
@@ -1018,7 +1018,7 @@ async fn llm_error_emits_run_error_keeps_user_message_and_closes_with_failure_ma
     assert_eq!(
         conv.messages[n - 1],
         Message::assistant_from(
-            vec![ContentBlock::text(voice::run_failed_marker())],
+            vec![ContentBlock::text(voice::Marker::RunFailed.text())],
             provenance
         )
     );
@@ -1053,7 +1053,7 @@ async fn an_llm_error_after_a_tool_ran_keeps_the_partial_run_under_the_failure_m
     assert_eq!(
         tail[2],
         Message::assistant_from(
-            vec![ContentBlock::text(voice::run_failed_marker())],
+            vec![ContentBlock::text(voice::Marker::RunFailed.text())],
             provenance
         )
     );

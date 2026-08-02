@@ -1,8 +1,17 @@
 
 use super::*;
+use super::codec::decode_line;
+use crate::content::Role;
 use crate::session::{Session, SessionConfig, SessionOpts};
+use crate::voice;
 use serde_json::json;
 use tempfile::TempDir;
+
+// A user message from content blocks - the fold's own `user_message` helper is
+// private to the `fold` submodule now, so the test keeps its own trivial copy.
+fn user_message(content: Vec<ContentBlock>) -> Message {
+    Message::user(content)
+}
 
 // A Session rooted at `dir`, session_dir under it, no-env config path.
 fn session_in(dir: &std::path::Path) -> Session {
@@ -151,7 +160,7 @@ fn an_all_unanswered_batch_collapses_to_the_empty_response_marker() {
         messages,
         vec![
             user_message(vec![text("go")]),
-            Message::assistant(vec![text(voice::empty_response_marker())]),
+            Message::assistant(vec![text(voice::Marker::EmptyResponse.text())]),
         ]
     );
 }
@@ -546,7 +555,7 @@ async fn a_live_compaction_and_its_logged_fold_reconstruct_byte_identical_messag
     // The same ops feed the Session Log so the log mirrors the live events.
     let (_tmp, session, mut log) = open_log();
 
-    let opts = ConversationOpts::new(2000, 500).compaction_slack(0.0);
+    let opts = ConversationOpts { compaction_slack: 0.0, ..ConversationOpts::new(2000, 500) };
     let mut conv = Conversation::new("You are Baud.", opts);
     for i in (1..=5).rev() {
         let body = format!("{}: turn {i}", "line ".repeat(50));

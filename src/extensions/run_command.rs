@@ -79,26 +79,20 @@ impl Presenter for RunCommand {
         _opts: &Value,
     ) -> TranscriptItem {
         // Rewrite a run_command Tool Result summary to the exit badge; without
-        // the artifact (or for any other tool) pass through unchanged.
+        // the artifact (or for any other tool) pass through unchanged. The badge
+        // is the ONLY field that differs, so swap `summary` in place and hand the
+        // rest of the item straight back.
         match item {
             TranscriptItem::ToolResult {
                 name,
                 is_error,
                 key_arg,
                 summary,
-            } if name == TOOL => match badge(artifacts) {
-                Some(badge) => TranscriptItem::ToolResult {
-                    name,
-                    summary: badge,
-                    is_error,
-                    key_arg,
-                },
-                None => TranscriptItem::ToolResult {
-                    name,
-                    summary,
-                    is_error,
-                    key_arg,
-                },
+            } if name == TOOL => TranscriptItem::ToolResult {
+                summary: badge(artifacts).unwrap_or(summary),
+                name,
+                is_error,
+                key_arg,
             },
             other => other,
         }

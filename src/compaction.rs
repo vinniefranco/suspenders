@@ -165,7 +165,7 @@ Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
     /// Convenience wrapper for use as a Run `compact` Dep capture: runs and
     /// drops the new state - the caller fires the state update separately.
     /// Returns `Ok(conversation)` or `Err(reason)`.
-    // qual:test_helper
+    #[cfg(test)]
     pub async fn recovery_capture(
         &self,
         conv: &Conversation,

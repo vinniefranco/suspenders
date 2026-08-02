@@ -191,7 +191,7 @@ fn outcome_run_limit_maps_to_max_turns() {
         model().provenance(),
     );
     // The Loop appends a marker-only assistant message on a Run-Limit close.
-    conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::run_limit_marker())]);
+    conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::Marker::RunLimit.text())]);
     let out = outcome_to_result(Outcome::Ok(conv, OutcomeStop::Reason(StopReason::RunLimit)));
     assert_eq!(out.terminate_reason, "MAX_TURNS");
     // The trailing pure-marker message is skipped; the real text is the answer.
@@ -202,7 +202,7 @@ fn outcome_run_limit_maps_to_max_turns() {
 fn outcome_failed_maps_to_error_with_partial_text() {
     let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 100));
     conv.add_assistant_response(vec![ContentBlock::text("partial")], model().provenance());
-    conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::run_failed_marker())]);
+    conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::Marker::RunFailed.text())]);
     let out = outcome_to_result(Outcome::Failed("boom".to_string(), conv));
     assert_eq!(out.terminate_reason, "ERROR");
     assert_eq!(out.result, "partial");
@@ -218,7 +218,7 @@ fn outcome_budget_error_maps_to_error_with_no_text() {
 #[test]
 fn outcome_stuck_loop_maps_to_error() {
     let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 100));
-    conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::loop_stall_marker())]);
+    conv.add_assistant_blocks(vec![ContentBlock::text(crate::voice::Marker::LoopStall.text())]);
     let out = outcome_to_result(Outcome::Ok(
         conv,
         OutcomeStop::Reason(StopReason::RunLimitStuck),

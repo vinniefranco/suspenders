@@ -25,13 +25,20 @@ const FLOOR_CHARS: usize = 4_000;
 /// run_command's head:tail split. The tail carries the signal.
 const HEAD_QUARTER: usize = 4;
 
+/// The Result Cap numerator: `3.5 chars/token * 1/16 of the window` expressed as
+/// the exact rational `7 / 32` (`3.5 = 7/2`, times `1/16`, is `7/32`), applied
+/// as integer `window * CAP_NUMERATOR / CAP_DENOMINATOR` to avoid float rounding.
+const CAP_NUMERATOR: u64 = 7;
+/// The Result Cap denominator (see [`CAP_NUMERATOR`]).
+const CAP_DENOMINATOR: u64 = 32;
+
 /// Derives the Result Cap in chars from the Context Budget and the reply
 /// reserve: a sixteenth of the Conversation window, at 3.5 chars per token,
 /// floored at 4000 chars (`window * 7 / 32`).
 pub fn cap_for(context_budget: u64, max_tokens_reserve: u64) -> usize {
     let window_tokens = context_budget.saturating_sub(max_tokens_reserve);
     // window_tokens * 3.5 chars/token, a sixteenth of it: window * 7 / 32.
-    ((window_tokens * 7 / 32) as usize).max(FLOOR_CHARS)
+    ((window_tokens * CAP_NUMERATOR / CAP_DENOMINATOR) as usize).max(FLOOR_CHARS)
 }
 
 /// Shapes one Tool Result's block list to the Result Cap (ADR-0059). The cap

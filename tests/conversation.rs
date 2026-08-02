@@ -49,7 +49,7 @@ fn new_builds_empty_conversation_from_explicit_values() {
 #[test]
 fn new_overhead_chars_defaults_to_0_and_is_settable() {
     let base = Conversation::new("sys", ConversationOpts::new(123, 0));
-    let with_overhead = Conversation::new("sys", ConversationOpts::new(123, 0).overhead_chars(700));
+    let with_overhead = Conversation::new("sys", ConversationOpts { overhead_chars: 700, ..ConversationOpts::new(123, 0) });
     assert_eq!(base.overhead_chars, 0);
     assert_eq!(with_overhead.overhead_chars, 700);
 }
@@ -57,7 +57,7 @@ fn new_overhead_chars_defaults_to_0_and_is_settable() {
 #[test]
 fn new_compaction_slack_defaults_to_zero_and_is_settable() {
     let base = Conversation::new("sys", ConversationOpts::new(123, 0));
-    let with_slack = Conversation::new("sys", ConversationOpts::new(123, 0).compaction_slack(0.5));
+    let with_slack = Conversation::new("sys", ConversationOpts { compaction_slack: 0.5, ..ConversationOpts::new(123, 0) });
     assert_eq!(base.compaction_slack, 0.0);
     assert_eq!(with_slack.compaction_slack, 0.5);
 }
@@ -65,7 +65,7 @@ fn new_compaction_slack_defaults_to_zero_and_is_settable() {
 #[test]
 fn new_compaction_keep_defaults_to_half_and_is_settable() {
     let base = Conversation::new("sys", ConversationOpts::new(123, 0));
-    let with_keep = Conversation::new("sys", ConversationOpts::new(123, 0).compaction_keep(0.3));
+    let with_keep = Conversation::new("sys", ConversationOpts { compaction_keep: 0.3, ..ConversationOpts::new(123, 0) });
     assert_eq!(base.compaction_keep, 0.5);
     assert_eq!(with_keep.compaction_keep, 0.3);
 }
@@ -147,7 +147,7 @@ fn token_estimate_is_ceil_chars_over_35() {
 #[test]
 fn token_estimate_counts_overhead_chars() {
     // 4 + 5 + 26 = 35 -> 35 / 3.5 = 10
-    let mut conv = Conversation::new("abcd", ConversationOpts::new(1000, 0).overhead_chars(26));
+    let mut conv = Conversation::new("abcd", ConversationOpts { overhead_chars: 26, ..ConversationOpts::new(1000, 0) });
     conv.add_user_text("hello");
     assert_eq!(conv.token_estimate(), 10);
 }
@@ -224,7 +224,7 @@ fn token_estimate_floors_at_the_cache_inclusive_sum() {
 fn compaction_target_is_live_window_minus_slack() {
     let conv = Conversation::new(
         "sys",
-        ConversationOpts::new(1000, 200).compaction_slack(0.3),
+        ConversationOpts { compaction_slack: 0.3, ..ConversationOpts::new(1000, 200) },
     );
     assert_eq!(conv.compaction_target(), 500);
     assert_eq!(compaction_target(1000, 200, 0.3), 500);
@@ -245,7 +245,7 @@ fn compaction_target_clamps_at_zero() {
 
 #[test]
 fn compaction_keep_amount_is_keep_fraction_of_live_window() {
-    let conv = Conversation::new("sys", ConversationOpts::new(1000, 200).compaction_keep(0.5));
+    let conv = Conversation::new("sys", ConversationOpts { compaction_keep: 0.5, ..ConversationOpts::new(1000, 200) });
     assert_eq!(conv.compaction_keep_amount(), 400);
     assert_eq!(compaction_keep_amount(1000, 200, 0.5), 400);
 }
@@ -350,7 +350,7 @@ fn prepare_compaction_noop_for_one_user_message() {
 
 #[test]
 fn prepare_compaction_finds_cutoff_across_runs() {
-    let mut conv = Conversation::new("sys", ConversationOpts::new(200, 0).compaction_slack(0.0));
+    let mut conv = Conversation::new("sys", ConversationOpts { compaction_slack: 0.0, ..ConversationOpts::new(200, 0) });
     for (u, a) in [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")] {
         conv.add_user_text(u.repeat(100));
         conv.add_assistant_blocks(vec![ContentBlock::text(a.repeat(100))]);
@@ -388,12 +388,12 @@ fn multi_run_conv(
 fn prepare_compaction_keep_is_compaction_keep_of_window() {
     let pairs = [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")];
     let small = multi_run_conv(
-        ConversationOpts::new(10_000, 0).compaction_keep(0.05),
+        ConversationOpts { compaction_keep: 0.05, ..ConversationOpts::new(10_000, 0) },
         &pairs,
         700,
     );
     let large = multi_run_conv(
-        ConversationOpts::new(10_000, 0).compaction_keep(0.3),
+        ConversationOpts { compaction_keep: 0.3, ..ConversationOpts::new(10_000, 0) },
         &pairs,
         700,
     );
@@ -415,7 +415,7 @@ fn prepare_compaction_walk_measures_keep_in_chars_not_tokens() {
     // messages and snap to index 4.
     let pairs = [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")];
     let conv = multi_run_conv(
-        ConversationOpts::new(10_000, 0).compaction_keep(0.05),
+        ConversationOpts { compaction_keep: 0.05, ..ConversationOpts::new(10_000, 0) },
         &pairs,
         600,
     );
@@ -428,9 +428,13 @@ fn prepare_compaction_walk_measures_keep_in_chars_not_tokens() {
 #[test]
 fn prepare_compaction_compaction_slack_no_longer_affects_cutoff() {
     let pairs = [("a", "b"), ("c", "d"), ("e", "f")];
-    let make_opts = || ConversationOpts::new(1_000, 0).compaction_keep(0.5);
-    let zero = multi_run_conv(make_opts().compaction_slack(0.0), &pairs, 300);
-    let high = multi_run_conv(make_opts().compaction_slack(0.9), &pairs, 300);
+    let make_opts = |slack: f64| ConversationOpts {
+        compaction_keep: 0.5,
+        compaction_slack: slack,
+        ..ConversationOpts::new(1_000, 0)
+    };
+    let zero = multi_run_conv(make_opts(0.0), &pairs, 300);
+    let high = multi_run_conv(make_opts(0.9), &pairs, 300);
 
     let (_, cutoff_zero, _) = zero.prepare_compaction().unwrap();
     let (_, cutoff_high, _) = high.prepare_compaction().unwrap();

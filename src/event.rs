@@ -563,7 +563,7 @@ impl Event {
         Event::SessionCost { total }
     }
 
-    // qual:test_helper
+    #[cfg(test)]
     pub fn session_log_error(message: impl Into<String>) -> Self {
         Event::SessionLogError {
             message: message.into(),

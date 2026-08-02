@@ -30,27 +30,32 @@ fn output_text(text: &Option<Source>) -> String {
     text.as_ref().map(Source::normalize).unwrap_or_default()
 }
 
+/// One MIME grammar token: a non-empty run of the permissive ASCII-printable
+/// set qwen's `MIME_TYPE_RE` allows. Pure decision, no calls out.
+fn is_mime_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))
+}
+
+/// The `subtree.subtype(+suffix)` half of a MIME type: a token, optionally
+/// followed by a single `+suffix` token. Pure decision over already-split parts.
+fn is_mime_subtype(rest: &str) -> bool {
+    match rest.split_once('+') {
+        Some((base, suffix)) => is_mime_token(base) && is_mime_token(suffix),
+        None => is_mime_token(rest),
+    }
+}
+
 /// IANA MIME-type grammar guard (qwen `MIME_TYPE_RE`/`sanitizeMimeTypes`):
 /// accept a permissive ASCII-printable `type/subtree.subtype(+suffix)` shape and
 /// reject anything else, so an attacker-authored notebook cannot break out of
 /// the `[non-text output: ...]` placeholder with prompt-shaped `data` keys.
+/// Orchestration only: split on `/`, then delegate each half to a pure predicate.
 fn is_valid_mime(key: &str) -> bool {
-    fn token(s: &str) -> bool {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))
-    }
-    let (ty, rest) = match key.split_once('/') {
-        Some(parts) => parts,
-        None => return false,
-    };
-    if !token(ty) {
-        return false;
-    }
-    // subtree.subtype optionally followed by a single `+suffix`.
-    match rest.split_once('+') {
-        Some((base, suffix)) => token(base) && token(suffix),
-        None => token(rest),
+    match key.split_once('/') {
+        Some((ty, rest)) => is_mime_token(ty) && is_mime_subtype(rest),
+        None => false,
     }
 }
 

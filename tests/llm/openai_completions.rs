@@ -5,7 +5,7 @@ use crate::content::Message;
 use crate::llm::adapter_test_support as ats;
 use crate::llm::model::Api;
 use crate::llm::response::StopReason;
-use crate::llm::{Dispatcher, Llm, malformed_input_marker};
+use crate::llm::{Dispatcher, Llm, StreamEvent, malformed_input_marker};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

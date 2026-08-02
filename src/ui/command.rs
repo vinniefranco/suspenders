@@ -51,7 +51,7 @@ fn handled(name: &str) -> Option<Handled> {
 
 /// Whether the adapter has a handler for `name`. Derived from [`handled`], so it
 /// can never drift past the router.
-// qual:test_helper - only the coverage test in this module calls it
+#[cfg(test)]
 pub fn is_handled(name: &str) -> bool {
     handled(name).is_some()
 }

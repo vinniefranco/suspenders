@@ -91,7 +91,10 @@ impl Presenter for Todo {
 // ---- artifact (de)serialization ----
 
 fn put_todos(token: Token, artifact: &TodoArtifact) -> Token {
-    let value = serde_json::to_value(artifact).expect("Todo artifact serializes");
+    // Fail-open (ADR-0007): a Todo artifact always serializes, but should that
+    // ever break, attach nothing rather than panic - the Presenter reads `None`
+    // and simply shows no todo box.
+    let value = serde_json::to_value(artifact).unwrap_or(Value::Null);
     token.put_artifact(keys::TODOS, value)
 }
 

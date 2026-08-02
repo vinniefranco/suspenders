@@ -91,14 +91,21 @@ fn build_checkpoint(
     conv
 }
 
+// Executes one Tool Call. The caller filters to tool_use blocks, so the guard
+// destructures the call and a non-tool_use block (which the filter never yields)
+// answers a benign error rather than panicking - no unreachable in the run path.
 async fn execute_tool<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     block: &ContentBlock,
 ) -> ContentBlock {
-    let (id, name, input) = match block {
-        ContentBlock::ToolUse { id, name, input } => (id.clone(), name.clone(), input.clone()),
-        _ => unreachable!("execute_tool only sees tool_use blocks"),
+    let ContentBlock::ToolUse { id, name, input } = block else {
+        return ContentBlock::tool_result(
+            String::new(),
+            voice::malformed_input("not a tool call"),
+            true,
+        );
     };
+    let (id, name, input) = (id.clone(), name.clone(), input.clone());
 
     state.emitter.emit(Event::tool_call(
         id.clone(),
@@ -171,7 +178,7 @@ impl Answer {
 
     /// An Approval denial (ADR-0005): the command never ran.
     fn denied() -> Self {
-        Answer::text(voice::command_denied(), true, Default::default())
+        Answer::text(voice::Marker::CommandDenied.text(), true, Default::default())
     }
 
     /// The Extension pipeline executed the call: the shaped block list rides

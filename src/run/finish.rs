@@ -15,7 +15,8 @@ use crate::content::ContentBlock;
 use crate::conversation::Conversation;
 use crate::llm::response::{Response, StopReason};
 use crate::run::deps::RunDeps;
-use crate::run::loop_::{Flow, LoopState, Outcome, OutcomeStop};
+use crate::run::dispatch::Flow;
+use crate::run::loop_::{LoopState, Outcome, OutcomeStop};
 use crate::session::log;
 use crate::voice;
 
@@ -54,7 +55,7 @@ pub(super) fn fail<D: RunDeps>(
         .filter(|b| !b.is_tool_use())
         .cloned()
         .collect();
-    blocks.push(ContentBlock::text(voice::run_failed_marker()));
+    blocks.push(ContentBlock::text(voice::Marker::RunFailed.text()));
     // The partial text is the model's, so the message carries its Provenance
     // (the appended marker rides the same message, as the fold's does).
     conversation.add_assistant_response(blocks, state.deps.provenance());
@@ -86,11 +87,12 @@ fn close_blocks(blocks: &[ContentBlock], stop_reason: &StopReason) -> Vec<Conten
         .cloned()
         .collect();
     if kept.is_empty() {
-        if *stop_reason == StopReason::MaxTokens {
-            vec![ContentBlock::text(voice::truncation_marker())]
+        let marker = if *stop_reason == StopReason::MaxTokens {
+            voice::Marker::Truncation
         } else {
-            vec![ContentBlock::text(voice::empty_response_marker())]
-        }
+            voice::Marker::EmptyResponse
+        };
+        vec![ContentBlock::text(marker.text())]
     } else {
         kept
     }

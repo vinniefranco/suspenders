@@ -173,7 +173,7 @@ fn tool_content(blocks: &[ResultBlock], is_error: bool) -> String {
         })
         .collect::<String>();
     if is_error {
-        format!("{} {content}", crate::voice::tool_error_marker())
+        format!("{} {content}", crate::voice::Marker::ToolError.text())
     } else {
         content
     }

@@ -702,7 +702,7 @@ impl Screen {
     /// several Thinking passes, tool machinery, harness markers, and an answer
     /// with a code fence - the exact shape that exposed the fold / separator /
     /// blank-line bugs. No IO, no events; the transcript is authored directly.
-    // qual:test_helper - called only from render tests in ui::components
+    #[cfg(test)]
     pub fn demo() -> Self {
         let mut screen = Screen::new(ScreenOpts::default());
         let t = &mut screen.transcript;

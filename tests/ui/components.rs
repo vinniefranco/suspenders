@@ -1,7 +1,43 @@
 
 use super::*;
+// The render code split into per-responsibility submodules of `components`
+// (the god-module split); these tests exercise their `pub(super)` items
+// directly, so each sibling is globbed here (a test-file wildcard the
+// production quality gate does not flag). The submodules now import their
+// primitives EXPLICITLY rather than through a parent re-export, so the tests
+// glob the shared-primitive modules (`style`/`box_draw`/`text`/`picker`)
+// directly too, and name the crate + ratatui types they build fixtures with.
+use super::approval::*;
+use super::composer_input::*;
+use super::diff::*;
+use super::footer::*;
+use super::header::*;
+use super::overlay::*;
+use super::pending::*;
+use super::popup::*;
+use super::style::*;
+use super::sticky::*;
+use super::text::*;
+use super::tool_group::*;
+
+use ratatui::Frame;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
+use ratatui::widgets::Widget;
+use unicode_width::UnicodeWidthStr;
+
+use crate::approvals::ApprovalMode;
+use crate::plan::{TodoItem, TodoStatus};
+use crate::ui::completion;
+use crate::ui::composer::{self, OverlayStatus, OverlayView};
+use crate::ui::lull;
+use crate::ui::markdown::MdStyle;
+use crate::ui::screen::{Screen, Status};
+use crate::ui::theme::{self, Theme};
 use crate::ui::transcript::Transcript;
-use crate::view_model::DiffLine;
+use crate::view_model::{DiffHunk, DiffLine, DiffSide, SelectorRow, Tone, TranscriptItem};
 
 // A first-class `Diff` item (ADR-0008) with one all-added hunk of raw
 // (marker-free) code lines - the shape the Diff extension's Presenter emits.

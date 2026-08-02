@@ -31,8 +31,9 @@ pub struct Conversation {
 
 /// The explicit options a Conversation is built from. `context_budget` and
 /// `max_tokens_reserve` are required (baud raised `KeyError` when they were
-/// absent; here the type system requires them). The rest carry baud's
-/// defaults via [`Default`].
+/// absent); [`ConversationOpts::new`] takes them and [`Default`] fills the rest
+/// with baud's defaults, so a caller overriding a tail knob writes
+/// `ConversationOpts { compaction_slack: 0.3, ..ConversationOpts::new(b, r) }`.
 #[derive(Debug, Clone)]
 pub struct ConversationOpts {
     pub context_budget: u64,
@@ -50,32 +51,30 @@ const DEFAULT_COMPACTION_SLACK: f64 = 0.0;
 /// Default compaction keep fraction: keep the newest 50% of the live window.
 const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
 
-impl ConversationOpts {
-    /// The two required knobs, with baud's defaults for the rest
-    /// (`overhead_chars: 0`, `compaction_slack: 0.0`, `compaction_keep: 0.5`).
-    pub fn new(context_budget: u64, max_tokens_reserve: u64) -> Self {
+impl Default for ConversationOpts {
+    /// baud's defaults, with a zero budget/reserve placeholder: prefer
+    /// [`ConversationOpts::new`], which names the two required knobs.
+    fn default() -> Self {
         ConversationOpts {
-            context_budget,
-            max_tokens_reserve,
+            context_budget: 0,
+            max_tokens_reserve: 0,
             overhead_chars: 0,
             compaction_slack: DEFAULT_COMPACTION_SLACK,
             compaction_keep: DEFAULT_COMPACTION_KEEP,
         }
     }
+}
 
-    pub fn overhead_chars(mut self, v: u64) -> Self {
-        self.overhead_chars = v;
-        self
-    }
-
-    pub fn compaction_slack(mut self, v: f64) -> Self {
-        self.compaction_slack = v;
-        self
-    }
-
-    pub fn compaction_keep(mut self, v: f64) -> Self {
-        self.compaction_keep = v;
-        self
+impl ConversationOpts {
+    /// The two required knobs, with baud's defaults for the rest
+    /// (`overhead_chars: 0`, `compaction_slack: 0.0`, `compaction_keep: 0.5`).
+    /// Override a tail knob with struct-update syntax over the result.
+    pub fn new(context_budget: u64, max_tokens_reserve: u64) -> Self {
+        ConversationOpts {
+            context_budget,
+            max_tokens_reserve,
+            ..ConversationOpts::default()
+        }
     }
 }
 

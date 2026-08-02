@@ -192,7 +192,10 @@ fn created_diff(token: Token, content: &str) -> Token {
 // Artifacts ride the event as JSON (baud's map); serialize the Diff into the
 // `diff` slot.
 fn put_diff(token: Token, artifact: &DiffArtifact) -> Token {
-    let value = serde_json::to_value(artifact).expect("Diff artifact serializes");
+    // Fail-open (ADR-0007): a Diff artifact is a plain struct that always
+    // serializes, but should that ever break, attach nothing rather than panic -
+    // the Presenter reads `None` and simply shows no diff.
+    let value = serde_json::to_value(artifact).unwrap_or(Value::Null);
     token.put_artifact(keys::DIFF, value)
 }
 

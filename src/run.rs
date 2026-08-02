@@ -9,6 +9,7 @@
 mod batch;
 pub mod child;
 pub mod deps;
+mod dispatch;
 mod finish;
 pub mod loop_;
 pub mod next_speaker;
@@ -268,12 +269,14 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
     // Model like any Run (ADR-0037).
     let mut conversation = Conversation::new(
         req.system_prompt,
-        ConversationOpts::new(
-            session.context_budget_for(&req.model),
-            session.reply_reserve_for(&req.model),
-        )
-        .compaction_slack(session.compaction_slack)
-        .compaction_keep(session.compaction_keep),
+        ConversationOpts {
+            compaction_slack: session.compaction_slack,
+            compaction_keep: session.compaction_keep,
+            ..ConversationOpts::new(
+                session.context_budget_for(&req.model),
+                session.reply_reserve_for(&req.model),
+            )
+        },
     );
     conversation.add_user_text(req.prompt);
 
@@ -383,26 +386,8 @@ fn last_assistant_text(conversation: &Conversation) -> String {
         .iter()
         .rev()
         .filter_map(assistant_texts)
-        .find(|text| !is_pure_close_marker(text))
+        .find(|text| !crate::voice::Marker::is_run_close(text))
         .unwrap_or_default()
-}
-
-/// Whether `text` is exactly one of the Voice close markers the Loop appends as
-/// a marker-only assistant message (ADR-0061). Compared against the markers a
-/// `finish`/`close`/`fail` can author so the parent never sees them as the
-/// subagent's answer.
-fn is_pure_close_marker(text: &str) -> bool {
-    use crate::voice;
-    [
-        voice::run_limit_marker(),
-        voice::loop_stall_marker(),
-        voice::run_stopped_marker(),
-        voice::run_failed_marker(),
-        voice::run_cancelled_marker(),
-        voice::truncation_marker(),
-        voice::empty_response_marker(),
-    ]
-    .contains(&text)
 }
 
 #[cfg(test)]

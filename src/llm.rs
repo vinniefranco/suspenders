@@ -75,31 +75,46 @@ pub enum ToolCallStyle {
 }
 
 impl ToolCallStyle {
+    /// The single source of truth pairing each variant with its wire token.
+    /// [`as_str`](ToolCallStyle::as_str) and [`parse`](ToolCallStyle::parse) - exact
+    /// inverses over the wire tokens - both scan this ONE table, so the mapping
+    /// is written once and the two cannot drift apart (rather than each
+    /// re-matching the variant set separately).
+    const WIRE: [(ToolCallStyle, &'static str); 3] = [
+        (ToolCallStyle::Auto, "auto"),
+        (ToolCallStyle::Structured, "structured"),
+        (ToolCallStyle::Text, "text"),
+    ];
+
     /// The lowercase wire token, paired with [`parse`](ToolCallStyle::parse):
     /// `as_str` and `parse` are exact inverses over the wire tokens.
     pub fn as_str(self) -> &'static str {
-        match self {
-            ToolCallStyle::Auto => "auto",
-            ToolCallStyle::Structured => "structured",
-            ToolCallStyle::Text => "text",
-        }
+        // Every variant is in WIRE, so the scan always hits; the fallback is
+        // unreachable and keeps this total without a panic arm.
+        Self::WIRE
+            .iter()
+            .find(|(style, _)| *style == self)
+            .map_or("auto", |(_, token)| *token)
     }
 
     /// Parses a wire token; `None` on an unknown one (the config env seam turns
     /// that into a malformed-value error naming the accepted set).
     pub fn parse(s: &str) -> Option<ToolCallStyle> {
-        match s {
-            "auto" => Some(ToolCallStyle::Auto),
-            "structured" => Some(ToolCallStyle::Structured),
-            "text" => Some(ToolCallStyle::Text),
-            _ => None,
-        }
+        Self::WIRE
+            .iter()
+            .find(|(_, token)| *token == s)
+            .map(|(style, _)| *style)
     }
 }
 
 /// A typed request as the caller assembles it. The adapter selected by the
 /// captured Model's Api renders it to that protocol's wire payload.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Default` gives every option field its server-defers value (`None` sampling
+/// knobs, no-think off, [`ToolCallStyle::Auto`]), so [`new`](LlmRequest::new)
+/// sets only the three required parts and struct-update carries the rest - no
+/// hand-spelled default per field.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LlmRequest {
     pub system: String,
     pub messages: Vec<Message>,
@@ -138,12 +153,7 @@ impl LlmRequest {
             system: system.into(),
             messages,
             tools,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            no_think: false,
-            thinking_budget: None,
-            tool_call_style: ToolCallStyle::Auto,
+            ..LlmRequest::default()
         }
     }
 
@@ -159,16 +169,6 @@ impl LlmRequest {
 
     pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
         self.temperature = temperature;
-        self
-    }
-
-    pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
-        self.top_p = top_p;
-        self
-    }
-
-    pub fn with_top_k(mut self, top_k: Option<u64>) -> Self {
-        self.top_k = top_k;
         self
     }
 
@@ -297,6 +297,157 @@ pub type OnEvent<'cb> = dyn FnMut(&StreamEvent) + Send + 'cb;
 /// Shared by every adapter's transport loop.
 pub(crate) fn emit(on_event: &mut OnEvent<'_>, ev: StreamEvent) {
     on_event(&ev);
+}
+
+/// The shared transport driver (ADR-0002, ADR-0037): the request/response and
+/// SSE-fold flow every adapter runs, captured ONCE so the Anthropic and OpenAI
+/// adapters supply only their protocol differences (endpoint path, headers,
+/// frame parsing, fold state, done-detection) instead of copy-pasting the
+/// send/status/stream loop. The Adapter pattern: [`SseProtocol`] is the
+/// per-Api strategy, [`stream_completion`] and [`fetch_models`] the shared
+/// orchestration.
+pub(crate) mod transport {
+    use eventsource_stream::Eventsource;
+    use futures_util::StreamExt;
+
+    use super::throttle::{Decision, Throttle, monotonic_ms};
+    use super::{Delta, DiscoveredModel, OnEvent, Response, StreamEvent, emit, models_from_body};
+    use crate::content::ContentBlock;
+
+    /// Minimum ms between streaming updates. At ~30fps the UI stays responsive
+    /// to keyboard input; text rendering above this rate is imperceptible and
+    /// only floods the channel.
+    const STREAM_INTERVAL_MS: i64 = 33;
+
+    /// A per-Api SSE fold state. Both adapters' `StreamState`s implement it, so
+    /// the shared driver folds either without knowing the dialect.
+    pub trait SseFold {
+        /// The adapter's parsed SSE frame type.
+        type Event;
+        /// Folds one parsed frame into the accumulating state.
+        fn handle_event(&mut self, event: &Self::Event);
+        /// The content blocks accumulated so far (open blocks included).
+        fn snapshot(&self) -> Vec<ContentBlock>;
+        /// Turns the accumulated state into the final [`Response`].
+        fn finalize(self) -> Response;
+        /// The frame standing for a mid-stream transport death, folded so
+        /// partial content survives (the error algebra).
+        fn stream_error(message: String) -> Self::Event;
+    }
+
+    /// A per-Api protocol strategy: the differences the shared driver routes
+    /// around. One zero-cost value per adapter carries the request's dialect
+    /// knobs (e.g. the Tool Call style) so its `new_fold` can seed the state.
+    pub trait SseProtocol {
+        /// The adapter's [`SseFold`] state type.
+        type Fold: SseFold;
+
+        /// A fresh fold state for one completion.
+        fn new_fold(&self) -> Self::Fold;
+        /// Parses a raw `event:`/`data:` frame into a fold event. The name is
+        /// the SSE `event:` field (empty for dialects that carry only `data:`).
+        fn parse_frame(&self, name: &str, data: &str) -> <Self::Fold as SseFold>::Event;
+        /// The renderable delta a frame carries, if any (text/thinking only).
+        fn delta_of(&self, event: &<Self::Fold as SseFold>::Event) -> Option<Delta>;
+        /// Whether this frame terminates the stream (the OpenAI `[DONE]`
+        /// sentinel); the Anthropic dialect has none, so it answers `false`.
+        fn is_done(&self, event: &<Self::Fold as SseFold>::Event) -> bool;
+    }
+
+    /// Drives one streaming completion: sends `request`, and on a 2xx folds the
+    /// SSE stream through `protocol`'s fold, pacing `on_event`. Honors the error
+    /// algebra: never `Err`, never panic - a send failure, a non-2xx status, and
+    /// a mid-stream death all become a [`Response`] with an `Error` stop reason
+    /// and whatever partial content had streamed.
+    pub async fn stream_completion<P: SseProtocol>(
+        request: reqwest::RequestBuilder,
+        protocol: &P,
+        on_event: &mut OnEvent<'_>,
+    ) -> Response {
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            // Connection refused, DNS failure, etc. - no content streamed.
+            Err(e) => return Response::error(request_err(e)),
+        };
+        let resp = match ensure_success(resp).await {
+            Ok(resp) => resp,
+            Err(status_err) => return Response::error(status_err),
+        };
+
+        let mut state = protocol.new_fold();
+        let mut throttle = Throttle::new(STREAM_INTERVAL_MS);
+        let mut sse = resp.bytes_stream().eventsource();
+
+        while let Some(item) = sse.next().await {
+            match item {
+                Ok(event) => {
+                    let sse_event = protocol.parse_frame(&event.event, &event.data);
+                    // Extract any renderable delta BEFORE folding so we can
+                    // snapshot the state AFTER folding this delta in.
+                    let delta = protocol.delta_of(&sse_event);
+                    state.handle_event(&sse_event);
+
+                    if let Some(delta) = delta
+                        && throttle.tick(monotonic_ms()) == Decision::Emit
+                    {
+                        emit(
+                            on_event,
+                            StreamEvent {
+                                delta,
+                                content: state.snapshot(),
+                            },
+                        );
+                    }
+
+                    // `[DONE]` (the OpenAI terminator) ends the read; hosts may
+                    // hold the connection open past it.
+                    if protocol.is_done(&sse_event) {
+                        break;
+                    }
+                }
+                // Mid-stream death (dropped connection, framing error): fold an
+                // error so partial content survives (the error algebra).
+                Err(e) => {
+                    state.handle_event(&P::Fold::stream_error(format!("stream_error: {e}")));
+                    break;
+                }
+            }
+        }
+
+        state.finalize()
+    }
+
+    /// Drives one models listing: sends `request` (already carrying the
+    /// adapter's headers and the discovery timeout) and parses the shared
+    /// `{"data": [...]}` body. Unlike [`stream_completion`], a listing RETURNS a
+    /// `Result` (ADR-0002 amendment): a discrete user query, not the Run loop.
+    pub async fn fetch_models(
+        request: reqwest::RequestBuilder,
+    ) -> Result<Vec<DiscoveredModel>, String> {
+        let resp = request.send().await.map_err(request_err)?;
+        let resp = ensure_success(resp).await?;
+        let body = resp.text().await.map_err(request_err)?;
+        models_from_body(&body)
+    }
+
+    /// The shared status check both flows report identically: a 2xx returns the
+    /// response for reading, else it consumes the body into the `request_failed:
+    /// HTTP {status}: {body}` error string. Consuming (rather than borrowing)
+    /// keeps the success path free to stream the same response.
+    async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response, String> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("request_failed: HTTP {status}: {body}"))
+    }
+
+    /// Formats a `request_failed: {e}` error string. The single place the
+    /// transport's failure literal is typed.
+    pub fn request_err(e: impl std::fmt::Display) -> String {
+        format!("request_failed: {e}")
+    }
 }
 
 /// The LLM boundary seam. Object-safe so `Arc<dyn Llm>` works (ADR-0020).

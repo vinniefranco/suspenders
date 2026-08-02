@@ -124,18 +124,24 @@ pub enum ApprovalMode {
     Yolo,
 }
 
+/// The Shift+Tab cycle order, qwen's `APPROVAL_MODES` array verbatim (ADR-0050).
+/// [`ApprovalMode::cycle`] steps `(i + 1) % len` over it, so the wrap and the
+/// order live in one place - adding a mode is one edit here, not a rewired match.
+const CYCLE: [ApprovalMode; 5] = [
+    ApprovalMode::Plan,
+    ApprovalMode::Default,
+    ApprovalMode::AutoEdit,
+    ApprovalMode::Auto,
+    ApprovalMode::Yolo,
+];
+
 impl ApprovalMode {
     /// The next mode in the Shift+Tab cycle (qwen `(i + 1) % len` over
-    /// `APPROVAL_MODES`): plan → default → auto-edit → auto → yolo → plan. A
-    /// total function with a hard wrap, so the cycle can never leave the set.
+    /// [`CYCLE`]): plan → default → auto-edit → auto → yolo → plan. A total
+    /// function with a hard wrap, so the cycle can never leave the set.
     pub fn cycle(self) -> ApprovalMode {
-        match self {
-            ApprovalMode::Plan => ApprovalMode::Default,
-            ApprovalMode::Default => ApprovalMode::AutoEdit,
-            ApprovalMode::AutoEdit => ApprovalMode::Auto,
-            ApprovalMode::Auto => ApprovalMode::Yolo,
-            ApprovalMode::Yolo => ApprovalMode::Plan,
-        }
+        let i = CYCLE.iter().position(|&m| m == self).unwrap_or(0);
+        CYCLE[(i + 1) % CYCLE.len()]
     }
 
     /// Whether this mode auto-approves EVERY gated Call without ever showing an

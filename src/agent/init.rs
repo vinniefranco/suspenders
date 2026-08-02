@@ -193,13 +193,15 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     // from the captured Model at every Run start (ADR-0037, `reset_run_state`).
     let mut conversation = Conversation::new(
         system_prompt,
-        ConversationOpts::new(
-            session.context_budget_for(&model),
-            session.reply_reserve_for(&model),
-        )
-        .overhead_chars(overhead)
-        .compaction_slack(session.compaction_slack)
-        .compaction_keep(session.compaction_keep),
+        ConversationOpts {
+            overhead_chars: overhead,
+            compaction_slack: session.compaction_slack,
+            compaction_keep: session.compaction_keep,
+            ..ConversationOpts::new(
+                session.context_budget_for(&model),
+                session.reply_reserve_for(&model),
+            )
+        },
     );
     // A Resume seeds the messages verbatim ahead of the (empty) fresh ones.
     let mut seeded = resumed_messages.clone();

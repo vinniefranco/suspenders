@@ -21,6 +21,11 @@ use crate::llm::provider::Provider;
 use crate::llm::response::Response;
 use crate::llm::{DiscoveredModel, Llm, LlmRequest, OnEvent};
 
+/// The billed-dollars floor a priced call must clear to move the running total
+/// and fire the sink: a priced Model whose call metered zero usage prices to
+/// exactly zero, which is metered silence, not an update.
+const BILLABLE_FLOOR: f64 = 0.0;
+
 /// The sink the new running total (in dollars) is pushed through after every
 /// priced call.
 pub type OnTotal = Box<dyn Fn(f64) + Send + Sync>;
@@ -53,10 +58,15 @@ impl Llm for Metered {
     ) -> Response {
         let response = self.inner.complete(request, model, on_event).await;
         if let Some(cost) = model.cost(&response.usage)
-            && cost.total > 0.0
+            && cost.total > BILLABLE_FLOOR
         {
             let total = {
-                let mut total = self.total.lock().unwrap();
+                // The lock guards only this add-and-read. A poisoned mutex
+                // (a prior holder panicked) still carries a valid running
+                // total, and metering must never crash the Run, so recover the
+                // inner value rather than propagate the poison (the error
+                // algebra: failure is data, not a panic).
+                let mut total = self.total.lock().unwrap_or_else(|e| e.into_inner());
                 *total += cost.total;
                 *total
             };

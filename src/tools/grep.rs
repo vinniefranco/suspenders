@@ -37,7 +37,7 @@
 
 use crate::glob_match;
 use crate::tool::path::{FileError, file_error, resolve_path, with_path};
-use crate::tool::{Tool, ToolCtx, ToolSpec};
+use crate::tool::{Tool, ToolCtx, ToolSpec, optional_str};
 use crate::walk::{qwenignore, walk_files};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
@@ -109,17 +109,9 @@ impl Tool for Grep {
             .ok_or_else(|| "invalid input: grep requires a string \"pattern\"".to_string())?;
         // path is optional (qwen: defaults to the search directory); a
         // non-string path is an error.
-        let path = match input.get("path") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            Some(_) => return Err("path must be a string".to_string()),
-        };
+        let path = optional_str(input, "path")?;
         // glob is optional; a non-string glob is an error.
-        let glob = match input.get("glob") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            Some(_) => return Err("glob must be a string".to_string()),
-        };
+        let glob = optional_str(input, "glob")?;
         // limit is optional; a non-integer limit is an error. qwen caps the
         // number of matching lines shown.
         let limit = match input.get("limit") {
@@ -174,17 +166,17 @@ impl Tool for Grep {
                 None => "in the workspace directory".to_string(),
             };
 
-            Ok(search(
-                &files,
-                &regex,
-                glob_regex.as_ref(),
-                &root,
-                &ctx.root,
+            Ok(search(GrepSearch {
+                files: &files,
+                regex: &regex,
+                glob_regex: glob_regex.as_ref(),
+                rel_root: &root,
+                project_root: &ctx.root,
                 pattern,
                 glob,
-                &location,
+                location: &location,
                 limit,
-            ))
+            }))
         })
     }
 }
@@ -210,18 +202,37 @@ fn compile(pattern: &str) -> Result<Regex, String> {
 // PROJECT ROOT (`project_root`), NOT the search dir, so a root-anchored pattern
 // means the same thing regardless of `path` (ripGrep.ts:404-435, mirroring
 // glob.rs).
-#[allow(clippy::too_many_arguments)]
-fn search(
-    files: &[std::path::PathBuf],
-    regex: &Regex,
-    glob_regex: Option<&Regex>,
-    rel_root: &Path,
-    project_root: &Path,
-    pattern: &str,
-    glob: Option<&str>,
-    location: &str,
+/// The cohesive inputs one grep walk needs (Parameter Object): the collected
+/// `files`, the compiled content `regex` and optional `glob_regex` filter, the
+/// two roots (`rel_root`, the search dir reported paths and the glob match
+/// relative to; `project_root`, what `.qwenignore` anchors to), the `pattern`
+/// and `glob` strings the header echoes, the verbatim `location` clause, and the
+/// optional line `limit`. Nine cohesive inputs made a first-class type so the
+/// walk takes one argument.
+struct GrepSearch<'a> {
+    files: &'a [std::path::PathBuf],
+    regex: &'a Regex,
+    glob_regex: Option<&'a Regex>,
+    rel_root: &'a Path,
+    project_root: &'a Path,
+    pattern: &'a str,
+    glob: Option<&'a str>,
+    location: &'a str,
     limit: Option<usize>,
-) -> String {
+}
+
+fn search(req: GrepSearch<'_>) -> String {
+    let GrepSearch {
+        files,
+        regex,
+        glob_regex,
+        rel_root,
+        project_root,
+        pattern,
+        glob,
+        location,
+        limit,
+    } = req;
     let mut all_lines: Vec<String> = Vec::new();
     for file in files {
         if qwenignore::is_ignored(project_root, file) {

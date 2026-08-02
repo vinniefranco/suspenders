@@ -31,6 +31,13 @@ use crate::llm::LlmRequest;
 use crate::llm::model::{Api, Model};
 use crate::voice;
 
+/// The FNV-1a 64-bit offset basis: the hash's starting accumulator (the
+/// canonical FNV constant, `0xcbf29ce484222325`).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// The FNV-1a 64-bit prime the accumulator is multiplied by per byte
+/// (`0x100000001b3`).
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 /// The id length cap of the anthropic-messages Api (alphabet `[a-zA-Z0-9_-]`).
 const ANTHROPIC_MAX_ID: usize = 64;
 /// The id length cap of the openai-completions Api (same alphabet, capped
@@ -183,10 +190,10 @@ fn sanitize(id: &str) -> String {
 // stable across releases, and the rewrite must be deterministic across
 // sessions so a resumed history renormalizes to the same ids).
 fn short_hash(s: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash: u64 = FNV_OFFSET_BASIS;
     for byte in s.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
 }
@@ -275,7 +282,7 @@ fn orphan_ids(messages: &[Message], index: usize) -> Vec<String> {
 fn insert_answers(messages: &mut Vec<Message>, index: usize, orphans: &[String]) {
     let answers = orphans
         .iter()
-        .map(|id| ContentBlock::tool_result(id, voice::orphaned_call_answer(), true));
+        .map(|id| ContentBlock::tool_result(id, voice::Marker::OrphanedCall.text(), true));
     match messages.get_mut(index + 1) {
         Some(next) if next.role == crate::content::Role::User => {
             let at = next

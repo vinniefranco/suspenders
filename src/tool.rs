@@ -268,6 +268,24 @@ pub fn validate(
     }
 }
 
+/// Read an OPTIONAL string parameter from a tool's decoded input.
+///
+/// The same three-way classification recurs across the read-only tools' `run`
+/// (glob's `path`, grep's `path` and `glob`): a missing key or JSON `null` is
+/// `None`, a string is `Some`, and any other JSON type is a caller error worded
+/// `"{field} must be a string"`. Hoisted here so that data-clump lives in one
+/// place instead of being rewritten per param.
+pub fn optional_str<'a>(
+    input: &'a serde_json::Value,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(format!("{field} must be a string")),
+    }
+}
+
 fn quote_join<'a, I: Iterator<Item = &'a str>>(items: I) -> String {
     items
         .map(|s| format!("{s:?}"))

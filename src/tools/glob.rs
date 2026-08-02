@@ -35,7 +35,7 @@
 
 use crate::glob_match;
 use crate::tool::path::{FileError, file_error, resolve_path, with_path};
-use crate::tool::{Tool, ToolCtx, ToolSpec};
+use crate::tool::{Tool, ToolCtx, ToolSpec, optional_str};
 use crate::walk::{qwenignore, walk_files};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -101,11 +101,7 @@ impl Tool for Glob {
             .ok_or_else(|| "invalid input: glob requires a string \"pattern\"".to_string())?;
         // path is optional (qwen: omit to search the workspace directory); a
         // non-string path is an error.
-        let path = match input.get("path") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            Some(_) => return Err("path must be a string".to_string()),
-        };
+        let path = optional_str(input, "path")?;
 
         let regex = glob_match::compile(pattern)?;
 
@@ -124,7 +120,14 @@ impl Tool for Glob {
                 resolve_path(path.unwrap_or("."), &ctx.root).unwrap_or_else(|_| abs.to_path_buf());
             // The pattern matches relative to `root` (the search dir); ignores
             // anchor to `ctx.root` (the project root, glob.ts:159).
-            Ok(search(abs, &root, &ctx.root, &regex, pattern, &location))
+            Ok(search(GlobSearch {
+                dir: abs,
+                rel_root: &root,
+                project_root: &ctx.root,
+                regex: &regex,
+                pattern,
+                location: &location,
+            }))
         })
     }
 }
@@ -140,14 +143,30 @@ impl Tool for Glob {
 // like `/build/` means the same thing regardless of `path` - this mirrors
 // qwen's explicit choice to evaluate ignores against the project root even when
 // searchDir != projectRoot (glob.ts:155-159).
-fn search(
-    dir: &Path,
-    rel_root: &Path,
-    project_root: &Path,
-    regex: &Regex,
-    pattern: &str,
-    location: &str,
-) -> String {
+/// The cohesive inputs one glob walk needs (Parameter Object): the search
+/// directory, the two roots the walk anchors against (`rel_root`, the search dir
+/// the PATTERN matches relative to; `project_root`, the project root
+/// `.qwenignore` anchors to), and the compiled query (`regex` + its `pattern`)
+/// plus the verbatim `location` clause. A recurring data clump made a first-
+/// class type so the walk takes one argument rather than six.
+struct GlobSearch<'a> {
+    dir: &'a Path,
+    rel_root: &'a Path,
+    project_root: &'a Path,
+    regex: &'a Regex,
+    pattern: &'a str,
+    location: &'a str,
+}
+
+fn search(req: GlobSearch<'_>) -> String {
+    let GlobSearch {
+        dir,
+        rel_root,
+        project_root,
+        regex,
+        pattern,
+        location,
+    } = req;
     let mut matched: Vec<Entry> = walk_files(dir)
         .into_iter()
         .filter(|file| regex.is_match(&relative_to(file, rel_root)))

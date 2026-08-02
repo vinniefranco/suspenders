@@ -218,14 +218,24 @@ impl StreamState {
     }
 }
 
-/// Folds a sequence of parsed SSE events into a [`Response`] - the pure core.
-// qual:test_helper
-pub fn fold_sse(events: impl IntoIterator<Item = SseEvent>) -> Response {
-    let mut state = StreamState::new();
-    for event in events {
-        state.handle_event(&event);
+impl crate::llm::transport::SseFold for StreamState {
+    type Event = SseEvent;
+
+    fn handle_event(&mut self, event: &SseEvent) {
+        StreamState::handle_event(self, event);
     }
-    state.finalize()
+
+    fn snapshot(&self) -> Vec<ContentBlock> {
+        StreamState::snapshot(self)
+    }
+
+    fn finalize(self) -> Response {
+        StreamState::finalize(self)
+    }
+
+    fn stream_error(message: String) -> SseEvent {
+        SseEvent::ParseError(message)
+    }
 }
 
 // ---------------------------------------------------------------------------

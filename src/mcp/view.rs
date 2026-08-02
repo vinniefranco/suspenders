@@ -51,25 +51,27 @@ pub enum McpServerStatus {
 }
 
 impl McpServerStatus {
-    /// The status glyph qwen draws (`utils.getStatusIcon`): `✓` connected, `…`
-    /// connecting, `✗` disconnected.
-    pub fn icon(self) -> char {
+    /// The single display table for a status: its glyph and its lowercase word,
+    /// the one place a status's presentation lives (qwen's `getStatusIcon` +
+    /// `STATUS_TEXT`). `disconnected` shows as `failed`, the word qwen prints.
+    fn display(self) -> (char, &'static str) {
         match self {
-            McpServerStatus::Connected => '✓',
-            McpServerStatus::Connecting => '…',
-            McpServerStatus::Disconnected => '✗',
+            McpServerStatus::Connected => ('✓', "connected"),
+            McpServerStatus::Connecting => ('…', "connecting"),
+            McpServerStatus::Disconnected => ('✗', "failed"),
         }
     }
 
+    /// The status glyph qwen draws (`utils.getStatusIcon`): `✓` connected, `…`
+    /// connecting, `✗` disconnected.
+    pub fn icon(self) -> char {
+        self.display().0
+    }
+
     /// The lowercase status word the dialog prints beside the glyph
-    /// (`t(server.status)`): `connected` / `connecting` / `failed`. qwen's
-    /// `STATUS_TEXT` maps `disconnected` to `failed`, which is the word shown.
+    /// (`t(server.status)`): `connected` / `connecting` / `failed`.
     pub fn label(self) -> &'static str {
-        match self {
-            McpServerStatus::Connected => "connected",
-            McpServerStatus::Connecting => "connecting",
-            McpServerStatus::Disconnected => "failed",
-        }
+        self.display().1
     }
 }
 

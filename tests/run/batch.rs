@@ -60,7 +60,7 @@ async fn two_gated_calls_never_overlap_the_second_waits_for_the_first() {
 fn a_denial_pairs_the_command_denied_voice_with_the_denied_fact() {
     // ADR-0005: the Approval gate; the command never ran.
     let answer = Answer::denied();
-    assert_eq!(result_blocks_text(&answer.content), voice::command_denied());
+    assert_eq!(result_blocks_text(&answer.content), voice::Marker::CommandDenied.text());
     assert!(answer.is_error);
 }
 

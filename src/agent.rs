@@ -56,11 +56,18 @@ pub mod background_shell;
 mod capabilities;
 mod deps;
 mod init;
+mod mcp_ops;
+mod model_ops;
 mod settle;
 use background::BackgroundTask;
 use background_shell::{BackgroundShell, ShellOutcome};
-use deps::AgentDeps;
+use deps::{AgentDeps, RequestSettings, RunSpawn};
+use mcp_ops::{mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_set_enabled};
+use model_ops::{apply_enriched_model, spawn_list_models, swap_active_model};
 use settle::{LoopOrDown, settle_event_to_event, to_settlement_outcome};
+// The Session-stable tool-set rebuild lives with the live MCP ops that share it;
+// `init_agent` reaches it as `crate::agent::rebuild_session_tools`.
+pub(crate) use mcp_ops::rebuild_session_tools;
 
 #[cfg(test)]
 #[path = "../tests/agent.rs"]
@@ -140,7 +147,7 @@ impl StartOpts {
         self
     }
 
-    // qual:test_helper
+    #[cfg(test)]
     pub fn with_resume(mut self, resume: Resume) -> Self {
         self.resume = Some(resume);
         self
@@ -339,7 +346,6 @@ pub enum Command {
     Cancel(oneshot::Sender<()>),
     Status(oneshot::Sender<Status>),
     Conversation(oneshot::Sender<Conversation>),
-    SessionQuery(oneshot::Sender<Session>),
     Plan(oneshot::Sender<Option<String>>),
     ResumeInfoQuery(oneshot::Sender<Option<ResumeInfo>>),
 }
@@ -491,9 +497,11 @@ impl AgentHandle {
     }
 
     /// The Active Model identifier the next Run will call (ADR-0033), for a
-    /// caller marking "(current)".
+    /// caller marking "(current)". A dead Agent (the process is shutting down,
+    /// every handle about to drop) answers the empty string rather than
+    /// panicking, matching the graceful degradation `status`/`plan` take.
     pub async fn active_model(&self) -> String {
-        self.query(Command::ActiveModel).await.expect("agent alive")
+        self.query(Command::ActiveModel).await.unwrap_or_default()
     }
 
     /// Lists every Provider's models for the `/model` selector (ADR-0033,
@@ -625,18 +633,13 @@ impl AgentHandle {
         self.query(Command::Status).await.unwrap_or(Status::Idle)
     }
 
-    /// The current Conversation (baud's `conversation/1`).
+    /// The current Conversation (baud's `conversation/1`). A dead Agent (the
+    /// process is shutting down) answers an empty Conversation rather than
+    /// panicking, the same graceful degradation `active_model`/`status` take.
     pub async fn conversation(&self) -> Conversation {
         self.query(Command::Conversation)
             .await
-            .expect("agent alive")
-    }
-
-    /// The Session's fixed facts (baud's `session/1`).
-    pub async fn session(&self) -> Session {
-        self.query(Command::SessionQuery)
-            .await
-            .expect("agent alive")
+            .unwrap_or_else(empty_conversation)
     }
 
     /// The current Plan, or `None` (baud's `plan/1`).
@@ -656,6 +659,13 @@ impl AgentHandle {
         }
         rx.await.ok()
     }
+}
+
+/// The empty Conversation a dead-Agent [`AgentHandle::conversation`] degrades to:
+/// no system prompt, zero budget knobs. Never sent to the model - only read for
+/// its (zero) token estimate and (empty) message list by a shutting-down caller.
+fn empty_conversation() -> Conversation {
+    Conversation::new("", crate::conversation::ConversationOpts::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -793,25 +803,18 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
     state.abort_all_background_shells();
 }
 
+// The public-Command dispatcher: a flat table that routes each Command to its
+// own small handler (the Command pattern), so no arm carries inline branching
+// and the dispatch stays cyclomatically trivial. Each handler owns the
+// state-mutation-plus-reply for one Command; the reads that are a single
+// `reply.send(state.field.clone())` route through `reply_query` so the read arms
+// share one shape. The four MCP live-op arms are defensive: `run_agent`
+// intercepts those ahead of this sync handler (they await), so reaching one
+// means a future dispatch change regressed - answer the Err rather than panic.
 fn handle_command(state: &mut AgentState, cmd: Command) {
     match cmd {
-        Command::Submit(prompt, reply) => {
-            if state.task.is_some() {
-                let _ = reply.send(Err(Busy));
-            } else {
-                start_run(state, prompt);
-                let _ = reply.send(Ok(()));
-            }
-        }
-        Command::Steer(text, reply) => {
-            if state.task.is_some() {
-                state.steering.push(text.clone());
-                broadcast(state, Event::steering_queued(text));
-                let _ = reply.send(Ok(()));
-            } else {
-                let _ = reply.send(Err(Idle));
-            }
-        }
+        Command::Submit(prompt, reply) => handle_submit(state, prompt, reply),
+        Command::Steer(text, reply) => handle_steer(state, text, reply),
         Command::SetModel(scoped, reply) => {
             let _ = reply.send(swap_active_model(state, &scoped));
         }
@@ -824,8 +827,7 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             let _ = reply.send(());
         }
         Command::CycleApprovalMode(reply) => {
-            let mode = cycle_approval_mode(state);
-            let _ = reply.send(mode);
+            let _ = reply.send(cycle_approval_mode(state));
         }
         Command::AnswerQuestion(id, answers, reply) => {
             answer_question(state, id, answers);
@@ -834,45 +836,24 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         Command::McpViews(reply) => {
             let _ = reply.send(state.mcp.views());
         }
-        // The two live MCP ops (McpReconnect/McpSetEnabled) await, so `run_agent`
-        // intercepts them ahead of this sync handler - they never arrive here. The
-        // arms answer defensively (an Err the dialog surfaces) rather than panic,
-        // so a future dispatch change degrades safely instead of crashing the
-        // actor.
         Command::McpReconnect(_, reply) => {
-            let _ = reply.send(Err("MCP reconnect was not dispatched".to_string()));
+            let _ = reply.send(mcp_not_dispatched("reconnect"));
         }
         Command::McpSetEnabled(_, _, reply) => {
-            let _ = reply.send(Err("MCP enable/disable was not dispatched".to_string()));
+            let _ = reply.send(mcp_not_dispatched("enable/disable"));
         }
-        // McpAuthenticate/McpClearAuth await too, so `run_agent` intercepts them
-        // ahead of this sync handler; the defensive arms mirror the two above.
         Command::McpAuthenticate(_, reply) => {
-            let _ = reply.send(Err("MCP authenticate was not dispatched".to_string()));
+            let _ = reply.send(mcp_not_dispatched("authenticate"));
         }
         Command::McpClearAuth(_, reply) => {
-            let _ = reply.send(Err("MCP clear-auth was not dispatched".to_string()));
+            let _ = reply.send(mcp_not_dispatched("clear-auth"));
         }
-        Command::Cancel(reply) => {
-            if let Some(abort) = &state.task {
-                abort.abort();
-                state.cancel_flag = true;
-                state.settlement = std::mem::take(&mut state.settlement).note_cancelled();
-            }
-            let _ = reply.send(());
-        }
+        Command::Cancel(reply) => handle_cancel(state, reply),
         Command::Status(reply) => {
-            let _ = reply.send(if state.task.is_some() {
-                Status::Running
-            } else {
-                Status::Idle
-            });
+            let _ = reply.send(current_status(state));
         }
         Command::Conversation(reply) => {
             let _ = reply.send(state.conversation.clone());
-        }
-        Command::SessionQuery(reply) => {
-            let _ = reply.send(state.session.clone());
         }
         Command::Plan(reply) => {
             let _ = reply.send(state.plan.clone());
@@ -881,6 +862,55 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             let _ = reply.send(state.resume_info.clone());
         }
     }
+}
+
+// Submit starts a Run when idle; a running Run is Busy (baud's submit guard).
+fn handle_submit(state: &mut AgentState, prompt: String, reply: oneshot::Sender<Result<(), Busy>>) {
+    if state.task.is_some() {
+        let _ = reply.send(Err(Busy));
+    } else {
+        start_run(state, prompt);
+        let _ = reply.send(Ok(()));
+    }
+}
+
+// Steer queues text onto the running Run; no Run is Idle (baud's steer guard).
+fn handle_steer(state: &mut AgentState, text: String, reply: oneshot::Sender<Result<(), Idle>>) {
+    if state.task.is_some() {
+        state.steering.push(text.clone());
+        broadcast(state, Event::steering_queued(text));
+        let _ = reply.send(Ok(()));
+    } else {
+        let _ = reply.send(Err(Idle));
+    }
+}
+
+// Cancel aborts the running Run and notes the cancellation on the Settlement so
+// the following abort settles as cancelled; a no-op when idle (baud's cancel).
+fn handle_cancel(state: &mut AgentState, reply: oneshot::Sender<()>) {
+    if let Some(abort) = &state.task {
+        abort.abort();
+        state.cancel_flag = true;
+        state.settlement = std::mem::take(&mut state.settlement).note_cancelled();
+    }
+    let _ = reply.send(());
+}
+
+// The Agent's status derived from whether a Run task is in flight (baud's
+// `status`).
+fn current_status(state: &AgentState) -> Status {
+    if state.task.is_some() {
+        Status::Running
+    } else {
+        Status::Idle
+    }
+}
+
+// The defensive Err a live-MCP arm answers when it reaches the sync handler:
+// `run_agent` intercepts those ahead of here (they await), so this only fires on
+// a dispatch regression - the one place the four arms' wording is authored.
+fn mcp_not_dispatched(op: &str) -> Result<(), String> {
+    Err(format!("MCP {op} was not dispatched"))
 }
 
 fn handle_run(state: &mut AgentState, run: RunMsg) {
@@ -977,260 +1007,6 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             let _ = reply.send(drained);
         }
     }
-}
-
-/// Assembles the Session-stable tool set (F8, ADR-0056; ADR-0065 Phase C): the
-/// built-ins, then the discovered MCP `adapters`, then the one `skill` tool, then
-/// the one `agent` tool - the ONE order `init_agent` builds it in and every live
-/// `/mcp` op rebuilds it in, so a rebuild is order-identical to the launch set.
-/// The skill + agent tools are re-minted over the retained managers (their
-/// dynamic catalogs are unchanged), so only the MCP slice actually differs after
-/// a reconnect/enable/disable. The result is a fresh `Arc<[...]>`: swapping it on
-/// the Agent lands on the NEXT Run's capture, never an in-flight Run's.
-pub(crate) fn rebuild_session_tools(
-    adapters: Vec<Box<dyn crate::tool::Tool>>,
-    skill_manager: &Arc<crate::skills::SkillManager>,
-    subagents: &Arc<crate::subagents::SubagentRegistry>,
-) -> Arc<[Box<dyn crate::tool::Tool>]> {
-    let mut all = crate::tools::tools();
-    all.extend(adapters);
-    all.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
-        skill_manager,
-    ))));
-    all.push(Box::new(crate::tools::agent::AgentTool::new(Arc::clone(
-        subagents,
-    ))));
-    all.into()
-}
-
-// Rebuilds the Session-stable tool set from the manager's CURRENT MCP adapters
-// (ADR-0065 Phase C): the one line every live MCP op ends on. The manager has
-// already applied the reconnect/enable/disable, so `adapters()` reflects the new
-// connected set; `rebuild_session_tools` re-mints the built-ins + skill + agent
-// tools around them. Swapping `state.session_tools` lands on the NEXT Run's
-// capture - an in-flight Run keeps the `Arc` it already cloned (ADR-0033's swap
-// rule, ADR-0017's read-only guest).
-fn refresh_session_tools(state: &mut AgentState) {
-    let adapters = state.mcp.adapters();
-    state.session_tools = rebuild_session_tools(adapters, &state.skill_manager, &state.subagents);
-}
-
-// The Reconnect action (ADR-0065 Phase C, qwen `discoverToolsForServer`):
-// re-attach the named server and rebuild the tool set from the manager's fresh
-// adapters. A failed re-attach is fail-open (a Disconnected view + a launch
-// notice), so this always completes; an unknown server is a no-op the manager
-// absorbs. Runs INLINE on the actor loop, so the swap is exclusive and lands on
-// the next Run.
-async fn mcp_reconnect(state: &mut AgentState, name: String) {
-    state.mcp.reconnect(&name).await;
-    // Surface a fresh connect failure the same way `init_agent` does (ADR-0007's
-    // fail-open report seam): a reconnect that fails again is a visible skip.
-    for (server, reason) in state.mcp.failures() {
-        if server == name {
-            let _ = state.events.send(Event::extension_error(
-                format!("mcp server {server}"),
-                crate::event::Stage::PreRun,
-                format!("could not connect - {reason}"),
-            ));
-        }
-    }
-    refresh_session_tools(state);
-}
-
-// The Enable/Disable action (ADR-0065 Phase C, qwen `enable`/`disableServer`):
-// persist the target scope's `mcp.excluded` list, update the Session's merged
-// excluded set + the manager, and rebuild the tool set. `enabled` is the DESIRED
-// state, so a disable is `enabled == false`. The scope is the server's Source: a
-// User server writes the user config, a Workspace server the workspace config; an
-// Extension server cannot be toggled (qwen refuses it too), an `Err` the dialog
-// surfaces. Runs INLINE on the actor loop like `mcp_reconnect`.
-async fn mcp_set_enabled(
-    state: &mut AgentState,
-    name: String,
-    enabled: bool,
-) -> Result<(), String> {
-    // The server must be one this Session knows (its Source picks the scope file).
-    let Some(source) = state.session.mcp_sources.get(&name).copied() else {
-        return Err(format!("unknown MCP server {name:?}"));
-    };
-    // qwen cannot enable/disable an extension-contributed server: it has no
-    // settings file to write the exclusion into.
-    let path = match source {
-        crate::mcp::McpSource::User => crate::session::default_config_path(),
-        crate::mcp::McpSource::Workspace => {
-            crate::session::workspace_config_path(&state.session.root)
-        }
-        crate::mcp::McpSource::Extension => {
-            return Err("extension MCP servers cannot be enabled or disabled".to_string());
-        }
-    };
-
-    // Fold the toggle into the Session's merged excluded set: a disable adds the
-    // name, an enable removes it. The set stays de-duplicated so a name persisted
-    // once is not written twice.
-    let disabled = !enabled;
-    let mut excluded: Vec<String> = state
-        .session
-        .mcp_excluded
-        .iter()
-        .filter(|n| *n != &name)
-        .cloned()
-        .collect();
-    if disabled {
-        excluded.push(name.clone());
-    }
-
-    // The scope file holds ONLY the exclusions whose Source is that scope (the
-    // merge CONCATENATES scopes, so each file owns its own names). Derive that
-    // slice from the new merged set + the recorded Sources, sorted for a stable
-    // on-disk order.
-    let mut scope_excluded: Vec<String> = excluded
-        .iter()
-        .filter(|n| state.session.mcp_sources.get(*n).copied() == Some(source))
-        .cloned()
-        .collect();
-    scope_excluded.sort();
-    scope_excluded.dedup();
-    crate::session::SessionConfig::persist_excluded(&path, &scope_excluded)
-        .map_err(|e| format!("could not persist MCP exclusion to {path}: {e}"))?;
-
-    // The write stuck, so update the in-memory Session + manager to match, then
-    // rebuild the tool set from the manager's fresh adapters.
-    state.session.mcp_excluded = excluded;
-    state.mcp.set_disabled(&name, disabled).await;
-    refresh_session_tools(state);
-    Ok(())
-}
-
-// The Authenticate action (ADR-0065 Phase D, qwen's Authenticate step): run the
-// OAuth browser flow for the named server, store the token, then re-attach the
-// server (reusing the reconnect path so tools re-discover under the fresh Bearer)
-// and rebuild the tool set. Progress lines (the copy-the-URL hint + the auth URL)
-// stream back over the events broadcast as they arrive, so the dialog (Phase E)
-// can render qwen's messages live. Runs INLINE on the actor loop like the other
-// live MCP ops, so the browser flow's await holds the loop for its duration (the
-// operator is mid-dialog, not mid-Run - the same exclusivity the reconnect takes).
-async fn mcp_authenticate(state: &mut AgentState, name: String) -> Result<(), String> {
-    // The server must be known and carry an OAuth block, and the manager must have
-    // a token store to save into (always so outside the empty test manager).
-    let (oauth, server_url) = state
-        .mcp
-        .oauth_target(&name)
-        .ok_or_else(|| format!("MCP server {name:?} has no OAuth configuration"))?;
-    let tokens_path = state
-        .mcp
-        .oauth_tokens_path()
-        .ok_or_else(|| "no MCP OAuth token store configured".to_string())?
-        .to_string();
-
-    // The progress sink forwards each OAuth signal onto the events broadcast as an
-    // `McpAuthProgress` (qwen's OauthDisplayMessage / OauthAuthUrl). A clone of the
-    // broadcast sender + the server name is moved into the boxed closure.
-    let events = state.events.clone();
-    let server = name.clone();
-    let sink: crate::mcp::oauth::ProgressSink = Box::new(move |progress| {
-        let event = match progress {
-            crate::mcp::oauth::OAuthProgress::Message(message) => {
-                Event::mcp_auth_message(server.clone(), message)
-            }
-            crate::mcp::oauth::OAuthProgress::AuthUrl(url) => {
-                Event::mcp_auth_url(server.clone(), url)
-            }
-        };
-        let _ = events.send(event);
-    });
-
-    // Run the flow through a provider over the SAME token store the connect-time
-    // injection reads (so a stored token lands where the next attach finds it).
-    let storage = crate::mcp::oauth::McpOAuthTokenStorage::new(tokens_path);
-    let provider = crate::mcp::oauth::McpOAuthProvider::new(storage);
-    provider
-        .authenticate(&name, &oauth, server_url.as_deref(), sink)
-        .await
-        .map_err(|reason| format!("OAuth authentication failed for {name:?}: {reason}"))?;
-
-    // Re-attach the server so its tools re-discover under the fresh Bearer (the
-    // token is now stored, so `connect_one`'s injection picks it up), then rebuild
-    // the tool set - the same path Reconnect takes.
-    mcp_reconnect(state, name).await;
-    Ok(())
-}
-
-// The Clear Authentication action (ADR-0065 Phase D, qwen `handleClearAuth`):
-// delete the server's stored OAuth token, disconnect it (dropping its
-// authenticated tools without disabling it), and rebuild the tool set. The
-// disconnect leaves the server enabled so a later Authenticate/Reconnect
-// re-attaches it. Runs INLINE like the other live MCP ops.
-async fn mcp_clear_auth(state: &mut AgentState, name: String) -> Result<(), String> {
-    let tokens_path = state
-        .mcp
-        .oauth_tokens_path()
-        .ok_or_else(|| "no MCP OAuth token store configured".to_string())?
-        .to_string();
-    crate::mcp::oauth::McpOAuthTokenStorage::new(tokens_path)
-        .delete(&name)
-        .map_err(|e| format!("could not clear MCP OAuth token for {name:?}: {e}"))?;
-    // Drop the authenticated conn + tools (the server stays enabled), then rebuild
-    // the tool set so the next Run no longer sees the server's tools.
-    state.mcp.disconnect(&name);
-    refresh_session_tools(state);
-    Ok(())
-}
-
-// The SetModel swap (ADR-0033 amendment): the whole Model swaps - the scoped
-// id resolves against the Session's fixed Provider set (Catalog figures for
-// known built-in models, config synthesis otherwise), and the per-Model
-// budget invariants are re-checked (ADR-0037) so a pick that cannot fit is
-// rejected here with the reason, never accepted and exploded later. The next
-// spawned Run snapshots it; an in-flight Run is unaffected. A rejected pick
-// leaves the Active Model as-is and the Err rides back to the caller.
-fn swap_active_model(state: &mut AgentState, scoped: &str) -> Result<(), String> {
-    let model = state.session.resolve_model(scoped)?;
-    state.session.validate_model_budget(&model)?;
-    state.model = model.clone();
-    // The picked Model resolved sync from config/fallback; enrich its window
-    // from the server OFF the actor (ADR-0037, ADR-0011/0017: never block the
-    // loop on the network). The Active Model applies now on its guessed window;
-    // the enriched window folds in when the reply lands - guarded on the pick
-    // still being active (see `apply_enriched_model`).
-    spawn_model_enrichment(state, model);
-    Ok(())
-}
-
-// The off-actor window enrichment for a `/model` swap (ADR-0037): clone the
-// boundary and the Session, discover the server window, and message the enriched
-// Model back to the actor. A discovery failure yields the sync-resolved Model
-// unchanged, so the swap always lands.
-fn spawn_model_enrichment(state: &AgentState, model: Model) {
-    let llm = Arc::clone(&state.llm);
-    let session = state.session.clone();
-    let self_tx = state.self_tx.clone();
-    tokio::spawn(async move {
-        let enriched = session.enrich_model_window(llm.as_ref(), model).await;
-        let _ = self_tx.send(Msg::EnrichedModel(enriched));
-    });
-}
-
-// Folds an off-actor enriched Model back onto the Active Model (ADR-0037). Guards
-// on the scoped id still matching: a second `/model` swap between the spawn and
-// this reply must win, so a stale enrichment for the superseded pick is dropped.
-fn apply_enriched_model(state: &mut AgentState, model: Model) {
-    if state.model.scoped_id() == model.scoped_id() {
-        state.model = model;
-    }
-}
-
-// The ListModels fetch, OFF the actor (ADR-0011/0017: never block the actor
-// loop on the network). Clone the boundary and the Session's fixed Provider
-// set, then answer the oneshot from the spawned task: `llm::offerings` walks
-// every Provider - live discovery for customs, the Catalog for built-ins
-// (ADR-0037).
-fn spawn_list_models(state: &AgentState, reply: oneshot::Sender<Vec<ProviderModels>>) {
-    let llm = Arc::clone(&state.llm);
-    let providers = state.session.providers.clone();
-    tokio::spawn(async move {
-        let _ = reply.send(crate::llm::offerings(llm.as_ref(), &providers).await);
-    });
 }
 
 // A Standing Approval covering the exact string answers the Run immediately -
@@ -1403,18 +1179,20 @@ fn spawn_run(state: &mut AgentState) {
     // Model), not `session.model`: a `SetModel` between Runs lands on this
     // next Run, and an in-flight Run keeps the Model it already captured
     // (ADR-0017's read-only guest; ADR-0033).
-    let deps = AgentDeps::new(
-        state.self_tx.clone(),
-        Arc::clone(&state.llm),
-        state.model.clone(),
-        state.session.temperature,
-        state.session.thinking_budget,
-        state.session.tool_call_style,
-        state.compaction.clone(),
-        Arc::clone(&state.session_tools),
-        Arc::clone(&state.subagents),
-        state.session.clone(),
-    );
+    let deps = AgentDeps::new(RunSpawn {
+        tx: state.self_tx.clone(),
+        llm: Arc::clone(&state.llm),
+        model: state.model.clone(),
+        settings: RequestSettings {
+            temperature: state.session.temperature,
+            thinking_budget: state.session.thinking_budget,
+            tool_call_style: state.session.tool_call_style,
+        },
+        compaction: state.compaction.clone(),
+        session_tools: Arc::clone(&state.session_tools),
+        subagents: Arc::clone(&state.subagents),
+        session: state.session.clone(),
+    });
     let conversation = state.conversation.clone();
     let session = state.session.clone();
     let opts = run_opts(state, state.compaction.original_task.clone());

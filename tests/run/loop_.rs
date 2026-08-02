@@ -5,10 +5,10 @@ use crate::content::{ContentBlock, Role};
 use crate::event::Stage;
 use crate::extensions::Registered;
 use crate::llm::model::{Api, Model};
-use crate::llm::response::Response;
+use crate::llm::response::{Response, StopReason};
 use crate::llm::{Delta, malformed_input_marker};
 use crate::middleware::{Middleware, Token};
-use crate::run::deps::CompactError;
+use crate::run::deps::{AfterPass, CompactError};
 use crate::run::fixtures::{
     FakeDeps, conversation, count_voiced, deps_for, empty, events, find_tool_result, just,
     last_message, next_speaker_verdict, ok, root, run_with, session, session_next_speaker,
@@ -943,7 +943,7 @@ async fn turn_counter_bounds_the_run_at_max_turns() {
     assert_eq!(deps.requests.lock().unwrap().len(), 3);
     let lm = last_message(conv);
     assert!(
-        matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
+        matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::Marker::RunLimit.text())
     );
 }
 
@@ -993,7 +993,7 @@ async fn a_stuck_identical_batch_trips_the_loop_detector_without_injecting_text(
     // The Run closes on the loop-stall marker.
     let lm = last_message(conv);
     assert!(
-        matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::loop_stall_marker())
+        matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::Marker::LoopStall.text())
     );
 
     // The passive invariant: NO loop-detector steering text entered the
@@ -1013,7 +1013,7 @@ async fn a_stuck_identical_batch_trips_the_loop_detector_without_injecting_text(
         .collect();
     assert_eq!(
         voice_texts,
-        vec![voice::loop_stall_marker()],
+        vec![voice::Marker::LoopStall.text()],
         "the detector appends only the close marker, no steering text"
     );
 
@@ -1272,7 +1272,7 @@ async fn the_continuation_is_bounded_by_max_turns() {
     assert_eq!(deps.requests.lock().unwrap().len(), 3);
     let lm = last_message(conv);
     assert!(
-        matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::run_limit_marker())
+        matches!(&lm.content[0], ContentBlock::Text { text } if text == voice::Marker::RunLimit.text())
     );
 }
 
@@ -1356,7 +1356,7 @@ async fn a_denied_run_command_answers_the_denial_and_never_runs() {
     assert!(
         find_tool_result(&evs, "r1")
             .map(|e| matches!(e, Event::ToolResult { is_error, content, .. }
-                    if *is_error && content == voice::command_denied()))
+                    if *is_error && content == voice::Marker::CommandDenied.text()))
             .unwrap_or(false)
     );
 }
@@ -1657,7 +1657,10 @@ async fn proactive_compacts_before_first_pass() {
     // assistant blob puts the estimate over target but under the cliff.
     let mut conv = Conversation::new(
         "sys",
-        crate::conversation::ConversationOpts::new(4000, 100).compaction_slack(0.3),
+        crate::conversation::ConversationOpts {
+            compaction_slack: 0.3,
+            ..crate::conversation::ConversationOpts::new(4000, 100)
+        },
     );
     conv.add_user_text("original task");
     conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(12_000))]);

@@ -221,7 +221,7 @@ fn an_orphaned_call_in_a_mismatched_message_is_answered_in_the_voice() {
     assert!(matches!(
         &out[2].content[1],
         ContentBlock::ToolResult { content, is_error: true, .. }
-            if crate::content::result_blocks_text(content) == voice::orphaned_call_answer()
+            if crate::content::result_blocks_text(content) == voice::Marker::OrphanedCall.text()
     ));
     assert!(matches!(&out[2].content[2], ContentBlock::Text { text } if text == "steering"));
 }
@@ -240,7 +240,7 @@ fn a_trailing_orphaned_call_gets_a_fresh_user_message() {
         &out[2].content[0],
         ContentBlock::ToolResult { tool_use_id, is_error: true, content }
             if tool_use_id == "t1"
-                && crate::content::result_blocks_text(content) == voice::orphaned_call_answer()
+                && crate::content::result_blocks_text(content) == voice::Marker::OrphanedCall.text()
     ));
 }
 

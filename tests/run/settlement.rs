@@ -109,7 +109,7 @@ fn adopts_the_loop_closed_conversation_as_is() {
     let mut closed = base();
     closed.add_assistant_blocks(vec![
         ContentBlock::text("partial thought"),
-        ContentBlock::text(voice::run_failed_marker()),
+        ContentBlock::text(voice::Marker::RunFailed.text()),
     ]);
 
     let settlement = Settlement::new().note_checkpoint(checkpoint(base()));
@@ -135,7 +135,7 @@ fn in_run_error_with_no_checkpoint_closes_the_pre_run_conversation() {
     assert_closed_with(
         &resolution.conversation,
         &base(),
-        voice::run_failed_marker(),
+        voice::Marker::RunFailed.text(),
     );
 }
 
@@ -157,7 +157,7 @@ fn in_run_error_with_a_checkpoint_the_partial_run_survives() {
     assert_closed_with(
         &resolution.conversation,
         &partial,
-        voice::run_failed_marker(),
+        voice::Marker::RunFailed.text(),
     );
 }
 
@@ -175,7 +175,7 @@ fn the_latest_checkpoint_wins() {
     assert_closed_with(
         &resolution.conversation,
         &second,
-        voice::run_failed_marker(),
+        voice::Marker::RunFailed.text(),
     );
 }
 
@@ -192,7 +192,7 @@ fn a_crash_settles_as_a_failure() {
     assert_closed_with(
         &resolution.conversation,
         &checkpoint(base()),
-        voice::run_failed_marker(),
+        voice::Marker::RunFailed.text(),
     );
 }
 
@@ -205,7 +205,7 @@ fn a_shutdown_nobody_asked_for_settles_as_a_failure() {
     assert_closed_with(
         &resolution.conversation,
         &base(),
-        voice::run_failed_marker(),
+        voice::Marker::RunFailed.text(),
     );
 }
 
@@ -219,7 +219,7 @@ fn a_crash_that_races_a_cancel_settles_as_a_failure_never_a_cancellation() {
     assert_closed_with(
         &resolution.conversation,
         &base(),
-        voice::run_failed_marker(),
+        voice::Marker::RunFailed.text(),
     );
 }
 
@@ -339,7 +339,7 @@ fn cancel_plus_shutdown_closes_the_checkpoint_with_the_cancelled_marker() {
     assert_closed_with(
         &resolution.conversation,
         &partial,
-        voice::run_cancelled_marker(),
+        voice::Marker::RunCancelled.text(),
     );
 }
 
@@ -353,6 +353,6 @@ fn with_no_checkpoint_the_pre_run_conversation_is_the_base() {
     assert_closed_with(
         &resolution.conversation,
         &base(),
-        voice::run_cancelled_marker(),
+        voice::Marker::RunCancelled.text(),
     );
 }

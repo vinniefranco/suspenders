@@ -17,6 +17,16 @@ fn tool_fragment(fragment: Value) -> SseEvent {
     delta(json!({ "tool_calls": [fragment] }))
 }
 
+/// Folds a sequence of parsed SSE events into a [`Response`] - the pure core,
+/// exercised only by these tests (the transport drives the state incrementally).
+fn fold_sse(events: impl IntoIterator<Item = SseEvent>) -> Response {
+    let mut state = StreamState::new();
+    for event in events {
+        state.handle_event(&event);
+    }
+    state.finalize()
+}
+
 fn fold(events: Vec<SseEvent>) -> Response {
     fold_sse(events)
 }
