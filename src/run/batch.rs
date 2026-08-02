@@ -120,6 +120,7 @@ async fn execute_tool<D: RunDeps>(
 
     maybe_store_plan(state, &name, &input, is_error).await;
     maybe_activate_skills(state, &name, &input, is_error);
+    maybe_register_skill_hooks(state, &name, &input, is_error);
 
     // The UI event carries the text projection (ADR-0059): a media block renders
     // as a short placeholder there, while the Conversation keeps the full block
@@ -176,6 +177,51 @@ fn touched_paths<'a>(_name: &str, input: &'a Value) -> Vec<&'a str> {
         .filter_map(|key| input.get(*key).and_then(Value::as_str))
         .filter(|p| !p.is_empty())
         .collect()
+}
+
+// Skill-hook registration at the tool-success seam (Phase 4c, ADR-0066): a
+// SUCCESSFUL `skill` tool call - the MODEL invoking a skill - registers that
+// skill's frontmatter `hooks:` as SESSION-scoped hooks in the live HookManager,
+// so they fire at their events for the rest of the Run (qwen semantics:
+// model-invocation only, session-scoped, carrying SUSPENDERS_SKILL_ROOT). The
+// skill is resolved by the `skill` input arg through the shared
+// `Arc<SkillManager>` (the same handle `maybe_activate_skills` uses), and its
+// `base_dir` becomes the hook skill_root so a registered command hook sees
+// SUSPENDERS_SKILL_ROOT when the Phase 2 runner fires it. Registration is
+// idempotent (a skill invoked twice registers once). This keeps the `skill` tool
+// hook-free: the RUN layer detects the invocation and does the registration,
+// mirroring the todo/subagent hook wiring (ADR-0066's layering preference). A Run
+// with no hooks handle, no skill_activation, an errored call, or a non-`skill`
+// tool is a cheap no-op. The user `/<name>` slash path (Phase 4b) does NOT reach
+// here - it never emits a `skill` tool call - so only the model path registers
+// hooks, faithful to qwen.
+fn maybe_register_skill_hooks<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    is_error: bool,
+) {
+    if is_error || name != "skill" {
+        return;
+    }
+    let (Some(hooks), Some(activation)) = (state.hooks, state.skill_activation.as_ref()) else {
+        return;
+    };
+    let Some(skill_name) = input.get("skill").and_then(Value::as_str).map(str::trim) else {
+        return;
+    };
+    let Some(skill) = activation.skills.find(skill_name) else {
+        return;
+    };
+    // Only a skill that actually carries a parsed `hooks:` block registers
+    // anything; a skill with no hooks is a no-op (registers nothing).
+    if let Some(skill_hooks) = &skill.hooks {
+        hooks.register_skill(
+            &skill.name,
+            &skill.base_dir.to_string_lossy(),
+            skill_hooks,
+        );
+    }
 }
 
 // A successful todo_write Tool Call replaces the Plan's task list and stores its

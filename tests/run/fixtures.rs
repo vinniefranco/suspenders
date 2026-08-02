@@ -169,6 +169,52 @@ pub(super) async fn run_with_hooks(
     (outcome, deps)
 }
 
+/// Runs the loop with BOTH a hook firing handle AND the conditional-skill /
+/// skill-hook-registration seam wired (Phase 4c, ADR-0066). The caller supplies a
+/// [`crate::run::hooks::Hooks`] (over injected fakes) and a shared
+/// [`crate::skills::SkillManager`]; `run` threads both into the `RunEnv` so
+/// `batch` fires the tool events AND registers a model-invoked skill's `hooks:`.
+/// `project_root` is the root a touched path resolves against (also the skill
+/// activation scope). Mirrors [`run_with_hooks`].
+pub(super) async fn run_with_hooks_and_skills(
+    session: &Session,
+    prompt: &str,
+    mut deps: FakeDeps,
+    hooks: &crate::run::hooks::Hooks<'_>,
+    skills: Arc<crate::skills::SkillManager>,
+    project_root: std::path::PathBuf,
+) -> (Outcome, FakeDeps) {
+    let conv = conversation(session, prompt);
+    // A registry carrying the `skill` tool over the SAME shared SkillManager, so a
+    // model `skill` call actually SUCCEEDS in-test (the registration trigger keys
+    // off tool SUCCESS). Built beside the built-in set the other tools come from.
+    let mut tools = crate::tools::tools();
+    tools.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
+        &skills,
+    ))));
+    let registry = Arc::new(crate::tool_registry::ToolRegistry::new(tools));
+    let ctx = session.tool_ctx(
+        &session.model,
+        crate::tool::caps::Capabilities::for_test_with_registry(registry),
+    );
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: Some(hooks),
+            skill_activation: Some(crate::run::loop_::SkillActivation {
+                skills,
+                project_root,
+            }),
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
+    (outcome, deps)
+}
+
 pub(super) fn deps_for(session: &Session, entries: Vec<Entry>) -> FakeDeps {
     FakeDeps::new(FakeLlm::script(entries), session.model.clone())
 }

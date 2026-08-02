@@ -6,7 +6,7 @@
 //! are proven end to end, not in isolation.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -17,8 +17,11 @@ use crate::event::Event;
 use crate::hooks::{HttpPost, ShellExec, ShellResult};
 use crate::llm::response::{Response, StopReason};
 use crate::run::Outcome;
-use crate::run::fixtures::{deps_for, events, just, run_with_hooks, session, text_end};
+use crate::run::fixtures::{
+    deps_for, events, just, run_with_hooks, run_with_hooks_and_skills, session, text_end,
+};
 use crate::run::hooks::Hooks;
+use crate::skills::SkillManager;
 use crate::test_support::{Entry, FakeLlm};
 
 // ---- fakes -------------------------------------------------------------------
@@ -940,5 +943,294 @@ async fn hook_runner_error_is_fail_open() {
     assert!(
         hook_line_for(&evs, "PreToolUse").is_none(),
         "a fail-open hook surfaces no deciding line"
+    );
+}
+
+// ---- skill-hook registration on invocation (Phase 4c) ------------------------
+
+/// A fake ShellExec that answers every command hook with the SAME crafted stdout
+/// and RECORDS the `env` each fire saw (so a test can assert a registered skill
+/// command hook carried `SUSPENDERS_SKILL_ROOT`). Shared behind an `Arc` so the
+/// test keeps the recorder after the boxed handle moves into `Hooks`.
+struct RecordingShell {
+    stdout: String,
+    envs: Mutex<Vec<HashMap<String, String>>>,
+}
+
+impl RecordingShell {
+    fn new(stdout: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(RecordingShell {
+            stdout: stdout.to_string(),
+            envs: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+struct SharedRecordingShell(std::sync::Arc<RecordingShell>);
+
+#[async_trait]
+impl ShellExec for SharedRecordingShell {
+    async fn run(
+        &self,
+        _command: &str,
+        _stdin_json: &str,
+        _cwd: &str,
+        env: &HashMap<String, String>,
+        _timeout_secs: u64,
+    ) -> Result<ShellResult, String> {
+        self.0.envs.lock().unwrap().push(env.clone());
+        Ok(ShellResult {
+            exit_code: 0,
+            stdout: self.0.stdout.clone(),
+            stderr: String::new(),
+        })
+    }
+}
+
+/// Writes a `SKILL.md` under `<skills_root>/<name>/` (the skills root
+/// `SkillManager::discover` takes directly) and discovers a shared
+/// [`SkillManager`] over it. The disk path matters: the skill's real `base_dir`
+/// (`<skills_root>/<name>`) becomes the hook `skill_root` a registered command hook
+/// carries in `SUSPENDERS_SKILL_ROOT`. Returns the manager and the skill's
+/// `base_dir` so a test can assert the exact env value.
+fn skill_manager_with(
+    skills_root: &std::path::Path,
+    name: &str,
+    content: &str,
+) -> (Arc<SkillManager>, std::path::PathBuf) {
+    let dir = skills_root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    (Arc::new(SkillManager::discover(skills_root, None)), dir)
+}
+
+/// A `HookManager` with NO standing config (so every fired hook comes from a
+/// registered skill). The empty manager Phase 4c registers skills into.
+fn empty_manager() -> crate::hooks::HookManager {
+    crate::hooks::HookManager::from_config(None)
+}
+
+/// The model invoking the `skill` tool registers that skill's `hooks:` as
+/// session-scoped: a skill carrying a PreToolUse hook makes that hook FIRE on the
+/// next matching tool call in the same Run, and the registered COMMAND hook carries
+/// the skill's base_dir in `SUSPENDERS_SKILL_ROOT`.
+#[tokio::test]
+async fn model_invoked_skill_registers_hooks_that_fire_and_carry_skill_root() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    // A skill whose frontmatter (between the fences) declares a PreToolUse command
+    // hook. The nested `hooks:` block lives IN the frontmatter.
+    let skill_md = "---\nname: fmt\ndescription: a formatter\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: guard.sh\n---\nbody text\n";
+    let (skills, base_dir) = skill_manager_with(root.path(), "fmt", skill_md);
+
+    let manager = empty_manager();
+    // exit 0 + empty JSON => a steers-nothing allow; the fire COUNTS via the env log.
+    let shell = RecordingShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedRecordingShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // Pass 1: the model invokes the skill (registers its PreToolUse hook). Pass 2:
+    // the model calls list_directory - the registered hook fires BEFORE it.
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass("s1", "skill", json!({ "skill": "fmt" }))),
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, _deps) = run_with_hooks_and_skills(
+        &session,
+        "go",
+        deps,
+        &hooks,
+        Arc::clone(&skills),
+        root.path().to_path_buf(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    // The registered PreToolUse hook fired exactly once (on the list_directory
+    // call, not the skill call - the skill call preceded registration). Its env
+    // carries the skill's base_dir as SUSPENDERS_SKILL_ROOT.
+    let envs = shell.envs.lock().unwrap();
+    assert_eq!(envs.len(), 1, "the registered hook fired once, on the next tool");
+    let expected_root = base_dir.to_string_lossy().into_owned();
+    assert_eq!(
+        envs[0].get("SUSPENDERS_SKILL_ROOT").map(String::as_str),
+        Some(expected_root.as_str()),
+        "the registered command hook carries the skill root: {envs:?}"
+    );
+}
+
+/// A model-invoked skill with NO `hooks:` block registers nothing: a later tool
+/// call fires no hook.
+#[tokio::test]
+async fn model_invoked_skill_without_hooks_registers_nothing() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let skill_md = "---\nname: plain\ndescription: no hooks here\n---\njust a body\n";
+    let (skills, _base_dir) = skill_manager_with(root.path(), "plain", skill_md);
+
+    let manager = empty_manager();
+    let shell = RecordingShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedRecordingShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass("s1", "skill", json!({ "skill": "plain" }))),
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, _deps) = run_with_hooks_and_skills(
+        &session,
+        "go",
+        deps,
+        &hooks,
+        Arc::clone(&skills),
+        root.path().to_path_buf(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    assert!(
+        shell.envs.lock().unwrap().is_empty(),
+        "a hook-less skill registers no hooks, so nothing fires"
+    );
+}
+
+/// Invoking the SAME skill twice registers its hooks ONCE (idempotent, ADR-0066):
+/// the live manager ends the Run with exactly one skill hook for the event, not a
+/// stacked pair. Asserting on the manager (not the fire count) isolates the
+/// registration, since the registered PreToolUse hook otherwise fires before every
+/// SUBSEQUENT tool call (including the second `skill` call), which would confound a
+/// fire-count assertion.
+#[tokio::test]
+async fn double_skill_invocation_is_idempotent() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let skill_md = "---\nname: fmt\ndescription: a formatter\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: guard.sh\n---\nbody\n";
+    let (skills, _base_dir) = skill_manager_with(root.path(), "fmt", skill_md);
+
+    let manager = empty_manager();
+    let shell = RecordingShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedRecordingShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // Invoke the SAME skill twice (two Passes), then end. The second invocation
+    // must register nothing new.
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass("s1", "skill", json!({ "skill": "fmt" }))),
+            Entry::just(tool_pass("s2", "skill", json!({ "skill": "fmt" }))),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, _deps) = run_with_hooks_and_skills(
+        &session,
+        "go",
+        deps,
+        &hooks,
+        Arc::clone(&skills),
+        root.path().to_path_buf(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    // The manager holds exactly ONE PreToolUse skill hook after two invocations of
+    // the same skill: registration is idempotent.
+    assert_eq!(
+        manager
+            .hooks_for(crate::hooks::HookEvent::PreToolUse, Some("anything"))
+            .len(),
+        1,
+        "a skill invoked twice registers its hook exactly once"
+    );
+}
+
+/// The user `/<name>` slash path does NOT register skill hooks (Phase 4b is a
+/// submit-prompt injection, not a `skill` tool call). A Run that never emits a
+/// `skill` tool call registers nothing, so a later tool fires no skill hook - only
+/// the model tool-invocation path registers (qwen semantics).
+#[tokio::test]
+async fn user_slash_path_does_not_register_skill_hooks() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    // The skill carries a PreToolUse hook, but it is never invoked via the tool.
+    let skill_md = "---\nname: fmt\ndescription: a formatter\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: guard.sh\n---\nbody\n";
+    let (skills, _base_dir) = skill_manager_with(root.path(), "fmt", skill_md);
+
+    let manager = empty_manager();
+    let shell = RecordingShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedRecordingShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // No `skill` tool call: the model just calls a plain tool (the slash path would
+    // have injected the skill body into the prompt, not emitted a tool call).
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, _deps) = run_with_hooks_and_skills(
+        &session,
+        "go",
+        deps,
+        &hooks,
+        Arc::clone(&skills),
+        root.path().to_path_buf(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    assert!(
+        shell.envs.lock().unwrap().is_empty(),
+        "no `skill` tool call means no registration, so the skill hook never fires"
     );
 }

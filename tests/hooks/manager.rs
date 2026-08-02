@@ -105,7 +105,7 @@ fn skill_hooks_carry_skill_root_after_config() {
     let config = json!({
         "PostToolUse": [ { "hooks": [ { "type": "command", "command": "standing" } ] } ]
     });
-    let mut mgr = HookManager::from_config(Some(&config));
+    let mgr = HookManager::from_config(Some(&config));
 
     let skill_hooks = json!({
         "PostToolUse": [ { "hooks": [ { "type": "command", "command": "skill-fmt" } ] } ]
@@ -125,18 +125,44 @@ fn skill_hooks_carry_skill_root_after_config() {
         selected[1].hook.kind,
         HookKind::Command { command: "skill-fmt".to_string() }
     );
-    assert_eq!(selected[1].skill_root, Some("/skills/formatter"));
+    assert_eq!(selected[1].skill_root.as_deref(), Some("/skills/formatter"));
 }
 
 /// A malformed skill hooks block is recorded fail-open, labeled by skill name.
 #[test]
 fn malformed_skill_hooks_recorded_fail_open() {
-    let mut mgr = HookManager::from_config(None);
+    let mgr = HookManager::from_config(None);
     let bad = json!({ "Stop": [ { "hooks": [ { "type": "function" } ] } ] });
     mgr.register_skill("broken", "/skills/broken", &bad);
     assert_eq!(mgr.failures().len(), 1);
     assert_eq!(mgr.failures()[0].0, "skill broken");
     assert!(mgr.hooks_for(HookEvent::Stop, None).is_empty());
+}
+
+/// Registering the SAME skill twice is idempotent: its hooks are added once, not
+/// doubled (ADR-0066).
+#[test]
+fn register_skill_is_idempotent() {
+    let mgr = HookManager::from_config(None);
+    let skill_hooks = json!({
+        "Stop": [ { "hooks": [ { "type": "command", "command": "once" } ] } ]
+    });
+    mgr.register_skill("dup", "/skills/dup", &skill_hooks);
+    mgr.register_skill("dup", "/skills/dup", &skill_hooks);
+    assert_eq!(
+        mgr.hooks_for(HookEvent::Stop, None).len(),
+        1,
+        "a skill invoked twice registers its hooks once"
+    );
+}
+
+/// A registered skill with NO hooks block (an empty object) contributes nothing.
+#[test]
+fn register_skill_with_no_hooks_adds_nothing() {
+    let mgr = HookManager::from_config(None);
+    mgr.register_skill("empty", "/skills/empty", &json!({}));
+    assert!(mgr.hooks_for(HookEvent::Stop, None).is_empty());
+    assert!(mgr.failures().is_empty(), "an empty hooks object is not a failure");
 }
 
 /// A malformed config.json hooks block records a failure but the manager still

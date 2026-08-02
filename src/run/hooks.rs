@@ -339,14 +339,25 @@ impl<'a> Hooks<'a> {
         let selected = self.manager.hooks_for(event, Some(tool_name));
         let caps = self.caps();
         let mut outcomes = Vec::with_capacity(selected.len());
-        for sel in selected {
+        for sel in &selected {
             let ctx = HookRunContext {
                 cwd: &self.cwd,
-                skill_root: sel.skill_root,
+                skill_root: sel.skill_root.as_deref(),
             };
-            outcomes.push(run_hook(sel.hook, payload, &ctx, &caps).await);
+            outcomes.push(run_hook(&sel.hook, payload, &ctx, &caps).await);
         }
         outcomes
+    }
+
+    /// Registers a skill's session-scoped hooks into the manager (Phase 4c,
+    /// ADR-0066): delegates to [`HookManager::register_skill`] through the handle's
+    /// shared manager, so the run layer (`crate::run::batch`) can register on skill
+    /// invocation without depending on the hook subsystem directly. Idempotent (a
+    /// skill invoked twice registers once). `skill_root` is the skill's base
+    /// directory, carried so a registered command hook sees `SUSPENDERS_SKILL_ROOT`
+    /// when it fires.
+    pub fn register_skill(&self, name: &str, skill_root: &str, hooks: &serde_json::Value) {
+        self.manager.register_skill(name, skill_root, hooks);
     }
 
     /// Fires the PreToolUse hooks and folds them into a [`PreToolDecision`]
@@ -496,12 +507,12 @@ impl<'a> Hooks<'a> {
         let selected = self.manager.hooks_for(event, None);
         let caps = self.caps();
         let mut outcomes = Vec::with_capacity(selected.len());
-        for sel in selected {
+        for sel in &selected {
             let ctx = HookRunContext {
                 cwd: &self.cwd,
-                skill_root: sel.skill_root,
+                skill_root: sel.skill_root.as_deref(),
             };
-            outcomes.push(run_hook(sel.hook, payload, &ctx, &caps).await);
+            outcomes.push(run_hook(&sel.hook, payload, &ctx, &caps).await);
         }
         outcomes
     }
