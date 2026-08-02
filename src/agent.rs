@@ -840,12 +840,27 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
 // without threading hook plumbing into the UI. Built on demand (it borrows the
 // state), never held, so it never outlives an `&AgentState` borrow.
 fn agent_hooks(state: &AgentState) -> crate::run::hooks::Hooks<'_> {
+    let transcript = transcript_path(state);
+    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
     crate::run::hooks::Hooks::new(
         state.hook_manager.as_ref(),
         state.llm.as_ref(),
         &state.model,
         state.session.root.clone(),
+        session_id,
+        transcript,
     )
+}
+
+// The Session Log's JSONL path (H1, ADR-0010/0066): the running transcript the hook
+// payloads report as `transcript_path`. Empty when the Agent opened no log (the log
+// open failed) - the fail-open base-identity fallback.
+fn transcript_path(state: &AgentState) -> String {
+    state
+        .log
+        .as_ref()
+        .map(|log| log.path.clone())
+        .unwrap_or_default()
 }
 
 // Fires the SessionEnd hooks at Agent shutdown (Phase 3b, ADR-0066).
@@ -866,8 +881,17 @@ fn fire_notification(state: &AgentState, message: String) {
     let llm = Arc::clone(&state.llm);
     let model = state.model.clone();
     let root = state.session.root.clone();
+    let transcript = transcript_path(state);
+    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
     tokio::spawn(async move {
-        let hooks = crate::run::hooks::Hooks::new(manager.as_ref(), llm.as_ref(), &model, root);
+        let hooks = crate::run::hooks::Hooks::new(
+            manager.as_ref(),
+            llm.as_ref(),
+            &model,
+            root,
+            session_id,
+            transcript,
+        );
         hooks.notification(&message).await;
     });
 }
@@ -1278,6 +1302,7 @@ fn spawn_run(state: &mut AgentState) {
         session: state.session.clone(),
         hooks: Arc::clone(&state.hook_manager),
         skills: Arc::clone(&state.skill_manager),
+        transcript_path: transcript_path(state),
     });
     let conversation = state.conversation.clone();
     let session = state.session.clone();

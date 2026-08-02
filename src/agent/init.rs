@@ -224,8 +224,16 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     } else {
         "startup"
     };
-    let session_start_hooks =
-        crate::run::hooks::Hooks::new(&hook_manager, llm.as_ref(), &model, session.root.clone());
+    let transcript = log.as_ref().map(|l| l.path.clone()).unwrap_or_default();
+    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    let session_start_hooks = crate::run::hooks::Hooks::new(
+        &hook_manager,
+        llm.as_ref(),
+        &model,
+        session.root.clone(),
+        session_id,
+        transcript,
+    );
     let system_prompt = match session_start_hooks.session_start(source).await {
         Some(context) => {
             let _ = events.send(Event::extension_error(

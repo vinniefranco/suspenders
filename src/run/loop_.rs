@@ -91,13 +91,19 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     // `batch` can activate a conditional skill by the touched file path at the
     // tool-success seam. `None` for a Run that activates no skills (child/test).
     pub(super) skill_activation: Option<SkillActivation>,
-    // The Stop-hook loop-guard (Phase 3b, ADR-0066, qwen's `stop_hook_active`):
-    // set once a Stop hook has FORCED a continuation this Run. While set, the
-    // finish path does not fire Stop again, so a Stop hook that always blocks
-    // cannot loop forever - it forces at most one extra continuation, matching
-    // qwen. `finish` reads it before firing Stop and sets it when a Stop hook
-    // forces the Run to continue.
-    pub(super) stop_hook_active: bool,
+    // The Stop-hook continuation COUNTER (Phase 3b, ADR-0066; A2, qwen's
+    // `stopHookState.iterationCount`): how many times a Stop hook has forced a
+    // continuation this Run. The finish path (`dispatch::finish_or_stop_hook`) fires
+    // Stop while `stop_hook_count < stop_hook_cap`, increments on each forced
+    // continuation, and at the cap emits qwen's
+    // `formatStopHookBlockingCapWarning` then STOPS - so a Stop hook that always
+    // blocks forces at most `cap` extra Passes (qwen default 8), never an infinite
+    // loop, and a legitimate stop (no forcing hook) is never wrongly blocked.
+    pub(super) stop_hook_count: u64,
+    // The resolved Stop-hook continuation cap (A2, qwen's
+    // `resolveStopHookBlockingCap`): env `SUSPENDERS_STOP_HOOK_BLOCK_CAP` (clamped
+    // to 1..=100) else the default 8. Resolved once at Run start.
+    pub(super) stop_hook_cap: u64,
     pub(super) plan: Plan,
     // The current Pass number, 1-based (replaces the Ledger's `pass()`).
     pub(super) turn: u64,
@@ -188,7 +194,8 @@ pub async fn run<D: RunDeps>(
         hooks: env.hooks,
         hook_stop: None,
         skill_activation: env.skill_activation,
-        stop_hook_active: false,
+        stop_hook_count: 0,
+        stop_hook_cap: crate::run::hooks::resolve_stop_hook_cap(),
         plan,
         turn: 1,
         max_turns: session.run_limit,

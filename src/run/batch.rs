@@ -373,8 +373,21 @@ async fn gated_execute<D: RunDeps>(
     pre_permission: Option<crate::hooks::PermissionDecision>,
 ) -> Answer {
     let Some(text) = approvals::gate_text(name, input) else {
-        // An ungated Tool: a PreToolUse `deny` still applies (it was handled as a
-        // Block above), and a bare `allow` is moot (there is no gate to open).
+        // An ungated Tool: a PreToolUse `deny` was already handled as a universal
+        // Block above (A1), and a bare `allow` is moot (there is no gate to open).
+        // But a PreToolUse `ask` FORCES a confirmation even on an ungated tool
+        // (A1, qwen `isAsk()` -> requires-confirmation regardless of gating), so
+        // synthesize the gate over a generic confirm text and let the mode decide.
+        if pre_permission == Some(crate::hooks::PermissionDecision::Ask) {
+            emit_hook_decision(state, "PreToolUse", "requested confirmation");
+            let id = new_ref();
+            let text = format!("Confirm {name}");
+            return if state.deps.request_approval(id, text).await {
+                execute_tool_call(state, name, input).await
+            } else {
+                Answer::denied()
+            };
+        }
         return execute_tool_call(state, name, input).await;
     };
 
@@ -471,8 +484,13 @@ async fn fire_pre_tool_use<D: RunDeps>(
     };
 
     match hooks.pre_tool_use(name, input).await {
-        hooks::PreToolDecision::Block { reason, context } => {
+        hooks::PreToolDecision::Block {
+            reason,
+            context,
+            system_message,
+        } => {
             emit_hook_decision(state, "PreToolUse", &format!("blocked a Tool Call: {reason}"));
+            surface_system_message(state, "PreToolUse", system_message);
             // The blocked call reads as an error result: the reason, with any
             // additionalContext the blocking hook still injected appended.
             let content = append_context(reason, context);
@@ -482,6 +500,7 @@ async fn fire_pre_tool_use<D: RunDeps>(
             permission,
             context,
             stop,
+            system_message,
         } => {
             if let Some(reason) = stop {
                 emit_hook_decision(state, "PreToolUse", &format!("requested stop: {reason}"));
@@ -490,6 +509,7 @@ async fn fire_pre_tool_use<D: RunDeps>(
             if context.is_some() {
                 emit_hook_decision(state, "PreToolUse", "injected additional context");
             }
+            surface_system_message(state, "PreToolUse", system_message);
             PreOutcome::Proceed {
                 permission,
                 context,
@@ -517,6 +537,7 @@ async fn post_process<D: RunDeps>(
                 emit_hook_decision(state, "PostToolUse", &format!("requested stop: {reason}"));
                 state.hook_stop.get_or_insert(reason);
             }
+            surface_system_message(state, "PostToolUse", decision.system_message);
             decision.context
         }
         Some(hooks) => hooks.post_tool_use_failure(name, &output).await,
@@ -573,6 +594,21 @@ fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, wha
         crate::event::Stage::Present,
         what.to_string(),
     ));
+}
+
+// Surfaces a hook's `systemMessage` on the same visible channel (A5, qwen's
+// `processCommonHookOutputFields`): a hook can hand the USER a note (distinct from
+// the model-facing additionalContext) UNLESS it set `suppressOutput` (the fold
+// already applied that gate, so this only sees the messages qwen would show). `None`
+// is a no-op - the common case where no hook set a systemMessage.
+fn surface_system_message<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    event: &str,
+    message: Option<String>,
+) {
+    if let Some(message) = message {
+        emit_hook_decision(state, event, &format!("system message: {message}"));
+    }
 }
 
 // The per-call Approval reference (baud's `make_ref()`), an opaque unique id.

@@ -102,6 +102,13 @@ pub struct Capture {
     /// fresh empty manager (a subagent activates nothing - the seam is the
     /// parent's).
     pub skills: Arc<crate::skills::SkillManager>,
+    /// The Session identifier the hook payloads carry (H1, ADR-0066): the unique
+    /// per-session token from the Session Log's JSONL file stem (ADR-0010). Empty
+    /// for a Run whose Agent opened no log (a test, or a log-open failure).
+    pub session_id: String,
+    /// The Session Log's JSONL path the hook payloads carry (H1, ADR-0066): the
+    /// running transcript a hook can tail (`transcript_path`). Empty when no log.
+    pub transcript_path: String,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -183,6 +190,8 @@ pub async fn run(
         capture.llm.as_ref(),
         &capture.model,
         session.root.clone(),
+        capture.session_id.clone(),
+        capture.transcript_path.clone(),
     );
 
     // The conditional-skill activation seam (ADR-0058): the shared skill manager

@@ -338,8 +338,17 @@ async fn run_prompt_hook(
     caps: &HookCaps<'_>,
 ) -> HookOutcome {
     // Replace every $ARGUMENTS with the payload JSON (qwen's
-    // replaceArgumentsPlaceholder).
-    let processed = prompt.replace("$ARGUMENTS", payload);
+    // replaceArgumentsPlaceholder). The prompt hook alone PRETTY-prints the input
+    // (qwen `promptHookRunner.ts`: `JSON.stringify(input, null, 2)`) - the
+    // command/http paths deliver the compact payload verbatim - so a small local
+    // model reads a legible 2-space-indented object. A `payload` that does not
+    // re-parse (it always does; it is our own serialization) falls back to the
+    // compact form.
+    let pretty = serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| payload.to_string());
+    let processed = prompt.replace("$ARGUMENTS", &pretty);
 
     let request = LlmRequest::new(
         PROMPT_HOOK_SYSTEM_PROMPT,
@@ -365,10 +374,45 @@ async fn run_prompt_hook(
         })
         .collect::<String>();
 
-    match LlmHookResponse::parse(reply.trim()) {
+    // Strip a leading/trailing ```json ... ``` markdown fence before parsing
+    // (qwen `parseResponse`): a small local model often wraps its JSON reply in a
+    // fenced block, and qwen extracts the inner text before `JSON.parse`.
+    let stripped = strip_json_fence(reply.trim());
+    match LlmHookResponse::parse(stripped) {
         Some(r) => outcome_from_prompt_response(&r),
-        // Unparseable / empty reply: fail open (non-blocking).
-        None => HookOutcome::default(),
+        // Unparseable / empty reply: qwen's `parseResponse` fail-open returns
+        // `{ok:true, reason:"...defaulting to allow"}`, which `processResult` maps
+        // to `{continue:true, decision:'allow', reason}`. An EXPLICIT allow (not the
+        // steers-nothing default) so a downstream fold sees the same allow qwen
+        // produces.
+        None => outcome_from_prompt_response(&LlmHookResponse {
+            ok: true,
+            reason: Some("Failed to parse LLM response, defaulting to allow".to_string()),
+            additional_context: None,
+        }),
+    }
+}
+
+/// Strips a single leading/trailing markdown code fence (```json … ``` or ``` …
+/// ```) from an LLM reply, VERBATIM from qwen's `parseResponse` regex
+/// (`/```(?:json)?\s*([\s\S]*?)```/`): the FIRST fenced block's inner text is
+/// returned trimmed, else the input is returned unchanged. A small local model
+/// often fences its JSON, so the runner must unwrap it before parsing.
+fn strip_json_fence(text: &str) -> &str {
+    let Some(open) = text.find("```") else {
+        return text;
+    };
+    // Skip past the opening fence and an optional `json` language tag, then any
+    // whitespace, matching qwen's `` ```(?:json)?\s* ``.
+    let after_ticks = &text[open + 3..];
+    let after_lang = after_ticks
+        .strip_prefix("json")
+        .unwrap_or(after_ticks)
+        .trim_start();
+    // The inner block ends at the next closing fence.
+    match after_lang.find("```") {
+        Some(close) => after_lang[..close].trim(),
+        None => text,
     }
 }
 

@@ -614,13 +614,13 @@ async fn user_prompt_submit_injects_additional_context() {
 
 // ---- Stop (Phase 3b) ---------------------------------------------------------
 
-/// A Stop hook that blocks FORCES the Run to continue once (qwen's Stop-hook
-/// feedback inversion): the model would have ended after the first (no-tool)
-/// reply, but the hook injects its feedback and the loop runs a second Pass. The
-/// loop-guard (`stop_hook_active`) then lets the second end through, so the hook
-/// forces exactly ONE extra Pass - it cannot loop forever.
+/// A Stop hook that ALWAYS blocks forces continuations up to the resolved cap
+/// (A2, qwen's `DEFAULT_STOP_HOOK_BLOCK_CAP=8`), then the Run ends despite the still-
+/// blocking hook and qwen's cap warning is emitted. This is the configurable-cap
+/// replacement for the old one-shot boolean: the hook cannot loop forever, but it
+/// gets `cap` tries, not one.
 #[tokio::test]
-async fn stop_hook_forces_one_continuation_then_the_guard_lets_it_end() {
+async fn stop_hook_forces_continuations_up_to_the_cap_then_ends() {
     let root = TempDir::new().unwrap();
     let session = session(root.path());
     let manager = manager_for("Stop");
@@ -636,42 +636,39 @@ async fn stop_hook_forces_one_continuation_then_the_guard_lets_it_end() {
         session.root.clone(),
     );
 
-    // Two no-tool replies: the first would end (Stop fires -> forces continue),
-    // the second ends after the guard is set (Stop does not fire again). A third
-    // reply is scripted as a safety net; if the guard failed and the hook looped,
-    // the Run would keep consuming replies and the test's response count would
-    // reveal it.
-    let deps = deps_for(
-        &session,
-        vec![
-            just(text_end("first end")),
-            just(text_end("second end")),
-            just(text_end("safety net")),
-        ],
-    );
+    // The default cap is 8: the hook forces continuations at counts 1..7 (7 extra
+    // Passes) and the Run ends on the 8th block. So the loop consumes exactly 8
+    // no-tool replies (the first end + 7 forced continuations); a 9th is scripted
+    // as a safety net that must never be consumed (if it were, the cap failed to
+    // stop the loop and the count assertion would reveal it).
+    let cap = crate::run::hooks::DEFAULT_STOP_HOOK_BLOCK_CAP;
+    let replies: Vec<_> = (0..=cap).map(|i| just(text_end(&format!("end {i}")))).collect();
+    let deps = deps_for(&session, replies);
     let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
     assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
 
     let evs = events(&deps);
-    // Exactly TWO model Passes: the forced continuation plus the final end (the
-    // third scripted reply is never consumed - the guard stopped the loop).
+    // Exactly `cap` model Passes: the initial end + (cap-1) forced continuations,
+    // then the cap stops it (the safety-net reply is never consumed).
     let starts = evs
         .iter()
         .filter(|e| matches!(e, Event::MessageStart { .. }))
         .count();
-    assert_eq!(starts, 2, "the Stop hook forced exactly one extra Pass");
+    assert_eq!(starts as u64, cap, "the Stop hook forced continuations up to the cap");
     // The feedback was delivered as steering (the qwen-wrapped stopReason).
     let steered = evs.iter().any(|e| matches!(
         e,
         Event::SteeringDelivered { text } if text.contains("Stop hook feedback") && text.contains("keep going")
     ));
     assert!(steered, "the Stop feedback was injected as guidance");
-    // The force-continue is visible.
+    // qwen's cap warning is surfaced when the cap is hit (any Stop line carries it).
     assert!(
-        hook_line_for(&evs, "Stop")
-            .map(|l| l.contains("continue"))
-            .unwrap_or(false),
-        "the force-continue is surfaced"
+        evs.iter().any(|e| matches!(
+            e,
+            Event::ExtensionError { extension, message, .. }
+                if extension == "hook Stop" && message.contains("overriding and ending the turn")
+        )),
+        "the cap warning is surfaced when the Stop hook is overridden"
     );
 }
 
@@ -943,6 +940,424 @@ async fn hook_runner_error_is_fail_open() {
     assert!(
         hook_line_for(&evs, "PreToolUse").is_none(),
         "a fail-open hook surfaces no deciding line"
+    );
+}
+
+// ---- A1: universal permission-deny + ask-forces-gate on UNGATED tools --------
+
+/// A PreToolUse hook returning ONLY a permission-channel `deny` (no base
+/// `decision`) blocks an UNGATED tool universally (A1, qwen toolHickTriggers
+/// `isDenied()` blocks regardless of gating): `list_directory` is ungated, yet the
+/// deny still stops it and the reason reaches the model.
+#[tokio::test]
+async fn pre_tool_use_permission_deny_blocks_an_ungated_tool() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreToolUse");
+    // permissionDecision deny with NO base `decision` - the channel qwen honors
+    // universally. `list_directory` does NOT gate, so the pre-fix code dropped it.
+    let shell = ScriptedShell::new(
+        r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"path off-limits"}}"#,
+    );
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let Event::ToolResult {
+        content, is_error, ..
+    } = tool_result(&evs, "t1")
+    else {
+        unreachable!()
+    };
+    assert!(*is_error, "an ungated tool is still blocked by a permission deny");
+    assert!(
+        content.contains("path off-limits"),
+        "the permissionDecisionReason reaches the model: {content}"
+    );
+}
+
+/// A PreToolUse hook returning permission `ask` on an UNGATED tool FORCES the
+/// confirmation gate (A1, qwen `isAsk()` -> requires-confirmation regardless of
+/// gating) rather than silently proceeding: a modal opens and the canned deny
+/// stops the call.
+#[tokio::test]
+async fn pre_tool_use_permission_ask_forces_gate_on_an_ungated_tool() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreToolUse");
+    let shell = ScriptedShell::new(r#"{"hookSpecificOutput":{"permissionDecision":"ask"}}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // list_directory is ungated; the ask must synthesize a gate. Seed a DENY so a
+    // gate that opens rejects the call - proving the gate opened (an ungated tool
+    // would otherwise just run).
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    )
+    .with_approvals(vec![false]);
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    assert!(
+        evs.iter().any(|e| matches!(e, Event::ApprovalRequest { .. })),
+        "an ungated tool with a PreToolUse ask opens the confirmation gate"
+    );
+    let Event::ToolResult { is_error, .. } = tool_result(&evs, "t1") else {
+        unreachable!()
+    };
+    assert!(*is_error, "the canned deny at the forced gate stopped the call");
+}
+
+// ---- A4: multi-hook PreToolUse fold ------------------------------------------
+
+/// TWO PreToolUse hooks fire; when EITHER blocks, the call is blocked and BOTH
+/// hooks' reasons AND additionalContexts are folded (A4, qwen mergeWithOrLogic
+/// joins all reasons + contexts across every matched hook).
+#[tokio::test]
+async fn pre_tool_use_folds_all_hooks_when_any_blocks() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    // Two DISTINCT command hooks on PreToolUse (two entries), so both fire and both
+    // outcomes fold. The first injects context but does not block; the second
+    // blocks. qwen folds ALL reasons/contexts, not just the blocker's.
+    let hooks_cfg = json!({
+        "PreToolUse": [
+            { "hooks": [ { "type": "command", "command": "a.sh" } ] },
+            { "hooks": [ { "type": "command", "command": "b.sh" } ] },
+        ]
+    });
+    let manager = crate::hooks::HookManager::from_config(Some(&hooks_cfg));
+    // A shell that answers by COMMAND: a.sh injects context (allow), b.sh blocks.
+    let shell = ByCommandShell::new();
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let Event::ToolResult {
+        content, is_error, ..
+    } = tool_result(&evs, "t1")
+    else {
+        unreachable!()
+    };
+    assert!(*is_error, "any blocking hook blocks the call");
+    assert!(
+        content.contains("policy violation"),
+        "the blocker's reason folds in: {content}"
+    );
+    assert!(
+        content.contains("note from a.sh"),
+        "the NON-blocking hook's additionalContext still folds in: {content}"
+    );
+}
+
+/// A shell that answers per command name: `a.sh` allows with an additionalContext,
+/// `b.sh` blocks with a reason. Lets a multi-hook test drive two distinct outcomes.
+struct ByCommandShell;
+
+impl ByCommandShell {
+    fn new() -> Self {
+        ByCommandShell
+    }
+}
+
+#[async_trait]
+impl ShellExec for ByCommandShell {
+    async fn run(
+        &self,
+        command: &str,
+        _stdin_json: &str,
+        _cwd: &str,
+        _env: &HashMap<String, String>,
+        _timeout_secs: u64,
+    ) -> Result<ShellResult, String> {
+        let stdout = if command.contains("a.sh") {
+            r#"{"decision":"allow","hookSpecificOutput":{"additionalContext":"note from a.sh"}}"#
+        } else {
+            r#"{"decision":"deny","reason":"policy violation"}"#
+        };
+        Ok(ShellResult {
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        })
+    }
+}
+
+// ---- H1/H2: payload base fields + tool_response object -----------------------
+
+/// A shell that CAPTURES the stdin payload each fire saw, so a test can assert the
+/// exact JSON a command hook receives. Shared behind an `Arc`.
+struct CapturingShell {
+    stdout: String,
+    stdin: Mutex<Vec<String>>,
+}
+
+impl CapturingShell {
+    fn new(stdout: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(CapturingShell {
+            stdout: stdout.to_string(),
+            stdin: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+struct SharedCapturingShell(std::sync::Arc<CapturingShell>);
+
+#[async_trait]
+impl ShellExec for SharedCapturingShell {
+    async fn run(
+        &self,
+        _command: &str,
+        stdin_json: &str,
+        _cwd: &str,
+        _env: &HashMap<String, String>,
+        _timeout_secs: u64,
+    ) -> Result<ShellResult, String> {
+        self.0.stdin.lock().unwrap().push(stdin_json.to_string());
+        Ok(ShellResult {
+            exit_code: 0,
+            stdout: self.0.stdout.clone(),
+            stderr: String::new(),
+        })
+    }
+}
+
+/// A PreToolUse payload carries the five qwen base fields (H1): `session_id`,
+/// `transcript_path`, `cwd`, `hook_event_name`, `timestamp` - plus the tool fields.
+#[tokio::test]
+async fn pre_tool_use_payload_carries_the_base_fields() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreToolUse");
+    let shell = CapturingShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedCapturingShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let _ = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    let payloads = shell.stdin.lock().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+    // The with_caps synthetic identity (H1): every required base field is present.
+    assert_eq!(payload["session_id"], "test-session");
+    assert_eq!(payload["transcript_path"], "/tmp/test-session.jsonl");
+    assert_eq!(payload["cwd"], session.root);
+    assert_eq!(payload["hook_event_name"], "PreToolUse");
+    assert!(
+        payload["timestamp"].as_str().unwrap().contains('T'),
+        "timestamp is ISO-8601: {}",
+        payload["timestamp"]
+    );
+    assert_eq!(payload["tool_name"], "list_directory");
+}
+
+/// A PostToolUse payload carries `tool_response` as a JSON OBJECT (H2), never a
+/// bare string: a plain-text tool output is wrapped as `{"output": <string>}` so a
+/// qwen hook can index `tool_response` as a record.
+#[tokio::test]
+async fn post_tool_use_payload_wraps_tool_response_as_an_object() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PostToolUse");
+    let shell = CapturingShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedCapturingShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let _ = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    let payloads = shell.stdin.lock().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+    let tr = &payload["tool_response"];
+    assert!(tr.is_object(), "tool_response is an object, not a string: {tr}");
+    assert!(
+        tr.get("output").and_then(|v| v.as_str()).is_some(),
+        "a plain-text tool output is wrapped under `output`: {tr}"
+    );
+}
+
+// ---- A5: systemMessage surfaced, gated on suppressOutput ---------------------
+
+/// A PreToolUse hook's `systemMessage` is surfaced on the visible hook channel
+/// (A5, qwen `processCommonHookOutputFields`) when `suppressOutput` is not set.
+#[tokio::test]
+async fn pre_tool_use_system_message_is_surfaced() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreToolUse");
+    let shell = ScriptedShell::new(r#"{"decision":"allow","systemMessage":"heads up: slow disk"}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (_outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    let evs = events(&deps);
+    assert!(
+        hook_line_for(&evs, "PreToolUse")
+            .into_iter()
+            .chain(
+                evs.iter().filter_map(|e| match e {
+                    Event::ExtensionError { extension, message, .. }
+                        if extension == "hook PreToolUse" => Some(message.clone()),
+                    _ => None,
+                })
+            )
+            .any(|l| l.contains("heads up: slow disk")),
+        "the systemMessage is surfaced on the hook channel"
+    );
+}
+
+/// A `systemMessage` accompanied by `suppressOutput: true` is NOT surfaced (A5's
+/// gate): the user channel stays quiet.
+#[tokio::test]
+async fn system_message_is_suppressed_when_suppress_output_is_set() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreToolUse");
+    let shell = ScriptedShell::new(
+        r#"{"decision":"allow","systemMessage":"hidden note","suppressOutput":true}"#,
+    );
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (_outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    let evs = events(&deps);
+    assert!(
+        !evs.iter().any(|e| matches!(
+            e,
+            Event::ExtensionError { message, .. } if message.contains("hidden note")
+        )),
+        "a suppressed systemMessage is never surfaced"
     );
 }
 
@@ -1233,4 +1648,134 @@ async fn user_slash_path_does_not_register_skill_hooks() {
         shell.envs.lock().unwrap().is_empty(),
         "no `skill` tool call means no registration, so the skill hook never fires"
     );
+}
+
+// ---- C-F1: ProcessGroupShell concurrency + timeout ---------------------------
+
+/// The production [`ProcessGroupShell`] must drain stdout WHILE writing a large
+/// stdin payload (C-F1): a >128KB payload piped to a `cat`-style hook that echoes
+/// stdin to stdout completes without deadlock and round-trips every byte. Before
+/// the fix the whole payload was written before any read, so it deadlocked once the
+/// payload exceeded the pipe buffer (~64KB) and the hook's own stdout filled.
+#[cfg(unix)]
+#[tokio::test]
+async fn process_group_shell_large_stdin_does_not_deadlock() {
+    use crate::run::hooks::ProcessGroupShell;
+    let root = TempDir::new().unwrap();
+    // A payload well beyond the ~64KB pipe buffer.
+    let payload = "x".repeat(256 * 1024);
+    let out = ProcessGroupShell
+        .run(
+            "cat", // echoes stdin to stdout
+            &payload,
+            &root.path().to_string_lossy(),
+            &HashMap::new(),
+            30,
+        )
+        .await
+        .expect("a large stdin round-trips without deadlock");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout.len(), payload.len(), "the whole payload echoed back");
+}
+
+/// A normal command round-trips its stdout (the happy path stays intact after the
+/// concurrency rework).
+#[cfg(unix)]
+#[tokio::test]
+async fn process_group_shell_round_trips_stdout() {
+    use crate::run::hooks::ProcessGroupShell;
+    let root = TempDir::new().unwrap();
+    let out = ProcessGroupShell
+        .run(
+            "printf 'hello hook'",
+            "{}",
+            &root.path().to_string_lossy(),
+            &HashMap::new(),
+            30,
+        )
+        .await
+        .expect("a normal hook round-trips its stdout");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "hello hook");
+}
+
+/// A hook that sleeps past its timeout is killed (killpg) and returns fail-open
+/// (an `Err` the leaf turns into the steers-nothing outcome). The write is small
+/// here; the timeout wraps the whole write+wait, so the sleep is what elapses.
+#[cfg(unix)]
+#[tokio::test]
+async fn process_group_shell_times_out_and_kills() {
+    use crate::run::hooks::ProcessGroupShell;
+    let root = TempDir::new().unwrap();
+    let start = std::time::Instant::now();
+    let result = ProcessGroupShell
+        .run(
+            "sleep 30",
+            "{}",
+            &root.path().to_string_lossy(),
+            &HashMap::new(),
+            1, // 1s timeout, far below the 30s sleep
+        )
+        .await;
+    assert!(result.is_err(), "a hook past its timeout is an Err (fail-open)");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "the timeout fired promptly (killpg), not after the full sleep"
+    );
+}
+
+// ---- A2/H1: pure-function unit coverage --------------------------------------
+
+/// The Stop-hook cap resolver honors the env override, clamps to the ceiling, and
+/// falls back to the default for empty/non-numeric/non-positive values (A2, qwen's
+/// `resolveStopHookBlockingCap` + `normalizeStopHookBlockingCap`). Serialized by a
+/// mutex because it mutates the process env.
+#[test]
+fn resolve_stop_hook_cap_honors_env_and_clamps() {
+    use crate::run::hooks::{
+        DEFAULT_STOP_HOOK_BLOCK_CAP, MAX_STOP_HOOK_BLOCK_CAP, STOP_HOOK_BLOCK_CAP_ENV,
+        resolve_stop_hook_cap,
+    };
+    // No env: the default.
+    unsafe { std::env::remove_var(STOP_HOOK_BLOCK_CAP_ENV) };
+    assert_eq!(resolve_stop_hook_cap(), DEFAULT_STOP_HOOK_BLOCK_CAP);
+    // A valid override.
+    unsafe { std::env::set_var(STOP_HOOK_BLOCK_CAP_ENV, "3") };
+    assert_eq!(resolve_stop_hook_cap(), 3);
+    // Above the ceiling: clamped.
+    unsafe { std::env::set_var(STOP_HOOK_BLOCK_CAP_ENV, "10000") };
+    assert_eq!(resolve_stop_hook_cap(), MAX_STOP_HOOK_BLOCK_CAP);
+    // Non-positive / non-numeric: the default.
+    unsafe { std::env::set_var(STOP_HOOK_BLOCK_CAP_ENV, "0") };
+    assert_eq!(resolve_stop_hook_cap(), DEFAULT_STOP_HOOK_BLOCK_CAP);
+    unsafe { std::env::set_var(STOP_HOOK_BLOCK_CAP_ENV, "abc") };
+    assert_eq!(resolve_stop_hook_cap(), DEFAULT_STOP_HOOK_BLOCK_CAP);
+    unsafe { std::env::remove_var(STOP_HOOK_BLOCK_CAP_ENV) };
+}
+
+/// The cap warning wording matches qwen's `formatStopHookBlockingCapWarning`,
+/// including the singular/plural of "time(s)" (A2).
+#[test]
+fn stop_hook_cap_warning_wording() {
+    use crate::run::hooks::format_stop_hook_cap_warning;
+    assert_eq!(
+        format_stop_hook_cap_warning(8),
+        "Stop hook blocked continuation 8 consecutive times; overriding and ending the turn."
+    );
+    assert_eq!(
+        format_stop_hook_cap_warning(1),
+        "Stop hook blocked continuation 1 consecutive time; overriding and ending the turn."
+    );
+}
+
+/// `session_id` is derived from the transcript path's file stem, empty when absent
+/// (H1).
+#[test]
+fn session_id_from_log_path_uses_the_file_stem() {
+    use crate::run::hooks::session_id_from_log_path;
+    assert_eq!(
+        session_id_from_log_path("/sessions/20260802-120000-42.jsonl"),
+        "20260802-120000-42"
+    );
+    assert_eq!(session_id_from_log_path(""), "");
 }

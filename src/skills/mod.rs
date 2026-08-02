@@ -39,8 +39,8 @@
 //! `skills/types.ts`, `tools/skill-utils.ts`): the frontmatter fence split, the
 //! required-field rejection, the `SKILL_NAME_PATTERN` charset, the XML escape,
 //! the LLM content wrapper ([`build_skill_llm_content`]), the honored fields
-//! above, priority-desc-then-name ordering, project-over-user-over-bundled
-//! precedence, and conditional activation. `disable-model-invocation` and the
+//! above, alphabetical (name) ordering with `priority:` parsed-but-not-a-sort-key,
+//! project-over-user-over-bundled precedence, and conditional activation. `disable-model-invocation` and the
 //! `hooks` block are PARSED into [`Skill`] here for Phases 4b/4c to consume but
 //! carry no behavior yet. Deferred as OUT (ADR-0058): `model` override,
 //! `allowedTools` gating, extension skills, and the change-listener refresh.
@@ -69,6 +69,18 @@ pub enum SkillLevel {
     Bundled,
 }
 
+impl SkillLevel {
+    /// The lowercase label qwen appends to each catalog entry's description as a
+    /// `(${skill.level})` suffix (tools/skill.ts:174): `project`/`user`/`bundled`.
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillLevel::Project => "project",
+            SkillLevel::User => "user",
+            SkillLevel::Bundled => "bundled",
+        }
+    }
+}
+
 /// A loaded skill: the required `name`/`description`, the optional `when_to_use`
 /// hint, the skill's base directory, the markdown body (trimmed), and the honored
 /// frontmatter (ADR-0058). `disable_model_invocation` and `hooks` are parsed for
@@ -85,8 +97,11 @@ pub struct Skill {
     pub body: String,
     /// Which source this skill was discovered from.
     pub level: SkillLevel,
-    /// The ordering hint: higher sorts earlier in the catalog, ties break
-    /// alphabetically. A missing/invalid `priority` normalizes to `0`.
+    /// The `priority:` hint, PARSED AND STORED but with no current display
+    /// surface: qwen reserves it for its `/skills` listing (which Suspenders does
+    /// not have) and keeps the model-facing catalog name-sorted, so priority does
+    /// NOT reorder the catalog here (skill-manager.ts:238-243). A missing/invalid
+    /// `priority` normalizes to `0`.
     pub priority: i64,
     /// The `argument-hint` string shown after the slash command name in the
     /// `/`-menu completion (Phase 4b consumer). Display-only.
@@ -203,8 +218,11 @@ impl SkillManager {
         }
         load_bundled(&mut seen, &mut skills, &mut failures);
 
-        // Priority desc, then name asc (qwen's `/skills` display sort applied at
-        // discovery so the catalog and any listing share one order).
+        // Stable ALPHABETICAL by name (qwen's `listSkills`, skill-manager.ts:238):
+        // `priority:` is parsed and stored but does NOT reorder the model-facing
+        // catalog. qwen applies its priority sort only at the `/skills` display
+        // layer, which Suspenders does not have; the programmatic consumer here
+        // (the `skill` tool's `<available_skills>` block) stays name-sorted.
         sort_skills(&mut skills);
 
         SkillManager {
@@ -214,7 +232,7 @@ impl SkillManager {
         }
     }
 
-    /// Every discovered skill, priority-sorted. Includes conditional and
+    /// Every discovered skill, name-sorted. Includes conditional and
     /// `disable-model-invocation` skills; [`catalog`](SkillManager::catalog) is
     /// the filtered model-facing view.
     pub fn available(&self) -> &[Skill] {
@@ -224,8 +242,9 @@ impl SkillManager {
     /// The model-facing catalog: every non-`disable-model-invocation` skill that
     /// is currently active. A plain skill is always active; a conditional skill
     /// (non-empty `paths:`) is included only once a touched file has activated
-    /// it. Priority-sorted like [`available`](SkillManager::available). Read by
-    /// the `skill` tool to build its `<available_skills>` block.
+    /// it. Name-sorted like [`available`](SkillManager::available). Read by
+    /// the `skill` tool to build its `<available_skills>` block and to resolve an
+    /// invocation (a skill NOT in this set is not model-invocable).
     pub fn catalog(&self) -> Vec<&Skill> {
         self.skills
             .iter()
@@ -266,10 +285,36 @@ impl SkillManager {
         newly
     }
 
-    /// The skill matching `name` exactly, or `None`. Used by the `skill` tool's
-    /// `run` to resolve an invocation to its body.
+    /// The skill matching `name` exactly, or `None`. Matches ANY discovered
+    /// skill (including hidden/inactive ones), so it is the discovery-level
+    /// lookup; the model-invocable resolution goes through
+    /// [`find_invocable`](SkillManager::find_invocable) instead.
     pub fn find(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|s| s.name == name)
+    }
+
+    /// The MODEL-INVOCABLE skill matching `name`, or `None`: the same filtered set
+    /// [`catalog`](SkillManager::catalog) surfaces (not `disable-model-invocation`
+    /// AND currently active). qwen's `validateToolParams` (tools/skill.ts:262-265)
+    /// only permits invoking a skill in this set, so the model can never invoke a
+    /// hidden or not-yet-activated skill through the `skill` tool.
+    pub fn find_invocable(&self, name: &str) -> Option<&Skill> {
+        self.catalog().into_iter().find(|s| s.name == name)
+    }
+
+    /// Whether `name` is a PENDING conditional skill: a model-invocable
+    /// (not `disable-model-invocation`) skill with `paths:` globs that has not yet
+    /// been activated by a matching file touch (qwen's
+    /// `pendingConditionalSkillNames`, tools/skill.ts:119-129). The `skill` tool
+    /// uses this to give qwen's distinct path-gated message instead of the generic
+    /// not-found one.
+    pub fn is_pending_conditional(&self, name: &str) -> bool {
+        self.skills.iter().any(|s| {
+            s.name == name
+                && !s.disable_model_invocation
+                && !s.paths.is_empty()
+                && !self.activation.is_activated(&s.name)
+        })
     }
 
     /// The per-manifest discovery failures (`(skill <name>, reason)`). The Agent
@@ -280,11 +325,15 @@ impl SkillManager {
     }
 }
 
-/// Sorts skills priority-desc then name-asc (qwen's `listSkills` display order,
-/// applied at discovery). Deterministic: names are unique after dedup, so the
-/// name tiebreak fully orders equal-priority skills.
+/// Sorts skills ALPHABETICALLY by name (qwen's `listSkills`,
+/// skill-manager.ts:243: `skills.sort((a, b) => a.name.localeCompare(b.name))`).
+/// `priority:` is deliberately NOT a sort key: a qwen manifest with `priority:`
+/// still loads and the field is parsed-and-stored, but it does not reorder the
+/// model-facing catalog (qwen reserves priority for its `/skills` display layer,
+/// which Suspenders has no equivalent of). Deterministic: names are unique after
+/// dedup, so the name comparison fully orders the set.
 fn sort_skills(skills: &mut [Skill]) {
-    skills.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// Resolves `file_path` to a project-root-relative form (`/`-separated), or
@@ -307,8 +356,14 @@ fn project_relative(file_path: &Path, project_root: &Path) -> Option<String> {
 /// [`crate::glob_match`] engine (the same matcher behind the ignore-crate walk
 /// and `@path` completion, so one glob semantics across the codebase). A glob
 /// that will not compile matches nothing (fail-open, no panic).
+///
+/// Uses the CASE-SENSITIVE compile path: qwen's skill activation builds its
+/// picomatch matchers with the default `nocase: false` (skill-activation.ts:100),
+/// so `paths: ["**/*.RS"]` activates on `x.RS` but NOT on `x.rs`. This is the one
+/// glob caller that wants case-sensitivity; the search tools (glob/grep) keep the
+/// case-insensitive [`crate::glob_match::compile`] default.
 fn path_matches(glob: &str, path: &str) -> bool {
-    crate::glob_match::compile(glob)
+    crate::glob_match::compile_case_sensitive(glob)
         .map(|re| re.is_match(path))
         .unwrap_or(false)
 }

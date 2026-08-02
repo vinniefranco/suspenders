@@ -102,31 +102,45 @@ async fn no_tool_call<D: RunDeps>(
 // tool calls, the next-speaker check said User or was skipped). Fire the Stop
 // hooks first - a Stop hook that blocks (`continue:false`) INVERTS the stop: the
 // Run must continue, and the hook's "Stop hook feedback:\n<reason>" is injected as
-// a user turn to guide the next Pass. The loop-guard (`state.stop_hook_active`)
-// makes this fire at most once: once a Stop hook has forced a continuation, Stop
-// is not fired again, so a hook that always blocks forces only one extra Pass
-// (qwen's `stop_hook_active`). With no forcing hook (or the guard already set),
-// the Run finishes as it would have.
+// a user turn to guide the next Pass. A2 (qwen's configurable cap): the Run tracks
+// a continuation COUNTER against a resolved cap (default 8, env-overridable). Stop
+// fires while `stop_hook_count < stop_hook_cap`, incrementing on each forced
+// continuation; when the count reaches the cap the Run STOPS despite a still-
+// blocking hook and qwen's cap warning is emitted. So a hook that always blocks
+// forces at most `cap` extra Passes, never an infinite loop, and a legitimate stop
+// (no forcing hook) is never wrongly blocked.
 async fn finish_or_stop_hook<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     response: Response,
     content: Vec<ContentBlock>,
 ) -> Flow {
-    // The guard already tripped, or no hooks are wired: finish as normal.
-    let Some(hooks) = state.hooks.filter(|_| !state.stop_hook_active) else {
+    // The cap already reached, or no hooks are wired: finish as normal.
+    let Some(hooks) = state
+        .hooks
+        .filter(|_| state.stop_hook_count < state.stop_hook_cap)
+    else {
         return finish::finish(state, conversation, content, response.stop_reason);
     };
 
-    match hooks.stop(state.stop_hook_active).await {
+    match hooks.stop().await {
         crate::run::hooks::StopDecision::Stop => {
             finish::finish(state, conversation, content, response.stop_reason)
         }
         crate::run::hooks::StopDecision::Continue { feedback } => {
-            // The forced continuation: set the guard so a second Stop cannot loop,
-            // append the model's reply (stamped), inject the feedback as a user
-            // turn, and advance the Pass (bounded by `max_turns` at the loop top).
-            state.stop_hook_active = true;
+            // The forced continuation: increment the counter (A2). If it has now
+            // reached the cap, emit qwen's cap warning and END the Run rather than
+            // continue - the hook is overridden so it cannot loop forever.
+            state.stop_hook_count += 1;
+            if state.stop_hook_count >= state.stop_hook_cap {
+                let warning = crate::run::hooks::format_stop_hook_cap_warning(state.stop_hook_cap);
+                state.emitter.emit(Event::extension_error(
+                    "hook Stop".to_string(),
+                    crate::event::Stage::Present,
+                    warning,
+                ));
+                return finish::finish(state, conversation, content, response.stop_reason);
+            }
             state.emitter.emit(Event::extension_error(
                 "hook Stop".to_string(),
                 crate::event::Stage::Present,

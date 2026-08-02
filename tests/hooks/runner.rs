@@ -392,9 +392,11 @@ async fn prompt_ok_true_is_allow() {
     assert!(!out.is_blocking());
 }
 
-/// The $ARGUMENTS placeholder is replaced with the payload JSON in the request.
+/// The $ARGUMENTS placeholder is replaced with the PRETTY-printed payload JSON in
+/// the request (L1, qwen `promptHookRunner.ts`: `JSON.stringify(input, null, 2)`).
+/// The prompt hook alone pretty-prints - command/http deliver the compact payload.
 #[tokio::test]
-async fn prompt_splices_payload_into_template() {
+async fn prompt_splices_pretty_payload_into_template() {
     use std::sync::Arc;
     let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let seen2 = seen.clone();
@@ -416,30 +418,72 @@ async fn prompt_splices_payload_into_template() {
     let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
     let ctx = HookRunContext { cwd: "/w", skill_root: None };
     let _ = run_hook(&prompt_hook("check <$ARGUMENTS>"), "{\"tool\":\"x\"}", &ctx, &caps).await;
+    // 2-space indented, not the compact `{"tool":"x"}`.
     assert_eq!(
         seen.lock().unwrap().clone().unwrap(),
-        "check <{\"tool\":\"x\"}>"
+        "check <{\n  \"tool\": \"x\"\n}>"
     );
 }
 
-/// A model reply that is not the {ok} shape fails open to the default outcome.
+/// A model reply that is not the {ok} shape defaults to an EXPLICIT allow (L2,
+/// qwen `parseResponse` fail-open -> `{ok:true, ...defaulting to allow}` ->
+/// `{continue:true, decision:'allow'}`), NOT the steers-nothing default outcome -
+/// so a downstream fold sees the same allow qwen produces.
 #[tokio::test]
-async fn prompt_non_ok_reply_fails_open() {
+async fn prompt_non_ok_reply_defaults_to_explicit_allow() {
     let llm = FakeLlm::script([Entry::just(text_response("I cannot comply, sorry."))]);
     let model = test_model();
     let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
     let ctx = HookRunContext { cwd: "/w", skill_root: None };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
-    assert_eq!(out, HookOutcome::default());
+    assert_eq!(out.continue_, Some(true));
+    assert_eq!(out.decision, Some(Decision::Allow));
+    assert!(!out.is_blocking());
+    assert!(
+        out.reason.as_deref().unwrap().contains("defaulting to allow"),
+        "the allow carries qwen's fail-open reason: {:?}",
+        out.reason
+    );
 }
 
-/// An LLM error (empty content) fails open.
+/// An LLM error (empty content) defaults to an explicit allow (L2), like an
+/// unparseable reply - the prompt hook is fail-open to allow, not steers-nothing.
 #[tokio::test]
-async fn prompt_llm_error_fails_open() {
+async fn prompt_llm_error_defaults_to_explicit_allow() {
     let llm = FakeLlm::script([Entry::error("model down")]);
     let model = test_model();
     let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
     let ctx = HookRunContext { cwd: "/w", skill_root: None };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
-    assert_eq!(out, HookOutcome::default());
+    assert_eq!(out.continue_, Some(true));
+    assert_eq!(out.decision, Some(Decision::Allow));
+}
+
+/// A prompt hook reply wrapped in a ```json ... ``` markdown fence is unwrapped
+/// before parsing (L2, qwen `parseResponse` regex): the inner block's decision is
+/// honored, so a small local model that fences its JSON still blocks/allows.
+#[tokio::test]
+async fn prompt_reply_wrapped_in_json_fence_is_parsed() {
+    let llm = FakeLlm::script([Entry::just(text_response(
+        "```json\n{\"ok\": false, \"reason\": \"fenced block\"}\n```",
+    ))]);
+    let model = test_model();
+    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
+    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
+    assert_eq!(out.decision, Some(Decision::Block));
+    assert_eq!(out.reason.as_deref(), Some("fenced block"));
+}
+
+/// A bare ``` fence (no `json` language tag) is also unwrapped (qwen's regex makes
+/// the tag optional).
+#[tokio::test]
+async fn prompt_reply_wrapped_in_bare_fence_is_parsed() {
+    let llm = FakeLlm::script([Entry::just(text_response("```\n{\"ok\": true}\n```"))]);
+    let model = test_model();
+    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
+    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
+    assert_eq!(out.decision, Some(Decision::Allow));
+    assert_eq!(out.continue_, Some(true));
 }

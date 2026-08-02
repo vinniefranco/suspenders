@@ -41,11 +41,66 @@
 use std::collections::HashMap;
 
 use crate::hooks::{
-    HookCaps, HookEvent, HookManager, HookRunContext, HttpPost, PermissionDecision, ShellExec,
-    ShellResult, run_hook,
+    HookCaps, HookEvent, HookManager, HookOutcome, HookRunContext, HttpPost, PermissionDecision,
+    ShellExec, ShellResult, run_hook,
 };
 use crate::llm::Llm;
 use crate::llm::model::Model;
+
+/// qwen's `DEFAULT_STOP_HOOK_BLOCK_CAP` (stopHookCap.ts): a Stop hook may force at
+/// most this many consecutive continuations before the Run ends regardless (A2).
+pub const DEFAULT_STOP_HOOK_BLOCK_CAP: u64 = 8;
+
+/// qwen's `MAX_STOP_HOOK_BLOCK_CAP` (stopHookCap.ts): the resolved cap is clamped
+/// to this ceiling so an env override cannot ask for an unbounded loop (A2).
+pub const MAX_STOP_HOOK_BLOCK_CAP: u64 = 100;
+
+/// The env var that overrides the Stop-hook cap (A2, qwen's
+/// `QWEN_CODE_STOP_HOOK_BLOCK_CAP`, adapted to the product name).
+pub const STOP_HOOK_BLOCK_CAP_ENV: &str = "SUSPENDERS_STOP_HOOK_BLOCK_CAP";
+
+/// Resolves the Stop-hook continuation cap (A2, qwen's `resolveStopHookBlockingCap`
+/// and `normalizeStopHookBlockingCap`): the `SUSPENDERS_STOP_HOOK_BLOCK_CAP` env
+/// value when set to a parseable positive integer (clamped to the `MAX` ceiling),
+/// else the default 8. A non-numeric, empty, or non-positive value falls back to the
+/// default, matching qwen's normalizer.
+pub fn resolve_stop_hook_cap() -> u64 {
+    match std::env::var(STOP_HOOK_BLOCK_CAP_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => normalize_stop_hook_cap(raw.trim().parse::<i64>().ok()),
+        _ => DEFAULT_STOP_HOOK_BLOCK_CAP,
+    }
+}
+
+/// qwen's `normalizeStopHookBlockingCap`: a finite integer `>= 1` is clamped to the
+/// `MAX` ceiling; anything else (missing, `< 1`) is the default 8 (A2).
+fn normalize_stop_hook_cap(value: Option<i64>) -> u64 {
+    match value {
+        Some(n) if n >= 1 => (n as u64).min(MAX_STOP_HOOK_BLOCK_CAP),
+        _ => DEFAULT_STOP_HOOK_BLOCK_CAP,
+    }
+}
+
+/// Derives the hook payload's `session_id` from the Session Log's JSONL path (H1,
+/// ADR-0010): the file stem (`<utc-stamp>-<unique>`) is the unique per-session token
+/// suspenders mints - the closest analog to qwen's `getSessionId()`. Empty when no
+/// log opened (a test Run, or a log-open failure), matching qwen's empty-when-absent.
+pub fn session_id_from_log_path(transcript_path: &str) -> String {
+    if transcript_path.is_empty() {
+        return String::new();
+    }
+    std::path::Path::new(transcript_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// qwen's `formatStopHookBlockingCapWarning` for the Stop hook (A2): the user-facing
+/// line emitted when the cap is hit and the Run ends despite a still-blocking Stop
+/// hook. Verbatim wording, with the correct singular/plural of "time(s)".
+pub fn format_stop_hook_cap_warning(cap: u64) -> String {
+    let times = if cap == 1 { "time" } else { "times" };
+    format!("Stop hook blocked continuation {cap} consecutive {times}; overriding and ending the turn.")
+}
 
 /// The production [`ShellExec`] (ADR-0066, ADR-0023): runs a command hook in its
 /// own process group (`setpgid`) so a timeout killpg's the whole subtree, writing
@@ -101,16 +156,39 @@ impl ShellExec for ProcessGroupShell {
             .map_err(|err| format!("could not run hook command: {err}"))?;
         let pid = child.id().map(|p| p as i32);
 
-        // Write the JSON payload to stdin, then close it so a hook reading stdin to
-        // EOF unblocks. A broken pipe (a hook that never reads stdin) is not fatal.
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(stdin_json.as_bytes()).await;
-            drop(stdin);
-        }
+        // The stdin write must run CONCURRENTLY with draining stdout/stderr (C-F1):
+        // a PostToolUse payload embeds the full tool output and can exceed the pipe
+        // buffer (~64KB), so a hook that echoes stdin to stdout deadlocks if we write
+        // the whole payload before starting to read (the child blocks on a full
+        // stdout pipe while we block on a full stdin pipe). Spawning the write as a
+        // task lets `wait_with_output` drain both pipes while the payload streams in;
+        // the task drops stdin at the end so a hook reading to EOF unblocks. A broken
+        // pipe (a hook that never reads stdin) is swallowed - it is not fatal.
+        let stdin = child.stdin.take();
+        let payload = stdin_json.as_bytes().to_vec();
+        let writer = tokio::spawn(async move {
+            if let Some(mut stdin) = stdin {
+                let _ = stdin.write_all(&payload).await;
+                // Explicit drop closes the pipe (EOF) before the task ends.
+                drop(stdin);
+            }
+        });
 
-        let wait = child.wait_with_output();
+        // Wrap the ENTIRE write + wait in ONE timeout (C-F1): a stuck write (a hook
+        // that fills stdout without reading stdin, so the write never completes) is
+        // now inside the timeout, so it is killpg'd on elapse instead of hanging
+        // run() forever. Draining stdout/stderr concurrently means the write always
+        // makes progress once the child reads, so the normal path never trips it.
         let timeout = std::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, wait).await {
+        let combined = async {
+            let output = child.wait_with_output().await;
+            // The writer has finished (stdin drained) by the time the child exits;
+            // join it so no task is left detached. Its result is ignored (a broken
+            // pipe is expected for a hook that ignores stdin).
+            let _ = writer.await;
+            output
+        };
+        match tokio::time::timeout(timeout, combined).await {
             Ok(Ok(output)) => Ok(ShellResult {
                 exit_code: output.status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -118,7 +196,8 @@ impl ShellExec for ProcessGroupShell {
             }),
             Ok(Err(err)) => Err(format!("hook runner exited: {err}")),
             Err(_elapsed) => {
-                // Timeout: signal the whole process group, not just the child.
+                // Timeout: signal the whole process group, not just the child. This
+                // now also fires for a stuck stdin write (it is inside the timeout).
                 if let Some(pid) = pid {
                     let _ = nix::sys::signal::killpg(
                         nix::unistd::Pid::from_raw(pid),
@@ -196,6 +275,28 @@ pub struct Hooks<'a> {
     /// The working directory the payload reports and a command hook runs in (the
     /// Session's Project Root).
     cwd: String,
+    /// The Session identifier every payload carries (H1, qwen's
+    /// `createBaseInput.session_id` from `config.getSessionId()`). Sourced from the
+    /// Session Log's per-session file stem (ADR-0010) - the unique token that names
+    /// this Session's JSONL - so a hook keys the same identity across events. Empty
+    /// when no log opened (a test Run, or a log-open failure).
+    session_id: String,
+    /// The Session Log's JSONL path every payload carries (H1, qwen's
+    /// `createBaseInput.transcript_path` from `config.getTranscriptPath()`), so a
+    /// hook can tail the running transcript (ADR-0010). Empty when no log opened.
+    transcript_path: String,
+}
+
+/// The five base fields every hook payload carries (H1, qwen's `createBaseInput`):
+/// `session_id`, `transcript_path`, `cwd`, `hook_event_name`, and a `timestamp`.
+/// Built once per fire from the [`Hooks`] handle + the event, then merged into the
+/// per-event map by [`payload_json`] / [`lifecycle_payload`]. qwen's `timestamp` is
+/// an ISO-8601 string (`new Date().toISOString()`), so this stamps the same shape.
+struct BaseInput<'a> {
+    session_id: &'a str,
+    transcript_path: &'a str,
+    cwd: &'a str,
+    event: HookEvent,
 }
 
 /// A hook's decision at the PreToolUse seam, folded from every fired hook's
@@ -209,6 +310,8 @@ pub enum PreToolDecision {
     Block {
         reason: String,
         context: Option<String>,
+        /// A hook's visible `systemMessage` (A5), gated on `suppressOutput`.
+        system_message: Option<String>,
     },
     /// No hook blocked: the call proceeds. `permission` is the permission decision
     /// a PreToolUse hook contributed (feeding the Approval seam), `context` is the
@@ -218,6 +321,8 @@ pub enum PreToolDecision {
         permission: Option<PermissionDecision>,
         context: Option<String>,
         stop: Option<String>,
+        /// A hook's visible `systemMessage` (A5), gated on `suppressOutput`.
+        system_message: Option<String>,
     },
 }
 
@@ -244,6 +349,8 @@ pub enum PermissionVerdict {
 pub struct PostToolDecision {
     pub context: Option<String>,
     pub stop: Option<String>,
+    /// A hook's visible `systemMessage` (A5), gated on `suppressOutput`.
+    pub system_message: Option<String>,
 }
 
 /// A hook's decision at the UserPromptSubmit seam (Phase 3b, ADR-0066): fired
@@ -281,7 +388,14 @@ pub enum StopDecision {
 impl<'a> Hooks<'a> {
     /// Builds the Run's firing handle from the manager + the captured Llm/Model +
     /// the Session's Project Root, wiring the production shell/http capabilities.
-    pub fn new(manager: &'a HookManager, llm: &'a dyn Llm, model: &'a Model, cwd: String) -> Self {
+    pub fn new(
+        manager: &'a HookManager,
+        llm: &'a dyn Llm,
+        model: &'a Model,
+        cwd: String,
+        session_id: String,
+        transcript_path: String,
+    ) -> Self {
         Hooks {
             manager,
             shell: Box::new(ProcessGroupShell),
@@ -289,6 +403,8 @@ impl<'a> Hooks<'a> {
             llm,
             model,
             cwd,
+            session_id,
+            transcript_path,
         }
     }
 
@@ -312,6 +428,20 @@ impl<'a> Hooks<'a> {
             llm,
             model,
             cwd,
+            // A test Run carries synthetic base identity so a payload assertion has
+            // stable values to check (H1); production sources these from the log.
+            session_id: "test-session".to_string(),
+            transcript_path: "/tmp/test-session.jsonl".to_string(),
+        }
+    }
+
+    // The five base fields (H1) this handle stamps on every payload for `event`.
+    fn base(&self, event: HookEvent) -> BaseInput<'_> {
+        BaseInput {
+            session_id: &self.session_id,
+            transcript_path: &self.transcript_path,
+            cwd: &self.cwd,
+            event,
         }
     }
 
@@ -367,24 +497,40 @@ impl<'a> Hooks<'a> {
     /// hook contributed, the concatenated additionalContext, and the first
     /// `continue:false` stop reason. The model-sent `input` rides in the payload.
     pub async fn pre_tool_use(&self, tool_name: &str, input: &serde_json::Value) -> PreToolDecision {
-        let payload = payload_json(HookEvent::PreToolUse, tool_name, &self.cwd, Some(input), None);
+        let payload = payload_json(
+            self.base(HookEvent::PreToolUse),
+            tool_name,
+            Some(input),
+            None,
+        );
         let outcomes = self.fire(HookEvent::PreToolUse, tool_name, &payload).await;
 
-        // A blocking outcome stops the call; its reason (plus any context it still
-        // carried) is fed back to the model as the tool result.
-        for outcome in &outcomes {
-            if outcome.is_blocking() {
-                let (_, reason) = outcome.blocking_error();
-                return PreToolDecision::Block {
-                    reason,
-                    context: outcome.additional_context(),
-                };
-            }
+        // The permission decision folded across every hook (deny wins, else ask,
+        // else allow), matching qwen's toolHookTriggers precedence
+        // (`isDenied()`/`isAsk()`). This drives the UNIVERSAL block: qwen blocks on
+        // an `isDenied()` regardless of tool gating (a PreToolUse permissionDecision
+        // `deny` on an ungated tool must still stop the call), so a folded Deny is a
+        // Block here, not merely a permission hint the gated path might drop.
+        let permission = fold_permission(&outcomes);
+
+        // A blocking outcome stops the call universally. qwen mergeWithOrLogic joins
+        // ALL matched hooks' reasons + additionalContexts and blocks if ANY blocks
+        // (A4), so the fold spans every outcome, not just the first blocker. A base
+        // `decision` block/deny OR a folded permission Deny (A1) both block.
+        let blocks = outcomes.iter().any(|o| o.is_blocking())
+            || permission == Some(PermissionDecision::Deny);
+        let system_message = fold_system_message(&outcomes);
+        if blocks {
+            return PreToolDecision::Block {
+                reason: fold_block_reason(&outcomes, permission),
+                context: join_context(&outcomes),
+                system_message,
+            };
         }
 
-        // No block: fold the permission decision (first wins), the injected
+        // No block: proceed carrying the folded permission (an `Ask` forces the
+        // confirmation gate even on an ungated tool, qwen's `isAsk()`), the injected
         // context (concatenated), and the halt reason (first wins).
-        let permission = outcomes.iter().find_map(|o| o.permission_decision());
         let context = join_context(&outcomes);
         let stop = outcomes
             .iter()
@@ -394,6 +540,7 @@ impl<'a> Hooks<'a> {
             permission,
             context,
             stop,
+            system_message,
         }
     }
 
@@ -411,9 +558,8 @@ impl<'a> Hooks<'a> {
         pre_permission: Option<PermissionDecision>,
     ) -> PermissionVerdict {
         let payload = payload_json(
-            HookEvent::PermissionRequest,
+            self.base(HookEvent::PermissionRequest),
             tool_name,
-            &self.cwd,
             Some(input),
             None,
         );
@@ -462,9 +608,8 @@ impl<'a> Hooks<'a> {
     /// payload.
     pub async fn post_tool_use(&self, tool_name: &str, output: &str) -> PostToolDecision {
         let payload = payload_json(
-            HookEvent::PostToolUse,
+            self.base(HookEvent::PostToolUse),
             tool_name,
-            &self.cwd,
             None,
             Some(output),
         );
@@ -475,6 +620,7 @@ impl<'a> Hooks<'a> {
                 .iter()
                 .find(|o| o.should_stop())
                 .map(|o| o.effective_reason()),
+            system_message: fold_system_message(&outcomes),
         }
     }
 
@@ -483,9 +629,8 @@ impl<'a> Hooks<'a> {
     /// concatenated context to append to the error result the model sees.
     pub async fn post_tool_use_failure(&self, tool_name: &str, output: &str) -> Option<String> {
         let payload = payload_json(
-            HookEvent::PostToolUseFailure,
+            self.base(HookEvent::PostToolUseFailure),
             tool_name,
-            &self.cwd,
             None,
             Some(output),
         );
@@ -524,8 +669,10 @@ impl<'a> Hooks<'a> {
     /// prompt text rides the payload's `prompt` field (qwen's UserPromptSubmit
     /// payload key).
     pub async fn user_prompt_submit(&self, prompt: &str) -> UserPromptDecision {
-        let payload =
-            lifecycle_payload(HookEvent::UserPromptSubmit, &self.cwd, &[("prompt", prompt)]);
+        let payload = lifecycle_payload(
+            self.base(HookEvent::UserPromptSubmit),
+            &[("prompt", prompt)],
+        );
         let outcomes = self
             .fire_lifecycle(HookEvent::UserPromptSubmit, &payload)
             .await;
@@ -548,14 +695,16 @@ impl<'a> Hooks<'a> {
     /// ADR-0066), porting qwen's Stop-hook feedback INVERSION: a Stop hook that
     /// blocks (`continue:false` or a `block`/`deny` decision) FORCES the Run to
     /// continue, feeding its `stopReason` back as "Stop hook feedback:\n<reason>".
-    /// `stop_hook_active` is qwen's loop-guard: once a Stop hook has already forced
-    /// a continuation this Run, it rides the payload so a hook can see it, and the
-    /// caller does not fire again (so a Stop hook cannot loop forever). The FIRST
-    /// forcing outcome wins.
-    pub async fn stop(&self, stop_hook_active: bool) -> StopDecision {
-        let active = if stop_hook_active { "true" } else { "false" };
-        let payload =
-            lifecycle_payload(HookEvent::Stop, &self.cwd, &[("stop_hook_active", active)]);
+    /// The payload's `stop_hook_active` is HARDCODED `true` (A3, qwen client.ts:1720
+    /// sends `stop_hook_active: true` on every Stop fire), so a Stop hook always sees
+    /// the "you are already in a stop-hook loop" flag - the iteration bound is the
+    /// CALLER's counter+cap (A2, `dispatch::finish_or_stop_hook`), not this flag. The
+    /// FIRST forcing outcome wins.
+    pub async fn stop(&self) -> StopDecision {
+        let payload = lifecycle_payload(
+            self.base(HookEvent::Stop),
+            &[("stop_hook_active", "true")],
+        );
         let outcomes = self.fire_lifecycle(HookEvent::Stop, &payload).await;
 
         // A Stop hook forces continuation when it halts (continue:false) or blocks:
@@ -577,7 +726,7 @@ impl<'a> Hooks<'a> {
     /// payload; a StopFailure hook cannot steer (it fires on an already-failed Run),
     /// so this returns nothing.
     pub async fn stop_failure(&self, error: &str) {
-        let payload = lifecycle_payload(HookEvent::StopFailure, &self.cwd, &[("error", error)]);
+        let payload = lifecycle_payload(self.base(HookEvent::StopFailure), &[("error", error)]);
         let _ = self.fire_lifecycle(HookEvent::StopFailure, &payload).await;
     }
 
@@ -587,7 +736,7 @@ impl<'a> Hooks<'a> {
     /// concatenated `additionalContext` is injected as initial context; a
     /// SessionStart hook is otherwise observational (it cannot veto a session).
     pub async fn session_start(&self, source: &str) -> Option<String> {
-        let payload = lifecycle_payload(HookEvent::SessionStart, &self.cwd, &[("source", source)]);
+        let payload = lifecycle_payload(self.base(HookEvent::SessionStart), &[("source", source)]);
         let outcomes = self.fire_lifecycle(HookEvent::SessionStart, &payload).await;
         join_context(&outcomes)
     }
@@ -596,7 +745,7 @@ impl<'a> Hooks<'a> {
     /// session shutdown. `reason` names the end kind (qwen's `clear`/`logout`/
     /// `exit`).
     pub async fn session_end(&self, reason: &str) {
-        let payload = lifecycle_payload(HookEvent::SessionEnd, &self.cwd, &[("reason", reason)]);
+        let payload = lifecycle_payload(self.base(HookEvent::SessionEnd), &[("reason", reason)]);
         let _ = self.fire_lifecycle(HookEvent::SessionEnd, &payload).await;
     }
 
@@ -605,7 +754,7 @@ impl<'a> Hooks<'a> {
     /// adjust the summarization. The concatenated `additionalContext` is the
     /// instruction to fold in; `None` when no hook contributed one.
     pub async fn pre_compact(&self) -> Option<String> {
-        let payload = lifecycle_payload(HookEvent::PreCompact, &self.cwd, &[]);
+        let payload = lifecycle_payload(self.base(HookEvent::PreCompact), &[]);
         let outcomes = self.fire_lifecycle(HookEvent::PreCompact, &payload).await;
         join_context(&outcomes)
     }
@@ -614,7 +763,7 @@ impl<'a> Hooks<'a> {
     /// (its returned JSON produces no control effect). Fired after the compaction
     /// service produces its summary.
     pub async fn post_compact(&self) {
-        let payload = lifecycle_payload(HookEvent::PostCompact, &self.cwd, &[]);
+        let payload = lifecycle_payload(self.base(HookEvent::PostCompact), &[]);
         let _ = self.fire_lifecycle(HookEvent::PostCompact, &payload).await;
     }
 
@@ -623,7 +772,7 @@ impl<'a> Hooks<'a> {
     /// created item rides the payload.
     pub async fn todo_created(&self, content: &str) {
         let payload =
-            lifecycle_payload(HookEvent::TodoCreated, &self.cwd, &[("content", content)]);
+            lifecycle_payload(self.base(HookEvent::TodoCreated), &[("content", content)]);
         let _ = self.fire_lifecycle(HookEvent::TodoCreated, &payload).await;
     }
 
@@ -632,7 +781,7 @@ impl<'a> Hooks<'a> {
     /// of the completed item rides the payload.
     pub async fn todo_completed(&self, content: &str) {
         let payload =
-            lifecycle_payload(HookEvent::TodoCompleted, &self.cwd, &[("content", content)]);
+            lifecycle_payload(self.base(HookEvent::TodoCompleted), &[("content", content)]);
         let _ = self.fire_lifecycle(HookEvent::TodoCompleted, &payload).await;
     }
 
@@ -641,8 +790,7 @@ impl<'a> Hooks<'a> {
     /// `subagent_type` rides the payload.
     pub async fn subagent_start(&self, subagent_type: &str) {
         let payload = lifecycle_payload(
-            HookEvent::SubagentStart,
-            &self.cwd,
+            self.base(HookEvent::SubagentStart),
             &[("subagent_type", subagent_type)],
         );
         let _ = self.fire_lifecycle(HookEvent::SubagentStart, &payload).await;
@@ -655,8 +803,7 @@ impl<'a> Hooks<'a> {
     /// completed subagent, so this stays observational).
     pub async fn subagent_stop(&self, subagent_type: &str) {
         let payload = lifecycle_payload(
-            HookEvent::SubagentStop,
-            &self.cwd,
+            self.base(HookEvent::SubagentStop),
             &[("subagent_type", subagent_type)],
         );
         let _ = self.fire_lifecycle(HookEvent::SubagentStop, &payload).await;
@@ -667,7 +814,7 @@ impl<'a> Hooks<'a> {
     /// rides the payload.
     pub async fn notification(&self, message: &str) {
         let payload =
-            lifecycle_payload(HookEvent::Notification, &self.cwd, &[("message", message)]);
+            lifecycle_payload(self.base(HookEvent::Notification), &[("message", message)]);
         let _ = self.fire_lifecycle(HookEvent::Notification, &payload).await;
     }
 }
@@ -677,21 +824,12 @@ impl<'a> Hooks<'a> {
 /// `tool_response` (Post). Delivered to a command hook on stdin, POSTed by an http
 /// hook, spliced into a prompt hook's template.
 fn payload_json(
-    event: HookEvent,
+    base: BaseInput<'_>,
     tool_name: &str,
-    cwd: &str,
     tool_input: Option<&serde_json::Value>,
     tool_output: Option<&str>,
 ) -> String {
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "hook_event_name".to_string(),
-        serde_json::Value::String(event.wire_name().to_string()),
-    );
-    map.insert(
-        "cwd".to_string(),
-        serde_json::Value::String(cwd.to_string()),
-    );
+    let mut map = base_map(&base);
     map.insert(
         "tool_name".to_string(),
         serde_json::Value::String(tool_name.to_string()),
@@ -700,12 +838,62 @@ fn payload_json(
         map.insert("tool_input".to_string(), input.clone());
     }
     if let Some(output) = tool_output {
-        map.insert(
-            "tool_response".to_string(),
-            serde_json::Value::String(output.to_string()),
-        );
+        map.insert("tool_response".to_string(), tool_response_value(output));
     }
     serde_json::Value::Object(map).to_string()
+}
+
+/// The base map every payload starts from (H1, qwen's `createBaseInput`):
+/// `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `timestamp`. qwen
+/// ALWAYS includes all five (types.ts marks them required), so a hook authored
+/// against qwen reads the same fields here.
+fn base_map(base: &BaseInput<'_>) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(base.session_id.to_string()),
+    );
+    map.insert(
+        "transcript_path".to_string(),
+        serde_json::Value::String(base.transcript_path.to_string()),
+    );
+    map.insert(
+        "cwd".to_string(),
+        serde_json::Value::String(base.cwd.to_string()),
+    );
+    map.insert(
+        "hook_event_name".to_string(),
+        serde_json::Value::String(base.event.wire_name().to_string()),
+    );
+    map.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(iso8601_now()),
+    );
+    map
+}
+
+/// The `tool_response` field for a PostToolUse payload as a JSON OBJECT (H2, qwen's
+/// `PostToolUseInput.tool_response: Record<string, unknown>`). A qwen PostToolUse
+/// hook indexes `tool_response` as an object (e.g. `tool_response.output`), so a
+/// tool output that already IS a JSON object rides through directly, and a plain
+/// string is wrapped as `{"output": <string>}` - the stable key a hook can read for
+/// either shape. A non-object JSON value (a bare array/number) is also wrapped, so
+/// the field is invariably an object.
+fn tool_response_value(output: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => serde_json::json!({ "output": output }),
+    }
+}
+
+/// An ISO-8601 UTC timestamp (H1, qwen's `new Date().toISOString()`), the shape a
+/// qwen hook expects in `timestamp`. Falls back to the epoch on the (unreachable)
+/// format error so a payload always carries a well-formed stamp.
+fn iso8601_now() -> String {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 /// The qwen event payload JSON for a NON-tool lifecycle event (Phase 3b,
@@ -715,13 +903,8 @@ fn payload_json(
 /// [`payload_json`] so the two payload shapes read together; the lifecycle events
 /// carry no `tool_name`/`tool_input`/`tool_response`, so they build the smaller
 /// map here rather than threading `None`s through the tool builder.
-fn lifecycle_payload(event: HookEvent, cwd: &str, fields: &[(&str, &str)]) -> String {
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "hook_event_name".to_string(),
-        serde_json::Value::String(event.wire_name().to_string()),
-    );
-    map.insert("cwd".to_string(), serde_json::Value::String(cwd.to_string()));
+fn lifecycle_payload(base: BaseInput<'_>, fields: &[(&str, &str)]) -> String {
+    let mut map = base_map(&base);
     for (key, value) in fields {
         map.insert(
             key.to_string(),
@@ -734,7 +917,7 @@ fn lifecycle_payload(event: HookEvent, cwd: &str, fields: &[(&str, &str)]) -> St
 /// Concatenates the sanitized `additionalContext` of every outcome that carries
 /// one (ADR-0066), newline-joined in source order, or `None` when none did. The
 /// escape (`<`/`>` -> entities) already happened in the leaf's accessor.
-fn join_context(outcomes: &[crate::hooks::HookOutcome]) -> Option<String> {
+fn join_context(outcomes: &[HookOutcome]) -> Option<String> {
     let parts: Vec<String> = outcomes
         .iter()
         .filter_map(|o| o.additional_context())
@@ -743,6 +926,69 @@ fn join_context(outcomes: &[crate::hooks::HookOutcome]) -> Option<String> {
         None
     } else {
         Some(parts.join("\n"))
+    }
+}
+
+/// The visible `systemMessage` folded across a fired event's outcomes (A5, qwen's
+/// `processCommonHookOutputFields`): a hook's `systemMessage` is surfaced to the
+/// user UNLESS that same outcome set `suppressOutput: true` (the gate). qwen's
+/// merge keeps the LAST systemMessage across hooks, so this returns the last
+/// non-suppressed one, or `None` when none qualified.
+fn fold_system_message(outcomes: &[HookOutcome]) -> Option<String> {
+    outcomes
+        .iter()
+        .filter(|o| o.suppress_output != Some(true))
+        .filter_map(|o| o.system_message.clone())
+        .next_back()
+}
+
+/// The permission decision folded across every PreToolUse outcome (A1, qwen's
+/// toolHookTriggers `isDenied()`/`isAsk()` precedence): a `deny` from ANY hook
+/// wins (most restrictive), else an `ask` forces the confirmation gate, else an
+/// `allow` auto-approves. `None` when no hook contributed a permission decision.
+/// Folds the whole batch (not first-wins) so a later hook's deny is never dropped.
+fn fold_permission(outcomes: &[HookOutcome]) -> Option<PermissionDecision> {
+    let mut result: Option<PermissionDecision> = None;
+    for pd in outcomes.iter().filter_map(|o| o.permission_decision()) {
+        result = Some(match (result, pd) {
+            // A deny is absolute (security wins), regardless of order.
+            (_, PermissionDecision::Deny) | (Some(PermissionDecision::Deny), _) => {
+                PermissionDecision::Deny
+            }
+            // An ask outranks an allow (a confirmation is more restrictive).
+            (_, PermissionDecision::Ask) | (Some(PermissionDecision::Ask), _) => {
+                PermissionDecision::Ask
+            }
+            (_, PermissionDecision::Allow) => PermissionDecision::Allow,
+        });
+    }
+    result
+}
+
+/// The reason for a folded PreToolUse block (A1 + A4, qwen mergeWithOrLogic joins
+/// ALL reasons with "\n"): every blocking/deny outcome's reason, newline-joined in
+/// source order. A permission-deny with no reason of its own reads its
+/// `permissionDecisionReason`, then `reason`; a base block/deny reads its effective
+/// reason. Falls back to the leaf's "No reason provided" sentinel when none carried
+/// one, so the model always gets a reason.
+fn fold_block_reason(outcomes: &[HookOutcome], permission: Option<PermissionDecision>) -> String {
+    let mut reasons: Vec<String> = Vec::new();
+    for o in outcomes {
+        if o.is_blocking() {
+            reasons.push(o.blocking_error().1);
+        } else if permission == Some(PermissionDecision::Deny)
+            && o.permission_decision() == Some(PermissionDecision::Deny)
+        {
+            reasons.push(
+                o.permission_decision_reason()
+                    .unwrap_or_else(|| o.effective_reason()),
+            );
+        }
+    }
+    if reasons.is_empty() {
+        "No reason provided".to_string()
+    } else {
+        reasons.join("\n")
     }
 }
 

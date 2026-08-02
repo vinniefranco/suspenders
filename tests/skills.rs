@@ -293,9 +293,13 @@ fn a_missing_or_invalid_priority_normalizes_to_zero() {
 }
 
 #[test]
-fn the_catalog_sorts_by_priority_desc_then_name() {
+fn the_catalog_is_alphabetical_regardless_of_priority() {
+    // [M1] qwen's `listSkills` (skill-manager.ts:238-243) is stable ALPHABETICAL;
+    // `priority:` is parsed and stored but does NOT reorder the model-facing
+    // catalog. Give the alphabetically-earliest skill the LOWEST priority and the
+    // latest the HIGHEST: if priority sorted, `high` (priority 9) would lead; since
+    // it does not, the order is purely by name.
     let tmp = TempDir::new().unwrap();
-    // Distinct priorities plus a tie to exercise the alphabetical tiebreak.
     write_skill(tmp.path(), "low", "---\nname: low\ndescription: d\npriority: 1\n---\nb");
     write_skill(
         tmp.path(),
@@ -304,18 +308,15 @@ fn the_catalog_sorts_by_priority_desc_then_name() {
     );
     write_skill(
         tmp.path(),
-        "mid_b",
-        "---\nname: mid_b\ndescription: d\npriority: 5\n---\nb",
-    );
-    write_skill(
-        tmp.path(),
-        "mid_a",
-        "---\nname: mid_a\ndescription: d\npriority: 5\n---\nb",
+        "mid",
+        "---\nname: mid\ndescription: d\npriority: 5\n---\nb",
     );
     let mgr = SkillManager::discover(tmp.path(), None);
+    // Priority is still PARSED (a `priority:` manifest loads) and stored.
+    assert_eq!(mgr.find("high").unwrap().priority, 9);
+    // ...but the order is alphabetical: high, low, mid (NOT priority 9,5,1).
     let order: Vec<&str> = disk_skills(&mgr).iter().map(|s| s.name.as_str()).collect();
-    // 9, then the two 5s alphabetically (mid_a before mid_b), then 1.
-    assert_eq!(order, vec!["high", "mid_a", "mid_b", "low"]);
+    assert_eq!(order, vec!["high", "low", "mid"]);
 }
 
 // ---- argument-hint ----
@@ -483,6 +484,31 @@ fn a_path_outside_the_project_root_never_activates() {
     let newly = mgr.activate_by_path(outside, tmp.path());
     assert!(newly.is_empty());
     assert!(!mgr.catalog().iter().any(|s| s.name == "rusty"));
+}
+
+#[test]
+fn conditional_paths_matching_is_case_sensitive() {
+    // [L3] qwen's skill activation builds picomatch with the default
+    // `nocase: false` (skill-activation.ts:100), so a `paths: ["**/*.RS"]` skill
+    // activates on `x.RS` but NOT on `x.rs`. (The search tools stay
+    // case-insensitive; only skill `paths` matching is case-sensitive.)
+    let tmp = TempDir::new().unwrap();
+    write_skill(
+        tmp.path(),
+        "shouty",
+        "---\nname: shouty\ndescription: d\npaths:\n  - '**/*.RS'\n---\nb",
+    );
+    let mgr = SkillManager::discover(tmp.path(), None);
+
+    // A lowercase `.rs` file does NOT activate the uppercase-glob skill.
+    let none = mgr.activate_by_path(Path::new("x.rs"), tmp.path());
+    assert!(none.is_empty());
+    assert!(!mgr.catalog().iter().any(|s| s.name == "shouty"));
+
+    // The exact-case `.RS` file DOES activate it.
+    let newly = mgr.activate_by_path(Path::new("x.RS"), tmp.path());
+    assert_eq!(newly, vec!["shouty".to_string()]);
+    assert!(mgr.catalog().iter().any(|s| s.name == "shouty"));
 }
 
 // ---- bundled skills ----

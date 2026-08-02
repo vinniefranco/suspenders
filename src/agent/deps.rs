@@ -64,6 +64,9 @@ pub(crate) struct RunSpawn {
     /// `crate::run::batch` can activate a conditional skill at the tool-success
     /// seam, and the same shared `Arc` the `skill` tool reads its catalog off.
     pub(crate) skills: Arc<crate::skills::SkillManager>,
+    /// The Session Log's JSONL path (H1, ADR-0010/0066): the running transcript a
+    /// hook payload reports as `transcript_path`. Empty when the Agent opened no log.
+    pub(crate) transcript_path: String,
 }
 
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
@@ -104,6 +107,10 @@ pub(crate) struct AgentDeps {
     /// [`crate::run::Capture`] so `crate::run::batch` can activate a conditional
     /// skill by touched path. Shared by `Arc` with the `skill` tool.
     skills: Arc<crate::skills::SkillManager>,
+    /// The Session Log's JSONL path (H1, ADR-0010/0066): threaded into each Run's
+    /// [`crate::run::Capture`] so the hook payloads carry `transcript_path` +
+    /// `session_id` (the latter derived from this path's file stem).
+    transcript_path: String,
 }
 
 impl AgentDeps {
@@ -122,6 +129,7 @@ impl AgentDeps {
             session,
             hooks,
             skills,
+            transcript_path,
         } = spawn;
         let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
@@ -136,6 +144,7 @@ impl AgentDeps {
             subagent_run_limit,
             hooks,
             skills,
+            transcript_path,
         }
     }
 
@@ -204,6 +213,10 @@ impl AgentDeps {
             // reads the same activation state. The skill list is immutable for the
             // Session; only its interior activation registry mutates.
             skills: Arc::clone(&self.skills),
+            // The hook payload base identity (H1, ADR-0066): the transcript path is
+            // the Session Log's JSONL path; the session id is derived from its stem.
+            transcript_path: self.transcript_path.clone(),
+            session_id: crate::run::hooks::session_id_from_log_path(&self.transcript_path),
         }
     }
 
