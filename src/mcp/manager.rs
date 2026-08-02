@@ -262,6 +262,7 @@ impl McpManager {
         let oauth = server.config.oauth.clone()?;
         let url = match &server.config.transport {
             McpTransport::Http { url, .. } => Some(url.clone()),
+            McpTransport::Sse { url, .. } => Some(url.clone()),
             McpTransport::Stdio { .. } => None,
         };
         Some((oauth, url))
@@ -446,6 +447,7 @@ fn server_view(name: &str, cfg: &McpServerConfig, parts: ServerViewParts) -> Mcp
     let cwd = match &cfg.transport {
         McpTransport::Stdio { cwd, .. } => cwd.clone(),
         McpTransport::Http { .. } => None,
+        McpTransport::Sse { .. } => None,
     };
     McpServerView {
         name: name.to_string(),

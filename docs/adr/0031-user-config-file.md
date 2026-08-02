@@ -146,17 +146,19 @@ sparse-write exception (which still never writes any `token`) all stand.
 MCP servers (ADR-0056) add one more file-only map to the schema:
 
 - **`mcp_servers`** - keyed by user-chosen name, each entry an external MCP tool
-  server. A stdio entry carries `command` (+ optional `args`/`env`/`cwd`); an
-  HTTP entry carries `http_url` (+ optional `headers`). Optional `timeout_ms`,
-  `trust`, `include_tools`, `exclude_tools` per entry. Like `providers`, it is a
-  file-only structure the env cannot express, so it lives outside the file/env
-  lockstep; it overlays whole (replace), not merge.
+  server. A stdio entry carries `command` (+ optional `args`/`env`/`cwd`); a
+  streamable-HTTP entry carries `http_url` (+ optional `headers`); a legacy
+  HTTP+SSE entry carries `url` (+ optional `headers`) - qwen's three transports
+  (ADR-0056). Optional `timeout_ms`, `trust`, `include_tools`, `exclude_tools`
+  per entry. Like `providers`, it is a file-only structure the env cannot
+  express, so it lives outside the file/env lockstep; it overlays whole
+  (replace), not merge.
 - The Suspenders-native key is snake_case **`mcp_servers`**, diverging from
   qwen-code's camelCase `mcpServers` - a config port stays in Suspenders' idiom.
 - Each entry is `deny_unknown_fields` like the rest of the schema, so a typo'd
-  key is a loud parse error. A malformed *transport* (both `command` and
-  `http_url`, or neither) is a loud launch failure at `Session::build`, distinct
-  from the fail-open connect path (a server that resolves but will not connect is
-  skipped at attach, never rejected here - ADR-0056).
+  key is a loud parse error. A malformed *transport* (more than one of
+  `command`/`http_url`/`url`, or none) is a loud parse error, distinct from the
+  fail-open connect path (a server that resolves but will not connect is skipped
+  at attach, never rejected here - ADR-0056).
 - No credential is ever persisted by the tool: static `headers` (a bearer token
   the user writes by hand) are the only auth, OAuth is out of scope.

@@ -519,6 +519,94 @@ impl SessionConfig {
         );
         persist_json_key(path, "mcp_excluded", value)
     }
+
+    /// Scope-aware sparse persist for the `mcp add` CLI (ADR-0065): sets only
+    /// `mcp_servers[name]` in the given scope's config file, preserving every
+    /// other key (sibling top-level keys and sibling servers alike). `path` names
+    /// the scope (user or workspace config), so an add lands in whichever scope
+    /// the CLI targets; the file is created if absent, the same sanctioned
+    /// create-if-absent exception `/model`, `/theme`, and the `/mcp` disable
+    /// toggle take. `server` is serialized to its flat wire shape through its
+    /// hand-written [`Serialize`](crate::mcp::McpServerConfig) (via
+    /// [`serde_json::to_value`]) and merged under the nested key. Shares the
+    /// atomic write-then-rename with the scalar persists through
+    /// [`write_config_atomic`], the same pure/impure split as [`persist_json_key`]
+    /// (pure [`merge_mcp_server`] here).
+    pub fn persist_mcp_server(
+        path: &str,
+        name: &str,
+        server: &crate::mcp::McpServerConfig,
+    ) -> Result<(), SessionError> {
+        let value = serde_json::to_value(server)
+            .map_err(|e| SessionError(format!("failed to serialize MCP server `{name}`: {e}")))?;
+
+        let existing = match std::fs::read_to_string(path) {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(SessionError(format!(
+                    "failed to read config at {path}: {e}"
+                )));
+            }
+        };
+
+        let json = merge_mcp_server(existing.as_deref(), name, value)
+            .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?;
+
+        write_config_atomic(path, json)
+    }
+
+    /// Scope-aware sparse removal for the `mcp remove` CLI (ADR-0065): removes
+    /// `mcp_servers[name]` from the given scope's config file, preserving every
+    /// other key, and returns whether the name existed (so the CLI reports
+    /// "removed" vs "no such server"). Unlike the persists, this does NOT
+    /// create-if-absent: an absent file has nothing to remove, so it reports
+    /// `Ok(false)` and touches nothing (removing from a file that was never
+    /// written is a no-op, not an error). A malformed file is an [`Err`] naming
+    /// `path`. Shares the atomic write-then-rename through [`write_config_atomic`],
+    /// the pure/impure split as [`remove_mcp_server_key`].
+    pub fn remove_mcp_server(path: &str, name: &str) -> Result<bool, SessionError> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(SessionError(format!(
+                    "failed to read config at {path}: {e}"
+                )));
+            }
+        };
+
+        let (json, present) = remove_mcp_server_key(&existing, name)
+            .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?;
+
+        // Only rewrite when the map actually changed - a `remove` of an absent
+        // name leaves the file byte-for-byte untouched.
+        if present {
+            write_config_atomic(path, json)?;
+        }
+        Ok(present)
+    }
+
+    /// The configured MCP servers paired with the scope that declared each, for
+    /// the `mcp list` CLI (ADR-0065). [`compose`](SessionConfig::compose) already
+    /// merges the scopes into `mcp_servers` and records the winning
+    /// [`McpSource`](crate::mcp::McpSource) per name in `mcp_sources`; this pairs
+    /// the two so the call site reads one iterator of `(name, config, source)`
+    /// rather than re-deriving the source-default ([`McpSource::User`] when
+    /// unrecorded) itself. BTreeMap order keeps the listing deterministic
+    /// (alphabetical by name).
+    pub fn servers_with_source(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::mcp::McpServerConfig, crate::mcp::McpSource)> {
+        self.mcp_servers.iter().map(|(name, config)| {
+            let source = self
+                .mcp_sources
+                .get(name)
+                .copied()
+                .unwrap_or(crate::mcp::McpSource::User);
+            (name.as_str(), config, source)
+        })
+    }
 }
 
 /// The sparse sticky write behind [`SessionConfig::persist_model`] and
@@ -553,6 +641,19 @@ fn persist_json_key(path: &str, key: &str, value: serde_json::Value) -> Result<(
     let json = merge_json_key(existing.as_deref(), key, value)
         .map_err(|e| SessionError(format!("invalid config at {path}: {e}")))?;
 
+    write_config_atomic(path, json)
+}
+
+/// The atomic write-then-rename behind every sparse config persist (ADR-0033,
+/// ADR-0038, ADR-0065). Creates `path`'s parent dirs (the sanctioned
+/// create-if-absent exception a deliberate pick takes), then writes through a
+/// same-directory temp file and renames it into place. Never in place: a crash
+/// mid-write must not leave a torn config.json. The temp file sits in the SAME
+/// directory, because a same-directory rename is atomic on POSIX (a
+/// cross-filesystem one is not even a rename). Shared by [`persist_json_key`]
+/// (top-level keys) and the nested `mcp_servers` persists, so the rename logic
+/// lives in one place.
+fn write_config_atomic(path: &str, json: String) -> Result<(), SessionError> {
     if let Some(parent) = std::path::Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
@@ -561,10 +662,6 @@ fn persist_json_key(path: &str, key: &str, value: serde_json::Value) -> Result<(
         })?;
     }
 
-    // Write-then-rename, never in place: a crash mid-write must not leave a
-    // torn config.json. The temp file sits in the SAME directory, because a
-    // same-directory rename is atomic on POSIX (a cross-filesystem one is
-    // not even a rename).
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, json)
         .map_err(|e| SessionError(format!("failed to write config to {tmp}: {e}")))?;
@@ -596,6 +693,68 @@ fn merge_json_key(
     obj.insert(key.into(), value);
 
     serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Pure sparse merge of one server into a config file's nested `mcp_servers`
+/// object (ADR-0065, the `mcp add` CLI): `existing` is the current file contents
+/// (or `None` when absent), `server` is the already-serialized entry, and the
+/// result is the pretty JSON to write back. The `mcp_servers` object is
+/// got-or-created, `name` is inserted (overwriting a same-named entry), and every
+/// OTHER key - sibling top-level keys and sibling servers alike - is preserved. A
+/// malformed or non-object existing file, or an existing `mcp_servers` that is not
+/// an object, is an [`Err`] carrying the path-agnostic reason (the caller wraps it
+/// with the resolved path). Path-free and side-effect-free, the same pure/impure
+/// split as [`merge_json_key`], so it unit-tests with literals.
+fn merge_mcp_server(
+    existing: Option<&str>,
+    name: &str,
+    server: serde_json::Value,
+) -> Result<String, String> {
+    let mut root = match existing {
+        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(raw) => serde_json::from_str(raw).map_err(|e| e.to_string())?,
+    };
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "config root must be a JSON object".to_string())?;
+    let servers = obj
+        .entry("mcp_servers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "`mcp_servers` must be a JSON object".to_string())?;
+    servers.insert(name.into(), server);
+
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Pure sparse removal of one server from a config file's nested `mcp_servers`
+/// object (ADR-0065, the `mcp remove` CLI): `existing` is the current file
+/// contents, and the result is the pretty JSON to write back paired with whether
+/// `name` was present (so the CLI can report "removed" vs "no such server"). A
+/// missing `mcp_servers` object reports `false` and leaves the file untouched (an
+/// absent map is simply "not present", not an error). A malformed or non-object
+/// existing file, or an `mcp_servers` that is not an object, is an [`Err`]
+/// carrying the path-agnostic reason. Path-free and side-effect-free, the same
+/// pure/impure split as [`merge_mcp_server`].
+fn remove_mcp_server_key(existing: &str, name: &str) -> Result<(String, bool), String> {
+    let mut root: serde_json::Value = serde_json::from_str(existing).map_err(|e| e.to_string())?;
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "config root must be a JSON object".to_string())?;
+    let present = match obj.get_mut("mcp_servers") {
+        None => false,
+        Some(servers) => {
+            let servers = servers
+                .as_object_mut()
+                .ok_or_else(|| "`mcp_servers` must be a JSON object".to_string())?;
+            servers.remove(name).is_some()
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    Ok((json, present))
 }
 
 /// One custom Provider's config entry (ADR-0031 amendment, ADR-0037): the

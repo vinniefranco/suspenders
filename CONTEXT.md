@@ -57,7 +57,7 @@ The one runtime intervention: a passive circuit breaker that ends the Run when t
 _Avoid_: nudge, governor (it judges nothing and injects nothing; it counts identical batches and stops), guard rail
 
 **Tool**:
-A named capability with a JSON schema that the model can invoke: read_file, write_file, edit_file, run_command, grep, glob, list_files, web_fetch, and todo_write. Named and shaped to match qwen-code's tools so a small local model calls them without translation (ADR-0045). Every request offers the full registry - there is no per-Pass narrowing.
+A named capability with a JSON schema that the model can invoke: read_file, write_file, edit_file, run_command, grep, glob, list_files, web_fetch, and todo_write. Named and shaped to match qwen-code's tools so a small local model calls them without translation (ADR-0045). Every request offers the full registry - there is no per-Pass narrowing. The built-ins may be joined by MCP tools: capabilities discovered from external Model Context Protocol servers the user attaches over one of three transports - stdio, streamable-HTTP, or legacy HTTP+SSE - authored with the `suspenders mcp add/remove/list` CLI and viewed through the `/mcp` dialog (ADR-0056, ADR-0065). MCP tools are deferred, surfaced on demand rather than riding the wire list at Run start.
 
 **Tool Call**:
 A structured `tool_use` block emitted by the model requesting one Tool execution.

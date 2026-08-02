@@ -70,6 +70,12 @@ directories = "5"                                            # XDG session_dir d
 time = { version = "0.3", features = ["formatting", "macros"] } # Session Log UTC filenames
 rmcp = { version = "3.0.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 http = "1"
+# The legacy MCP HTTP+SSE client transport (ADR-0056): rmcp 3.0.1 dropped its
+# standalone SSE client, so `mcp::manager::connect` hand-rolls it. `sse-stream` is
+# rmcp's own SSE framer (already in the lock tree via its client-side-sse feature),
+# pinned direct so we parse the `text/event-stream` off reqwest's byte stream with
+# the same parser rmcp uses internally rather than re-implementing the framing.
+sse-stream = "0.2"
 base64 = "0.23.0"
 # MCP OAuth (ADR-0065 Phase D): PKCE needs SHA-256 of the code verifier and a few
 # CSPRNG bytes for the verifier + state. `sha2` is the sole genuinely-new crate -

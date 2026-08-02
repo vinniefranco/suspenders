@@ -8,16 +8,18 @@
 //! in Suspenders' idiom, not the source's.
 //!
 //! The wire shape stays FLAT (qwen fidelity): a user writes `{command, args,
-//! ...}` XOR `{http_url, headers}` at the top level, alongside the common
-//! `timeout_ms`/`trust`/`include_tools`/`exclude_tools`. But the in-memory model
-//! makes the transport a SUM TYPE ([`McpTransport`]) so the "both `command` and
-//! `http_url`" and "neither" states are UNREPRESENTABLE, not a deferred runtime
-//! check. The flat wire and the sum type are bridged by a hand-written
-//! [`Deserialize`]/[`Serialize`] on [`McpServerConfig`]: parse reads the known
-//! flat keys, rejects an unknown key (`deny_unknown_fields` parity) and the
-//! command-XOR-http_url ambiguity AT PARSE TIME (with field context), then folds
-//! the transport fields into the sum type; serialize writes the same flat shape
-//! back.
+//! ...}` XOR `{http_url, headers}` XOR `{url, headers}` at the top level,
+//! alongside the common `timeout_ms`/`trust`/`include_tools`/`exclude_tools`.
+//! The three transport keys are mutually exclusive: `command` is stdio,
+//! `http_url` is streamable-HTTP, and `url` is the legacy MCP HTTP+SSE transport
+//! (qwen names this key `url`, distinct from streamable-HTTP's `http_url`). But
+//! the in-memory model makes the transport a SUM TYPE ([`McpTransport`]) so the
+//! "more than one transport key" and "neither" states are UNREPRESENTABLE, not a
+//! deferred runtime check. The flat wire and the sum type are bridged by a
+//! hand-written [`Deserialize`]/[`Serialize`] on [`McpServerConfig`]: parse reads
+//! the known flat keys, rejects an unknown key (`deny_unknown_fields` parity) and
+//! the transport-key ambiguity AT PARSE TIME (with field context), then folds the
+//! transport fields into the sum type; serialize writes the same flat shape back.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,10 +35,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// module docs); construct one from a [`McpTransport`] via [`McpServerConfig::new`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
-    /// The resolved transport - exactly one of stdio or HTTP. The flat wire keys
-    /// (`command`/`args`/`env`/`cwd` or `http_url`/`headers`) fold into this at
-    /// parse time; the both/neither ambiguity is a parse error, not a stored
-    /// illegal state.
+    /// The resolved transport - exactly one of stdio, streamable-HTTP, or SSE.
+    /// The flat wire keys (`command`/`args`/`env`/`cwd`, `http_url`/`headers`, or
+    /// `url`/`headers`) fold into this at parse time; the more-than-one / neither
+    /// ambiguity is a parse error, not a stored illegal state.
     pub transport: McpTransport,
     /// The per-server connect + call timeout in milliseconds; absent uses the
     /// transport default (30s stdio, 5s HTTP).
@@ -117,11 +119,11 @@ pub struct McpOAuthConfig {
     pub registration_url: Option<String>,
 }
 
-/// A resolved transport: exactly one of the two shapes a server config
+/// A resolved transport: exactly one of the three shapes a server config
 /// expresses. The manager builds the concrete rmcp transport from this (the only
 /// place the wire crate is touched), so the resolution stays pure and
 /// unit-tested. Modelling it as a sum type (rather than a bag of `Option`s) is
-/// what makes "both transports" and "neither" unrepresentable.
+/// what makes "more than one transport" and "neither" unrepresentable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpTransport {
     /// A stdio server: spawn `command` with `args`, `env` layered over the
@@ -135,6 +137,15 @@ pub enum McpTransport {
     /// A streamable-HTTP server at `url`, sending the static `headers` with
     /// every request.
     Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+    /// A legacy MCP HTTP+SSE server at `url` (qwen's `url` key, distinct from
+    /// [`Http`](Self::Http)'s `http_url`): the client GETs `url` as a
+    /// `text/event-stream`, the server's first `endpoint` event names the URL to
+    /// POST JSON-RPC to, and responses arrive as `message` events on the open
+    /// stream. `headers` ride both the GET and the POST.
+    Sse {
         url: String,
         headers: BTreeMap<String, String>,
     },
@@ -181,6 +192,7 @@ const FIELDS: &[&str] = &[
     "env",
     "cwd",
     "http_url",
+    "url",
     "headers",
     "timeout_ms",
     "trust",
@@ -190,10 +202,11 @@ const FIELDS: &[&str] = &[
 ];
 
 /// Deserializes the FLAT wire shape into the sum-type config. The transport keys
-/// (`command`/`args`/`env`/`cwd` and `http_url`/`headers`) are read into locals;
-/// the command-XOR-http_url rule is enforced HERE, so "both" and "neither" are
-/// parse errors with the field context rather than a deferred runtime check. An
-/// unknown key errors (`deny_unknown_fields` parity).
+/// (`command`/`args`/`env`/`cwd`, `http_url`/`headers`, and `url`/`headers`) are
+/// read into locals; the "exactly one of command/http_url/url" rule is enforced
+/// HERE, so "more than one" and "neither" are parse errors with the field context
+/// rather than a deferred runtime check. An unknown key errors
+/// (`deny_unknown_fields` parity).
 impl<'de> Deserialize<'de> for McpServerConfig {
     fn deserialize<D>(deserializer: D) -> Result<McpServerConfig, D::Error>
     where
@@ -205,7 +218,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
             type Value = McpServerConfig;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("an MCP server config (a `command` or `http_url` entry)")
+                f.write_str("an MCP server config (a `command`, `http_url`, or `url` entry)")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<McpServerConfig, A::Error>
@@ -217,6 +230,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                 let mut env: Option<BTreeMap<String, String>> = None;
                 let mut cwd: Option<String> = None;
                 let mut http_url: Option<String> = None;
+                let mut url: Option<String> = None;
                 let mut headers: Option<BTreeMap<String, String>> = None;
                 let mut timeout_ms: Option<u64> = None;
                 let mut trust: Option<bool> = None;
@@ -244,6 +258,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                         "env" => set_once!(env),
                         "cwd" => set_once!(cwd),
                         "http_url" => set_once!(http_url),
+                        "url" => set_once!(url),
                         "headers" => set_once!(headers),
                         "timeout_ms" => set_once!(timeout_ms),
                         "trust" => set_once!(trust),
@@ -255,17 +270,19 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                     }
                 }
 
-                // The transport rule, enforced at parse time: command XOR
-                // http_url. "both" and "neither" become deserialize errors (with
-                // the offending shape named) rather than a stored illegal state.
-                // Each arm also rejects the OTHER transport's keys, so a key that
-                // does not belong to the chosen shape is a loud error rather than
-                // a value that silently round-trips away.
-                let transport = match (command, http_url) {
-                    (Some(command), None) => {
+                // The transport rule, enforced at parse time: exactly one of
+                // `command` / `http_url` / `url`. "more than one" and "neither"
+                // become deserialize errors (with the offending shape named)
+                // rather than a stored illegal state. Each arm also rejects the
+                // OTHER transports' keys, so a key that does not belong to the
+                // chosen shape is a loud error rather than a value that silently
+                // round-trips away. `headers` is valid on `http_url` AND `url`;
+                // `args`/`env`/`cwd` are stdio-only.
+                let transport = match (command, http_url, url) {
+                    (Some(command), None, None) => {
                         if headers.is_some() {
                             return Err(de::Error::custom(
-                                "`headers` set on a stdio server (`command`) - headers belong to an HTTP server (`http_url`)",
+                                "`headers` set on a stdio server (`command`) - headers belong to an HTTP (`http_url`) or SSE (`url`) server",
                             ));
                         }
                         McpTransport::Stdio {
@@ -275,7 +292,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                             cwd,
                         }
                     }
-                    (None, Some(url)) => {
+                    (None, Some(url), None) => {
                         if args.is_some() || env.is_some() || cwd.is_some() {
                             return Err(de::Error::custom(
                                 "`args`/`env`/`cwd` set on an HTTP server (`http_url`) - those belong to a stdio server (`command`)",
@@ -286,14 +303,25 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                             headers: headers.unwrap_or_default(),
                         }
                     }
-                    (Some(_), Some(_)) => {
+                    (None, None, Some(url)) => {
+                        if args.is_some() || env.is_some() || cwd.is_some() {
+                            return Err(de::Error::custom(
+                                "`args`/`env`/`cwd` set on an SSE server (`url`) - those belong to a stdio server (`command`)",
+                            ));
+                        }
+                        McpTransport::Sse {
+                            url,
+                            headers: headers.unwrap_or_default(),
+                        }
+                    }
+                    (None, None, None) => {
                         return Err(de::Error::custom(
-                            "both `command` and `http_url` set - an MCP server is either stdio (command) or HTTP (http_url), not both",
+                            "none of `command`, `http_url`, or `url` set - an MCP server needs one transport",
                         ));
                     }
-                    (None, None) => {
+                    _ => {
                         return Err(de::Error::custom(
-                            "neither `command` nor `http_url` set - an MCP server needs one transport",
+                            "more than one of `command`, `http_url`, `url` set - an MCP server has exactly one transport (stdio, HTTP, or SSE)",
                         ));
                     }
                 };
@@ -335,6 +363,10 @@ impl Serialize for McpServerConfig {
                 len += 1; // http_url
                 len += usize::from(!headers.is_empty());
             }
+            McpTransport::Sse { headers, .. } => {
+                len += 1; // url
+                len += usize::from(!headers.is_empty());
+            }
         }
         len += usize::from(self.timeout_ms.is_some());
         len += usize::from(self.trust.is_some());
@@ -363,6 +395,12 @@ impl Serialize for McpServerConfig {
             }
             McpTransport::Http { url, headers } => {
                 s.serialize_field("http_url", url)?;
+                if !headers.is_empty() {
+                    s.serialize_field("headers", headers)?;
+                }
+            }
+            McpTransport::Sse { url, headers } => {
+                s.serialize_field("url", url)?;
                 if !headers.is_empty() {
                     s.serialize_field("headers", headers)?;
                 }

@@ -192,12 +192,13 @@ pub fn mcp_offline_count(servers: &[McpServerView]) -> usize {
 }
 
 /// Renders a transport for the SERVER_DETAIL `Command:` line, matching qwen's
-/// `formatServerCommand`: an HTTP server shows `<url> (http)`; a stdio server
-/// shows `<command> <args...> (stdio)` with the args joined by spaces and the
-/// trailing space trimmed when there are none.
+/// `formatServerCommand`: an HTTP server shows `<url> (http)`; an SSE server shows
+/// `<url> (sse)`; a stdio server shows `<command> <args...> (stdio)` with the args
+/// joined by spaces and the trailing space trimmed when there are none.
 pub fn format_transport(transport: &McpTransport) -> String {
     match transport {
         McpTransport::Http { url, .. } => format!("{url} (http)"),
+        McpTransport::Sse { url, .. } => format!("{url} (sse)"),
         McpTransport::Stdio { command, args, .. } => {
             // qwen joins `${command} ${args} (stdio)` and trims; with no args that
             // leaves a stray double space. Build the parts cleanly instead so the
