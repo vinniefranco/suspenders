@@ -87,6 +87,10 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     // reads it AFTER the batch answers and closes the Run through the same
     // `close_custom` path an after-Pass `Stop` takes.
     pub(super) hook_stop: Option<String>,
+    // The conditional-skill activation seam (ADR-0058), threaded from RunEnv so
+    // `batch` can activate a conditional skill by the touched file path at the
+    // tool-success seam. `None` for a Run that activates no skills (child/test).
+    pub(super) skill_activation: Option<SkillActivation>,
     // The Stop-hook loop-guard (Phase 3b, ADR-0066, qwen's `stop_hook_active`):
     // set once a Stop hook has FORCED a continuation this Run. While set, the
     // finish path does not fire Stop again, so a Stop hook that always blocks
@@ -135,6 +139,29 @@ pub struct RunEnv<'a> {
     /// The tool-dispatch seam ([`crate::run::batch`]) fires the four tool events
     /// through it; `None` is the fire-nothing path.
     pub hooks: Option<&'a crate::run::hooks::Hooks<'a>>,
+    /// The conditional-skill activation seam (ADR-0058): the shared skill manager
+    /// and the Project Root a touched file path is resolved against. `None` for a
+    /// Run that activates no skills (a child/subagent Run, or a test). The
+    /// tool-success seam ([`crate::run::batch`]) calls
+    /// [`crate::skills::SkillManager::activate_by_path`] through it.
+    pub skill_activation: Option<SkillActivation>,
+}
+
+/// The conditional-skill activation input for one Run (ADR-0058): the shared
+/// [`crate::skills::SkillManager`] a Run activates a conditional skill on, plus
+/// the Project Root a touched file path is resolved relative to. Bundled because
+/// the two are always used together, at the one seam ([`crate::run::batch`]), and
+/// carried by `Arc`/owned so the [`LoopState`] holds no extra borrow. The manager
+/// is shared with the `skill` tool, so an activation this Run makes shows up in
+/// the tool's next catalog build.
+#[derive(Clone)]
+pub struct SkillActivation {
+    /// The shared skill manager; its interior activation registry is the mutated
+    /// state.
+    pub skills: std::sync::Arc<crate::skills::SkillManager>,
+    /// The Project Root a touched path is resolved against (conditional skills
+    /// are project-scoped).
+    pub project_root: std::path::PathBuf,
 }
 
 /// Runs the loop until the model stops asking for tools, the turn bound is hit,
@@ -160,6 +187,7 @@ pub async fn run<D: RunDeps>(
         tool_ctx: env.tool_ctx,
         hooks: env.hooks,
         hook_stop: None,
+        skill_activation: env.skill_activation,
         stop_hook_active: false,
         plan,
         turn: 1,

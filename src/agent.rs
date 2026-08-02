@@ -1257,6 +1257,7 @@ fn spawn_run(state: &mut AgentState) {
         subagents: Arc::clone(&state.subagents),
         session: state.session.clone(),
         hooks: Arc::clone(&state.hook_manager),
+        skills: Arc::clone(&state.skill_manager),
     });
     let conversation = state.conversation.clone();
     let session = state.session.clone();

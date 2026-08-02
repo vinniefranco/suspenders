@@ -3,101 +3,267 @@
 //! A skill is a directory under `<root>/.suspenders/skills/<name>/` (project) or
 //! `~/.suspenders/skills/<name>/` (user) containing a `SKILL.md` manifest: YAML
 //! frontmatter between `---` fences (a required `name` + `description`, an
-//! optional `when_to_use`, plus qwen's other flat fields parsed-and-ignored so a
-//! real qwen manifest still loads) followed by a markdown body. The body is the
-//! instruction text the model reads when it invokes the skill.
+//! optional `when_to_use`, plus the honored fields `priority`, `argument-hint`,
+//! `disable-model-invocation`, `paths`, and a nested `hooks:` block) followed by
+//! a markdown body. The body is the instruction text the model reads when it
+//! invokes the skill. Beneath project and user sits a third source, bundled
+//! skills embedded at compile time (Phase 4a, ADR-0058), so precedence is
+//! project > user > bundled.
 //!
-//! This is a LEAF module (ADR-0058): it imports only `std` + `serde_json`, never
-//! the agent/run/ui/session layers. [`SkillManager::discover`] walks the two
-//! skill roots fail-open - a malformed or invalid manifest is recorded on
-//! `failures` and skipped, mirroring how [`crate::mcp::manager`] records a broken
-//! server. The one `skill` tool (`crate::tools::skill`) holds an `Arc` of the
-//! manager and embeds [`SkillManager::available`] into its dynamically-built
-//! description as an `<available_skills>` catalog; that catalog IS the surfacing
-//! mechanism, so the tool is always visible (not deferred).
+//! This is a LEAF module (ADR-0058): it imports only `std` + `serde_json` (+ the
+//! shared `crate::glob_match` and `crate::hooks::config` leaves), never the
+//! agent/run/ui/session layers. [`SkillManager::discover`] walks the two disk
+//! skill roots and the embedded bundled set fail-open - a malformed or invalid
+//! manifest is recorded on `failures` and skipped, mirroring how
+//! [`crate::mcp::manager`] records a broken server. The one `skill` tool
+//! (`crate::tools::skill`) holds an `Arc` of the manager and embeds
+//! [`SkillManager::catalog`] into its dynamically-built description as an
+//! `<available_skills>` catalog; that catalog IS the surfacing mechanism, so the
+//! tool is always visible (not deferred).
 //!
-//! ## What is ported and what is out
+//! ## Conditional (`paths:`) activation
 //!
-//! Ported verbatim from qwen v0.16.0 (`skills/skill-load.ts`, `skills/types.ts`,
-//! `tools/skill-utils.ts`): the frontmatter fence split, the required-field
-//! rejection, the `SKILL_NAME_PATTERN` charset, the XML escape, and the LLM
-//! content wrapper ([`build_skill_llm_content`]). Deferred as OUT (ADR-0058):
-//! `paths:` conditional activation, `hooks:`, `model` override, `priority`,
-//! `disable-model-invocation`, extension/bundled skill levels, and the
-//! change-listener refresh. Those fields are parsed-and-ignored so their presence
-//! never blocks a load.
+//! A skill whose frontmatter carries `paths:` globs is a *conditional skill*: it
+//! is hidden from the catalog until a Tool Call touches a matching file path,
+//! then activated for the rest of the Session (ADR-0058, qwen's
+//! `skill-activation.ts`). The manager holds a shared, interior-mutable
+//! activation registry ([`ActivationRegistry`]); `crate::run::batch` calls
+//! [`SkillManager::activate_by_path`] at the tool-success seam, and the `skill`
+//! tool reads the same registry through the shared `Arc<SkillManager>` when it
+//! builds the catalog, so a newly-activated skill appears next turn with no
+//! change-listener (unlike qwen).
+//!
+//! ## What is honored and what is out
+//!
+//! Ported from qwen v0.16.0 (`skills/skill-load.ts`, `skills/skill-manager.ts`,
+//! `skills/types.ts`, `tools/skill-utils.ts`): the frontmatter fence split, the
+//! required-field rejection, the `SKILL_NAME_PATTERN` charset, the XML escape,
+//! the LLM content wrapper ([`build_skill_llm_content`]), the honored fields
+//! above, priority-desc-then-name ordering, project-over-user-over-bundled
+//! precedence, and conditional activation. `disable-model-invocation` and the
+//! `hooks` block are PARSED into [`Skill`] here for Phases 4b/4c to consume but
+//! carry no behavior yet. Deferred as OUT (ADR-0058): `model` override,
+//! `allowedTools` gating, extension skills, and the change-listener refresh.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use serde_json::Value;
 
 /// The manifest filename inside each skill directory (qwen's
 /// `SKILL_MANIFEST_FILE`).
 const SKILL_MANIFEST_FILE: &str = "SKILL.md";
 
+/// Which source a skill was discovered from (ADR-0058). Precedence resolves in
+/// this order, project first: a project skill shadows a same-named user skill,
+/// which shadows a same-named bundled skill. Recorded on each [`Skill`] so a
+/// consumer (and a test) can tell where a skill came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillLevel {
+    /// `<project-root>/.suspenders/skills/`.
+    Project,
+    /// The user's `~/.suspenders/skills/`.
+    User,
+    /// The set embedded in the binary at compile time.
+    Bundled,
+}
+
 /// A loaded skill: the required `name`/`description`, the optional `when_to_use`
-/// hint, the skill's base directory (the directory containing its `SKILL.md`,
-/// used for absolute-path resolution), and the markdown body (trimmed). Mirrors
-/// the fields qwen's `SkillConfig` carries that Suspenders actually uses; the
-/// rest of qwen's fields are parsed-and-ignored (ADR-0058).
+/// hint, the skill's base directory, the markdown body (trimmed), and the honored
+/// frontmatter (ADR-0058). `disable_model_invocation` and `hooks` are parsed for
+/// Phases 4b/4c but unused here. Mirrors the fields qwen's `SkillConfig` carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub when_to_use: Option<String>,
+    /// The directory the skill's `SKILL.md` lives in. For a disk skill this is
+    /// the real path; for a bundled skill it is the synthetic
+    /// `<bundled>/<name>` marker (there is no on-disk directory).
     pub base_dir: PathBuf,
     pub body: String,
+    /// Which source this skill was discovered from.
+    pub level: SkillLevel,
+    /// The ordering hint: higher sorts earlier in the catalog, ties break
+    /// alphabetically. A missing/invalid `priority` normalizes to `0`.
+    pub priority: i64,
+    /// The `argument-hint` string shown after the slash command name in the
+    /// `/`-menu completion (Phase 4b consumer). Display-only.
+    pub argument_hint: Option<String>,
+    /// The `disable-model-invocation` flag: `true` drops the skill from the
+    /// model-facing catalog, leaving it `/<name>`-only (Phase 4b consumer).
+    /// Parsed here, not wired.
+    pub disable_model_invocation: bool,
+    /// The `paths:` globs that gate a conditional skill. A non-empty list makes
+    /// the skill hidden until a matching file is touched (see
+    /// [`ActivationRegistry`]).
+    pub paths: Vec<String>,
+    /// The nested `hooks:` block parsed to the same `serde_json::Value` shape the
+    /// [`crate::hooks::HookManager`] consumes (Phase 4c consumer). Parsed here,
+    /// not wired. `None` when absent or malformed (fail-open, ADR-0058).
+    pub hooks: Option<Value>,
 }
 
-/// The frontmatter fields a manifest parse yields: the required `name` +
-/// `description` and the optional `when_to_use`. The other qwen frontmatter keys
-/// are parsed-and-ignored, so they never reach this struct. Public because it is
-/// the return shape of the public [`parse_skill_content`].
+/// The frontmatter fields a manifest parse yields (ADR-0058): the required
+/// `name` + `description`, the optional `when_to_use`, and the honored
+/// `priority`/`argument-hint`/`disable-model-invocation`/`paths`/`hooks`. Public
+/// because it is the return shape of the public [`parse_skill_content`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frontmatter {
     pub name: String,
     pub description: String,
     pub when_to_use: Option<String>,
+    pub priority: i64,
+    pub argument_hint: Option<String>,
+    pub disable_model_invocation: bool,
+    pub paths: Vec<String>,
+    pub hooks: Option<Value>,
+}
+
+/// The shared, interior-mutable set of activated conditional-skill names
+/// (ADR-0058, qwen's `SkillActivationRegistry`). A conditional skill (non-empty
+/// `paths:`) starts inactive and flips to active - and stays active for the
+/// registry's lifetime - the first time a touched file path matches one of its
+/// globs. Wrapped in `Arc<Mutex<..>>` so the `skill` tool (reading, when it
+/// builds the catalog) and `crate::run::batch` (writing, at the tool-success
+/// seam) observe the same set through the shared `Arc<SkillManager>`.
+#[derive(Debug, Clone, Default)]
+struct ActivationRegistry {
+    activated: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ActivationRegistry {
+    /// Whether `name` has been activated (a plain, non-conditional skill never
+    /// enters here - the manager treats it as always active).
+    fn is_activated(&self, name: &str) -> bool {
+        self.activated
+            .lock()
+            .map(|set| set.contains(name))
+            .unwrap_or(false)
+    }
+
+    /// Marks `name` activated.
+    fn activate(&self, name: &str) {
+        if let Ok(mut set) = self.activated.lock() {
+            set.insert(name.to_string());
+        }
+    }
 }
 
 /// The fail-open discovery front for the skill subsystem (ADR-0058), mirroring
 /// [`crate::mcp::manager::McpManager`]: [`discover`](SkillManager::discover)
-/// walks the project + user skill roots, and a malformed or invalid manifest is
-/// recorded on `failures` and skipped rather than crashing startup. The one
-/// `skill` tool holds an `Arc` of this manager and reads
-/// [`available`](SkillManager::available) into its `<available_skills>` catalog.
+/// walks the project + user skill roots and the embedded bundled set, and a
+/// malformed or invalid manifest is recorded on `failures` and skipped rather
+/// than crashing startup. The one `skill` tool holds an `Arc` of this manager
+/// and reads [`catalog`](SkillManager::catalog) into its `<available_skills>`
+/// block; the same `Arc` is threaded to each Run so `crate::run::batch` can
+/// [`activate_by_path`](SkillManager::activate_by_path) a conditional skill.
 #[derive(Debug, Clone, Default)]
 pub struct SkillManager {
     skills: Vec<Skill>,
     failures: Vec<(String, String)>,
+    activation: ActivationRegistry,
 }
 
 impl SkillManager {
-    /// Walks the project skill root (and the optional user skill root) for
-    /// `<root>/<name>/SKILL.md` manifests, fail-open. Each root is
-    /// `<...>/.suspenders/skills`; the caller passes those directories directly.
-    /// A directory without a `SKILL.md`, a plain file, and an unreadable root are
-    /// all silently skipped (qwen's `loadSkillsFromDir`); a `SKILL.md` that fails
-    /// to parse or validate is recorded as a `(skill <name>, reason)` failure and
-    /// skipped. Project skills are walked first, so on a name collision the
-    /// project skill wins (`find`/`available` return the first match) - qwen's
-    /// project-over-user precedence.
+    /// Walks the project skill root, the optional user skill root, and the
+    /// embedded bundled set for `<root>/<name>/SKILL.md` manifests, fail-open.
+    /// Each disk root is `<...>/.suspenders/skills`; the caller passes those
+    /// directories directly. A directory without a `SKILL.md`, a plain file, and
+    /// an unreadable root are all silently skipped (qwen's `loadSkillsFromDir`);
+    /// a `SKILL.md` that fails to parse or validate is recorded as a
+    /// `(skill <name>, reason)` failure and skipped. Sources are walked in
+    /// precedence order project > user > bundled, so on a name collision the
+    /// higher-precedence skill wins and the shadowed one is dropped silently.
+    /// Discovered skills are sorted priority-desc-then-name.
     pub fn discover(project_root: &Path, user_root: Option<&Path>) -> SkillManager {
         let mut skills: Vec<Skill> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
 
-        // Project first, then user: the first-loaded skill wins a name collision,
-        // so a project skill shadows a same-named user skill (qwen precedence).
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for root in [Some(project_root), user_root].into_iter().flatten() {
-            load_root(root, &mut seen, &mut skills, &mut failures);
+        // Precedence project > user > bundled: the first-loaded skill wins a name
+        // collision, so a project skill shadows a same-named user skill, and a
+        // disk skill shadows a same-named bundled skill (qwen precedence).
+        let mut seen: HashSet<String> = HashSet::new();
+        load_root(
+            project_root,
+            SkillLevel::Project,
+            &mut seen,
+            &mut skills,
+            &mut failures,
+        );
+        if let Some(user_root) = user_root {
+            load_root(
+                user_root,
+                SkillLevel::User,
+                &mut seen,
+                &mut skills,
+                &mut failures,
+            );
         }
+        load_bundled(&mut seen, &mut skills, &mut failures);
 
-        SkillManager { skills, failures }
+        // Priority desc, then name asc (qwen's `/skills` display sort applied at
+        // discovery so the catalog and any listing share one order).
+        sort_skills(&mut skills);
+
+        SkillManager {
+            skills,
+            failures,
+            activation: ActivationRegistry::default(),
+        }
     }
 
-    /// The loaded skills, in discovery order (project before user). Read by the
-    /// `skill` tool to build its `<available_skills>` catalog.
+    /// Every discovered skill, priority-sorted. Includes conditional and
+    /// `disable-model-invocation` skills; [`catalog`](SkillManager::catalog) is
+    /// the filtered model-facing view.
     pub fn available(&self) -> &[Skill] {
         &self.skills
+    }
+
+    /// The model-facing catalog: every non-`disable-model-invocation` skill that
+    /// is currently active. A plain skill is always active; a conditional skill
+    /// (non-empty `paths:`) is included only once a touched file has activated
+    /// it. Priority-sorted like [`available`](SkillManager::available). Read by
+    /// the `skill` tool to build its `<available_skills>` block.
+    pub fn catalog(&self) -> Vec<&Skill> {
+        self.skills
+            .iter()
+            .filter(|s| !s.disable_model_invocation)
+            .filter(|s| self.is_active(s))
+            .collect()
+    }
+
+    /// Whether a skill is currently eligible for the catalog: a plain skill (no
+    /// `paths:`) is always active; a conditional skill is active only after a
+    /// matching file path activated it (qwen's `isSkillActive`).
+    fn is_active(&self, skill: &Skill) -> bool {
+        skill.paths.is_empty() || self.activation.is_activated(&skill.name)
+    }
+
+    /// Activates any conditional skill whose `paths:` globs match `file_path`,
+    /// resolved relative to `project_root` (ADR-0058, qwen's `matchAndConsume`).
+    /// Called at the tool-success seam in `crate::run::batch` with the path a
+    /// just-run Tool Call touched. A path outside the project root, or one that
+    /// matches no inactive conditional skill, is a no-op. Activate-once-sticky:
+    /// a skill already active is left alone. Returns the names newly activated by
+    /// this call (empty when nothing flipped), so the caller can surface them.
+    pub fn activate_by_path(&self, file_path: &Path, project_root: &Path) -> Vec<String> {
+        let Some(relative) = project_relative(file_path, project_root) else {
+            return Vec::new();
+        };
+
+        let mut newly: Vec<String> = Vec::new();
+        for skill in &self.skills {
+            if skill.paths.is_empty() || self.activation.is_activated(&skill.name) {
+                continue;
+            }
+            if skill.paths.iter().any(|glob| path_matches(glob, &relative)) {
+                self.activation.activate(&skill.name);
+                newly.push(skill.name.clone());
+            }
+        }
+        newly
     }
 
     /// The skill matching `name` exactly, or `None`. Used by the `skill` tool's
@@ -114,14 +280,49 @@ impl SkillManager {
     }
 }
 
-/// Walks one skill root's immediate subdirectories for `SKILL.md` manifests. A
-/// non-directory entry, a directory without a manifest, or a name already loaded
-/// from an earlier root is skipped; a manifest that fails to parse/validate is
-/// recorded on `failures`. An unreadable root (it does not exist yet) is a silent
-/// no-op - the common case where a project has no `.suspenders/skills/` dir.
+/// Sorts skills priority-desc then name-asc (qwen's `listSkills` display order,
+/// applied at discovery). Deterministic: names are unique after dedup, so the
+/// name tiebreak fully orders equal-priority skills.
+fn sort_skills(skills: &mut [Skill]) {
+    skills.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
+}
+
+/// Resolves `file_path` to a project-root-relative form (`/`-separated), or
+/// `None` when it escapes the project root (qwen's `resolveProjectRelativePath`
+/// scoping: conditional skills are project-scoped). An already-relative path is
+/// taken as-is against the root; an absolute path is stripped of the root prefix.
+fn project_relative(file_path: &Path, project_root: &Path) -> Option<String> {
+    let joined = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        project_root.join(file_path)
+    };
+    // Lexical: `strip_prefix` against the (possibly relative) root. A path
+    // outside the root yields None (conditional skills are project-scoped).
+    let relative = joined.strip_prefix(project_root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Whether a project-root-relative `path` matches a skill's `glob` via the shared
+/// [`crate::glob_match`] engine (the same matcher behind the ignore-crate walk
+/// and `@path` completion, so one glob semantics across the codebase). A glob
+/// that will not compile matches nothing (fail-open, no panic).
+fn path_matches(glob: &str, path: &str) -> bool {
+    crate::glob_match::compile(glob)
+        .map(|re| re.is_match(path))
+        .unwrap_or(false)
+}
+
+/// Walks one disk skill root's immediate subdirectories for `SKILL.md`
+/// manifests. A non-directory entry, a directory without a manifest, or a name
+/// already loaded from a higher-precedence source is skipped; a manifest that
+/// fails to parse/validate is recorded on `failures`. An unreadable root (it
+/// does not exist yet) is a silent no-op - the common case where a project has
+/// no `.suspenders/skills/` dir.
 fn load_root(
     root: &Path,
-    seen: &mut std::collections::HashSet<String>,
+    level: SkillLevel,
+    seen: &mut HashSet<String>,
     skills: &mut Vec<Skill>,
     failures: &mut Vec<(String, String)>,
 ) {
@@ -147,56 +348,119 @@ fn load_root(
             continue;
         }
 
+        let dir_name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
         let content = match std::fs::read_to_string(&manifest) {
             Ok(content) => content,
             Err(e) => {
-                let name = dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                failures.push((name, format!("could not read SKILL.md - {e}")));
+                failures.push((dir_name, format!("could not read SKILL.md - {e}")));
                 continue;
             }
         };
 
-        match parse_skill_content(&content) {
-            Ok((fm, body)) => {
-                // A later root's same-named skill loses to the earlier one
-                // (project-over-user); record nothing - it is not a failure.
-                if seen.contains(&fm.name) {
-                    continue;
-                }
-                seen.insert(fm.name.clone());
-                skills.push(Skill {
-                    name: fm.name,
-                    description: fm.description,
-                    when_to_use: fm.when_to_use,
-                    base_dir: dir.clone(),
-                    body,
-                });
+        push_parsed(
+            &content,
+            dir.clone(),
+            level,
+            &dir_name,
+            seen,
+            skills,
+            failures,
+        );
+    }
+}
+
+/// Walks the compile-time-embedded bundled set (ADR-0058): each bundled skill's
+/// `SKILL.md` is baked into the binary, so there is no on-disk root to read.
+/// Same precedence rule as a disk root, one level deeper: a name already loaded
+/// from project/user shadows the bundled one silently. The `base_dir` is a
+/// synthetic `<bundled>/<name>` marker (there is no real directory), which the
+/// LLM content wrapper still renders faithfully.
+fn load_bundled(
+    seen: &mut HashSet<String>,
+    skills: &mut Vec<Skill>,
+    failures: &mut Vec<(String, String)>,
+) {
+    for (dir_name, content) in BUNDLED_SKILLS {
+        let base_dir = Path::new("<bundled>").join(dir_name);
+        push_parsed(
+            content,
+            base_dir,
+            SkillLevel::Bundled,
+            dir_name,
+            seen,
+            skills,
+            failures,
+        );
+    }
+}
+
+/// The bundled skills embedded at compile time (ADR-0058). Each entry is
+/// `(<name>, <SKILL.md contents>)`, sourced with `include_str!` so no on-disk
+/// install step and no extra dependency is needed (Suspenders is a single binary,
+/// ADR-0019). qwen's shipped `loop`/`review`/`qc-helper` are deferred (they rely
+/// on subsystems Suspenders does not have); `batch` is a faithful port (the one
+/// `task` -> `agent` tool rename) and `stuck` is a Suspenders-native rewrite.
+const BUNDLED_SKILLS: &[(&str, &str)] = &[
+    ("batch", include_str!("bundled/batch/SKILL.md")),
+    ("stuck", include_str!("bundled/stuck/SKILL.md")),
+];
+
+/// Parses one manifest `content` and, on success, pushes the resulting [`Skill`]
+/// unless its name was already loaded from a higher-precedence source (dedup).
+/// A parse/validate error is recorded on `failures` under `dir_name` (the source
+/// directory, since the manifest may fail before yielding a name). Shared by the
+/// disk-root and bundled walks so precedence + failure handling stay identical.
+fn push_parsed(
+    content: &str,
+    base_dir: PathBuf,
+    level: SkillLevel,
+    dir_name: &str,
+    seen: &mut HashSet<String>,
+    skills: &mut Vec<Skill>,
+    failures: &mut Vec<(String, String)>,
+) {
+    match parse_skill_content(content) {
+        Ok((fm, body)) => {
+            // A lower-precedence same-named skill loses to the earlier one; record
+            // nothing - it is a silent shadow, not a failure.
+            if seen.contains(&fm.name) {
+                return;
             }
-            Err(reason) => {
-                // Name the failure by the directory (the manifest may have failed
-                // before yielding a name).
-                let name = dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                failures.push((name, reason));
-            }
+            seen.insert(fm.name.clone());
+            skills.push(Skill {
+                name: fm.name,
+                description: fm.description,
+                when_to_use: fm.when_to_use,
+                base_dir,
+                body,
+                level,
+                priority: fm.priority,
+                argument_hint: fm.argument_hint,
+                disable_model_invocation: fm.disable_model_invocation,
+                paths: fm.paths,
+                hooks: fm.hooks,
+            });
         }
+        Err(reason) => failures.push((dir_name.to_string(), reason)),
     }
 }
 
 /// Splits a `SKILL.md` into its frontmatter fields and trimmed body (pure).
 /// Ports qwen's `parseSkillContent` regex
-/// `^---\n([\s\S]*?)\n---(?:\n|$)([\s\S]*)$` as a manual line scan (no YAML
-/// crate, no regex): the frontmatter is the block between the leading `---`
-/// fence and the next `---` line; the body is everything after, trimmed. The
-/// frontmatter is parsed as flat `key: value` scalars - list/nested qwen fields
-/// (`allowedTools`, `hooks`, `paths`) are parsed-and-ignored so a real qwen
-/// manifest still loads. Errs (skipping the skill) when the fences are missing or
-/// the required `name`/`description` are absent or empty (qwen's throw sites).
+/// `^---\n([\s\S]*?)\n---(?:\n|$)([\s\S]*)$` as a manual line scan (no regex):
+/// the frontmatter is the block between the leading `---` fence and the next
+/// `---` line; the body is everything after, trimmed. Flat `key: value` scalars
+/// (`name`, `description`, `when_to_use`, `priority`, `argument-hint`,
+/// `disable-model-invocation`) are hand-parsed; the nested `paths:` list and
+/// `hooks:` map are carved out and handed to `serde_yaml_ng` (the same YAML path
+/// [`crate::hooks::config::hooks_value_from_yaml`] uses), so the hand parser
+/// never has to understand nesting. A malformed nested value fails open (the
+/// skill still loads off name+description). Errs (skipping the skill) when the
+/// fences are missing or the required `name`/`description` are absent or empty.
 pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> {
     // Normalize BOM + CRLF the way qwen's `normalizeContent` does, so a Windows-
     // authored manifest still splits on the `---` fences.
@@ -215,12 +479,22 @@ pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> 
     validate_skill_name(&name)?;
     let description = required_field(&fields, "description")?;
     let when_to_use = scalar_field(&fields, "when_to_use");
+    let priority = parse_priority(&fields);
+    let argument_hint = scalar_field(&fields, "argument-hint");
+    let disable_model_invocation = parse_bool_field(&fields, "disable-model-invocation");
+    let paths = parse_paths_block(frontmatter);
+    let hooks = parse_hooks_block(frontmatter);
 
     Ok((
         Frontmatter {
             name,
             description,
             when_to_use,
+            priority,
+            argument_hint,
+            disable_model_invocation,
+            paths,
+            hooks,
         },
         body.trim().to_string(),
     ))
@@ -266,12 +540,12 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 }
 
 /// Parses the frontmatter block into flat `key: value` scalar pairs, in the
-/// order they appear, and drops the trailing frontmatter newline qwen's regex
-/// leaves out. List/nested YAML fields (a `key:` with no inline value, or a `- `
-/// continuation line) are parsed-and-ignored: the key's value is left empty and
-/// the continuation lines are skipped, so `allowedTools`/`hooks`/`paths` never
-/// crash the parse. A `# comment` line and a blank line are skipped. Quotes
-/// around a scalar value are stripped.
+/// order they appear. List/nested YAML fields (a `key:` with no inline value, or
+/// a `- ` continuation line) are parsed-and-ignored HERE: the key's value is left
+/// empty and the continuation lines are skipped, so the flat scan never crashes
+/// on `paths`/`hooks` (those blocks are carved out separately by
+/// [`parse_paths_block`]/[`parse_hooks_block`]). A `# comment` line and a blank
+/// line are skipped. Quotes around a scalar value are stripped.
 fn parse_frontmatter_fields(frontmatter: &str) -> Vec<(String, String)> {
     let mut fields: Vec<(String, String)> = Vec::new();
     for line in frontmatter.lines() {
@@ -290,6 +564,131 @@ fn parse_frontmatter_fields(frontmatter: &str) -> Vec<(String, String)> {
         fields.push((key, value));
     }
     fields
+}
+
+/// Carves the nested YAML block for `key` out of the raw frontmatter and returns
+/// it as its own YAML document string (or `None` when `key` is absent or has an
+/// inline scalar value rather than a nested block). A block is the `key:` line
+/// plus every following line that is indented under it, ending at the next line
+/// at the frontmatter's top level. The `key:` line is re-emitted verbatim, so
+/// `serde_yaml_ng` sees a top-level `key:` mapping - the shape
+/// [`crate::hooks::config::hooks_value_from_yaml`] expects.
+fn extract_nested_block(frontmatter: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let key_prefix = format!("{key}:");
+
+    // Find the `key:` line at the frontmatter's top level (indent 0). A nested
+    // key inside another block is not a top-level field.
+    let start = lines.iter().position(|l| {
+        let indent = l.len() - l.trim_start().len();
+        indent == 0 && l.trim_start().starts_with(&key_prefix)
+    })?;
+
+    // An inline value (`key: something`) is a scalar, not a nested block.
+    let inline = lines[start].trim_start()[key_prefix.len()..].trim();
+    if !inline.is_empty() {
+        return None;
+    }
+
+    // Collect the continuation lines: everything after `key:` that is indented
+    // (a blank line inside the block is kept; the block ends at the next
+    // top-level line).
+    let mut block: Vec<String> = vec![format!("{key}:")];
+    for line in &lines[start + 1..] {
+        if line.trim().is_empty() {
+            block.push(String::new());
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
+            break;
+        }
+        block.push((*line).to_string());
+    }
+
+    // Nothing followed `key:` - an empty block (qwen's `paths:` with no value).
+    if block.len() == 1 {
+        return None;
+    }
+    Some(block.join("\n"))
+}
+
+/// Parses the nested `paths:` block into a normalized glob list (ADR-0058, qwen's
+/// `parsePathsField`). Carves the block via [`extract_nested_block`] and parses
+/// it with `serde_yaml_ng`; a non-list value or an unparseable block yields an
+/// empty list (fail-open: the skill loads as unconditional rather than dropping).
+/// Blank entries are trimmed out. Absolute or root-escaping (`..`) globs are
+/// dropped, since a conditional skill is project-scoped and such a glob could
+/// never match a project-relative path anyway.
+fn parse_paths_block(frontmatter: &str) -> Vec<String> {
+    let Some(block) = extract_nested_block(frontmatter, "paths") else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_yaml_ng::from_str::<Value>(&block) else {
+        return Vec::new();
+    };
+    let Some(list) = value.get("paths").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter(|p| project_scoped_glob(p))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a `paths:` glob is project-scoped: not absolute and with no `..`
+/// segment that would escape the project root (qwen's `parsePathsField` guard).
+/// A backslash is normalized to `/` first so a Windows-shaped pattern is judged
+/// the same way.
+fn project_scoped_glob(glob: &str) -> bool {
+    let normalized = glob.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return false;
+    }
+    // A drive-letter prefix (`C:...`) is absolute on Windows.
+    let mut chars = normalized.chars();
+    if let (Some(c), Some(':')) = (chars.next(), chars.next())
+        && c.is_ascii_alphabetic()
+    {
+        return false;
+    }
+    !normalized.split('/').any(|seg| seg == "..")
+}
+
+/// Parses the nested `hooks:` block to the `serde_json::Value` shape the
+/// [`crate::hooks::HookManager`] consumes (ADR-0058/0066). Carves the block via
+/// [`extract_nested_block`] and reuses
+/// [`crate::hooks::config::hooks_value_from_yaml`] (the ONE YAML path for skill
+/// hooks) so the skill loader never adds a second YAML approach. A malformed or
+/// absent block yields `None` (fail-open: the skill still loads off
+/// name+description; the hooks are simply dropped, ADR-0058).
+fn parse_hooks_block(frontmatter: &str) -> Option<Value> {
+    let block = extract_nested_block(frontmatter, "hooks")?;
+    let value = crate::hooks::config::hooks_value_from_yaml(&block).ok()?;
+    // The block re-includes the `hooks:` key, so pull the mapping back out.
+    value.get("hooks").cloned()
+}
+
+/// Parses the flat `priority:` scalar to an `i64`, normalizing a missing, empty,
+/// or non-integer value to `0` (ADR-0058, qwen's `parsePriorityField`: a
+/// cosmetic ordering hint must never make a valid skill disappear).
+fn parse_priority(fields: &[(String, String)]) -> i64 {
+    scalar_field(fields, "priority")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Parses a flat boolean scalar (`disable-model-invocation`): `true` only for the
+/// literal `true` (qwen accepts the boolean `true` and the string `"true"`; the
+/// flat parser sees a string, so this is the string check). Anything else,
+/// including absence, is `false`.
+fn parse_bool_field(fields: &[(String, String)], key: &str) -> bool {
+    scalar_field(fields, key)
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Strips a single matching pair of surrounding single or double quotes from a

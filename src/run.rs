@@ -93,6 +93,15 @@ pub struct Capture {
     /// Agent. A child Run carries the empty manager (a subagent fires no hooks in
     /// this phase - the tool-dispatch seam is the parent's).
     pub hooks: Arc<crate::hooks::HookManager>,
+    /// The disk-skill manager (ADR-0058): the Agent discovered it once at
+    /// launch, threaded so the Run can activate a conditional skill by touched
+    /// path at the tool-success seam (`crate::run::batch`). Shared by `Arc` with
+    /// the `skill` tool, so an activation this Run makes is visible to the tool's
+    /// next catalog build. `Arc<SkillManager>` is Send+Sync, so the [`Capture`]
+    /// stays `Send` for the `tokio::spawn` at the Agent. A child Run carries a
+    /// fresh empty manager (a subagent activates nothing - the seam is the
+    /// parent's).
+    pub skills: Arc<crate::skills::SkillManager>,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -176,12 +185,23 @@ pub async fn run(
         session.root.clone(),
     );
 
+    // The conditional-skill activation seam (ADR-0058): the shared skill manager
+    // the Agent discovered + the Session's Project Root, so `batch` can activate a
+    // conditional skill by the file path a Tool Call touched. The manager is shared
+    // with the `skill` tool, so an activation this Run makes shows up in the tool's
+    // next catalog build.
+    let skill_activation = loop_::SkillActivation {
+        skills: Arc::clone(&capture.skills),
+        project_root: std::path::PathBuf::from(&session.root),
+    };
+
     loop_::run(
         conversation,
         &session,
         loop_::RunEnv {
             tool_ctx: &tool_ctx,
             hooks: Some(&hooks),
+            skill_activation: Some(skill_activation),
         },
         &mut deps,
         opts,
@@ -309,6 +329,10 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
             // seam that fires them is the parent's, and a subagent has no standing
             // manager threaded. Phase 3b/4 revisits subagent-scoped firing.
             hooks: None,
+            // A child Run activates no conditional skills either (ADR-0058): the
+            // activation seam is the parent's, and a subagent has no shared skill
+            // manager threaded.
+            skill_activation: None,
         },
         &mut deps,
         RunOpts::default(),

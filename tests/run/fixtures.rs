@@ -131,6 +131,7 @@ pub(super) async fn run_with(
         RunEnv {
             tool_ctx: &ctx,
             hooks: None,
+            skill_activation: None,
         },
         &mut deps,
         RunOpts::default(),
@@ -159,6 +160,7 @@ pub(super) async fn run_with_hooks(
         RunEnv {
             tool_ctx: &ctx,
             hooks: Some(hooks),
+            skill_activation: None,
         },
         &mut deps,
         RunOpts::default(),

@@ -119,6 +119,7 @@ async fn execute_tool<D: RunDeps>(
     let is_error = answer.is_error;
 
     maybe_store_plan(state, &name, &input, is_error).await;
+    maybe_activate_skills(state, &name, &input, is_error);
 
     // The UI event carries the text projection (ADR-0059): a media block renders
     // as a short placeholder there, while the Conversation keeps the full block
@@ -132,6 +133,49 @@ async fn execute_tool<D: RunDeps>(
     ));
 
     ContentBlock::tool_result_blocks(id, content, is_error)
+}
+
+// Conditional-skill activation at the tool-success seam (ADR-0058, qwen's
+// `matchAndActivateByPath`). A SUCCESSFUL Tool Call that names a file path
+// activates any conditional (`paths:`) skill whose globs match that path,
+// resolved relative to the Project Root; the skill then appears in the `skill`
+// tool's `<available_skills>` catalog on its next description read (the manager
+// is shared, so no change-listener). Checking SUCCESS (not attempt) means a
+// failed touch never leaks a hidden skill into the catalog. A no-activation Run
+// (no `skill_activation` threaded, an errored call, or a tool that touches no
+// file) is a cheap no-op.
+fn maybe_activate_skills<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    is_error: bool,
+) {
+    if is_error {
+        return;
+    }
+    let Some(activation) = state.skill_activation.as_ref() else {
+        return;
+    };
+    for path in touched_paths(name, input) {
+        activation
+            .skills
+            .activate_by_path(std::path::Path::new(path), &activation.project_root);
+    }
+}
+
+// The file path(s) a Tool Call named in its input (ADR-0058). Reads the standard
+// path keys the file-touching tools carry - `file_path` (read_file/edit/
+// write_file), `notebook_path` (notebook_edit), and `path` (list_directory/glob/
+// grep_search, a search-root that can still match a `src/**`-style skill glob) -
+// so activation keys off the same signal the tool result carries. A tool that
+// names no path (or names it under an unrecognized key) yields nothing.
+fn touched_paths<'a>(_name: &str, input: &'a Value) -> Vec<&'a str> {
+    const PATH_KEYS: [&str; 3] = ["file_path", "notebook_path", "path"];
+    PATH_KEYS
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(Value::as_str))
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 // A successful todo_write Tool Call replaces the Plan's task list and stores its

@@ -89,9 +89,12 @@ async fn run_not_found_is_the_verbatim_message_with_available_names() {
     let (mgr, _tmp) = manager_with(&[("pdf", "PDFs", "b"), ("xlsx", "sheets", "b")]);
     let tool = SkillTool::new(mgr);
     let err = tool.run(&json!({"skill": "missing"}), &ctx()).await;
+    // The available-names list spans every discovered skill (qwen parity),
+    // including the always-present bundled `batch`/`stuck`, name-sorted by the
+    // priority-then-name discovery order.
     assert_eq!(
         err,
-        Err("Skill \"missing\" not found. Available skills: pdf, xlsx".to_string())
+        Err("Skill \"missing\" not found. Available skills: batch, pdf, stuck, xlsx".to_string())
     );
 }
 

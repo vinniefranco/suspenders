@@ -48,14 +48,19 @@ impl SkillTool {
         SkillTool { manager }
     }
 
-    /// The `<available_skills>` body: one `<skill>` entry per discovered skill
-    /// (name + description XML-escaped, the `when_to_use` appended to the
-    /// description as qwen does), or the empty-catalog text. The `<location>` is
-    /// the skill's base directory so the model can resolve absolute paths before
-    /// even invoking. Built fresh for every `spec()` call off the manager's
-    /// current catalog.
+    /// The `<available_skills>` body: one `<skill>` entry per catalog skill (a
+    /// conditional skill only after activation, and never a
+    /// `disable-model-invocation` skill), name + description XML-escaped, the
+    /// `when_to_use` appended to the description as qwen does, or the empty-catalog
+    /// text. The `<location>` is the skill's base directory so the model can
+    /// resolve absolute paths before even invoking. Built fresh for every `spec()`
+    /// call off the manager's current catalog.
     fn skill_descriptions(&self) -> String {
-        let skills = self.manager.available();
+        // The model-facing CATALOG, not every discovered skill (ADR-0058): a
+        // conditional (`paths:`) skill is excluded until a touched file activates
+        // it, and a `disable-model-invocation` skill is dropped entirely. Built
+        // fresh per `spec()` call, so a newly-activated skill appears next turn.
+        let skills = self.manager.catalog();
         if skills.is_empty() {
             return NO_SKILLS_TEXT.to_string();
         }

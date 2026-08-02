@@ -1584,6 +1584,7 @@ async fn proactive_compacts_before_first_pass() {
         RunEnv {
             tool_ctx: &ctx,
             hooks: None,
+            skill_activation: None,
         },
         &mut deps,
         RunOpts::default(),

@@ -59,6 +59,11 @@ pub(crate) struct RunSpawn {
     pub(crate) subagents: Arc<crate::subagents::SubagentRegistry>,
     pub(crate) session: crate::session::Session,
     pub(crate) hooks: Arc<crate::hooks::HookManager>,
+    /// The disk-skill manager (ADR-0058): the Agent discovered it once at
+    /// launch. Threaded into each Run's [`crate::run::Capture`] so
+    /// `crate::run::batch` can activate a conditional skill at the tool-success
+    /// seam, and the same shared `Arc` the `skill` tool reads its catalog off.
+    pub(crate) skills: Arc<crate::skills::SkillManager>,
 }
 
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
@@ -95,6 +100,10 @@ pub(crate) struct AgentDeps {
     /// at launch. Threaded into each Run's [`crate::run::Capture`] so `run` builds
     /// the Run's hook firing handle over it.
     hooks: Arc<crate::hooks::HookManager>,
+    /// The disk-skill manager (ADR-0058): threaded into each Run's
+    /// [`crate::run::Capture`] so `crate::run::batch` can activate a conditional
+    /// skill by touched path. Shared by `Arc` with the `skill` tool.
+    skills: Arc<crate::skills::SkillManager>,
 }
 
 impl AgentDeps {
@@ -112,6 +121,7 @@ impl AgentDeps {
             subagents,
             session,
             hooks,
+            skills,
         } = spawn;
         let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
@@ -125,6 +135,7 @@ impl AgentDeps {
             session,
             subagent_run_limit,
             hooks,
+            skills,
         }
     }
 
@@ -188,6 +199,11 @@ impl AgentDeps {
             // builds the Run's firing handle over it. Shared by Arc, like the tool
             // set - the manager is immutable for the Session's lifetime this phase.
             hooks: Arc::clone(&self.hooks),
+            // The disk-skill manager (ADR-0058): shared by Arc so `crate::run::batch`
+            // can activate a conditional skill by touched path and the `skill` tool
+            // reads the same activation state. The skill list is immutable for the
+            // Session; only its interior activation registry mutates.
+            skills: Arc::clone(&self.skills),
         }
     }
 
