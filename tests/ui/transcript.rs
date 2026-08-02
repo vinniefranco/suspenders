@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::presenter::Presenter;
 use crate::view_model::{DiffHunk, DiffLine, DiffSide};

@@ -55,61 +55,13 @@ pub use resume::{Drift, ResumeError, plan, resume};
 
 // ------------------------------------------------------------------
 // Terminal stop reason + settled outcome (shared with Run Settlement).
-// These types were introduced by the Settlement phase and are BUILT ON
-// here, not redefined.
+// `Settled`/`SettledEntry` are BUILT ON here; `StopReason` is the leaf
+// run-lifecycle vocabulary [`crate::stop_reason`], re-exported so the
+// Session Log's historical `session::log::StopReason` path keeps resolving
+// without importing it into any cycle (Voice reads the leaf directly).
 // ------------------------------------------------------------------
 
-/// A Run's terminal stop reason as it enters the Session Log and the
-/// settlement event. Spans the LLM-reported reasons that ride through a
-/// completed Run (`end_turn`, `max_tokens`, ...) and the Run-Limit reasons
-/// the loop mints (`turn_limit` at the max-turns bound, `turn_limit_stuck`
-/// when the loop-detector trips). `Error`/`Unknown` are the synthetic reasons
-/// Settlement writes for failed/cancelled Runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    EndTurn,
-    ToolUse,
-    MaxTokens,
-    StopSequence,
-    /// The Run ran out of Passes productively (baud `:turn_limit`).
-    RunLimit,
-    /// The Run ran out of Passes while stuck in a failure loop.
-    RunLimitStuck,
-    /// A failed Run's synthetic reason (baud `:error`).
-    Error,
-    /// A cancelled Run's synthetic reason (baud `:unknown`).
-    Unknown,
-}
-
-impl StopReason {
-    pub(super) fn as_str(&self) -> &'static str {
-        match self {
-            StopReason::EndTurn => "end_turn",
-            StopReason::ToolUse => "tool_use",
-            StopReason::MaxTokens => "max_tokens",
-            StopReason::StopSequence => "stop_sequence",
-            StopReason::RunLimit => "turn_limit",
-            StopReason::RunLimitStuck => "turn_limit_stuck",
-            StopReason::Error => "error",
-            StopReason::Unknown => "unknown",
-        }
-    }
-
-    // Unknown strings degrade to `Unknown` rather than minting reasons from
-    // disk (baud: `String.to_existing_atom` guarded by a known set).
-    pub(super) fn from_str(s: &str) -> StopReason {
-        match s {
-            "end_turn" => StopReason::EndTurn,
-            "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::MaxTokens,
-            "stop_sequence" => StopReason::StopSequence,
-            "turn_limit" => StopReason::RunLimit,
-            "turn_limit_stuck" => StopReason::RunLimitStuck,
-            "error" => StopReason::Error,
-            _ => StopReason::Unknown,
-        }
-    }
-}
+pub(crate) use crate::stop_reason::StopReason;
 
 /// How a settled Run resolved (baud's `:completed | :failed | :cancelled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

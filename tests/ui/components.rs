@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ui::transcript::Transcript;
 use crate::view_model::DiffLine;

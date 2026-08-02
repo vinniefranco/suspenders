@@ -22,6 +22,7 @@ pub mod presenter;
 pub mod run;
 pub mod session;
 pub mod skills;
+pub mod stop_reason;
 pub mod subagents;
 pub mod text;
 pub mod tool;
