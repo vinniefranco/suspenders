@@ -1,3 +1,4 @@
+
 use super::*;
 use crate::approvals::ApprovalMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1030,462 +1031,154 @@ async fn run_effect_theme_choice_of_a_file_broken_after_open_refuses_and_persist
     );
 }
 
-// END-TO-END inline freeze (ADR-0046): driving `dispatch` with a fold that
-// commits must (a) blit the committed slice into the TestBackend's native
-// SCROLLBACK via `insert_before`, and (b) leave that item OUT of the pending
-// region on the next draw. This is the whole point of the seam - the item
-// moves from the live frame to frozen scrollback - and it is headless-
-// testable because `Terminal::insert_before` works under `TestBackend`
-// (via `append_lines`) when the viewport is `Inline`.
-#[tokio::test(flavor = "multi_thread")]
-async fn dispatch_commit_freezes_the_slice_into_scrollback_and_drops_it_from_pending() {
-    let dir = TempDir::new().unwrap();
-    let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
-    let ctx = adapter_ctx(&agent);
-    let mut state = test_state();
+// FIRST FRAME (ADR-0046, fullscreen): a single draw of a launch Screen shows a
+// COMPLETE frame - the startup Header banner, the composer placeholder, and the
+// flat footer - all in the viewport, with NO keypress and no commit seam. The
+// whole transcript renders each frame, so the header stays visible (it is not
+// frozen into scrollback).
+#[test]
+fn first_frame_renders_header_composer_and_footer() {
+    let state = test_state();
     let mut cache = components::RenderCache::new();
 
-    // An INLINE TestBackend, deliberately SHORT (a 3-row terminal with a
-    // 1-row inline viewport) so a multi-row committed slice overflows the top
-    // of the terminal buffer and lands in the backend's `scrollback()`.
-    let mut terminal = Terminal::with_options(
-        TestBackend::new(30, 3),
-        TerminalOptions {
-            viewport: TermViewport::Inline(1),
-        },
-    )
-    .unwrap();
-
-    // A fresh Screen opens with the startup Header banner, which spans
-    // several rows at this narrow width - so the committed slice overflows
-    // the 3-row terminal and its top rows reach the backend's scrollback.
-    // run_started makes the whole leading prefix terminal, so the fold emits
-    // Effect::Commit.
-    let core = Screen::new(ScreenOpts::default());
-    let (core, effects) = core.apply_event(Event::run_started("r1"));
-    assert!(
-        effects.iter().any(|e| matches!(e, Effect::Commit { .. })),
-        "the fold emitted a Commit to freeze"
-    );
-
-    let core = dispatch(
-        &mut terminal,
-        core,
-        effects,
-        &mut Adapter {
-            ctx: &ctx,
-            state: &mut state,
-            cache: &mut cache,
-        },
-    )
-    .await
-    .expect("dispatch freezes without error");
-
-    // (a) The committed header landed in NATIVE SCROLLBACK (above the inline
-    // viewport), not in the live viewport buffer.
-    let scrollback: String = {
-        let sb = terminal.backend().scrollback();
-        (0..sb.area.height)
-            .map(|y| {
-                (0..sb.area.width)
-                    .map(|x| sb.cell((x, y)).expect("cell").symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert!(
-        scrollback.contains(">_ suspenders"),
-        "the committed header froze into native scrollback:\n{scrollback}"
-    );
-
-    // The adapter advanced the high-water mark ONLY after the successful blit
-    // (transactional commit): the header is now committed.
-    assert!(
-        core.transcript().committed_high_water() >= 1,
-        "the mark advanced post-blit"
-    );
-
-    // (b) The committed slice has LEFT the pending region: drawing the live
-    // frame now shows the pending body WITHOUT it (it is committed, drawn from
-    // scrollback on a real TTY). Grow the inline viewport first so the body +
-    // status + composer layout has room to render.
-    terminal.backend_mut().resize(30, 8);
-    terminal
-        .resize(ratatui::layout::Rect::new(0, 0, 30, 6))
-        .unwrap();
+    // A FULLSCREEN TestBackend (the default viewport): tall enough to hold the
+    // header, the body, the footer, and the composer.
+    let mut terminal = test_terminal(48, 20);
     let conn = components::ConnectionFacts {
         base_url: "http://test".into(),
         model: "m".into(),
     };
-    draw(
-        &mut terminal,
-        &core,
-        &mut cache,
-        components::FrameCtx {
-            conn: conn.view(),
-            anim: components::Anim::default(),
-            theme: theme::dark(),
-        },
-    )
-    .unwrap();
-    let pending: String = {
-        let buf = terminal.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf.cell((x, y)).expect("cell").symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert!(
-        !pending.contains(">_ suspenders"),
-        "the committed header is gone from the pending region:\n{pending}"
-    );
-}
 
-// FIRST-FRAME bug (ADR-0046): on startup the header must be committed to
-// native scrollback UP FRONT, so frame 1 already shows the composer +
-// status - WITHOUT any keypress. This mirrors `run_loop`'s three-beat first
-// frame (draw to establish the inline viewport, startup `dispatch` with an
-// EMPTY effect vector whose trailing-freeze flushes the committable notices,
-// then a clean pending redraw). Before the fix the initial draw painted the
-// header still uncommitted and the composer/status only appeared after the
-// first key triggered the deferred commit.
-#[tokio::test(flavor = "multi_thread")]
-async fn startup_commits_header_and_frame_one_shows_composer_and_status() {
-    let dir = TempDir::new().unwrap();
-    let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
-    let ctx = adapter_ctx(&agent);
-    let mut state = test_state();
-    let mut cache = components::RenderCache::new();
-
-    // An INLINE TestBackend that is SHORT (a small terminal with a 5-row
-    // inline viewport) so the committed header overflows the top of the
-    // terminal buffer and lands in the backend's scrollback, while the
-    // viewport still fits the status bar + composer chrome.
-    let mut terminal = Terminal::with_options(
-        TestBackend::new(40, 6),
-        TerminalOptions {
-            viewport: TermViewport::Inline(5),
-        },
-    )
-    .unwrap();
-
-    let conn = components::ConnectionFacts {
-        base_url: "http://test".into(),
-        model: "m".into(),
-    };
-    let anim = components::Anim::default();
-
-    // A launch Screen: the startup Header banner (terminal, hence
-    // committable) with the high-water mark at 0.
-    let mut screen = Some(Screen::new(ScreenOpts::default()));
-    assert_eq!(
-        screen.as_ref().unwrap().transcript().committed_high_water(),
-        0,
-        "nothing committed before the startup pass"
-    );
-    let committable = screen.as_ref().unwrap().transcript().committable_upto();
-    assert!(committable >= 1, "the header is committable at launch");
-
-    // Beat 1: establish the inline viewport.
+    let screen = Screen::new(ScreenOpts::default());
     draw_previewed(
         &mut terminal,
-        screen.as_ref().unwrap(),
+        &screen,
         &conn,
-        anim,
+        components::Anim::default(),
         &mut cache,
         &state,
     )
     .unwrap();
 
-    // Beat 2: the startup commit - an EMPTY effect vector, so ONLY dispatch's
-    // trailing freeze runs, flushing exactly the committable notices.
-    screen = Some(
-        dispatch(
-            &mut terminal,
-            screen.take().unwrap(),
-            Vec::new(),
-            &mut Adapter {
-                ctx: &ctx,
-                state: &mut state,
-                cache: &mut cache,
-            },
-        )
-        .await
-        .expect("startup dispatch freezes without error"),
-    );
-
-    // Beat 3: the clean pending redraw.
-    draw_previewed(
-        &mut terminal,
-        screen.as_ref().unwrap(),
-        &conn,
-        anim,
-        &mut cache,
-        &state,
-    )
-    .unwrap();
-
-    let core = screen.as_ref().unwrap();
-
-    // The startup pass advanced the high-water mark past the notices - the
-    // header is now committed, with NO simulated keypress.
-    assert_eq!(
-        core.transcript().committed_high_water(),
-        committable,
-        "the startup commit advanced the mark past the committable notices"
-    );
-
-    // (a) The header froze into NATIVE SCROLLBACK.
-    let scrollback: String = {
-        let sb = terminal.backend().scrollback();
-        (0..sb.area.height)
-            .map(|y| {
-                (0..sb.area.width)
-                    .map(|x| sb.cell((x, y)).expect("cell").symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let frame = buffer_text(&terminal);
     assert!(
-        scrollback.contains(">_ suspenders"),
-        "frame 1: the header is in scrollback:\n{scrollback}"
-    );
-
-    // (b) The live viewport already shows the composer placeholder AND footer
-    // content on frame 1 - no keypress needed.
-    let viewport = buffer_text(&terminal);
-    assert!(
-        viewport.contains("Type your message"),
-        "frame 1: the composer placeholder is drawn:\n{viewport}"
+        frame.contains(">_ suspenders"),
+        "the header wordmark renders in the fullscreen frame:\n{frame}"
     );
     assert!(
-        viewport.contains("model m") && viewport.contains("? for shortcuts"),
-        "frame 1: the flat footer (model fact + shortcuts hint) is drawn:\n{viewport}"
+        frame.contains("Type your message"),
+        "the composer placeholder is drawn:\n{frame}"
     );
-    // The header is NOT re-drawn in the pending region (it is committed).
     assert!(
-        !viewport.contains(">_ suspenders"),
-        "frame 1: the committed header is gone from the pending region:\n{viewport}"
+        frame.contains("model m") && frame.contains("? for shortcuts"),
+        "the flat footer (model fact + shortcuts hint) is drawn:\n{frame}"
     );
 }
 
-// Ctrl-S peek (BUG 1, ADR-0046): driving `dispatch` with a `PeekPending`
-// effect must (a) blit the FULL pending body into the TestBackend's native
-// SCROLLBACK via `insert_before`, and (b) leave the high-water mark UNCHANGED -
-// it is a non-committing peek, so nothing freezes and the same body redraws
-// (clipped) in the live viewport next frame.
+// A settled transcript item renders in the fullscreen frame (ADR-0046): with
+// the whole transcript drawn each frame, a run's settled answer appears in the
+// viewport - there is no commit seam moving it out of view.
 #[tokio::test(flavor = "multi_thread")]
-async fn dispatch_peek_pending_blits_the_full_body_and_keeps_the_mark() {
-    let dir = TempDir::new().unwrap();
-    let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
-    let ctx = adapter_ctx(&agent);
-    let mut state = test_state();
+async fn a_settled_item_renders_in_the_fullscreen_frame() {
+    let state = test_state();
     let mut cache = components::RenderCache::new();
+    let mut terminal = test_terminal(48, 20);
+    let conn = components::ConnectionFacts {
+        base_url: "http://test".into(),
+        model: "m".into(),
+    };
 
-    // A SHORT inline terminal so the pending body overflows the live viewport
-    // and the peek's blit reaches the backend's scrollback.
-    let mut terminal = Terminal::with_options(
-        TestBackend::new(60, 3),
-        TerminalOptions {
-            viewport: TermViewport::Inline(1),
-        },
-    )
-    .unwrap();
-
-    // First settle the transcript so the peek is the ONLY thing dispatch can
-    // do: a live (un-resulted) `run_command` tool call is NON-terminal, so
-    // `committable_upto` stops before it and dispatch's trailing commit is a
-    // no-op - isolating the peek's effect on the mark. The header + call are
-    // committed up front so the pending body is a stable, live tool group.
+    // Stream + settle an assistant answer.
     let core = Screen::new(ScreenOpts::default());
     let (core, _) = core.apply_event(Event::run_started("r1"));
-    let (core, _) = core.apply_event(Event::tool_call(
-        "t1",
-        "run_shell_command",
-        serde_json::json!({"command": "echo peek-me"}),
+    let (core, _) = core.apply_event(Event::message_start(1));
+    let (core, _) = core.apply_event(Event::message_update(
+        crate::llm::Delta::Text("all done here".into()),
+        vec![crate::content::ContentBlock::Text {
+            text: "all done here".into(),
+        }],
     ));
-    // Freeze everything committable (the header), leaving the live call
-    // pending. Do it through dispatch so the mark reflects real adapter state.
-    let prime = core.transcript().committable_upto();
-    let core = dispatch(
+    let (core, _) = core.apply_event(Event::message_end(
+        vec![crate::content::ContentBlock::Text {
+            text: "all done here".into(),
+        }],
+        StopReason::EndTurn,
+    ));
+
+    draw_previewed(
         &mut terminal,
-        core,
-        vec![Effect::Commit { count: prime }],
-        &mut Adapter {
-            ctx: &ctx,
-            state: &mut state,
-            cache: &mut cache,
-        },
-    )
-    .await
-    .expect("prime commit succeeds");
-
-    let mark_before = core.transcript().committed_high_water();
-    let (core, effects) = core.handle_key(crate::ui::screen::Key::ShowMore);
-    assert_eq!(
-        effects,
-        vec![Effect::PeekPending],
-        "Ctrl-S minted exactly the peek"
-    );
-
-    let core = dispatch(
-        &mut terminal,
-        core,
-        effects,
-        &mut Adapter {
-            ctx: &ctx,
-            state: &mut state,
-            cache: &mut cache,
-        },
-    )
-    .await
-    .expect("dispatch peeks without error");
-
-    // (a) The FULL pending body landed via `insert_before`: its rows scroll up
-    // from the live viewport into native SCROLLBACK (rows past the top of the
-    // short terminal). Capture the scrollback AND the live buffer so the check
-    // is robust to exactly where the short terminal's boundary falls.
-    let render = |area: ratatui::layout::Rect, cell: &dyn Fn(u16, u16) -> String| -> String {
-        (0..area.height)
-            .map(|y| (0..area.width).map(|x| cell(x, y)).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let scrollback = {
-        let sb = terminal.backend().scrollback();
-        render(sb.area, &|x, y| {
-            sb.cell((x, y)).expect("cell").symbol().to_string()
-        })
-    };
-    let live = {
-        let buf = terminal.backend().buffer();
-        render(buf.area, &|x, y| {
-            buf.cell((x, y)).expect("cell").symbol().to_string()
-        })
-    };
-    let combined = format!("{scrollback}\n{live}");
-    assert!(
-        combined.contains("echo peek-me"),
-        "the full pending body was peeked into scrollback + viewport:\n{combined}"
-    );
-
-    // (b) The high-water mark is UNCHANGED - the peek committed NOTHING.
-    assert_eq!(
-        core.transcript().committed_high_water(),
-        mark_before,
-        "a peek does not advance the high-water mark (non-committing)"
-    );
-}
-
-// RedrawScrollback (ADR-0052): a compact toggle over frozen scrollback must
-// (a) leave the high-water mark UNCHANGED (the committed prefix stays
-// committed), and (b) re-sync the render cache to the new compact so the very
-// next pending draw hides the committed-then-uncommitted thought. The SPIKE
-// (see `redraw_scrollback`) established that native scrollback above the fold
-// cannot be un-drawn portably (the degraded fallback); this pins the parts
-// that ARE correct - the mark and the fresh pending render.
-#[tokio::test(flavor = "multi_thread")]
-async fn dispatch_redraw_scrollback_keeps_the_mark_and_resyncs_to_compact() {
-    use crate::llm::Delta;
-    use crate::view_model::TranscriptItem;
-
-    let dir = TempDir::new().unwrap();
-    let agent = start_agent(&dir, FakeLlm::script(vec![Entry::just(end_turn("hi"))]));
-    let ctx = adapter_ctx(&agent);
-    let mut state = test_state();
-    let mut cache = components::RenderCache::new();
-    let mut terminal = Terminal::with_options(
-        TestBackend::new(60, 8),
-        TerminalOptions {
-            viewport: TermViewport::Inline(3),
-        },
+        &core,
+        &conn,
+        components::Anim::default(),
+        &mut cache,
+        &state,
     )
     .unwrap();
 
-    // Build a committed thought purely (the multi-dispatch stream is exercised
-    // elsewhere): stream + settle a thought, then freeze the terminal prefix as
-    // `commit_items` would. The pure `handle_key` then flips compact and mints
-    // the RedrawScrollback whose ADAPTER handling this test pins.
-    let core = Screen::new(ScreenOpts::default());
-    let (core, _) = core.apply_event(Event::message_start(1));
-    let (core, _) = core.apply_event(Event::message_update(
-        Delta::Thinking("thinking".into()),
-        vec![crate::content::ContentBlock::Thinking {
-            text: "a secret thought".into(),
-        }],
-    ));
-    let (mut core, _) = core.apply_event(Event::message_end(vec![], StopReason::EndTurn));
-    core.mark_committed(core.transcript().committable_upto());
+    let frame = buffer_text(&terminal);
     assert!(
-        core.transcript()
-            .items()
-            .iter()
-            .any(|i| matches!(i, TranscriptItem::Thinking { .. })),
-        "a committed Thinking item exists"
+        frame.contains("all done here"),
+        "the settled answer renders in the fullscreen frame:\n{frame}"
     );
-    let mark_before = core.transcript().committed_high_water();
-    assert!(mark_before >= 1, "the thought committed");
+}
 
-    // Ctrl+O: the fold flips compact and mints RedrawScrollback.
-    let (core, effects) = core.handle_key(crate::ui::screen::Key::ToggleCompact);
-    assert!(core.compact_mode, "compact is now on");
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::RedrawScrollback)),
-        "the toggle minted a scrollback redraw: {effects:?}"
-    );
-
-    let core = dispatch(
-        &mut terminal,
-        core,
-        effects,
-        &mut Adapter {
-            ctx: &ctx,
-            state: &mut state,
-            cache: &mut cache,
-        },
-    )
-    .await
-    .expect("redraw dispatches without error");
-
-    // (a) The high-water mark is UNCHANGED - the prefix stays committed.
-    assert_eq!(
-        core.transcript().committed_high_water(),
-        mark_before,
-        "RedrawScrollback must not move the high-water mark"
-    );
-    // (b) The redraw actually re-synced the CACHE to the new compact: blitting
-    // the committed prefix from the re-synced cache now renders the secret
-    // thought as ZERO lines (compact hides a Thinking item entirely, like
-    // `cache_sync_rebuilds_when_compact_hides_a_thought`). Rendering FROM THE
-    // CACHE (not re-asserting the pure predicate) proves the adapter's
-    // `sync_commit_cache` took effect.
-    let hw = core.transcript().committed_high_water();
-    let items: Vec<_> = core.transcript().items().iter().take(hw).cloned().collect();
-    let theme = state.themes.active().clone();
-    let slice = components::CommittedSlice {
-        cache: &cache,
-        items: &items,
-        hw: 0,
-        count: hw,
-        theme: &theme,
+// RESIZE regression (ADR-0046): the whole transcript is redrawn from the model
+// at the current size, so shrinking the terminal re-wraps the header cleanly -
+// no leftover wide cells from the previous width. This guards the corruption
+// the old inline model showed when committed scrollback could not re-wrap.
+#[test]
+fn resize_re_renders_the_header_cleanly_at_the_new_width() {
+    let state = test_state();
+    let mut cache = components::RenderCache::new();
+    let conn = components::ConnectionFacts {
+        base_url: "http://test".into(),
+        model: "m".into(),
     };
-    let height = components::commit_slice_height(&slice, 60).max(1);
-    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 60, height));
-    components::render_committed_slice(&mut buf, &slice);
-    let text: String = (0..buf.area.height)
-        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-        .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
-        .collect();
+    let screen = Screen::new(ScreenOpts::default());
+
+    // Draw WIDE first, so the header lays out across a wide row.
+    let mut terminal = test_terminal(80, 20);
+    draw_previewed(
+        &mut terminal,
+        &screen,
+        &conn,
+        components::Anim::default(),
+        &mut cache,
+        &state,
+    )
+    .unwrap();
     assert!(
-        !text.contains("a secret thought"),
-        "the re-synced cache blits the committed thought as 0 lines under compact:\n{text}"
+        buffer_text(&terminal).contains(">_ suspenders"),
+        "the header renders at the wide width"
+    );
+
+    // Shrink to a NARROW width and redraw from the model.
+    terminal.backend_mut().resize(30, 20);
+    terminal
+        .resize(ratatui::layout::Rect::new(0, 0, 30, 20))
+        .unwrap();
+    draw_previewed(
+        &mut terminal,
+        &screen,
+        &conn,
+        components::Anim::default(),
+        &mut cache,
+        &state,
+    )
+    .unwrap();
+
+    let narrow = buffer_text(&terminal);
+    // Every drawn row fits the new width - no row is wider than 30 cells, so no
+    // leftover wide cells survive the shrink.
+    for line in narrow.lines() {
+        assert!(
+            line.chars().count() <= 30,
+            "a row overflows the narrow width (leftover wide cells):\n{narrow}"
+        );
+    }
+    // The header still renders (re-wrapped for the narrow width).
+    assert!(
+        narrow.contains("suspenders"),
+        "the header wordmark re-renders at the narrow width:\n{narrow}"
     );
 }
