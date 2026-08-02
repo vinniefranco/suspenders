@@ -537,15 +537,16 @@ impl SessionConfig {
         name: &str,
         server: &crate::mcp::McpServerConfig,
     ) -> Result<(), SessionError> {
-        let value = serde_json::to_value(server).map_err(|e| {
-            SessionError(format!("failed to serialize MCP server `{name}`: {e}"))
-        })?;
+        let value = serde_json::to_value(server)
+            .map_err(|e| SessionError(format!("failed to serialize MCP server `{name}`: {e}")))?;
 
         let existing = match std::fs::read_to_string(path) {
             Ok(raw) => Some(raw),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                return Err(SessionError(format!("failed to read config at {path}: {e}")));
+                return Err(SessionError(format!(
+                    "failed to read config at {path}: {e}"
+                )));
             }
         };
 
@@ -569,7 +570,9 @@ impl SessionConfig {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => {
-                return Err(SessionError(format!("failed to read config at {path}: {e}")));
+                return Err(SessionError(format!(
+                    "failed to read config at {path}: {e}"
+                )));
             }
         };
 

@@ -182,7 +182,10 @@ fn oauth_flags_populate_the_block_enabled() {
         oauth.authorization_url.as_deref(),
         Some("https://auth.example.com/authorize")
     );
-    assert_eq!(oauth.token_url.as_deref(), Some("https://auth.example.com/token"));
+    assert_eq!(
+        oauth.token_url.as_deref(),
+        Some("https://auth.example.com/token")
+    );
     assert_eq!(
         oauth.scopes,
         Some(vec!["read".to_string(), "write".to_string()])
@@ -292,6 +295,10 @@ fn list_renders_each_server_with_transport_and_scope() {
     print_list(&cfg, &mut |l| lines.push(l.to_string()));
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("pytools"), "got: {:?}", lines);
-    assert!(lines[0].contains("python -m srv (stdio)"), "got: {:?}", lines);
+    assert!(
+        lines[0].contains("python -m srv (stdio)"),
+        "got: {:?}",
+        lines
+    );
     assert!(lines[0].contains("[project]"), "got: {:?}", lines);
 }

@@ -1606,9 +1606,7 @@ fn merge_mcp_server_errors_on_a_malformed_or_non_object_root() {
     // A non-object root is an Err.
     assert!(merge_mcp_server(Some("[]"), "x", serde_json::json!({})).is_err());
     // A non-object `mcp_servers` is an Err.
-    assert!(
-        merge_mcp_server(Some(r#"{"mcp_servers": 5}"#), "x", serde_json::json!({})).is_err()
-    );
+    assert!(merge_mcp_server(Some(r#"{"mcp_servers": 5}"#), "x", serde_json::json!({})).is_err());
 }
 
 #[test]

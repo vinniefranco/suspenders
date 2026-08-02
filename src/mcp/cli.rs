@@ -257,7 +257,9 @@ fn parse_headers(headers: &[String]) -> Result<BTreeMap<String, String>, String>
             .ok_or_else(|| format!("`--header` must be `Name: Value`, got: {header:?}"))?;
         let name = name.trim();
         if name.is_empty() {
-            return Err(format!("`--header` name must be non-empty, got: {header:?}"));
+            return Err(format!(
+                "`--header` name must be non-empty, got: {header:?}"
+            ));
         }
         map.insert(name.to_string(), value.trim_start().to_string());
     }

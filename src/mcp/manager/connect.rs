@@ -433,9 +433,9 @@ impl SseClientTransport {
                 .ok_or_else(|| SseTransportError("SSE stream closed before endpoint".into()))?
                 .map_err(|e| SseTransportError(format!("SSE read failed: {e}")))?;
             if event.event.as_deref() == Some("endpoint") {
-                let data = event.data.ok_or_else(|| {
-                    SseTransportError("SSE endpoint event had no data".into())
-                })?;
+                let data = event
+                    .data
+                    .ok_or_else(|| SseTransportError("SSE endpoint event had no data".into()))?;
                 break resolve_url(url, data.trim());
             }
         };
@@ -528,7 +528,10 @@ fn resolve_url(base: &str, endpoint: &str) -> String {
     // A bare relative value joins onto the base path's directory (everything up
     // to and including the last `/`).
     let base_no_query = base.split('?').next().unwrap_or(base);
-    let dir_end = base_no_query.rfind('/').map(|i| i + 1).unwrap_or(base_no_query.len());
+    let dir_end = base_no_query
+        .rfind('/')
+        .map(|i| i + 1)
+        .unwrap_or(base_no_query.len());
     format!("{}{endpoint}", &base_no_query[..dir_end])
 }
 
