@@ -14,7 +14,6 @@ use tempfile::TempDir;
 use crate::content::{ContentBlock, Message, Usage};
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::extensions::Registered;
 use crate::llm::model::Model;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{Llm, LlmRequest, StreamEvent};
@@ -125,15 +124,11 @@ pub(super) async fn run_with(
     mut deps: FakeDeps,
 ) -> (Outcome, FakeDeps) {
     let conv = conversation(session, prompt);
-    let extensions: Vec<Registered> = Vec::new();
     let ctx = tool_ctx(session);
     let outcome = run(
         conv,
         session,
-        RunEnv {
-            extensions: &extensions,
-            tool_ctx: &ctx,
-        },
+        RunEnv { tool_ctx: &ctx },
         &mut deps,
         RunOpts::default(),
     )

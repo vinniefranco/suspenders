@@ -15,7 +15,7 @@
 //! * The display history is the Transcript STORE's (ADR-0034): every event arm
 //!   that shows something delegates one store verb. The store holds the
 //!   history's invariants (appends never bump the revision, Tool Result
-//!   pairing by id, Presentment on every append); this fold holds the
+//!   pairing by id, the tool-display swap on a Tool Result); this fold holds the
 //!   choreography - which event means which verb - and the Voice: the startup
 //!   Header, stop reasons, cancellation notes, and wave lines are authored
 //!   HERE and recorded through the store.
@@ -36,7 +36,6 @@
 use crate::approvals::ApprovalMode;
 use crate::conversation::compaction_target;
 use crate::event::Event;
-use crate::extensions::Registered;
 use crate::llm::response::StopReason;
 use crate::tool::caps::Question;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
@@ -415,12 +414,12 @@ pub enum Effect {
 /// The pure Screen state (ADR-0034; the renamed fold root of baud's
 /// `%Baud.UI.Transcript{}`).
 ///
-/// The Transcript store's extensions are not `Clone`/`PartialEq`, so the core
-/// is not `Clone`; the fold takes and returns an owned `Screen` by value,
-/// mirroring the Elixir struct-threading style.
+/// The Transcript store holds a live [`Streaming`] snapshot and is not
+/// `Clone`/`PartialEq`, so the core is not `Clone`; the fold takes and returns
+/// an owned `Screen` by value, mirroring the Elixir struct-threading style.
 pub struct Screen {
-    /// The Transcript (ADR-0034): the display-side history, the streaming
-    /// snapshot, and Presentment, behind [`crate::ui::transcript`]'s store
+    /// The Transcript (ADR-0034): the display-side history and the streaming
+    /// snapshot, behind [`crate::ui::transcript`]'s store
     /// seam. Private on purpose - reads go through [`Screen::transcript`]
     /// (the render adapter's window), mutation only through the folds and the
     /// submitted/steered outcome hooks.
@@ -508,7 +507,6 @@ const WHEEL_STEP: usize = 3;
 pub struct ScreenOpts {
     pub context_budget: Option<u64>,
     pub compaction_slack: f64,
-    pub extensions: Vec<Registered>,
     pub history: Vec<String>,
     /// Launch-time info lines the adapter authors (context-file skips today):
     /// news from before the event loop existed, recorded right after the
@@ -665,7 +663,7 @@ impl Screen {
             cwd,
             tip_seed,
         } = opts.header;
-        let mut transcript = Transcript::new(opts.extensions);
+        let mut transcript = Transcript::new();
         transcript.header(
             HEADER_TITLE,
             version,
@@ -1020,8 +1018,8 @@ impl Screen {
                 (self, vec![])
             }
 
-            // An Extension crashed and was skipped (fail-open, ADR-0007) - the
-            // same report line the store's own Presentment failures use.
+            // A tool-side subsystem (MCP init/ops today) failed and was skipped
+            // fail-open (ADR-0007) - recorded as one visible report line.
             Event::ExtensionError {
                 extension,
                 stage,

@@ -31,14 +31,13 @@ use crate::mcp::McpServerView;
 use crate::tool::caps::Question;
 use crate::view_model::SelectorRow;
 
-/// The `extension_error` stage: which point in the extension's lifecycle crashed
-/// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
-/// deferred `:present`).
+/// The `extension_error` stage: which point a tool-side subsystem crashed
+/// (fail-open, ADR-0007). Today the Agent's MCP init / ops report `PreRun`; the
+/// other variants remain the wire-stage labels the report line renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     PreRun,
     PostRun,
-    /// The Presentment stage (deferred with the Transcript Item type).
     Present,
 }
 
@@ -527,8 +526,9 @@ impl Event {
 
     // ---- The rest ----
 
-    /// Constructs an `extension_error` from a pipeline [`crate::extensions::Failure`]'s
-    /// parts: the extension name, the stage that crashed, and the message.
+    /// Constructs an `extension_error` from a tool-side subsystem failure's
+    /// parts: the source name, the stage that crashed, and the message. Used by
+    /// the Agent's MCP init / ops fail-open reporting (ADR-0056).
     pub fn extension_error(
         extension: impl Into<String>,
         stage: Stage,

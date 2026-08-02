@@ -49,7 +49,6 @@ fn defaults_come_from_config() {
     assert_eq!(session.llm_module, "Suspenders.FakeLLM");
     assert_eq!(session.context_budget, cfg().context_budget);
     assert_eq!(session.model.max_tokens, cfg().max_tokens);
-    assert_eq!(session.extensions, Vec::<String>::new());
 }
 
 #[test]
@@ -212,7 +211,6 @@ fn opts_override_config() {
     let o = SessionOpts {
         root: Some("/tmp".into()),
         llm_module: Some("SomeLLM".into()),
-        extensions: Some(vec!["some_extension".into()]),
         context_budget: Some(5_000),
         compaction_slack: Some(0.1),
         compaction_keep: Some(0.4),
@@ -223,7 +221,6 @@ fn opts_override_config() {
     };
     let session = Session::build(o, &cfg()).unwrap();
     assert_eq!(session.llm_module, "SomeLLM");
-    assert_eq!(session.extensions, vec!["some_extension".to_string()]);
     assert_eq!(session.context_budget, Some(5_000));
     assert_eq!(session.compaction_slack, 0.1);
     assert_eq!(session.compaction_keep, 0.4);
@@ -359,20 +356,6 @@ fn skip_next_speaker_defaults_on_in_base_and_test_defaults() {
     // with `skip_next_speaker: Some(false)`.
     assert!(SessionConfig::base().skip_next_speaker);
     assert!(SessionConfig::test_defaults().skip_next_speaker);
-}
-
-// The silent-regression guard for the todo-render defect (ADR-0048): the
-// shipped default MUST enlist the `todo` extension, else `todo_write` dumps
-// raw JSON (the Presenter never runs). `base()` IS the shipped default (there
-// is no `Default` impl; the app builds from `base()` overlaid by config).
-#[test]
-fn the_shipped_default_config_enlists_the_todo_extension() {
-    assert!(
-        SessionConfig::base()
-            .extensions
-            .contains(&"todo".to_string()),
-        "the shipped default must register the todo extension (risk #5)"
-    );
 }
 
 #[test]

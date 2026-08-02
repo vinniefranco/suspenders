@@ -83,6 +83,82 @@ async fn nonzero_exit_code_is_an_error_with_output_and_code() {
     assert!(err.contains("[exit code: 3]"));
 }
 
+// ---- exit-code badge Artifact (relocated from the run_command extension) ----
+
+async fn run_rich(input: Value, ctx: &ToolCtx) -> crate::tool::ToolOutput {
+    RunCommand
+        .run_rich(&input, ctx)
+        .await
+        .expect("run_shell_command always returns Ok(ToolOutput) for a completed run")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_rich_attaches_the_exit_code_artifact_on_success() {
+    let tmp = TempDir::new().unwrap();
+    let output = run_rich(json!({"command": "true"}), &ctx(tmp.path())).await;
+
+    assert!(!output.is_error);
+    assert_eq!(output.artifacts.get(keys::EXIT_CODE), Some(&json!(0)));
+    assert!(!output.artifacts.contains_key(keys::TIMED_OUT));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_rich_reports_a_failed_command_as_ok_with_is_error_and_the_exit_code() {
+    // A nonzero-exit command is NOT a tool failure: `run_rich` returns
+    // `Ok(ToolOutput { is_error: true, .. })` so the exit-code Artifact rides
+    // alongside `is_error` (Option A). The model still sees is_error: true.
+    let tmp = TempDir::new().unwrap();
+    let output = run_rich(json!({"command": "echo boom; exit 3"}), &ctx(tmp.path())).await;
+
+    assert!(output.is_error);
+    assert!(crate::content::result_blocks_text(&output.blocks).contains("boom"));
+    assert_eq!(output.artifacts.get(keys::EXIT_CODE), Some(&json!(3)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_rich_marks_a_timeout_and_attaches_no_exit_code() {
+    let tmp = TempDir::new().unwrap();
+    let mut c = ctx(tmp.path());
+    c.command_timeout_ms = 100;
+
+    // A busy loop (not `sleep`, which the sleep guard blocks) exercises the
+    // timeout path so the badge reads `✗ timed out`.
+    let output = run_rich(json!({"command": "while true; do :; done"}), &c).await;
+
+    assert!(output.is_error);
+    assert_eq!(output.artifacts.get(keys::TIMED_OUT), Some(&json!(true)));
+    assert!(!output.artifacts.contains_key(keys::EXIT_CODE));
+}
+
+// ---- noise-run condensing (relocated from the condense extension) ----
+
+#[cfg(unix)]
+#[tokio::test]
+async fn condenses_a_long_run_of_compile_progress_in_the_tool_output() {
+    // The tool applies condensing to its own model-facing output: a run of >= 5
+    // same-class noise lines collapses to its first line plus an exact-count
+    // marker. Printed via a single echo so the merged stdout carries the run.
+    let tmp = TempDir::new().unwrap();
+    let script = "echo '   Compiling a v0.1.0'; \
+                  echo '   Compiling b v0.1.0'; \
+                  echo '   Compiling c v0.1.0'; \
+                  echo '   Compiling d v0.1.0'; \
+                  echo '   Compiling e v0.1.0'; \
+                  echo done";
+    let out = run(json!({"command": script}), &ctx(tmp.path()))
+        .await
+        .unwrap();
+
+    assert!(out.contains("   Compiling a v0.1.0"));
+    assert!(out.contains("[condense: 4 more compile-progress lines omitted]"));
+    // The non-noise lines and the exit tail survive verbatim.
+    assert!(out.contains("done"));
+    assert!(out.ends_with("[exit code: 0]"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn pipefail_reports_the_producers_failure_not_the_consumers_success() {

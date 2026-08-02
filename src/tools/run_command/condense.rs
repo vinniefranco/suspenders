@@ -1,10 +1,10 @@
-//! The condense Extension: collapses noise runs in run_command results.
+//! Noise-run condensing for `run_shell_command` output.
 //!
 //! Measurement across real Session Logs put run_command results at ~11% of
 //! Conversation token mass, and roughly half of that is noise lines: cargo
 //! compile progress and per-test PASS lines. A passing `cargo test` is ~70%
-//! noise, `cargo nextest` ~99%. [`post_run`](Condense::post_run) rewrites the
-//! model-facing content BEFORE Shaping: each maximal run of consecutive
+//! noise, `cargo nextest` ~99%. [`condense`] rewrites the model-facing content
+//! the tool returns (BEFORE Shaping caps it): each maximal run of consecutive
 //! same-class noise lines keeps its first line (the model still sees the shape
 //! of what was omitted) followed by an exact-count marker,
 //! `[condense: N more <class> lines omitted]`.
@@ -13,19 +13,9 @@
 //! (ADR-0039's honesty principle: omission must be self-detecting, not a
 //! silent cut). Everything outside a qualifying run passes through verbatim:
 //! FAILED/error/warning lines, blanks, and the `[exit code: N]` / timeout tail
-//! that [`crate::tools::run_command::report`] owns and the exit-badge extension
-//! parses. The marker wording is this Extension's own (CONTEXT.md: strings an
-//! Extension produces about its own decisions stay in that Extension).
-//!
-//! This is a Middleware-only Extension (ADR-0042): it rewrites model-facing
-//! content in `post_run` and has no display-side Presenter role.
-
-use serde_json::Value;
-
-use crate::middleware::{Middleware, Token};
-
-/// The one tool this extension acts on.
-const TOOL: &str = "run_shell_command";
+//! that [`super::report`] owns and the exit-badge parses. The marker wording is
+//! the tool's own (CONTEXT.md: strings a tool produces about its own decisions
+//! stay in that tool).
 
 /// Minimum run length that collapses. Below 5 the first-line-plus-marker pair
 /// saves two lines at most - not worth trading real output for a marker.
@@ -61,24 +51,7 @@ impl NoiseClass {
     }
 }
 
-/// The condense extension.
-pub struct Condense;
-
-impl Middleware for Condense {
-    fn post_run(&self, mut token: Token, _opts: &Value) -> Token {
-        // Pass and fail alike: a failing run carries compile-progress noise too.
-        if token.tool != TOOL {
-            return token;
-        }
-        if let Some(result) = token.result.as_mut() {
-            let condensed = condense(&result.text_of());
-            result.set_text(condensed);
-        }
-        token
-    }
-}
-
-/// Classifies one line, or `None` for anything this extension must not touch.
+/// Classifies one line, or `None` for anything condensing must not touch.
 fn classify(line: &str) -> Option<NoiseClass> {
     let trimmed = line.trim_start();
     if COMPILE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
@@ -97,7 +70,7 @@ fn classify(line: &str) -> Option<NoiseClass> {
 /// Rewrites content: each maximal same-class run of >= [`MIN_RUN`] noise lines
 /// becomes its first line plus an exact-count marker; every other line - and
 /// the line structure around it - survives byte-for-byte.
-fn condense(content: &str) -> String {
+pub(super) fn condense(content: &str) -> String {
     let lines: Vec<&str> = content.split('\n').collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
@@ -140,5 +113,5 @@ fn emit_run(out: &mut Vec<String>, run: &[&str], class: NoiseClass) {
 }
 
 #[cfg(test)]
-#[path = "../../tests/extensions/condense.rs"]
+#[path = "../../../tests/tools/run_command/condense.rs"]
 mod tests;

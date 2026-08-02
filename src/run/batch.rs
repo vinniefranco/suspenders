@@ -5,11 +5,11 @@
 //!
 //! [`execute_tools`] runs a Pass's Tool Calls in emission order. Each call goes
 //! through the gates in sequence: the malformed-input sentinel (the LLM layer
-//! tags inputs that never parsed - those are answered, never run), then the
-//! Extension lifecycle (ADR-0007: pre_run - which may halt the call with the
-//! Extension's own wording - execution, post_run/Shaping), with Approval
-//! (ADR-0005) requested between pre_run and execution for the tools that
-//! require it, on the Middleware-adjusted input. Once the batch finishes the
+//! tags inputs that never parsed - those are answered, never run), then Approval
+//! (ADR-0005) on the raw tool input for the tools that require it, then execution
+//! with Shaping (the Result Cap). A tool shapes its own model-facing output and
+//! attaches any display Artifacts (ADR-0007: the diff / todos / exit-code badge
+//! live in the tools now, not a wrapper pipeline). Once the batch finishes the
 //! Conversation is checkpointed with only the answered Tool Calls, so the
 //! checkpoint never persists an unanswered tool_use block.
 //!
@@ -24,12 +24,11 @@ use crate::approvals;
 use crate::content::{ContentBlock, ResultBlock, result_blocks_text};
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::extensions;
 use crate::llm::malformed_tool_input;
-use crate::middleware::Token;
 use crate::plan::Update;
 use crate::run::deps::RunDeps;
 use crate::run::loop_::LoopState;
+use crate::tools;
 use crate::voice;
 
 // Run tool calls in emission order; results keep that order. Checkpoint ONCE
@@ -156,8 +155,9 @@ pub(super) fn display_input(input: &Value) -> Value {
     }
 }
 
-// How the batch answered one Tool Call: the Tool Result the model will read
-// plus whether it was an error. Built only through the constructors below.
+// How the batch answered one Tool Call: the Tool Result the model will read,
+// whether it was an error, and the display Artifacts the tool attached. Built
+// only through the constructors below.
 struct Answer {
     content: Vec<ResultBlock>,
     is_error: bool,
@@ -168,26 +168,18 @@ impl Answer {
     /// A malformed-input answer is recorded like any error - it reads as a
     /// run.
     fn malformed(raw: &str) -> Self {
-        Answer::text(voice::malformed_input(raw), true, Default::default())
-    }
-
-    /// A Middleware halt reads as a failed run.
-    fn halted(reason: String, artifacts: HashMap<String, Value>) -> Self {
-        Answer::text(reason, true, artifacts)
+        Answer::text(voice::malformed_input(raw), true)
     }
 
     /// An Approval denial (ADR-0005): the command never ran.
     fn denied() -> Self {
-        Answer::text(
-            voice::Marker::CommandDenied.text(),
-            true,
-            Default::default(),
-        )
+        Answer::text(voice::Marker::CommandDenied.text(), true)
     }
 
-    /// The Extension pipeline executed the call: the shaped block list rides
-    /// straight through (ADR-0059).
-    fn ran(result: extensions::PipelineResult) -> Self {
+    /// The tool executed and was Shaped (the Result Cap): the block list, the
+    /// error flag, and the tool's display Artifacts ride straight through
+    /// (ADR-0059).
+    fn ran(result: tools::ToolResult) -> Self {
         Answer {
             content: result.content,
             is_error: result.is_error,
@@ -195,75 +187,51 @@ impl Answer {
         }
     }
 
-    /// A single-Text-block answer - the shape every Voice-worded outcome
-    /// (malformed/halted/denied) takes.
-    fn text(content: impl Into<String>, is_error: bool, artifacts: HashMap<String, Value>) -> Self {
+    /// A single-Text-block answer with no Artifacts - the shape every
+    /// Voice-worded outcome (malformed / denied) takes.
+    fn text(content: impl Into<String>, is_error: bool) -> Self {
         Answer {
             content: vec![ResultBlock::text(content)],
             is_error,
-            artifacts,
+            artifacts: HashMap::new(),
         }
     }
 }
 
-// The Extension lifecycle (ADR-0007): the LLM layer tags malformed inputs -
-// never run those. Otherwise pre_run, Approval on the Middleware-adjusted
-// command, and execution with post_run and Shaping.
+// The Tool Call lifecycle (ADR-0007, pipeline retired): the LLM layer tags
+// malformed inputs - never run those. Otherwise Approval on the raw tool input,
+// then execution with Shaping. There is no input-adjust and no halt - a tool
+// shapes its own output and attaches its own display Artifacts.
 async fn run_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str, input: &Value) -> Answer {
     if let Some(raw) = malformed_tool_input(input) {
         return Answer::malformed(raw);
     }
 
-    run_lifecycle(state, name, input).await
-}
-
-async fn run_lifecycle<D: RunDeps>(
-    state: &mut LoopState<'_, D>,
-    name: &str,
-    input: &Value,
-) -> Answer {
-    let token = Token::new(name, input.clone(), state.tool_ctx.clone());
-    let (token, failures) = extensions::pre_run(state.extensions, token);
-    emit_extension_errors(state, &failures);
-
-    if token.halted {
-        let reason = token.halt_reason.clone().unwrap_or_default();
-        return Answer::halted(reason, token.artifacts.clone());
-    }
-
-    // The one Approval seam: Some(text) gates and text is exactly what the
-    // user reads (the command, or web_fetch's URL), read from the
-    // Middleware-adjusted input; None means no gate (approvals::gate_text).
-    match approvals::gate_text(name, &token.input) {
+    // The one Approval seam: Some(text) gates and text is exactly what the user
+    // reads (the command, or web_fetch's URL), read from the raw tool input;
+    // None means no gate (approvals::gate_text).
+    match approvals::gate_text(name, input) {
         Some(text) => {
             let id = new_ref();
             if state.deps.request_approval(id, text).await {
-                execute_token(state, token).await
+                execute_tool_call(state, name, input).await
             } else {
                 Answer::denied()
             }
         }
-        None => execute_token(state, token).await,
+        None => execute_tool_call(state, name, input).await,
     }
 }
 
-async fn execute_token<D: RunDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
-    let (result, failures) = extensions::execute(state.extensions, token).await;
-    emit_extension_errors(state, &failures);
-    Answer::ran(result)
-}
-
-fn emit_extension_errors<D: RunDeps>(
+// Runs the named tool with Shaping (the Result Cap) - the extension-free dispatch
+// path (`tools::run`). A tool can never crash the Run: an unknown name or an
+// `Err` return both come back as an `is_error` result (ADR-0018 fail-open).
+async fn execute_tool_call<D: RunDeps>(
     state: &mut LoopState<'_, D>,
-    failures: &[extensions::Failure],
-) {
-    for failure in failures {
-        state.emitter.emit(Event::extension_error(
-            failure.extension.clone(),
-            failure.stage,
-            failure.message.clone(),
-        ));
-    }
+    name: &str,
+    input: &Value,
+) -> Answer {
+    Answer::ran(tools::run(name, input, state.tool_ctx).await)
 }
 
 // The per-call Approval reference (baud's `make_ref()`), an opaque unique id.

@@ -33,41 +33,85 @@ pub mod registry;
 /// capability (which names `Model`) would otherwise close (see ADR-0055).
 pub use crate::content::ToolSpec;
 
+use std::collections::HashMap;
+
+use serde_json::Value;
+
 use crate::content::{Modalities, ResultBlock};
 
-/// A Tool Result: the content that enters the Conversation and whether it was
-/// an error. Mirrors baud's `Baud.Tools.result/0`. Lives with the Tool
-/// authoring contract (it is what a Tool's `run` ultimately becomes), so the
-/// Registry can dispatch to a result without depending on the concrete tool
-/// set - which keeps the tool -> tool_registry -> tools module graph acyclic.
+/// A Tool Result: the content that enters the Conversation, whether it was an
+/// error, and the display-side Artifacts. Mirrors baud's `Baud.Tools.result/0`.
+/// Lives with the Tool authoring contract (it is what a Tool's `run` ultimately
+/// becomes), so the Registry can dispatch to a result without depending on the
+/// concrete tool set - which keeps the tool -> tool_registry -> tools module
+/// graph acyclic.
 ///
 /// `content` is a [`ResultBlock`] list (ADR-0059): the common case is a single
 /// Text block, media reaches it only from a tool that overrides
 /// [`Tool::run_rich`] (P3 3b's read_file). Text tools return `Result<String, _>`
 /// through [`Tool::run`] and become one Text block.
+///
+/// `artifacts` is display-side data (CONTEXT.md: Artifact): a `HashMap<String,
+/// Value>`, `{}` for the common case, populated only by a tool that shapes its
+/// own transcript display (edit_file/write_file's `diff`, todo_write's `todos`,
+/// run_shell_command's exit-code/timeout). It rides the `:tool_result` event to
+/// the Transcript store and NEVER enters the Conversation - it is never shaped,
+/// evicted, or sent on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     pub content: Vec<ResultBlock>,
     pub is_error: bool,
+    pub artifacts: HashMap<String, Value>,
 }
 
-/// The rich output a Tool may produce (ADR-0059): an ordered block list. A text
-/// tool's `String` return becomes one Text block through [`From<String>`]; only
-/// a tool overriding [`Tool::run_rich`] yields more (P3 3b's read_file, whose
-/// media blocks ride when the Model supports the modality). Named in `tool.rs`
-/// (not `content`) so the tool authoring contract carries its own return shape;
-/// its blocks are the shared [`ResultBlock`] leaf, so no `tool -> llm` edge.
+/// The rich output a Tool may produce (ADR-0059): an ordered block list, the
+/// error flag, and the display-side Artifacts the tool attaches. A text tool's
+/// `String` return becomes one non-error Text block with no Artifacts through
+/// [`From<String>`]; a tool overriding [`Tool::run_rich`] yields more (P3 3b's
+/// read_file's media blocks, or the display Artifacts the file-editing / shell
+/// tools attach).
+///
+/// `is_error` lets a tool report a completed-but-failed run WHILE carrying
+/// Artifacts: a nonzero-exit `run_shell_command` is not a tool failure (the tool
+/// ran fine), so it returns `Ok(ToolOutput { is_error: true, .. })` with the
+/// exit-code Artifact, rather than the `Err(String)` path (which the Registry
+/// maps to an error result with no Artifacts). A genuine tool error - bad input,
+/// spawn failure - still returns `Err`.
+///
+/// Named in `tool.rs` (not `content`) so the tool authoring contract carries its
+/// own return shape; its blocks are the shared [`ResultBlock`] leaf, so no `tool
+/// -> llm` edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     pub blocks: Vec<ResultBlock>,
+    pub is_error: bool,
+    pub artifacts: HashMap<String, Value>,
 }
 
 impl ToolOutput {
-    /// A single Text block output - the common case.
+    /// A single non-error Text block output with no Artifacts - the common case.
     pub fn text(s: impl Into<String>) -> Self {
         ToolOutput {
             blocks: vec![ResultBlock::text(s)],
+            is_error: false,
+            artifacts: HashMap::new(),
         }
+    }
+
+    /// Flags this output as a completed-but-failed run (the model sees
+    /// `is_error: true`) while keeping its blocks and Artifacts. Used by
+    /// `run_shell_command` for a nonzero-exit / timed-out command.
+    pub fn error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+
+    /// Attaches a display Artifact under `key` (CONTEXT.md: Artifact), threading
+    /// through a builder. Used by the file-editing and shell tools to carry their
+    /// diff / todos / exit-code display data to the Transcript store.
+    pub fn with_artifact(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.artifacts.insert(key.into(), value.into());
+        self
     }
 }
 
@@ -75,7 +119,8 @@ impl ToolOutput {
 // a single ResultBlock::Text inside the `blocks` Vec, not a newtype passthrough;
 // a derive macro would move the String verbatim into the field."
 impl From<String> for ToolOutput {
-    /// A text tool's `String` return becomes one Text block.
+    /// A text tool's `String` return becomes one non-error Text block with no
+    /// Artifacts.
     fn from(s: String) -> Self {
         ToolOutput::text(s)
     }

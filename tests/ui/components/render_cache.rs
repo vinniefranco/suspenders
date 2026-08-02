@@ -6,7 +6,7 @@ fn line_text(line: &Line<'static>) -> String {
 }
 
 fn fresh_transcript() -> Transcript {
-    Transcript::new(Vec::new())
+    Transcript::new()
 }
 
 /// Syncs `t` into a fresh cache at width 80 + dark theme, then plants a

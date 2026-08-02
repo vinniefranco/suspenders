@@ -162,6 +162,8 @@ pub(super) fn read_image(
             mime: super::detect::image_mime(path).to_string(),
             data,
         }],
+        is_error: false,
+        artifacts: std::collections::HashMap::new(),
     })
 }
 
@@ -192,6 +194,8 @@ pub(super) async fn read_pdf(
                 mime: "application/pdf".to_string(),
                 data,
             }],
+            is_error: false,
+            artifacts: std::collections::HashMap::new(),
         });
     }
 

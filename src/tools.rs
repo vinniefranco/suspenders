@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod ask_user_question;
 pub mod edit_file;
+pub mod file_diff;
 pub mod glob;
 pub mod grep;
 pub mod list_files;

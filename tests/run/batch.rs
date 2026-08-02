@@ -75,10 +75,3 @@ fn a_malformed_input_answer_reads_as_a_run() {
     );
     assert!(answer.is_error);
 }
-
-#[test]
-fn an_extension_halt_reads_as_a_failed_run() {
-    let answer = Answer::halted("blocked by plugin".to_string(), Default::default());
-    assert_eq!(result_blocks_text(&answer.content), "blocked by plugin");
-    assert!(answer.is_error);
-}

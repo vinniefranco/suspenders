@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use crate::content::{ContentBlock, Message, Role};
 use crate::conversation::{Conversation, ConversationOpts};
-use crate::extensions;
 use crate::llm::Llm;
 use crate::llm::ToolCallStyle;
 use crate::llm::model::Model;
@@ -97,11 +96,6 @@ pub async fn run(
     mut deps: impl RunDeps,
     opts: RunOpts,
 ) -> Outcome {
-    // Resolve the Session's ordered Extension names into the live pipeline. The
-    // shipped config carries `["diff"]`, so the live app runs the Run with the
-    // Diff extension; the test config carries `[]`.
-    let extensions = extensions::configured(&session.extensions);
-
     // The Tool Registry, built once per Run (F3, F8). Reveals are Run-scoped: a
     // fresh registry per Run resets them, matching qwen's
     // clearRevealedDeferredTools on session reset. It shares the Agent's
@@ -165,7 +159,6 @@ pub async fn run(
         conversation,
         &session,
         loop_::RunEnv {
-            extensions: &extensions,
             tool_ctx: &tool_ctx,
         },
         &mut deps,
@@ -222,10 +215,6 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
     let mut session = req.session;
     session.run_limit = req.max_turns as u64;
     session.model = req.model.clone();
-
-    // The child extension pipeline: a child Run runs extension-free (the parent
-    // owns the Diff extension's presenter seam; a subagent's edits are its own).
-    let extensions = extensions::configured(&[]);
 
     // The child Tool Registry over the request's narrowed tool subset (built-ins
     // minus the excluded set, per the def's selector). `with_shared` wants an
@@ -293,7 +282,6 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
         conversation,
         &session,
         RunEnv {
-            extensions: &extensions,
             tool_ctx: &tool_ctx,
         },
         &mut deps,

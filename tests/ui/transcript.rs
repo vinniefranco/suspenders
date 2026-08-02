@@ -1,12 +1,11 @@
 use super::*;
-use crate::presenter::Presenter;
 use crate::view_model::{DiffHunk, DiffLine, DiffSide};
 use serde_json::json;
 
 // --- helpers ------------------------------------------------------------
 
 fn fresh() -> Transcript {
-    Transcript::new(Vec::new())
+    Transcript::new()
 }
 
 fn user(text: &str) -> TranscriptItem {
@@ -424,127 +423,161 @@ fn only_a_delivered_steering_removal_bumps_the_revision() {
     assert_eq!(t.revision(), 1);
 }
 
-// --- presentment -----------------------------------------------------------
+// --- tool-display swaps (ADR-0007) -----------------------------------------
+//
+// A tool attaches a display Artifact to its Tool Result; `tool_result` reads it
+// and swaps the one-line summary for a first-class item. Real Artifacts (not
+// mock presenters) so the store's swap is exercised against the same shapes the
+// tools produce.
 
-// A first-class Diff item as the Diff extension's Presenter would emit.
-fn diff_item(name: &str) -> TranscriptItem {
-    TranscriptItem::Diff {
-        title: format!("diff {name}"),
-        lang: None,
-        hunks: vec![DiffHunk {
-            header: None,
-            lines: vec![DiffLine::new(DiffSide::Added, "new line")],
-        }],
-        elided: 0,
-    }
-}
+use crate::tools::file_diff::{self, DiffArtifact};
+use crate::tools::run_command;
+use crate::tools::todo_write::{self, TodoArtifact};
 
-struct DiffPresenter;
-impl Presenter for DiffPresenter {
-    fn present(
-        &self,
-        item: TranscriptItem,
-        artifacts: &HashMap<String, Value>,
-        _opts: &Value,
-    ) -> TranscriptItem {
-        match &item {
-            TranscriptItem::ToolResult {
-                name,
-                is_error: false,
-                ..
-            } if artifacts.contains_key("diff") => diff_item(name),
-            _ => item,
-        }
-    }
-}
-
-struct PresentCrasher;
-impl Presenter for PresentCrasher {
-    fn present(
-        &self,
-        _item: TranscriptItem,
-        _artifacts: &HashMap<String, Value>,
-        _opts: &Value,
-    ) -> TranscriptItem {
-        panic!("render boom")
-    }
-}
-
-fn reg(name: &str, presenter: Box<dyn Presenter>) -> Registered {
-    Registered::new(name, Value::Null).with_presenter(presenter)
-}
-
-fn diff_artifacts() -> HashMap<String, Value> {
+// The `diff` Artifact edit_file / write_file attach: a real one-line change.
+fn diff_artifacts(path: &str) -> HashMap<String, Value> {
+    let value = file_diff::artifact(Some("a\nb\nc\n"), "a\nB\nc\n", path).expect("a change diffs");
     let mut artifacts = HashMap::new();
-    artifacts.insert("diff".to_string(), json!("some_diff"));
+    artifacts.insert(file_diff::DIFF.to_string(), value);
+    artifacts
+}
+
+// The Diff item the store builds from that Artifact under the given tool name.
+fn diff_item(name: &str, path: &str) -> TranscriptItem {
+    let diff: DiffArtifact =
+        serde_json::from_value(diff_artifacts(path)[file_diff::DIFF].clone()).unwrap();
+    file_diff::to_diff_item(name, &diff)
+}
+
+fn todo_artifacts() -> HashMap<String, Value> {
+    let items = crate::plan::parse_todos(&json!({
+        "todos": [
+            { "id": "1", "content": "read", "status": "completed" },
+            { "id": "2", "content": "edit", "status": "in_progress" },
+        ]
+    }))
+    .unwrap();
+    let mut artifacts = HashMap::new();
+    artifacts.insert(
+        todo_write::TODOS.to_string(),
+        serde_json::to_value(TodoArtifact { items }).unwrap(),
+    );
+    artifacts
+}
+
+fn exit_code_artifacts(code: i64) -> HashMap<String, Value> {
+    let mut artifacts = HashMap::new();
+    artifacts.insert(run_command::keys::EXIT_CODE.to_string(), json!(code));
     artifacts
 }
 
 #[test]
-fn extension_replaces_tool_result_summary_using_artifacts() {
-    let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
-    t.tool_result("t1", "edit".into(), "edited x", false, &diff_artifacts());
-    assert_eq!(t.items(), vec![diff_item("edit")]);
+fn a_diff_artifact_swaps_the_tool_result_for_a_diff_item() {
+    let mut t = fresh();
+    t.tool_result("t1", "edit".into(), "edited x", false, &diff_artifacts("lib/x.ex"));
+    assert_eq!(t.items(), vec![diff_item("edit", "lib/x.ex")]);
 }
 
 #[test]
-fn without_matching_artifact_default_summary_survives() {
-    let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
+fn without_a_diff_artifact_the_default_summary_survives() {
+    let mut t = fresh();
     t.tool_result("t1", "edit".into(), "edited x", false, &HashMap::new());
     assert_eq!(t.items(), vec![tool_result_item("edit", "edited x", false)]);
 }
 
 #[test]
-fn tool_call_items_pass_through_present() {
-    let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
+fn a_failed_edit_keeps_its_summary_even_with_a_diff_artifact() {
+    // The diff swap fires only on a successful result.
+    let mut t = fresh();
+    t.tool_result("t1", "edit".into(), "boom", true, &diff_artifacts("lib/x.ex"));
+    assert_eq!(t.items(), vec![tool_result_item("edit", "boom", true)]);
+}
+
+#[test]
+fn a_todos_artifact_swaps_the_tool_result_for_a_todo_item() {
+    let mut t = fresh();
+    t.tool_result(
+        "t1",
+        "todo_write".into(),
+        "todos=...",
+        false,
+        &todo_artifacts(),
+    );
+    match t.items() {
+        [TranscriptItem::Todo { items }] => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].content, "read");
+        }
+        other => panic!("expected one Todo, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_run_command_exit_code_rewrites_the_summary_to_the_badge() {
+    let mut t = fresh();
+    t.tool_result(
+        "t1",
+        "run_shell_command".into(),
+        "output\n[exit code: 0]",
+        false,
+        &exit_code_artifacts(0),
+    );
+    assert_eq!(
+        t.items(),
+        vec![tool_result_item("run_shell_command", "✓ exit 0", false)]
+    );
+}
+
+#[test]
+fn a_failed_run_command_still_shows_the_exit_badge() {
+    // The badge fires even on an is_error result (a nonzero-exit command).
+    let mut t = fresh();
+    t.tool_result(
+        "t1",
+        "run_shell_command".into(),
+        "boom\n[exit code: 3]",
+        true,
+        &exit_code_artifacts(3),
+    );
+    assert_eq!(
+        t.items(),
+        vec![tool_result_item("run_shell_command", "✗ exit 3", true)]
+    );
+}
+
+#[test]
+fn a_run_command_timeout_shows_the_timed_out_badge() {
+    let mut t = fresh();
+    let mut artifacts = HashMap::new();
+    artifacts.insert(run_command::keys::TIMED_OUT.to_string(), json!(true));
+    t.tool_result(
+        "t1",
+        "run_shell_command".into(),
+        "[command timed out after 100ms]",
+        true,
+        &artifacts,
+    );
+    assert_eq!(
+        t.items(),
+        vec![tool_result_item("run_shell_command", "✗ timed out", true)]
+    );
+}
+
+#[test]
+fn tool_call_items_are_never_swapped() {
+    let mut t = fresh();
     t.tool_call("t1".into(), "grep_search".into(), &json!({}));
     assert_eq!(t.items(), vec![tool_call_item("t1", "grep_search", "")]);
 }
 
-#[test]
-fn crashing_present_falls_back_to_default_with_info_line() {
-    let mut t = Transcript::new(vec![reg("PresentCrasher", Box::new(PresentCrasher))]);
-    t.tool_result("t1", "edit".into(), "edited x", false, &diff_artifacts());
-    let items = t.items();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0], tool_result_item("edit", "edited x", false));
-    match &items[1] {
-        TranscriptItem::Info { text } => {
-            assert!(text.contains("PresentCrasher"));
-            assert!(text.contains("present"));
-            assert!(text.contains("render boom"));
-        }
-        other => panic!("expected info, got {other:?}"),
-    }
-}
-
-// The recursion bound: the fail-open report line is pushed RAW, never
-// re-presented - a extension that panics on EVERY item (this one) would
-// otherwise crash on its own failure report, report that, crash on the
-// report of the report, and never terminate.
-#[test]
-fn a_presentment_failure_line_bypasses_presentment() {
-    let mut t = Transcript::new(vec![reg("PresentCrasher", Box::new(PresentCrasher))]);
-    t.info("news");
-    let items = t.items();
-    // The pre-stage item survives fail-open, then exactly ONE raw report.
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0], info("news"));
-    match &items[1] {
-        TranscriptItem::Info { text } => assert!(text.contains("PresentCrasher")),
-        other => panic!("expected info, got {other:?}"),
-    }
-}
-
-// The diff redundancy case: because the paired call is removed, the Diff
-// extension's Diff item (whose title summarizes the call) stands alone.
+// The diff redundancy case: because the paired call is removed, the Diff item
+// (whose title summarizes the call) stands alone, and the revision bumps.
 #[test]
 fn a_diff_stands_alone_after_the_paired_call_is_removed() {
-    let mut t = Transcript::new(vec![reg("DiffPresenter", Box::new(DiffPresenter))]);
+    let mut t = fresh();
     t.tool_call("t1".into(), "edit".into(), &json!({"path": "src/x.rs"}));
-    t.tool_result("t1", "edit".into(), "edited", false, &diff_artifacts());
-    // Only the Diff remains - the redundant call line is gone.
-    assert_eq!(t.items(), vec![diff_item("edit")]);
+    t.tool_result("t1", "edit".into(), "edited", false, &diff_artifacts("lib/x.ex"));
+    assert_eq!(t.items(), vec![diff_item("edit", "lib/x.ex")]);
     assert_eq!(t.revision(), 1);
 }
 
@@ -571,7 +604,7 @@ fn every_verb_preserves_the_items_prefix_or_bumps_the_revision() {
             Box::new(|t| t.marker("✂ evicted 3 stale results", Tone::Housekeeping)),
         ),
         ("user", Box::new(|t| t.user("hello"))),
-        ("push", Box::new(|t| t.push(diff_item("edit")))),
+        ("push", Box::new(|t| t.push(diff_item("edit", "lib/x.ex")))),
         ("message_start", Box::new(|t| t.message_start())),
         (
             "message_update",

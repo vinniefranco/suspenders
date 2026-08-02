@@ -13,15 +13,13 @@
 //! model stops calling tools lives in [`super::finish`].
 //!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
-//! [`RunDeps`]. Tool execution (the Extension pipeline) runs in-loop over an
-//! `extensions` list and a `ToolCtx` the caller supplies - the Rust Session
-//! carries extension *names*, not `Registered` values, so these ride as
-//! explicit `run` arguments (the shell builds them from the Session).
+//! [`RunDeps`]. Tool execution runs in-loop over a `ToolCtx` the caller
+//! supplies; each tool shapes its own output and attaches its own display
+//! Artifacts (ADR-0007), so there is no wrapper pipeline.
 
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::extensions::Registered;
 use crate::llm::response::Response;
 use crate::llm::{LlmRequest, StreamEvent};
 use crate::plan::Plan;
@@ -79,7 +77,6 @@ pub struct RunOpts {
 pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) deps: &'a mut D,
     pub(super) emitter: Emitter,
-    pub(super) extensions: &'a [Registered],
     pub(super) tool_ctx: &'a ToolCtx,
     pub(super) plan: Plan,
     // The current Pass number, 1-based (replaces the Ledger's `pass()`).
@@ -110,19 +107,17 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) skip_next_speaker: bool,
 }
 
-/// The Extension pipeline and Tool execution context for one Run: always built
-/// from Session data by the caller, passed together because they are always
-/// produced together and belong together.
+/// The Tool execution context for one Run: the [`ToolCtx`] the caller builds
+/// from Session data. A struct (not a bare `&ToolCtx`) so a future Run-scoped
+/// input can join it without churning every call site.
 pub struct RunEnv<'a> {
-    pub extensions: &'a [Registered],
     pub tool_ctx: &'a ToolCtx,
 }
 
 /// Runs the loop until the model stops asking for tools, the turn bound is hit,
 /// or the response errors.
 ///
-/// `env` bundles the Extension pipeline and Tool execution context (both
-/// Session-derived; the Rust Session carries extension names only).
+/// `env` carries the Tool execution context (Session-derived).
 pub async fn run<D: RunDeps>(
     mut conversation: Conversation,
     session: &Session,
@@ -139,7 +134,6 @@ pub async fn run<D: RunDeps>(
     let mut state = LoopState {
         deps,
         emitter,
-        extensions: env.extensions,
         tool_ctx: env.tool_ctx,
         plan,
         turn: 1,

@@ -1,24 +1,10 @@
 use super::*;
-use crate::middleware::token::TokenResult;
-use crate::tool::ToolCtx;
-use serde_json::json;
 
-fn ctx() -> ToolCtx {
-    ToolCtx::for_test("/nowhere".into(), 10_000)
-}
-
-fn token_with(tool: &str, content: &str, is_error: bool) -> Token {
-    let mut token = Token::new(tool, json!({"command": "cargo test"}), ctx());
-    token.result = Some(TokenResult::text(content, is_error));
-    token
-}
-
-fn run(content: &str, is_error: bool) -> String {
-    Condense
-        .post_run(token_with(TOOL, content, is_error), &json!({}))
-        .result
-        .unwrap()
-        .text_of()
+// The behavior is a pure text rewrite the tool applies to its output (both the
+// Ok and the completed-but-failed arm); `is_error` is threaded through the test
+// names for documentation, but condensing itself does not depend on it.
+fn run(content: &str, _is_error: bool) -> String {
+    condense(content)
 }
 
 #[test]
@@ -149,15 +135,17 @@ fn the_exit_code_tail_survives_and_still_parses() {
 }
 
 #[test]
-fn a_non_run_command_token_passes_through_unchanged() {
-    let noisy = "test a ... ok\n\
-            test b ... ok\n\
-            test c ... ok\n\
-            test d ... ok\n\
-            test e ... ok";
-    let token = Condense.post_run(token_with("read_file", noisy, false), &json!({}));
+fn non_noise_content_passes_through_verbatim() {
+    // Condensing is conservative: ordinary output with no qualifying noise run
+    // (compile-progress / passing-test) is returned byte-for-byte. Only
+    // run_shell_command feeds this function (it is the sole caller), so no other
+    // tool's output is ever touched - a structural guarantee, not a tool check.
+    let plain = "hello world\n\
+            building the thing\n\
+            all done, shipping it\n\
+            one last line";
 
-    assert_eq!(token.result.unwrap().text_of(), noisy);
+    assert_eq!(run(plain, false), plain);
 }
 
 #[test]
@@ -172,14 +160,4 @@ fn libtest_and_nextest_passing_lines_do_not_share_a_run() {
             PASS [ 0.01s] crate c";
 
     assert_eq!(run(content, false), content);
-}
-
-#[test]
-fn registry_resolves_condense_and_the_default_config_ships_it() {
-    let extensions = crate::extensions::configured(&["condense".to_string()]);
-    assert_eq!(extensions.len(), 1);
-    assert_eq!(extensions[0].name, "condense");
-
-    let base = crate::session::SessionConfig::base();
-    assert!(base.extensions.contains(&"condense".to_string()));
 }

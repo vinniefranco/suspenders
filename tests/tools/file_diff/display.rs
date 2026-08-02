@@ -1,5 +1,5 @@
 use super::*;
-use crate::extensions::diff::hunks;
+use crate::tools::file_diff::hunks;
 
 // ---- title/2 ----
 
