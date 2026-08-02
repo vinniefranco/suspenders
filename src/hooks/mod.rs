@@ -38,18 +38,23 @@
 //!
 //! ## The leaf, and what is wired above it
 //!
-//! Phase 2 delivered this fully unit-tested foundation. Phase 3a WIRES the four
+//! Phase 2 delivered this fully unit-tested foundation. Phase 3a WIRED the four
 //! tool-dispatch + permission events (`PreToolUse`, `PostToolUse`,
 //! `PostToolUseFailure`, `PermissionRequest`) into the live run loop at
 //! [`crate::run::hooks`] (the firing facade + production ShellExec/HttpPost
 //! capabilities, which live ABOVE this leaf so the leaf never reaches up into
-//! `run_command`), fired from the tool-dispatch seam [`crate::run::batch`]. The
-//! other twelve lifecycle events (Stop / session / compaction / todo / subagent /
-//! UserPromptSubmit / Notification) are Phase 3b, and skill-hook REGISTRATION on
-//! skill invocation is Phase 4 - both out of scope of Phase 3a. The rejected
-//! `function` hook type and qwen's deferred surface (async hooks, the
-//! `sequential` flag, extension/system scopes, `allowedEnvVars` / `env` /
-//! `headers` / `once` / `if`) are recorded as OUT in ADR-0066.
+//! `run_command`), fired from the tool-dispatch seam [`crate::run::batch`]. Phase
+//! 3b WIRES the remaining twelve lifecycle events through the SAME facade: the
+//! Run-layer events fire from the loop (`UserPromptSubmit` at Run start, `Stop` /
+//! `StopFailure` at the finish/error paths, `Pre`/`PostCompact` around the compact
+//! Dep, `TodoCreated`/`TodoCompleted` off the Plan fold, `SubagentStart`/
+//! `SubagentStop` bracketing the `agent` tool dispatch), and the Agent-layer events
+//! fire from the actor (`SessionStart` in `init_agent`, `SessionEnd` at actor-loop
+//! end, `Notification` at the ask-request broadcast). Skill-hook REGISTRATION on
+//! skill invocation is Phase 4 - still out of scope. The rejected `function` hook
+//! type and qwen's deferred surface (async hooks, the `sequential` flag,
+//! extension/system scopes, `allowedEnvVars` / `env` / `headers` / `once` / `if`)
+//! are recorded as OUT in ADR-0066.
 
 pub mod config;
 pub mod event;

@@ -89,6 +89,25 @@ impl ShellExec for ErringShell {
     }
 }
 
+/// A ShellExec wrapping a shared [`ScriptedShell`], so a test can keep the call
+/// counter while the `Hooks` handle owns a boxed ShellExec (the fire-count fakes
+/// share ONE counter across a Run).
+struct SharedShell(std::sync::Arc<ScriptedShell>);
+
+#[async_trait]
+impl ShellExec for SharedShell {
+    async fn run(
+        &self,
+        command: &str,
+        stdin_json: &str,
+        cwd: &str,
+        env: &HashMap<String, String>,
+        timeout_secs: u64,
+    ) -> Result<ShellResult, String> {
+        self.0.run(command, stdin_json, cwd, env, timeout_secs).await
+    }
+}
+
 /// A never-called HttpPost (the tests exercise the command path only).
 struct UnusedHttp;
 #[async_trait]
@@ -500,6 +519,380 @@ async fn post_tool_use_failure_appends_context_on_error() {
     assert!(
         content.contains("failure noted"),
         "the failure context is appended: {content}"
+    );
+}
+
+// ---- UserPromptSubmit (Phase 3b) ---------------------------------------------
+
+/// A UserPromptSubmit `deny` vetoes the prompt: the model is NEVER called (the
+/// script is empty, so a call would panic), and the Run closes on the hook's
+/// reason. A visible reject line is surfaced (ADR-0018).
+#[tokio::test]
+async fn user_prompt_submit_block_vetoes_the_run() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("UserPromptSubmit");
+    let shell = ScriptedShell::new(r#"{"decision":"deny","reason":"prompt not allowed"}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // An EMPTY script: if the vetoed prompt reached the model, `complete` would
+    // panic (no scripted response), proving the model was never called.
+    let deps = deps_for(&session, vec![]);
+    let (outcome, deps) = run_with_hooks(&session, "do the thing", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let line = hook_line_for(&evs, "UserPromptSubmit").expect("a reject line was surfaced");
+    assert!(line.contains("rejected"), "{line}");
+    // The model was never asked (no MessageStart at all).
+    assert!(
+        !evs.iter().any(|e| matches!(e, Event::MessageStart { .. })),
+        "a vetoed prompt never reaches the model"
+    );
+}
+
+/// A UserPromptSubmit hook injecting additionalContext prepends it onto the
+/// prompt the model reads (the first request's user turn carries the note).
+#[tokio::test]
+async fn user_prompt_submit_injects_additional_context() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("UserPromptSubmit");
+    let shell = ScriptedShell::new(
+        r#"{"hookSpecificOutput":{"additionalContext":"context from a hook"}}"#,
+    );
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(&session, vec![just(text_end("ok"))]);
+    let (outcome, deps) = run_with_hooks(&session, "the prompt", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    // The first request the model saw carries the injected context on the user
+    // turn alongside the prompt.
+    let requests = deps.requests.lock().unwrap();
+    let first = requests.first().expect("a request was built");
+    let user_text: String = first
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        user_text.contains("context from a hook"),
+        "the injected context reaches the model: {user_text}"
+    );
+    let evs = events(&deps);
+    assert!(
+        hook_line_for(&evs, "UserPromptSubmit")
+            .map(|l| l.contains("injected"))
+            .unwrap_or(false),
+        "the inject is visible"
+    );
+}
+
+// ---- Stop (Phase 3b) ---------------------------------------------------------
+
+/// A Stop hook that blocks FORCES the Run to continue once (qwen's Stop-hook
+/// feedback inversion): the model would have ended after the first (no-tool)
+/// reply, but the hook injects its feedback and the loop runs a second Pass. The
+/// loop-guard (`stop_hook_active`) then lets the second end through, so the hook
+/// forces exactly ONE extra Pass - it cannot loop forever.
+#[tokio::test]
+async fn stop_hook_forces_one_continuation_then_the_guard_lets_it_end() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("Stop");
+    // continue:false with a stopReason INVERTS to "do not stop" + feedback.
+    let shell = ScriptedShell::new(r#"{"continue":false,"stopReason":"keep going"}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // Two no-tool replies: the first would end (Stop fires -> forces continue),
+    // the second ends after the guard is set (Stop does not fire again). A third
+    // reply is scripted as a safety net; if the guard failed and the hook looped,
+    // the Run would keep consuming replies and the test's response count would
+    // reveal it.
+    let deps = deps_for(
+        &session,
+        vec![
+            just(text_end("first end")),
+            just(text_end("second end")),
+            just(text_end("safety net")),
+        ],
+    );
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    // Exactly TWO model Passes: the forced continuation plus the final end (the
+    // third scripted reply is never consumed - the guard stopped the loop).
+    let starts = evs
+        .iter()
+        .filter(|e| matches!(e, Event::MessageStart { .. }))
+        .count();
+    assert_eq!(starts, 2, "the Stop hook forced exactly one extra Pass");
+    // The feedback was delivered as steering (the qwen-wrapped stopReason).
+    let steered = evs.iter().any(|e| matches!(
+        e,
+        Event::SteeringDelivered { text } if text.contains("Stop hook feedback") && text.contains("keep going")
+    ));
+    assert!(steered, "the Stop feedback was injected as guidance");
+    // The force-continue is visible.
+    assert!(
+        hook_line_for(&evs, "Stop")
+            .map(|l| l.contains("continue"))
+            .unwrap_or(false),
+        "the force-continue is surfaced"
+    );
+}
+
+/// A Stop hook that does NOT block lets the Run end normally (the common case):
+/// one Pass, no forced continuation.
+#[tokio::test]
+async fn stop_hook_that_allows_lets_the_run_end() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("Stop");
+    let shell = ScriptedShell::new(r#"{"continue":true}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(&session, vec![just(text_end("done"))]);
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let starts = evs
+        .iter()
+        .filter(|e| matches!(e, Event::MessageStart { .. }))
+        .count();
+    assert_eq!(starts, 1, "a non-blocking Stop hook does not force a continuation");
+}
+
+// ---- Todo / Subagent fire-happened (Phase 3b) --------------------------------
+
+/// A `todo_write` that adds items fires TodoCreated for each new item and
+/// TodoCompleted for each completed one, detected at the RUN layer from the Plan
+/// fold (the tool never touches the hook subsystem). The ScriptedShell counts the
+/// fires across both events.
+#[tokio::test]
+async fn todo_write_fires_created_and_completed_from_the_run_layer() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    // One manager firing the SAME command hook on BOTH events, so the shared
+    // ScriptedShell call count is the total TodoCreated + TodoCompleted fires.
+    let hooks_cfg = json!({
+        "TodoCreated": [ { "hooks": [ { "type": "command", "command": "t.sh" } ] } ],
+        "TodoCompleted": [ { "hooks": [ { "type": "command", "command": "t.sh" } ] } ],
+    });
+    let manager = crate::hooks::HookManager::from_config(Some(&hooks_cfg));
+    let llm = FakeLlm::script([]);
+    // A shared shell so the test keeps the call counter after handing a boxed
+    // ShellExec to the `Hooks` handle.
+    let shell = std::sync::Arc::new(ScriptedShell::new(r#"{}"#));
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // A todo_write with one pending + one completed item: 2 created, 1 completed.
+    let todos = json!({
+        "todos": [
+            { "id": "a", "content": "task a", "status": "pending" },
+            { "id": "b", "content": "task b", "status": "completed" },
+        ]
+    });
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass("t1", "todo_write", todos)),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, _deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    // 2 created (both new) + 1 completed (task b) = 3 fires.
+    assert_eq!(
+        *shell.calls.lock().unwrap(),
+        3,
+        "TodoCreated fired per new item and TodoCompleted per completed item"
+    );
+}
+
+/// The `agent` tool dispatch brackets SubagentStart / SubagentStop at the PARENT
+/// run layer (Phase 3b, ADR-0066): both fire around the child-Run spawn even when
+/// the spawn itself is unavailable in the test ctx (the bracket is on the tool
+/// dispatch, not the child's success). One shared command hook on both events, so
+/// the fire count is start + stop = 2.
+#[tokio::test]
+async fn agent_tool_brackets_subagent_start_and_stop() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let hooks_cfg = json!({
+        "SubagentStart": [ { "hooks": [ { "type": "command", "command": "s.sh" } ] } ],
+        "SubagentStop": [ { "hooks": [ { "type": "command", "command": "s.sh" } ] } ],
+    });
+    let manager = crate::hooks::HookManager::from_config(Some(&hooks_cfg));
+    let shell = std::sync::Arc::new(ScriptedShell::new(r#"{}"#));
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "a1",
+                "agent",
+                json!({ "subagent_type": "general", "prompt": "do it", "description": "x" }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, _deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    assert_eq!(
+        *shell.calls.lock().unwrap(),
+        2,
+        "SubagentStart and SubagentStop each fired once around the agent dispatch"
+    );
+}
+
+// ---- SessionStart / Compact / Notification facade fires (Phase 3b) -----------
+
+/// SessionStart returns the hook's injected additionalContext, which `init_agent`
+/// folds onto the system prompt as initial context. Exercised through the SAME
+/// `Hooks` facade the Agent builds.
+#[tokio::test]
+async fn session_start_returns_injected_initial_context() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("SessionStart");
+    let shell = ScriptedShell::new(
+        r#"{"hookSpecificOutput":{"additionalContext":"project convention: use tabs"}}"#,
+    );
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let context = hooks.session_start("startup").await;
+    assert_eq!(
+        context.as_deref(),
+        Some("project convention: use tabs"),
+        "SessionStart injects initial context"
+    );
+}
+
+/// PreCompact returns the hook's injected compaction instruction; PostCompact is
+/// observe-only (it returns nothing). Both fire through the facade the loop uses
+/// around the compact Dep.
+#[tokio::test]
+async fn pre_compact_injects_instruction_post_compact_observes() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreCompact");
+    let shell = std::sync::Arc::new(ScriptedShell::new(
+        r#"{"hookSpecificOutput":{"additionalContext":"keep the API decisions"}}"#,
+    ));
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let instruction = hooks.pre_compact().await;
+    assert_eq!(
+        instruction.as_deref(),
+        Some("keep the API decisions"),
+        "PreCompact injects a compaction instruction"
+    );
+    // PostCompact fires (observe-only): the shell was NOT configured for it, so a
+    // second manager proves the observe-only fire returns nothing meaningful.
+    hooks.post_compact().await;
+    assert!(
+        *shell.calls.lock().unwrap() >= 1,
+        "PreCompact fired through the command hook"
+    );
+}
+
+/// The Notification fire reaches the command hook (the "agent is waiting" alert),
+/// exercised through the facade the Agent builds off the ask-request broadcast.
+#[tokio::test]
+async fn notification_fires_the_command_hook() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("Notification");
+    let shell = std::sync::Arc::new(ScriptedShell::new(r#"{}"#));
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    hooks.notification("Approval requested: rm -rf /tmp/x").await;
+    assert_eq!(
+        *shell.calls.lock().unwrap(),
+        1,
+        "the Notification hook fired"
     );
 }
 

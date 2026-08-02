@@ -807,6 +807,52 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
     // (P4b/Phase 9, ADR-0063).
     state.abort_all_background();
     state.abort_all_background_shells();
+
+    // The SessionEnd hooks (Phase 3b, ADR-0066): fired ONCE here at shutdown,
+    // through the same firing facade a Run uses. Observational (a SessionEnd hook
+    // cannot steer a session that is already ending). `exit` is qwen's SessionEnd
+    // reason for the process ending. Fail-open: no hooks, or a runner failure,
+    // is a no-op.
+    fire_session_end(&state).await;
+}
+
+// Builds the Agent's lifecycle-hook firing facade (Phase 3b, ADR-0066) over the
+// standing manager + the Session's Llm/Model/Root - the same
+// [`crate::run::hooks::Hooks`] a Run builds, so the Agent fires session/
+// notification events through the identical capability set (command/http/prompt)
+// without threading hook plumbing into the UI. Built on demand (it borrows the
+// state), never held, so it never outlives an `&AgentState` borrow.
+fn agent_hooks(state: &AgentState) -> crate::run::hooks::Hooks<'_> {
+    crate::run::hooks::Hooks::new(
+        state.hook_manager.as_ref(),
+        state.llm.as_ref(),
+        &state.model,
+        state.session.root.clone(),
+    )
+}
+
+// Fires the SessionEnd hooks at Agent shutdown (Phase 3b, ADR-0066).
+async fn fire_session_end(state: &AgentState) {
+    agent_hooks(state).session_end("exit").await;
+}
+
+// Fires the Notification hooks (Phase 3b, ADR-0066) for the "agent is waiting"
+// moment - the same ask-request broadcast that drives the terminal notification
+// (an Approval or a Question opening a modal). Spawned DETACHED off the actor loop
+// (over owned Arc/Model/Root clones the built `Hooks` borrows inside the task) so a
+// slow command/http/prompt hook never stalls the single owner while it holds the
+// user waiting; observational, so nothing flows back. A Session with no
+// Notification hooks spawns nothing (the resolved list is empty and the fire is a
+// no-op) - cheap enough to skip the emptiness pre-check.
+fn fire_notification(state: &AgentState, message: String) {
+    let manager = Arc::clone(&state.hook_manager);
+    let llm = Arc::clone(&state.llm);
+    let model = state.model.clone();
+    let root = state.session.root.clone();
+    tokio::spawn(async move {
+        let hooks = crate::run::hooks::Hooks::new(manager.as_ref(), llm.as_ref(), &model, root);
+        hooks.notification(&message).await;
+    });
 }
 
 // The public-Command dispatcher: a flat table that routes each Command to its
@@ -1035,6 +1081,10 @@ fn request_approval(
         Request::Pending(approvals) => {
             state.approvals = approvals;
             state.approval_replies.insert(id.clone(), reply);
+            // The Notification seam (Phase 3b, ADR-0066): an ask opening a modal is
+            // the "agent is waiting" moment, so fire the Notification hooks with the
+            // command the user is being asked to approve.
+            fire_notification(state, format!("Approval requested: {command}"));
             broadcast(state, Event::approval_request(id, command));
         }
     }
@@ -1072,6 +1122,14 @@ fn ask_question(
     reply: oneshot::Sender<QuestionAnswers>,
 ) {
     state.question_replies.insert(id.clone(), reply);
+    // The Notification seam (Phase 3b, ADR-0066): a question opening a modal is the
+    // "agent is waiting" moment, so fire the Notification hooks. The question text
+    // is the salient waiting content.
+    let message = questions
+        .first()
+        .map(|q| format!("Question: {}", q.question))
+        .unwrap_or_else(|| "Agent is waiting for input".to_string());
+    fire_notification(state, message);
     broadcast(state, Event::question_request(id, questions));
 }
 

@@ -209,6 +209,35 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     }
     let system_prompt = format!("{system_prompt}{}", memory.prompt_suffix());
 
+    // The SessionStart hooks (Phase 3b, ADR-0066): fired ONCE here, after all
+    // subsystem discovery (MCP, skills, hooks, subagents), through the same
+    // firing facade a Run uses ([`crate::run::hooks::Hooks`] over the standing
+    // manager + the Session's Llm/Model/Root). The `source` is `resume` when a
+    // prior log was folded, else `startup` (qwen's SessionStart source kinds). A
+    // hook's injected `additionalContext` becomes initial context, folded onto the
+    // system prompt as its own `\n\n---\n\n` section - the same composition point
+    // the Deferred Tools / memory sections use. Observational otherwise (a
+    // SessionStart hook cannot veto a session). Fail-open: no hooks, or a runner
+    // failure, leaves the prompt untouched.
+    let source = if resume_info.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
+    let session_start_hooks =
+        crate::run::hooks::Hooks::new(&hook_manager, llm.as_ref(), &model, session.root.clone());
+    let system_prompt = match session_start_hooks.session_start(source).await {
+        Some(context) => {
+            let _ = events.send(Event::extension_error(
+                "hook SessionStart".to_string(),
+                crate::event::Stage::PreRun,
+                "injected initial context".to_string(),
+            ));
+            format!("{system_prompt}\n\n---\n\n{context}")
+        }
+        None => system_prompt,
+    };
+
     // The budget figures derive from the launch Model here and are re-derived
     // from the captured Model at every Run start (ADR-0037, `reset_run_state`).
     let mut conversation = Conversation::new(

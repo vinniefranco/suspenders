@@ -85,9 +85,15 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     // ADR-0066): the minimal Stop thread. `batch` records the reason here when a
     // Pre/PostToolUse hook returns `continue:false`; `dispatch::continue_tools`
     // reads it AFTER the batch answers and closes the Run through the same
-    // `close_custom` path an after-Pass `Stop` takes. Phase 3b widens this to the
-    // full lifecycle-Stop event set.
+    // `close_custom` path an after-Pass `Stop` takes.
     pub(super) hook_stop: Option<String>,
+    // The Stop-hook loop-guard (Phase 3b, ADR-0066, qwen's `stop_hook_active`):
+    // set once a Stop hook has FORCED a continuation this Run. While set, the
+    // finish path does not fire Stop again, so a Stop hook that always blocks
+    // cannot loop forever - it forces at most one extra continuation, matching
+    // qwen. `finish` reads it before firing Stop and sets it when a Stop hook
+    // forces the Run to continue.
+    pub(super) stop_hook_active: bool,
     pub(super) plan: Plan,
     // The current Pass number, 1-based (replaces the Ledger's `pass()`).
     pub(super) turn: u64,
@@ -154,6 +160,7 @@ pub async fn run<D: RunDeps>(
         tool_ctx: env.tool_ctx,
         hooks: env.hooks,
         hook_stop: None,
+        stop_hook_active: false,
         plan,
         turn: 1,
         max_turns: session.run_limit,
@@ -167,9 +174,88 @@ pub async fn run<D: RunDeps>(
         skip_next_speaker: session.skip_next_speaker,
     };
 
+    // The UserPromptSubmit seam (Phase 3b, ADR-0066): fire before the model sees
+    // the prompt. A blocking hook vetoes the Run (the prompt never reaches the
+    // model); an injecting hook prepends its additionalContext as a leading user
+    // turn. Returns `Err(outcome)` when the Run is vetoed here.
+    conversation = match fire_user_prompt_submit(&mut state, conversation).await {
+        Ok(conv) => conv,
+        Err(outcome) => return outcome,
+    };
+
     conversation = maybe_compact_proactive(&mut state, conversation).await;
     conversation = drain_notifications_at_run_start(&mut state, conversation).await;
     run_loop(&mut state, conversation).await
+}
+
+// The UserPromptSubmit fire (Phase 3b, ADR-0066): fired once at Run start, before
+// the first request, so a hook can veto or enrich the submitted prompt. The
+// submitted prompt is the Conversation's LAST user text (a fresh Run appended it;
+// a next-Pass Run has no fresh prompt, so the last user text is still the most
+// recent thing the user said). A Reject closes the Run through the custom-stop
+// path (the prompt is never sent); a Proceed with additionalContext merges it
+// onto the trailing user message so the model reads the hook's note with the
+// prompt. Every deciding fire is surfaced visibly (ADR-0018); a firing error is
+// fail-open (no hooks wired, or a runner failure, leaves the prompt untouched).
+async fn fire_user_prompt_submit<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+) -> Result<Conversation, Outcome> {
+    let Some(hooks) = state.hooks else {
+        return Ok(conversation);
+    };
+    let Some(prompt) = last_user_text(&conversation) else {
+        return Ok(conversation);
+    };
+
+    match hooks.user_prompt_submit(&prompt).await {
+        crate::run::hooks::UserPromptDecision::Reject { reason, context } => {
+            emit_hook_decision(state, "UserPromptSubmit", &format!("rejected the prompt: {reason}"));
+            // The vetoed prompt never reaches the model: close the Run on the
+            // hook's reason through the custom-stop path a Stop hook takes, so the
+            // Run ends with the hook's explanation. Any additionalContext the
+            // blocking hook still carried rides the closing marker text.
+            let marker = match context {
+                Some(ctx) => format!("{}\n{ctx}", voice::Marker::RunStopped.text()),
+                None => voice::Marker::RunStopped.text().to_string(),
+            };
+            Err(finish::close_custom(state, conversation, &marker, reason))
+        }
+        crate::run::hooks::UserPromptDecision::Proceed { context } => {
+            if let Some(ctx) = context {
+                emit_hook_decision(state, "UserPromptSubmit", "injected additional context");
+                conversation.merge_user_text(ctx);
+            }
+            Ok(conversation)
+        }
+    }
+}
+
+// The Conversation's last user text (the submitted prompt at Run start): the
+// text of the trailing user message, or `None` when the last message is not a
+// user text block. Used only by the UserPromptSubmit fire.
+fn last_user_text(conversation: &Conversation) -> Option<String> {
+    conversation.messages.iter().rev().find_map(|m| {
+        if m.role != crate::content::Role::User {
+            return None;
+        }
+        match m.content.first() {
+            Some(crate::content::ContentBlock::Text { text }) => Some(text.clone()),
+            _ => None,
+        }
+    })
+}
+
+// Surfaces a deciding lifecycle-hook fire as a visible line (ADR-0018, ADR-0066),
+// the same fail-open report seam `batch` uses for the tool events: an
+// `extension_error` labelled `hook <event>` with the `Present` mid-Run stage, so a
+// veto / inject / force-continue is never a silent decision.
+fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, what: &str) {
+    state.emitter.emit(Event::extension_error(
+        format!("hook {event}"),
+        crate::event::Stage::Present,
+        what.to_string(),
+    ));
 }
 
 // Run-start notification drain (P4b, ADR-0063): a background child can settle
@@ -207,13 +293,37 @@ async fn maybe_compact_proactive<D: RunDeps>(
     conversation: Conversation,
 ) -> Conversation {
     if Compaction::proactive(&conversation) {
-        match state.deps.compact(conversation.clone()).await {
+        match compact_with_hooks(state, conversation.clone()).await {
             Ok(compacted) => compacted,
             Err(_) => conversation,
         }
     } else {
         conversation
     }
+}
+
+// The Pre/PostCompact seam (Phase 3b, ADR-0066): fire PreCompact before the
+// compaction service runs and PostCompact after it produces a summary. PreCompact
+// may inject a custom instruction (surfaced visibly); PostCompact is observe-only
+// (matching qwen). Both bracket the `compact` Dep - the SINGLE place the loop
+// invokes compaction - so proactive and reactive compaction share one fire path.
+// A firing error is fail-open (the compaction proceeds regardless).
+async fn compact_with_hooks<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+) -> Result<Conversation, crate::run::deps::CompactError> {
+    if let Some(hooks) = state.hooks
+        && hooks.pre_compact().await.is_some()
+    {
+        emit_hook_decision(state, "PreCompact", "injected a compaction instruction");
+    }
+    let result = state.deps.compact(conversation).await;
+    if let Some(hooks) = state.hooks
+        && result.is_ok()
+    {
+        hooks.post_compact().await;
+    }
+    result
 }
 
 // The loop skeleton (integration, IOSP): it owns only the Pass cycle and the
@@ -345,7 +455,7 @@ async fn compact_and_retry<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Result<(LlmRequest, Conversation), ()> {
-    match state.deps.compact(conversation.clone()).await {
+    match compact_with_hooks(state, conversation.clone()).await {
         Ok(compacted) => Box::pin(build_request(state, compacted)).await,
         Err(_) => Err(()),
     }

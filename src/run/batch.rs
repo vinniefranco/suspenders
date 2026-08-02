@@ -118,7 +118,7 @@ async fn execute_tool<D: RunDeps>(
     let content = answer.content;
     let is_error = answer.is_error;
 
-    maybe_store_plan(state, &name, &input, is_error);
+    maybe_store_plan(state, &name, &input, is_error).await;
 
     // The UI event carries the text projection (ADR-0059): a media block renders
     // as a short placeholder there, while the Conversation keeps the full block
@@ -135,16 +135,53 @@ async fn execute_tool<D: RunDeps>(
 }
 
 // A successful todo_write Tool Call replaces the Plan's task list and stores its
-// rendered form through the set_plan Dep; the Loop keeps this Run's copy.
-fn maybe_store_plan<D: RunDeps>(
+// rendered form through the set_plan Dep; the Loop keeps this Run's copy. The
+// TodoCreated / TodoCompleted hooks (Phase 3b, ADR-0066) fire here at the RUN
+// layer: the Plan fold detects the created/completed transitions from the old vs.
+// new todo lists, so a todo_write tool never depends on the hook subsystem
+// (ADR-0066's layering preference - tools stay hook-free).
+async fn maybe_store_plan<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
     is_error: bool,
 ) {
-    if let Update::Updated(plan) = state.plan.update(name, input, is_error) {
-        state.deps.set_plan(plan.render());
-        state.plan = plan;
+    let Update::Updated(plan) = state.plan.update(name, input, is_error) else {
+        return;
+    };
+    fire_todo_hooks(state, &plan).await;
+    state.deps.set_plan(plan.render());
+    state.plan = plan;
+}
+
+// Fires TodoCreated / TodoCompleted for the transitions between the Run's current
+// Plan (`state.plan`) and the freshly-folded `new_plan` (Phase 3b, ADR-0066). A
+// created todo is one whose content is new to the list; a completed todo is one
+// that is Completed now and was NOT Completed before (a fresh content that lands
+// Completed counts as both created and completed, matching qwen's per-item
+// validation/postWrite split firing on each). Fire-and-observe: these events do
+// not steer, so any outcome is ignored.
+async fn fire_todo_hooks<D: RunDeps>(state: &mut LoopState<'_, D>, new_plan: &crate::plan::Plan) {
+    let Some(hooks) = state.hooks else {
+        return;
+    };
+    use crate::plan::TodoStatus;
+    let was_completed = |content: &str| {
+        state
+            .plan
+            .todos
+            .iter()
+            .any(|t| t.content == content && t.status == TodoStatus::Completed)
+    };
+    let existed = |content: &str| state.plan.todos.iter().any(|t| t.content == content);
+
+    for todo in &new_plan.todos {
+        if !existed(&todo.content) {
+            hooks.todo_created(&todo.content).await;
+        }
+        if todo.status == TodoStatus::Completed && !was_completed(&todo.content) {
+            hooks.todo_completed(&todo.content).await;
+        }
     }
 }
 
@@ -292,13 +329,27 @@ async fn gated_execute<D: RunDeps>(
 
 // Runs the named tool with Shaping (the Result Cap) - the extension-free dispatch
 // path (`tools::run`). A tool can never crash the Run: an unknown name or an
-// `Err` return both come back as an `is_error` result (ADR-0018 fail-open).
+// `Err` return both come back as an `is_error` result (ADR-0018 fail-open). The
+// `agent` tool spawns a child Run, so the SubagentStart / SubagentStop hooks
+// (Phase 3b, ADR-0066) bracket its dispatch here at the PARENT run layer - the
+// child's own inner Run stays hook-free (the Phase 3a choice).
 async fn execute_tool_call<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
 ) -> Answer {
-    Answer::ran(tools::run(name, input, state.tool_ctx).await)
+    let subagent_type = (name == "agent")
+        .then(|| input.get("subagent_type").and_then(Value::as_str))
+        .flatten();
+
+    if let (Some(hooks), Some(kind)) = (state.hooks, subagent_type) {
+        hooks.subagent_start(kind).await;
+    }
+    let answer = Answer::ran(tools::run(name, input, state.tool_ctx).await);
+    if let (Some(hooks), Some(kind)) = (state.hooks, subagent_type) {
+        hooks.subagent_stop(kind).await;
+    }
+    answer
 }
 
 // The PreToolUse fold from the Run's view (ADR-0066): either the call is blocked

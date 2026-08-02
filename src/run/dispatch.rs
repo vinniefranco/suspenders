@@ -46,7 +46,7 @@ pub(super) async fn dispatch<D: RunDeps>(
     response: Response,
 ) -> Flow {
     if response.stop_reason == StopReason::Error {
-        return error_flow(state, conversation, response);
+        return error_flow(state, conversation, response).await;
     }
 
     let has_tool_use = response.content.iter().any(ContentBlock::is_tool_use);
@@ -79,7 +79,8 @@ pub(super) async fn dispatch<D: RunDeps>(
 // "Please continue." user message and keeps looping (bounded by `max_turns`
 // through the loop's top-of-loop guard); `User` finishes the Run as before.
 // `skip_next_speaker` short-circuits straight to finishing (the pre-check
-// behavior).
+// behavior). Either way, the WOULD-FINISH branch first consults the Stop hook
+// (Phase 3b, ADR-0066): a Stop hook that blocks forces one more continuation.
 async fn no_tool_call<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
@@ -88,12 +89,63 @@ async fn no_tool_call<D: RunDeps>(
     let content = response.content.clone();
 
     if state.skip_next_speaker {
-        return finish::finish(state, conversation, content, response.stop_reason);
+        return finish_or_stop_hook(state, conversation, response, content).await;
     }
 
     match next_speaker::check_next_speaker(state.deps, &response).await {
-        NextSpeaker::User => finish::finish(state, conversation, content, response.stop_reason),
+        NextSpeaker::User => finish_or_stop_hook(state, conversation, response, content).await,
         NextSpeaker::Model => continue_after_no_tool(state, conversation, response),
+    }
+}
+
+// The Stop seam (Phase 3b, ADR-0066): the model would END the Run here (no more
+// tool calls, the next-speaker check said User or was skipped). Fire the Stop
+// hooks first - a Stop hook that blocks (`continue:false`) INVERTS the stop: the
+// Run must continue, and the hook's "Stop hook feedback:\n<reason>" is injected as
+// a user turn to guide the next Pass. The loop-guard (`state.stop_hook_active`)
+// makes this fire at most once: once a Stop hook has forced a continuation, Stop
+// is not fired again, so a hook that always blocks forces only one extra Pass
+// (qwen's `stop_hook_active`). With no forcing hook (or the guard already set),
+// the Run finishes as it would have.
+async fn finish_or_stop_hook<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    response: Response,
+    content: Vec<ContentBlock>,
+) -> Flow {
+    // The guard already tripped, or no hooks are wired: finish as normal.
+    let Some(hooks) = state.hooks.filter(|_| !state.stop_hook_active) else {
+        return finish::finish(state, conversation, content, response.stop_reason);
+    };
+
+    match hooks.stop(state.stop_hook_active).await {
+        crate::run::hooks::StopDecision::Stop => {
+            finish::finish(state, conversation, content, response.stop_reason)
+        }
+        crate::run::hooks::StopDecision::Continue { feedback } => {
+            // The forced continuation: set the guard so a second Stop cannot loop,
+            // append the model's reply (stamped), inject the feedback as a user
+            // turn, and advance the Pass (bounded by `max_turns` at the loop top).
+            state.stop_hook_active = true;
+            state.emitter.emit(Event::extension_error(
+                "hook Stop".to_string(),
+                crate::event::Stage::Present,
+                "forced the Run to continue".to_string(),
+            ));
+            let blocks: Vec<ContentBlock> = content
+                .iter()
+                .filter(|b| !b.is_tool_use() && !matches!(b, ContentBlock::Thinking { .. }))
+                .cloned()
+                .collect();
+            if !blocks.is_empty() {
+                conversation.add_assistant_response(blocks, state.deps.provenance());
+            }
+            conversation.add_user_text(feedback.clone());
+            state.emitter.emit(Event::steering_delivered(feedback));
+            state.deps.checkpoint(&conversation);
+            state.turn += 1;
+            Flow::Continue(conversation)
+        }
     }
 }
 
@@ -139,7 +191,7 @@ fn continue_after_no_tool<D: RunDeps>(
 // Session Log entry), and re-request the SAME, unmutated Conversation. On a
 // non-retryable error, or once the budget is spent (default 3, 0 disables), the
 // loud `finish::fail` runs.
-fn error_flow<D: RunDeps>(
+async fn error_flow<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
@@ -153,6 +205,14 @@ fn error_flow<D: RunDeps>(
             .emit(Event::retry(error, attempt, state.malformed_retry_budget));
         Flow::Retry(conversation)
     } else {
+        // The StopFailure seam (Phase 3b, ADR-0066): the turn ended on an API error
+        // (non-retryable, or the re-draw budget is spent). Fire the observational
+        // StopFailure hooks with the error before the loud `fail` closes the Run.
+        if let Some(hooks) = state.hooks {
+            hooks
+                .stop_failure(&response.error.clone().unwrap_or_default())
+                .await;
+        }
         Flow::Done(finish::fail(state, conversation, response))
     }
 }
