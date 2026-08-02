@@ -22,6 +22,7 @@ pub mod presenter;
 pub mod run;
 pub mod session;
 pub mod skills;
+pub mod stop_reason;
 pub mod subagents;
 pub mod text;
 pub mod tool;
@@ -39,4 +40,5 @@ pub mod walk;
 pub mod app;
 
 #[cfg(test)]
+#[path = "../tests/test_support.rs"]
 pub mod test_support;

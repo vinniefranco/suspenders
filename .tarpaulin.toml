@@ -2,7 +2,8 @@
 [default]
 # llvm instrumentation is faster and more accurate than the ptrace default
 engine = "Llvm"
-# tests live inline (src/**/tests.rs, #[cfg(test)] blocks); don't count them as lines to cover
+# tests live under /tests, wired into their modules as `#[cfg(test)] #[path=...]
+# mod tests;`; don't count that test code as lines to cover
 ignore-tests = true
 out = ["Lcov", "Html"]
 output-dir = "target/tarpaulin"

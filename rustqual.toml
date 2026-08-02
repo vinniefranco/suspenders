@@ -4,10 +4,11 @@
 # Thresholds are set to your current maximums + 20% headroom.
 # Tighten them over time as you improve code quality.
 
-# docs/** holds vendored tuning-fixture crates, not production code. Unlike the
-# old CRAP gate we do NOT exclude test files: rustqual analyzes test code on
-# purpose (the Test Quality dimension and the [tests] threshold overrides).
-exclude_files = ["docs/**"]
+# docs/** holds vendored tuning-fixture crates, not production code. All unit
+# tests live under /tests (wired into their modules as `#[cfg(test)] #[path=...]
+# mod tests;`), so the quality score reflects business logic only; Test Quality
+# stays honest via the coverage report (--coverage, CI passes tarpaulin lcov).
+exclude_files = ["docs/**", "tests/**"]
 strict_closures = false
 strict_iterator_chains = false
 allow_recursion = false

@@ -33,7 +33,7 @@ use crate::agent::{AgentState, Msg, RunMsg};
 use crate::event::Event;
 use crate::session::log::Entry as LogEntry;
 
-use super::background::task_notification;
+use super::background::{StopDecision, stop_tracked_entry, task_notification};
 
 /// One background shell the Agent is tracking (Phase 9, ADR-0063). The `abort`
 /// handle cancels the detached watcher task at actor-loop exit; `pgid` is the
@@ -79,6 +79,10 @@ pub enum ShellStatus {
 /// completed/failed. `exit_code` is the process exit status (`None` if killed by a
 /// signal or never spawned); `signalled` is whether a signal terminated it;
 /// `spawn_error` carries the OS error text when the child could not start at all.
+/// The [`Default`] is the "clean, no-detail" base (no exit code, unsignalled, no
+/// spawn error) each real outcome derives from with struct-update, so only the
+/// field that actually differs is stated.
+#[derive(Default)]
 pub struct ShellOutcome {
     pub exit_code: Option<i32>,
     pub signalled: bool,
@@ -220,39 +224,24 @@ impl AgentState {
     /// error) - are VERBATIM qwen.
     pub(super) fn stop_background_shell(&mut self, id: String) -> Option<String> {
         let entry = self.background_shells.get_mut(&id)?;
-        if !matches!(entry.status, ShellStatus::Running) {
-            let status = shell_status_word(&entry.status);
-            return Some(format!(
-                "Error: Background agent \"{id}\" is not running (status: {status})."
-            ));
-        }
-
-        // Signal the whole process group so the child + its grandchildren die, not
-        // just the direct child (ADR-0023). Then abort the watcher task and mark
-        // the entry Cancelled so the racing `BackgroundShellDone` (if the killpg
-        // loses the race to the child's own exit) is dropped.
-        killpg(entry.pgid);
-        entry.abort.abort();
-        entry.status = ShellStatus::Cancelled;
-        let command = entry.command.clone();
-
-        // Queue the terminal `was cancelled` notification synchronously with an
-        // EMPTY result (no `<result>` tag) - the killpg means no
-        // `BackgroundShellDone` will arrive to carry an outcome.
-        let notification = task_notification(&id, "cancelled", &command, "");
-        self.notifications.push(notification.clone());
-        super::log_entry(self, LogEntry::UserText(notification.clone()));
-        super::broadcast(self, Event::background_notification(notification));
-        super::broadcast(
-            self,
-            Event::background_task_finished(id.clone(), "cancelled"),
-        );
-
-        Some(format!(
-            "Cancellation requested for background agent \"{id}\". A final \
-             task-notification carrying the agent's last result will follow.\n\
-             Description: {command}"
-        ))
+        let decision = if matches!(entry.status, ShellStatus::Running) {
+            // Signal the whole process group so the child + its grandchildren
+            // die, not just the direct child (ADR-0023). Then abort the watcher
+            // task and mark the entry Cancelled so a racing `BackgroundShellDone`
+            // (if the killpg loses the race to the child's own exit) is dropped.
+            // The shared tail then queues the cancelled notification.
+            killpg(entry.pgid);
+            entry.abort.abort();
+            entry.status = ShellStatus::Cancelled;
+            StopDecision::Running {
+                summary: entry.command.clone(),
+            }
+        } else {
+            StopDecision::NotRunning {
+                status_word: shell_status_word(&entry.status),
+            }
+        };
+        Some(stop_tracked_entry(self, id, decision))
     }
 
     /// killpg + abort every tracked background shell at actor-loop exit (Phase 9,
@@ -403,13 +392,12 @@ fn spawn_detached_shell(
                 ShellOutcome {
                     exit_code: status.code(),
                     signalled: status.signal().is_some(),
-                    spawn_error: None,
+                    ..ShellOutcome::default()
                 }
             }
             Err(err) => ShellOutcome {
-                exit_code: None,
-                signalled: false,
                 spawn_error: Some(err.to_string()),
+                ..ShellOutcome::default()
             },
         };
 
@@ -436,12 +424,5 @@ fn spawn_detached_shell(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mint_shell_id_is_bg_n() {
-        assert_eq!(mint_shell_id(1), "bg_1");
-        assert_eq!(mint_shell_id(7), "bg_7");
-    }
-}
+#[path = "../../tests/agent/background_shell.rs"]
+mod tests;

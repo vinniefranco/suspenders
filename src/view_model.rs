@@ -321,6 +321,7 @@ impl TranscriptItem {
     ///
     /// [`has_foldable_body`]: TranscriptItem::has_foldable_body
     /// [`Diff`]: TranscriptItem::Diff
+    #[cfg(test)]
     pub fn fold_title(&self) -> Option<&str> {
         match self {
             TranscriptItem::Diff { title, .. } => Some(title),

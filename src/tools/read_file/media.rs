@@ -13,8 +13,9 @@ use crate::tool::{ToolCtx, ToolOutput};
 
 /// The base64-after-encoding size guard (qwen's `9.9` MB, margin under 10MB).
 const MAX_BASE64_MB: f64 = 9.9;
-/// The SVG-as-text size cap (qwen `SVG_MAX_SIZE_BYTES`, 1MB).
-const SVG_MAX_SIZE_BYTES: u64 = 1024 * 1024;
+/// The SVG-as-text size cap (qwen `SVG_MAX_SIZE_BYTES`, 1MB). Widened to
+/// `pub(super)` so the read_file tests can size an over-cap SVG against it.
+pub(super) const SVG_MAX_SIZE_BYTES: u64 = 1024 * 1024;
 /// Bytes per megabyte, for the MB size math the base64 and PDF-extraction guards
 /// read against (`size / BYTES_PER_MB`).
 const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
@@ -229,10 +230,4 @@ fn base64_too_large(data: &str, _path: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// The 1MB SVG-as-text cap, for the read_file test that builds an over-cap SVG.
-#[cfg(test)]
-pub(super) fn svg_max_size_bytes() -> u64 {
-    SVG_MAX_SIZE_BYTES
 }

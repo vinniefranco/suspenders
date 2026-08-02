@@ -22,6 +22,7 @@ use crate::ui::picker::PickerOutcome;
 use crate::ui::theme::ActiveTheme;
 
 #[cfg(test)]
+#[path = "../tests/app.rs"]
 mod tests;
 
 /// Launches the interactive ratatui frontend (ADR-0001, ADR-0019). Builds the

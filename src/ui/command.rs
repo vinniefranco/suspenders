@@ -20,6 +20,7 @@
 
 use crate::ui::{AdapterCtx, AdapterState};
 
+use super::mcp_command;
 use super::model_command;
 use super::screen::Screen;
 use super::theme_command;
@@ -32,6 +33,8 @@ enum Handled {
     Model,
     /// `/theme` - [`super::theme_command`].
     Theme,
+    /// `/mcp` - [`super::mcp_command`] (opens the McpDialog overlay).
+    Mcp,
 }
 
 /// The SINGLE name→command mapping, over each module's own minted `NAME`, so
@@ -41,13 +44,14 @@ fn handled(name: &str) -> Option<Handled> {
     match name {
         n if n == model_command::NAME => Some(Handled::Model),
         n if n == theme_command::NAME => Some(Handled::Theme),
+        n if n == mcp_command::NAME => Some(Handled::Mcp),
         _ => None,
     }
 }
 
 /// Whether the adapter has a handler for `name`. Derived from [`handled`], so it
 /// can never drift past the router.
-// qual:test_helper - only the coverage test in this module calls it
+#[cfg(test)]
 pub fn is_handled(name: &str) -> bool {
     handled(name).is_some()
 }
@@ -69,6 +73,10 @@ pub(super) async fn run(
     match handled(name) {
         Some(Handled::Model) => model_command::run(screen, ctx, generation).await,
         Some(Handled::Theme) => theme_command::run(screen, ctx, &mut state.themes, generation),
+        // `/mcp` opens the McpDialog overlay (ADR-0065 Phase E): the Composer
+        // already opened it to a Loading state on commit; this kicks the async
+        // `mcp_views()` fetch that fills it.
+        Some(Handled::Mcp) => mcp_command::run(screen, ctx, generation).await,
         // The info line's Commit is re-derived by dispatch's trailing freeze
         // (ADR-0046), so drop it here - this seam returns only the Screen.
         None => screen.info(format!("/{name}: no handler")).0,
@@ -88,32 +96,15 @@ pub(super) async fn choose(
     match handled(command) {
         Some(Handled::Model) => model_command::choose(screen, ctx, value).await,
         Some(Handled::Theme) => theme_command::choose(screen, ctx, &mut state.themes, value),
+        // `/mcp` is not a flat selector (its rows live in the McpDialog overlay,
+        // which routes its own actions through `Effect::McpAction`, ADR-0065): a
+        // `SelectorChosen` for it can never arise. Leave the Screen untouched.
+        Some(Handled::Mcp) => screen,
         // Info line's Commit re-derived by dispatch's trailing freeze (ADR-0046).
         None => screen.info(format!("/{command}: no handler")).0,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ui::slash;
-
-    #[test]
-    fn model_and_theme_are_handled_and_an_unknown_name_is_not() {
-        assert!(is_handled("model"));
-        assert!(is_handled("theme"));
-        assert!(!is_handled("compact"));
-        assert!(!is_handled(""));
-    }
-
-    // Adding a COMMANDS entry without a `handled` mapping would otherwise fail
-    // silently (ADR-0032's extension seam): assert every registered command is
-    // handled. This drives the real classifier - the same one `run`/`choose`
-    // match exhaustively - so a registry entry cannot outrun its adapter arm.
-    #[test]
-    fn every_registry_command_is_handled() {
-        for c in slash::COMMANDS {
-            assert!(is_handled(c.name), "unhandled command: {}", c.name);
-        }
-    }
-}
+#[path = "../../tests/ui/command.rs"]
+mod tests;
