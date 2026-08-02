@@ -31,9 +31,11 @@ use crate::mcp::McpServerView;
 use crate::tool::caps::Question;
 use crate::view_model::SelectorRow;
 
-/// The `extension_error` stage: which point a tool-side subsystem crashed
-/// (fail-open, ADR-0007). Today the Agent's MCP init / ops report `PreRun`; the
-/// other variants remain the wire-stage labels the report line renders.
+/// A label on the generic fail-open `extension_error` report channel: which
+/// point an extension subsystem crashed (fail-open, ADR-0007). These are just
+/// labels on the report line, not a Middleware pipeline stage - the pipeline is
+/// retired (Hooks are the lifecycle-interception layer, ADR-0066). MCP connect,
+/// Hook discovery/firing, and skill discovery report through this channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     PreRun,
@@ -70,9 +72,10 @@ pub struct FileSuggestion {
 
 /// Every event shape the Run and the Agent emit.
 ///
-/// The `artifacts` on [`Event::ToolResult`] is display-side Presenter data
-/// (CONTEXT.md: Artifact) - a `HashMap<String, Value>`, `{}` when no extension
-/// attached any; it never enters the Conversation, is never shaped or evicted.
+/// The `artifacts` on [`Event::ToolResult`] is the display-side data a Tool
+/// attaches to its result (CONTEXT.md: Artifact) - a `HashMap<String, Value>`,
+/// `{}` when the Tool attached none; it never enters the Conversation, is never
+/// shaped or evicted.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     // ---- Run lifecycle ----

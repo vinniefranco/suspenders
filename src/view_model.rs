@@ -161,9 +161,9 @@ impl DiffLine {
 
 /// One hunk of a [`TranscriptItem::Diff`] (ADR-0008): an optional unified-diff
 /// header (`@@ -a,b +c,d @@`, `None` for a created file where the header is
-/// noise) and the run of tagged code lines. Structure the Presenter carries and
-/// the adapter renders - the header is a location string, the lines are RAW code
-/// tagged by [`DiffSide`].
+/// noise) and the run of tagged code lines. Structure the diff Artifact carries
+/// and the adapter renders - the header is a location string, the lines are RAW
+/// code tagged by [`DiffSide`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffHunk {
     /// The `@@ … @@` unified-diff header, or `None` for a created file.
@@ -185,7 +185,8 @@ pub struct DiffHunk {
 ///   interprets it.
 /// * `ToolResult { name, summary, is_error, key_arg }` -
 ///   `{:tool_result, name, summary, is_error, key_arg}`, the default one-line
-///   summary a extension's `present` may replace; `key_arg` is the salient input
+///   summary the Transcript store may swap for a richer item when the Tool
+///   Result carries an Artifact; `key_arg` is the salient input
 ///   arg (path/command/pattern) carried over from the paired call so the merged
 ///   line reads `name  <key_arg> · <result>`, `None` for an unpaired result.
 /// * `Diff { title, lang, hunks, elided }` - a first-class diff (ADR-0008): a
@@ -195,8 +196,9 @@ pub struct DiffHunk {
 ///   tint, and the syntect foreground.
 /// * `Todo { items }` - a first-class task list (ADR-0048): the model's
 ///   `todo_write` items in order, the SAME [`crate::plan::TodoItem`] vocabulary
-///   the Run-loop's Plan fold reads. The Todo display extension's Presenter swaps
-///   a successful `todo_write` Tool Result for this item, so the committed render
+///   the Run-loop's Plan fold reads. The Transcript store swaps a successful
+///   `todo_write` Tool Result for this item when the result carries the `todos`
+///   Artifact the tool attached, so the committed render
 ///   draws the circle list (`○ ◐ ●`) instead of the raw JSON args. Pure - the
 ///   glyph/colour treatment lives in `ui/components` (ADR-0019).
 /// * `Header { title, version, model, cwd, tip }` - the startup banner (qwen
@@ -255,9 +257,9 @@ pub enum TranscriptItem {
         elided: usize,
     },
     /// A first-class task list (ADR-0048): the model's `todo_write` items in
-    /// order, held as the pure [`crate::plan::TodoItem`] vocabulary. The Todo
-    /// display extension's Presenter emits this in place of a successful
-    /// `todo_write` Tool Result; the adapter draws the circle list.
+    /// order, held as the pure [`crate::plan::TodoItem`] vocabulary. The
+    /// Transcript store emits this in place of a successful `todo_write` Tool
+    /// Result carrying the `todos` Artifact; the adapter draws the circle list.
     Todo {
         items: Vec<crate::plan::TodoItem>,
     },

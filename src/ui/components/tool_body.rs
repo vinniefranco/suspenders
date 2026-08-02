@@ -136,10 +136,11 @@ pub(super) fn confirming_inner_lines(
 }
 
 /// A Todo tool item's inner box lines (ADR-0048, qwen `TodoDisplay`/`TodoItemRow`):
-/// a clean `✓ todo_write` header row with an EMPTY description - the Presenter
-/// dropped the raw JSON args when it swapped the Tool Result for a [`Todo`], so
-/// there is nothing to leak - then one circle-glyph row per item indented under
-/// the 3-wide marker column. The glyph is [`crate::plan::TodoStatus::glyph`]
+/// a clean `✓ todo_write` header row with an EMPTY description - the Transcript
+/// store dropped the raw JSON args when it swapped the Tool Result for a
+/// [`Todo`], so there is nothing to leak - then one circle-glyph row per item
+/// indented under the 3-wide marker column. The glyph is
+/// [`crate::plan::TodoStatus::glyph`]
 /// (`○ ◐ ●`); in_progress reads `success_style` (green), completed reads
 /// `primary_style` + [`Modifier::CROSSED_OUT`] (qwen colours completed
 /// Foreground, NOT green - only in_progress is green), everything else

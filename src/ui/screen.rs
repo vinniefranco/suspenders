@@ -541,10 +541,10 @@ pub struct HeaderFacts {
 
 // ---- diff-demo fixtures (Screen::demo_diffs) ----------------------------
 //
-// These build `TranscriptItem::Diff`s directly, in the shape the diff
-// extension's Presenter emits: raw marker-free code lines tagged by `DiffSide`,
-// a header per hunk (`None` for a created file), and a `lang` from the file
-// extension. Used only by [`Screen::demo_diffs`] for the live `diff-demo`.
+// These build `TranscriptItem::Diff`s directly, in the shape a diff Artifact
+// swaps in: raw marker-free code lines tagged by `DiffSide`, a header per hunk
+// (`None` for a created file), and a `lang` from the file extension. Used only
+// by [`Screen::demo_diffs`] for the live `diff-demo`.
 
 // One tagged code line (raw text, no `+`/`-` marker - the adapter adds it).
 fn diff_line(side: DiffSide, text: &str) -> DiffLine {
@@ -810,9 +810,9 @@ impl Screen {
     /// is free to grow without churning them.
     ///
     /// One user request; the diffs follow it in the transcript and fold
-    /// under Ctrl-O exactly like a real edit would. Each Diff is shaped as the
-    /// diff extension's Presenter emits it (raw marker-free lines, a
-    /// `display::title`-style title, the file extension as `lang`).
+    /// under Ctrl-O exactly like a real edit would. Each Diff is shaped as a
+    /// diff Artifact swaps in (raw marker-free lines, a `display::title`-style
+    /// title, the file extension as `lang`).
     pub fn demo_diffs() -> Self {
         let mut screen = Screen::new(ScreenOpts::default());
         let t = &mut screen.transcript;

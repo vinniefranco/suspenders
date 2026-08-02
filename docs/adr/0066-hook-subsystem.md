@@ -84,6 +84,10 @@ hooks:
 
 The `matcher` is a tool-name pattern that scopes a tool event (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`) to matching tools; an absent matcher matches all tools, and matcher is inert on non-tool events. Each hook carries its `type` and the one field that type needs (`command`, `url`, or `prompt`) plus an optional `timeout`. A skill's frontmatter uses the SAME shape under its own `hooks:` key, so a hook reads identically whether it came from `config.json` or a `SKILL.md`; the only difference is scope (standing vs. session) and the `SUSPENDERS_SKILL_ROOT` a skill hook additionally sees.
 
+One env var tunes the Stop path: `SUSPENDERS_STOP_HOOK_BLOCK_CAP` (qwen's `QWEN_CODE_STOP_HOOK_BLOCK_CAP`, renamed) caps how many times a Stop hook may force the Run to continue past a clean end before the cap wins and the Run stops anyway. It defaults to `8` and is clamped to a maximum of `100`; a missing, empty, non-integer, or below-`1` value falls back to the default. This bounds a Stop hook that keeps returning `continue:false` so it cannot loop the Run forever.
+
+A `continue:false` stop from a Pre/PostToolUse hook is batch-granular: the current tool batch finishes before the Run stops, so every `tool_use` in the batch still gets its answering `tool_result` and none is left unanswered. The stop lands at the batch boundary, not mid-batch.
+
 ## What is rejected or deferred
 
 - **The function hook type** is rejected, as argued above: an in-process SDK callback has no host to register it in a compiled Rust CLI, and porting it would mean an unusable plugin-callback ABI.
@@ -91,3 +95,5 @@ The `matcher` is a tool-name pattern that scopes a tool event (`PreToolUse`, `Po
 - **The `sequential` per-definition flag** (qwen runs a definition's hooks concurrently unless it is set) is deferred; Suspenders' first cut fixes an ordering it can reason about rather than exposing the toggle.
 - **Extension- and system-scoped hooks** (qwen's `Extensions` and `System` config sources) are out: Suspenders reads project, user, and session (skill) scopes only, matching the skill and MCP subsystems, which also load project + user rather than an extension level.
 - **`allowedEnvVars` / per-hook `env` / `headers` / `shell` selection and the `once`/`if` guards** are qwen surface we may honor later; the first cut delivers the three types with a timeout and the full decision protocol, which is the load-bearing part.
+- **http-URL validation (SSRF)** is a deferral. An **http** hook POSTs to whatever `url` its config names, with no allowlist or private-address guard, so a hook can reach an internal endpoint. This is consistent with the run_command shell tool under the no-approval trust model: a configured hook is already trusted to run arbitrary shell (ADR-0023), so a configured URL is no larger a grant than the shell it sits beside. The guard is deferred, not a claim that SSRF is impossible.
+- **command-hook env inheritance** is a deferral. A **command** hook inherits the parent process environment rather than running under a scrubbed env, so it sees the same variables the harness does. This too matches the run_command shell tool: under the no-approval trust model a configured command hook is trusted like any shell-out, so env scrubbing is deferred surface rather than a security boundary this ADR draws.

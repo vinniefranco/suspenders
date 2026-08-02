@@ -191,7 +191,8 @@ impl SkillManager {
     /// `(skill <name>, reason)` failure and skipped. Sources are walked in
     /// precedence order project > user > bundled, so on a name collision the
     /// higher-precedence skill wins and the shadowed one is dropped silently.
-    /// Discovered skills are sorted priority-desc-then-name.
+    /// Discovered skills are name-sorted (`priority:` is parsed and stored but
+    /// is not a sort key).
     pub fn discover(project_root: &Path, user_root: Option<&Path>) -> SkillManager {
         let mut skills: Vec<Skill> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();

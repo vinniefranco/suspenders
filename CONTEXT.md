@@ -84,7 +84,7 @@ _Avoid_: middleware (a Hook is one fire-point, not a composed chain), plugin, in
 The control-flow a Hook returns via its JSON output: halt the loop (`continue:false`+`stopReason`), control a Tool Call (`decision`: block/deny/approve/allow/ask), resolve an **Approval** (`permissionDecision`), inject context (`additionalContext`), or hide output (`suppressOutput`). A Hook is a decision-maker, not just an observer.
 
 **Answer**:
-How the Run's batch answered one Tool Call: the Tool Result the model will read plus the typed fact of whether the call ran - Ran (executed, and the outcomes that read as runs: a Middleware halt, a malformed-input answer) or Denied (the Approval gate). Built only through constructors that pair the Voice's wording with the fact so the two cannot drift: the batch states the fact.
+How the Run's batch answered one Tool Call: the Tool Result the model will read plus the typed fact of whether the call ran - Ran (executed, and the outcomes that read as runs: a Hook block, a malformed-input answer) or Denied (the Approval gate). Built only through constructors that pair the Voice's wording with the fact so the two cannot drift: the batch states the fact.
 _Avoid_: response (a Response is the model's), reply (also the model's), outcome alone (the ran-fact is one part of an Answer)
 
 **Thinking**:
@@ -156,10 +156,12 @@ _Avoid_: completion (reserved for the model's response), run management
 (Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
 
 **Presentment**:
-(Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
+The act of the Transcript store turning a Tool Result into a display item, substituting a richer item when the result carries an **Artifact** (via `swap_for_display`). It is role-less: no Middleware or Presenter is involved, only the store reading what the Tool already attached.
+_Avoid_: rendering (that's the frame draw), presenter (the retired role is gone)
 
 **Artifact**:
-(Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
+Display-side data a Tool attaches to its Tool Result - a diff, a parsed todo list, an exit-code badge - carried in the Tool Result's `artifacts` map. It never enters the Conversation and costs no **Context Budget**. The Transcript store reads it (`swap_for_display`) to substitute a richer Transcript item for the plain summary. Tool-owned: the Tool that produced the result attaches it directly.
+_Avoid_: Presenter output (the retired role is gone; the Tool owns the Artifact now), attachment (overloaded with model-facing content)
 
 **Voice**:
 Every Suspenders-voiced string the model reads: the system prompt, the compaction prompt, and every marker (run limit, cancellation, Result Cap cuts, malformed input, the run-close markers, and the error answers to a truncated or orphaned Tool Call). The Voice no longer authors any mid-Conversation steering - the nudge, anchor, and endgame apparatus is gone; the loop-detector's run-close marker is the only intervention text and it merely ends the Run. The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Hook produces about its own decisions stay in that Hook. Owned by one module so wording can be tuned per model in one place.
