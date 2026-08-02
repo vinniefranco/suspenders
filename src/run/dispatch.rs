@@ -46,7 +46,7 @@ pub(super) async fn dispatch<D: RunDeps>(
     response: Response,
 ) -> Flow {
     if response.stop_reason == StopReason::Error {
-        return error_flow(state, conversation, response);
+        return error_flow(state, conversation, response).await;
     }
 
     let has_tool_use = response.content.iter().any(ContentBlock::is_tool_use);
@@ -79,7 +79,8 @@ pub(super) async fn dispatch<D: RunDeps>(
 // "Please continue." user message and keeps looping (bounded by `max_turns`
 // through the loop's top-of-loop guard); `User` finishes the Run as before.
 // `skip_next_speaker` short-circuits straight to finishing (the pre-check
-// behavior).
+// behavior). Either way, the WOULD-FINISH branch first consults the Stop hook
+// (Phase 3b, ADR-0066): a Stop hook that blocks forces one more continuation.
 async fn no_tool_call<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
@@ -88,12 +89,77 @@ async fn no_tool_call<D: RunDeps>(
     let content = response.content.clone();
 
     if state.skip_next_speaker {
-        return finish::finish(state, conversation, content, response.stop_reason);
+        return finish_or_stop_hook(state, conversation, response, content).await;
     }
 
     match next_speaker::check_next_speaker(state.deps, &response).await {
-        NextSpeaker::User => finish::finish(state, conversation, content, response.stop_reason),
+        NextSpeaker::User => finish_or_stop_hook(state, conversation, response, content).await,
         NextSpeaker::Model => continue_after_no_tool(state, conversation, response),
+    }
+}
+
+// The Stop seam (Phase 3b, ADR-0066): the model would END the Run here (no more
+// tool calls, the next-speaker check said User or was skipped). Fire the Stop
+// hooks first - a Stop hook that blocks (`continue:false`) INVERTS the stop: the
+// Run must continue, and the hook's "Stop hook feedback:\n<reason>" is injected as
+// a user turn to guide the next Pass. A2 (qwen's configurable cap): the Run tracks
+// a continuation COUNTER against a resolved cap (default 8, env-overridable). Stop
+// fires while `stop_hook_count < stop_hook_cap`, incrementing on each forced
+// continuation; when the count reaches the cap the Run STOPS despite a still-
+// blocking hook and qwen's cap warning is emitted. So a hook that always blocks
+// forces at most `cap` extra Passes, never an infinite loop, and a legitimate stop
+// (no forcing hook) is never wrongly blocked.
+async fn finish_or_stop_hook<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+    response: Response,
+    content: Vec<ContentBlock>,
+) -> Flow {
+    // The cap already reached, or no hooks are wired: finish as normal.
+    let Some(hooks) = state
+        .hooks
+        .filter(|_| state.stop_hook_count < state.stop_hook_cap)
+    else {
+        return finish::finish(state, conversation, content, response.stop_reason);
+    };
+
+    match hooks.stop().await {
+        crate::run::hooks::StopDecision::Stop => {
+            finish::finish(state, conversation, content, response.stop_reason)
+        }
+        crate::run::hooks::StopDecision::Continue { feedback } => {
+            // The forced continuation: increment the counter (A2). If it has now
+            // reached the cap, emit qwen's cap warning and END the Run rather than
+            // continue - the hook is overridden so it cannot loop forever.
+            state.stop_hook_count += 1;
+            if state.stop_hook_count >= state.stop_hook_cap {
+                let warning = crate::run::hooks::format_stop_hook_cap_warning(state.stop_hook_cap);
+                state.emitter.emit(Event::extension_error(
+                    "hook Stop".to_string(),
+                    crate::event::Stage::Present,
+                    warning,
+                ));
+                return finish::finish(state, conversation, content, response.stop_reason);
+            }
+            state.emitter.emit(Event::extension_error(
+                "hook Stop".to_string(),
+                crate::event::Stage::Present,
+                "forced the Run to continue".to_string(),
+            ));
+            let blocks: Vec<ContentBlock> = content
+                .iter()
+                .filter(|b| !b.is_tool_use() && !matches!(b, ContentBlock::Thinking { .. }))
+                .cloned()
+                .collect();
+            if !blocks.is_empty() {
+                conversation.add_assistant_response(blocks, state.deps.provenance());
+            }
+            conversation.add_user_text(feedback.clone());
+            state.emitter.emit(Event::steering_delivered(feedback));
+            state.deps.checkpoint(&conversation);
+            state.turn += 1;
+            Flow::Continue(conversation)
+        }
     }
 }
 
@@ -139,7 +205,7 @@ fn continue_after_no_tool<D: RunDeps>(
 // Session Log entry), and re-request the SAME, unmutated Conversation. On a
 // non-retryable error, or once the budget is spent (default 3, 0 disables), the
 // loud `finish::fail` runs.
-fn error_flow<D: RunDeps>(
+async fn error_flow<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
     response: Response,
@@ -153,6 +219,14 @@ fn error_flow<D: RunDeps>(
             .emit(Event::retry(error, attempt, state.malformed_retry_budget));
         Flow::Retry(conversation)
     } else {
+        // The StopFailure seam (Phase 3b, ADR-0066): the turn ended on an API error
+        // (non-retryable, or the re-draw budget is spent). Fire the observational
+        // StopFailure hooks with the error before the loud `fail` closes the Run.
+        if let Some(hooks) = state.hooks {
+            hooks
+                .stop_failure(&response.error.clone().unwrap_or_default())
+                .await;
+        }
         Flow::Done(finish::fail(state, conversation, response))
     }
 }
@@ -178,6 +252,26 @@ async fn continue_tools<D: RunDeps>(
     }
     let (results, conversation) =
         batch::execute_tools(state, conversation, &response.content).await;
+
+    // A hook's `continue:false` (Phase 3a, ADR-0066): a Pre/PostToolUse hook that
+    // ran during this batch requested the loop stop. Answer the batch first (the
+    // results are appended so the Conversation never persists an unanswered
+    // tool_use block), then close the Run on the hook's reason through the same
+    // custom-stop path an after-Pass `Stop` takes. Taken (not peeked) so a later
+    // Pass does not re-close.
+    if let Some(reason) = state.hook_stop.take() {
+        let (mut conversation, response, results) = (conversation, response, results);
+        conversation.add_assistant_response(response.content.clone(), state.deps.provenance());
+        conversation.add_tool_results(results, Vec::new());
+        state.deps.checkpoint(&conversation);
+        return Flow::Done(finish::close_custom(
+            state,
+            conversation,
+            voice::Marker::RunStopped.text(),
+            reason,
+        ));
+    }
+
     next_pass(state, conversation, response, results).await
 }
 

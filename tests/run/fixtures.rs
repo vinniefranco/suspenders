@@ -14,7 +14,6 @@ use tempfile::TempDir;
 use crate::content::{ContentBlock, Message, Usage};
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::extensions::Registered;
 use crate::llm::model::Model;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{Llm, LlmRequest, StreamEvent};
@@ -125,14 +124,89 @@ pub(super) async fn run_with(
     mut deps: FakeDeps,
 ) -> (Outcome, FakeDeps) {
     let conv = conversation(session, prompt);
-    let extensions: Vec<Registered> = Vec::new();
     let ctx = tool_ctx(session);
     let outcome = run(
         conv,
         session,
         RunEnv {
-            extensions: &extensions,
             tool_ctx: &ctx,
+            hooks: None,
+            skill_activation: None,
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
+    (outcome, deps)
+}
+
+/// Runs the loop with a hook firing handle wired (Phase 3a, ADR-0066). The
+/// caller builds a [`crate::run::hooks::Hooks`] over an injected fake
+/// ShellExec/HttpPost (crafted [`crate::hooks::HookOutcome`]s) and a fresh
+/// [`crate::llm::Llm`]; the `run` threads it into `RunEnv.hooks` so `batch` fires
+/// the four tool events. Returns `(outcome, deps)` for event/checkpoint
+/// inspection, mirroring [`run_with`].
+pub(super) async fn run_with_hooks(
+    session: &Session,
+    prompt: &str,
+    mut deps: FakeDeps,
+    hooks: &crate::run::hooks::Hooks<'_>,
+) -> (Outcome, FakeDeps) {
+    let conv = conversation(session, prompt);
+    let ctx = tool_ctx(session);
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: Some(hooks),
+            skill_activation: None,
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
+    (outcome, deps)
+}
+
+/// Runs the loop with BOTH a hook firing handle AND the conditional-skill /
+/// skill-hook-registration seam wired (Phase 4c, ADR-0066). The caller supplies a
+/// [`crate::run::hooks::Hooks`] (over injected fakes) and a shared
+/// [`crate::skills::SkillManager`]; `run` threads both into the `RunEnv` so
+/// `batch` fires the tool events AND registers a model-invoked skill's `hooks:`.
+/// `project_root` is the root a touched path resolves against (also the skill
+/// activation scope). Mirrors [`run_with_hooks`].
+pub(super) async fn run_with_hooks_and_skills(
+    session: &Session,
+    prompt: &str,
+    mut deps: FakeDeps,
+    hooks: &crate::run::hooks::Hooks<'_>,
+    skills: Arc<crate::skills::SkillManager>,
+    project_root: std::path::PathBuf,
+) -> (Outcome, FakeDeps) {
+    let conv = conversation(session, prompt);
+    // A registry carrying the `skill` tool over the SAME shared SkillManager, so a
+    // model `skill` call actually SUCCEEDS in-test (the registration trigger keys
+    // off tool SUCCESS). Built beside the built-in set the other tools come from.
+    let mut tools = crate::tools::tools();
+    tools.push(Box::new(crate::tools::skill::SkillTool::new(Arc::clone(
+        &skills,
+    ))));
+    let registry = Arc::new(crate::tool_registry::ToolRegistry::new(tools));
+    let ctx = session.tool_ctx(
+        &session.model,
+        crate::tool::caps::Capabilities::for_test_with_registry(registry),
+    );
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: Some(hooks),
+            skill_activation: Some(crate::run::loop_::SkillActivation {
+                skills,
+                project_root,
+            }),
         },
         &mut deps,
         RunOpts::default(),

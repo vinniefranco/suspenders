@@ -31,14 +31,15 @@ use crate::mcp::McpServerView;
 use crate::tool::caps::Question;
 use crate::view_model::SelectorRow;
 
-/// The `extension_error` stage: which point in the extension's lifecycle crashed
-/// (fail-open, ADR-0007). Mirrors baud's `:pre_run | :post_run` (and the
-/// deferred `:present`).
+/// A label on the generic fail-open `extension_error` report channel: which
+/// point an extension subsystem crashed (fail-open, ADR-0007). These are just
+/// labels on the report line, not a Middleware pipeline stage - the pipeline is
+/// retired (Hooks are the lifecycle-interception layer, ADR-0066). MCP connect,
+/// Hook discovery/firing, and skill discovery report through this channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     PreRun,
     PostRun,
-    /// The Presentment stage (deferred with the Transcript Item type).
     Present,
 }
 
@@ -71,9 +72,10 @@ pub struct FileSuggestion {
 
 /// Every event shape the Run and the Agent emit.
 ///
-/// The `artifacts` on [`Event::ToolResult`] is display-side Presenter data
-/// (CONTEXT.md: Artifact) - a `HashMap<String, Value>`, `{}` when no extension
-/// attached any; it never enters the Conversation, is never shaped or evicted.
+/// The `artifacts` on [`Event::ToolResult`] is the display-side data a Tool
+/// attaches to its result (CONTEXT.md: Artifact) - a `HashMap<String, Value>`,
+/// `{}` when the Tool attached none; it never enters the Conversation, is never
+/// shaped or evicted.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     // ---- Run lifecycle ----
@@ -527,8 +529,9 @@ impl Event {
 
     // ---- The rest ----
 
-    /// Constructs an `extension_error` from a pipeline [`crate::extensions::Failure`]'s
-    /// parts: the extension name, the stage that crashed, and the message.
+    /// Constructs an `extension_error` from a tool-side subsystem failure's
+    /// parts: the source name, the stage that crashed, and the message. Used by
+    /// the Agent's MCP init / ops fail-open reporting (ADR-0056).
     pub fn extension_error(
         extension: impl Into<String>,
         stage: Stage,

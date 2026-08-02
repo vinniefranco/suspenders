@@ -5,11 +5,11 @@
 //!
 //! [`execute_tools`] runs a Pass's Tool Calls in emission order. Each call goes
 //! through the gates in sequence: the malformed-input sentinel (the LLM layer
-//! tags inputs that never parsed - those are answered, never run), then the
-//! Extension lifecycle (ADR-0007: pre_run - which may halt the call with the
-//! Extension's own wording - execution, post_run/Shaping), with Approval
-//! (ADR-0005) requested between pre_run and execution for the tools that
-//! require it, on the Middleware-adjusted input. Once the batch finishes the
+//! tags inputs that never parsed - those are answered, never run), then Approval
+//! (ADR-0005) on the raw tool input for the tools that require it, then execution
+//! with Shaping (the Result Cap). A tool shapes its own model-facing output and
+//! attaches any display Artifacts (ADR-0007: the diff / todos / exit-code badge
+//! live in the tools now, not a wrapper pipeline). Once the batch finishes the
 //! Conversation is checkpointed with only the answered Tool Calls, so the
 //! checkpoint never persists an unanswered tool_use block.
 //!
@@ -24,12 +24,12 @@ use crate::approvals;
 use crate::content::{ContentBlock, ResultBlock, result_blocks_text};
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::extensions;
 use crate::llm::malformed_tool_input;
-use crate::middleware::Token;
 use crate::plan::Update;
 use crate::run::deps::RunDeps;
+use crate::run::hooks;
 use crate::run::loop_::LoopState;
+use crate::tools;
 use crate::voice;
 
 // Run tool calls in emission order; results keep that order. Checkpoint ONCE
@@ -118,7 +118,9 @@ async fn execute_tool<D: RunDeps>(
     let content = answer.content;
     let is_error = answer.is_error;
 
-    maybe_store_plan(state, &name, &input, is_error);
+    maybe_store_plan(state, &name, &input, is_error).await;
+    maybe_activate_skills(state, &name, &input, is_error);
+    maybe_register_skill_hooks(state, &name, &input, is_error);
 
     // The UI event carries the text projection (ADR-0059): a media block renders
     // as a short placeholder there, while the Conversation keeps the full block
@@ -134,17 +136,138 @@ async fn execute_tool<D: RunDeps>(
     ContentBlock::tool_result_blocks(id, content, is_error)
 }
 
-// A successful todo_write Tool Call replaces the Plan's task list and stores its
-// rendered form through the set_plan Dep; the Loop keeps this Run's copy.
-fn maybe_store_plan<D: RunDeps>(
+// Conditional-skill activation at the tool-success seam (ADR-0058, qwen's
+// `matchAndActivateByPath`). A SUCCESSFUL Tool Call that names a file path
+// activates any conditional (`paths:`) skill whose globs match that path,
+// resolved relative to the Project Root; the skill then appears in the `skill`
+// tool's `<available_skills>` catalog on its next description read (the manager
+// is shared, so no change-listener). Checking SUCCESS (not attempt) means a
+// failed touch never leaks a hidden skill into the catalog. A no-activation Run
+// (no `skill_activation` threaded, an errored call, or a tool that touches no
+// file) is a cheap no-op.
+fn maybe_activate_skills<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
     is_error: bool,
 ) {
-    if let Update::Updated(plan) = state.plan.update(name, input, is_error) {
-        state.deps.set_plan(plan.render());
-        state.plan = plan;
+    if is_error {
+        return;
+    }
+    let Some(activation) = state.skill_activation.as_ref() else {
+        return;
+    };
+    for path in touched_paths(name, input) {
+        activation
+            .skills
+            .activate_by_path(std::path::Path::new(path), &activation.project_root);
+    }
+}
+
+// The file path(s) a Tool Call named in its input (ADR-0058). Reads the standard
+// path keys the file-touching tools carry - `file_path` (read_file/edit/
+// write_file), `notebook_path` (notebook_edit), and `path` (list_directory/glob/
+// grep_search, a search-root that can still match a `src/**`-style skill glob) -
+// so activation keys off the same signal the tool result carries. A tool that
+// names no path (or names it under an unrecognized key) yields nothing.
+fn touched_paths<'a>(_name: &str, input: &'a Value) -> Vec<&'a str> {
+    const PATH_KEYS: [&str; 3] = ["file_path", "notebook_path", "path"];
+    PATH_KEYS
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(Value::as_str))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+// Skill-hook registration at the tool-success seam (Phase 4c, ADR-0066): a
+// SUCCESSFUL `skill` tool call - the MODEL invoking a skill - registers that
+// skill's frontmatter `hooks:` as SESSION-scoped hooks in the live HookManager,
+// so they fire at their events for the rest of the Run (qwen semantics:
+// model-invocation only, session-scoped, carrying SUSPENDERS_SKILL_ROOT). The
+// skill is resolved by the `skill` input arg through the shared
+// `Arc<SkillManager>` (the same handle `maybe_activate_skills` uses), and its
+// `base_dir` becomes the hook skill_root so a registered command hook sees
+// SUSPENDERS_SKILL_ROOT when the Phase 2 runner fires it. Registration is
+// idempotent (a skill invoked twice registers once). This keeps the `skill` tool
+// hook-free: the RUN layer detects the invocation and does the registration,
+// mirroring the todo/subagent hook wiring (ADR-0066's layering preference). A Run
+// with no hooks handle, no skill_activation, an errored call, or a non-`skill`
+// tool is a cheap no-op. The user `/<name>` slash path (Phase 4b) does NOT reach
+// here - it never emits a `skill` tool call - so only the model path registers
+// hooks, faithful to qwen.
+fn maybe_register_skill_hooks<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    is_error: bool,
+) {
+    if is_error || name != "skill" {
+        return;
+    }
+    let (Some(hooks), Some(activation)) = (state.hooks, state.skill_activation.as_ref()) else {
+        return;
+    };
+    let Some(skill_name) = input.get("skill").and_then(Value::as_str).map(str::trim) else {
+        return;
+    };
+    let Some(skill) = activation.skills.find(skill_name) else {
+        return;
+    };
+    // Only a skill that actually carries a parsed `hooks:` block registers
+    // anything; a skill with no hooks is a no-op (registers nothing).
+    if let Some(skill_hooks) = &skill.hooks {
+        hooks.register_skill(&skill.name, &skill.base_dir.to_string_lossy(), skill_hooks);
+    }
+}
+
+// A successful todo_write Tool Call replaces the Plan's task list and stores its
+// rendered form through the set_plan Dep; the Loop keeps this Run's copy. The
+// TodoCreated / TodoCompleted hooks (Phase 3b, ADR-0066) fire here at the RUN
+// layer: the Plan fold detects the created/completed transitions from the old vs.
+// new todo lists, so a todo_write tool never depends on the hook subsystem
+// (ADR-0066's layering preference - tools stay hook-free).
+async fn maybe_store_plan<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    is_error: bool,
+) {
+    let Update::Updated(plan) = state.plan.update(name, input, is_error) else {
+        return;
+    };
+    fire_todo_hooks(state, &plan).await;
+    state.deps.set_plan(plan.render());
+    state.plan = plan;
+}
+
+// Fires TodoCreated / TodoCompleted for the transitions between the Run's current
+// Plan (`state.plan`) and the freshly-folded `new_plan` (Phase 3b, ADR-0066). A
+// created todo is one whose content is new to the list; a completed todo is one
+// that is Completed now and was NOT Completed before (a fresh content that lands
+// Completed counts as both created and completed, matching qwen's per-item
+// validation/postWrite split firing on each). Fire-and-observe: these events do
+// not steer, so any outcome is ignored.
+async fn fire_todo_hooks<D: RunDeps>(state: &mut LoopState<'_, D>, new_plan: &crate::plan::Plan) {
+    let Some(hooks) = state.hooks else {
+        return;
+    };
+    use crate::plan::TodoStatus;
+    let was_completed = |content: &str| {
+        state
+            .plan
+            .todos
+            .iter()
+            .any(|t| t.content == content && t.status == TodoStatus::Completed)
+    };
+    let existed = |content: &str| state.plan.todos.iter().any(|t| t.content == content);
+
+    for todo in &new_plan.todos {
+        if !existed(&todo.content) {
+            hooks.todo_created(&todo.content).await;
+        }
+        if todo.status == TodoStatus::Completed && !was_completed(&todo.content) {
+            hooks.todo_completed(&todo.content).await;
+        }
     }
 }
 
@@ -156,8 +279,9 @@ pub(super) fn display_input(input: &Value) -> Value {
     }
 }
 
-// How the batch answered one Tool Call: the Tool Result the model will read
-// plus whether it was an error. Built only through the constructors below.
+// How the batch answered one Tool Call: the Tool Result the model will read,
+// whether it was an error, and the display Artifacts the tool attached. Built
+// only through the constructors below.
 struct Answer {
     content: Vec<ResultBlock>,
     is_error: bool,
@@ -168,26 +292,18 @@ impl Answer {
     /// A malformed-input answer is recorded like any error - it reads as a
     /// run.
     fn malformed(raw: &str) -> Self {
-        Answer::text(voice::malformed_input(raw), true, Default::default())
-    }
-
-    /// A Middleware halt reads as a failed run.
-    fn halted(reason: String, artifacts: HashMap<String, Value>) -> Self {
-        Answer::text(reason, true, artifacts)
+        Answer::text(voice::malformed_input(raw), true)
     }
 
     /// An Approval denial (ADR-0005): the command never ran.
     fn denied() -> Self {
-        Answer::text(
-            voice::Marker::CommandDenied.text(),
-            true,
-            Default::default(),
-        )
+        Answer::text(voice::Marker::CommandDenied.text(), true)
     }
 
-    /// The Extension pipeline executed the call: the shaped block list rides
-    /// straight through (ADR-0059).
-    fn ran(result: extensions::PipelineResult) -> Self {
+    /// The tool executed and was Shaped (the Result Cap): the block list, the
+    /// error flag, and the tool's display Artifacts ride straight through
+    /// (ADR-0059).
+    fn ran(result: tools::ToolResult) -> Self {
         Answer {
             content: result.content,
             is_error: result.is_error,
@@ -195,74 +311,300 @@ impl Answer {
         }
     }
 
-    /// A single-Text-block answer - the shape every Voice-worded outcome
-    /// (malformed/halted/denied) takes.
-    fn text(content: impl Into<String>, is_error: bool, artifacts: HashMap<String, Value>) -> Self {
+    /// A single-Text-block answer with no Artifacts - the shape every
+    /// Voice-worded outcome (malformed / denied) takes.
+    fn text(content: impl Into<String>, is_error: bool) -> Self {
         Answer {
             content: vec![ResultBlock::text(content)],
             is_error,
-            artifacts,
+            artifacts: HashMap::new(),
         }
     }
 }
 
-// The Extension lifecycle (ADR-0007): the LLM layer tags malformed inputs -
-// never run those. Otherwise pre_run, Approval on the Middleware-adjusted
-// command, and execution with post_run and Shaping.
+// The Tool Call lifecycle (ADR-0007, pipeline retired): the LLM layer tags
+// malformed inputs - never run those. Otherwise the hook-fire seam (Phase 3a,
+// ADR-0066) wraps the Approval + execution: PreToolUse may block the call or feed
+// a permission decision, PermissionRequest composes with the Approval, and
+// Post{ToolUse,ToolUseFailure} enrich the result. A tool shapes its own output
+// and attaches its own display Artifacts; the hooks only decide/enrich around it.
 async fn run_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str, input: &Value) -> Answer {
     if let Some(raw) = malformed_tool_input(input) {
         return Answer::malformed(raw);
     }
 
-    run_lifecycle(state, name, input).await
+    // The PreToolUse seam (ADR-0066): fire before Approval/execution. A blocking
+    // hook (block/deny, or a prompt hook's ok:false) stops the call - the tool
+    // does NOT run and the hook's reason is fed to the model as the result (a
+    // Ran-with-blocked outcome, not a crash). Otherwise the call proceeds carrying
+    // the hook's permission decision, injected context, and any stop request.
+    let pre = fire_pre_tool_use(state, name, input).await;
+    let (pre_permission, pre_context) = match pre {
+        PreOutcome::Block(answer) => return answer,
+        PreOutcome::Proceed {
+            permission,
+            context,
+        } => (permission, context),
+    };
+
+    let answer = gated_execute(state, name, input, pre_permission).await;
+
+    // The Post seam (ADR-0066): a successful result runs PostToolUse (context +
+    // stop); a failed result runs PostToolUseFailure (context only). The injected
+    // context is appended to the result the model reads, PreToolUse's context
+    // first so a guard's note precedes an audit's note.
+    post_process(state, name, answer, pre_context).await
 }
 
-async fn run_lifecycle<D: RunDeps>(
+// The Approval seam with the hook permission composition (ADR-0066, ADR-0050
+// revised). Only the gated Tools reach it (`approvals::gate_text`); for those,
+// the PermissionRequest hook composes with the mode: `allow` auto-approves with
+// no modal, `deny` rejects outright (overriding even Yolo) with the hook reason,
+// `ask`/no-decision falls through to the normal `request_approval` gate. The
+// PreToolUse permission decision joins the composition with the same precedence.
+async fn gated_execute<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
+    pre_permission: Option<crate::hooks::PermissionDecision>,
 ) -> Answer {
-    let token = Token::new(name, input.clone(), state.tool_ctx.clone());
-    let (token, failures) = extensions::pre_run(state.extensions, token);
-    emit_extension_errors(state, &failures);
+    let Some(text) = approvals::gate_text(name, input) else {
+        // An ungated Tool: a PreToolUse `deny` was already handled as a universal
+        // Block above (A1), and a bare `allow` is moot (there is no gate to open).
+        // But a PreToolUse `ask` FORCES a confirmation even on an ungated tool
+        // (A1, qwen `isAsk()` -> requires-confirmation regardless of gating), so
+        // synthesize the gate over a generic confirm text and let the mode decide.
+        if pre_permission == Some(crate::hooks::PermissionDecision::Ask) {
+            emit_hook_decision(state, "PreToolUse", "requested confirmation");
+            let id = new_ref();
+            let text = format!("Confirm {name}");
+            return if state.deps.request_approval(id, text).await {
+                execute_tool_call(state, name, input).await
+            } else {
+                Answer::denied()
+            };
+        }
+        return execute_tool_call(state, name, input).await;
+    };
 
-    if token.halted {
-        let reason = token.halt_reason.clone().unwrap_or_default();
-        return Answer::halted(reason, token.artifacts.clone());
-    }
+    // Compose the hook verdict with the mode. `None` hooks handle => Ask (the
+    // normal gate); a fired hook may Allow / Deny / Ask.
+    let verdict = match state.hooks {
+        Some(hooks) => hooks.permission_request(name, input, pre_permission).await,
+        None => match pre_permission {
+            // With no PermissionRequest hooks, a PreToolUse permission decision
+            // still composes (ADR-0050 revised): allow auto-approves, deny rejects.
+            Some(crate::hooks::PermissionDecision::Allow) => hooks::PermissionVerdict::Allow,
+            Some(crate::hooks::PermissionDecision::Deny) => hooks::PermissionVerdict::Deny {
+                reason: voice::Marker::CommandDenied.text().to_string(),
+            },
+            _ => hooks::PermissionVerdict::Ask,
+        },
+    };
 
-    // The one Approval seam: Some(text) gates and text is exactly what the
-    // user reads (the command, or web_fetch's URL), read from the
-    // Middleware-adjusted input; None means no gate (approvals::gate_text).
-    match approvals::gate_text(name, &token.input) {
-        Some(text) => {
+    match verdict {
+        hooks::PermissionVerdict::Allow => {
+            emit_hook_decision(state, "PermissionRequest", "auto-approved a Tool Call");
+            execute_tool_call(state, name, input).await
+        }
+        hooks::PermissionVerdict::Deny { reason } => {
+            emit_hook_decision(
+                state,
+                "PermissionRequest",
+                &format!("denied a Tool Call: {reason}"),
+            );
+            Answer::text(reason, true)
+        }
+        hooks::PermissionVerdict::Ask => {
             let id = new_ref();
             if state.deps.request_approval(id, text).await {
-                execute_token(state, token).await
+                execute_tool_call(state, name, input).await
             } else {
                 Answer::denied()
             }
         }
-        None => execute_token(state, token).await,
     }
 }
 
-async fn execute_token<D: RunDeps>(state: &mut LoopState<'_, D>, token: Token) -> Answer {
-    let (result, failures) = extensions::execute(state.extensions, token).await;
-    emit_extension_errors(state, &failures);
-    Answer::ran(result)
+// Runs the named tool with Shaping (the Result Cap) - the extension-free dispatch
+// path (`tools::run`). A tool can never crash the Run: an unknown name or an
+// `Err` return both come back as an `is_error` result (ADR-0018 fail-open). The
+// `agent` tool spawns a child Run, so the SubagentStart / SubagentStop hooks
+// (Phase 3b, ADR-0066) bracket its dispatch here at the PARENT run layer - the
+// child's own inner Run stays hook-free (the Phase 3a choice).
+async fn execute_tool_call<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+) -> Answer {
+    let subagent_type = (name == "agent")
+        .then(|| input.get("subagent_type").and_then(Value::as_str))
+        .flatten();
+
+    if let (Some(hooks), Some(kind)) = (state.hooks, subagent_type) {
+        hooks.subagent_start(kind).await;
+    }
+    let answer = Answer::ran(tools::run(name, input, state.tool_ctx).await);
+    if let (Some(hooks), Some(kind)) = (state.hooks, subagent_type) {
+        hooks.subagent_stop(kind).await;
+    }
+    answer
 }
 
-fn emit_extension_errors<D: RunDeps>(
+// The PreToolUse fold from the Run's view (ADR-0066): either the call is blocked
+// (the tool must not run; the Answer carries the hook's reason) or it proceeds
+// carrying the permission decision + injected context the later seams honor.
+enum PreOutcome {
+    Block(Answer),
+    Proceed {
+        permission: Option<crate::hooks::PermissionDecision>,
+        context: Option<String>,
+    },
+}
+
+// Fires the PreToolUse hooks (ADR-0066). With no hooks wired the call proceeds
+// unchanged. A blocking outcome becomes a Ran-with-blocked Answer (the reason,
+// plus any additionalContext the blocking hook still carried, fed to the model as
+// an error result - the tool never ran). A `continue:false` records the minimal
+// Stop on the LoopState. Every deciding fire is surfaced visibly (ADR-0018).
+async fn fire_pre_tool_use<D: RunDeps>(
     state: &mut LoopState<'_, D>,
-    failures: &[extensions::Failure],
+    name: &str,
+    input: &Value,
+) -> PreOutcome {
+    let Some(hooks) = state.hooks else {
+        return PreOutcome::Proceed {
+            permission: None,
+            context: None,
+        };
+    };
+
+    match hooks.pre_tool_use(name, input).await {
+        hooks::PreToolDecision::Block {
+            reason,
+            context,
+            system_message,
+        } => {
+            emit_hook_decision(
+                state,
+                "PreToolUse",
+                &format!("blocked a Tool Call: {reason}"),
+            );
+            surface_system_message(state, "PreToolUse", system_message);
+            // The blocked call reads as an error result: the reason, with any
+            // additionalContext the blocking hook still injected appended.
+            let content = append_context(reason, context);
+            PreOutcome::Block(Answer::text(content, true))
+        }
+        hooks::PreToolDecision::Proceed {
+            permission,
+            context,
+            stop,
+            system_message,
+        } => {
+            if let Some(reason) = stop {
+                emit_hook_decision(state, "PreToolUse", &format!("requested stop: {reason}"));
+                state.hook_stop.get_or_insert(reason);
+            }
+            if context.is_some() {
+                emit_hook_decision(state, "PreToolUse", "injected additional context");
+            }
+            surface_system_message(state, "PreToolUse", system_message);
+            PreOutcome::Proceed {
+                permission,
+                context,
+            }
+        }
+    }
+}
+
+// The Post seam (ADR-0066): fire PostToolUse on a success (context + stop) or
+// PostToolUseFailure on an error (context only), then append the collected
+// additionalContext (PreToolUse's first, then Post's) to the result the model
+// reads. A `continue:false` from PostToolUse records the minimal Stop. No hooks
+// wired => the Answer passes through with only the PreToolUse context appended.
+async fn post_process<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    answer: Answer,
+    pre_context: Option<String>,
+) -> Answer {
+    let output = result_blocks_text(&answer.content);
+    let post_context = match state.hooks {
+        Some(hooks) if !answer.is_error => {
+            let decision = hooks.post_tool_use(name, &output).await;
+            if let Some(reason) = decision.stop {
+                emit_hook_decision(state, "PostToolUse", &format!("requested stop: {reason}"));
+                state.hook_stop.get_or_insert(reason);
+            }
+            surface_system_message(state, "PostToolUse", decision.system_message);
+            decision.context
+        }
+        Some(hooks) => hooks.post_tool_use_failure(name, &output).await,
+        None => None,
+    };
+
+    if post_context.is_some() {
+        let event = if answer.is_error {
+            "PostToolUseFailure"
+        } else {
+            "PostToolUse"
+        };
+        emit_hook_decision(state, event, "injected additional context");
+    }
+
+    // Nothing to append: the Answer is unchanged.
+    if pre_context.is_none() && post_context.is_none() {
+        return answer;
+    }
+
+    // Append the injected context as a trailing text block on the result the model
+    // reads (PreToolUse's note first, then Post's), so a hook can hand the model
+    // lint output or a policy note. The is_error flag and Artifacts are untouched.
+    let extra = [pre_context, post_context]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut content = answer.content;
+    content.push(ResultBlock::text(extra));
+    Answer { content, ..answer }
+}
+
+// Appends the optional hook `additionalContext` to a reason string as a trailing
+// paragraph (the blocked-call answer). No context leaves the reason unchanged.
+fn append_context(reason: String, context: Option<String>) -> String {
+    match context {
+        Some(ctx) => format!("{reason}\n{ctx}"),
+        None => reason,
+    }
+}
+
+// Surfaces a deciding hook fire as a visible line (ADR-0018 fail-open-with-
+// visibility, ADR-0066): a block / auto-approve / deny / stop / inject is never
+// silent. Reuses the fail-open report seam skills/MCP use (an `extension_error`
+// with a `hook <event>` label + the `Present` mid-Run stage), so the operator
+// reads what a hook did on the same channel a launch notice takes.
+fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, what: &str) {
+    state.emitter.emit(Event::extension_error(
+        format!("hook {event}"),
+        crate::event::Stage::Present,
+        what.to_string(),
+    ));
+}
+
+// Surfaces a hook's `systemMessage` on the same visible channel (A5, qwen's
+// `processCommonHookOutputFields`): a hook can hand the USER a note (distinct from
+// the model-facing additionalContext) UNLESS it set `suppressOutput` (the fold
+// already applied that gate, so this only sees the messages qwen would show). `None`
+// is a no-op - the common case where no hook set a systemMessage.
+fn surface_system_message<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    event: &str,
+    message: Option<String>,
 ) {
-    for failure in failures {
-        state.emitter.emit(Event::extension_error(
-            failure.extension.clone(),
-            failure.stage,
-            failure.message.clone(),
-        ));
+    if let Some(message) = message {
+        emit_hook_decision(state, event, &format!("system message: {message}"));
     }
 }
 

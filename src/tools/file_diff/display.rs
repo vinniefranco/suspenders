@@ -2,18 +2,18 @@
 //! vocabulary).
 //!
 //! Produces a title, the source language, and the tagged [`DiffHunk`]s from a
-//! diff artifact. Extracted from [`crate::extensions::diff`] so the rendering
-//! logic is unit-testable without a Middleware lifecycle.
+//! diff artifact. Split from [`crate::tools::file_diff`] so the rendering
+//! logic is unit-testable in isolation.
 //!
 //! Lines carry a [`DiffSide`] - `Added`, `Removed`, `Context` - and RAW code
 //! text (no `+`/`-` marker); a later `ui/components` phase maps the side to a
 //! background tint, adds the marker glyph, and layers the syntect foreground.
-//! The Presenter decides WHAT to show (this language, these hunks, this much
+//! The tool decides WHAT to show (this language, these hunks, this much
 //! elided); the adapter decides HOW.
 
 use serde::{Deserialize, Serialize};
 
-use crate::extensions::diff::hunks::{Hunk, Line, Tag};
+use crate::tools::file_diff::hunks::{Hunk, Line, Tag};
 use crate::view_model::{DiffHunk, DiffLine, DiffSide};
 
 /// The default display cap: hunks render at most this many lines before eliding
@@ -104,8 +104,8 @@ fn hunk_header(hunk: &Hunk, created: bool) -> Option<String> {
 }
 
 // The line's [`DiffSide`] over its RAW text (ADR-0008): the adapter adds the
-// `+`/`-`/context marker and the color. This is an Extension display choice (the
-// Extension decides WHAT to show; the adapter decides HOW).
+// `+`/`-`/context marker and the color. This is the tool's display choice (the
+// tool decides WHAT to show; the adapter decides HOW).
 fn diff_line(line: &Line) -> DiffLine {
     let side = match line.tag {
         Tag::Context => DiffSide::Context,
@@ -116,5 +116,5 @@ fn diff_line(line: &Line) -> DiffLine {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/extensions/diff/display.rs"]
+#[path = "../../../tests/tools/file_diff/display.rs"]
 mod tests;

@@ -59,24 +59,55 @@ impl Tool for WriteFile {
     }
 
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let raw_path = input
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                "invalid input: write_file requires a string \"file_path\"".to_string()
-            })?;
-        // qwen's `unescapePath(params.file_path.trim())` (write-file.ts): trim
-        // surrounding whitespace and strip shell-escaping backslashes BEFORE the
-        // absolute-path check and before the path is echoed back.
-        let path = unescape_and_trim(raw_path);
-        let content = input
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: write_file requires a string \"content\"".to_string())?;
-
-        let abs = resolve(&path, ctx)?;
-        write(&abs, content, ctx)
+        // The text projection: the model-facing message, dropping the display
+        // Artifact. `run_rich` (the Registry's dispatch path) keeps the diff.
+        write_file(input, ctx).map(|outcome| outcome.message)
     }
+
+    async fn run_rich(
+        &self,
+        input: &Value,
+        ctx: &ToolCtx,
+    ) -> Result<crate::tool::ToolOutput, String> {
+        // write_file knows the before-content (an overwrite) and the written
+        // content, so it computes its own diff (ADR-0007's diff behavior,
+        // relocated here) and attaches the `diff` display Artifact, which the
+        // Transcript store swaps for a first-class Diff item.
+        let outcome = write_file(input, ctx)?;
+        let output = crate::tool::ToolOutput::text(outcome.message);
+        Ok(match outcome.diff {
+            Some(diff) => output.with_artifact(crate::tools::file_diff::DIFF, diff),
+            None => output,
+        })
+    }
+}
+
+/// One write's outcome: the model-facing message and the optional `diff` display
+/// Artifact (a serialized [`crate::tools::file_diff::DiffArtifact`]). `run`
+/// projects the message; `run_rich` also attaches the diff.
+struct WriteOutcome {
+    message: String,
+    diff: Option<Value>,
+}
+
+/// Decodes the input, resolves the path, and writes the file, returning the
+/// message and the diff Artifact. Shared by `run` and `run_rich`.
+fn write_file(input: &Value, ctx: &ToolCtx) -> Result<WriteOutcome, String> {
+    let raw_path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "invalid input: write_file requires a string \"file_path\"".to_string())?;
+    // qwen's `unescapePath(params.file_path.trim())` (write-file.ts): trim
+    // surrounding whitespace and strip shell-escaping backslashes BEFORE the
+    // absolute-path check and before the path is echoed back.
+    let path = unescape_and_trim(raw_path);
+    let content = input
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "invalid input: write_file requires a string \"content\"".to_string())?;
+
+    let abs = resolve(&path, ctx)?;
+    write(&abs, raw_path, content, ctx)
 }
 
 /// Resolve a model-supplied ABSOLUTE `file_path` and confine it to the Project
@@ -101,7 +132,12 @@ fn resolve(path: &str, ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
 /// directories, then stamp the read cache. `abs` is used in the model-facing
 /// result string, matching qwen's `${file_path}` (its already-resolved absolute
 /// path).
-fn write(abs: &std::path::Path, content: &str, ctx: &ToolCtx) -> Result<String, String> {
+fn write(
+    abs: &std::path::Path,
+    diff_path: &str,
+    content: &str,
+    ctx: &ToolCtx,
+) -> Result<WriteOutcome, String> {
     if abs.is_dir() {
         // qwen's `validateToolParamValues` rejects a directory target; keep the
         // POSIX-narrative wording the other file tools use.
@@ -125,7 +161,14 @@ fn write(abs: &std::path::Path, content: &str, ctx: &ToolCtx) -> Result<String, 
         ));
     }
 
+    // Snapshot the existing content BEFORE the overwrite so the diff renders
+    // old->new; a fresh create reads nothing and renders an all-added diff.
     let existed = abs.exists();
+    let before = if existed {
+        std::fs::read_to_string(abs).ok()
+    } else {
+        None
+    };
     if let Err(err) = std::fs::write(abs, content) {
         return Err(file_error(
             "write",
@@ -139,7 +182,14 @@ fn write(abs: &std::path::Path, content: &str, ctx: &ToolCtx) -> Result<String, 
     // content rather than reading the tool's own write as a stale external change.
     record_write(ctx, abs);
 
-    Ok(result_message(abs, existed))
+    // The diff Artifact: an overwrite diffs the snapshot->new content, a fresh
+    // create is one all-added created-file diff. `diff_path` is the RAW model
+    // `file_path` input, echoed verbatim in the diff title.
+    let diff = crate::tools::file_diff::artifact(before.as_deref(), content, diff_path);
+    Ok(WriteOutcome {
+        message: result_message(abs, existed),
+        diff,
+    })
 }
 
 /// qwen's `llmSuccessMessageParts` (write-file.ts): a fresh create vs. an

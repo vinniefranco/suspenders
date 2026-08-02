@@ -13,15 +13,13 @@
 //! model stops calling tools lives in [`super::finish`].
 //!
 //! The Loop owns zero I/O and zero process concerns: every effect goes through
-//! [`RunDeps`]. Tool execution (the Extension pipeline) runs in-loop over an
-//! `extensions` list and a `ToolCtx` the caller supplies - the Rust Session
-//! carries extension *names*, not `Registered` values, so these ride as
-//! explicit `run` arguments (the shell builds them from the Session).
+//! [`RunDeps`]. Tool execution runs in-loop over a `ToolCtx` the caller
+//! supplies; each tool shapes its own output and attaches its own display
+//! Artifacts (ADR-0007), so there is no wrapper pipeline.
 
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::event::Event;
-use crate::extensions::Registered;
 use crate::llm::response::Response;
 use crate::llm::{LlmRequest, StreamEvent};
 use crate::plan::Plan;
@@ -79,8 +77,33 @@ pub struct RunOpts {
 pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) deps: &'a mut D,
     pub(super) emitter: Emitter,
-    pub(super) extensions: &'a [Registered],
     pub(super) tool_ctx: &'a ToolCtx,
+    // The Run's hook firing handle (Phase 3a, ADR-0066), threaded from RunEnv so
+    // `batch` can fire the four tool events. `None` for a Run that fires no hooks.
+    pub(super) hooks: Option<&'a crate::run::hooks::Hooks<'a>>,
+    // A hook's `continue:false` halt requested during a tool batch (Phase 3a,
+    // ADR-0066): the minimal Stop thread. `batch` records the reason here when a
+    // Pre/PostToolUse hook returns `continue:false`; `dispatch::continue_tools`
+    // reads it AFTER the batch answers and closes the Run through the same
+    // `close_custom` path an after-Pass `Stop` takes.
+    pub(super) hook_stop: Option<String>,
+    // The conditional-skill activation seam (ADR-0058), threaded from RunEnv so
+    // `batch` can activate a conditional skill by the touched file path at the
+    // tool-success seam. `None` for a Run that activates no skills (child/test).
+    pub(super) skill_activation: Option<SkillActivation>,
+    // The Stop-hook continuation COUNTER (Phase 3b, ADR-0066; A2, qwen's
+    // `stopHookState.iterationCount`): how many times a Stop hook has forced a
+    // continuation this Run. The finish path (`dispatch::finish_or_stop_hook`) fires
+    // Stop while `stop_hook_count < stop_hook_cap`, increments on each forced
+    // continuation, and at the cap emits qwen's
+    // `formatStopHookBlockingCapWarning` then STOPS - so a Stop hook that always
+    // blocks forces at most `cap` extra Passes (qwen default 8), never an infinite
+    // loop, and a legitimate stop (no forcing hook) is never wrongly blocked.
+    pub(super) stop_hook_count: u64,
+    // The resolved Stop-hook continuation cap (A2, qwen's
+    // `resolveStopHookBlockingCap`): env `SUSPENDERS_STOP_HOOK_BLOCK_CAP` (clamped
+    // to 1..=100) else the default 8. Resolved once at Run start.
+    pub(super) stop_hook_cap: u64,
     pub(super) plan: Plan,
     // The current Pass number, 1-based (replaces the Ledger's `pass()`).
     pub(super) turn: u64,
@@ -110,19 +133,47 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) skip_next_speaker: bool,
 }
 
-/// The Extension pipeline and Tool execution context for one Run: always built
-/// from Session data by the caller, passed together because they are always
-/// produced together and belong together.
+/// The Tool execution context for one Run: the [`ToolCtx`] the caller builds
+/// from Session data, plus the Run's optional hook firing handle (Phase 3a,
+/// ADR-0066). A struct (not a bare `&ToolCtx`) so a Run-scoped input can join it
+/// without churning every call site - the [`crate::run::hooks::Hooks`] handle is
+/// exactly the input this comment anticipated.
 pub struct RunEnv<'a> {
-    pub extensions: &'a [Registered],
     pub tool_ctx: &'a ToolCtx,
+    /// The Run's hook firing handle (Phase 3a, ADR-0066), or `None` for a Run that
+    /// fires no hooks (a child/subagent Run, or a test that does not wire them).
+    /// The tool-dispatch seam ([`crate::run::batch`]) fires the four tool events
+    /// through it; `None` is the fire-nothing path.
+    pub hooks: Option<&'a crate::run::hooks::Hooks<'a>>,
+    /// The conditional-skill activation seam (ADR-0058): the shared skill manager
+    /// and the Project Root a touched file path is resolved against. `None` for a
+    /// Run that activates no skills (a child/subagent Run, or a test). The
+    /// tool-success seam ([`crate::run::batch`]) calls
+    /// [`crate::skills::SkillManager::activate_by_path`] through it.
+    pub skill_activation: Option<SkillActivation>,
+}
+
+/// The conditional-skill activation input for one Run (ADR-0058): the shared
+/// [`crate::skills::SkillManager`] a Run activates a conditional skill on, plus
+/// the Project Root a touched file path is resolved relative to. Bundled because
+/// the two are always used together, at the one seam ([`crate::run::batch`]), and
+/// carried by `Arc`/owned so the [`LoopState`] holds no extra borrow. The manager
+/// is shared with the `skill` tool, so an activation this Run makes shows up in
+/// the tool's next catalog build.
+#[derive(Clone)]
+pub struct SkillActivation {
+    /// The shared skill manager; its interior activation registry is the mutated
+    /// state.
+    pub skills: std::sync::Arc<crate::skills::SkillManager>,
+    /// The Project Root a touched path is resolved against (conditional skills
+    /// are project-scoped).
+    pub project_root: std::path::PathBuf,
 }
 
 /// Runs the loop until the model stops asking for tools, the turn bound is hit,
 /// or the response errors.
 ///
-/// `env` bundles the Extension pipeline and Tool execution context (both
-/// Session-derived; the Rust Session carries extension names only).
+/// `env` carries the Tool execution context (Session-derived).
 pub async fn run<D: RunDeps>(
     mut conversation: Conversation,
     session: &Session,
@@ -139,8 +190,12 @@ pub async fn run<D: RunDeps>(
     let mut state = LoopState {
         deps,
         emitter,
-        extensions: env.extensions,
         tool_ctx: env.tool_ctx,
+        hooks: env.hooks,
+        hook_stop: None,
+        skill_activation: env.skill_activation,
+        stop_hook_count: 0,
+        stop_hook_cap: crate::run::hooks::resolve_stop_hook_cap(),
         plan,
         turn: 1,
         max_turns: session.run_limit,
@@ -154,9 +209,92 @@ pub async fn run<D: RunDeps>(
         skip_next_speaker: session.skip_next_speaker,
     };
 
+    // The UserPromptSubmit seam (Phase 3b, ADR-0066): fire before the model sees
+    // the prompt. A blocking hook vetoes the Run (the prompt never reaches the
+    // model); an injecting hook prepends its additionalContext as a leading user
+    // turn. Returns `Err(outcome)` when the Run is vetoed here.
+    conversation = match fire_user_prompt_submit(&mut state, conversation).await {
+        Ok(conv) => conv,
+        Err(outcome) => return outcome,
+    };
+
     conversation = maybe_compact_proactive(&mut state, conversation).await;
     conversation = drain_notifications_at_run_start(&mut state, conversation).await;
     run_loop(&mut state, conversation).await
+}
+
+// The UserPromptSubmit fire (Phase 3b, ADR-0066): fired once at Run start, before
+// the first request, so a hook can veto or enrich the submitted prompt. The
+// submitted prompt is the Conversation's LAST user text (a fresh Run appended it;
+// a next-Pass Run has no fresh prompt, so the last user text is still the most
+// recent thing the user said). A Reject closes the Run through the custom-stop
+// path (the prompt is never sent); a Proceed with additionalContext merges it
+// onto the trailing user message so the model reads the hook's note with the
+// prompt. Every deciding fire is surfaced visibly (ADR-0018); a firing error is
+// fail-open (no hooks wired, or a runner failure, leaves the prompt untouched).
+async fn fire_user_prompt_submit<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    mut conversation: Conversation,
+) -> Result<Conversation, Outcome> {
+    let Some(hooks) = state.hooks else {
+        return Ok(conversation);
+    };
+    let Some(prompt) = last_user_text(&conversation) else {
+        return Ok(conversation);
+    };
+
+    match hooks.user_prompt_submit(&prompt).await {
+        crate::run::hooks::UserPromptDecision::Reject { reason, context } => {
+            emit_hook_decision(
+                state,
+                "UserPromptSubmit",
+                &format!("rejected the prompt: {reason}"),
+            );
+            // The vetoed prompt never reaches the model: close the Run on the
+            // hook's reason through the custom-stop path a Stop hook takes, so the
+            // Run ends with the hook's explanation. Any additionalContext the
+            // blocking hook still carried rides the closing marker text.
+            let marker = match context {
+                Some(ctx) => format!("{}\n{ctx}", voice::Marker::RunStopped.text()),
+                None => voice::Marker::RunStopped.text().to_string(),
+            };
+            Err(finish::close_custom(state, conversation, &marker, reason))
+        }
+        crate::run::hooks::UserPromptDecision::Proceed { context } => {
+            if let Some(ctx) = context {
+                emit_hook_decision(state, "UserPromptSubmit", "injected additional context");
+                conversation.merge_user_text(ctx);
+            }
+            Ok(conversation)
+        }
+    }
+}
+
+// The Conversation's last user text (the submitted prompt at Run start): the
+// text of the trailing user message, or `None` when the last message is not a
+// user text block. Used only by the UserPromptSubmit fire.
+fn last_user_text(conversation: &Conversation) -> Option<String> {
+    conversation.messages.iter().rev().find_map(|m| {
+        if m.role != crate::content::Role::User {
+            return None;
+        }
+        match m.content.first() {
+            Some(crate::content::ContentBlock::Text { text }) => Some(text.clone()),
+            _ => None,
+        }
+    })
+}
+
+// Surfaces a deciding lifecycle-hook fire as a visible line (ADR-0018, ADR-0066),
+// the same fail-open report seam `batch` uses for the tool events: an
+// `extension_error` labelled `hook <event>` with the `Present` mid-Run stage, so a
+// veto / inject / force-continue is never a silent decision.
+fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, what: &str) {
+    state.emitter.emit(Event::extension_error(
+        format!("hook {event}"),
+        crate::event::Stage::Present,
+        what.to_string(),
+    ));
 }
 
 // Run-start notification drain (P4b, ADR-0063): a background child can settle
@@ -194,13 +332,37 @@ async fn maybe_compact_proactive<D: RunDeps>(
     conversation: Conversation,
 ) -> Conversation {
     if Compaction::proactive(&conversation) {
-        match state.deps.compact(conversation.clone()).await {
+        match compact_with_hooks(state, conversation.clone()).await {
             Ok(compacted) => compacted,
             Err(_) => conversation,
         }
     } else {
         conversation
     }
+}
+
+// The Pre/PostCompact seam (Phase 3b, ADR-0066): fire PreCompact before the
+// compaction service runs and PostCompact after it produces a summary. PreCompact
+// may inject a custom instruction (surfaced visibly); PostCompact is observe-only
+// (matching qwen). Both bracket the `compact` Dep - the SINGLE place the loop
+// invokes compaction - so proactive and reactive compaction share one fire path.
+// A firing error is fail-open (the compaction proceeds regardless).
+async fn compact_with_hooks<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    conversation: Conversation,
+) -> Result<Conversation, crate::run::deps::CompactError> {
+    if let Some(hooks) = state.hooks
+        && hooks.pre_compact().await.is_some()
+    {
+        emit_hook_decision(state, "PreCompact", "injected a compaction instruction");
+    }
+    let result = state.deps.compact(conversation).await;
+    if let Some(hooks) = state.hooks
+        && result.is_ok()
+    {
+        hooks.post_compact().await;
+    }
+    result
 }
 
 // The loop skeleton (integration, IOSP): it owns only the Pass cycle and the
@@ -332,7 +494,7 @@ async fn compact_and_retry<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     conversation: Conversation,
 ) -> Result<(LlmRequest, Conversation), ()> {
-    match state.deps.compact(conversation.clone()).await {
+    match compact_with_hooks(state, conversation.clone()).await {
         Ok(compacted) => Box::pin(build_request(state, compacted)).await,
         Err(_) => Err(()),
     }

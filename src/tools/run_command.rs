@@ -31,14 +31,29 @@
 //! and [`spawn`] (foreground execution + the background handoff + the exit tail).
 
 mod command_shape;
+mod condense;
 mod spawn;
 mod validate;
 
-use crate::tool::{Tool, ToolCtx, ToolSpec};
+use crate::tool::{Tool, ToolCtx, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
 use self::spawn::{run_background, spawn_and_wait};
 use self::validate::validate_params;
+
+/// The Artifact keys the run_command exit badge reserves, declared in one place:
+/// a producer (this tool) and consumer (the Transcript store) that disagree fail
+/// to *compile*, and a rename touches this module alone.
+pub mod keys {
+    /// `artifacts`: the exit code recovered from the result's `[exit code: N]`
+    /// tail, read back by the Transcript store to build the `✓ exit 0` / `✗ exit
+    /// N` badge.
+    pub const EXIT_CODE: &str = "exit_code";
+
+    /// `artifacts`: set when the result is the timeout report, so the badge reads
+    /// `✗ timed out` (there is no exit code on a timeout).
+    pub const TIMED_OUT: &str = "timed_out";
+}
 
 // Re-exported so the `#[path]` unit tests (which use `super::*`) can reach the
 // spawn/command-shape helpers they exercise directly.
@@ -48,6 +63,10 @@ use self::command_shape::{has_top_level_git_commit, strip_trailing_background_am
 use self::spawn::report;
 
 pub struct RunCommand;
+
+/// The wire name of this tool, shared with the Transcript store's exit-badge
+/// swap so the two never drift.
+pub const SHELL: &str = "run_shell_command";
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -158,57 +177,104 @@ impl Tool for RunCommand {
     }
 
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let command = match input.get("command") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    "invalid input: run_shell_command requires a non-empty string \"command\""
-                        .into(),
-                );
-            }
+        // The text projection: condense the model-facing output (BEFORE Shaping
+        // caps it) on both the Ok and the completed-but-failed arm - a failing
+        // run carries compile-progress noise too. `run_rich` (the Registry's
+        // dispatch path) additionally attaches the exit-code badge Artifact.
+        execute_shell(input, ctx)
+            .await
+            .map(|out| condense::condense(&out))
+            .map_err(|err| condense::condense(&err))
+    }
+
+    async fn run_rich(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, String> {
+        // A completed-but-failed command (nonzero exit / timeout) is not a tool
+        // failure: `execute_shell` returns Err, but we route it through
+        // `Ok(ToolOutput.error(true))` so the exit-code Artifact rides alongside
+        // `is_error`. Condensing runs first (so the badge parses the SAME
+        // condensed content the model sees), then the badge Artifact is attached.
+        let (raw, is_error) = match execute_shell(input, ctx).await {
+            Ok(out) => (out, false),
+            Err(err) => (err, true),
         };
-        let is_background = input
-            .get("is_background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let timeout_param = input.get("timeout");
-        let directory = input.get("directory").and_then(Value::as_str);
+        let content = condense::condense(&raw);
+        let output = ToolOutput::text(&content).error(is_error);
+        Ok(attach_badge(output, &content))
+    }
+}
 
-        // Pure parameter validation (qwen `validateToolParamValues`), VERBATIM
-        // messages. Runs BEFORE any spawn, foreground or background.
-        validate_params(&command, is_background, timeout_param, directory, &ctx.root)?;
-
-        // The resolved cwd: the validated absolute-and-within-root `directory`, else
-        // the project root (qwen `params.directory || getTargetDir()`).
-        let cwd = directory
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| ctx.root.clone());
-
-        if is_background {
-            return run_background(&command, &cwd, ctx).await;
+/// Runs the shell command and returns its RAW report (or a completed-but-failed
+/// report as `Err`, or a genuine tool error as `Err`), BEFORE condensing. Shared
+/// by `run` (text projection) and `run_rich` (badge Artifact). A nonzero-exit
+/// foreground command lands as `Err(report_with_tail)`; the caller decides how
+/// to surface it.
+async fn execute_shell(input: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let command = match input.get("command") {
+        Some(Value::String(s)) => s.clone(),
+        _ => {
+            return Err(
+                "invalid input: run_shell_command requires a non-empty string \"command\"".into(),
+            );
         }
+    };
+    let is_background = input
+        .get("is_background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let timeout_param = input.get("timeout");
+    let directory = input.get("directory").and_then(Value::as_str);
 
-        // Foreground: the effective timeout is `params.timeout` when given, else the
-        // Session's `command_timeout_ms` (overrides the old always-ctx behavior).
-        let timeout = timeout_param
-            .and_then(Value::as_u64)
-            .filter(|t| *t > 0)
-            .unwrap_or(if ctx.command_timeout_ms == 0 {
-                DEFAULT_TIMEOUT_MS
-            } else {
-                ctx.command_timeout_ms
-            });
+    // Pure parameter validation (qwen `validateToolParamValues`), VERBATIM
+    // messages. Runs BEFORE any spawn, foreground or background.
+    validate_params(&command, is_background, timeout_param, directory, &ctx.root)?;
 
-        spawn_and_wait(&command, &cwd, timeout).await
+    // The resolved cwd: the validated absolute-and-within-root `directory`, else
+    // the project root (qwen `params.directory || getTargetDir()`).
+    let cwd = directory
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| ctx.root.clone());
+
+    if is_background {
+        return run_background(&command, &cwd, ctx).await;
+    }
+
+    // Foreground: the effective timeout is `params.timeout` when given, else the
+    // Session's `command_timeout_ms` (overrides the old always-ctx behavior).
+    let timeout = timeout_param
+        .and_then(Value::as_u64)
+        .filter(|t| *t > 0)
+        .unwrap_or(if ctx.command_timeout_ms == 0 {
+            DEFAULT_TIMEOUT_MS
+        } else {
+            ctx.command_timeout_ms
+        });
+
+    spawn_and_wait(&command, &cwd, timeout).await
+}
+
+/// Attaches the exit-code / timeout badge Artifact to a run_command output, read
+/// from the (condensed) result content the model sees. A timeout wins over an
+/// exit code (a timed-out command has no meaningful code); content with neither
+/// tail (a validation error, a background start block) attaches nothing, so the
+/// Transcript store keeps the plain summary. The `[exit code: N]` tail is the
+/// single-sourced fact [`report`] owns; parsing it here reads a SEMANTIC fact
+/// carried from execution, not a fragile UI-side re-parse.
+fn attach_badge(output: ToolOutput, content: &str) -> ToolOutput {
+    if parse_timed_out(content) {
+        return output.with_artifact(keys::TIMED_OUT, true);
+    }
+    match parse_exit_code(content) {
+        Some(code) => output.with_artifact(keys::EXIT_CODE, code as i64),
+        None => output,
     }
 }
 
 /// Recovers the exit code [`report`] owns from a run_command result, or `None`
 /// when the tail is absent (a timeout, or content produced elsewhere). The
-/// inverse of `report`: the `[exit code: N]` tail is the single-sourced
-/// contract between here and the run_command extension's `present`, so the badge is
-/// a semantic fact, not a fragile fold-time parse. Searched from the END so
-/// command output that happens to contain the phrase cannot spoof it.
+/// inverse of `report`: the `[exit code: N]` tail is the single-sourced contract
+/// between here and [`attach_badge`], so the badge is a semantic fact, not a
+/// fragile fold-time parse. Searched from the END so command output that happens
+/// to contain the phrase cannot spoof it.
 pub fn parse_exit_code(content: &str) -> Option<i32> {
     let last = content.lines().last()?.trim_end();
     let inner = last.strip_prefix("[exit code: ")?.strip_suffix(']')?;

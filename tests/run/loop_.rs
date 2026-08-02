@@ -1,21 +1,18 @@
 use super::*;
 use crate::content::Usage;
 use crate::content::{ContentBlock, Role};
-use crate::event::Stage;
-use crate::extensions::Registered;
 use crate::llm::model::{Api, Model};
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{Delta, malformed_input_marker};
-use crate::middleware::{Middleware, Token};
 use crate::run::deps::{AfterPass, CompactError};
 use crate::run::fixtures::{
-    FakeDeps, conversation, count_voiced, deps_for, empty, events, find_tool_result, just,
-    last_message, next_speaker_verdict, ok, root, run_with, session, session_next_speaker,
-    session_with, session_with_limit, text_end, text_result, tool_ctx, tool_use_result, write,
+    count_voiced, deps_for, empty, events, find_tool_result, just, last_message,
+    next_speaker_verdict, ok, root, run_with, session, session_next_speaker, session_with,
+    session_with_limit, text_end, text_result, tool_ctx, tool_use_result, write,
 };
-use crate::session::{Session, SessionOpts};
+use crate::session::SessionOpts;
 use crate::test_support::Entry;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 // The harness fixtures (session builders, Response builders, `run_with`,
@@ -1417,112 +1414,31 @@ async fn malformed_input_becomes_error_result_never_executes() {
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
-// ---- extension lifecycle (ADR-0007) -----------------------------------
+// ---- tool display Artifacts on the tool_result event (ADR-0007) -------
 
-struct HaltEdits;
-impl Middleware for HaltEdits {
-    fn pre_run(&self, token: Token, _opts: &Value) -> Token {
-        if token.tool == "edit" {
-            token.halt("[edits are frozen by HaltEdits]")
-        } else {
-            token
-        }
-    }
-}
-
-struct Artifactor;
-impl Middleware for Artifactor {
-    fn post_run(&self, token: Token, _opts: &Value) -> Token {
-        let tool = token.tool.clone();
-        token.put_artifact("mark", Value::String(tool))
-    }
-}
-
-struct PreBoomer;
-impl Middleware for PreBoomer {
-    fn pre_run(&self, _token: Token, _opts: &Value) -> Token {
-        panic!("pre boom")
-    }
-}
-
-async fn run_with_extensions(
-    session: &Session,
-    prompt: &str,
-    mut deps: FakeDeps,
-    extensions: Vec<Registered>,
-) -> (Outcome, FakeDeps) {
-    let conv = conversation(session, prompt);
-    let ctx = tool_ctx(session);
-    let outcome = run(
-        conv,
-        session,
-        RunEnv {
-            extensions: &extensions,
-            tool_ctx: &ctx,
-        },
-        &mut deps,
-        RunOpts::default(),
-    )
-    .await;
-    (outcome, deps)
-}
-
+// A tool that shapes its own transcript display attaches a display Artifact to
+// its Tool Result; that Artifact must ride the `:tool_result` event to the UI
+// (it never enters the Conversation). Exercised end-to-end through the loop with
+// a real tool (todo_write attaches the `todos` Artifact), not a mock pipeline.
 #[tokio::test]
-async fn halting_extension_denies_the_call_with_its_own_wording() {
+async fn tool_display_artifacts_ride_the_tool_result_event() {
     let root = root();
-    let session = session(root.path());
-    let input = json!({"path": "f.txt", "old_str": "a", "new_str": "b"});
-    let deps = deps_for(
-        &session,
-        vec![
-            just(tool_use_result("t1", "edit", input)),
-            just(text_end("ok")),
-        ],
-    );
-    let extensions =
-        vec![Registered::new("HaltEdits", json!([])).with_middleware(Box::new(HaltEdits))];
-    let (outcome, deps) = run_with_extensions(&session, "edit something", deps, extensions).await;
-    ok(&outcome);
-    let evs = events(&deps);
-    let tr = evs
-        .iter()
-        .find(|e| matches!(e, Event::ToolResult { .. }))
-        .unwrap();
-    match tr {
-        Event::ToolResult {
-            is_error,
-            content,
-            artifacts,
-            ..
-        } => {
-            assert!(is_error);
-            assert_eq!(content, "[edits are frozen by HaltEdits]");
-            assert!(artifacts.is_empty());
-        }
-        _ => unreachable!(),
-    }
-    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn artifacts_ride_the_tool_result_event() {
-    let root = root();
-    let dir = root.path().to_string_lossy().into_owned();
     let session = session(root.path());
     let deps = deps_for(
         &session,
         vec![
             just(tool_use_result(
                 "t1",
-                "list_directory",
-                json!({"path": dir}),
+                "todo_write",
+                json!({"todos": [
+                    { "id": "1", "content": "read", "status": "in_progress" },
+                    { "id": "2", "content": "edit", "status": "pending" },
+                ]}),
             )),
             just(text_end("ok")),
         ],
     );
-    let extensions =
-        vec![Registered::new("Artifactor", json!([])).with_middleware(Box::new(Artifactor))];
-    let (outcome, deps) = run_with_extensions(&session, "look around", deps, extensions).await;
+    let (outcome, deps) = run_with(&session, "make a plan", deps).await;
     ok(&outcome);
     let evs = events(&deps);
     let tr = evs
@@ -1536,49 +1452,46 @@ async fn artifacts_ride_the_tool_result_event() {
             ..
         } => {
             assert!(!is_error);
-            assert_eq!(
-                artifacts.get("mark"),
-                Some(&Value::String("list_directory".to_string()))
-            );
+            // The `todos` Artifact rides the event; parsing it back yields the
+            // two parsed items the Transcript store swaps in as a Todo.
+            let todos = crate::tools::todo_write::read_todos_artifact(artifacts)
+                .expect("todos artifact present");
+            assert_eq!(todos.items.len(), 2);
         }
         _ => unreachable!(),
     }
 }
 
+// A tool NEVER crashes the Run (ADR-0018 fail-open): a tool that returns `Err`
+// (or an unknown tool) comes back as an is_error Tool Result, and the Run
+// completes normally.
 #[tokio::test]
-async fn crashing_extension_is_fail_open() {
+async fn a_failing_tool_is_fail_open_and_the_run_completes() {
     let root = root();
-    let dir = root.path().to_string_lossy().into_owned();
     let session = session(root.path());
     let deps = deps_for(
         &session,
         vec![
+            // A relative edit path is refused by edit_file (qwen's absolute-path
+            // contract), so the tool returns Err -> an is_error result.
             just(tool_use_result(
                 "t1",
-                "list_directory",
-                json!({"path": dir}),
+                "edit",
+                json!({"file_path": "rel.txt", "old_string": "a", "new_string": "b"}),
             )),
             just(text_end("ok")),
         ],
     );
-    let extensions =
-        vec![Registered::new("PreBoomer", json!([])).with_middleware(Box::new(PreBoomer))];
-    let (outcome, deps) = run_with_extensions(&session, "look around", deps, extensions).await;
+    let (outcome, deps) = run_with(&session, "edit something", deps).await;
     ok(&outcome);
     let evs = events(&deps);
-    let pe = evs
-        .iter()
-        .find(|e| matches!(e, Event::ExtensionError { .. }))
-        .unwrap();
-    assert!(
-        matches!(pe, Event::ExtensionError { extension, stage, message }
-            if extension == "PreBoomer" && *stage == Stage::PreRun && message.contains("pre boom"))
-    );
     let tr = evs
         .iter()
         .find(|e| matches!(e, Event::ToolResult { .. }))
         .unwrap();
-    assert!(matches!(tr, Event::ToolResult { is_error, .. } if !is_error));
+    assert!(matches!(tr, Event::ToolResult { is_error, .. } if *is_error));
+    // Nothing was written.
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 // ---- Plan storage -----------------------------------------------------
@@ -1664,14 +1577,14 @@ async fn proactive_compacts_before_first_pass() {
     conv.add_user_text("original task");
     conv.add_assistant_blocks(vec![ContentBlock::text("x".repeat(12_000))]);
 
-    let extensions: Vec<Registered> = Vec::new();
     let ctx = tool_ctx(&session);
     let outcome = run(
         conv,
         &session,
         RunEnv {
-            extensions: &extensions,
             tool_ctx: &ctx,
+            hooks: None,
+            skill_activation: None,
         },
         &mut deps,
         RunOpts::default(),

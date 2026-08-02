@@ -133,3 +133,61 @@ fn every_command_declares_its_alt_names_slice() {
         assert!(c.alt_names.is_empty(), "/{} has no aliases yet", c.name);
     }
 }
+
+// --- the two-layer registry (ADR-0032/0058) ----------------------------
+
+fn skill_cmd(name: &str, help: &str, hint: Option<&str>) -> SkillCommand {
+    SkillCommand {
+        name: name.to_string(),
+        help: help.to_string(),
+        argument_hint: hint.map(str::to_string),
+    }
+}
+
+#[test]
+fn commands_ref_unions_the_built_ins_then_the_skill_layer() {
+    // The union is every built-in first (in registry order), then each runtime
+    // skill command - the stable `original_index` basis the ranking leans on.
+    let skills = [skill_cmd("commit", "write a commit", None)];
+    let refs = commands_ref(&skills);
+    assert_eq!(refs.len(), COMMANDS.len() + 1);
+    // Built-ins lead.
+    assert_eq!(refs[0].name, COMMANDS[0].name);
+    // The skill trails, projected fire-and-run with its hint slot.
+    let last = refs.last().unwrap();
+    assert_eq!(last.name, "commit");
+    assert!(
+        !last.opens_selector,
+        "a skill command never opens a selector"
+    );
+    assert_eq!(last.argument_hint, None);
+}
+
+#[test]
+fn a_skill_ref_carries_its_argument_hint() {
+    let skills = [skill_cmd("commit", "write a commit", Some("<message>"))];
+    let refs = commands_ref(&skills);
+    let commit = refs.iter().find(|c| c.name == "commit").unwrap();
+    assert_eq!(commit.argument_hint, Some("<message>"));
+    assert_eq!(commit.help, "write a commit");
+}
+
+#[test]
+fn a_skill_is_never_a_built_in_lookup() {
+    // The built-in-only lookup does not resolve a skill name (a skill is never
+    // selector-opening), so the Composer's "opens a selector?" test correctly
+    // says no for a `/<skill>` token.
+    assert!(lookup("commit").is_none());
+    assert!(lookup("model").is_some());
+}
+
+#[test]
+fn a_built_in_wins_a_union_name_collision() {
+    // A skill named after a built-in cannot shadow it: the same-named skill is
+    // dropped from the union, so only the built-in `/model` remains.
+    let skills = [skill_cmd("model", "a shadowing skill", None)];
+    let refs = commands_ref(&skills);
+    let models: Vec<_> = refs.iter().filter(|c| c.name == "model").collect();
+    assert_eq!(models.len(), 1, "the skill collision is dropped");
+    assert!(models[0].opens_selector, "the built-in /model wins");
+}

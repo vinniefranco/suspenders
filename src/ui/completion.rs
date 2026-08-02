@@ -30,7 +30,7 @@
 //! empty palette when a prefix would have matched.
 
 use crate::ui::selection::Millis;
-use crate::ui::slash::{self, SlashCommand};
+use crate::ui::slash::CommandRef;
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// qwen `RECENT_DECAY_MS`: a use's recency contribution decays linearly to zero
@@ -84,6 +84,11 @@ pub struct Suggestion {
     pub label: String,
     pub value: String,
     pub description: String,
+    /// The command's `argument-hint`, shown after the name in the palette (qwen
+    /// `/<name> <argument-hint>`): `Some` for a skill command that declared one,
+    /// `None` for a built-in or a hint-less skill. Display-only; the render adds
+    /// the leading space. A path suggestion never carries one.
+    pub argument_hint: Option<String>,
     /// The `[start, end)` char range of the match within `label`, collapsed
     /// from nucleo's (possibly non-contiguous) indices to the min..=max window
     /// (qwen renders one inverted substring, `PrepareLabel`). `None` when there
@@ -92,10 +97,12 @@ pub struct Suggestion {
 }
 
 // The internal ranked match, before it collapses to a [`Suggestion`] - qwen
-// `RankedCommandMatch`. The comparator sorts a `Vec` of these.
+// `RankedCommandMatch`. The comparator sorts a `Vec` of these. `command` is the
+// source-agnostic [`CommandRef`] (built-in or skill), so the ranking never
+// distinguishes the two layers.
 #[derive(Debug, Clone)]
-struct Ranked {
-    command: &'static SlashCommand,
+struct Ranked<'a> {
+    command: CommandRef<'a>,
     /// The command name or the alt name that matched (qwen `matchedValue`).
     matched_value: String,
     strength: MatchStrength,
@@ -235,26 +242,31 @@ impl Completion {
     }
 }
 
-/// Ranks the registry against `query` (the command token typed after `/`, no
-/// leading slash), newest-first by qwen's ladder (see the module doc). `recent`
-/// maps a command name to its use record for the recency bias; `now` is the
-/// host clock the decay reads. An empty `query` returns every command ordered
-/// by recency then the comparator. A matcher failure falls back to a
-/// prefix-only filter over name + alt names.
+/// Ranks the command registry against `query` (the command token typed after
+/// `/`, no leading slash), newest-first by qwen's ladder (see the module doc).
+/// `commands` is the source-agnostic UNION the caller assembles (built-ins PLUS
+/// the runtime skill layer, ADR-0032) - the ranking treats every [`CommandRef`]
+/// alike. `recent` maps a command name to its use record for the recency bias;
+/// `now` is the host clock the decay reads. An empty `query` returns every
+/// command ordered by recency then the comparator. A matcher failure falls back
+/// to a prefix-only filter over name + alt names.
 ///
 /// The returned [`Suggestion`]s are ready to render: `value` is the canonical
 /// name to insert, `label` is the best-matching value (an alias when one
-/// ranked best), `matched` is the inverted-highlight window over `label`.
+/// ranked best), `argument_hint` is the skill hint shown after the name (if
+/// any), `matched` is the inverted-highlight window over `label`.
 pub fn rank(
+    commands: &[CommandRef],
     query: &str,
     recent: &dyn Fn(&str) -> Option<RecentUse>,
     now: Millis,
 ) -> Vec<Suggestion> {
     let recent_of = |name: &str| recent_score(recent, name, now);
     let mut ranked: Vec<Ranked> = if query.is_empty() {
-        empty_query_ranked(&recent_of)
+        empty_query_ranked(commands, &recent_of)
     } else {
-        fuzzy_ranked(query, &recent_of).unwrap_or_else(|| prefix_ranked(query, &recent_of))
+        fuzzy_ranked(commands, query, &recent_of)
+            .unwrap_or_else(|| prefix_ranked(commands, query, &recent_of))
     };
     ranked.sort_by(compare_ranked);
     ranked.into_iter().map(to_suggestion).collect()
@@ -262,12 +274,15 @@ pub fn rank(
 
 // The empty-query pass (qwen `partial === ''`): every command at FUZZY
 // strength, score 0, matching on its canonical name, ordered later by recency.
-fn empty_query_ranked(recent_of: &dyn Fn(&str) -> f64) -> Vec<Ranked> {
-    slash::COMMANDS
+fn empty_query_ranked<'a>(
+    commands: &[CommandRef<'a>],
+    recent_of: &dyn Fn(&str) -> f64,
+) -> Vec<Ranked<'a>> {
+    commands
         .iter()
         .enumerate()
         .map(|(index, command)| Ranked {
-            command,
+            command: *command,
             matched_value: command.name.to_string(),
             strength: MatchStrength::Fuzzy,
             completion_priority: command.completion_priority,
@@ -286,16 +301,20 @@ fn empty_query_ranked(recent_of: &dyn Fn(&str) -> f64) -> Vec<Ranked> {
 // nucleo, keep the best-ranked value per command. `None` only if the matcher is
 // unusable for the whole pass (never in practice) - the caller then falls back
 // to prefix. An empty result (no value matched anything) is a valid `Some`.
-fn fuzzy_ranked(query: &str, recent_of: &dyn Fn(&str) -> f64) -> Option<Vec<Ranked>> {
+fn fuzzy_ranked<'a>(
+    commands: &[CommandRef<'a>],
+    query: &str,
+    recent_of: &dyn Fn(&str) -> f64,
+) -> Option<Vec<Ranked<'a>>> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut best: Vec<Ranked> = Vec::new();
-    for (index, command) in slash::COMMANDS.iter().enumerate() {
+    for (index, command) in commands.iter().enumerate() {
         let mut command_best: Option<Ranked> = None;
         for (value, is_alias) in candidate_values(command) {
             if let Some((score, matched)) = fuzzy_one(&mut matcher, &value, query) {
                 let start = matched.map(|(s, _)| s).unwrap_or(0);
                 let candidate = Ranked {
-                    command,
+                    command: *command,
                     strength: strength(&value, query, start),
                     completion_priority: command.completion_priority,
                     recent_score: recent_of(command.name),
@@ -326,15 +345,19 @@ fn fuzzy_ranked(query: &str, recent_of: &dyn Fn(&str) -> f64) -> Option<Vec<Rank
 
 // The prefix fallback (qwen `getPrefixSuggestions`): keep every command a value
 // case-insensitively prefixes, ranked by the same ladder, score 0.
-fn prefix_ranked(query: &str, recent_of: &dyn Fn(&str) -> f64) -> Vec<Ranked> {
+fn prefix_ranked<'a>(
+    commands: &[CommandRef<'a>],
+    query: &str,
+    recent_of: &dyn Fn(&str) -> f64,
+) -> Vec<Ranked<'a>> {
     let needle = query.to_lowercase();
     let mut out = Vec::new();
-    for (index, command) in slash::COMMANDS.iter().enumerate() {
+    for (index, command) in commands.iter().enumerate() {
         let mut command_best: Option<Ranked> = None;
         for (value, is_alias) in candidate_values(command) {
             if value.to_lowercase().starts_with(&needle) {
                 let candidate = Ranked {
-                    command,
+                    command: *command,
                     strength: strength(&value, query, 0),
                     completion_priority: command.completion_priority,
                     recent_score: recent_of(command.name),
@@ -363,7 +386,7 @@ fn prefix_ranked(query: &str, recent_of: &dyn Fn(&str) -> f64) -> Vec<Ranked> {
 
 // The value candidates for a command: its canonical name (not an alias) then
 // each alt name (qwen matches name + altNames).
-fn candidate_values(command: &SlashCommand) -> Vec<(String, bool)> {
+fn candidate_values(command: &CommandRef) -> Vec<(String, bool)> {
     let mut values = vec![(command.name.to_string(), false)];
     values.extend(command.alt_names.iter().map(|a| (a.to_string(), true)));
     values
@@ -465,6 +488,7 @@ fn to_suggestion(r: Ranked) -> Suggestion {
         label,
         value: r.command.name.to_string(),
         description: r.command.help.to_string(),
+        argument_hint: r.command.argument_hint.map(str::to_string),
         matched: r.matched,
     }
 }
@@ -512,6 +536,7 @@ pub fn rank_paths(paths: &[String], query: &str) -> Vec<Suggestion> {
             label: r.path.to_string(),
             value: r.path.to_string(),
             description: String::new(),
+            argument_hint: None,
             matched: r.window,
         })
         .collect()
@@ -534,6 +559,7 @@ fn path_suggestion(path: &str) -> Suggestion {
         label: path.to_string(),
         value: path.to_string(),
         description: String::new(),
+        argument_hint: None,
         matched: None,
     }
 }

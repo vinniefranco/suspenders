@@ -348,6 +348,12 @@ pub enum Command {
     Conversation(oneshot::Sender<Conversation>),
     Plan(oneshot::Sender<Option<String>>),
     ResumeInfoQuery(oneshot::Sender<Option<ResumeInfo>>),
+    /// The discovered skill manager (ADR-0058), a clone of the shared `Arc` the
+    /// Agent discovered at launch. Read-only, so it rides the sync handler: the
+    /// UI reads it once at mount to build the `/<name>` slash-command layer
+    /// (ADR-0032/0058) and again to resolve a committed `/<skill>` to its
+    /// submit-prompt body. Cheap - the `Arc` clones, the manager is not copied.
+    Skills(oneshot::Sender<Arc<crate::skills::SkillManager>>),
 }
 
 /// Both flavors ride the one mpsc (public so the Run shell can post `Run`
@@ -523,6 +529,17 @@ impl AgentHandle {
     /// re-polls it after every live op; a dead Agent answers an empty list.
     pub async fn mcp_views(&self) -> Vec<crate::mcp::McpServerView> {
         self.query(Command::McpViews).await.unwrap_or_default()
+    }
+
+    /// The discovered [`crate::skills::SkillManager`] (ADR-0058), for the
+    /// `/<name>` slash-command layer (ADR-0032): the UI reads it once at mount
+    /// to build every discovered skill's slash descriptor, and again to resolve
+    /// a committed `/<skill>` to its submit-prompt body. A dead Agent answers a
+    /// fresh empty manager (no skills), so the caller never unwraps.
+    pub async fn skills(&self) -> Arc<crate::skills::SkillManager> {
+        self.query(Command::Skills)
+            .await
+            .unwrap_or_else(|| Arc::new(crate::skills::SkillManager::default()))
     }
 
     /// Reconnects one MCP server (ADR-0065 Phase C, the dialog's Reconnect action):
@@ -733,6 +750,12 @@ struct AgentState {
     // (which must re-mint that same skill tool) without re-discovering skills
     // (ADR-0065 Phase C).
     skill_manager: Arc<crate::skills::SkillManager>,
+    // The hook subsystem (ADR-0066): the standing `config.json` hooks resolved
+    // once in `init_agent`, held so every Run fires the same standing set.
+    // Threaded into each Run's Capture (via AgentDeps) so `batch.rs` can fire the
+    // tool-dispatch + permission hooks. Skill-hook REGISTRATION (session scope) is
+    // Phase 4; this holds only the standing source today, reachable by every Run.
+    hook_manager: Arc<crate::hooks::HookManager>,
     // The subagent definitions (P4/F4, ADR-0061): the built-in registry, built
     // once in `init_agent`. Held by the `agent` tool (on `session_tools`) for its
     // dynamic schema/description AND threaded into each Run's Capture (via
@@ -801,6 +824,76 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
     // (P4b/Phase 9, ADR-0063).
     state.abort_all_background();
     state.abort_all_background_shells();
+
+    // The SessionEnd hooks (Phase 3b, ADR-0066): fired ONCE here at shutdown,
+    // through the same firing facade a Run uses. Observational (a SessionEnd hook
+    // cannot steer a session that is already ending). `exit` is qwen's SessionEnd
+    // reason for the process ending. Fail-open: no hooks, or a runner failure,
+    // is a no-op.
+    fire_session_end(&state).await;
+}
+
+// Builds the Agent's lifecycle-hook firing facade (Phase 3b, ADR-0066) over the
+// standing manager + the Session's Llm/Model/Root - the same
+// [`crate::run::hooks::Hooks`] a Run builds, so the Agent fires session/
+// notification events through the identical capability set (command/http/prompt)
+// without threading hook plumbing into the UI. Built on demand (it borrows the
+// state), never held, so it never outlives an `&AgentState` borrow.
+fn agent_hooks(state: &AgentState) -> crate::run::hooks::Hooks<'_> {
+    let transcript = transcript_path(state);
+    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    crate::run::hooks::Hooks::new(
+        state.hook_manager.as_ref(),
+        state.llm.as_ref(),
+        &state.model,
+        state.session.root.clone(),
+        session_id,
+        transcript,
+    )
+}
+
+// The Session Log's JSONL path (H1, ADR-0010/0066): the running transcript the hook
+// payloads report as `transcript_path`. Empty when the Agent opened no log (the log
+// open failed) - the fail-open base-identity fallback.
+fn transcript_path(state: &AgentState) -> String {
+    state
+        .log
+        .as_ref()
+        .map(|log| log.path.clone())
+        .unwrap_or_default()
+}
+
+// Fires the SessionEnd hooks at Agent shutdown (Phase 3b, ADR-0066).
+async fn fire_session_end(state: &AgentState) {
+    agent_hooks(state).session_end("exit").await;
+}
+
+// Fires the Notification hooks (Phase 3b, ADR-0066) for the "agent is waiting"
+// moment - the same ask-request broadcast that drives the terminal notification
+// (an Approval or a Question opening a modal). Spawned DETACHED off the actor loop
+// (over owned Arc/Model/Root clones the built `Hooks` borrows inside the task) so a
+// slow command/http/prompt hook never stalls the single owner while it holds the
+// user waiting; observational, so nothing flows back. A Session with no
+// Notification hooks spawns nothing (the resolved list is empty and the fire is a
+// no-op) - cheap enough to skip the emptiness pre-check.
+fn fire_notification(state: &AgentState, message: String) {
+    let manager = Arc::clone(&state.hook_manager);
+    let llm = Arc::clone(&state.llm);
+    let model = state.model.clone();
+    let root = state.session.root.clone();
+    let transcript = transcript_path(state);
+    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    tokio::spawn(async move {
+        let hooks = crate::run::hooks::Hooks::new(
+            manager.as_ref(),
+            llm.as_ref(),
+            &model,
+            root,
+            session_id,
+            transcript,
+        );
+        hooks.notification(&message).await;
+    });
 }
 
 // The public-Command dispatcher: a flat table that routes each Command to its
@@ -860,6 +953,9 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         }
         Command::ResumeInfoQuery(reply) => {
             let _ = reply.send(state.resume_info.clone());
+        }
+        Command::Skills(reply) => {
+            let _ = reply.send(Arc::clone(&state.skill_manager));
         }
     }
 }
@@ -1029,6 +1125,10 @@ fn request_approval(
         Request::Pending(approvals) => {
             state.approvals = approvals;
             state.approval_replies.insert(id.clone(), reply);
+            // The Notification seam (Phase 3b, ADR-0066): an ask opening a modal is
+            // the "agent is waiting" moment, so fire the Notification hooks with the
+            // command the user is being asked to approve.
+            fire_notification(state, format!("Approval requested: {command}"));
             broadcast(state, Event::approval_request(id, command));
         }
     }
@@ -1066,6 +1166,14 @@ fn ask_question(
     reply: oneshot::Sender<QuestionAnswers>,
 ) {
     state.question_replies.insert(id.clone(), reply);
+    // The Notification seam (Phase 3b, ADR-0066): a question opening a modal is the
+    // "agent is waiting" moment, so fire the Notification hooks. The question text
+    // is the salient waiting content.
+    let message = questions
+        .first()
+        .map(|q| format!("Question: {}", q.question))
+        .unwrap_or_else(|| "Agent is waiting for input".to_string());
+    fire_notification(state, message);
     broadcast(state, Event::question_request(id, questions));
 }
 
@@ -1192,6 +1300,9 @@ fn spawn_run(state: &mut AgentState) {
         session_tools: Arc::clone(&state.session_tools),
         subagents: Arc::clone(&state.subagents),
         session: state.session.clone(),
+        hooks: Arc::clone(&state.hook_manager),
+        skills: Arc::clone(&state.skill_manager),
+        transcript_path: transcript_path(state),
     });
     let conversation = state.conversation.clone();
     let session = state.session.clone();

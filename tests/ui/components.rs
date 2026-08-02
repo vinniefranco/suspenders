@@ -925,7 +925,7 @@ fn line_text(line: &Line<'static>) -> String {
 }
 
 fn fresh_transcript() -> Transcript {
-    Transcript::new(Vec::new())
+    Transcript::new()
 }
 
 #[test]
@@ -2008,7 +2008,7 @@ fn pending_body_height(
 /// then another assistant line - the shape the grouping fold boxes in the
 /// middle only.
 fn store_with_a_tool_run() -> crate::ui::transcript::Transcript {
-    let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+    let mut t = crate::ui::transcript::Transcript::new();
     t.user("do it");
     t.push(TranscriptItem::Assistant {
         text: "on it".into(),
@@ -2187,7 +2187,7 @@ fn tool_todo_lines_wraps_long_content_and_every_row_fits_the_inner_width() {
 #[test]
 fn a_todo_renders_as_a_bordered_circle_list() {
     use TodoStatus::{Completed, InProgress, Pending};
-    let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+    let mut t = crate::ui::transcript::Transcript::new();
     t.info("a prefix line");
     t.push(todo_item(vec![
         todo("read", Completed),
@@ -2495,7 +2495,7 @@ fn assert_every_box_row_is_exactly_width(
 // builder the box-rigidity goldens route through, so the `ToolResult { … }`
 // literal lives in one place (and a Diff/multi-tool case builds its own).
 fn store_with_one_result(name: &str, summary: String) -> crate::ui::transcript::Transcript {
-    let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+    let mut t = crate::ui::transcript::Transcript::new();
     t.push(TranscriptItem::ToolResult {
         name: name.into(),
         summary,
@@ -2526,7 +2526,7 @@ fn a_boxed_diff_with_a_wide_glyph_line_keeps_the_box_rigid() {
     // A tool group whose result is a Diff: the diff renders INSIDE the box
     // (tools_expanded), so every diff-in-box row - including a wide-glyph diff
     // line - must be exactly the box width, not just the header/border rows.
-    let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+    let mut t = crate::ui::transcript::Transcript::new();
     t.push(TranscriptItem::Diff {
         title: "edit 世界.rs".into(),
         lang: Some("txt".into()),
@@ -2549,7 +2549,7 @@ fn a_boxed_diff_with_a_wide_glyph_line_keeps_the_box_rigid() {
 fn a_multi_tool_box_pads_its_gap_row_to_the_width() {
     // Two tools in one box exercise the `gap:1` blank row between them; the gap
     // row (and every other row) must still be exactly the box width.
-    let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+    let mut t = crate::ui::transcript::Transcript::new();
     t.push(TranscriptItem::ToolResult {
         name: "read_file".into(),
         summary: "340 lines".into(),
@@ -2576,7 +2576,7 @@ fn a_tool_name_on_the_inner_width_boundary_keeps_the_box_rigid() {
     let budget = inner - STATUS_INDICATOR_WIDTH; // marker column
     let name = "n".repeat(8);
     let desc = "d".repeat(budget - name.len() - 1); // -1 for the space
-    let mut t = crate::ui::transcript::Transcript::new(Vec::new());
+    let mut t = crate::ui::transcript::Transcript::new();
     t.push(TranscriptItem::ToolResult {
         name,
         summary: desc,
@@ -3110,6 +3110,7 @@ fn suggestion(
         label: label.to_string(),
         value: value.to_string(),
         description: desc.to_string(),
+        argument_hint: None,
         matched,
     }
 }
@@ -4272,14 +4273,11 @@ fn screen_confirming(name: &str, input: serde_json::Value, command: &str) -> Scr
 // A Screen carrying a COMMITTED Todo list (so the sticky "Current tasks" box
 // would show) AND an open approval on a live `run_command` ToolCall. The Todo
 // rides in through the real event path (a `todo_write` result with the todos
-// artifact, promoted by the registered todo Extension), is frozen with
-// `mark_committed`, then a second Run opens the confirming call + approval.
+// artifact, which the Transcript store swaps for a first-class Todo item), is
+// frozen with `mark_committed`, then a second Run opens the confirming call +
+// approval.
 fn screen_committed_todo_then_confirming() -> Screen {
-    let opts = ScreenOpts {
-        extensions: crate::extensions::configured(&["todo".to_string()]),
-        ..ScreenOpts::default()
-    };
-    let screen = Screen::new(opts);
+    let screen = Screen::new(ScreenOpts::default());
     let todos = serde_json::json!({
         "todos": [
             {"content": "read the file", "status": "in_progress"},
@@ -4288,8 +4286,8 @@ fn screen_committed_todo_then_confirming() -> Screen {
     });
     let (s, _) = screen.apply_event(Event::run_started("r1"));
     let (s, _) = s.apply_event(Event::tool_call("todo-call", "todo_write", todos));
-    // The todos artifact rides the result so the todo Extension promotes it
-    // to a first-class Todo item (ADR-0048).
+    // The todos artifact rides the result so the Transcript store swaps it for
+    // a first-class Todo item (ADR-0048).
     let mut artifacts = std::collections::HashMap::new();
     artifacts.insert(
         "todos".to_string(),
@@ -4312,7 +4310,7 @@ fn screen_committed_todo_then_confirming() -> Screen {
     // sticky box qualifies (ADR-0048, fullscreen: not-the-tail gate).
     assert!(
         s.transcript().latest_todo().is_some(),
-        "the todo Extension promoted a Todo item"
+        "the Transcript store swapped in a Todo item"
     );
     // Now a second, live run_command gated on an open approval.
     let (s, _) = s.apply_event(Event::tool_call(
@@ -4388,11 +4386,7 @@ fn pending_layout_reserves_no_sticky_zone_while_an_approval_is_open() {
 // (the fullscreen not-the-tail gate) - the sticky box is the only thing
 // driving the frame.
 fn screen_committed_todo_no_approval() -> Screen {
-    let opts = ScreenOpts {
-        extensions: crate::extensions::configured(&["todo".to_string()]),
-        ..ScreenOpts::default()
-    };
-    let screen = Screen::new(opts);
+    let screen = Screen::new(ScreenOpts::default());
     let todos = serde_json::json!({
         "todos": [
             {"content": "read the file", "status": "in_progress"},

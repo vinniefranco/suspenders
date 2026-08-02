@@ -58,6 +58,15 @@ pub(crate) struct RunSpawn {
     pub(crate) session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
     pub(crate) subagents: Arc<crate::subagents::SubagentRegistry>,
     pub(crate) session: crate::session::Session,
+    pub(crate) hooks: Arc<crate::hooks::HookManager>,
+    /// The disk-skill manager (ADR-0058): the Agent discovered it once at
+    /// launch. Threaded into each Run's [`crate::run::Capture`] so
+    /// `crate::run::batch` can activate a conditional skill at the tool-success
+    /// seam, and the same shared `Arc` the `skill` tool reads its catalog off.
+    pub(crate) skills: Arc<crate::skills::SkillManager>,
+    /// The Session Log's JSONL path (H1, ADR-0010/0066): the running transcript a
+    /// hook payload reports as `transcript_path`. Empty when the Agent opened no log.
+    pub(crate) transcript_path: String,
 }
 
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
@@ -90,6 +99,18 @@ pub(crate) struct AgentDeps {
     /// The child Run's turn bound (qwen's per-subagent run cap): the Session's
     /// own `run_limit`, so a subagent runs the same bound a top-level Run does.
     subagent_run_limit: usize,
+    /// The standing hook manager (Phase 3a, ADR-0066): the Agent resolved it once
+    /// at launch. Threaded into each Run's [`crate::run::Capture`] so `run` builds
+    /// the Run's hook firing handle over it.
+    hooks: Arc<crate::hooks::HookManager>,
+    /// The disk-skill manager (ADR-0058): threaded into each Run's
+    /// [`crate::run::Capture`] so `crate::run::batch` can activate a conditional
+    /// skill by touched path. Shared by `Arc` with the `skill` tool.
+    skills: Arc<crate::skills::SkillManager>,
+    /// The Session Log's JSONL path (H1, ADR-0010/0066): threaded into each Run's
+    /// [`crate::run::Capture`] so the hook payloads carry `transcript_path` +
+    /// `session_id` (the latter derived from this path's file stem).
+    transcript_path: String,
 }
 
 impl AgentDeps {
@@ -106,6 +127,9 @@ impl AgentDeps {
             session_tools,
             subagents,
             session,
+            hooks,
+            skills,
+            transcript_path,
         } = spawn;
         let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
@@ -118,6 +142,9 @@ impl AgentDeps {
             subagents,
             session,
             subagent_run_limit,
+            hooks,
+            skills,
+            transcript_path,
         }
     }
 
@@ -177,6 +204,19 @@ impl AgentDeps {
             bg_shells: Arc::new(AgentBackgroundShellSpawner {
                 tx: self.tx.clone(),
             }),
+            // The standing hook manager (Phase 3a, ADR-0066): threaded so `run`
+            // builds the Run's firing handle over it. Shared by Arc, like the tool
+            // set - the manager is immutable for the Session's lifetime this phase.
+            hooks: Arc::clone(&self.hooks),
+            // The disk-skill manager (ADR-0058): shared by Arc so `crate::run::batch`
+            // can activate a conditional skill by touched path and the `skill` tool
+            // reads the same activation state. The skill list is immutable for the
+            // Session; only its interior activation registry mutates.
+            skills: Arc::clone(&self.skills),
+            // The hook payload base identity (H1, ADR-0066): the transcript path is
+            // the Session Log's JSONL path; the session id is derived from its stem.
+            transcript_path: self.transcript_path.clone(),
+            session_id: crate::run::hooks::session_id_from_log_path(&self.transcript_path),
         }
     }
 

@@ -29,10 +29,10 @@ use serde_json::Value;
 /// One item in the model's task list: a `content` line in the model's voice and
 /// its `status`. Held verbatim; the harness never edits the content.
 ///
-/// `Serialize`/`Deserialize` so the Todo display extension can attach the parsed
-/// list as an Artifact (ADR-0048): the same value the Run-loop's Plan fold reads
-/// rides the Tool Result to Presentment, so the committed render never re-parses
-/// the raw JSON args.
+/// `Serialize`/`Deserialize` so the `todo_write` tool can attach the parsed list
+/// as an Artifact (ADR-0048): the same value the Run-loop's Plan fold reads rides
+/// the Tool Result to Presentment (the Transcript store swaps in a richer item),
+/// so the committed render never re-parses the raw JSON args.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,

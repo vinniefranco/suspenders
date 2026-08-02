@@ -53,6 +53,7 @@ impl AgentState {
             mcp: crate::mcp::manager::McpManager::default(),
             session_tools: crate::tools::tools().into(),
             skill_manager,
+            hook_manager: Arc::new(crate::hooks::HookManager::default()),
             subagents,
             background: HashMap::new(),
             notifications: Vec::new(),

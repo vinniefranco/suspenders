@@ -117,6 +117,28 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         ));
     }
 
+    // The hook subsystem (ADR-0066): resolve the standing `config.json` hooks
+    // once, fail-open, the same shape as the MCP/skill attach above. A malformed
+    // hook entry is recorded on the manager and skipped, surfaced below as a
+    // launch notice; a config with no `hooks` block yields the empty manager.
+    // Skill-hook registration (session scope) is Phase 4 - this holds only the
+    // standing source, reachable by every Run.
+    let hook_manager = Arc::new(crate::hooks::HookManager::from_config(
+        session.hooks.as_ref(),
+    ));
+
+    // Surface each fail-open hook parse skip as a launch notice, exactly like an
+    // MCP connect or skill parse failure (ADR-0007's fail-open report seam, the
+    // fail-open-with-visibility ethos of ADR-0018): a malformed hook is a visible
+    // skip, not a silent one.
+    for (context, reason) in hook_manager.failures() {
+        let _ = events.send(Event::extension_error(
+            format!("hook {context}"),
+            crate::event::Stage::PreRun,
+            reason.clone(),
+        ));
+    }
+
     // The subagent registry (P4/F4, ADR-0061): the built-in defs, built once
     // here. The `agent` tool holds it (for its dynamic schema/description, the
     // way the `skill` tool holds a SkillManager) AND each Run's Capture threads
@@ -189,6 +211,43 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     }
     let system_prompt = format!("{system_prompt}{}", memory.prompt_suffix());
 
+    // The SessionStart hooks (Phase 3b, ADR-0066): fired ONCE here, after all
+    // subsystem discovery (MCP, skills, hooks, subagents), through the same
+    // firing facade a Run uses ([`crate::run::hooks::Hooks`] over the standing
+    // manager + the Session's Llm/Model/Root). The `source` is `resume` when a
+    // prior log was folded, else `startup` (qwen's SessionStart source kinds). A
+    // hook's injected `additionalContext` becomes initial context, folded onto the
+    // system prompt as its own `\n\n---\n\n` section - the same composition point
+    // the Deferred Tools / memory sections use. Observational otherwise (a
+    // SessionStart hook cannot veto a session). Fail-open: no hooks, or a runner
+    // failure, leaves the prompt untouched.
+    let source = if resume_info.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
+    let transcript = log.as_ref().map(|l| l.path.clone()).unwrap_or_default();
+    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    let session_start_hooks = crate::run::hooks::Hooks::new(
+        &hook_manager,
+        llm.as_ref(),
+        &model,
+        session.root.clone(),
+        session_id,
+        transcript,
+    );
+    let system_prompt = match session_start_hooks.session_start(source).await {
+        Some(context) => {
+            let _ = events.send(Event::extension_error(
+                "hook SessionStart".to_string(),
+                crate::event::Stage::PreRun,
+                "injected initial context".to_string(),
+            ));
+            format!("{system_prompt}\n\n---\n\n{context}")
+        }
+        None => system_prompt,
+    };
+
     // The budget figures derive from the launch Model here and are re-derived
     // from the captured Model at every Run start (ADR-0037, `reset_run_state`).
     let mut conversation = Conversation::new(
@@ -230,6 +289,7 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         mcp,
         session_tools,
         skill_manager,
+        hook_manager,
         subagents,
         background: HashMap::new(),
         notifications: Vec::new(),

@@ -54,8 +54,6 @@ pub struct Session {
     /// The module implementing the LLM boundary (a name; the trait wiring is a
     /// later phase - carried here as a module name).
     pub llm_module: String,
-    /// The Session's Extension list (opaque here; entries carried as names).
-    pub extensions: Vec<String>,
     /// The config `context_budget` knob, reinterpreted (ADR-0037, ADR-0031
     /// amendment): an optional global cap on every Model's effective budget,
     /// and the window figure for Models the Catalog does not know. The budget
@@ -140,6 +138,14 @@ pub struct Session {
     /// defaults to [`McpSource::User`](crate::mcp::McpSource::User) when the plan
     /// map is built.
     pub mcp_sources: BTreeMap<String, crate::mcp::McpSource>,
+    /// The standing hook config (ADR-0066), the opaque `hooks` value from
+    /// `config.json` carried verbatim like qwen keeps its settings `hooks` block.
+    /// `None` when no scope declared one (the common case). `init_agent` hands it
+    /// to [`HookManager::from_config`](crate::hooks::HookManager::from_config),
+    /// which parses it fail-open. A file-only value (the env cannot express it);
+    /// a later scope replaces an earlier one (the plain overlay, not the MCP
+    /// merge - a first-cut choice, ADR-0066).
+    pub hooks: Option<serde_json::Value>,
 }
 
 /// Raised (returned) when a Session's fixed facts fail validation. The message
@@ -169,6 +175,12 @@ pub struct SessionConfig {
     /// records the lowest scope that named it (workspace shadows user). Default
     /// empty; never file-settable directly - it is a byproduct of composition.
     pub mcp_sources: BTreeMap<String, crate::mcp::McpSource>,
+    /// The standing hook config (ADR-0066): the opaque `hooks` value from
+    /// `config.json`, carried verbatim and parsed fail-open by the
+    /// [`HookManager`](crate::hooks::HookManager) at launch. Default `None`
+    /// (no hooks); a file-only value (no env seam) landed by the plain overlay,
+    /// so a later scope replaces the earlier one.
+    pub hooks: Option<serde_json::Value>,
     /// The scoped `provider/model-id` the launch Model resolves from.
     pub model: String,
     /// The configured Theme name (ADR-0038): a built-in (`dark`, `light`) or a
@@ -197,7 +209,6 @@ pub struct SessionConfig {
     pub malformed_retry_budget: u64,
     /// Skips the next-speaker check (ADR-0043); `false` runs it.
     pub skip_next_speaker: bool,
-    pub extensions: Vec<String>,
     pub session_dir: String,
 }
 
@@ -276,6 +287,9 @@ impl SessionConfig {
             // both fill in as the composer merges the settings scopes.
             mcp_excluded: Vec::new(),
             mcp_sources: BTreeMap::new(),
+            // No standing hooks out of the box (ADR-0066): the user adds them by
+            // hand under a `hooks` key. `None` means the Agent fires none.
+            hooks: None,
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             theme: "dark".into(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -300,18 +314,12 @@ impl SessionConfig {
             // qwen-code's `skipNextSpeakerCheck` default of true): a no-tool-call
             // Pass finishes the Run without the side-query.
             skip_next_speaker: true,
-            extensions: vec![
-                "diff".into(),
-                "run_shell_command".into(),
-                "condense".into(),
-                "todo".into(),
-            ],
             session_dir: default_session_dir(),
         }
     }
 
-    /// The config the test env resolves to: fakes injected, empty extension
-    /// list, tmp session dir. The next-speaker check is skipped here (ADR-0043,
+    /// The config the test env resolves to: fakes injected, tmp session dir. The
+    /// next-speaker check is skipped here (ADR-0043,
     /// now the base default too) so the loop and agent tests exercise the tool
     /// loop without a side-query firing on every text reply; the check's own
     /// behavior is covered by the tests that opt back in
@@ -325,7 +333,6 @@ impl SessionConfig {
             .expect("base ships local")
             .base_url = "http://localhost:0/v1".into();
         cfg.llm_module = "Suspenders.FakeLLM".into();
-        cfg.extensions = vec![];
         cfg.skip_next_speaker = true;
         cfg.session_dir = std::env::temp_dir()
             .join("suspenders_test_sessions")
@@ -457,6 +464,10 @@ impl SessionConfig {
             // so this is an empty array in the template - present so a user knows
             // the `/mcp` dialog's disable toggle has a home here.
             mcp_excluded: Some(base.mcp_excluded),
+            // The standing hooks value (ADR-0066): base ships none, so this is
+            // absent from the template - the `hooks` key is documented in the ADR
+            // and left out of the scaffold so an empty null is not persisted.
+            hooks: base.hooks,
             model: Some(base.model),
             theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
@@ -805,6 +816,12 @@ pub(crate) struct FileConfig {
     /// so the composer - not [`apply`](FileConfig::apply) - lands it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp_excluded: Option<Vec<String>>,
+    /// The standing hook config (ADR-0066): the opaque `hooks` value kept
+    /// verbatim (qwen's settings `hooks` block), parsed fail-open by the
+    /// [`HookManager`](crate::hooks::HookManager) at launch rather than by serde
+    /// here - so a malformed hook is a visible skip, not a config-load failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -872,6 +889,10 @@ impl FileConfig {
             &mut cfg.malformed_retry_budget,
         );
         overlay(&self.skip_next_speaker, &mut cfg.skip_next_speaker);
+        // The standing hooks value (ADR-0066): a plain overlay like the scalars,
+        // so a later scope's `hooks` block replaces the earlier one (the first-cut
+        // choice; the MCP-style cross-scope merge is deferred).
+        overlay_opt(&self.hooks, &mut cfg.hooks);
     }
 }
 
@@ -1065,7 +1086,6 @@ fn parse_compaction_keep(raw: &str) -> Result<f64, SessionError> {
 pub struct SessionOpts {
     pub root: Option<String>,
     pub llm_module: Option<String>,
-    pub extensions: Option<Vec<String>>,
     pub context_budget: Option<u64>,
     pub compaction_slack: Option<f64>,
     pub compaction_keep: Option<f64>,
@@ -1131,7 +1151,6 @@ impl Session {
             root,
             memory_root,
             llm_module: opts.llm_module.unwrap_or_else(|| config.llm_module.clone()),
-            extensions: opts.extensions.unwrap_or_else(|| config.extensions.clone()),
             context_budget,
             compaction_slack: opts.compaction_slack.unwrap_or(config.compaction_slack),
             compaction_keep: opts.compaction_keep.unwrap_or(config.compaction_keep),
@@ -1160,6 +1179,10 @@ impl Session {
             mcp_servers: config.mcp_servers.clone(),
             mcp_excluded: config.mcp_excluded.clone(),
             mcp_sources: config.mcp_sources.clone(),
+            // The standing hooks value rides from config verbatim (ADR-0066): a
+            // file-only value like `mcp_servers`, parsed fail-open by the
+            // HookManager at launch, not here.
+            hooks: config.hooks.clone(),
         };
 
         validate(&session)?;

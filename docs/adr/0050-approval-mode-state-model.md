@@ -38,6 +38,17 @@ but behavior-STUBBED.**
   vacuous). The footer still NAMES them so the cycle is whole and forward-
   compatible, but they carry no behavior yet. This is documented, not hidden.
 
+**A PermissionRequest hook decides ahead of the mode.** A Hook (ADR-0066) firing
+at the PermissionRequest event may return a permission decision, and it is
+consulted before the gate consults the mode. An `allow` auto-approves the Call:
+`Approvals::request` short-circuits to `Auto` with no modal, scoped to this Call
+rather than a Standing entry. A `deny` rejects the Call outright, returning the
+hook's stated reason to the model in place of a Tool Result, and the Approval
+gate never opens. An `ask` (and any hook that returns no decision) falls through
+to the normal gate, so the mode and any Standing Approval decide as described
+above. Because the hook is consulted first, a `deny` overrides even Yolo, which
+is deliberate: a PermissionRequest hook is an operator-installed guard.
+
 **The `AutoAcceptIndicator` is a footer status segment.** `StatusSegment::ApprovalMode(mode)`
 (the mode label, coloured per mode) + `StatusSegment::ApprovalModeHint` (the
 secondary ` (shift + tab to cycle)` phrase - a separate segment because it is a

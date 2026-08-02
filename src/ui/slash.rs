@@ -5,20 +5,29 @@
 //! [`Effect::Command`](crate::ui::screen::Effect::Command); the actual work
 //! runs adapter-side in that Effect's arm.
 //!
-//! ## The registry is the extension seam
+//! ## The two-layer registry is the extension seam
 //!
-//! [`COMMANDS`] is a `&'static` slice of descriptors. Adding a command later is
-//! one more entry, not a new widget: the fuzzy `/` palette
-//! ([`crate::ui::completion`], ADR-0051 System B) ranks the registry, and a
-//! selector-opening command's numbered `›` dialog ([`crate::ui::selection`],
-//! System A) reuses the shared list.
+//! [`COMMANDS`] is a `&'static` slice of BUILT-IN descriptors. Alongside it
+//! sits a DYNAMIC command-source layer resolved at launch (ADR-0032/0058): a
+//! runtime `&[`[`SkillCommand`]`]` the adapter feeds in from the discovered
+//! [`crate::skills::SkillManager`], one entry per discovered skill. The registry
+//! the pure core ranks and resolves over is the UNION of the two, projected to a
+//! borrowed [`CommandRef`] so the fuzzy palette and lookup treat a built-in and
+//! a skill command identically - the pure core never learns what a skill command
+//! DOES (it emits the command-agnostic
+//! [`Effect::Command`](crate::ui::screen::Effect::Command); the adapter maps it,
+//! ADR-0019). Adding a command later is one more entry in either layer, not a new
+//! widget: the fuzzy `/` palette ([`crate::ui::completion`], ADR-0051 System B)
+//! ranks the union, and a selector-opening built-in's numbered `›` dialog
+//! ([`crate::ui::selection`], System A) reuses the shared list.
 //!
 //! ## Parsing a slash draft
 //!
 //! A slash draft is `/name[ rest]`: the FIRST space separates the command token
 //! (`name`) from an optional remainder (`rest`). [`parse`] splits it; [`lookup`]
-//! resolves a name to a descriptor. The palette ranking lives in
-//! [`crate::ui::completion::rank`], reading this registry (name + `alt_names`).
+//! resolves a name to a built-in descriptor, and [`lookup_ref`] resolves it over
+//! the union (built-ins PLUS the runtime skill layer). The palette ranking lives
+//! in [`crate::ui::completion::rank`], reading the union (name + `alt_names`).
 
 /// One command descriptor: the name typed after `/` and the one-line help the
 /// menu shows. The Effect the command produces is NOT here - the pure core
@@ -90,6 +99,95 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
 ];
 
+/// One runtime (dynamic-source) command descriptor - the DYNAMIC layer beside
+/// the `&'static` [`COMMANDS`] (ADR-0032/0058). Today the one source is
+/// discovered Skills: the adapter builds one of these per discovered skill from
+/// the [`crate::skills::SkillManager`] and feeds the list into the Composer at
+/// launch (the same way history/header/theme launch data reaches the UI). A
+/// skill command is always fire-and-run (`opens_selector` is not carried - a
+/// skill never opens a value selector), so committing it emits a plain
+/// [`Effect::Command`](crate::ui::screen::Effect::Command) the adapter maps to
+/// the submit-prompt injection. The pure core stays command-agnostic: it ranks
+/// and resolves this exactly like a built-in and never learns it is a skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCommand {
+    /// The `/<name>` token, the discovered skill's name.
+    pub name: String,
+    /// The one-line menu help - the skill's `description`.
+    pub help: String,
+    /// The skill's `argument-hint`, shown after the command name in the palette
+    /// (qwen `/<name> <argument-hint>`), or `None`. Display-only.
+    pub argument_hint: Option<String>,
+}
+
+/// A borrowed, source-agnostic VIEW of one command - the union projection the
+/// pure ranking/lookup fold over (ADR-0032's two-layer registry). A `&'static`
+/// [`SlashCommand`] and a runtime [`SkillCommand`] both project to this, so
+/// [`crate::ui::completion::rank`] and [`lookup_ref`] treat a built-in and a
+/// skill command identically. `alt_names`/`completion_priority` are the
+/// built-in-only ranking extras (a skill carries neither); `argument_hint` is
+/// the skill-only completion annotation (a built-in carries none). The core
+/// reads these fields to rank/render - never to decide what the command DOES.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandRef<'a> {
+    pub name: &'a str,
+    pub help: &'a str,
+    pub opens_selector: bool,
+    pub alt_names: &'a [&'a str],
+    pub completion_priority: i32,
+    /// The skill's `argument-hint` (dynamic layer only), shown after the name in
+    /// the completion menu. `None` for a built-in.
+    pub argument_hint: Option<&'a str>,
+}
+
+impl<'a> CommandRef<'a> {
+    /// Projects a `&'static` built-in descriptor into the union view.
+    pub fn from_static(command: &'a SlashCommand) -> Self {
+        CommandRef {
+            name: command.name,
+            help: command.help,
+            opens_selector: command.opens_selector,
+            alt_names: command.alt_names,
+            completion_priority: command.completion_priority,
+            argument_hint: None,
+        }
+    }
+
+    /// Projects a runtime skill descriptor into the union view (fire-and-run, no
+    /// alt names, no priority nudge; its `argument-hint` rides along).
+    pub fn from_skill(skill: &'a SkillCommand) -> Self {
+        CommandRef {
+            name: &skill.name,
+            help: &skill.help,
+            opens_selector: false,
+            alt_names: &[],
+            completion_priority: 0,
+            argument_hint: skill.argument_hint.as_deref(),
+        }
+    }
+}
+
+/// The whole command registry as a source-agnostic union (ADR-0032): every
+/// built-in [`COMMANDS`] entry first, then every runtime skill command whose
+/// name does NOT collide with a built-in, each as a borrowed [`CommandRef`].
+/// Built-ins lead AND win a name collision - a skill cannot shadow `/model`, so
+/// a same-named skill is dropped from the union (it would otherwise rank as a
+/// duplicate row and route to the wrong handler). The order is the ranking's
+/// stable `original_index` basis, so it must not change between the rank and
+/// lookup passes on one draft.
+pub fn commands_ref(skills: &[SkillCommand]) -> Vec<CommandRef<'_>> {
+    COMMANDS
+        .iter()
+        .map(CommandRef::from_static)
+        .chain(
+            skills
+                .iter()
+                .filter(|s| lookup(&s.name).is_none())
+                .map(CommandRef::from_skill),
+        )
+        .collect()
+}
+
 /// A parsed slash draft: the command token and an optional remainder. For
 /// `"/mod"` → `{ name: "mod", rest: None }`; for `"/model qw"` →
 /// `{ name: "model", rest: Some("qw") }`.
@@ -125,7 +223,14 @@ pub fn parse(draft: &str) -> SlashDraft {
     }
 }
 
-/// The descriptor whose name matches `name` exactly, if any.
+/// The BUILT-IN descriptor whose name matches `name` exactly, if any. Resolves
+/// only the `&'static` layer: a selector-opening command (`/model`, `/theme`)
+/// is always a built-in, so the Composer's "does this open a selector?" and
+/// "is this `/mcp`?" tests read this. A skill command is never selector-opening,
+/// so [`lookup`] returning `None` for a `/<skill>` token is correct - a `/<skill>`
+/// is resolved by ranking it in the [`commands_ref`] union, then committed
+/// fire-and-run (the adapter maps its [`Effect::Command`](crate::ui::screen::Effect::Command)
+/// to the skill's submit-prompt injection).
 pub fn lookup(name: &str) -> Option<&'static SlashCommand> {
     COMMANDS.iter().find(|c| c.name == name)
 }

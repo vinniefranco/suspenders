@@ -8,10 +8,14 @@
 //! (names + descriptions XML-escaped). That catalog IS the surfacing mechanism -
 //! the model reads the skill list off the tool's own description - so the tool is
 //! always on the wire list (`always_load` true, never deferred). Invoking it with
-//! a `skill` name returns that skill's body wrapped by
-//! [`build_skill_llm_content`](crate::skills::build_skill_llm_content), so the
-//! model gets the skill's instructions plus its base directory for absolute-path
-//! resolution.
+//! a `skill` name that is in the MODEL-INVOCABLE catalog (not
+//! `disable-model-invocation` AND currently active) returns that skill's body
+//! wrapped by [`build_skill_llm_content`](crate::skills::build_skill_llm_content),
+//! so the model gets the skill's instructions plus its base directory for
+//! absolute-path resolution. A hidden or not-yet-activated skill cannot be invoked
+//! (qwen's `validateToolParams` gating): a pending conditional skill gets qwen's
+//! distinct path-gated message, and the not-found list is the model-facing catalog
+//! only, never leaking hidden/inactive names.
 //!
 //! The description scaffold (`Execute a skill within the main conversation` +
 //! `<skills_instructions>` + `<available_skills>`) is ported VERBATIM from qwen
@@ -48,25 +52,37 @@ impl SkillTool {
         SkillTool { manager }
     }
 
-    /// The `<available_skills>` body: one `<skill>` entry per discovered skill
-    /// (name + description XML-escaped, the `when_to_use` appended to the
-    /// description as qwen does), or the empty-catalog text. The `<location>` is
-    /// the skill's base directory so the model can resolve absolute paths before
-    /// even invoking. Built fresh for every `spec()` call off the manager's
-    /// current catalog.
+    /// The `<available_skills>` body: one `<skill>` entry per catalog skill (a
+    /// conditional skill only after activation, and never a
+    /// `disable-model-invocation` skill), name + description XML-escaped, the
+    /// `when_to_use` appended to the description as qwen does, or the empty-catalog
+    /// text. The `<location>` is the skill's base directory so the model can
+    /// resolve absolute paths before even invoking. Built fresh for every `spec()`
+    /// call off the manager's current catalog.
     fn skill_descriptions(&self) -> String {
-        let skills = self.manager.available();
+        // The model-facing CATALOG, not every discovered skill (ADR-0058): a
+        // conditional (`paths:`) skill is excluded until a touched file activates
+        // it, and a `disable-model-invocation` skill is dropped entirely. Built
+        // fresh per `spec()` call, so a newly-activated skill appears next turn.
+        let skills = self.manager.catalog();
         if skills.is_empty() {
             return NO_SKILLS_TEXT.to_string();
         }
         skills
             .iter()
             .map(|skill| {
-                // qwen: `${description}${whenToUse ? ` - ${whenToUse}` : ''}` (qwen's
-                // em-dash rendered as a hyphen, per the house hyphens-everywhere rule).
+                // qwen (tools/skill.ts:174): `${description}${whenToUse ? ` - ${whenToUse}`
+                // : ''} (${skill.level})` (qwen's em-dash rendered as a hyphen, per the
+                // house hyphens-everywhere rule). The trailing `(level)` names the source
+                // (project/user/bundled) so the model can tell them apart.
+                let level = skill.level.label();
                 let desc = match &skill.when_to_use {
-                    Some(w) => format!("{} - {}", escape_xml(&skill.description), escape_xml(w)),
-                    None => escape_xml(&skill.description),
+                    Some(w) => format!(
+                        "{} - {} ({level})",
+                        escape_xml(&skill.description),
+                        escape_xml(w)
+                    ),
+                    None => format!("{} ({level})", escape_xml(&skill.description)),
                 };
                 format!(
                     "<skill>\n<name>\n{}\n</name>\n<description>\n{}\n</description>\n<location>\n{}\n</location>\n</skill>",
@@ -154,22 +170,41 @@ Important:
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "Parameter \"skill\" must be a non-empty string.".to_string())?;
 
-        match self.manager.find(name) {
-            Some(skill) => Ok(build_skill_llm_content(&skill.base_dir, &skill.body)),
-            None => {
-                // qwen's not-found message, with the available-names list.
-                let names: Vec<&str> = self
-                    .manager
-                    .available()
-                    .iter()
-                    .map(|s| s.name.as_str())
-                    .collect();
-                Err(format!(
-                    "Skill \"{name}\" not found. Available skills: {}",
-                    names.join(", ")
-                ))
-            }
+        // Resolve against the MODEL-INVOCABLE set (the same filtered catalog the
+        // <available_skills> block surfaces): not `disable-model-invocation` AND
+        // currently active. A hidden or not-yet-activated skill is never invocable
+        // through this tool (qwen's `validateToolParams`, tools/skill.ts:251-290).
+        if let Some(skill) = self.manager.find_invocable(name) {
+            return Ok(build_skill_llm_content(&skill.base_dir, &skill.body));
         }
+
+        // A known-but-pending conditional skill gets qwen's DISTINCT path-gated
+        // message (tools/skill.ts:278-280), not the generic not-found, so the model
+        // learns it exists but must touch a matching file to unlock it.
+        if self.manager.is_pending_conditional(name) {
+            return Err(format!(
+                "Skill \"{name}\" is gated by path-based activation (paths: frontmatter) and is not yet available. Access a file matching its paths patterns first to activate it."
+            ));
+        }
+
+        // qwen's not-found message. The available-names list is the MODEL-FACING
+        // catalog only (tools/skill.ts:282-289), so a hidden/inactive skill name
+        // is never leaked to the model.
+        let names: Vec<&str> = self
+            .manager
+            .catalog()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        if names.is_empty() {
+            return Err(format!(
+                "Skill \"{name}\" not found. No skills are currently available."
+            ));
+        }
+        Err(format!(
+            "Skill \"{name}\" not found. Available skills: {}",
+            names.join(", ")
+        ))
     }
 }
 

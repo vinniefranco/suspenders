@@ -1,4 +1,4 @@
-//! Line-level diff hunks for [`crate::extensions::diff`], computed with a
+//! Line-level diff hunks for [`crate::tools::file_diff`], computed with a
 //! Myers/LCS line diff - no dependency.
 //!
 //! A hunk is a run of changed lines plus up to 3 context lines on each side;
@@ -125,5 +125,5 @@ pub fn stats(hunks: &[Hunk]) -> Stats {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/extensions/diff/hunks.rs"]
+#[path = "../../../tests/tools/file_diff/hunks.rs"]
 mod tests;

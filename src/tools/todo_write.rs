@@ -14,14 +14,39 @@
 //! Storage is the harness's concern, not this tool's: qwen's disk persistence
 //! (`todos/<sessionId>.json`) and its TodoCreated/TodoCompleted hook system are
 //! qwen-internal infra, out of the model-facing contract, and not ported. The
-//! suspenders UI renders the list from a first-class `TranscriptItem::Todo` that
-//! the Todo extension (`src/extensions/todo.rs`) derives from the call input,
-//! independent of the string this tool returns.
+//! suspenders UI renders the list from a first-class `TranscriptItem::Todo`: on a
+//! successful call this tool parses `todos` with the SAME `plan::parse_todos` the
+//! Run-loop's Plan fold uses (ADR-0048: `plan.rs` owns the todo vocabulary; no
+//! consumer re-derives it) and attaches a `todos` display Artifact (via
+//! [`Tool::run_rich`]), which the Transcript store swaps in for the raw JSON
+//! args - independent of the string this tool returns to the model.
 
-use crate::tool::{Tool, ToolCtx, ToolSpec};
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::plan::{self, TodoItem};
+use crate::tool::{Tool, ToolCtx, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
 pub struct TodoWriteTool;
+
+/// The wire name of this tool, shared with the Transcript store's Todo swap so
+/// the two never drift.
+pub const TOOL: &str = "todo_write";
+
+/// The Artifact key the Todo display reserves, declared in one place: a producer
+/// (this tool) and consumer (the Transcript store) that disagree fail to
+/// *compile*, and a rename touches this module alone.
+pub const TODOS: &str = "todos";
+
+/// The Artifact carried to the Transcript store: the parsed task list. Serialized
+/// into the `todos` slot; `TodoItem`'s `snake_case` status matches the
+/// `todo_write` vocabulary on the wire (ADR-0048, [`plan::TodoItem`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoArtifact {
+    pub items: Vec<TodoItem>,
+}
 
 /// qwen's `todoWriteToolDescription` (tools/todoWrite.ts:64-240), verbatim. The
 /// `${...}` interpolations in qwen's source resolve to literal tool names in the
@@ -329,6 +354,36 @@ impl Tool for TodoWriteTool {
         validate(todos)?;
         Ok(llm_content(todos))
     }
+
+    async fn run_rich(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, String> {
+        // A successful todo_write attaches the parsed task list as the `todos`
+        // display Artifact, which the Transcript store swaps for a first-class
+        // Todo item (the circle list) rather than the raw `{"todos": ...}` args.
+        // The SAME parse the Plan fold runs: a missing/non-array `todos` or an
+        // all-malformed list yields nothing, so no Artifact attaches and the raw
+        // result passes through.
+        let output = ToolOutput::text(self.run(input, ctx).await?);
+        Ok(match plan::parse_todos(input) {
+            Some(items) if !items.is_empty() => {
+                // Fail-open (ADR-0007): a Todo Artifact always serializes, but
+                // should that ever break, attach nothing rather than panic - the
+                // Transcript store reads `None` and simply shows no todo box.
+                match serde_json::to_value(TodoArtifact { items }) {
+                    Ok(value) => output.with_artifact(TODOS, value),
+                    Err(_) => output,
+                }
+            }
+            _ => output,
+        })
+    }
+}
+
+/// Reads the `todos` display Artifact back out of a Tool Result's Artifacts, or
+/// `None` when it is absent or malformed. Read by the Transcript store to decide
+/// whether to swap the summary for a [`crate::view_model::TranscriptItem::Todo`].
+pub fn read_todos_artifact(artifacts: &HashMap<String, Value>) -> Option<TodoArtifact> {
+    let value = artifacts.get(TODOS)?;
+    serde_json::from_value(value.clone()).ok()
 }
 
 #[cfg(test)]

@@ -737,12 +737,24 @@ pub struct Composer {
     /// the dialog is up, `None` otherwise. Keys route to it with FIRST REFUSAL
     /// above the flat selector.
     mcp_dialog: Option<McpDialog>,
+    /// The dynamic command-source layer (ADR-0032/0058): one [`SkillCommand`]
+    /// per discovered skill, fed in at launch from the
+    /// [`crate::skills::SkillManager`] (the same way history is fed in). The
+    /// palette ranks and lookup resolves over the UNION of the built-in
+    /// [`slash::COMMANDS`] and this list, so a `/<skill>` command sits in the
+    /// same menu as `/model`. The Composer stays command-agnostic: these are
+    /// opaque descriptors it ranks/renders, never learning what a skill DOES -
+    /// committing one emits a plain [`Effect::Command`] the adapter maps to the
+    /// submit-prompt injection.
+    skill_commands: Vec<slash::SkillCommand>,
 }
 
 impl Composer {
     /// A fresh Composer: empty draft, no overlay, the history ring seeded
-    /// with `history` (oldest first, from the on-disk file).
-    pub fn new(history: Vec<String>) -> Self {
+    /// with `history` (oldest first, from the on-disk file), and the dynamic
+    /// `skill_commands` layer seeded from the discovered skills (ADR-0032/0058),
+    /// so `/<skill>` sits in the palette beside the built-ins.
+    pub fn new(history: Vec<String>, skill_commands: Vec<slash::SkillCommand>) -> Self {
         Composer {
             value: String::new(),
             cursor: 0,
@@ -752,6 +764,7 @@ impl Composer {
             history: History::new(history),
             at_files: AtFiles::closed(),
             mcp_dialog: None,
+            skill_commands,
         }
     }
 
@@ -1136,7 +1149,7 @@ impl Composer {
     // filtered rows.
     fn menu_key(&mut self, key: Key, name: &str, status: Status) -> KeyOutcome {
         self.selector.close();
-        let suggestions = rank_menu(name);
+        let suggestions = rank_menu(&self.skill_commands, name);
         self.menu.clamp(suggestions.len());
         match key {
             // Arrow-only nav (ADR-0046): no Key::Wheel* is minted into the
@@ -1546,7 +1559,7 @@ impl Composer {
     // scroll window (re-clamped to the ranked length), and the query for the
     // inverted-highlight render.
     fn menu_view(&self, query: &str) -> OverlayView {
-        let suggestions = rank_menu(query);
+        let suggestions = rank_menu(&self.skill_commands, query);
         let mut menu = self.menu.clone();
         menu.clamp(suggestions.len());
         OverlayView::Menu {
@@ -1857,12 +1870,14 @@ fn filter_mode_for(command: &str) -> DialogFilter {
     }
 }
 
-// Ranks the registry against the query token (ADR-0051 System B). No recency
-// store exists in suspenders yet, so an empty recent map + a constant clock are
-// passed - the `now` seam is honored in [`completion::rank`]'s signature for
-// when a store lands.
-fn rank_menu(query: &str) -> Vec<Suggestion> {
-    completion::rank(query, &|_| None, 0)
+// Ranks the two-layer registry against the query token (ADR-0032/0051 System
+// B): the built-in [`slash::COMMANDS`] UNION the runtime `skills` layer. No
+// recency store exists in suspenders yet, so an empty recent map + a constant
+// clock are passed - the `now` seam is honored in [`completion::rank`]'s
+// signature for when a store lands.
+fn rank_menu(skills: &[slash::SkillCommand], query: &str) -> Vec<Suggestion> {
+    let commands = slash::commands_ref(skills);
+    completion::rank(&commands, query, &|_| None, 0)
 }
 
 // Maps a wire [`FileSuggestion`] (the async AT fill) into a render
@@ -1874,6 +1889,7 @@ fn to_file_suggestion(s: FileSuggestion) -> Suggestion {
         label: s.label,
         value: s.value,
         description: String::new(),
+        argument_hint: None,
         matched: s.matched,
     }
 }

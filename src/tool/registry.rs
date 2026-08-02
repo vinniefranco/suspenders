@@ -202,19 +202,21 @@ impl ToolRegistry {
         match tool.run_rich(input, ctx).await {
             Ok(output) => ToolResult {
                 content: output.blocks,
-                is_error: false,
+                is_error: output.is_error,
+                artifacts: output.artifacts,
             },
             Err(reason) => error_result(reason),
         }
     }
 }
 
-/// An `is_error` Tool Result carrying a single Text block - the validate and
-/// unknown-tool paths, and a tool's `Err` return (ADR-0059).
+/// An `is_error` Tool Result carrying a single Text block and no Artifacts - the
+/// validate and unknown-tool paths, and a tool's `Err` return (ADR-0059).
 fn error_result(reason: String) -> ToolResult {
     ToolResult {
         content: vec![crate::content::ResultBlock::text(reason)],
         is_error: true,
+        artifacts: std::collections::HashMap::new(),
     }
 }
 

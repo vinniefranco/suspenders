@@ -552,6 +552,7 @@ fn test_state() -> AdapterState {
     AdapterState {
         themes: ActiveTheme::launch("dark", std::path::PathBuf::from("/nonexistent/themes")).0,
         history: None,
+        skills: std::sync::Arc::new(crate::skills::SkillManager::default()),
     }
 }
 

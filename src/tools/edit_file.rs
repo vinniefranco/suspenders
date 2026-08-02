@@ -91,41 +91,75 @@ impl Tool for EditFile {
     }
 
     async fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<String, String> {
-        let raw_file_path = input
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: edit requires a string \"file_path\"".to_string())?;
-        // qwen's `unescapePath(params.file_path.trim())` (edit.ts): trim
-        // surrounding whitespace and strip shell-escaping backslashes BEFORE the
-        // absolute-path check and before the path is echoed back in a message.
-        let file_path = unescape_and_trim(raw_file_path);
-        let old_string = input
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: edit requires a string \"old_string\"".to_string())?;
-        let new_string = input
-            .get("new_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "invalid input: edit requires a string \"new_string\"".to_string())?;
-        // `replace_all` is optional; a missing / non-boolean value defaults to
-        // false (qwen `params.replace_all ?? false`).
-        let replace_all = input
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let abs = resolve(&file_path, ctx)?;
-        apply_edit(
-            EditPlan {
-                abs: &abs,
-                file_path: &file_path,
-                old_string,
-                new_string,
-                replace_all,
-            },
-            ctx,
-        )
+        // The text projection: the model-facing message, dropping the display
+        // Artifact. `run_rich` (the Registry's dispatch path) keeps the diff.
+        edit(input, ctx).map(|outcome| outcome.message)
     }
+
+    async fn run_rich(
+        &self,
+        input: &Value,
+        ctx: &ToolCtx,
+    ) -> Result<crate::tool::ToolOutput, String> {
+        // The file-editing tool knows the before/after content, so it computes
+        // its own diff (ADR-0007's diff behavior, relocated here) and attaches
+        // the `diff` display Artifact, which the Transcript store swaps for a
+        // first-class Diff item.
+        let outcome = edit(input, ctx)?;
+        let output = crate::tool::ToolOutput::text(outcome.message);
+        Ok(match outcome.diff {
+            Some(diff) => output.with_artifact(crate::tools::file_diff::DIFF, diff),
+            None => output,
+        })
+    }
+}
+
+/// One edit's outcome: the model-facing message and the optional `diff` display
+/// Artifact (a serialized [`crate::tools::file_diff::DiffArtifact`]). `run`
+/// projects the message; `run_rich` also attaches the diff.
+struct EditOutcome {
+    message: String,
+    diff: Option<Value>,
+}
+
+/// Decodes the input, resolves the path, and applies the edit, returning the
+/// message and the diff Artifact. Shared by `run` and `run_rich`.
+fn edit(input: &Value, ctx: &ToolCtx) -> Result<EditOutcome, String> {
+    let raw_file_path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "invalid input: edit requires a string \"file_path\"".to_string())?;
+    // qwen's `unescapePath(params.file_path.trim())` (edit.ts): trim
+    // surrounding whitespace and strip shell-escaping backslashes BEFORE the
+    // absolute-path check and before the path is echoed back in a message.
+    let file_path = unescape_and_trim(raw_file_path);
+    let old_string = input
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "invalid input: edit requires a string \"old_string\"".to_string())?;
+    let new_string = input
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "invalid input: edit requires a string \"new_string\"".to_string())?;
+    // `replace_all` is optional; a missing / non-boolean value defaults to
+    // false (qwen `params.replace_all ?? false`).
+    let replace_all = input
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let abs = resolve(&file_path, ctx)?;
+    apply_edit(
+        EditPlan {
+            abs: &abs,
+            file_path: &file_path,
+            diff_path: raw_file_path,
+            old_string,
+            new_string,
+            replace_all,
+        },
+        ctx,
+    )
 }
 
 /// The cohesive inputs one edit needs (Parameter Object): the resolved absolute
@@ -136,6 +170,10 @@ impl Tool for EditFile {
 struct EditPlan<'a> {
     abs: &'a std::path::Path,
     file_path: &'a str,
+    /// The RAW model `file_path` input, echoed verbatim in the diff title (the
+    /// path the display carries), distinct from the unescaped `file_path` the
+    /// messages echo.
+    diff_path: &'a str,
     old_string: &'a str,
     new_string: &'a str,
     replace_all: bool,
@@ -162,10 +200,11 @@ fn resolve(path: &str, ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
 /// The core of qwen's `calculateEdit` + `execute`, narrowed to the model
 /// contract: read the file (or note its absence), decide the edit outcome,
 /// enforce prior-read for an in-place edit, apply, write, and record.
-fn apply_edit(plan: EditPlan<'_>, ctx: &ToolCtx) -> Result<String, String> {
+fn apply_edit(plan: EditPlan<'_>, ctx: &ToolCtx) -> Result<EditOutcome, String> {
     let EditPlan {
         abs,
         file_path,
+        diff_path,
         old_string,
         new_string,
         replace_all,
@@ -201,12 +240,15 @@ fn apply_edit(plan: EditPlan<'_>, ctx: &ToolCtx) -> Result<String, String> {
             // read_file/edit_file then sees a Fresh, full read rather than the
             // tool's own write as a stale external change.
             record_write(ctx, abs);
-            Ok(success_message(
-                file_path,
-                is_new_file,
-                current.as_deref(),
-                &new_content,
-            ))
+            // The diff Artifact from the exact before/after content the edit had
+            // in hand: an in-place edit diffs old->new; a fresh create (no
+            // `current`) is one all-added created-file diff.
+            let diff =
+                crate::tools::file_diff::artifact(current.as_deref(), &new_content, diff_path);
+            Ok(EditOutcome {
+                message: success_message(file_path, is_new_file, current.as_deref(), &new_content),
+                diff,
+            })
         }
         Err(err) => Err(file_error("write", file_path, FileError::from_io(&err))),
     }

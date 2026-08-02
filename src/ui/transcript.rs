@@ -1,12 +1,23 @@
 //! UI Transcript - the display-side history of a Session (CONTEXT.md), as a
 //! store (ADR-0034): the settled items, the revision counter the render cache
-//! keys on, the in-flight [`Streaming`] snapshot (a private child module), and
-//! Presentment (the Extension list lives here, so `present` runs on every append
-//! by construction). The [`crate::ui::screen`] fold delegates one verb per
-//! event arm; no caller can reach the items Vec directly.
+//! keys on, and the in-flight [`Streaming`] snapshot (a private child module).
+//! The [`crate::ui::screen`] fold delegates one verb per event arm; no caller
+//! can reach the items Vec directly.
 //!
 //! Pure like the rest of the core (ADR-0001/0019): no terminal, no async, no
-//! IO, no ratatui types. Not `Clone`/`PartialEq` - extensions aren't.
+//! IO, no ratatui types.
+//!
+//! ## Tool Result display swaps (ADR-0007)
+//!
+//! A tool that shapes its own transcript display attaches a display Artifact to
+//! its Tool Result (CONTEXT.md: Artifact), which rides the `:tool_result` event
+//! here. [`Transcript::tool_result`] reads those Artifacts and swaps the
+//! one-line summary for a first-class item: a `diff` Artifact (from edit_file /
+//! write_file) becomes a [`TranscriptItem::Diff`], a `todos` Artifact (from
+//! todo_write) becomes a [`TranscriptItem::Todo`], and run_shell_command's
+//! exit-code / timeout Artifact rewrites the summary to the `✓ exit 0` / `✗ exit
+//! N` / `✗ timed out` badge. No Artifact (or any other tool) keeps the plain
+//! summary. The swap is a pure read over the Artifacts - no IO.
 //!
 //! ## The invariants, held at this seam
 //!
@@ -18,12 +29,8 @@
 //!   private supersede funnel, so no verb can remove without bumping.
 //! * **Pairing is by `id`**, never by position - parallel Tool Calls
 //!   interleave.
-//! * **Presentment runs before every append**, and a paired result's
-//!   `key_arg` is stamped BEFORE Presentment (a extension may swap the item for
-//!   a Block; stamping after would stamp a dropped item).
-//! * **Fail-open lines bypass Presentment** (the recursion bound): a extension
-//!   cannot re-present its own failure report, so a extension that panics on
-//!   every item still terminates in one item plus one raw info line.
+//! * A paired result's `key_arg` is stamped as the successor is built, so the
+//!   merged one-line result carries the call's salient arg.
 //! * The pending-Steering marker is authored HERE, by both
 //!   [`Transcript::steering_queued`] and [`Transcript::steering_delivered`],
 //!   so the delivered removal-by-equality can never desync from the queued
@@ -36,7 +43,7 @@
 //! Voice strings stay with the Screen (the startup Header, stop reasons, wave
 //! lines, nudges - recorded through [`Transcript::header`]/[`Transcript::info`]);
 //! the store authors only the two lines its own invariants require verbatim: the
-//! pending Steering marker and the extension-failure line.
+//! pending Steering marker and the tooling-failure line.
 
 mod streaming;
 mod thought;
@@ -47,7 +54,7 @@ use serde_json::Value;
 
 use crate::content::ContentBlock;
 use crate::event::Stage;
-use crate::extensions::{self, Registered};
+use crate::tools::{file_diff, run_command, todo_write};
 use crate::view_model::{Tone, TranscriptItem};
 use streaming::Streaming;
 
@@ -70,15 +77,12 @@ enum Locator<'a> {
 }
 
 /// The Transcript (CONTEXT.md): the display-side history of a Session, oldest
-/// first. Owns the settled items, the revision counter, the in-flight
-/// [`Streaming`] snapshot, and Presentment - see the module doc for the
-/// invariants this seam holds.
-///
-/// `extensions` are not `Clone`/`PartialEq`, so neither is the store (nor the
-/// Screen that owns it).
+/// first. Owns the settled items, the revision counter, and the in-flight
+/// [`Streaming`] snapshot - see the module doc for the invariants this seam
+/// holds.
 pub struct Transcript {
     /// The settled items. Private: every write routes through the append
-    /// funnel (Presentment) or the supersede funnel (the revision rule).
+    /// funnel or the supersede funnel (the revision rule).
     items: Vec<TranscriptItem>,
     /// Bumped by the two structural edits, NEVER by an append. The render
     /// cache extends incrementally while this holds still and rebuilds when it
@@ -87,19 +91,22 @@ pub struct Transcript {
     /// The in-flight streaming snapshot and its materialize rules (the private
     /// `streaming` child module owns the end/flush asymmetry).
     streaming: Streaming,
-    /// The configured Extensions whose pure `present` runs on every append.
-    extensions: Vec<Registered>,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Transcript::new()
+    }
 }
 
 impl Transcript {
     /// An empty Transcript. The caller authors any opening line (the startup
     /// Header is the Screen's Voice, recorded through [`Transcript::header`]).
-    pub fn new(extensions: Vec<Registered>) -> Self {
+    pub fn new() -> Self {
         Transcript {
             items: Vec::new(),
             revision: 0,
             streaming: Streaming::idle(),
-            extensions,
         }
     }
 
@@ -122,7 +129,7 @@ impl Transcript {
     /// revision holds still.
     pub fn message_end(&mut self, final_content: &[ContentBlock]) {
         for item in self.streaming.end(final_content) {
-            self.append(item, &HashMap::new());
+            self.append(item);
         }
     }
 
@@ -141,7 +148,7 @@ impl Transcript {
     /// nothing flushes twice.
     pub fn close(&mut self, note: Option<String>) {
         for item in self.streaming.flush() {
-            self.append(item, &HashMap::new());
+            self.append(item);
         }
         if let Some(text) = note {
             self.info(text);
@@ -150,12 +157,12 @@ impl Transcript {
 
     // ---- Settled writes ----------------------------------------------------
 
-    /// The generic append: Presentment, then push. NEVER bumps the revision.
-    /// The public generic verb - like every named verb it routes through the
-    /// one private append funnel - so a new [`TranscriptItem`] kind needs a
-    /// variant and a render arm, never a new store method.
+    /// The generic append: push, NEVER bumps the revision. The public generic
+    /// verb - like every named verb it routes through the one private append
+    /// funnel - so a new [`TranscriptItem`] kind needs a variant and a render
+    /// arm, never a new store method.
     pub fn push(&mut self, item: TranscriptItem) {
-        self.append(item, &HashMap::new());
+        self.append(item);
     }
 
     /// Appends a user prompt (a submit, or Steering promoted on delivery).
@@ -210,22 +217,23 @@ impl Transcript {
     /// `key=value` summary only when no arg stands out. Appends; never bumps.
     pub fn tool_call(&mut self, id: String, name: String, input: &Value) {
         let summary = call_summary(&name, input);
-        self.append(
-            TranscriptItem::ToolCall { id, name, summary },
-            &HashMap::new(),
-        );
+        self.append(TranscriptItem::ToolCall { id, name, summary });
     }
 
     /// Merges a Tool Result with its call into ONE line: the pending
     /// [`TranscriptItem::ToolCall`] is found by `id` (NEVER by position -
     /// parallel tool calls interleave), its summary is recovered as the
     /// `key_arg` (it already IS the salient arg - [`key_arg`] never yields an
-    /// empty string; the render layer normalizes any empty value once), the
-    /// redundant call line is removed (a structural edit - the revision
-    /// bumps), and the arg is stamped onto the result BEFORE Presentment. An
-    /// unpaired result (a Voice answer to an orphaned call, no live call)
+    /// empty string; the render layer normalizes any empty value once), and the
+    /// redundant call line is removed (a structural edit - the revision bumps).
+    /// An unpaired result (a Voice answer to an orphaned call, no live call)
     /// removes nothing, does not bump, and carries no `key_arg` - a defined
     /// case, not an error.
+    ///
+    /// The tool's display Artifacts (ADR-0007) swap the one-line summary for a
+    /// first-class item: a `diff` for edit_file / write_file, a `todos` list for
+    /// todo_write, or the exit-code / timeout badge for run_shell_command. No
+    /// Artifact keeps the plain summary. See [`swap_for_display`].
     pub fn tool_result(
         &mut self,
         id: &str,
@@ -235,16 +243,18 @@ impl Transcript {
         artifacts: &HashMap<String, Value>,
     ) {
         let summary = summarize_result(content);
-        self.supersede(Locator::ToolCall { id }, artifacts, |call| {
-            TranscriptItem::ToolResult {
+        self.supersede(Locator::ToolCall { id }, |call| {
+            let key_arg = call.map(|item| match item {
+                TranscriptItem::ToolCall { summary, .. } => summary,
+                other => unreachable!("Locator::ToolCall matched {other:?}"),
+            });
+            let base = TranscriptItem::ToolResult {
                 name,
                 summary,
                 is_error,
-                key_arg: call.map(|item| match item {
-                    TranscriptItem::ToolCall { summary, .. } => summary,
-                    other => unreachable!("Locator::ToolCall matched {other:?}"),
-                }),
-            }
+                key_arg,
+            };
+            swap_for_display(base, artifacts)
         });
     }
 
@@ -266,15 +276,16 @@ impl Transcript {
     pub fn steering_delivered(&mut self, text: impl Into<String>) {
         let text = text.into();
         let marker = pending_steering_line(&text);
-        self.supersede(Locator::Marker { text: &marker }, &HashMap::new(), |_| {
+        self.supersede(Locator::Marker { text: &marker }, |_| {
             TranscriptItem::User { text }
         });
     }
 
-    /// Records the fail-open Extension report line (ADR-0007) - ONE format
-    /// whether the failure came from this store's own Presentment fold or from
-    /// the `extension_error` event the Run reports. Bypasses Presentment like
-    /// every fail-open line (the recursion bound - see the module doc).
+    /// Records a fail-open tooling-failure report line (ADR-0007) from the Run's
+    /// `extension_error` event - today the MCP init / ops failures the Agent
+    /// reports (ADR-0056), the fail-open-with-visibility principle the Hook
+    /// subsystem (ADR-0066) also governs. A plain append; it is not a Tool Result
+    /// and carries no display swap.
     pub fn extension_failure(&mut self, extension: &str, stage: Stage, message: &str) {
         self.items.push(TranscriptItem::Info {
             text: extension_failure_line(extension, stage, message),
@@ -361,27 +372,20 @@ impl Transcript {
 
     // ---- Internals ----------------------------------------------------------
 
-    // Presentment (CONTEXT.md), then push - the one append funnel. A crashing
-    // Presenter is skipped fail-open (ADR-0007): the item from before it ran
-    // survives, and its failure report lands as a RAW info line - never
-    // re-presented, so an Extension that panics on every item cannot recurse on
-    // its own report.
-    fn append(&mut self, item: TranscriptItem, artifacts: &HashMap<String, Value>) {
-        let (item, failures) = extensions::present(&self.extensions, item, artifacts);
+    // The one append funnel: push, never bump. A tool's display swap already
+    // happened in the verb that built the item (Tool Result -> Diff/Todo/badge
+    // from its Artifacts), so this is a plain push.
+    fn append(&mut self, item: TranscriptItem) {
         self.items.push(item);
-        for failure in failures {
-            self.extension_failure(&failure.extension, failure.stage, &failure.message);
-        }
     }
 
     // The one supersede funnel: remove-maybe, bump-iff-removed, build the
-    // successor FROM the removed anchor, present, append. Every structural
-    // edit routes through here, so a verb cannot remove without bumping - the
-    // RenderCache contract is held by construction, not by discipline.
+    // successor FROM the removed anchor, append. Every structural edit routes
+    // through here, so a verb cannot remove without bumping - the RenderCache
+    // contract is held by construction, not by discipline.
     fn supersede(
         &mut self,
         locator: Locator<'_>,
-        artifacts: &HashMap<String, Value>,
         successor: impl FnOnce(Option<TranscriptItem>) -> TranscriptItem,
     ) {
         let removed = self.locate(&locator).map(|pos| {
@@ -391,7 +395,7 @@ impl Transcript {
             self.revision += 1;
             item
         });
-        self.append(successor(removed), artifacts);
+        self.append(successor(removed));
     }
 
     fn locate(&self, locator: &Locator<'_>) -> Option<usize> {
@@ -418,10 +422,86 @@ fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
 }
 
-// The fail-open Extension report (ADR-0007) - sourced once, so the store's own
-// Presentment failures and the Run's `extension_error` events read identically.
+// The fail-open tooling-failure report (ADR-0007) - sourced once, so every
+// `extension_error` event the Run reports reads identically.
 fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> String {
     format!("plugin {extension} failed in {}: {message}", stage.as_str())
+}
+
+// Swaps a Tool Result item for its first-class display when the tool attached a
+// display Artifact (ADR-0007), else returns it unchanged. Each tool owns a
+// distinct Artifact key and tool name, so the arms are mutually exclusive:
+//
+// - edit_file / write_file attach a `diff` Artifact -> a [`TranscriptItem::Diff`]
+//   (only on a successful result; a failed edit attaches none).
+// - todo_write attaches a `todos` Artifact -> a [`TranscriptItem::Todo`].
+// - run_shell_command attaches an exit-code / timeout Artifact -> the summary is
+//   rewritten to the `✓ exit 0` / `✗ exit N` / `✗ timed out` badge (in place;
+//   every other field of the item is kept).
+//
+// A successful result with no Artifact (a malformed-but-schema-passing todo_write,
+// an edit with no textual change) keeps its plain summary.
+fn swap_for_display(item: TranscriptItem, artifacts: &HashMap<String, Value>) -> TranscriptItem {
+    let TranscriptItem::ToolResult {
+        name,
+        mut summary,
+        is_error,
+        key_arg,
+    } = item
+    else {
+        return item;
+    };
+
+    // The exit badge applies even to a failed (nonzero-exit / timed-out) run, so
+    // it is checked before the is_error gate the diff / todo swaps use. It only
+    // rewrites the summary, so it falls through to the single rebuild below.
+    if name == run_command::SHELL {
+        if let Some(badge) = run_command_badge(artifacts) {
+            summary = badge;
+        }
+    } else if !is_error {
+        // The diff / todo swaps produce a whole new item, and fire only on a
+        // successful result.
+        if file_diff::EDIT_TOOLS.contains(&name.as_str())
+            && let Some(diff) = file_diff::read_artifact(artifacts)
+        {
+            return file_diff::to_diff_item(&name, &diff);
+        }
+        if name == todo_write::TOOL
+            && let Some(todos) = todo_write::read_todos_artifact(artifacts)
+        {
+            return TranscriptItem::Todo { items: todos.items };
+        }
+    }
+
+    TranscriptItem::ToolResult {
+        name,
+        summary,
+        is_error,
+        key_arg,
+    }
+}
+
+// The exit-code / timeout badge for a run_shell_command result's Artifacts, or
+// `None` when neither marker is present (the summary passes through). A timeout
+// wins over an exit code (a timed-out command has no meaningful code). Byte-
+// identical to the old run_command extension's `badge`.
+fn run_command_badge(artifacts: &HashMap<String, Value>) -> Option<String> {
+    if artifacts
+        .get(run_command::keys::TIMED_OUT)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some("✗ timed out".to_string());
+    }
+    let code = artifacts
+        .get(run_command::keys::EXIT_CODE)
+        .and_then(Value::as_i64)?;
+    Some(if code == 0 {
+        "✓ exit 0".to_string()
+    } else {
+        format!("✗ exit {code}")
+    })
 }
 
 /// Maximum display width for a whole summary line (e.g. `key=value ...`).
