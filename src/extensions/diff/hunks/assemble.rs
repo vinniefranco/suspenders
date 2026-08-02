@@ -69,15 +69,17 @@ impl Assembler {
             .map(|(i, _)| i)
             .collect();
 
-        self.cluster(&changed)
+        Self::cluster(&changed)
             .into_iter()
             .map(|range| self.build_hunk(range))
             .collect()
     }
 
     /// Clusters changed indices into `(first, last)` ranges, merging runs whose
-    /// gap is within a context window on each side (baud's `cluster/1`).
-    fn cluster(&self, changed: &[usize]) -> Vec<(usize, usize)> {
+    /// gap is within a context window on each side (baud's `cluster/1`). Pure in
+    /// its inputs - the ranges depend only on `changed` and the context window,
+    /// not on the source lines - so it stands as an associated function.
+    fn cluster(changed: &[usize]) -> Vec<(usize, usize)> {
         let Some((&first, rest)) = changed.split_first() else {
             return Vec::new();
         };

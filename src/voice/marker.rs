@@ -9,7 +9,7 @@
 //! re-spelling the string. The few markers that interpolate a value stay
 //! functions (their wording is parameterized, not fixed).
 
-use crate::session::log::StopReason;
+use crate::stop_reason::StopReason;
 
 /// A fixed-wording Voice marker: one bracketed `[...]` string Suspenders writes
 /// into the Conversation to close a Run, or to answer a Tool Call it could not

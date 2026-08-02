@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::approvals::ApprovalMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

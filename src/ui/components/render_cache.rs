@@ -1,6 +1,8 @@
 use ratatui::text::Line;
 
-use super::{Toggles, markdown_lines, message_lines, wrapped_count};
+use super::markdown_render::markdown_lines;
+use super::message::message_lines;
+use super::tool_group::{Toggles, wrapped_count};
 use crate::ui::theme::{self, Theme};
 use crate::ui::transcript::Transcript;
 
