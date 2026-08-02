@@ -9,7 +9,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::mcp::config::{McpServerConfig, McpTransport};
 use crate::mcp::view::{McpToolAnnotations, McpToolView};
@@ -19,9 +21,11 @@ use crate::tool::Tool;
 // ---- rmcp imports, CONFINED to this module ---------------------------------
 use rmcp::ServiceExt;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ResourceContents, ToolAnnotations,
+    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ContentBlock, ResourceContents,
+    ServerJsonRpcMessage, ToolAnnotations,
 };
 use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::transport::Transport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
@@ -31,6 +35,10 @@ const DEFAULT_STDIO_TIMEOUT_MS: u64 = 30_000;
 
 /// The default per-server connect timeout for an HTTP server.
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 5_000;
+
+/// The default per-server connect timeout for a legacy HTTP+SSE server (same as
+/// HTTP - both are a network handshake, not a process boot).
+const DEFAULT_SSE_TIMEOUT_MS: u64 = 5_000;
 
 /// One server's successful attach: its shared conn, its admitted tools, and the
 /// matching [`McpToolView`] read model for each.
@@ -100,6 +108,7 @@ pub(super) async fn connect_one(
     let default_timeout = match &cfg.transport {
         McpTransport::Stdio { .. } => DEFAULT_STDIO_TIMEOUT_MS,
         McpTransport::Http { .. } => DEFAULT_HTTP_TIMEOUT_MS,
+        McpTransport::Sse { .. } => DEFAULT_SSE_TIMEOUT_MS,
     };
     let timeout = Duration::from_millis(cfg.timeout_ms.unwrap_or(default_timeout));
 
@@ -240,9 +249,11 @@ async fn force_refresh_oauth(
 /// client (it consumes tools, it does not serve any).
 ///
 /// `auth` is the resolved OAuth Bearer (ADR-0065 Phase D), injected at connect for
-/// an HTTP server: a `token_param_name` rides it as that query parameter (the SSE
-/// shape), else it rides an `Authorization: Bearer` header. Stdio servers ignore
-/// it (OAuth is an HTTP concern). `None` connects unauthenticated as before.
+/// an HTTP or SSE server: a `token_param_name` rides it as a query parameter (the
+/// SSE shape), else it rides an `Authorization: Bearer` header. Stdio servers
+/// ignore it (OAuth is an HTTP concern). `None` connects unauthenticated as
+/// before. The SSE arm hand-rolls the legacy HTTP+SSE transport
+/// ([`SseClientTransport`]) because rmcp 3.0.1 dropped its standalone SSE client.
 async fn serve(
     transport: McpTransport,
     auth: &Option<ResolvedAuth>,
@@ -273,14 +284,7 @@ async fn serve(
             Ok(().serve(child).await?)
         }
         McpTransport::Http { url, headers } => {
-            let mut custom = std::collections::HashMap::new();
-            for (key, value) in headers {
-                let name = http::HeaderName::from_bytes(key.as_bytes())
-                    .map_err(|e| format!("bad header name {key:?}: {e}"))?;
-                let val = http::HeaderValue::from_str(&value)
-                    .map_err(|e| format!("bad header value for {key:?}: {e}"))?;
-                custom.insert(name, val);
-            }
+            let mut header_map = build_header_map(&headers)?;
             // Inject the OAuth Bearer (ADR-0065 Phase D): an SSE `token_param_name`
             // appends it as a query parameter on the URL, else it rides the
             // `Authorization: Bearer` header alongside the static headers.
@@ -292,16 +296,259 @@ async fn serve(
                 Some(ResolvedAuth { access_token, .. }) => {
                     let val = http::HeaderValue::from_str(&format!("Bearer {access_token}"))
                         .map_err(|e| format!("bad Bearer token: {e}"))?;
-                    custom.insert(http::header::AUTHORIZATION, val);
+                    header_map.insert(http::header::AUTHORIZATION, val);
                     url
                 }
                 None => url,
             };
+            // `custom_headers` wants a `HashMap<HeaderName, HeaderValue>`. A
+            // `HeaderMap` iterates as `(Option<HeaderName>, _)` (a `None` repeats
+            // the prior name for a multi-valued header); ours are single-valued,
+            // built by the one shared builder, so unwrapping the name per entry
+            // reconstructs that map with no parallel construction path.
+            let custom: std::collections::HashMap<_, _> = header_map
+                .into_iter()
+                .filter_map(|(name, val)| name.map(|name| (name, val)))
+                .collect();
             let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom);
             let transport = StreamableHttpClientTransport::from_config(config);
             Ok(().serve(transport).await?)
         }
+        McpTransport::Sse { url, headers } => {
+            // Legacy MCP HTTP+SSE: build the header map, fold in the OAuth Bearer
+            // (a `token_param_name` rides the SSE GET url as a query param, else an
+            // `Authorization: Bearer` header on both GET and POST), then open the
+            // stream + read its `endpoint` event before handing the transport to
+            // rmcp's `serve` handshake.
+            let mut header_map = build_header_map(&headers)?;
+            let url = match auth {
+                Some(ResolvedAuth {
+                    access_token,
+                    token_param_name: Some(param),
+                }) => append_query_param(&url, param, access_token),
+                Some(ResolvedAuth { access_token, .. }) => {
+                    let val = http::HeaderValue::from_str(&format!("Bearer {access_token}"))
+                        .map_err(|e| format!("bad Bearer token: {e}"))?;
+                    header_map.insert(http::header::AUTHORIZATION, val);
+                    url
+                }
+                None => url,
+            };
+            let transport = SseClientTransport::connect(&url, header_map).await?;
+            Ok(().serve(transport).await?)
+        }
     }
+}
+
+/// A hand-rolled legacy MCP HTTP+SSE client transport (implements rmcp's
+/// [`Transport<RoleClient>`]). WHY hand-rolled: rmcp 3.0.1 dropped its standalone
+/// SSE client (only `TokioChildProcess` + `StreamableHttpClientTransport` ship in
+/// its `transport` module), so the legacy HTTP+SSE protocol is implemented here,
+/// inside the one rmcp-facing file, keeping the wire crate confined to this seam.
+///
+/// The protocol (qwen's `SSEClientTransport`):
+/// 1. GET the SSE `url`; the server opens a `text/event-stream`.
+/// 2. The first `endpoint` event's `data:` is the (possibly relative) URL to POST
+///    JSON-RPC to; we resolve it against the SSE url and keep it for `send`.
+/// 3. `send` POSTs a JSON-RPC message to that endpoint.
+/// 4. `receive` yields the next `message` event's JSON off the still-open GET
+///    stream, decoded into a [`ServerJsonRpcMessage`].
+///
+/// The custom headers ride BOTH the GET (opened in [`connect`](Self::connect))
+/// and every POST. The SSE parsing reuses [`sse_stream::SseStream`] (rmcp's own
+/// framer) over reqwest's byte stream, so we do not re-implement `event:`/`data:`
+/// framing.
+struct SseClientTransport {
+    /// The shared reqwest client + custom headers + resolved POST endpoint,
+    /// cloned into each `send` future so the future is `'static` (the trait
+    /// requires it, since sends may run concurrently). Behind an `Arc` so a clone
+    /// is a refcount bump, not a header-map copy.
+    post: Arc<PostContext>,
+    /// The open SSE GET stream, decoded to `message`-event JSON-RPC. `receive`
+    /// pulls the next server message from it; behind a `Mutex` so `&mut self`
+    /// receives are sequential (the trait's contract) while `send` clones only
+    /// `post`.
+    stream: Mutex<SseMessageStream>,
+}
+
+/// The shared state a `send` future needs: where to POST and with what headers.
+struct PostContext {
+    client: reqwest::Client,
+    endpoint: String,
+    headers: http::HeaderMap,
+}
+
+/// The decoded server-message side of the SSE stream: the still-open GET body,
+/// framed by `sse_stream` and filtered to `message` events parsed into
+/// [`ServerJsonRpcMessage`]. A boxed stream keeps the concrete reqwest/sse-stream
+/// generics off the transport type.
+type SseMessageStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = ServerJsonRpcMessage> + Send>>;
+
+/// A send/receive/parse failure on the SSE transport. rmcp's `Transport` trait
+/// requires the error be `std::error::Error + Send + Sync + 'static`; this wraps a
+/// message string (the underlying reqwest/serde errors are already stringified at
+/// the boundary).
+#[derive(Debug)]
+struct SseTransportError(String);
+
+impl std::fmt::Display for SseTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SSE transport error: {}", self.0)
+    }
+}
+
+impl std::error::Error for SseTransportError {}
+
+impl SseClientTransport {
+    /// Opens the SSE GET stream and reads the leading `endpoint` event, returning a
+    /// transport primed to POST to the resolved endpoint and to yield subsequent
+    /// `message` events. Any HTTP / framing / missing-endpoint failure is an
+    /// `Err` the caller records as a connect failure.
+    async fn connect(
+        url: &str,
+        headers: http::HeaderMap,
+    ) -> Result<SseClientTransport, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+        let response = client
+            .get(url)
+            .headers(headers.clone())
+            .header(http::header::ACCEPT, "text/event-stream")
+            .send()
+            .await?
+            .error_for_status()?;
+
+        // Frame the response body with rmcp's own SSE parser (over reqwest's
+        // byte stream) rather than re-implementing `event:`/`data:` splitting.
+        let byte_stream = response.bytes_stream();
+        let mut sse = sse_stream::SseStream::from_bytes_stream(byte_stream);
+
+        // The first meaningful event MUST be `endpoint`; its data is the POST URL,
+        // resolved relative to the SSE url (qwen's `SSEClientTransport`). Skip any
+        // leading keep-alive comments / dataless frames until it arrives.
+        let endpoint = loop {
+            let event = sse
+                .next()
+                .await
+                .ok_or_else(|| SseTransportError("SSE stream closed before endpoint".into()))?
+                .map_err(|e| SseTransportError(format!("SSE read failed: {e}")))?;
+            if event.event.as_deref() == Some("endpoint") {
+                let data = event.data.ok_or_else(|| {
+                    SseTransportError("SSE endpoint event had no data".into())
+                })?;
+                break resolve_url(url, data.trim());
+            }
+        };
+
+        // The remaining stream carries `message` events (the server's JSON-RPC
+        // responses + notifications); map each to a decoded message, dropping
+        // anything that is not a parseable message frame (keep-alives, comments).
+        let message_stream = sse
+            .filter_map(|event| async move {
+                let event = event.ok()?;
+                if event.event.as_deref() != Some("message") {
+                    return None;
+                }
+                let data = event.data?;
+                serde_json::from_str::<ServerJsonRpcMessage>(&data).ok()
+            })
+            .boxed();
+
+        Ok(SseClientTransport {
+            post: Arc::new(PostContext {
+                client,
+                endpoint,
+                headers,
+            }),
+            stream: Mutex::new(message_stream),
+        })
+    }
+}
+
+impl Transport<RoleClient> for SseClientTransport {
+    type Error = SseTransportError;
+
+    fn send(
+        &mut self,
+        item: ClientJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        // Clone the shared POST context so the future owns everything it needs and
+        // is `'static` (the trait requires it, since sends may run concurrently).
+        let post = Arc::clone(&self.post);
+        async move {
+            let body = serde_json::to_vec(&item)
+                .map_err(|e| SseTransportError(format!("serialize JSON-RPC failed: {e}")))?;
+            post.client
+                .post(&post.endpoint)
+                .headers(post.headers.clone())
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| SseTransportError(format!("POST to endpoint failed: {e}")))?
+                .error_for_status()
+                .map_err(|e| SseTransportError(format!("endpoint returned error: {e}")))?;
+            Ok(())
+        }
+    }
+
+    async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+        self.stream.lock().await.next().await
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        // Dropping the boxed byte stream closes the underlying GET connection;
+        // there is no server-side session to tear down in the legacy protocol.
+        Ok(())
+    }
+}
+
+/// Resolves a (possibly relative) endpoint URL from an SSE `endpoint` event
+/// against the SSE GET url (qwen resolves the endpoint relative to the SSE url).
+/// An absolute URL (has a scheme) is returned as-is; a root-relative path
+/// (`/messages`) replaces the base's path; any other relative value is joined
+/// onto the base's directory. No `url` crate: minimal string assembly over the
+/// scheme/authority the base already carries.
+fn resolve_url(base: &str, endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        return endpoint.to_string();
+    }
+    // Split the base into scheme+authority (up to the path) so a relative
+    // endpoint can be re-rooted. `base` is a well-formed http(s) URL here (the GET
+    // just succeeded against it).
+    let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let authority_end = base[scheme_end..]
+        .find('/')
+        .map(|i| scheme_end + i)
+        .unwrap_or(base.len());
+    let origin = &base[..authority_end];
+    if let Some(stripped) = endpoint.strip_prefix('/') {
+        return format!("{origin}/{stripped}");
+    }
+    // A bare relative value joins onto the base path's directory (everything up
+    // to and including the last `/`).
+    let base_no_query = base.split('?').next().unwrap_or(base);
+    let dir_end = base_no_query.rfind('/').map(|i| i + 1).unwrap_or(base_no_query.len());
+    format!("{}{endpoint}", &base_no_query[..dir_end])
+}
+
+/// Turns a server's static `BTreeMap<name, value>` headers into a typed
+/// [`http::HeaderMap`], the ONE header-construction path both the HTTP and SSE
+/// arms of [`serve`] share (the HTTP arm collects the result into the `HashMap`
+/// `custom_headers` wants). A malformed name or value is a loud error naming the
+/// offending header, preserving each arm's prior behavior.
+fn build_header_map(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<http::HeaderMap, String> {
+    let mut header_map = http::HeaderMap::new();
+    for (key, value) in headers {
+        let name = http::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| format!("bad header name {key:?}: {e}"))?;
+        let val = http::HeaderValue::from_str(value)
+            .map_err(|e| format!("bad header value for {key:?}: {e}"))?;
+        header_map.insert(name, val);
+    }
+    Ok(header_map)
 }
 
 /// Appends a `key=value` query parameter to a URL (ADR-0065 Phase D, the SSE

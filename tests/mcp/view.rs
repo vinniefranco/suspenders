@@ -75,7 +75,7 @@ fn tool_and_invalid_counts_read_the_tool_list() {
 }
 
 #[test]
-fn format_transport_renders_stdio_with_args_and_http_with_url() {
+fn format_transport_renders_stdio_with_args_and_http_and_sse_with_url() {
     let stdio = McpTransport::Stdio {
         command: "python".into(),
         args: vec!["-m".into(), "srv".into()],
@@ -97,6 +97,12 @@ fn format_transport_renders_stdio_with_args_and_http_with_url() {
         headers: Default::default(),
     };
     assert_eq!(format_transport(&http), "https://host/mcp (http)");
+
+    let sse = McpTransport::Sse {
+        url: "http://host/sse".into(),
+        headers: Default::default(),
+    };
+    assert_eq!(format_transport(&sse), "http://host/sse (sse)");
 }
 
 // The footer health count (qwen `MCPHealthPill`'s getPillLabel input).

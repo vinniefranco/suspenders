@@ -917,15 +917,15 @@ fn file_config_mcp_server_entry_rejects_an_unknown_key() {
 
 #[test]
 fn file_config_rejects_a_malformed_mcp_server_transport() {
-    // A malformed entry (both transports) is a LOUD PARSE failure now that the
-    // transport is a sum type resolved at deserialize time - the illegal state
-    // is unrepresentable, so it never reaches build (ADR-0056). This replaces
+    // A malformed entry (more than one transport key) is a LOUD PARSE failure now
+    // that the transport is a sum type resolved at deserialize time - the illegal
+    // state is unrepresentable, so it never reaches build (ADR-0056). This replaces
     // the old build-time transport-validation pass.
     let err = FileConfig::parse(
         r#"{"mcp_servers": {"broken": {"command": "cmd", "http_url": "https://x.test"}}}"#,
     )
     .unwrap_err();
-    assert!(err.0.contains("both"));
+    assert!(err.0.contains("more than one"));
 }
 
 #[test]
@@ -1528,6 +1528,161 @@ fn persist_excluded_round_trips_and_preserves_other_keys() {
     assert_eq!(cfg.mcp_excluded, vec!["one".to_string(), "two".to_string()]);
 
     let _ = std::fs::remove_file(&path);
+}
+
+// ---- mcp_servers sparse persist (ADR-0065: the `mcp add/remove` CLI) ------
+
+#[test]
+fn merge_mcp_server_creates_the_map_when_absent() {
+    // The pure seam: an absent existing file starts `{}`, gets an `mcp_servers`
+    // object, and lands the one entry. A realistic Sse server locks the
+    // three-transport round-trip through this layer (its flat `url` wire key
+    // comes back through the DTO as an Sse transport).
+    let server = crate::mcp::McpServerConfig::new(crate::mcp::McpTransport::Sse {
+        url: "https://mcp.example.test/sse".into(),
+        headers: [("authorization".to_string(), "Bearer tok".to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let value = serde_json::to_value(&server).unwrap();
+
+    let json = merge_mcp_server(None, "remote", value).unwrap();
+
+    let fc = FileConfig::parse(&json).unwrap();
+    let servers = fc.mcp_servers.clone().unwrap();
+    assert!(matches!(
+        &servers["remote"].transport,
+        crate::mcp::McpTransport::Sse { url, headers }
+            if url == "https://mcp.example.test/sse"
+                && headers["authorization"] == "Bearer tok"
+    ));
+}
+
+#[test]
+fn merge_mcp_server_preserves_sibling_top_level_keys_and_sibling_servers() {
+    // Sparse: a sibling top-level key (`model`) and a sibling server (`fs`)
+    // both survive the insert of a second server.
+    let existing = r#"{"model": "kept/model", "mcp_servers": {"fs": {"command": "mcp-fs"}}}"#;
+    let server = crate::mcp::McpServerConfig::new(crate::mcp::McpTransport::Http {
+        url: "https://mcp.example.test/mcp".into(),
+        headers: std::collections::BTreeMap::new(),
+    });
+    let value = serde_json::to_value(&server).unwrap();
+
+    let json = merge_mcp_server(Some(existing), "remote", value).unwrap();
+
+    let fc = FileConfig::parse(&json).unwrap();
+    assert_eq!(fc.model.as_deref(), Some("kept/model"));
+    let servers = fc.mcp_servers.clone().unwrap();
+    let names: Vec<&str> = servers.keys().map(String::as_str).collect();
+    assert_eq!(names, vec!["fs", "remote"]);
+}
+
+#[test]
+fn merge_mcp_server_overwrites_a_same_named_server() {
+    // A re-add of an existing name replaces its entry (stdio -> http here),
+    // leaving no stale transport keys behind.
+    let existing = r#"{"mcp_servers": {"x": {"command": "old-cmd"}}}"#;
+    let server = crate::mcp::McpServerConfig::new(crate::mcp::McpTransport::Http {
+        url: "https://new.example.test/mcp".into(),
+        headers: std::collections::BTreeMap::new(),
+    });
+    let value = serde_json::to_value(&server).unwrap();
+
+    let json = merge_mcp_server(Some(existing), "x", value).unwrap();
+
+    let fc = FileConfig::parse(&json).unwrap();
+    let servers = fc.mcp_servers.clone().unwrap();
+    assert!(matches!(
+        &servers["x"].transport,
+        crate::mcp::McpTransport::Http { url, .. } if url == "https://new.example.test/mcp"
+    ));
+}
+
+#[test]
+fn merge_mcp_server_errors_on_a_malformed_or_non_object_root() {
+    // Malformed existing JSON is an Err (path-agnostic message).
+    assert!(merge_mcp_server(Some("{ not json"), "x", serde_json::json!({})).is_err());
+    // A non-object root is an Err.
+    assert!(merge_mcp_server(Some("[]"), "x", serde_json::json!({})).is_err());
+    // A non-object `mcp_servers` is an Err.
+    assert!(
+        merge_mcp_server(Some(r#"{"mcp_servers": 5}"#), "x", serde_json::json!({})).is_err()
+    );
+}
+
+#[test]
+fn remove_mcp_server_key_reports_present_and_preserves_siblings() {
+    // Removing a present name reports `true` and leaves the sibling server
+    // (`fs`) and a sibling top-level key (`model`) intact.
+    let existing = r#"{"model": "kept/model", "mcp_servers": {"fs": {"command": "mcp-fs"}, "gone": {"command": "bye"}}}"#;
+
+    let (json, present) = remove_mcp_server_key(existing, "gone").unwrap();
+    assert!(present);
+
+    let fc = FileConfig::parse(&json).unwrap();
+    assert_eq!(fc.model.as_deref(), Some("kept/model"));
+    let servers = fc.mcp_servers.clone().unwrap();
+    let names: Vec<&str> = servers.keys().map(String::as_str).collect();
+    assert_eq!(names, vec!["fs"]);
+}
+
+#[test]
+fn remove_mcp_server_key_reports_absent_name_and_absent_map() {
+    // An unknown name in a present map reports `false`.
+    let existing = r#"{"mcp_servers": {"fs": {"command": "mcp-fs"}}}"#;
+    let (_, present) = remove_mcp_server_key(existing, "nope").unwrap();
+    assert!(!present);
+
+    // A wholly absent `mcp_servers` object also reports `false`, no error.
+    let (_, present) = remove_mcp_server_key(r#"{"model": "m"}"#, "nope").unwrap();
+    assert!(!present);
+
+    // Malformed existing JSON is an Err.
+    assert!(remove_mcp_server_key("{ not json", "x").is_err());
+}
+
+#[test]
+fn persist_mcp_server_creates_the_file_and_round_trips_through_compose() {
+    // The impure add: an absent file is created (the sanctioned exception),
+    // the entry lands under `mcp_servers`, and `compose` reads it back with the
+    // User source. A remove then reports it existed and empties the map.
+    let path = temp_config_path("persist_mcp_server");
+    let _ = std::fs::remove_file(&path);
+    assert!(!std::path::Path::new(&path).exists());
+
+    let server = crate::mcp::McpServerConfig::new(crate::mcp::McpTransport::Stdio {
+        command: "mcp-fs".into(),
+        args: vec!["--root".into(), "/tmp".into()],
+        env: std::collections::BTreeMap::new(),
+        cwd: None,
+    });
+    SessionConfig::persist_mcp_server(&path, "fs", &server).unwrap();
+
+    let cfg = SessionConfig::compose(&path, None).unwrap();
+    let listed: Vec<(&str, crate::mcp::McpSource)> = cfg
+        .servers_with_source()
+        .map(|(name, _cfg, source)| (name, source))
+        .collect();
+    assert_eq!(listed, vec![("fs", crate::mcp::McpSource::User)]);
+
+    // Remove reports it existed; a second remove reports it did not.
+    assert!(SessionConfig::remove_mcp_server(&path, "fs").unwrap());
+    assert!(!SessionConfig::remove_mcp_server(&path, "fs").unwrap());
+    let cfg = SessionConfig::compose(&path, None).unwrap();
+    assert!(cfg.mcp_servers.is_empty());
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn remove_mcp_server_on_an_absent_file_reports_false() {
+    // No file, nothing to remove: `Ok(false)`, no file created.
+    let path = temp_config_path("remove_mcp_absent");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!SessionConfig::remove_mcp_server(&path, "whatever").unwrap());
+    assert!(!std::path::Path::new(&path).exists());
 }
 
 // ---- the theme key (ADR-0038: file + env, precedence like `model`) -------

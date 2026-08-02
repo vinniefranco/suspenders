@@ -1,6 +1,18 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 /// A terminal coding agent for small local models.
+///
+/// The top-level run args (root, headless, resume, ...) drive the default path -
+/// a bare `suspenders`, a headless run, or `--write-config` - exactly as before.
+/// An optional subcommand ([`Command`]) layers management commands (today the
+/// `mcp` tree) on top WITHOUT changing that path: when no subcommand is given,
+/// `command` is `None` and the run args take over. Clap allows the run args to
+/// sit alongside an optional subcommand because the subcommand is the last
+/// positional, so `suspenders <prompt>` parses `<prompt>` into `prompts` -
+/// EXCEPT when the prompt's first token is a reserved subcommand name (today
+/// just `mcp`): being the last positional, that token is captured as the
+/// subcommand instead. A headless prompt that must begin with such a word can be
+/// forced past the subcommand with a `--` separator.
 #[derive(Parser, Debug)]
 #[command(name = "suspenders")]
 struct Cli {
@@ -21,11 +33,33 @@ struct Cli {
     force: bool,
     /// Prompt(s) to submit (headless runs them as sequential Runs)
     prompts: Vec<String>,
+    /// A management subcommand; absent runs the default (TUI/headless) path.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// The management subcommands that layer over the default run path. Each is a
+/// terminal action (do the thing, print, exit) resolved before any Session is
+/// built, like `--write-config`.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Manage MCP servers in the config (add, remove, list).
+    Mcp {
+        #[command(subcommand)]
+        command: suspenders::mcp::cli::McpCommand,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // A management subcommand is a terminal action, dispatched before any Session
+    // is built (like --write-config): the mcp tree resolves the scope path, calls
+    // the config seam, prints, and returns. The run args are ignored on this path.
+    if let Some(Command::Mcp { command }) = cli.command {
+        return suspenders::mcp::cli::dispatch(command);
+    }
 
     // --write-config removes the hand-authoring friction (ADR-0031): resolve
     // the target (empty = XDG default, a rule the config seam owns), write the

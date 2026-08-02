@@ -40,17 +40,75 @@ fn parses_an_http_url_only_entry_to_http() {
 }
 
 #[test]
+fn parses_a_url_only_entry_to_sse() {
+    // The `url` key (distinct from streamable-HTTP's `http_url`) is the legacy
+    // MCP HTTP+SSE transport.
+    let cfg: McpServerConfig =
+        serde_json::from_str(r#"{"url":"http://localhost:8080/sse"}"#).unwrap();
+    assert_eq!(
+        cfg.transport,
+        McpTransport::Sse {
+            url: "http://localhost:8080/sse".into(),
+            headers: BTreeMap::new(),
+        }
+    );
+}
+
+#[test]
+fn accepts_headers_on_an_sse_entry() {
+    let cfg: McpServerConfig = serde_json::from_str(
+        r#"{"url":"http://localhost:8080/sse","headers":{"X-Api-Key":"secret"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.transport,
+        McpTransport::Sse {
+            url: "http://localhost:8080/sse".into(),
+            headers: BTreeMap::from([("X-Api-Key".into(), "secret".into())]),
+        }
+    );
+}
+
+#[test]
+fn round_trips_the_flat_sse_wire_shape() {
+    let raw = r#"{"url":"http://localhost:8080/sse","headers":{"X-Api-Key":"secret"},"include_tools":["keep"]}"#;
+    let cfg: McpServerConfig = serde_json::from_str(raw).unwrap();
+    let back = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(
+        back,
+        serde_json::from_str::<serde_json::Value>(raw).unwrap()
+    );
+}
+
+#[test]
 fn rejects_both_transports_at_parse_time() {
     let err =
         serde_json::from_str::<McpServerConfig>(r#"{"command":"cmd","http_url":"https://x.test"}"#)
             .unwrap_err();
-    assert!(err.to_string().contains("both"));
+    assert!(err.to_string().contains("more than one"));
+}
+
+#[test]
+fn rejects_url_and_http_url_both_at_parse_time() {
+    let err = serde_json::from_str::<McpServerConfig>(
+        r#"{"http_url":"https://x.test/mcp","url":"https://x.test/sse"}"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("more than one"));
+}
+
+#[test]
+fn rejects_url_and_command_both_at_parse_time() {
+    let err =
+        serde_json::from_str::<McpServerConfig>(r#"{"command":"cmd","url":"https://x.test/sse"}"#)
+            .unwrap_err();
+    assert!(err.to_string().contains("more than one"));
 }
 
 #[test]
 fn rejects_neither_transport_at_parse_time() {
     let err = serde_json::from_str::<McpServerConfig>(r#"{"trust":true}"#).unwrap_err();
-    assert!(err.to_string().contains("neither"));
+    assert!(err.to_string().contains("none of"));
 }
 
 #[test]

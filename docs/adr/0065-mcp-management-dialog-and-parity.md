@@ -5,9 +5,10 @@
 Accepted (2026-08-01). Supersedes the "Out of scope" clause of
 [ADR-0056](0056-mcp-client-subsystem.md): the items that ADR deferred (OAuth,
 live mid-session reconnect, MCP-call approval-gating via `trust`, a second
-settings scope) are brought into scope here. The transport seam, fail-open
-attach, deferred-tool discovery, and result collapse of ADR-0056 stand
-unchanged.
+settings scope, the legacy HTTP+SSE transport) are brought into scope here - the
+SSE transport is recorded in ADR-0056 itself as the now-third `McpTransport` arm.
+The transport seam, fail-open attach, deferred-tool discovery, and result
+collapse of ADR-0056 stand unchanged.
 
 ## Context
 
@@ -43,6 +44,13 @@ Server** has a **Status**, a **Source** (which settings scope declared it), and
 a set of discovered **MCP Tools** each carrying **Annotations** and a
 **validity**. The dialog is the **MCP Dialog** - a Composer overlay in System A
 (numbered dialog, ADR-0051), distinct from the `/` palette.
+
+The dialog **views, manages, and authenticates** servers; it does not author
+them. Server **authoring** (create / update / delete an entry) is a CLI surface,
+`suspenders mcp add | remove | list` (Phase G), matching qwen exactly - qwen's
+`/mcp` dialog is likewise read/manage/auth while `qwen mcp add/...` writes the
+config. This split completes qwen parity: everything qwen's MCP surface does,
+Suspenders now does.
 
 ### Phase A - Tool annotations + validity
 
@@ -152,11 +160,44 @@ A footer pill (ADR-0053 flat footer) that reads the status registry and shows
 `N MCP{s} offline` when `disconnected > 0`, hidden otherwise; `connecting` is
 suppressed to avoid boot flicker (qwen's rule).
 
+### Phase G - The `mcp add/remove/list` CLI
+
+The server-authoring surface (`src/mcp/cli.rs`), a faithful port of qwen's
+`qwen mcp add/remove/list` in Suspenders' snake_case idiom. `main` gains an
+optional `#[command(subcommand)]`; an absent subcommand leaves the default run
+path (bare `suspenders`, headless, `--write-config`) unchanged. The module
+splits on the pure/impure line the config seam keeps: `build_server_config` is a
+PURE flags -> `McpServerConfig` builder doing ALL the validation (transport,
+positional `<commandOrUrl>`/`[args...]`, header/env, OAuth rules) with clear
+error strings and no filesystem, so wire fidelity is unit-tested with literals;
+`dispatch` is the impure edge that resolves the scope path, calls the persist/
+remove/compose seams, and prints. The flags mirror qwen: `-s/--scope`
+(`user`|`project`), `-t/--transport` (`stdio`|`http`|`sse`, the three transports
+of ADR-0056), `-e/--env`, `-H/--header`, `--timeout`, `--trust`,
+`--include-tools`, `--exclude-tools`, and `--oauth-*` (any of which arms
+`oauth.enabled`).
+
+**Scope semantics** mirror qwen. `add`/`remove` target one scope: `--scope
+project` writes the workspace `.suspenders/config.json` under the cwd,
+`--scope user` (the default) writes the XDG user config. `list` composes BOTH
+scopes and takes `--root` (not `--scope`), annotating each server with its
+Source. **Persistence** is a sparse nested read-modify-write into the
+`mcp_servers` map (`SessionConfig::persist_mcp_server` / `remove_mcp_server`,
+with `servers_with_source` composing the listing), reusing the atomic
+write-then-rename and sticky-write pattern of ADR-0031/ADR-0033: only the one
+server key is set or dropped, every other key the user wrote is preserved, and
+`token` is still never written by the tool.
+
 ## Consequences
 
 - Suspenders gains a second settings scope - the first project-local config.
   This is a general capability (workspace config) that MCP is the first
   consumer of; it is designed as such, not bolted onto MCP.
+- Suspenders grows its first CLI subcommand tree (`mcp add/remove/list`). The
+  optional subcommand leaves the default run path untouched, so a bare
+  `suspenders` still launches the TUI; authoring a server no longer requires
+  hand-editing `config.json`. Servers can now be authored from the CLI and
+  viewed/managed/authenticated from the dialog - the split qwen uses.
 - OAuth adds a real subsystem (browser flow, token store on disk). It is
   confined behind the transport seam and the `mcp::oauth` module.
 - The session tool set becomes live-mutable behind a generation, a small

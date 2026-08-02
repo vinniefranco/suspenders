@@ -40,6 +40,7 @@
 //! still surfaces as an `is_error` Tool Result until a reconnect re-attaches it.
 
 pub mod adapter;
+pub mod cli;
 pub mod config;
 pub mod manager;
 pub mod oauth;
