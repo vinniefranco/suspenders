@@ -1,27 +1,7 @@
-# Extensions wrap the Tool Call lifecycle via Middleware and Presenter roles
+# Lifecycle interception is the Hook subsystem, not an extension pipeline
 
-An Extension fills two composable roles over one Tool Call's lifecycle. A
-Middleware implements the execution-path callbacks; a Presenter implements the
-display-path callback. A registered Extension may fill either role or both.
+suspenders has no extension or middleware pipeline. Generic interception of the Tool Call lifecycle is the Hook subsystem (ADR-0066), the single seam an operator installs guards on.
 
-- `pre_run` (Middleware) - before execution. May adjust the input, or halt and deny the call.
-- `post_run` (Middleware) - after execution, before Shaping. May transform the Tool Result the model sees, and may attach Artifacts.
-- `present` (Presenter) - a **pure** function inside the Transcript fold. May substitute a richer display item.
+Tool behaviors live in their Tools, not in a wrapper layer: diff rendering in the `edit_file` and `write_file` tools, todo shaping in the `todo_write` tool, and output shaping in the `run_shell_command` tool (the exit-code badge and the noise-run condensing of compile/test output). Conversation-level compaction is a separate concern owned by the compaction service (ADR-0012).
 
-Extensions are a static, ordered list. Ordering is onion-style: `pre_run` in registration order, `post_run` in reverse.
-
-## Fail-open with visibility
-
-All three stages are synchronous, so each call is wrapped in `std::panic::catch_unwind`. A panicking Extension is skipped - its effect dropped, the token or item passing through unchanged - and recorded as a failure surfaced to the user as an info line. The model never sees it, and the Run never fails because of a Middleware or Presenter.
-
-This is distinct from the Run's control-bearing effects (the `RunDeps` trait, ADR-0011), which are fail-**loud**.
-
-## Considered and rejected
-
-- **A general middleware/pipeline abstraction.** Assumes one synchronous pass over one token; this lifecycle spans the Run task and the UI and three points in time.
-- **Telemetry-style observers.** Cannot modify inputs or results, which is the point.
-- **A runtime extension registry.** No consumer for mid-Session toggling; a static list keeps dispatch pure and testable.
-
-## Consequence
-
-Extensions never add Tools; they wrap existing ones. Approval is the only hard safety gate; the Middleware and Presenter roles are cosmetic and enriching, and safe to fail.
+The fail-open-with-visibility principle (ADR-0018) governs Hook execution: a hook failure never fails the Run and is recorded visibly. Approval is the hard safety gate (ADR-0005).

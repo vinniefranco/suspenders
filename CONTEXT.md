@@ -8,7 +8,7 @@ A terminal coding agent, local-first: a full-screen TUI where an LLM - a locally
 ## Language
 
 **Session**:
-One session of the Suspenders TUI, from launch to exit, holding exactly one Conversation. Its fixed facts - the Project Root, the Run Limit, the command timeout, the Middleware and Presenter set, the Provider set (each Provider's endpoint, credential, and Api), and the sampling temperature - are resolved and validated once at launch into a Session value; the Conversation and the Active Model are mutable state that live beside that value, owned by the Agent. The Context Budget and the Result Cap are not fixed facts: they derive from the Model each Run captures.
+One session of the Suspenders TUI, from launch to exit, holding exactly one Conversation. Its fixed facts - the Project Root, the Run Limit, the command timeout, the Hook set (Hooks resolved from config.json plus Skills at launch), the discovered Skill catalog, the Provider set (each Provider's endpoint, credential, and Api), and the sampling temperature - are resolved and validated once at launch into a Session value; the Conversation and the Active Model are mutable state that live beside that value, owned by the Agent. The Context Budget and the Result Cap are not fixed facts: they derive from the Model each Run captures.
 
 **Conversation**:
 The ordered message history sent to the model - user messages, assistant messages, and Tool Results.
@@ -65,6 +65,23 @@ _Avoid_: invocation (the legacy text-protocol term), tool request
 
 **Tool Result**:
 The structured outcome of executing a Tool Call, returned to the model as a `tool_result` block.
+
+**Skill**:
+A directory under `.suspenders/skills/<name>/` (project), `~/.config/suspenders/skills/<name>/` (user), or a compile-time-embedded bundled set, containing a `SKILL.md` (YAML-ish frontmatter: required `name`+`description`, optional `when_to_use`, plus qwen fields) and a markdown body. The body is instruction text the model reads on demand. A Skill adds no Tool; the one always-on `skill` tool surfaces a catalog of Skills and injects a chosen Skill's body into the Conversation.
+_Avoid_: plugin, tool, macro.
+
+**Conditional Skill**:
+A Skill whose frontmatter carries `paths:` glob patterns; it stays out of the model-facing catalog until a Tool Call touches a matching file path, then activates for the rest of the Session.
+
+**Bundled Skill**:
+A built-in Skill embedded in the binary at compile time (qwen ships these in a dist dir; suspenders is a single binary, ADR-0019, so they are compiled in). Lowest precedence: project shadows user shadows bundled.
+
+**Hook**:
+A user- or Skill-configured action fired at a lifecycle event (a command shell-out, an http POST, or a prompt LLM-eval). Hooks are the single generic lifecycle-interception mechanism (they replace the retired **Middleware**/**Presenter** pipeline). A Hook is a discrete fire-point at a specific lifecycle site, not a composed chain. Configured in `config.json` or a Skill's `hooks:` frontmatter. See ADR-0066.
+_Avoid_: middleware (a Hook is one fire-point, not a composed chain), plugin, interceptor, listener.
+
+**Hook Decision**:
+The control-flow a Hook returns via its JSON output: halt the loop (`continue:false`+`stopReason`), control a Tool Call (`decision`: block/deny/approve/allow/ask), resolve an **Approval** (`permissionDecision`), inject context (`additionalContext`), or hide output (`suppressOutput`). A Hook is a decision-maker, not just an observer.
 
 **Answer**:
 How the Run's batch answered one Tool Call: the Tool Result the model will read plus the typed fact of whether the call ran - Ran (executed, and the outcomes that read as runs: a Middleware halt, a malformed-input answer) or Denied (the Approval gate). Built only through constructors that pair the Voice's wording with the fact so the two cannot drift: the batch states the fact.
@@ -133,23 +150,19 @@ How an ended Run enters the Conversation. Every Run settles exactly one way: com
 _Avoid_: completion (reserved for the model's response), run management
 
 **Middleware**:
-A unit of extension that wraps a Tool Call's execution at two points: before the Tool executes (may adjust or deny the call, short-circuiting it) and after it executes (may transform the Tool Result the model sees). Middleware wrap one another, first-registered outermost - the onion familiar from Tower and Rack. Middleware never add Tools; they wrap existing ones. A denial still produces exactly one Tool Result, voiced by that Middleware. The execution-path counterpart to a Presenter (the display-path role); one registered extension may fill either role or both.
-_Avoid_: plugin (its everyday meaning is "adds a capability"; a Middleware wraps an existing Tool and never adds one, the opposite connotation), hook (a hook is one attachment point in the lifecycle, not the unit), interceptor, filter
+(Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
 
 **Presenter**:
-The display-side role an extension may fill: at Presentment it may substitute a richer Transcript item (a diff instead of a one-line summary) and carry an Artifact. Named apart from Middleware because it sits at a different seam - Middleware in the Tool Call's execution path, Presenter in the Transcript's display path - and a given extension often fills only one: a diff view is a Presenter only, a token counter a Middleware only. A Presenter never touches the Conversation.
-_Avoid_: renderer (that's the terminal drawing the Transcript; a Presenter decides what the item is), formatter, plugin
+(Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
 
 **Presentment**:
-The act of turning a Session event into a Transcript item. A Presenter may substitute a richer item at Presentment - a diff instead of a one-line summary - but Presentment only ever shapes the Transcript, never the Conversation.
-_Avoid_: rendering (that's the terminal drawing the Transcript; Presentment decides what the item is)
+(Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
 
 **Artifact**:
-Display-side data a Presenter derives from a Tool Call - a diff, an annotation - carried alongside the Tool Result to Presentment. An Artifact never enters the Conversation and costs no Context Budget.
-_Avoid_: metadata, attachment
+(Retired 2026-08-02) Superseded by the **Hook** subsystem (ADR-0066); tool behaviors now live in their Tools and the compaction service.
 
 **Voice**:
-Every Suspenders-voiced string the model reads: the system prompt, the compaction prompt, and every marker (run limit, cancellation, Result Cap cuts, malformed input, the run-close markers, and the error answers to a truncated or orphaned Tool Call). The Voice no longer authors any mid-Conversation steering - the nudge, anchor, and endgame apparatus is gone; the loop-detector's run-close marker is the only intervention text and it merely ends the Run. The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Middleware produces about its own decisions stay in that Middleware. Owned by one module so wording can be tuned per model in one place.
+Every Suspenders-voiced string the model reads: the system prompt, the compaction prompt, and every marker (run limit, cancellation, Result Cap cuts, malformed input, the run-close markers, and the error answers to a truncated or orphaned Tool Call). The Voice no longer authors any mid-Conversation steering - the nudge, anchor, and endgame apparatus is gone; the loop-detector's run-close marker is the only intervention text and it merely ends the Run. The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Hook produces about its own decisions stay in that Hook. Owned by one module so wording can be tuned per model in one place.
 _Avoid_: prompt strings, constants, "static strings" (parameterized wording still belongs), Steering Vocabulary (legacy name; Steering now means mid-Run user input)
 
 **Steering**:
@@ -189,11 +202,9 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - The system prompt, the compaction prompt, and every marker belong to the **Voice**; the **Voice** authors no mid-Conversation steering
 - The **Loop-detector** ends a **Run** when the model repeats the byte-identical **Tool Call** batch `loop_stall_limit` times; it injects nothing into the **Conversation** and appends only a run-close marker
 - The **Approval** gate encodes the user's judgment, not a tuned learning
-- **Middleware** wrap every **Tool Call**'s execution at two points, before and after, wrapping one another first-registered outermost; a **Presenter** shapes the same Tool Call's **Presentment** on the display side
-- A **Middleware** may adjust or deny a **Tool Call** before execution, and an **Approval** always shows the final, middleware-adjusted command
-- A **Middleware** denial still produces exactly one **Tool Result**, voiced by that Middleware
-- An **Artifact** a **Presenter** derives travels with its **Tool Result** to **Presentment** and appears only in the **Transcript**, never the **Conversation**
-- A **Middleware** or **Presenter** failure never fails the **Run** and never reaches the model; the **Transcript** records it as an info line and the Tool Call proceeds without that extension
+- **Hook**s fire at lifecycle sites and may return a **Hook Decision** that blocks or denies a **Tool Call**, resolves an **Approval**, injects context, or halts the **Run**
+- A **Hook** failure never fails the **Run** and never reaches the model; it is fail-open, recorded visibly in the **Transcript**, and the lifecycle proceeds as if the Hook had not fired (ADR-0018)
+- The one always-on `skill` **Tool** surfaces the **Skill** catalog and injects a chosen Skill's body into the **Conversation**; a **Conditional Skill** joins the catalog only after a **Tool Call** touches a matching path
 - A **Session** draws with exactly one active **Theme**; the `/theme` **Slash Command** changes it live, and the choice outlives the Session
 - A **Theme** shapes only how the **Transcript** and the **Screen**'s chrome are colored, never what anything means; a broken Theme is refused whole, and the Session falls back to the built-in default rather than drawing half-right
 - A **Run** ends in exactly one **Run Settlement**: completed, failed, or cancelled
@@ -218,7 +229,6 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 ## Flagged ambiguities
 
 - "Turn" was the outer request cycle, but the ecosystem (pi, Anthropic, OpenAI) calls one **Pass** a "turn" - a standard word reassigned to the opposite level, a false friend for newcomers - resolved 2026-07: the outer cycle is now a **Run** (matching OpenAI's Run), and **Pass** keeps its coined name. This was a half rename by design: it removes the collision one-way without reassigning "turn". Adopting "turn" for a **Pass** (the full alignment) is a possible later step, deferred because it is a two-way rename sharing the token. "Run" brushes against run_command and the informal "run of the TUI" (now a **Session**); context disambiguates.
-- **Middleware** and **Presenter** were one term, "Plugin", covering both the Tool Call execution wrap and the display-side enrichment - resolved 2026-07: split to name the two seams honestly. "Plugin" connoted "adds a capability", the opposite of what these do (they wrap existing Tools); the execution wrap is textbook **Middleware** (Tower/Rack onion), and the display role is a **Presenter**. One registered extension may fill either role or both. Supersedes the naming in ADR-0007 (plugin-lifecycle); the lifecycle itself is unchanged.
 
 - The whole steering apparatus (Governor, Nudge, Anchor, Endgame, Recovery Run, Scout, and mechanical Eviction/Dead Mass/Supersession) was removed 2026-07 in favor of a plain ReAct loop, a strong static system prompt, and a passive **Loop-detector** (ADR-0045). The wager: a clean, predictable context keeps a small local model on task more often than corrective text pulled it back. Those terms are retired from the language; git history holds their design.
 
@@ -226,6 +236,8 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - the **Compaction Target** trigger and the **Compaction Keep** recency were once one knob; resolved 2026-07: they are decoupled - fire high, keep low.
 - "toggling thinking" was read as enabling/disabling the model's **Thinking** when it once meant expanding/collapsing settled Thinking items - resolved 2026-07-29 by the qwen-code port (ADR-0046) and verified against qwen-code v0.16.0: there is no Ctrl-T and no per-item expand/collapse. Thinking persists as a dimmed `✦` history item (markdown body) AND shows a transient subject on the spinner line; a single global compact toggle hides Thinking and Tool output together. Whether the model thinks at all remains a request-level knob (today fixed: on for the main Conversation) with no user-facing toggle.
 - the **Compaction Keep** is configured and validated in token-space (a fraction of the live window), but the cutoff walk accumulates raw chars, so the executed keep is ~3.5x smaller than the configured fraction - discovered 2026-07-21, dates to the original port. Deliberately preserved and pinned by test for now; whether to fix the units (and retune the default) is an open tuning decision.
+
+- the **Middleware**/**Presenter** abstraction was a suspenders invention with no qwen counterpart - retired 2026-08-02 in favor of qwen's model, where tool behaviors (diff, todo, run_command output) live inside their Tools and services and **Hook**s are the sole lifecycle-interception layer. Supersedes ADR-0007's plugin pipeline and ADR-0042's Middleware/Presenter vocabulary; the retired glossary entries are kept as one-line redirects so references in old code still resolve.
 
 ## Compaction
 

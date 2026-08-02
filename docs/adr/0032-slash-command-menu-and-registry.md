@@ -15,13 +15,27 @@ and unknown-command handling all live in the **pure Composer** (`ui::composer`,
 ADR-0034's module inside ADR-0001's TEA core), where every other Composer rule
 already lives and is unit-tested - no crossterm, no I/O.
 
-**A `&'static` registry of command descriptors** is the extension seam. A
-descriptor is just `{ name, help, produce-an-Effect }`. The pure core looks a
-submitted/selected command up in the registry and emits a new
-`Effect::Command(…)` variant; it never learns what any command *does*. The
-actual work runs adapter-side (`ui.rs`) in that Effect's arm, because commands
-need terminal ownership, network round-trips, or Agent commands - none of which
-belong in the synchronous fold.
+**A two-layer registry of command descriptors** is the extension seam. A
+descriptor is just `{ name, help, produce-an-Effect }`. The first layer is the
+`&'static` built-in commands, compiled in. The second is a **dynamic
+command-source layer** resolved at launch: sources contributed at startup that
+the compiled list cannot know at compile time. The registry the pure core folds
+over is the union of the two. The pure core looks a submitted/selected command
+up in that union and emits a new `Effect::Command(…)` variant; it never learns
+what any command *does*. The actual work runs adapter-side (`ui.rs`) in that
+Effect's arm, because commands need terminal ownership, network round-trips, or
+Agent commands - none of which belong in the synchronous fold.
+
+The first dynamic source is discovered **Skills** (ADR-0058). Each Skill
+registers as a `/<name>` command, the analog of qwen's `CommandKind.SKILL`. A
+Skill declaring `disable-model-invocation: true` is `/<name>`-only: it appears
+in the command menu but is not offered to the model. A normal Skill is both a
+model-facing catalog entry and a `/<name>` command, so the same Skill is
+reachable by the operator through the menu and by the model through its catalog.
+A Skill is thus a new command with no new widget and no core change, the same
+one-entry cost a built-in carries, sourced at launch rather than at compile
+time. Other dynamic sources (MCP-prompt commands, file-defined commands) can
+join the same layer without touching the pure core.
 
 **One generic inline filterable-list selector** backs both the command menu
 and any command's own list (the `/model` model list, a future `/theme` theme
@@ -57,8 +71,8 @@ Transcript info line, never a Run.
 
 ## Consequences
 
-- Adding a command = one registry entry + one `Effect::Command` arm. The menu,
-  filter, and selector are untouched.
+- Adding a command = one registry entry (built-in or dynamic source) + one
+  `Effect::Command` arm. The menu, filter, and selector are untouched.
 - The cost of "always intercept `/`": the user cannot steer the model with text
   that literally begins with `/`. Accepted (and pi-consistent).
 - `/model` (ADR-0033) is the first consumer and exercises the async path
