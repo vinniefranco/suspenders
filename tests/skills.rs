@@ -300,7 +300,11 @@ fn the_catalog_is_alphabetical_regardless_of_priority() {
     // latest the HIGHEST: if priority sorted, `high` (priority 9) would lead; since
     // it does not, the order is purely by name.
     let tmp = TempDir::new().unwrap();
-    write_skill(tmp.path(), "low", "---\nname: low\ndescription: d\npriority: 1\n---\nb");
+    write_skill(
+        tmp.path(),
+        "low",
+        "---\nname: low\ndescription: d\npriority: 1\n---\nb",
+    );
     write_skill(
         tmp.path(),
         "high",
@@ -383,7 +387,8 @@ fn a_root_escaping_paths_glob_is_dropped() {
     // Absolute and `..`-escaping globs are project-unscoped and dropped, so the
     // skill loads as unconditional rather than carrying a glob that can never
     // match a project-relative path.
-    let text = "---\nname: p\ndescription: d\npaths:\n  - /etc/passwd\n  - ../secret\n  - src/**\n---\nb";
+    let text =
+        "---\nname: p\ndescription: d\npaths:\n  - /etc/passwd\n  - ../secret\n  - src/**\n---\nb";
     let (fm, _) = parse_skill_content(text).unwrap();
     assert_eq!(fm.paths, vec!["src/**".to_string()]);
 }
@@ -401,7 +406,10 @@ fn a_nested_hooks_block_parses_to_the_hook_value_shape() {
         .and_then(|v| v.as_array())
         .expect("PreToolUse definitions");
     assert_eq!(defs.len(), 1);
-    assert_eq!(defs[0].get("matcher").and_then(|v| v.as_str()), Some("edit"));
+    assert_eq!(
+        defs[0].get("matcher").and_then(|v| v.as_str()),
+        Some("edit")
+    );
 }
 
 #[test]

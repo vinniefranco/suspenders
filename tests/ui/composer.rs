@@ -313,9 +313,15 @@ fn a_skill_command_is_listed_in_the_palette_beside_the_built_ins() {
     // Typing `/` opens the palette over the two-layer registry: a discovered
     // `/commit` sits in the same menu as the built-ins.
     let c = slashing_with_skills(&[("commit", "write a commit", None)], "/");
-    let names: Vec<String> = menu_suggestions(&c).iter().map(|s| s.value.clone()).collect();
+    let names: Vec<String> = menu_suggestions(&c)
+        .iter()
+        .map(|s| s.value.clone())
+        .collect();
     assert!(names.contains(&"commit".to_string()), "listed: {names:?}");
-    assert!(names.contains(&"model".to_string()), "built-ins too: {names:?}");
+    assert!(
+        names.contains(&"model".to_string()),
+        "built-ins too: {names:?}"
+    );
 }
 
 #[test]
@@ -325,7 +331,10 @@ fn a_disable_model_invocation_skill_still_appears_on_the_slash_surface() {
     // the 4a catalog filter is the tool's, not the menu's). Filtering to it
     // surfaces it.
     let c = slashing_with_skills(&[("deploy", "ship it", None)], "/deploy");
-    let names: Vec<String> = menu_suggestions(&c).iter().map(|s| s.value.clone()).collect();
+    let names: Vec<String> = menu_suggestions(&c)
+        .iter()
+        .map(|s| s.value.clone())
+        .collect();
     assert_eq!(names, vec!["deploy"]);
 }
 
@@ -333,7 +342,10 @@ fn a_disable_model_invocation_skill_still_appears_on_the_slash_surface() {
 fn the_menu_shows_a_skill_argument_hint() {
     // The `argument-hint` reaches the Menu overlay's suggestion (qwen `/<name>
     // <argument-hint>`), display-only, for the completion render.
-    let c = slashing_with_skills(&[("commit", "write a commit", Some("<message>"))], "/commit");
+    let c = slashing_with_skills(
+        &[("commit", "write a commit", Some("<message>"))],
+        "/commit",
+    );
     let s = menu_suggestions(&c);
     assert_eq!(s[0].value, "commit");
     assert_eq!(s[0].argument_hint.as_deref(), Some("<message>"));
@@ -352,7 +364,11 @@ fn committing_a_skill_command_fires_and_runs_an_effect_command() {
             generation: 0,
         }]
     );
-    assert_eq!(c.view().draft, "", "the draft clears after a fire-and-run skill");
+    assert_eq!(
+        c.view().draft,
+        "",
+        "the draft clears after a fire-and-run skill"
+    );
     assert_eq!(overlay(&c), None);
 }
 

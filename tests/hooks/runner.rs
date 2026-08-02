@@ -149,7 +149,9 @@ fn text_response(text: &str) -> Response {
 
 fn command_hook(cmd: &str) -> Hook {
     Hook {
-        kind: HookKind::Command { command: cmd.to_string() },
+        kind: HookKind::Command {
+            command: cmd.to_string(),
+        },
         timeout_secs: Some(7),
     }
 }
@@ -205,8 +207,16 @@ async fn command_without_skill_root_sets_no_env() {
     });
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &shell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/work", skill_root: None };
+    let caps = HookCaps {
+        shell: &shell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/work",
+        skill_root: None,
+    };
     let _ = run_hook(&command_hook("x"), "{}", &ctx, &caps).await;
     let env = shell.seen.lock().unwrap().clone().unwrap().env;
     assert!(!env.contains_key("SUSPENDERS_SKILL_ROOT"));
@@ -275,8 +285,16 @@ async fn command_shell_error_fails_open() {
     let shell = FakeShell::err("spawn failed");
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &shell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &shell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&command_hook("x"), "{}", &ctx, &caps).await;
     assert_eq!(out, HookOutcome::default());
 }
@@ -286,8 +304,16 @@ async fn run_command_with(result: ShellResult) -> HookOutcome {
     let shell = FakeShell::ok(result);
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &shell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &shell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     run_hook(&command_hook("x"), "{}", &ctx, &caps).await
 }
 
@@ -295,7 +321,9 @@ async fn run_command_with(result: ShellResult) -> HookOutcome {
 
 fn http_hook(url: &str) -> Hook {
     Hook {
-        kind: HookKind::Http { url: url.to_string() },
+        kind: HookKind::Http {
+            url: url.to_string(),
+        },
         timeout_secs: None,
     }
 }
@@ -306,8 +334,16 @@ async fn http_2xx_json_parses_and_posts_payload() {
     let http = FakeHttp::ok(200, r#"{"decision":"deny","reason":"policy"}"#);
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &http, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &http,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&http_hook("https://x/hook"), "{\"p\":2}", &ctx, &caps).await;
     assert_eq!(out.decision, Some(Decision::Deny));
     assert_eq!(http.seen_body.lock().unwrap().clone().unwrap(), "{\"p\":2}");
@@ -319,8 +355,16 @@ async fn http_non_2xx_is_nonblocking_continue() {
     let http = FakeHttp::ok(500, r#"{"decision":"block"}"#);
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &http, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &http,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&http_hook("https://x"), "{}", &ctx, &caps).await;
     assert_eq!(out.continue_, Some(true));
     assert!(out.decision.is_none(), "non-2xx body is ignored");
@@ -332,8 +376,16 @@ async fn http_plaintext_body_is_system_message_continue() {
     let http = FakeHttp::ok(200, "just a note");
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &http, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &http,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&http_hook("https://x"), "{}", &ctx, &caps).await;
     assert_eq!(out.continue_, Some(true));
     assert_eq!(out.system_message.as_deref(), Some("just a note"));
@@ -345,8 +397,16 @@ async fn http_transport_error_fails_open() {
     let http = FakeHttp::err("connection refused");
     let llm = FakeLlm::script([]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &http, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &http,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&http_hook("https://x"), "{}", &ctx, &caps).await;
     assert_eq!(out, HookOutcome::default());
 }
@@ -355,7 +415,9 @@ async fn http_transport_error_fails_open() {
 
 fn prompt_hook(template: &str) -> Hook {
     Hook {
-        kind: HookKind::Prompt { prompt: template.to_string() },
+        kind: HookKind::Prompt {
+            prompt: template.to_string(),
+        },
         timeout_secs: None,
     }
 }
@@ -368,8 +430,16 @@ async fn prompt_ok_false_is_block() {
         r#"{"ok": false, "reason": "unsafe edit", "additionalContext": "see policy"}"#,
     ))]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&prompt_hook("evaluate: $ARGUMENTS"), "{}", &ctx, &caps).await;
     assert_eq!(out.continue_, Some(false));
     assert!(out.should_stop());
@@ -384,8 +454,16 @@ async fn prompt_ok_false_is_block() {
 async fn prompt_ok_true_is_allow() {
     let llm = FakeLlm::script([Entry::just(text_response(r#"{"ok": true}"#))]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
     assert_eq!(out.continue_, Some(true));
     assert_eq!(out.decision, Some(Decision::Allow));
@@ -415,9 +493,23 @@ async fn prompt_splices_pretty_payload_into_template() {
         text_response(r#"{"ok": true}"#)
     })]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
-    let _ = run_hook(&prompt_hook("check <$ARGUMENTS>"), "{\"tool\":\"x\"}", &ctx, &caps).await;
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
+    let _ = run_hook(
+        &prompt_hook("check <$ARGUMENTS>"),
+        "{\"tool\":\"x\"}",
+        &ctx,
+        &caps,
+    )
+    .await;
     // 2-space indented, not the compact `{"tool":"x"}`.
     assert_eq!(
         seen.lock().unwrap().clone().unwrap(),
@@ -433,14 +525,25 @@ async fn prompt_splices_pretty_payload_into_template() {
 async fn prompt_non_ok_reply_defaults_to_explicit_allow() {
     let llm = FakeLlm::script([Entry::just(text_response("I cannot comply, sorry."))]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
     assert_eq!(out.continue_, Some(true));
     assert_eq!(out.decision, Some(Decision::Allow));
     assert!(!out.is_blocking());
     assert!(
-        out.reason.as_deref().unwrap().contains("defaulting to allow"),
+        out.reason
+            .as_deref()
+            .unwrap()
+            .contains("defaulting to allow"),
         "the allow carries qwen's fail-open reason: {:?}",
         out.reason
     );
@@ -452,8 +555,16 @@ async fn prompt_non_ok_reply_defaults_to_explicit_allow() {
 async fn prompt_llm_error_defaults_to_explicit_allow() {
     let llm = FakeLlm::script([Entry::error("model down")]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
     assert_eq!(out.continue_, Some(true));
     assert_eq!(out.decision, Some(Decision::Allow));
@@ -468,8 +579,16 @@ async fn prompt_reply_wrapped_in_json_fence_is_parsed() {
         "```json\n{\"ok\": false, \"reason\": \"fenced block\"}\n```",
     ))]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
     assert_eq!(out.decision, Some(Decision::Block));
     assert_eq!(out.reason.as_deref(), Some("fenced block"));
@@ -481,8 +600,16 @@ async fn prompt_reply_wrapped_in_json_fence_is_parsed() {
 async fn prompt_reply_wrapped_in_bare_fence_is_parsed() {
     let llm = FakeLlm::script([Entry::just(text_response("```\n{\"ok\": true}\n```"))]);
     let model = test_model();
-    let caps = HookCaps { shell: &UnusedShell, http: &UnusedHttp, llm: &llm, prompt_model: &model };
-    let ctx = HookRunContext { cwd: "/w", skill_root: None };
+    let caps = HookCaps {
+        shell: &UnusedShell,
+        http: &UnusedHttp,
+        llm: &llm,
+        prompt_model: &model,
+    };
+    let ctx = HookRunContext {
+        cwd: "/w",
+        skill_root: None,
+    };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
     assert_eq!(out.decision, Some(Decision::Allow));
     assert_eq!(out.continue_, Some(true));

@@ -27,7 +27,10 @@ fn parses_all_three_types() {
 
     let mut failures = Vec::new();
     let cfg = parse_hooks(&hooks, "config.json", &mut failures);
-    assert!(failures.is_empty(), "clean block has no failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "clean block has no failures: {failures:?}"
+    );
 
     let pre = cfg.definitions(HookEvent::PreToolUse);
     assert_eq!(pre.len(), 1);
@@ -113,7 +116,10 @@ fn non_event_fields_skipped_silently() {
     });
     let mut failures = Vec::new();
     let cfg = parse_hooks(&hooks, "config.json", &mut failures);
-    assert!(failures.is_empty(), "config fields are not failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "config fields are not failures: {failures:?}"
+    );
     assert_eq!(cfg.definitions(HookEvent::Stop).len(), 1);
 }
 
@@ -198,7 +204,10 @@ fn command_hook_missing_command_fails_open() {
     let hooks = json!({ "Stop": [ { "hooks": [ { "type": "command" } ] } ] });
     let mut failures = Vec::new();
     let cfg = parse_hooks(&hooks, "config.json", &mut failures);
-    assert!(cfg.by_event.is_empty(), "definition with only bad hooks drops");
+    assert!(
+        cfg.by_event.is_empty(),
+        "definition with only bad hooks drops"
+    );
     assert_eq!(failures.len(), 1);
     assert!(failures[0].1.contains("missing or empty `command`"));
 }
@@ -224,7 +233,11 @@ fn function_hook_type_rejected() {
     let cfg = parse_hooks(&hooks, "config.json", &mut failures);
     assert!(cfg.by_event.is_empty());
     assert_eq!(failures.len(), 1);
-    assert!(failures[0].1.contains("`function` hook type is not supported"));
+    assert!(
+        failures[0]
+            .1
+            .contains("`function` hook type is not supported")
+    );
 }
 
 /// An unknown hook type is skipped with a failure.
@@ -281,7 +294,10 @@ PostToolUse:
     let value = hooks_value_from_yaml(yaml).expect("valid YAML converts to Value");
     let mut failures = Vec::new();
     let cfg = parse_hooks(&value, "skill formatter", &mut failures);
-    assert!(failures.is_empty(), "clean YAML has no failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "clean YAML has no failures: {failures:?}"
+    );
     let defs = cfg.definitions(HookEvent::PostToolUse);
     assert_eq!(defs.len(), 1);
     assert_eq!(defs[0].matcher.as_deref(), Some("edit_file"));

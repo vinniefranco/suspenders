@@ -243,18 +243,10 @@ fn apply_edit(plan: EditPlan<'_>, ctx: &ToolCtx) -> Result<EditOutcome, String> 
             // The diff Artifact from the exact before/after content the edit had
             // in hand: an in-place edit diffs old->new; a fresh create (no
             // `current`) is one all-added created-file diff.
-            let diff = crate::tools::file_diff::artifact(
-                current.as_deref(),
-                &new_content,
-                diff_path,
-            );
+            let diff =
+                crate::tools::file_diff::artifact(current.as_deref(), &new_content, diff_path);
             Ok(EditOutcome {
-                message: success_message(
-                    file_path,
-                    is_new_file,
-                    current.as_deref(),
-                    &new_content,
-                ),
+                message: success_message(file_path, is_new_file, current.as_deref(), &new_content),
                 diff,
             })
         }

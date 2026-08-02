@@ -245,7 +245,11 @@ async fn fire_user_prompt_submit<D: RunDeps>(
 
     match hooks.user_prompt_submit(&prompt).await {
         crate::run::hooks::UserPromptDecision::Reject { reason, context } => {
-            emit_hook_decision(state, "UserPromptSubmit", &format!("rejected the prompt: {reason}"));
+            emit_hook_decision(
+                state,
+                "UserPromptSubmit",
+                &format!("rejected the prompt: {reason}"),
+            );
             // The vetoed prompt never reaches the model: close the Run on the
             // hook's reason through the custom-stop path a Stop hook takes, so the
             // Run ends with the hook's explanation. Any additionalContext the

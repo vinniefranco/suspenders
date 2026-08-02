@@ -474,7 +474,13 @@ fn exit_code_artifacts(code: i64) -> HashMap<String, Value> {
 #[test]
 fn a_diff_artifact_swaps_the_tool_result_for_a_diff_item() {
     let mut t = fresh();
-    t.tool_result("t1", "edit".into(), "edited x", false, &diff_artifacts("lib/x.ex"));
+    t.tool_result(
+        "t1",
+        "edit".into(),
+        "edited x",
+        false,
+        &diff_artifacts("lib/x.ex"),
+    );
     assert_eq!(t.items(), vec![diff_item("edit", "lib/x.ex")]);
 }
 
@@ -489,7 +495,13 @@ fn without_a_diff_artifact_the_default_summary_survives() {
 fn a_failed_edit_keeps_its_summary_even_with_a_diff_artifact() {
     // The diff swap fires only on a successful result.
     let mut t = fresh();
-    t.tool_result("t1", "edit".into(), "boom", true, &diff_artifacts("lib/x.ex"));
+    t.tool_result(
+        "t1",
+        "edit".into(),
+        "boom",
+        true,
+        &diff_artifacts("lib/x.ex"),
+    );
     assert_eq!(t.items(), vec![tool_result_item("edit", "boom", true)]);
 }
 
@@ -576,7 +588,13 @@ fn tool_call_items_are_never_swapped() {
 fn a_diff_stands_alone_after_the_paired_call_is_removed() {
     let mut t = fresh();
     t.tool_call("t1".into(), "edit".into(), &json!({"path": "src/x.rs"}));
-    t.tool_result("t1", "edit".into(), "edited", false, &diff_artifacts("lib/x.ex"));
+    t.tool_result(
+        "t1",
+        "edit".into(),
+        "edited",
+        false,
+        &diff_artifacts("lib/x.ex"),
+    );
     assert_eq!(t.items(), vec![diff_item("edit", "lib/x.ex")]);
     assert_eq!(t.revision(), 1);
 }

@@ -171,9 +171,7 @@ pub async fn run_hook(
             run_command_hook(command, payload, timeout_secs, ctx, caps.shell).await
         }
         HookKind::Http { url } => run_http_hook(url, payload, timeout_secs, caps.http).await,
-        HookKind::Prompt { prompt } => {
-            run_prompt_hook(prompt, payload, timeout_secs, caps).await
-        }
+        HookKind::Prompt { prompt } => run_prompt_hook(prompt, payload, timeout_secs, caps).await,
     }
 }
 
@@ -352,7 +350,9 @@ async fn run_prompt_hook(
 
     let request = LlmRequest::new(
         PROMPT_HOOK_SYSTEM_PROMPT,
-        vec![crate::content::Message::user(vec![ContentBlock::text(processed)])],
+        vec![crate::content::Message::user(vec![ContentBlock::text(
+            processed,
+        )])],
         Vec::new(),
     );
 

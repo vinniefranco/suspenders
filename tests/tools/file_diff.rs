@@ -55,7 +55,9 @@ async fn edit_file_exact_match_attaches_an_old_to_new_diff_and_stays_terse() {
     // The model-facing content is edit_file's own success message; the diff is
     // display-only and appends no grounding.
     let text = crate::content::result_blocks_text(&output.blocks);
-    assert!(text.starts_with(&format!("The file: {target} has been updated. Showing lines")));
+    assert!(text.starts_with(&format!(
+        "The file: {target} has been updated. Showing lines"
+    )));
     assert!(!text.contains("the match was fuzzy"));
 
     let diff = diff_of(&output);
@@ -94,7 +96,9 @@ async fn edit_file_run_projects_the_message_without_the_diff() {
     let input = json!({"file_path": &target, "old_string": "  x = 1", "new_string": "  y = 2"});
     let message = EditFile.run(&input, &ctx).await.unwrap();
 
-    assert!(message.starts_with(&format!("The file: {target} has been updated. Showing lines")));
+    assert!(message.starts_with(&format!(
+        "The file: {target} has been updated. Showing lines"
+    )));
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("code.ex")).unwrap(),
         "def foo do\n  y = 2\nend\n"

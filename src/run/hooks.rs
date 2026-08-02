@@ -66,7 +66,9 @@ pub const STOP_HOOK_BLOCK_CAP_ENV: &str = "SUSPENDERS_STOP_HOOK_BLOCK_CAP";
 /// default, matching qwen's normalizer.
 pub fn resolve_stop_hook_cap() -> u64 {
     match std::env::var(STOP_HOOK_BLOCK_CAP_ENV) {
-        Ok(raw) if !raw.trim().is_empty() => normalize_stop_hook_cap(raw.trim().parse::<i64>().ok()),
+        Ok(raw) if !raw.trim().is_empty() => {
+            normalize_stop_hook_cap(raw.trim().parse::<i64>().ok())
+        }
         _ => DEFAULT_STOP_HOOK_BLOCK_CAP,
     }
 }
@@ -99,7 +101,9 @@ pub fn session_id_from_log_path(transcript_path: &str) -> String {
 /// hook. Verbatim wording, with the correct singular/plural of "time(s)".
 pub fn format_stop_hook_cap_warning(cap: u64) -> String {
     let times = if cap == 1 { "time" } else { "times" };
-    format!("Stop hook blocked continuation {cap} consecutive {times}; overriding and ending the turn.")
+    format!(
+        "Stop hook blocked continuation {cap} consecutive {times}; overriding and ending the turn."
+    )
 }
 
 /// The production [`ShellExec`] (ADR-0066, ADR-0023): runs a command hook in its
@@ -496,7 +500,11 @@ impl<'a> Hooks<'a> {
     /// model; otherwise the call proceeds carrying the first permission decision a
     /// hook contributed, the concatenated additionalContext, and the first
     /// `continue:false` stop reason. The model-sent `input` rides in the payload.
-    pub async fn pre_tool_use(&self, tool_name: &str, input: &serde_json::Value) -> PreToolDecision {
+    pub async fn pre_tool_use(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> PreToolDecision {
         let payload = payload_json(
             self.base(HookEvent::PreToolUse),
             tool_name,
@@ -701,10 +709,8 @@ impl<'a> Hooks<'a> {
     /// CALLER's counter+cap (A2, `dispatch::finish_or_stop_hook`), not this flag. The
     /// FIRST forcing outcome wins.
     pub async fn stop(&self) -> StopDecision {
-        let payload = lifecycle_payload(
-            self.base(HookEvent::Stop),
-            &[("stop_hook_active", "true")],
-        );
+        let payload =
+            lifecycle_payload(self.base(HookEvent::Stop), &[("stop_hook_active", "true")]);
         let outcomes = self.fire_lifecycle(HookEvent::Stop, &payload).await;
 
         // A Stop hook forces continuation when it halts (continue:false) or blocks:
@@ -771,8 +777,7 @@ impl<'a> Hooks<'a> {
     /// the RUN layer when a `todo_write` adds a new todo item. The `content` of the
     /// created item rides the payload.
     pub async fn todo_created(&self, content: &str) {
-        let payload =
-            lifecycle_payload(self.base(HookEvent::TodoCreated), &[("content", content)]);
+        let payload = lifecycle_payload(self.base(HookEvent::TodoCreated), &[("content", content)]);
         let _ = self.fire_lifecycle(HookEvent::TodoCreated, &payload).await;
     }
 
@@ -782,7 +787,9 @@ impl<'a> Hooks<'a> {
     pub async fn todo_completed(&self, content: &str) {
         let payload =
             lifecycle_payload(self.base(HookEvent::TodoCompleted), &[("content", content)]);
-        let _ = self.fire_lifecycle(HookEvent::TodoCompleted, &payload).await;
+        let _ = self
+            .fire_lifecycle(HookEvent::TodoCompleted, &payload)
+            .await;
     }
 
     /// Fires the SubagentStart hooks (Phase 3b, ADR-0066): observational, fired at
@@ -793,7 +800,9 @@ impl<'a> Hooks<'a> {
             self.base(HookEvent::SubagentStart),
             &[("subagent_type", subagent_type)],
         );
-        let _ = self.fire_lifecycle(HookEvent::SubagentStart, &payload).await;
+        let _ = self
+            .fire_lifecycle(HookEvent::SubagentStart, &payload)
+            .await;
     }
 
     /// Fires the SubagentStop hooks (Phase 3b, ADR-0066): observational, fired at

@@ -26,9 +26,14 @@ fn non_tool_event_ignores_matcher() {
     assert_eq!(selected.len(), 1);
     assert_eq!(
         selected[0].hook.kind,
-        HookKind::Command { command: "x".to_string() }
+        HookKind::Command {
+            command: "x".to_string()
+        }
     );
-    assert!(selected[0].skill_root.is_none(), "config hook has no skill root");
+    assert!(
+        selected[0].skill_root.is_none(),
+        "config hook has no skill root"
+    );
 }
 
 /// A tool event with an exact-name matcher fires only for the matching tool.
@@ -40,8 +45,15 @@ fn tool_event_exact_matcher() {
         ]
     });
     let mgr = HookManager::from_config(Some(&hooks));
-    assert_eq!(mgr.hooks_for(HookEvent::PreToolUse, Some("run_command")).len(), 1);
-    assert!(mgr.hooks_for(HookEvent::PreToolUse, Some("edit_file")).is_empty());
+    assert_eq!(
+        mgr.hooks_for(HookEvent::PreToolUse, Some("run_command"))
+            .len(),
+        1
+    );
+    assert!(
+        mgr.hooks_for(HookEvent::PreToolUse, Some("edit_file"))
+            .is_empty()
+    );
 }
 
 /// A regex matcher matches the tool name (qwen regex.test semantics).
@@ -53,9 +65,20 @@ fn tool_event_regex_matcher() {
         ]
     });
     let mgr = HookManager::from_config(Some(&hooks));
-    assert_eq!(mgr.hooks_for(HookEvent::PreToolUse, Some("edit_file")).len(), 1);
-    assert_eq!(mgr.hooks_for(HookEvent::PreToolUse, Some("edit_notebook")).len(), 1);
-    assert!(mgr.hooks_for(HookEvent::PreToolUse, Some("run_command")).is_empty());
+    assert_eq!(
+        mgr.hooks_for(HookEvent::PreToolUse, Some("edit_file"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        mgr.hooks_for(HookEvent::PreToolUse, Some("edit_notebook"))
+            .len(),
+        1
+    );
+    assert!(
+        mgr.hooks_for(HookEvent::PreToolUse, Some("run_command"))
+            .is_empty()
+    );
 }
 
 /// An invalid regex matcher falls back to an exact string compare (qwen).
@@ -69,7 +92,10 @@ fn invalid_regex_matcher_falls_back_to_exact() {
     });
     let mgr = HookManager::from_config(Some(&hooks));
     assert_eq!(mgr.hooks_for(HookEvent::PreToolUse, Some("[")).len(), 1);
-    assert!(mgr.hooks_for(HookEvent::PreToolUse, Some("run_command")).is_empty());
+    assert!(
+        mgr.hooks_for(HookEvent::PreToolUse, Some("run_command"))
+            .is_empty()
+    );
 }
 
 /// An absent or `*` matcher matches all tools.
@@ -117,13 +143,17 @@ fn skill_hooks_carry_skill_root_after_config() {
     // Standing source first.
     assert_eq!(
         selected[0].hook.kind,
-        HookKind::Command { command: "standing".to_string() }
+        HookKind::Command {
+            command: "standing".to_string()
+        }
     );
     assert!(selected[0].skill_root.is_none());
     // Skill source second, carrying its root.
     assert_eq!(
         selected[1].hook.kind,
-        HookKind::Command { command: "skill-fmt".to_string() }
+        HookKind::Command {
+            command: "skill-fmt".to_string()
+        }
     );
     assert_eq!(selected[1].skill_root.as_deref(), Some("/skills/formatter"));
 }
@@ -162,7 +192,10 @@ fn register_skill_with_no_hooks_adds_nothing() {
     let mgr = HookManager::from_config(None);
     mgr.register_skill("empty", "/skills/empty", &json!({}));
     assert!(mgr.hooks_for(HookEvent::Stop, None).is_empty());
-    assert!(mgr.failures().is_empty(), "an empty hooks object is not a failure");
+    assert!(
+        mgr.failures().is_empty(),
+        "an empty hooks object is not a failure"
+    );
 }
 
 /// A malformed config.json hooks block records a failure but the manager still

@@ -62,7 +62,10 @@ fn continue_false_with_stop_reason() {
     let out = HookOutcome::parse(r#"{"continue":false,"stopReason":"halt now"}"#).unwrap();
     assert!(out.should_stop());
     assert_eq!(out.effective_reason(), "halt now");
-    assert_eq!(out.stop_hook_feedback().as_deref(), Some("Stop hook feedback:\nhalt now"));
+    assert_eq!(
+        out.stop_hook_feedback().as_deref(),
+        Some("Stop hook feedback:\nhalt now")
+    );
 }
 
 /// effectiveReason falls back stopReason -> reason -> the sentinel.
@@ -105,22 +108,15 @@ fn additional_context_non_string_is_none() {
 /// permissionDecision in hookSpecificOutput wins directly (allow/deny/ask).
 #[test]
 fn permission_decision_from_hook_specific_output() {
-    let allow = HookOutcome::parse(
-        r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
-    )
-    .unwrap();
+    let allow =
+        HookOutcome::parse(r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#).unwrap();
     assert_eq!(allow.permission_decision(), Some(PermissionDecision::Allow));
 
-    let deny = HookOutcome::parse(
-        r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#,
-    )
-    .unwrap();
+    let deny =
+        HookOutcome::parse(r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#).unwrap();
     assert_eq!(deny.permission_decision(), Some(PermissionDecision::Deny));
 
-    let ask = HookOutcome::parse(
-        r#"{"hookSpecificOutput":{"permissionDecision":"ask"}}"#,
-    )
-    .unwrap();
+    let ask = HookOutcome::parse(r#"{"hookSpecificOutput":{"permissionDecision":"ask"}}"#).unwrap();
     assert_eq!(ask.permission_decision(), Some(PermissionDecision::Ask));
 }
 
@@ -170,7 +166,10 @@ fn permission_decision_reason_prefers_hook_specific() {
         r#"{"reason":"base","hookSpecificOutput":{"permissionDecisionReason":"specific"}}"#,
     )
     .unwrap();
-    assert_eq!(hso.permission_decision_reason().as_deref(), Some("specific"));
+    assert_eq!(
+        hso.permission_decision_reason().as_deref(),
+        Some("specific")
+    );
 
     let base = HookOutcome::parse(r#"{"reason":"base"}"#).unwrap();
     assert_eq!(base.permission_decision_reason().as_deref(), Some("base"));

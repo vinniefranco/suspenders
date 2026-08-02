@@ -216,11 +216,7 @@ fn maybe_register_skill_hooks<D: RunDeps>(
     // Only a skill that actually carries a parsed `hooks:` block registers
     // anything; a skill with no hooks is a no-op (registers nothing).
     if let Some(skill_hooks) = &skill.hooks {
-        hooks.register_skill(
-            &skill.name,
-            &skill.base_dir.to_string_lossy(),
-            skill_hooks,
-        );
+        hooks.register_skill(&skill.name, &skill.base_dir.to_string_lossy(), skill_hooks);
     }
 }
 
@@ -489,7 +485,11 @@ async fn fire_pre_tool_use<D: RunDeps>(
             context,
             system_message,
         } => {
-            emit_hook_decision(state, "PreToolUse", &format!("blocked a Tool Call: {reason}"));
+            emit_hook_decision(
+                state,
+                "PreToolUse",
+                &format!("blocked a Tool Call: {reason}"),
+            );
             surface_system_message(state, "PreToolUse", system_message);
             // The blocked call reads as an error result: the reason, with any
             // additionalContext the blocking hook still injected appended.
@@ -568,10 +568,7 @@ async fn post_process<D: RunDeps>(
         .join("\n");
     let mut content = answer.content;
     content.push(ResultBlock::text(extra));
-    Answer {
-        content,
-        ..answer
-    }
+    Answer { content, ..answer }
 }
 
 // Appends the optional hook `additionalContext` to a reason string as a trailing

@@ -156,7 +156,10 @@ fn commands_ref_unions_the_built_ins_then_the_skill_layer() {
     // The skill trails, projected fire-and-run with its hint slot.
     let last = refs.last().unwrap();
     assert_eq!(last.name, "commit");
-    assert!(!last.opens_selector, "a skill command never opens a selector");
+    assert!(
+        !last.opens_selector,
+        "a skill command never opens a selector"
+    );
     assert_eq!(last.argument_hint, None);
 }
 

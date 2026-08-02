@@ -208,9 +208,7 @@ fn parse_definition(
     let Some(hooks_array) = obj.get("hooks").and_then(Value::as_array) else {
         failures.push((
             context.to_string(),
-            format!(
-                "hook definition {index} for \"{event_key}\" has no `hooks` array; skipping"
-            ),
+            format!("hook definition {index} for \"{event_key}\" has no `hooks` array; skipping"),
         ));
         return None;
     };
@@ -273,19 +271,13 @@ fn parse_hook(value: &Value) -> Result<Hook, String> {
         other => return Err(format!("unknown hook type \"{other}\"")),
     };
 
-    Ok(Hook {
-        kind,
-        timeout_secs,
-    })
+    Ok(Hook { kind, timeout_secs })
 }
 
 /// Reads a required non-empty string field from a hook entry, or an `Err` naming
 /// it. A present-but-empty value is treated as missing (a `command: ""` cannot
 /// run), matching the skill parser's present-but-empty-is-missing rule.
-fn required_str(
-    obj: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<String, String> {
+fn required_str(obj: &serde_json::Map<String, Value>, field: &str) -> Result<String, String> {
     match obj.get(field).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
         _ => Err(format!("missing or empty `{field}`")),
@@ -301,7 +293,8 @@ fn required_str(
 pub fn hooks_value_from_yaml(yaml: &str) -> Result<Value, String> {
     // serde_yaml_ng deserializes directly into serde_json::Value, so a skill's
     // YAML hooks block lands in the exact shape config.json's JSON hooks value has.
-    serde_yaml_ng::from_str::<Value>(yaml).map_err(|e| format!("invalid YAML in `hooks:` block: {e}"))
+    serde_yaml_ng::from_str::<Value>(yaml)
+        .map_err(|e| format!("invalid YAML in `hooks:` block: {e}"))
 }
 
 #[cfg(test)]

@@ -159,9 +159,7 @@ fn command_column_width(suggestions: &[completion::Suggestion], width: usize) ->
     // includes the leading space + the hint.
     let max_label = suggestions
         .iter()
-        .map(|s| {
-            s.label.width() + s.argument_hint.as_deref().map_or(0, |h| 1 + h.width())
-        })
+        .map(|s| s.label.width() + s.argument_hint.as_deref().map_or(0, |h| 1 + h.width()))
         .max()
         .unwrap_or(0);
     let has_descriptions = suggestions.iter().any(|s| !s.description.is_empty());

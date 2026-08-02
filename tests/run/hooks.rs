@@ -107,7 +107,9 @@ impl ShellExec for SharedShell {
         env: &HashMap<String, String>,
         timeout_secs: u64,
     ) -> Result<ShellResult, String> {
-        self.0.run(command, stdin_json, cwd, env, timeout_secs).await
+        self.0
+            .run(command, stdin_json, cwd, env, timeout_secs)
+            .await
     }
 }
 
@@ -271,9 +273,7 @@ async fn permission_request_allow_auto_approves_without_a_modal() {
     let root = TempDir::new().unwrap();
     let session = session(root.path());
     let manager = manager_for("PermissionRequest");
-    let shell = ScriptedShell::new(
-        r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
-    );
+    let shell = ScriptedShell::new(r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#);
     let llm = FakeLlm::script([]);
     let hooks = Hooks::with_caps(
         &manager,
@@ -376,10 +376,7 @@ async fn permission_request_deny_rejects_with_reason() {
         content.contains("no shell here"),
         "the deny reason reaches the model: {content}"
     );
-    assert!(
-        !content.contains("hi"),
-        "the command never ran: {content}"
-    );
+    assert!(!content.contains("hi"), "the command never ran: {content}");
 }
 
 /// A PermissionRequest `ask` (and any hook returning no decision) falls through to
@@ -418,13 +415,17 @@ async fn permission_request_ask_falls_through_to_the_gate() {
 
     let evs = events(&deps);
     assert!(
-        evs.iter().any(|e| matches!(e, Event::ApprovalRequest { .. })),
+        evs.iter()
+            .any(|e| matches!(e, Event::ApprovalRequest { .. })),
         "an ask falls through to the normal gate (a modal opens)"
     );
     let Event::ToolResult { content, .. } = tool_result(&evs, "g1") else {
         unreachable!()
     };
-    assert!(content.contains("hi"), "the approved command ran: {content}");
+    assert!(
+        content.contains("hi"),
+        "the approved command ran: {content}"
+    );
 }
 
 // ---- PostToolUse -------------------------------------------------------------
@@ -436,9 +437,7 @@ async fn post_tool_use_appends_additional_context() {
     let root = TempDir::new().unwrap();
     let session = session(root.path());
     let manager = manager_for("PostToolUse");
-    let shell = ScriptedShell::new(
-        r#"{"hookSpecificOutput":{"additionalContext":"audited ok"}}"#,
-    );
+    let shell = ScriptedShell::new(r#"{"hookSpecificOutput":{"additionalContext":"audited ok"}}"#);
     let llm = FakeLlm::script([]);
     let hooks = Hooks::with_caps(
         &manager,
@@ -487,9 +486,8 @@ async fn post_tool_use_failure_appends_context_on_error() {
     let root = TempDir::new().unwrap();
     let session = session(root.path());
     let manager = manager_for("PostToolUseFailure");
-    let shell = ScriptedShell::new(
-        r#"{"hookSpecificOutput":{"additionalContext":"failure noted"}}"#,
-    );
+    let shell =
+        ScriptedShell::new(r#"{"hookSpecificOutput":{"additionalContext":"failure noted"}}"#);
     let llm = FakeLlm::script([]);
     let hooks = Hooks::with_caps(
         &manager,
@@ -569,9 +567,8 @@ async fn user_prompt_submit_injects_additional_context() {
     let root = TempDir::new().unwrap();
     let session = session(root.path());
     let manager = manager_for("UserPromptSubmit");
-    let shell = ScriptedShell::new(
-        r#"{"hookSpecificOutput":{"additionalContext":"context from a hook"}}"#,
-    );
+    let shell =
+        ScriptedShell::new(r#"{"hookSpecificOutput":{"additionalContext":"context from a hook"}}"#);
     let llm = FakeLlm::script([]);
     let hooks = Hooks::with_caps(
         &manager,
@@ -642,7 +639,9 @@ async fn stop_hook_forces_continuations_up_to_the_cap_then_ends() {
     // as a safety net that must never be consumed (if it were, the cap failed to
     // stop the loop and the count assertion would reveal it).
     let cap = crate::run::hooks::DEFAULT_STOP_HOOK_BLOCK_CAP;
-    let replies: Vec<_> = (0..=cap).map(|i| just(text_end(&format!("end {i}")))).collect();
+    let replies: Vec<_> = (0..=cap)
+        .map(|i| just(text_end(&format!("end {i}"))))
+        .collect();
     let deps = deps_for(&session, replies);
     let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
     assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
@@ -654,7 +653,10 @@ async fn stop_hook_forces_continuations_up_to_the_cap_then_ends() {
         .iter()
         .filter(|e| matches!(e, Event::MessageStart { .. }))
         .count();
-    assert_eq!(starts as u64, cap, "the Stop hook forced continuations up to the cap");
+    assert_eq!(
+        starts as u64, cap,
+        "the Stop hook forced continuations up to the cap"
+    );
     // The feedback was delivered as steering (the qwen-wrapped stopReason).
     let steered = evs.iter().any(|e| matches!(
         e,
@@ -699,7 +701,10 @@ async fn stop_hook_that_allows_lets_the_run_end() {
         .iter()
         .filter(|e| matches!(e, Event::MessageStart { .. }))
         .count();
-    assert_eq!(starts, 1, "a non-blocking Stop hook does not force a continuation");
+    assert_eq!(
+        starts, 1,
+        "a non-blocking Stop hook does not force a continuation"
+    );
 }
 
 // ---- Todo / Subagent fire-happened (Phase 3b) --------------------------------
@@ -888,7 +893,9 @@ async fn notification_fires_the_command_hook() {
         session.root.clone(),
     );
 
-    hooks.notification("Approval requested: rm -rf /tmp/x").await;
+    hooks
+        .notification("Approval requested: rm -rf /tmp/x")
+        .await;
     assert_eq!(
         *shell.calls.lock().unwrap(),
         1,
@@ -990,7 +997,10 @@ async fn pre_tool_use_permission_deny_blocks_an_ungated_tool() {
     else {
         unreachable!()
     };
-    assert!(*is_error, "an ungated tool is still blocked by a permission deny");
+    assert!(
+        *is_error,
+        "an ungated tool is still blocked by a permission deny"
+    );
     assert!(
         content.contains("path off-limits"),
         "the permissionDecisionReason reaches the model: {content}"
@@ -1037,13 +1047,17 @@ async fn pre_tool_use_permission_ask_forces_gate_on_an_ungated_tool() {
 
     let evs = events(&deps);
     assert!(
-        evs.iter().any(|e| matches!(e, Event::ApprovalRequest { .. })),
+        evs.iter()
+            .any(|e| matches!(e, Event::ApprovalRequest { .. })),
         "an ungated tool with a PreToolUse ask opens the confirmation gate"
     );
     let Event::ToolResult { is_error, .. } = tool_result(&evs, "t1") else {
         unreachable!()
     };
-    assert!(*is_error, "the canned deny at the forced gate stopped the call");
+    assert!(
+        *is_error,
+        "the canned deny at the forced gate stopped the call"
+    );
 }
 
 // ---- A4: multi-hook PreToolUse fold ------------------------------------------
@@ -1262,7 +1276,10 @@ async fn post_tool_use_payload_wraps_tool_response_as_an_object() {
     let payloads = shell.stdin.lock().unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
     let tr = &payload["tool_response"];
-    assert!(tr.is_object(), "tool_response is an object, not a string: {tr}");
+    assert!(
+        tr.is_object(),
+        "tool_response is an object, not a string: {tr}"
+    );
     assert!(
         tr.get("output").and_then(|v| v.as_str()).is_some(),
         "a plain-text tool output is wrapped under `output`: {tr}"
@@ -1306,13 +1323,12 @@ async fn pre_tool_use_system_message_is_surfaced() {
     assert!(
         hook_line_for(&evs, "PreToolUse")
             .into_iter()
-            .chain(
-                evs.iter().filter_map(|e| match e {
-                    Event::ExtensionError { extension, message, .. }
-                        if extension == "hook PreToolUse" => Some(message.clone()),
-                    _ => None,
-                })
-            )
+            .chain(evs.iter().filter_map(|e| match e {
+                Event::ExtensionError {
+                    extension, message, ..
+                } if extension == "hook PreToolUse" => Some(message.clone()),
+                _ => None,
+            }))
             .any(|l| l.contains("heads up: slow disk")),
         "the systemMessage is surfaced on the hook channel"
     );
@@ -1480,7 +1496,11 @@ async fn model_invoked_skill_registers_hooks_that_fire_and_carry_skill_root() {
     // call, not the skill call - the skill call preceded registration). Its env
     // carries the skill's base_dir as SUSPENDERS_SKILL_ROOT.
     let envs = shell.envs.lock().unwrap();
-    assert_eq!(envs.len(), 1, "the registered hook fired once, on the next tool");
+    assert_eq!(
+        envs.len(),
+        1,
+        "the registered hook fired once, on the next tool"
+    );
     let expected_root = base_dir.to_string_lossy().into_owned();
     assert_eq!(
         envs[0].get("SUSPENDERS_SKILL_ROOT").map(String::as_str),
@@ -1675,7 +1695,11 @@ async fn process_group_shell_large_stdin_does_not_deadlock() {
         .await
         .expect("a large stdin round-trips without deadlock");
     assert_eq!(out.exit_code, 0);
-    assert_eq!(out.stdout.len(), payload.len(), "the whole payload echoed back");
+    assert_eq!(
+        out.stdout.len(),
+        payload.len(),
+        "the whole payload echoed back"
+    );
 }
 
 /// A normal command round-trips its stdout (the happy path stays intact after the
@@ -1717,7 +1741,10 @@ async fn process_group_shell_times_out_and_kills() {
             1, // 1s timeout, far below the 30s sleep
         )
         .await;
-    assert!(result.is_err(), "a hook past its timeout is an Err (fail-open)");
+    assert!(
+        result.is_err(),
+        "a hook past its timeout is an Err (fail-open)"
+    );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(10),
         "the timeout fired promptly (killpg), not after the full sleep"

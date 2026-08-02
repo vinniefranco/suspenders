@@ -123,7 +123,9 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     // launch notice; a config with no `hooks` block yields the empty manager.
     // Skill-hook registration (session scope) is Phase 4 - this holds only the
     // standing source, reachable by every Run.
-    let hook_manager = Arc::new(crate::hooks::HookManager::from_config(session.hooks.as_ref()));
+    let hook_manager = Arc::new(crate::hooks::HookManager::from_config(
+        session.hooks.as_ref(),
+    ));
 
     // Surface each fail-open hook parse skip as a launch notice, exactly like an
     // MCP connect or skill parse failure (ADR-0007's fail-open report seam, the
