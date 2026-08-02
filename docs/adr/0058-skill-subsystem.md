@@ -53,7 +53,7 @@ The two invocation paths are distinct on purpose. When the MODEL invokes a skill
 
 ## `argument-hint`, shown in the completion menu
 
-`argument-hint` is an optional frontmatter string parsed and shown after the slash command name in the `/`-menu completion, so `/commit` can advertise `/commit <message>`. It is display-only: it annotates the command in the menu and does not gate or parse the user's actual argument text, which still flows to `build_skill_llm_content` verbatim.
+`argument-hint` is an optional frontmatter string parsed and shown after the slash command name in the `/`-menu completion, so `/commit` can advertise `/commit <message>`. It is display-only: it annotates the command in the menu and never gates or parses the user's input. The user invocation injects `build_skill_llm_content(base_dir, body)` - the base-directory-wrapped skill body - as the submitted turn; the argument-hint is not consulted at commit and no separate arg string is spliced in (the fuzzy `/`-palette commits a highlighted command on the query-to-command boundary, so a fire-and-run skill has no trailing remainder to carry). The hint is purely a menu affordance advertising what to type into the ensuing turn.
 
 ## Bundled skills, a 4th level embedded at compile time
 

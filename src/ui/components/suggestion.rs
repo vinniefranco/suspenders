@@ -154,9 +154,14 @@ const EXPAND_AFFORDANCE_COLS: usize = 3;
 /// instead of chopped at width/2 - minus the ` → ` affordance's columns when a
 /// long row could show it, so the affordance never falls off the row's end. Pure.
 fn command_column_width(suggestions: &[completion::Suggestion], width: usize) -> usize {
+    // The command column must fit the name AND its ` <argument-hint>` (a skill's
+    // hint renders inside this column, after the name), so a hinted row's width
+    // includes the leading space + the hint.
     let max_label = suggestions
         .iter()
-        .map(|s| s.label.width())
+        .map(|s| {
+            s.label.width() + s.argument_hint.as_deref().map_or(0, |h| 1 + h.width())
+        })
         .max()
         .unwrap_or(0);
     let has_descriptions = suggestions.iter().any(|s| !s.description.is_empty());
@@ -202,6 +207,13 @@ fn suggestion_row(
     };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = push_label_with_match(&mut spans, s, state.expanded, text_color, cmd_col);
+    // The skill command's `argument-hint` (ADR-0058, qwen `/<name>
+    // <argument-hint>`): rendered muted right after the name, inside the command
+    // column, so the palette advertises what the command takes. Display-only.
+    if let Some(hint) = &s.argument_hint {
+        used = push_cols(&mut spans, " ", Style::default(), used, width);
+        used = push_cols(&mut spans, hint, secondary_style(theme), used, width);
+    }
     if used < cmd_col {
         used = push_cols(
             &mut spans,

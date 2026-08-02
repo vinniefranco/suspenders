@@ -348,6 +348,12 @@ pub enum Command {
     Conversation(oneshot::Sender<Conversation>),
     Plan(oneshot::Sender<Option<String>>),
     ResumeInfoQuery(oneshot::Sender<Option<ResumeInfo>>),
+    /// The discovered skill manager (ADR-0058), a clone of the shared `Arc` the
+    /// Agent discovered at launch. Read-only, so it rides the sync handler: the
+    /// UI reads it once at mount to build the `/<name>` slash-command layer
+    /// (ADR-0032/0058) and again to resolve a committed `/<skill>` to its
+    /// submit-prompt body. Cheap - the `Arc` clones, the manager is not copied.
+    Skills(oneshot::Sender<Arc<crate::skills::SkillManager>>),
 }
 
 /// Both flavors ride the one mpsc (public so the Run shell can post `Run`
@@ -523,6 +529,17 @@ impl AgentHandle {
     /// re-polls it after every live op; a dead Agent answers an empty list.
     pub async fn mcp_views(&self) -> Vec<crate::mcp::McpServerView> {
         self.query(Command::McpViews).await.unwrap_or_default()
+    }
+
+    /// The discovered [`crate::skills::SkillManager`] (ADR-0058), for the
+    /// `/<name>` slash-command layer (ADR-0032): the UI reads it once at mount
+    /// to build every discovered skill's slash descriptor, and again to resolve
+    /// a committed `/<skill>` to its submit-prompt body. A dead Agent answers a
+    /// fresh empty manager (no skills), so the caller never unwraps.
+    pub async fn skills(&self) -> Arc<crate::skills::SkillManager> {
+        self.query(Command::Skills)
+            .await
+            .unwrap_or_else(|| Arc::new(crate::skills::SkillManager::default()))
     }
 
     /// Reconnects one MCP server (ADR-0065 Phase C, the dialog's Reconnect action):
@@ -912,6 +929,9 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
         }
         Command::ResumeInfoQuery(reply) => {
             let _ = reply.send(state.resume_info.clone());
+        }
+        Command::Skills(reply) => {
+            let _ = reply.send(Arc::clone(&state.skill_manager));
         }
     }
 }

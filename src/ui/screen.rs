@@ -517,6 +517,12 @@ pub struct ScreenOpts {
     /// directory `cwd`. Empty by default (tests that don't care about the banner
     /// open with a bare Header); the `ui` adapter fills them at launch.
     pub header: HeaderFacts,
+    /// The dynamic slash-command layer (ADR-0032/0058): one descriptor per
+    /// discovered skill, threaded into the Composer at launch so every skill is
+    /// a `/<name>` command in the palette. Empty by default (a Session with no
+    /// skills, and tests that do not exercise them); the `ui` adapter fills it
+    /// from the discovered [`crate::skills::SkillManager`].
+    pub skill_commands: Vec<crate::ui::slash::SkillCommand>,
 }
 
 /// The facts the startup [`TranscriptItem::Header`] shows (qwen `AppHeader`):
@@ -686,7 +692,7 @@ impl Screen {
             pressure_level: PressureLevel::Ok,
             session_cost: INITIAL_SESSION_COST,
             mcp_offline: 0,
-            composer: Composer::new(opts.history),
+            composer: Composer::new(opts.history, opts.skill_commands),
             compact_mode: false,
             help_open: false,
             scroll_lines: 0,

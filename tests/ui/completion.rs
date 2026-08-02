@@ -1,9 +1,39 @@
 use super::*;
+use crate::ui::slash::{self, SkillCommand};
 
 const NOW: Millis = 1_000_000;
 
 fn no_recent(_: &str) -> Option<RecentUse> {
     None
+}
+
+// Ranks over the BUILT-IN registry alone (no dynamic skill layer) - the union
+// the pre-skill tests exercised. The two-layer `rank` takes the union slice; a
+// built-in-only union is `commands_ref(&[])`.
+fn rank(query: &str, recent: &dyn Fn(&str) -> Option<RecentUse>, now: Millis) -> Vec<Suggestion> {
+    let commands = slash::commands_ref(&[]);
+    super::rank(&commands, query, recent, now)
+}
+
+// Ranks over the UNION of built-ins and the given runtime skill commands - the
+// two-layer registry the Composer feeds in (ADR-0032/0058).
+fn rank_union(
+    skills: &[SkillCommand],
+    query: &str,
+    recent: &dyn Fn(&str) -> Option<RecentUse>,
+    now: Millis,
+) -> Vec<Suggestion> {
+    let commands = slash::commands_ref(skills);
+    super::rank(&commands, query, recent, now)
+}
+
+// A skill command descriptor for the union tests.
+fn skill(name: &str, help: &str, hint: Option<&str>) -> SkillCommand {
+    SkillCommand {
+        name: name.to_string(),
+        help: help.to_string(),
+        argument_hint: hint.map(str::to_string),
+    }
 }
 
 fn labels(s: &[Suggestion]) -> Vec<String> {
@@ -98,6 +128,69 @@ fn the_match_window_is_the_contiguous_prefix_span() {
     assert_eq!(s[0].matched, Some((0, 3)));
 }
 
+// --- the dynamic skill-command layer (ADR-0032/0058) -------------------
+
+#[test]
+fn the_empty_query_lists_skill_commands_beside_the_built_ins() {
+    // The dynamic layer joins the palette: a discovered `/commit` ranks
+    // alongside `/model`/`/theme`/`/mcp`. Built-ins lead the union
+    // (`original_index`), so the equal-strength `commit` (6) sorts after the
+    // shorter built-ins by the length tiebreak.
+    let skills = [skill("commit", "write a commit message", None)];
+    let s = rank_union(&skills, "", &no_recent, NOW);
+    assert!(
+        values(&s).contains(&"commit".to_string()),
+        "the skill command is on the slash surface: {:?}",
+        values(&s)
+    );
+}
+
+#[test]
+fn a_skill_command_ranks_by_the_same_prefix_ladder() {
+    // "/co" prefixes only the skill "commit"; no built-in has a 'c' prefix, so
+    // the skill is the sole prefix match and surfaces first.
+    let skills = [skill("commit", "write a commit message", None)];
+    let s = rank_union(&skills, "co", &no_recent, NOW);
+    assert_eq!(values(&s), vec!["commit"]);
+    assert_eq!(s[0].description, "write a commit message");
+    assert_eq!(s[0].matched, Some((0, 2)), "the 'co' prefix highlights");
+}
+
+#[test]
+fn a_disable_model_invocation_skill_is_on_the_slash_surface() {
+    // The slash surface lists the descriptor whatever the skill's model-catalog
+    // status: the adapter feeds EVERY discovered skill in (the 4a catalog filter
+    // is the tool's, not the menu's). The palette cannot tell the two apart -
+    // it ranks the descriptor it was given.
+    let skills = [skill("deploy", "ship it", None)];
+    let s = rank_union(&skills, "deploy", &no_recent, NOW);
+    assert_eq!(values(&s), vec!["deploy"]);
+}
+
+#[test]
+fn a_skill_argument_hint_rides_the_suggestion() {
+    // The `argument-hint` flows through ranking to the render-ready suggestion
+    // (qwen `/<name> <argument-hint>`), so the menu can annotate the command.
+    let skills = [skill("commit", "write a commit message", Some("<message>"))];
+    let s = rank_union(&skills, "commit", &no_recent, NOW);
+    assert_eq!(s[0].argument_hint.as_deref(), Some("<message>"));
+    // A built-in carries no hint.
+    let m = rank_union(&skills, "model", &no_recent, NOW);
+    assert_eq!(m[0].argument_hint, None);
+}
+
+#[test]
+fn a_built_in_wins_a_name_collision_with_a_skill() {
+    // A skill cannot shadow a built-in: built-ins lead the union, and the
+    // per-command best keeps the first (the built-in), so `/model` stays the
+    // selector-opening built-in even if a `model` skill is discovered.
+    let skills = [skill("model", "a shadowing skill", None)];
+    let s = rank_union(&skills, "model", &no_recent, NOW);
+    assert_eq!(values(&s), vec!["model"]);
+    // The built-in's help wins, not the skill's.
+    assert_eq!(s[0].description, "choose the model for this session");
+}
+
 // --- nav (wrap, clamp, scroll window) ----------------------------------
 
 #[test]
@@ -175,9 +268,9 @@ fn expand_toggles_only_the_active_row_and_collapse_clears_it() {
 // strength, everything zeroed. Tests set the ONE ladder field they pin via
 // struct update (`Ranked { field, ..base() }`), so each test reads as the
 // single tier it exercises.
-fn base() -> Ranked {
+fn base() -> Ranked<'static> {
     Ranked {
-        command: &slash::COMMANDS[0],
+        command: CommandRef::from_static(&slash::COMMANDS[0]),
         matched_value: slash::COMMANDS[0].name.to_string(),
         strength: MatchStrength::Fuzzy,
         completion_priority: 0,
@@ -312,8 +405,9 @@ fn recency_decay_responds_to_the_injected_clock() {
 #[test]
 fn the_prefix_fallback_keeps_prefix_matches_with_the_ladder() {
     let recent_of = |_: &str| 0.0;
+    let built_ins = slash::commands_ref(&[]);
     // "mod" prefixes only "model".
-    let mut out = prefix_ranked("mod", &recent_of);
+    let mut out = prefix_ranked(&built_ins, "mod", &recent_of);
     out.sort_by(compare_ranked);
     let vals: Vec<_> = out
         .into_iter()
@@ -322,11 +416,11 @@ fn the_prefix_fallback_keeps_prefix_matches_with_the_ladder() {
         .collect();
     assert_eq!(vals, vec!["model"]);
     // An exact name still ranks EXACT (the ladder holds in the fallback).
-    let exact = prefix_ranked("model", &recent_of);
+    let exact = prefix_ranked(&built_ins, "model", &recent_of);
     assert_eq!(exact.len(), 1);
     assert_eq!(exact[0].strength, MatchStrength::Exact);
     // A non-prefix query yields nothing (prefix-only, no fuzzy).
-    assert!(prefix_ranked("dl", &recent_of).is_empty());
+    assert!(prefix_ranked(&built_ins, "dl", &recent_of).is_empty());
 }
 
 // --- rank_paths (the AT file picker's pure ranking) --------------------

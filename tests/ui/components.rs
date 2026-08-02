@@ -3110,6 +3110,7 @@ fn suggestion(
         label: label.to_string(),
         value: value.to_string(),
         description: desc.to_string(),
+        argument_hint: None,
         matched,
     }
 }

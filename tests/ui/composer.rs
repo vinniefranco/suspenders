@@ -14,11 +14,26 @@ impl CommandSelector {
 // =======================================================================
 
 fn fresh() -> Composer {
-    Composer::new(vec![])
+    Composer::new(vec![], vec![])
 }
 
 fn with_history(entries: &[&str]) -> Composer {
-    Composer::new(entries.iter().map(|s| s.to_string()).collect())
+    Composer::new(entries.iter().map(|s| s.to_string()).collect(), vec![])
+}
+
+// A Composer seeded with the dynamic skill-command layer (ADR-0032/0058), for
+// the /<skill> palette tests. One [`slash::SkillCommand`] per (name, help,
+// argument-hint) triple.
+fn with_skills(skills: &[(&str, &str, Option<&str>)]) -> Composer {
+    let skills = skills
+        .iter()
+        .map(|(name, help, hint)| slash::SkillCommand {
+            name: name.to_string(),
+            help: help.to_string(),
+            argument_hint: hint.map(str::to_string),
+        })
+        .collect();
+    Composer::new(vec![], skills)
 }
 
 // A Composer holding `value` with the cursor at char index `cursor` -
@@ -271,6 +286,87 @@ fn a_slash_draft_never_submits_or_steers_even_while_running() {
             }]
         ),
         other => panic!("expected a consumed commit, got {other:?}"),
+    }
+}
+
+// --- the dynamic skill-command layer (ADR-0032/0058) --------------------
+
+// A skills-seeded Composer holding `draft` at the end - the `/<skill>` menu
+// opener (the analog of `slashing` but with the dynamic layer fed in).
+fn slashing_with_skills(skills: &[(&str, &str, Option<&str>)], draft: &str) -> Composer {
+    let mut c = with_skills(skills);
+    set_draft(&mut c, draft, draft.chars().count());
+    c
+}
+
+// The Menu overlay's ranked suggestions, or a panic if the overlay is not the
+// palette.
+fn menu_suggestions(c: &Composer) -> Vec<completion::Suggestion> {
+    match overlay(c) {
+        Some(OverlayView::Menu { suggestions, .. }) => suggestions,
+        other => panic!("expected the palette menu, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_skill_command_is_listed_in_the_palette_beside_the_built_ins() {
+    // Typing `/` opens the palette over the two-layer registry: a discovered
+    // `/commit` sits in the same menu as the built-ins.
+    let c = slashing_with_skills(&[("commit", "write a commit", None)], "/");
+    let names: Vec<String> = menu_suggestions(&c).iter().map(|s| s.value.clone()).collect();
+    assert!(names.contains(&"commit".to_string()), "listed: {names:?}");
+    assert!(names.contains(&"model".to_string()), "built-ins too: {names:?}");
+}
+
+#[test]
+fn a_disable_model_invocation_skill_still_appears_on_the_slash_surface() {
+    // The Composer ranks whatever descriptors it was fed - the adapter feeds
+    // EVERY discovered skill in (a disable-model-invocation skill included, since
+    // the 4a catalog filter is the tool's, not the menu's). Filtering to it
+    // surfaces it.
+    let c = slashing_with_skills(&[("deploy", "ship it", None)], "/deploy");
+    let names: Vec<String> = menu_suggestions(&c).iter().map(|s| s.value.clone()).collect();
+    assert_eq!(names, vec!["deploy"]);
+}
+
+#[test]
+fn the_menu_shows_a_skill_argument_hint() {
+    // The `argument-hint` reaches the Menu overlay's suggestion (qwen `/<name>
+    // <argument-hint>`), display-only, for the completion render.
+    let c = slashing_with_skills(&[("commit", "write a commit", Some("<message>"))], "/commit");
+    let s = menu_suggestions(&c);
+    assert_eq!(s[0].value, "commit");
+    assert_eq!(s[0].argument_hint.as_deref(), Some("<message>"));
+}
+
+#[test]
+fn committing_a_skill_command_fires_and_runs_an_effect_command() {
+    // Enter on a highlighted `/<skill>` is fire-and-run: it emits a plain
+    // `Effect::Command { name }` (the adapter maps it to the submit-prompt
+    // injection) and clears the draft. A skill never opens a selector.
+    let mut c = slashing_with_skills(&[("commit", "write a commit", None)], "/commit");
+    assert_eq!(
+        fold_consumed(&mut c, Key::Enter),
+        vec![Effect::Command {
+            name: "commit".into(),
+            generation: 0,
+        }]
+    );
+    assert_eq!(c.view().draft, "", "the draft clears after a fire-and-run skill");
+    assert_eq!(overlay(&c), None);
+}
+
+#[test]
+fn an_unknown_slash_command_does_not_resolve_to_a_skill() {
+    // With a `/commit` skill discovered, an unknown `/nope` still resolves to
+    // nothing - the unknown-command notice, no effect, no skill.
+    let mut c = slashing_with_skills(&[("commit", "write a commit", None)], "/nope");
+    match c.handle_key(UngatedKey::for_test(Key::Enter), Status::Idle) {
+        KeyOutcome::Consumed { effects, notice } => {
+            assert_eq!(effects, vec![], "no effect for an unknown command");
+            assert_eq!(notice.as_deref(), Some("unknown command: /nope"));
+        }
+        other => panic!("expected a consumed unknown-command, got {other:?}"),
     }
 }
 

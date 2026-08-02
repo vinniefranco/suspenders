@@ -198,6 +198,29 @@ pub(crate) struct AdapterCtx<'a> {
 pub(crate) struct AdapterState {
     pub(crate) themes: ActiveTheme,
     pub(crate) history: Option<String>,
+    /// The discovered skill manager (ADR-0058), held so a committed `/<skill>`
+    /// command resolves to its submit-prompt body ([`build_skill_llm_content`]).
+    /// The SAME `Arc` the Agent discovered; read-only here (the slash surface).
+    pub(crate) skills: std::sync::Arc<crate::skills::SkillManager>,
+}
+
+/// Builds the dynamic slash-command layer (ADR-0032/0058): one
+/// [`slash::SkillCommand`] descriptor per discovered skill, in the manager's
+/// priority-sorted order. EVERY discovered skill is on the slash surface - a
+/// `disable-model-invocation` skill (dropped from the model catalog in Phase 4a)
+/// and a conditional/`paths:` skill included - because the model-catalog filter
+/// only shapes the model-facing `<available_skills>`, not the user's `/<name>`
+/// menu. The `argument-hint` rides along for the completion annotation.
+fn skill_slash_commands(manager: &crate::skills::SkillManager) -> Vec<slash::SkillCommand> {
+    manager
+        .available()
+        .iter()
+        .map(|skill| slash::SkillCommand {
+            name: skill.name.clone(),
+            help: skill.description.clone(),
+            argument_hint: skill.argument_hint.clone(),
+        })
+        .collect()
 }
 
 async fn run_loop(
@@ -262,19 +285,32 @@ async fn run_loop(
         tip_seed: history.len(),
     };
 
+    // The dynamic slash-command layer (ADR-0032/0058): every discovered skill
+    // becomes a `/<name>` command. The Agent discovered the skills at launch; the
+    // adapter reads the shared manager once here to build the descriptors the
+    // pure Composer ranks, and keeps the manager (below, in `AdapterState`) so a
+    // committed `/<skill>` can resolve to its submit-prompt body. The whole
+    // discovered set is exposed on the slash surface - the model-catalog filter
+    // (disable-model-invocation, conditional/paths) is the tool's, not the menu's.
+    let skill_manager = agent.skills().await;
+    let skill_commands = skill_slash_commands(&skill_manager);
+
     let mut screen = Some(Screen::new(ScreenOpts {
         context_budget: Some(session.context_budget_for(&session.model)),
         compaction_slack: session.compaction_slack,
         history,
         notices: launch_notices,
         header,
+        skill_commands,
     }));
 
     // The mutable adapter state the Effect handlers thread as one carrier:
-    // the Theme state (ADR-0038) and the history path.
+    // the Theme state (ADR-0038), the history path, and the discovered skill
+    // manager (ADR-0058, for `/<skill>` invocation).
     let mut state = AdapterState {
         themes,
         history: history_store,
+        skills: skill_manager,
     };
 
     // The per-item render cache: settled items' lines and wrapped counts are
@@ -761,12 +797,11 @@ async fn run_effect(
             screen
         }
         Effect::HistoryAppend(prompt) => persist_history(screen, state, prompt),
-        // A committed Slash Command (ADR-0032/0033). The adapter routes it
-        // through the single `command::run` seam - `is_handled` reflects exactly
-        // what it routes, so an unwired registry entry is a visible info line,
-        // never a silent drop.
+        // A committed Slash Command (ADR-0032/0033): a discovered `/<skill>` is
+        // the submit-prompt injection, everything else the `command::run` seam.
+        // The classify-and-route logic lives in the handler (IOSP).
         Effect::Command { name, generation } => {
-            command::run(screen, ctx, state, &name, generation).await
+            run_command_effect(screen, ctx, state, name, generation).await
         }
         // A row was chosen from a command's selector (ADR-0033): routed through
         // the same seam as the command itself.
@@ -937,6 +972,36 @@ fn copy_via_osc52(text: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Routes a committed Slash Command (ADR-0032/0058) to its adapter work: a
+/// discovered `/<skill>` becomes the submit-prompt injection (a DIFFERENT path
+/// from the model calling the `skill` tool - qwen `submit_prompt`), and every
+/// other name routes through the single `command::run` seam. A skill resolves
+/// to its base-directory-wrapped body ([`build_skill_llm_content`]) submitted as
+/// a USER TURN through the normal submission path, so it flows through the run
+/// loop (and fires UserPromptSubmit hooks); a fire-and-run skill has no trailing
+/// arg to carry (the palette commits on the query-to-command boundary).
+async fn run_command_effect(
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    state: &mut AdapterState,
+    name: String,
+    generation: u64,
+) -> Screen {
+    if let Some(prompt) = skill_injection(&state.skills, &name) {
+        return run_agent_command(AgentCommand::Submit(prompt), screen, ctx, state).await;
+    }
+    command::run(screen, ctx, state, &name, generation).await
+}
+
+/// The submit-prompt body a committed `/<name>` injects when `name` is a
+/// discovered skill, or `None` when it is a built-in (ADR-0058). Pure over the
+/// manager: resolves the skill and wraps its body with its base directory.
+fn skill_injection(manager: &crate::skills::SkillManager, name: &str) -> Option<String> {
+    manager
+        .find(name)
+        .map(|skill| crate::skills::build_skill_llm_content(&skill.base_dir, &skill.body))
 }
 
 /// Runs one [`AgentCommand`] against the live [`AgentHandle`]: `submit`/`steer`
