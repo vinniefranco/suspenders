@@ -128,7 +128,38 @@ pub(super) async fn run_with(
     let outcome = run(
         conv,
         session,
-        RunEnv { tool_ctx: &ctx },
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: None,
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
+    (outcome, deps)
+}
+
+/// Runs the loop with a hook firing handle wired (Phase 3a, ADR-0066). The
+/// caller builds a [`crate::run::hooks::Hooks`] over an injected fake
+/// ShellExec/HttpPost (crafted [`crate::hooks::HookOutcome`]s) and a fresh
+/// [`crate::llm::Llm`]; the `run` threads it into `RunEnv.hooks` so `batch` fires
+/// the four tool events. Returns `(outcome, deps)` for event/checkpoint
+/// inspection, mirroring [`run_with`].
+pub(super) async fn run_with_hooks(
+    session: &Session,
+    prompt: &str,
+    mut deps: FakeDeps,
+    hooks: &crate::run::hooks::Hooks<'_>,
+) -> (Outcome, FakeDeps) {
+    let conv = conversation(session, prompt);
+    let ctx = tool_ctx(session);
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: Some(hooks),
+        },
         &mut deps,
         RunOpts::default(),
     )

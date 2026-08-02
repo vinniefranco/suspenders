@@ -11,6 +11,7 @@ pub mod child;
 pub mod deps;
 mod dispatch;
 mod finish;
+pub mod hooks;
 pub mod loop_;
 pub mod next_speaker;
 pub mod settlement;
@@ -85,6 +86,13 @@ pub struct Capture {
     /// [`crate::tool::caps::UnavailableBackgroundShellSpawner`] here instead - the
     /// recursion guard (a subagent cannot background a shell).
     pub bg_shells: Arc<dyn crate::tool::caps::BackgroundShellSpawner>,
+    /// The hook subsystem (Phase 3a, ADR-0066): the standing hook manager the
+    /// Agent resolved once at launch, threaded so `run` can build the Run's
+    /// [`crate::run::hooks::Hooks`] firing handle over it. `Arc<HookManager>` is
+    /// Send+Sync, so the [`Capture`] stays `Send` for the `tokio::spawn` at the
+    /// Agent. A child Run carries the empty manager (a subagent fires no hooks in
+    /// this phase - the tool-dispatch seam is the parent's).
+    pub hooks: Arc<crate::hooks::HookManager>,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -155,11 +163,25 @@ pub async fn run(
     // this Run's captured Model (ADR-0037), and the Run's Capabilities.
     let tool_ctx = session.tool_ctx(&capture.model, caps);
 
+    // The Run's hook firing handle (Phase 3a, ADR-0066): built at THIS wiring
+    // layer (above both the `hooks` leaf and `run_command`) over the standing
+    // manager the Agent resolved, the captured Llm boundary + Model as the prompt
+    // capability, and the Session's Project Root as the payload cwd. The
+    // production shell/http capabilities are wired inside `Hooks::new`. It borrows
+    // `capture`, which outlives the loop below.
+    let hooks = crate::run::hooks::Hooks::new(
+        capture.hooks.as_ref(),
+        capture.llm.as_ref(),
+        &capture.model,
+        session.root.clone(),
+    );
+
     loop_::run(
         conversation,
         &session,
         loop_::RunEnv {
             tool_ctx: &tool_ctx,
+            hooks: Some(&hooks),
         },
         &mut deps,
         opts,
@@ -283,6 +305,10 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
         &session,
         RunEnv {
             tool_ctx: &tool_ctx,
+            // A child Run (subagent) fires no hooks in Phase 3a: the tool-dispatch
+            // seam that fires them is the parent's, and a subagent has no standing
+            // manager threaded. Phase 3b/4 revisits subagent-scoped firing.
+            hooks: None,
         },
         &mut deps,
         RunOpts::default(),

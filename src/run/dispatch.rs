@@ -178,6 +178,26 @@ async fn continue_tools<D: RunDeps>(
     }
     let (results, conversation) =
         batch::execute_tools(state, conversation, &response.content).await;
+
+    // A hook's `continue:false` (Phase 3a, ADR-0066): a Pre/PostToolUse hook that
+    // ran during this batch requested the loop stop. Answer the batch first (the
+    // results are appended so the Conversation never persists an unanswered
+    // tool_use block), then close the Run on the hook's reason through the same
+    // custom-stop path an after-Pass `Stop` takes. Taken (not peeked) so a later
+    // Pass does not re-close.
+    if let Some(reason) = state.hook_stop.take() {
+        let (mut conversation, response, results) = (conversation, response, results);
+        conversation.add_assistant_response(response.content.clone(), state.deps.provenance());
+        conversation.add_tool_results(results, Vec::new());
+        state.deps.checkpoint(&conversation);
+        return Flow::Done(finish::close_custom(
+            state,
+            conversation,
+            voice::Marker::RunStopped.text(),
+            reason,
+        ));
+    }
+
     next_pass(state, conversation, response, results).await
 }
 

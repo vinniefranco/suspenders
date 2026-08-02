@@ -117,6 +117,26 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         ));
     }
 
+    // The hook subsystem (ADR-0066): resolve the standing `config.json` hooks
+    // once, fail-open, the same shape as the MCP/skill attach above. A malformed
+    // hook entry is recorded on the manager and skipped, surfaced below as a
+    // launch notice; a config with no `hooks` block yields the empty manager.
+    // Skill-hook registration (session scope) is Phase 4 - this holds only the
+    // standing source, reachable by every Run.
+    let hook_manager = Arc::new(crate::hooks::HookManager::from_config(session.hooks.as_ref()));
+
+    // Surface each fail-open hook parse skip as a launch notice, exactly like an
+    // MCP connect or skill parse failure (ADR-0007's fail-open report seam, the
+    // fail-open-with-visibility ethos of ADR-0018): a malformed hook is a visible
+    // skip, not a silent one.
+    for (context, reason) in hook_manager.failures() {
+        let _ = events.send(Event::extension_error(
+            format!("hook {context}"),
+            crate::event::Stage::PreRun,
+            reason.clone(),
+        ));
+    }
+
     // The subagent registry (P4/F4, ADR-0061): the built-in defs, built once
     // here. The `agent` tool holds it (for its dynamic schema/description, the
     // way the `skill` tool holds a SkillManager) AND each Run's Capture threads
@@ -230,6 +250,7 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         mcp,
         session_tools,
         skill_manager,
+        hook_manager,
         subagents,
         background: HashMap::new(),
         notifications: Vec::new(),

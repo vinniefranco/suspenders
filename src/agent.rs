@@ -733,6 +733,12 @@ struct AgentState {
     // (which must re-mint that same skill tool) without re-discovering skills
     // (ADR-0065 Phase C).
     skill_manager: Arc<crate::skills::SkillManager>,
+    // The hook subsystem (ADR-0066): the standing `config.json` hooks resolved
+    // once in `init_agent`, held so every Run fires the same standing set.
+    // Threaded into each Run's Capture (via AgentDeps) so `batch.rs` can fire the
+    // tool-dispatch + permission hooks. Skill-hook REGISTRATION (session scope) is
+    // Phase 4; this holds only the standing source today, reachable by every Run.
+    hook_manager: Arc<crate::hooks::HookManager>,
     // The subagent definitions (P4/F4, ADR-0061): the built-in registry, built
     // once in `init_agent`. Held by the `agent` tool (on `session_tools`) for its
     // dynamic schema/description AND threaded into each Run's Capture (via
@@ -1192,6 +1198,7 @@ fn spawn_run(state: &mut AgentState) {
         session_tools: Arc::clone(&state.session_tools),
         subagents: Arc::clone(&state.subagents),
         session: state.session.clone(),
+        hooks: Arc::clone(&state.hook_manager),
     });
     let conversation = state.conversation.clone();
     let session = state.session.clone();

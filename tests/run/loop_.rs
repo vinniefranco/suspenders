@@ -1581,7 +1581,10 @@ async fn proactive_compacts_before_first_pass() {
     let outcome = run(
         conv,
         &session,
-        RunEnv { tool_ctx: &ctx },
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: None,
+        },
         &mut deps,
         RunOpts::default(),
     )

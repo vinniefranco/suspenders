@@ -138,6 +138,14 @@ pub struct Session {
     /// defaults to [`McpSource::User`](crate::mcp::McpSource::User) when the plan
     /// map is built.
     pub mcp_sources: BTreeMap<String, crate::mcp::McpSource>,
+    /// The standing hook config (ADR-0066), the opaque `hooks` value from
+    /// `config.json` carried verbatim like qwen keeps its settings `hooks` block.
+    /// `None` when no scope declared one (the common case). `init_agent` hands it
+    /// to [`HookManager::from_config`](crate::hooks::HookManager::from_config),
+    /// which parses it fail-open. A file-only value (the env cannot express it);
+    /// a later scope replaces an earlier one (the plain overlay, not the MCP
+    /// merge - a first-cut choice, ADR-0066).
+    pub hooks: Option<serde_json::Value>,
 }
 
 /// Raised (returned) when a Session's fixed facts fail validation. The message
@@ -167,6 +175,12 @@ pub struct SessionConfig {
     /// records the lowest scope that named it (workspace shadows user). Default
     /// empty; never file-settable directly - it is a byproduct of composition.
     pub mcp_sources: BTreeMap<String, crate::mcp::McpSource>,
+    /// The standing hook config (ADR-0066): the opaque `hooks` value from
+    /// `config.json`, carried verbatim and parsed fail-open by the
+    /// [`HookManager`](crate::hooks::HookManager) at launch. Default `None`
+    /// (no hooks); a file-only value (no env seam) landed by the plain overlay,
+    /// so a later scope replaces the earlier one.
+    pub hooks: Option<serde_json::Value>,
     /// The scoped `provider/model-id` the launch Model resolves from.
     pub model: String,
     /// The configured Theme name (ADR-0038): a built-in (`dark`, `light`) or a
@@ -273,6 +287,9 @@ impl SessionConfig {
             // both fill in as the composer merges the settings scopes.
             mcp_excluded: Vec::new(),
             mcp_sources: BTreeMap::new(),
+            // No standing hooks out of the box (ADR-0066): the user adds them by
+            // hand under a `hooks` key. `None` means the Agent fires none.
+            hooks: None,
             model: "local/qwen/Qwen3.6-27B-MTP-GGUF".into(),
             theme: "dark".into(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -447,6 +464,10 @@ impl SessionConfig {
             // so this is an empty array in the template - present so a user knows
             // the `/mcp` dialog's disable toggle has a home here.
             mcp_excluded: Some(base.mcp_excluded),
+            // The standing hooks value (ADR-0066): base ships none, so this is
+            // absent from the template - the `hooks` key is documented in the ADR
+            // and left out of the scaffold so an empty null is not persisted.
+            hooks: base.hooks,
             model: Some(base.model),
             theme: Some(base.theme),
             max_tokens: Some(base.max_tokens),
@@ -795,6 +816,12 @@ pub(crate) struct FileConfig {
     /// so the composer - not [`apply`](FileConfig::apply) - lands it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp_excluded: Option<Vec<String>>,
+    /// The standing hook config (ADR-0066): the opaque `hooks` value kept
+    /// verbatim (qwen's settings `hooks` block), parsed fail-open by the
+    /// [`HookManager`](crate::hooks::HookManager) at launch rather than by serde
+    /// here - so a malformed hook is a visible skip, not a config-load failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -862,6 +889,10 @@ impl FileConfig {
             &mut cfg.malformed_retry_budget,
         );
         overlay(&self.skip_next_speaker, &mut cfg.skip_next_speaker);
+        // The standing hooks value (ADR-0066): a plain overlay like the scalars,
+        // so a later scope's `hooks` block replaces the earlier one (the first-cut
+        // choice; the MCP-style cross-scope merge is deferred).
+        overlay_opt(&self.hooks, &mut cfg.hooks);
     }
 }
 
@@ -1148,6 +1179,10 @@ impl Session {
             mcp_servers: config.mcp_servers.clone(),
             mcp_excluded: config.mcp_excluded.clone(),
             mcp_sources: config.mcp_sources.clone(),
+            // The standing hooks value rides from config verbatim (ADR-0066): a
+            // file-only value like `mcp_servers`, parsed fail-open by the
+            // HookManager at launch, not here.
+            hooks: config.hooks.clone(),
         };
 
         validate(&session)?;

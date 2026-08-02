@@ -58,6 +58,7 @@ pub(crate) struct RunSpawn {
     pub(crate) session_tools: Arc<[Box<dyn crate::tool::Tool>]>,
     pub(crate) subagents: Arc<crate::subagents::SubagentRegistry>,
     pub(crate) session: crate::session::Session,
+    pub(crate) hooks: Arc<crate::hooks::HookManager>,
 }
 
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
@@ -90,6 +91,10 @@ pub(crate) struct AgentDeps {
     /// The child Run's turn bound (qwen's per-subagent run cap): the Session's
     /// own `run_limit`, so a subagent runs the same bound a top-level Run does.
     subagent_run_limit: usize,
+    /// The standing hook manager (Phase 3a, ADR-0066): the Agent resolved it once
+    /// at launch. Threaded into each Run's [`crate::run::Capture`] so `run` builds
+    /// the Run's hook firing handle over it.
+    hooks: Arc<crate::hooks::HookManager>,
 }
 
 impl AgentDeps {
@@ -106,6 +111,7 @@ impl AgentDeps {
             session_tools,
             subagents,
             session,
+            hooks,
         } = spawn;
         let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
@@ -118,6 +124,7 @@ impl AgentDeps {
             subagents,
             session,
             subagent_run_limit,
+            hooks,
         }
     }
 
@@ -177,6 +184,10 @@ impl AgentDeps {
             bg_shells: Arc::new(AgentBackgroundShellSpawner {
                 tx: self.tx.clone(),
             }),
+            // The standing hook manager (Phase 3a, ADR-0066): threaded so `run`
+            // builds the Run's firing handle over it. Shared by Arc, like the tool
+            // set - the manager is immutable for the Session's lifetime this phase.
+            hooks: Arc::clone(&self.hooks),
         }
     }
 

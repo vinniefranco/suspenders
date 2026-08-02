@@ -36,12 +36,18 @@
 //!   [`hooks_for`](manager::HookManager::hooks_for) with matcher filtering, and
 //!   records [`failures`](manager::HookManager::failures).
 //!
-//! ## What is out of THIS phase (Phase 2)
+//! ## The leaf, and what is wired above it
 //!
-//! This phase delivers the fully unit-tested foundation. WIRING the sixteen
-//! fire-points into the run loop and integrating the decision (approvals /
-//! StopReason / tool dispatch) is Phase 3 (ADR-0066), out of scope here. The
-//! rejected `function` hook type and qwen's deferred surface (async hooks, the
+//! Phase 2 delivered this fully unit-tested foundation. Phase 3a WIRES the four
+//! tool-dispatch + permission events (`PreToolUse`, `PostToolUse`,
+//! `PostToolUseFailure`, `PermissionRequest`) into the live run loop at
+//! [`crate::run::hooks`] (the firing facade + production ShellExec/HttpPost
+//! capabilities, which live ABOVE this leaf so the leaf never reaches up into
+//! `run_command`), fired from the tool-dispatch seam [`crate::run::batch`]. The
+//! other twelve lifecycle events (Stop / session / compaction / todo / subagent /
+//! UserPromptSubmit / Notification) are Phase 3b, and skill-hook REGISTRATION on
+//! skill invocation is Phase 4 - both out of scope of Phase 3a. The rejected
+//! `function` hook type and qwen's deferred surface (async hooks, the
 //! `sequential` flag, extension/system scopes, `allowedEnvVars` / `env` /
 //! `headers` / `once` / `if`) are recorded as OUT in ADR-0066.
 

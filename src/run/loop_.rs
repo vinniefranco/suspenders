@@ -78,6 +78,16 @@ pub(super) struct LoopState<'a, D: RunDeps> {
     pub(super) deps: &'a mut D,
     pub(super) emitter: Emitter,
     pub(super) tool_ctx: &'a ToolCtx,
+    // The Run's hook firing handle (Phase 3a, ADR-0066), threaded from RunEnv so
+    // `batch` can fire the four tool events. `None` for a Run that fires no hooks.
+    pub(super) hooks: Option<&'a crate::run::hooks::Hooks<'a>>,
+    // A hook's `continue:false` halt requested during a tool batch (Phase 3a,
+    // ADR-0066): the minimal Stop thread. `batch` records the reason here when a
+    // Pre/PostToolUse hook returns `continue:false`; `dispatch::continue_tools`
+    // reads it AFTER the batch answers and closes the Run through the same
+    // `close_custom` path an after-Pass `Stop` takes. Phase 3b widens this to the
+    // full lifecycle-Stop event set.
+    pub(super) hook_stop: Option<String>,
     pub(super) plan: Plan,
     // The current Pass number, 1-based (replaces the Ledger's `pass()`).
     pub(super) turn: u64,
@@ -108,10 +118,17 @@ pub(super) struct LoopState<'a, D: RunDeps> {
 }
 
 /// The Tool execution context for one Run: the [`ToolCtx`] the caller builds
-/// from Session data. A struct (not a bare `&ToolCtx`) so a future Run-scoped
-/// input can join it without churning every call site.
+/// from Session data, plus the Run's optional hook firing handle (Phase 3a,
+/// ADR-0066). A struct (not a bare `&ToolCtx`) so a Run-scoped input can join it
+/// without churning every call site - the [`crate::run::hooks::Hooks`] handle is
+/// exactly the input this comment anticipated.
 pub struct RunEnv<'a> {
     pub tool_ctx: &'a ToolCtx,
+    /// The Run's hook firing handle (Phase 3a, ADR-0066), or `None` for a Run that
+    /// fires no hooks (a child/subagent Run, or a test that does not wire them).
+    /// The tool-dispatch seam ([`crate::run::batch`]) fires the four tool events
+    /// through it; `None` is the fire-nothing path.
+    pub hooks: Option<&'a crate::run::hooks::Hooks<'a>>,
 }
 
 /// Runs the loop until the model stops asking for tools, the turn bound is hit,
@@ -135,6 +152,8 @@ pub async fn run<D: RunDeps>(
         deps,
         emitter,
         tool_ctx: env.tool_ctx,
+        hooks: env.hooks,
+        hook_stop: None,
         plan,
         turn: 1,
         max_turns: session.run_limit,
