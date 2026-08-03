@@ -143,7 +143,7 @@ use header::{HeaderTier, header_tier, tildeify_with_home};
 #[cfg(test)]
 use markdown_render::{CODE_INSET, CodeFragment, highlight_code, markdown_lines};
 #[cfg(test)]
-use overlay::{help_panel_lines, question_modal_lines};
+use overlay::{help_panel_lines, plan_modal_lines, question_modal_lines};
 #[cfg(test)]
 use pending::{
     append_live, capped_composer_height, frame_chunks, pending_body_lines, pending_layout,

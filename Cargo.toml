@@ -89,6 +89,17 @@ base64 = "0.23.0"
 sha2 = "0.10"
 rand = "0.8"
 
+# Plan-mode shell classifier (ADR-0067, Phase 4b): a faithful port of qwen
+# v0.21.4's tree-sitter-bash safety classifier (`shellAstParser.ts`). qwen uses
+# web-tree-sitter (async WASM grammar init); the native `tree-sitter` crate parses
+# SYNCHRONOUSLY, so `shell_safety::classify_shell_command_safety` is a pure sync
+# fold. `tree-sitter-bash` 0.25.1 ships the bash grammar (a `cc`-built native
+# grammar via `tree-sitter-language`) whose node kinds match qwen's WASM grammar
+# 1:1 (command/redirected_statement/command_substitution/...); tree-sitter 0.26.11
+# resolves against its pinned ABI.
+tree-sitter = "0.26"
+tree-sitter-bash = "0.25.1"
+
 # The Catalog data generator (ADR-0037): `cargo run --bin generate-models`
 # rewrites the committed src/llm/catalog/data/*.json from models.dev.
 [[bin]]

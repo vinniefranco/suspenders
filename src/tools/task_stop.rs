@@ -31,6 +31,12 @@ const DESCRIPTION: &str = "Stop a background task by its ID. Running agents and 
 
 #[async_trait::async_trait]
 impl Tool for TaskStop {
+    // Other (qwen task-stop.ts `Kind.Other`): BLOCKED in plan mode (Other is not
+    // read-only). It is deferred anyway, so it rarely surfaces during planning.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Other
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task_stop".into(),

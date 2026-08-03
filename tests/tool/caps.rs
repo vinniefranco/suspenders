@@ -22,6 +22,9 @@ impl Capabilities {
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
             bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
         }
     }
 
@@ -38,6 +41,9 @@ impl Capabilities {
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
             bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
         }
     }
 
@@ -54,6 +60,9 @@ impl Capabilities {
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
             bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
         }
     }
 
@@ -71,6 +80,9 @@ impl Capabilities {
             questioner,
             subagents: Arc::new(UnavailableSubagentSpawner),
             bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
         }
     }
 
@@ -88,6 +100,9 @@ impl Capabilities {
             questioner: Arc::new(DecliningQuestioner),
             subagents,
             bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
         }
     }
 
@@ -105,6 +120,29 @@ impl Capabilities {
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
             bg_shells,
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
+        }
+    }
+
+    /// Capabilities over a caller-supplied [`PlanMode`] (and the full built-in
+    /// registry + denying effect seams), for the `enter_plan_mode`/`exit_plan_mode`
+    /// tests that inject a scripted plan-mode capability and assert what it
+    /// received/returned. The single plan-mode construction site, so a future
+    /// consumer touches one place.
+    pub fn for_test_with_plan_mode(plan_mode: Arc<dyn crate::tool::caps::PlanMode>) -> Self {
+        Capabilities {
+            registry: test_registry(),
+            read_cache: Arc::new(FileReadCache::new()),
+            approver: Arc::new(DenyingApprover),
+            side_query: Arc::new(DenyingSideQuery),
+            questioner: Arc::new(DecliningQuestioner),
+            subagents: Arc::new(UnavailableSubagentSpawner),
+            bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode,
         }
     }
 
@@ -122,6 +160,9 @@ impl Capabilities {
             questioner: Arc::new(DecliningQuestioner),
             subagents: Arc::new(UnavailableSubagentSpawner),
             bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+            plan_mode: Arc::new(SubagentPlanMode),
         }
     }
 }
@@ -174,6 +215,9 @@ async fn a_real_approver_returns_its_injected_decision() {
         questioner: Arc::new(DecliningQuestioner),
         subagents: Arc::new(UnavailableSubagentSpawner),
         bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+        approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+        plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+        plan_mode: Arc::new(SubagentPlanMode),
     };
     // The seam is proven with a live wire: the decision travels back through
     // the `Arc<dyn Approver>` the carrier holds.
@@ -229,6 +273,9 @@ fn capabilities_clones_and_debug_prints() {
         questioner: Arc::new(DecliningQuestioner),
         subagents: Arc::new(UnavailableSubagentSpawner),
         bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+        approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+        plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
+        plan_mode: Arc::new(SubagentPlanMode),
     };
     let cloned = caps.clone();
     // The clone shares the same handles (Arc), and both print with the
@@ -241,6 +288,9 @@ fn capabilities_clones_and_debug_prints() {
     assert!(rendered.contains("questioner"));
     assert!(rendered.contains("subagents"));
     assert!(rendered.contains("bg_shells"));
+    assert!(rendered.contains("approval_mode"));
+    assert!(rendered.contains("plan_exit_notice"));
+    assert!(rendered.contains("plan_mode"));
     assert!(rendered.contains("<dyn>"));
 }
 
@@ -400,6 +450,21 @@ async fn a_real_questioner_returns_its_injected_answers() {
     // `Arc<dyn Questioner>` the carrier holds.
     let out = caps.questioner.ask(vec![a_question()]).await.unwrap();
     assert_eq!(out, vec![(0, "serde".to_string())]);
+}
+
+// The subagent block (ADR-0061, ADR-0067): a child Run carries the degraded
+// SubagentPlanMode, so both plan-lifecycle legs return the blocked outcome rather
+// than mutating the parent's mode.
+#[tokio::test]
+async fn subagent_plan_mode_blocks_enter_and_exit() {
+    use crate::tool::caps::{EnterPlanOutcome, PlanExitOutcome, PlanMode, SubagentPlanMode};
+    let pm = SubagentPlanMode;
+    assert_eq!(pm.enter(true).await, EnterPlanOutcome::SubagentBlocked);
+    assert_eq!(pm.enter(false).await, EnterPlanOutcome::SubagentBlocked);
+    assert_eq!(
+        pm.request_exit("a plan".into()).await,
+        PlanExitOutcome::SubagentBlocked
+    );
 }
 
 #[test]

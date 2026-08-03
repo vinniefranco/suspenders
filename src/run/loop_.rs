@@ -484,7 +484,40 @@ fn shape_request<D: RunDeps>(
     state: &LoopState<'_, D>,
     req: crate::conversation::Request,
 ) -> LlmRequest {
-    LlmRequest::new(req.system, req.messages, state.tool_ctx.registry().specs())
+    let system = shape_plan_mode_system(state, req.system);
+    LlmRequest::new(system, req.messages, state.tool_ctx.registry().specs())
+}
+
+// The ephemeral plan-mode request-shaping Voice (ADR-0067, qwen's client.ts
+// inject-every-Pass + geminiChat.ts one-shot manual-exit): appends the plan-mode
+// reminders to the request's system text WITHOUT touching the Conversation or
+// the Session Log. Reached once per Pass (a compaction retry recurses through
+// `build_request` but only the terminal fitting call reaches `shape_request`),
+// so the take-and-clear below injects the manual-exit notice into exactly one
+// request.
+//
+//  - While the live mode is Plan: append `plan_mode_reminder` (qwen re-injects
+//    `getPlanModeSystemReminder` into EVERY request in Plan - a small model
+//    drifts without the standing read-only reminder, client.ts:2915).
+//  - When a manual-exit notice is pending (the user left Plan via Shift+Tab):
+//    TAKE-and-clear it and append `manual_plan_exit_reminder(mode)` ONCE (qwen's
+//    `takePendingManualPlanExitNotice`, geminiChat.ts:2384). The take clears the
+//    carrier, so the notice rides exactly one request. The two are mutually
+//    exclusive - a pending notice means the mode already left Plan - so at most
+//    one reminder is appended.
+//
+// The one impurity (the take-and-clear) IS the one-shot semantics, modelled as
+// the carrier's own `take`; `shape_request` stays otherwise pure.
+fn shape_plan_mode_system<D: RunDeps>(state: &LoopState<'_, D>, system: String) -> String {
+    let caps = &state.tool_ctx.caps;
+    if caps.approval_mode.load() == crate::approvals::ApprovalMode::Plan {
+        return format!("{system}\n\n{}", crate::voice::plan_mode_reminder());
+    }
+    if let Some(mode) = caps.plan_exit_notice.take() {
+        let reminder = crate::voice::manual_plan_exit_reminder(mode.wire_str());
+        return format!("{system}\n\n{reminder}");
+    }
+    system
 }
 
 // Reactive Compaction recovery (ADR-0012): summarize the over-budget

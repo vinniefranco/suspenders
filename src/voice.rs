@@ -21,6 +21,7 @@
 
 pub mod compaction;
 pub mod marker;
+pub mod plan;
 pub mod prompt;
 
 pub use compaction::{
@@ -29,6 +30,7 @@ pub use compaction::{
 pub use marker::{
     Marker, malformed_input, omitted_middle, please_continue, truncated_file, truncated_output,
 };
+pub use plan::{manual_plan_exit_reminder, plan_mode_reminder};
 pub use prompt::system_prompt;
 
 #[cfg(test)]

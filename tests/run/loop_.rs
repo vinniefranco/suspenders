@@ -1614,3 +1614,126 @@ async fn leaves_conversation_alone_under_the_target() {
     ok(&outcome);
     assert!(!*compacted.lock().unwrap());
 }
+
+// ---- Plan-mode request-shaping Voice (ADR-0067, Phase 4a) --------------
+
+use crate::approvals::ApprovalMode;
+use crate::run::fixtures::{run_with_mode, run_with_pending_exit_notice};
+
+// A fragment unique to the standing plan-mode reminder (qwen's
+// getPlanModeSystemReminder), and one unique to the manual-exit reminder, so the
+// tests assert on the actual Voice strings without pasting the whole verbatim
+// text.
+// A fragment of the standing reminder that does NOT appear in the manual-exit
+// reminder (the manual-exit text mentions "Plan mode is active" when it says it
+// is no longer active, so that phrase is not distinctive).
+const PLAN_REMINDER_MARK: &str = "The user indicated that they do not want you to execute yet";
+const MANUAL_EXIT_MARK: &str = "The approval mode changed outside the approved exit_plan_mode flow.";
+
+// While the live mode is Plan, the standing plan-mode reminder rides EVERY
+// request's system text (qwen re-injects getPlanModeSystemReminder into every
+// request in Plan - client.ts:2915). A two-Pass read-only script (read-only tools
+// are allowed in Plan) proves it is re-added on BOTH requests.
+#[tokio::test]
+async fn plan_mode_injects_the_standing_reminder_into_every_request() {
+    let root = root();
+    let dir = root.path().to_string_lossy().into_owned();
+    let session = session(root.path());
+    let deps = deps_for(
+        &session,
+        vec![
+            just(tool_use_result("tu_1", "list_directory", json!({"path": dir}))),
+            just(text_end("done planning")),
+        ],
+    );
+
+    let (outcome, deps) = run_with_mode(&session, "plan it", ApprovalMode::Plan, deps).await;
+    ok(&outcome);
+
+    let requests = deps.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "two Passes, two requests");
+    for (i, req) in requests.iter().enumerate() {
+        assert!(
+            req.system.contains(PLAN_REMINDER_MARK),
+            "request {i} must carry the standing plan reminder while in Plan"
+        );
+    }
+}
+
+// Outside Plan (the default mode) with no pending manual-exit notice, NEITHER
+// reminder is injected - the reminder is a Plan-mode invariant, gone the moment
+// the mode is not Plan (and it is ephemeral: never in the Conversation).
+#[tokio::test]
+async fn outside_plan_mode_injects_no_plan_reminder() {
+    let root = root();
+    let session = session(root.path());
+    let deps = deps_for(&session, vec![just(text_end("done"))]);
+
+    let (outcome, deps) = run_with(&session, "just answer", deps).await;
+    ok(&outcome);
+
+    let requests = deps.requests.lock().unwrap();
+    let sys = &requests[0].system;
+    assert!(!sys.contains(PLAN_REMINDER_MARK), "no plan reminder outside Plan");
+    assert!(!sys.contains(MANUAL_EXIT_MARK), "no manual-exit reminder with none pending");
+}
+
+// The standing plan reminder is EPHEMERAL: it rides the request's system text but
+// is never persisted into the Conversation the loop carries forward. After a
+// Plan-mode Run, the returned Conversation's system prompt is clean.
+#[tokio::test]
+async fn plan_reminder_is_not_persisted_in_the_conversation() {
+    let root = root();
+    let session = session(root.path());
+    let deps = deps_for(&session, vec![just(text_end("done planning"))]);
+
+    let (outcome, _deps) = run_with_mode(&session, "plan it", ApprovalMode::Plan, deps).await;
+    let (conv, _stop) = ok(&outcome);
+
+    // The wire request carried the reminder, but the Conversation snapshot the
+    // loop returns holds the ORIGINAL system prompt - the reminder never entered
+    // the persisted history.
+    let persisted = conv.for_request().unwrap().system;
+    assert!(
+        !persisted.contains(PLAN_REMINDER_MARK),
+        "the ephemeral reminder must not be persisted in the Conversation"
+    );
+}
+
+// A manual (Shift+Tab) exit queued a notice: the NEXT request carries the
+// one-shot manual-exit reminder ONCE (qwen's takePendingManualPlanExitNotice -
+// geminiChat.ts:2384), and the SECOND request does not (the take cleared it). A
+// two-Pass read-only script proves the exactly-once semantics. The live mode is
+// Default (already left Plan), so the standing plan reminder is absent.
+#[tokio::test]
+async fn manual_exit_injects_the_one_shot_reminder_exactly_once() {
+    let root = root();
+    let dir = root.path().to_string_lossy().into_owned();
+    let session = session(root.path());
+    let deps = deps_for(
+        &session,
+        vec![
+            just(tool_use_result("tu_1", "list_directory", json!({"path": dir}))),
+            just(text_end("done")),
+        ],
+    );
+
+    let (outcome, deps) =
+        run_with_pending_exit_notice(&session, "carry on", ApprovalMode::Default, deps).await;
+    ok(&outcome);
+
+    let requests = deps.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "two Passes, two requests");
+    assert!(
+        requests[0].system.contains(MANUAL_EXIT_MARK),
+        "the first request after a manual exit carries the one-shot reminder"
+    );
+    // And it names the current mode's wire string (default), verbatim.
+    assert!(requests[0].system.contains("The current approval mode is: default."));
+    assert!(
+        !requests[1].system.contains(MANUAL_EXIT_MARK),
+        "the one-shot reminder must not repeat on the next request"
+    );
+    // A manual exit is not Plan, so the standing plan reminder never appears.
+    assert!(!requests[0].system.contains(PLAN_REMINDER_MARK));
+}

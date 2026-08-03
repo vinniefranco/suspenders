@@ -92,6 +92,22 @@ impl ToolRegistry {
             .find(|n| n.to_lowercase() == lower)
     }
 
+    /// The [`Kind`](crate::approvals::Kind) of a tool by exact wire name, for the
+    /// plan-mode verdict fold (ADR-0067): the batch gate reads it so `classify`
+    /// can decide whether a Call mutates. An UNKNOWN name answers
+    /// [`Kind::Other`](crate::approvals::Kind::Other) - the same fail-safe the
+    /// trait default takes, so a call for a tool the registry does not hold is
+    /// treated as non-read-only (blocked in plan mode) rather than slipping
+    /// through. The dispatch path (`execute`) still answers its own unknown-tool
+    /// error, so this Kind only gates.
+    pub fn kind_of(&self, name: &str) -> crate::approvals::Kind {
+        self.tools
+            .iter()
+            .find(|t| t.spec().name == name)
+            .map(|t| t.kind())
+            .unwrap_or(crate::approvals::Kind::Other)
+    }
+
     /// The spec of a tool by exact (canonical) name, or `None`. `tool_search`
     /// uses this to render a resolved tool's schema block.
     pub fn spec_of(&self, canonical: &str) -> Option<ToolSpec> {

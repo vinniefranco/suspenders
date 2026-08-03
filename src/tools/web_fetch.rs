@@ -75,6 +75,13 @@ fn accept_header(format: &str) -> &'static str {
 
 #[async_trait::async_trait]
 impl Tool for WebFetch {
+    // Read-only (qwen web-fetch.ts:752 `Kind.Fetch`): ALLOWED in plan mode, but
+    // still gated (its confirmation is qwen's `type: 'info'`, so plan mode does
+    // not block it - it falls through to the normal domain-scoped Ask).
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Fetch
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_fetch".into(),

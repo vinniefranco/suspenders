@@ -138,6 +138,19 @@ impl From<String> for ToolOutput {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
+    /// The kind of effect this tool has (qwen `Kind`, ADR-0067): the per-Tool
+    /// self-description the plan-mode verdict fold ([`crate::approvals::classify`])
+    /// reads to decide whether a Call mutates. The DEFAULT is
+    /// [`Kind::Other`](crate::approvals::Kind::Other) - the fail-safe: an
+    /// undeclared tool is treated as non-read-only, so plan mode BLOCKS it rather
+    /// than risk slipping a mutation through (`Other` is not a mutator, but it is
+    /// also not read-only). Every built-in tool declares its real Kind by
+    /// matching qwen's corresponding tool file; the MCP adapter answers
+    /// `Kind::Other` (its side effects are opaque to us).
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Other
+    }
+
     async fn run(&self, input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, String>;
 
     /// The rich variant of [`run`](Tool::run) (ADR-0059): the block-list output a

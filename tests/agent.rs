@@ -45,8 +45,13 @@ impl AgentState {
             cancel_flag: false,
             settlement: Settlement::new(),
             approvals: Approvals::new(),
+            approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+            plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
             approval_replies: HashMap::new(),
             question_replies: HashMap::new(),
+            plan_replies: HashMap::new(),
+            pre_plan_mode: None,
+            approval_mode_revision: 0,
             steering: Vec::new(),
             compaction: Compaction::new(),
             self_tx,
@@ -642,6 +647,161 @@ async fn declining_a_question_yields_the_verbatim_decline_string() {
     .await;
     if let Event::ToolResult { content, .. } = result {
         assert_eq!(content, "User declined to answer the questions.");
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
+// ---- plan mode (ADR-0067) ---------------------------------------------
+
+// A Run whose model calls `enter_plan_mode` (userRequested true): the Agent flips
+// the mode to Plan, broadcasts ApprovalModeChanged(Plan), writes the mirror, and
+// the tool result is the plan-mode reminder VERBATIM.
+#[tokio::test(flavor = "multi_thread")]
+async fn enter_plan_mode_flips_the_mode_and_returns_the_reminder() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "tu_enter",
+            "enter_plan_mode",
+            json!({ "userRequested": true }),
+        )),
+        Entry::just(text_end("planning now")),
+    ]);
+
+    agent.submit("switch to plan mode").await.unwrap();
+
+    // The Agent broadcasts the mode change to Plan.
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ApprovalModeChanged { mode } if *mode == ApprovalMode::Plan),
+    )
+    .await;
+
+    // The tool result is the plan-mode reminder verbatim.
+    let result = recv_tool_ok(&mut rx, "tu_enter").await;
+    if let Event::ToolResult { content, .. } = result {
+        assert_eq!(content, crate::voice::plan_mode_reminder());
+    }
+    recv_match(&mut rx, is_run_finished).await;
+}
+
+// The full exit round-trip: enter plan, then exit_plan_mode raises a PlanRequest;
+// a driven AnswerPlan(ProceedOnce) flips the mode to Default, saves the plan to
+// disk, and the tool result is the VERBATIM "User approved." content.
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_plan_mode_round_trips_and_flips_to_the_target_mode() {
+    let (_dir, session, agent, mut rx) = harness_with_session(vec![
+        Entry::just(tool_use_result(
+            "tu_enter",
+            "enter_plan_mode",
+            json!({ "userRequested": true }),
+        )),
+        Entry::just(tool_use_result(
+            "tu_exit",
+            "exit_plan_mode",
+            json!({ "plan": "1. write the code\n2. test it" }),
+        )),
+        Entry::just(text_end("coding now")),
+    ]);
+
+    agent.submit("plan then code").await.unwrap();
+
+    // Step the two model calls through their own recv budgets (the reminder is a
+    // large payload, so each stage gets a fresh deadline): the enter flips to
+    // Plan, then the exit tool opens the plan dialog.
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ApprovalModeChanged { mode } if *mode == ApprovalMode::Plan),
+    )
+    .await;
+
+    // The exit tool opened the plan dialog: a PlanRequest carrying the id, the
+    // plan text, and the pre_plan_mode (Default, the mode Plan was entered from).
+    let req = recv_match(&mut rx, |e| matches!(e, Event::PlanRequest { .. })).await;
+    let (id, plan, pre) = match req {
+        Event::PlanRequest {
+            plan_id,
+            plan,
+            pre_plan_mode,
+        } => (plan_id, plan, pre_plan_mode),
+        other => panic!("expected a PlanRequest, got {other:?}"),
+    };
+    assert_eq!(plan, "1. write the code\n2. test it");
+    assert_eq!(pre, ApprovalMode::Default);
+
+    // Answer it as the UI would: "Yes, and manually approve edits" -> Default.
+    agent
+        .answer_plan(id.clone(), crate::approvals::PlanDecision::ProceedOnce)
+        .await;
+
+    // The mode flips to the target (Default) on approval.
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ApprovalModeChanged { mode } if *mode == ApprovalMode::Default),
+    )
+    .await;
+
+    // The Agent emits PlanResolved once the tool reads the reply.
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::PlanResolved { plan_id } if *plan_id == id),
+    )
+    .await;
+
+    // The tool result is the VERBATIM approved content.
+    let result = recv_tool_ok(&mut rx, "tu_exit").await;
+    if let Event::ToolResult { content, .. } = result {
+        assert_eq!(
+            content,
+            "User approved. You can now start coding. Start with updating your todo list if applicable."
+        );
+    }
+    recv_match(&mut rx, is_run_finished).await;
+
+    // The plan was saved to <session_dir>/plan.md.
+    let saved = std::fs::read_to_string(std::path::Path::new(&session.session_dir).join("plan.md"))
+        .expect("plan.md written");
+    assert_eq!(saved, "1. write the code\n2. test it");
+}
+
+// The keep-planning path: AnswerPlan(Cancel) stays in Plan, no mode change, and
+// the tool result is the VERBATIM "Remaining in plan mode." content.
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_plan_mode_cancel_stays_in_plan() {
+    let (_dir, agent, mut rx) = harness(vec![
+        Entry::just(tool_use_result(
+            "tu_enter",
+            "enter_plan_mode",
+            json!({ "userRequested": true }),
+        )),
+        Entry::just(tool_use_result(
+            "tu_exit",
+            "exit_plan_mode",
+            json!({ "plan": "the plan" }),
+        )),
+        Entry::just(text_end("still planning")),
+    ]);
+
+    agent.submit("plan").await.unwrap();
+
+    // Step through the enter (a large reminder payload) so the PlanRequest recv
+    // gets a fresh deadline.
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::ApprovalModeChanged { mode } if *mode == ApprovalMode::Plan),
+    )
+    .await;
+    let id = match recv_match(&mut rx, |e| matches!(e, Event::PlanRequest { .. })).await {
+        Event::PlanRequest { plan_id, .. } => plan_id,
+        other => panic!("expected a PlanRequest, got {other:?}"),
+    };
+
+    agent
+        .answer_plan(id.clone(), crate::approvals::PlanDecision::Cancel)
+        .await;
+
+    let result = recv_tool_ok(&mut rx, "tu_exit").await;
+    if let Event::ToolResult { content, .. } = result {
+        assert_eq!(content, "Plan execution was not approved. Remaining in plan mode.");
     }
     recv_match(&mut rx, is_run_finished).await;
 }
@@ -1629,12 +1789,14 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
             base_url: "http://localhost:0/v1".into(),
             api: Api::AnthropicMessages,
             // A narrower window than the 64k launch window, but still wide
-            // enough to hold the tool-spec overhead (~25.3k chars ~= 7.2k
-            // tokens after the faithful qwen-code description port) plus the
-            // reserve and a small Conversation - otherwise the post-swap Run
-            // can never fit its request and this test would hang. The value
-            // only has to be distinct from the launch window for the assertion.
-            context_window: Some(16_000),
+            // enough to hold the tool-spec overhead (~34.5k chars ~= 9.9k tokens
+            // after the ADR-0067 plan-mode tools joined the base wire list -
+            // enter_plan_mode is always-visible and exit_plan_mode is
+            // always-declared) plus the reserve and a small Conversation -
+            // otherwise the post-swap Run can never fit its request and this test
+            // would hang. The value only has to be distinct from the launch
+            // window for the assertion.
+            context_window: Some(24_000),
             token: None,
         },
     );
@@ -1668,7 +1830,7 @@ async fn the_budget_follows_the_captured_model_across_a_swap() {
     agent.set_model("tiny/m".into()).await.unwrap();
     agent.submit("second").await.unwrap();
     let ev = recv_match(&mut rx, is_run_finished).await;
-    assert_eq!(finished_budget(&ev), Some(16_000), "the captured window");
+    assert_eq!(finished_budget(&ev), Some(24_000), "the captured window");
 }
 
 // ===========================================================================
@@ -1701,6 +1863,341 @@ fn bg_task(
         description: description.into(),
     };
     (task, handle)
+}
+
+// The live Approval-mode mirror (ADR-0067): `cycle_approval_mode` writes the
+// shared atomic in lockstep with the pure `approvals` fold, so an in-flight Run's
+// batch gate reads the operator's live mode. This pins that the cycle mutation
+// path updates the mirror (Phase 2's enter/exit tools will get their own pins).
+#[tokio::test]
+async fn cycle_approval_mode_writes_the_shared_atomic_mirror() {
+    let dir = TempDir::new().unwrap();
+    let (mut state, _rx) =
+        super::AgentState::for_test(session_in(&dir), Arc::new(FakeLlm::script(vec![])));
+
+    // At launch the mirror agrees with the fold's default.
+    assert_eq!(state.approvals.mode, ApprovalMode::Default);
+    assert_eq!(state.approval_mode.load(), ApprovalMode::Default);
+
+    // Each cycle advances BOTH the fold and the mirror, in lockstep, through the
+    // full qwen order: default -> auto-edit -> auto -> yolo -> plan -> default.
+    for expected in [
+        ApprovalMode::AutoEdit,
+        ApprovalMode::Auto,
+        ApprovalMode::Yolo,
+        ApprovalMode::Plan,
+        ApprovalMode::Default,
+    ] {
+        let landed = super::cycle_approval_mode(&mut state);
+        assert_eq!(landed, expected);
+        assert_eq!(state.approvals.mode, expected, "fold advanced");
+        assert_eq!(
+            state.approval_mode.load(),
+            expected,
+            "mirror advanced in lockstep with the fold"
+        );
+    }
+}
+
+// ---- plan mode: Agent-side state mutation (ADR-0067) ------------------
+
+use crate::approvals::PlanDecision;
+use crate::tool::caps::{EnterPlanOutcome, PlanExitOutcome};
+
+fn fresh_state(dir: &TempDir) -> super::AgentState {
+    super::AgentState::for_test(session_in(dir), Arc::new(FakeLlm::script(vec![]))).0
+}
+
+// enter_plan_mode from Default: flips to Plan, records prePlanMode = Default,
+// bumps the revision, writes the mirror, and returns the reminder outcome.
+#[tokio::test]
+async fn enter_plan_mode_records_pre_plan_mode_and_bumps_revision() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    let rev0 = state.approval_mode_revision;
+
+    let outcome = super::enter_plan_mode(&mut state, true);
+
+    assert!(matches!(outcome, EnterPlanOutcome::Entered { .. }));
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan);
+    assert_eq!(state.approval_mode.load(), ApprovalMode::Plan, "mirror written");
+    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::Default), "prePlanMode recorded");
+    assert_eq!(state.approval_mode_revision, rev0 + 1, "revision bumped");
+}
+
+// A model-initiated entry from YOLO (userRequested false) is a no-op: StayedYolo,
+// no mode change, no prePlanMode, no revision bump.
+#[tokio::test]
+async fn enter_plan_mode_from_yolo_without_user_request_is_a_no_op() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::set_approval_mode(&mut state, ApprovalMode::Yolo, false);
+    let rev = state.approval_mode_revision;
+
+    let outcome = super::enter_plan_mode(&mut state, false);
+
+    assert!(matches!(outcome, EnterPlanOutcome::StayedYolo));
+    assert_eq!(state.approvals.mode, ApprovalMode::Yolo, "stayed in YOLO");
+    assert_eq!(state.pre_plan_mode, None);
+    assert_eq!(state.approval_mode_revision, rev, "no revision bump");
+}
+
+// An explicit user request DOES enter Plan from YOLO (the userRequested override).
+#[tokio::test]
+async fn enter_plan_mode_from_yolo_with_user_request_enters_plan() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::set_approval_mode(&mut state, ApprovalMode::Yolo, false);
+
+    let outcome = super::enter_plan_mode(&mut state, true);
+
+    assert!(matches!(outcome, EnterPlanOutcome::Entered { .. }));
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan);
+    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::Yolo), "prePlanMode is YOLO");
+}
+
+// Idempotent: entering plan while already in plan never overwrites prePlanMode
+// and does not bump the revision (qwen's `getApprovalMode() !== PLAN` guard).
+#[tokio::test]
+async fn enter_plan_mode_is_idempotent_and_preserves_pre_plan_mode() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    // Enter from AutoEdit so prePlanMode = AutoEdit.
+    super::set_approval_mode(&mut state, ApprovalMode::AutoEdit, false);
+    super::enter_plan_mode(&mut state, true);
+    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::AutoEdit));
+    let rev = state.approval_mode_revision;
+
+    // A second enter while already in Plan.
+    let outcome = super::enter_plan_mode(&mut state, true);
+
+    assert!(matches!(outcome, EnterPlanOutcome::Entered { .. }));
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan);
+    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::AutoEdit), "prePlanMode preserved");
+    assert_eq!(state.approval_mode_revision, rev, "no extra revision bump");
+}
+
+// Leaving Plan (any path) clears prePlanMode: a Shift+Tab cycle out of Plan
+// through set_approval_mode drops it (qwen's `mode !== PLAN && fromMode === PLAN`).
+#[tokio::test]
+async fn leaving_plan_clears_pre_plan_mode() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::enter_plan_mode(&mut state, true);
+    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::Default));
+
+    super::set_approval_mode(&mut state, ApprovalMode::Default, false);
+    assert_eq!(state.pre_plan_mode, None, "prePlanMode cleared on leaving Plan");
+}
+
+// A MANUAL exit (from_approved_plan_exit == false, the Shift+Tab path) queues the
+// one-shot manual-exit notice carrying the new mode (ADR-0067, qwen's
+// 'manual-exit' notice event). The loop takes it in shape_request.
+#[tokio::test]
+async fn manual_leave_of_plan_queues_the_exit_notice() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::enter_plan_mode(&mut state, true);
+    assert_eq!(state.plan_exit_notice.take(), None, "nothing queued while in Plan");
+
+    // The Shift+Tab cycle path leaves Plan with from_approved_plan_exit == false.
+    super::set_approval_mode(&mut state, ApprovalMode::Default, false);
+
+    assert_eq!(
+        state.plan_exit_notice.take(),
+        Some(ApprovalMode::Default),
+        "a manual exit queues the notice carrying the new mode"
+    );
+    assert_eq!(state.plan_exit_notice.take(), None, "one-shot: gone after the take");
+}
+
+// The Shift+Tab cycle helper itself queues the notice when it leaves Plan (it
+// routes through set_approval_mode with from_approved_plan_exit == false).
+#[tokio::test]
+async fn cycle_out_of_plan_queues_the_exit_notice() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::enter_plan_mode(&mut state, true);
+
+    // Plan -> Default in the cycle order (qwen APPROVAL_MODES).
+    let new_mode = super::cycle_approval_mode(&mut state);
+    assert_eq!(new_mode, ApprovalMode::Default, "Plan cycles to Default");
+
+    assert_eq!(
+        state.plan_exit_notice.take(),
+        Some(ApprovalMode::Default),
+        "a Shift+Tab cycle out of Plan queues the manual-exit notice"
+    );
+}
+
+// An APPROVED exit (answer_plan, from_approved_plan_exit == true) does NOT queue
+// the manual-exit notice (qwen's fromApprovedPlanExit -> 'clear'): the standing
+// plan reminder simply stops, no manual-exit reminder is injected.
+#[tokio::test]
+async fn approved_exit_does_not_queue_the_exit_notice() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::enter_plan_mode(&mut state, true);
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    super::request_plan_exit(&mut state, "the plan".into(), reply);
+    let id = state.plan_replies.keys().next().cloned().expect("one parked exit");
+
+    super::answer_plan(&mut state, id, PlanDecision::ProceedOnce);
+    assert_eq!(rx.await.unwrap(), PlanExitOutcome::Approved);
+    assert_ne!(state.approvals.mode, ApprovalMode::Plan, "left Plan on approval");
+
+    assert_eq!(
+        state.plan_exit_notice.take(),
+        None,
+        "an approved exit_plan_mode never queues the manual-exit notice"
+    );
+}
+
+// The `/plan` command's ENTER path (enter_plan_mode_requested): a user request,
+// so it enters Plan even from Yolo, records prePlanMode, and returns Plan.
+#[tokio::test]
+async fn plan_command_enter_enters_plan_even_from_yolo() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::set_approval_mode(&mut state, ApprovalMode::Yolo, false);
+
+    let mode = super::enter_plan_mode_requested(&mut state);
+
+    assert_eq!(mode, ApprovalMode::Plan, "returned the new (Plan) mode");
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan);
+    assert_eq!(
+        state.pre_plan_mode,
+        Some(ApprovalMode::Yolo),
+        "prePlanMode is the mode we came from"
+    );
+}
+
+// The `/plan exit` command's EXIT path (exit_plan_mode_restore): restores the
+// pre-plan mode AND, because it routes through the MANUAL-exit path
+// (from_approved_plan_exit == false), queues the one-shot manual-exit notice -
+// exactly as a Shift+Tab cycle out of Plan does.
+#[tokio::test]
+async fn plan_command_exit_restores_pre_plan_mode_and_queues_the_manual_exit_notice() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    // Enter from AutoEdit so the restore target is AutoEdit, not the Default default.
+    super::set_approval_mode(&mut state, ApprovalMode::AutoEdit, false);
+    super::enter_plan_mode_requested(&mut state);
+    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::AutoEdit));
+
+    let restored = super::exit_plan_mode_restore(&mut state);
+
+    assert_eq!(restored, ApprovalMode::AutoEdit, "restored the pre-plan mode");
+    assert_eq!(state.approvals.mode, ApprovalMode::AutoEdit);
+    assert_eq!(state.pre_plan_mode, None, "prePlanMode cleared on leaving Plan");
+    assert_eq!(
+        state.plan_exit_notice.take(),
+        Some(ApprovalMode::AutoEdit),
+        "a /plan exit is a MANUAL exit: it queues the one-shot manual-exit notice"
+    );
+}
+
+// With no prePlanMode recorded, exit restores Default (qwen's getPrePlanMode
+// `?? DEFAULT`).
+#[tokio::test]
+async fn plan_command_exit_defaults_to_default_when_no_pre_plan_mode() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    // Force Plan without recording a prePlanMode (a resumed-in-Plan edge).
+    state.approvals.mode = ApprovalMode::Plan;
+    state.approval_mode.store(ApprovalMode::Plan);
+    state.pre_plan_mode = None;
+
+    let restored = super::exit_plan_mode_restore(&mut state);
+
+    assert_eq!(restored, ApprovalMode::Default, "defaults to Default");
+    assert_eq!(state.approvals.mode, ApprovalMode::Default);
+}
+
+// request_plan_exit outside plan mode returns NotInPlanMode WITHOUT raising a
+// dialog (no PlanRequest, nothing parked).
+#[tokio::test]
+async fn request_plan_exit_outside_plan_is_not_in_plan_mode() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    let (reply, rx) = tokio::sync::oneshot::channel();
+
+    super::request_plan_exit(&mut state, "a plan".into(), reply);
+
+    let outcome = rx.await.unwrap();
+    assert!(
+        matches!(outcome, PlanExitOutcome::NotInPlanMode { current_mode } if current_mode == "default")
+    );
+    assert!(state.plan_replies.is_empty(), "no dialog parked");
+}
+
+// The proceed resolution flips to the decision's target and saves the plan;
+// RestorePrevious lands on prePlanMode.
+#[tokio::test]
+async fn answer_plan_restore_previous_flips_to_pre_plan_mode() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    // Enter Plan from AutoEdit so prePlanMode = AutoEdit.
+    super::set_approval_mode(&mut state, ApprovalMode::AutoEdit, false);
+    super::enter_plan_mode(&mut state, true);
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    super::request_plan_exit(&mut state, "the plan".into(), reply);
+    let id = state.plan_replies.keys().next().cloned().expect("one parked exit");
+
+    super::answer_plan(&mut state, id, PlanDecision::RestorePrevious);
+
+    assert_eq!(rx.await.unwrap(), PlanExitOutcome::Approved);
+    assert_eq!(state.approvals.mode, ApprovalMode::AutoEdit, "restored to prePlanMode");
+    assert!(state.pre_plan_mode.is_none(), "prePlanMode cleared on leaving Plan");
+    let saved = std::fs::read_to_string(
+        std::path::Path::new(&state.session.session_dir).join("plan.md"),
+    )
+    .expect("plan saved");
+    assert_eq!(saved, "the plan");
+}
+
+// The stale-guard: if the mode changed (revision moved) between raising the
+// dialog and resolving it, the resolution takes NO action and returns Stale.
+#[tokio::test]
+async fn answer_plan_is_stale_when_the_revision_moved() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::enter_plan_mode(&mut state, true);
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    super::request_plan_exit(&mut state, "the plan".into(), reply);
+    let id = state.plan_replies.keys().next().cloned().expect("one parked exit");
+
+    // The mode changes out from under the pending exit (a Shift+Tab cycle),
+    // bumping the revision. The exit's snapshot is now stale. (The cycle out of
+    // Plan leaves the mode non-Plan, which the guard also catches; re-enter Plan
+    // so we test the REVISION arm specifically, not the mode arm.)
+    super::set_approval_mode(&mut state, ApprovalMode::Default, false); // rev++ (leaves Plan)
+    super::set_approval_mode(&mut state, ApprovalMode::Plan, false); // rev++ (re-enters Plan)
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan, "back in Plan, but revision moved");
+
+    super::answer_plan(&mut state, id, PlanDecision::ProceedOnce);
+
+    assert_eq!(rx.await.unwrap(), PlanExitOutcome::Stale);
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan, "no action taken, still in Plan");
+    assert!(
+        !std::path::Path::new(&state.session.session_dir).join("plan.md").exists(),
+        "no plan saved on a stale resolution"
+    );
+}
+
+// A stale/duplicate answer_plan (no matching id) is dropped, mirroring
+// answer_question's ignore path.
+#[tokio::test]
+async fn answer_plan_with_unknown_id_is_dropped() {
+    let dir = TempDir::new().unwrap();
+    let mut state = fresh_state(&dir);
+    super::enter_plan_mode(&mut state, true);
+    // No parked exit; a stray answer_plan is a no-op (no panic, mode unchanged).
+    super::answer_plan(&mut state, "plan-999".into(), PlanDecision::ProceedOnce);
+    assert_eq!(state.approvals.mode, ApprovalMode::Plan);
 }
 
 #[tokio::test]

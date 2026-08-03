@@ -79,6 +79,83 @@ pub(super) fn tool_ctx(session: &Session) -> ToolCtx {
     session.tool_ctx(&session.model, crate::tool::caps::Capabilities::for_test())
 }
 
+/// A ToolCtx whose live Approval-mode mirror is pinned to `mode` (ADR-0067), for
+/// the plan-mode gate tests: the batch gate's `classify` reads this atomic, so
+/// pinning it to `Plan` proves the loop blocks a mutating Tool Call. Built off
+/// `for_test`'s Capabilities and then storing the mode into the shared atomic
+/// (the same mirror the Agent writes on a cycle).
+pub(super) fn tool_ctx_in_mode(session: &Session, mode: crate::approvals::ApprovalMode) -> ToolCtx {
+    let caps = crate::tool::caps::Capabilities::for_test();
+    caps.approval_mode.store(mode);
+    session.tool_ctx(&session.model, caps)
+}
+
+/// Runs the loop with the live Approval mode pinned to `mode` (ADR-0067),
+/// mirroring [`run_with`] but through a plan-mode-aware ToolCtx. Proves the batch
+/// gate enforces read-only against the live mode.
+pub(super) async fn run_with_mode(
+    session: &Session,
+    prompt: &str,
+    mode: crate::approvals::ApprovalMode,
+    mut deps: FakeDeps,
+) -> (Outcome, FakeDeps) {
+    let conv = conversation(session, prompt);
+    let ctx = tool_ctx_in_mode(session, mode);
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: None,
+            skill_activation: None,
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
+    (outcome, deps)
+}
+
+/// A ToolCtx carrying a PENDING manual-plan-exit notice (ADR-0067), for the
+/// one-shot manual-exit reminder test: the loop's `shape_request` takes-and-clears
+/// this carrier and injects the manual-exit reminder into exactly one request.
+/// The live mode is left at `for_test`'s default (NOT Plan), matching the state
+/// after a Shift+Tab exit - the mode already left Plan and the notice was queued.
+pub(super) fn tool_ctx_with_pending_exit_notice(
+    session: &Session,
+    mode: crate::approvals::ApprovalMode,
+) -> ToolCtx {
+    let caps = crate::tool::caps::Capabilities::for_test();
+    caps.plan_exit_notice.set(mode);
+    session.tool_ctx(&session.model, caps)
+}
+
+/// Runs the loop with a PENDING manual-plan-exit notice carrying `mode`
+/// (ADR-0067), mirroring [`run_with`]. Proves the one-shot manual-exit reminder
+/// is injected on the next request and never again.
+pub(super) async fn run_with_pending_exit_notice(
+    session: &Session,
+    prompt: &str,
+    mode: crate::approvals::ApprovalMode,
+    mut deps: FakeDeps,
+) -> (Outcome, FakeDeps) {
+    let conv = conversation(session, prompt);
+    let ctx = tool_ctx_with_pending_exit_notice(session, mode);
+    let outcome = run(
+        conv,
+        session,
+        RunEnv {
+            tool_ctx: &ctx,
+            hooks: None,
+            skill_activation: None,
+        },
+        &mut deps,
+        RunOpts::default(),
+    )
+    .await;
+    (outcome, deps)
+}
+
 // Response builders mirroring baud's text_result / tool_use_result.
 pub(super) fn text_result(text: &str, stop: StopReason) -> Response {
     Response {

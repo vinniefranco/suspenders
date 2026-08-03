@@ -28,15 +28,21 @@ cycle is Session-scoped: it works whether or not a Run is in flight, and while a
 Approval is open the key is swallowed by the block (the pending Approval is left
 untouched - no double-meaning).
 
-**Only Default and Yolo change BEHAVIOR; Plan/AutoEdit/Auto are DISPLAY-COMPLETE
+**Default, Yolo, and Plan change BEHAVIOR; AutoEdit/Auto are DISPLAY-COMPLETE
 but behavior-STUBBED.**
 - `Default` gates exactly as before.
 - `Yolo` auto-approves EVERY gated Call - `request` returns `Auto` with no modal
   and no Standing entry (dropping out of Yolo re-gates the command).
-- `Plan`, `AutoEdit`, `Auto` gate EXACTLY like `Default` this phase. suspenders has
-  no plan-loop and no classifier, and does not gate edits (so `AutoEdit` is
-  vacuous). The footer still NAMES them so the cycle is whole and forward-
-  compatible, but they carry no behavior yet. This is documented, not hidden.
+- `Plan` is now REAL (ADR-0067): a read-only planning mode with `enter_plan_mode`
+  / `exit_plan_mode` tools, a per-Tool-Call read-only verdict fold, the plan-mode
+  shell classifier, and a per-Pass reminder. The gate machinery this ADR describes
+  (the two-tool `gate_text` + `request` pair) was superseded by ADR-0067's single
+  `Approvals::classify(name, kind, input) -> Verdict` fold every Tool Call passes
+  through, so the mode is consulted for every call rather than the gated two.
+- `AutoEdit`, `Auto` gate EXACTLY like `Default` this phase. suspenders does not
+  gate edits (so `AutoEdit` is vacuous) and has no Auto classifier. The footer
+  still NAMES them so the cycle is whole and forward-compatible, but they carry no
+  behavior yet. This is documented, not hidden.
 
 **A PermissionRequest hook decides ahead of the mode.** A Hook (ADR-0066) firing
 at the PermissionRequest event may return a permission decision, and it is
@@ -64,11 +70,11 @@ signal the operator must keep seeing). Labels are qwen-verbatim: `plan mode`(gre
 - The two always-variants of qwen's exec/mcp confirmations collapse onto
   suspenders' single session-scoped `ApproveAlways` (ADR-0005): no cross-session
   persistence, no per-user scope. Deliberate.
-- **Risk (recorded):** the stubbed modes are MISLEADING - the footer can say `plan
-  mode` while files are still modified, because only Yolo/Default alter behavior. A
-  startup notice is deferred; this ADR is the record. Wiring real Plan/AutoEdit/Auto
-  behavior is future work (it needs a classifier + a plan-loop suspenders does not
-  have).
+- **Risk (discharged for Plan):** the stubbed modes were MISLEADING - the footer
+  could say `plan mode` while files were still modified, because only Yolo/Default
+  altered behavior. ADR-0067 makes Plan real (read-only enforcement, enter/exit
+  tools, shell classifier, per-Pass reminder), so this risk is discharged for Plan.
+  AutoEdit/Auto remain stubbed as described above until their own behavior lands.
 - The `expire(now)` timeout hook on `SelectionList` (ADR-0049) is host-driven and
   never fires for the 3-row approval; the tick wiring lands with Phase 5's longer
   dialogs.

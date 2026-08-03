@@ -123,6 +123,65 @@ fn mint_question_id() -> String {
     format!("question-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The tx-backed [`PlanMode`](crate::tool::caps::PlanMode): the Agent's
+/// fulfilment of the plan-lifecycle seam (ADR-0067). `enter` relays an
+/// `EnterPlanMode` and awaits the outcome the Agent's handler resolves (the
+/// atomic YOLO-guard / idempotent / prePlanMode logic); `request_exit` relays a
+/// `RequestPlanExit`, and the Agent mints a dialog id, broadcasts `PlanRequest`,
+/// and parks the reply until a `Command::AnswerPlan` resolves it. Built by
+/// [`super::deps::AgentDeps::capture`] and carried on the Run's
+/// [`crate::run::Capture`] into the Tool [`crate::tool::caps::Capabilities`].
+///
+/// A child Run (subagent) carries the degraded
+/// [`crate::tool::caps::SubagentPlanMode`] instead - the subagent block - so a
+/// plan-lifecycle call there never reaches this handle. On a closed/dropped
+/// channel (a dead Agent, a cancelled Run) both legs return the subagent-blocked
+/// outcome, the safe answer the tool folds into its content - the same posture
+/// [`AgentQuestioner`] takes with its decline string.
+pub(super) struct AgentPlanMode {
+    pub(super) tx: mpsc::UnboundedSender<Msg>,
+}
+
+#[async_trait::async_trait]
+impl crate::tool::caps::PlanMode for AgentPlanMode {
+    async fn enter(&self, user_requested: bool) -> crate::tool::caps::EnterPlanOutcome {
+        // Relay the entry and await the outcome the Agent's handler resolves. A
+        // closed channel is the safe subagent-blocked answer (the tool folds it).
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::EnterPlanMode {
+                user_requested,
+                reply,
+            }))
+            .is_err()
+        {
+            return crate::tool::caps::EnterPlanOutcome::SubagentBlocked;
+        }
+        rx.await
+            .unwrap_or(crate::tool::caps::EnterPlanOutcome::SubagentBlocked)
+    }
+
+    async fn request_exit(&self, plan: String) -> crate::tool::caps::PlanExitOutcome {
+        // Relay the exit request; the Agent mints the dialog id, broadcasts the
+        // `PlanRequest` (opening the modal), snapshots the revision, and parks the
+        // reply until the user answers. No timeout - the user decides. Unlike the
+        // Questioner (whose capability mints the id and so emits `question_resolved`
+        // itself), the plan dialog id is Agent-minted, so `plan_resolved` is emitted
+        // Agent-side in `answer_plan` where the id is known.
+        let tx = self.tx.clone();
+        let (reply, rx) = oneshot::channel();
+        if tx
+            .send(Msg::Run(RunMsg::RequestPlanExit { plan, reply }))
+            .is_err()
+        {
+            return crate::tool::caps::PlanExitOutcome::SubagentBlocked;
+        }
+        rx.await
+            .unwrap_or(crate::tool::caps::PlanExitOutcome::SubagentBlocked)
+    }
+}
+
 /// The VERBATIM qwen `task_stop` not-found wording, the one template both
 /// background-stop capability legs fall back to on a closed channel (a dead
 /// Agent). Owned here so the two relays share one copy of the sentence.

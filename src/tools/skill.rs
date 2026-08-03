@@ -98,6 +98,12 @@ impl SkillTool {
 
 #[async_trait::async_trait]
 impl Tool for SkillTool {
+    // Read (qwen skill.ts:131 `Kind.Read`): ALLOWED in plan mode. qwen kinds the
+    // `skill` tool as Read (it surfaces skill guidance), so it is read-only.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Read
+    }
+
     fn spec(&self) -> ToolSpec {
         // The description scaffold, VERBATIM from qwen's `tools/skill.ts`
         // `baseDescription`, with the live `<available_skills>` block spliced in.

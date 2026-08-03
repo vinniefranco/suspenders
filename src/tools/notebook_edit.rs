@@ -50,6 +50,11 @@ notebook first with read_file; then use the cell IDs shown in that output.";
 
 #[async_trait::async_trait]
 impl Tool for NotebookEdit {
+    // Mutator (qwen notebook-edit.ts:741 `Kind.Edit`): BLOCKED in plan mode.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Edit
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "notebook_edit".into(),

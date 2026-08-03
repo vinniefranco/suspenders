@@ -55,6 +55,19 @@ pub struct ToolSearch;
 
 #[async_trait::async_trait]
 impl Tool for ToolSearch {
+    // Other (qwen tool-search.ts `Kind.Other`). Note: qwen keys plan-mode
+    // blocking on the confirmation TYPE, not the Kind, and tool_search needs no
+    // confirmation (it just reveals schemas), so qwen never blocks it in plan
+    // mode. Suspenders keys the block on the Kind and `tool_search` is ungated
+    // (never in GATED), so `classify` DOES block it in plan mode as an `Other`
+    // Kind. This is a faithful-as-possible narrowing: discovering a tool's schema
+    // mid-plan is rare and harmless to defer, and matching qwen's TYPE-based
+    // carve-out would require a per-tool "needs no confirmation" fact this phase
+    // does not introduce. Documented, not hidden.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Other
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "tool_search".to_string(),

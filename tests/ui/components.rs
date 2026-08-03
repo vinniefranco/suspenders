@@ -4774,6 +4774,94 @@ fn question_modal_rows_are_rigid_to_the_box_width() {
     }
 }
 
+// --- Plan modal (ADR-0067, exit_plan_mode) render -----------------------
+
+#[test]
+fn plan_modal_renders_title_plan_markdown_and_the_four_outcome_rows() {
+    let screen = Screen::new(ScreenOpts::default());
+    let (screen, _) = screen.apply_event(Event::plan_request(
+        "p-1",
+        "# The Plan\n\nRefactor the widget.",
+        crate::approvals::ApprovalMode::Default,
+    ));
+    // The bordered modal draws bottom-most in the pending body (top-clipped like
+    // the approval/question), so on a short viewport the interactive outcome rows
+    // survive the clip while the title + plan text above them are clipped first.
+    // Assert the outcome rows are visible in the live viewport...
+    let terminal = draw_viewport(70, 40, &screen);
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("Yes, restore previous mode (default)"),
+        "the restore row interpolates the wire mode: {text}"
+    );
+    assert!(text.contains("Yes, and auto-accept edits"), "{text}");
+    assert!(text.contains("Yes, and manually approve edits"), "{text}");
+    assert!(text.contains("No, keep planning (esc)"), "{text}");
+
+    // ...and the VERBATIM title + the plan markdown are the box's top content
+    // rows (checked on the pure line set so the top-clip does not hide them).
+    let pending = screen.pending_plan.as_ref().unwrap();
+    let lines = plan_modal_lines(pending, 68, theme::dark());
+    let rendered: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("Would you like to proceed?")),
+        "the VERBATIM title row: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|row| row.contains("The Plan")),
+        "the plan markdown heading renders: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|row| row.contains("Refactor the widget.")),
+        "the plan markdown body renders: {rendered:?}"
+    );
+}
+
+// The restore row interpolates the entered-from mode's qwen WIRE string (the
+// enum value, e.g. `auto-edit`), matching qwen's `({{mode}})`, not the footer
+// label (`auto-accept edits`).
+#[test]
+fn plan_modal_restore_row_uses_the_wire_mode_string() {
+    let pending = crate::ui::screen::PendingPlan::new(
+        "p-1".into(),
+        "plan".into(),
+        crate::approvals::ApprovalMode::AutoEdit,
+    );
+    let lines = plan_modal_lines(&pending, 60, theme::dark());
+    let rendered: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("Yes, restore previous mode (auto-edit)")),
+        "the restore row shows the wire mode string: {rendered:?}"
+    );
+}
+
+// ADR-0029 rigidity: every rendered plan-modal row is exactly the box width, so
+// the right border aligns (the box wrapper padded each row).
+#[test]
+fn plan_modal_rows_are_rigid_to_the_box_width() {
+    let pending = crate::ui::screen::PendingPlan::new(
+        "p-1".into(),
+        "# H\n\nSome plan text that is fairly long to exercise truncation.".into(),
+        crate::approvals::ApprovalMode::Default,
+    );
+    let width: u16 = 50;
+    let lines = plan_modal_lines(&pending, width, theme::dark());
+    for line in &lines {
+        let cols: usize = line.spans.iter().map(|s| s.content.width()).sum();
+        assert_eq!(cols, width as usize, "every row spans the full box width");
+    }
+}
+
 // The confirming call's marker is `?` (warning), not the executing `⊷`.
 #[test]
 fn the_confirming_call_wears_the_question_marker() {

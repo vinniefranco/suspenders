@@ -50,16 +50,16 @@ fn values(s: &[Suggestion]) -> Vec<String> {
 fn an_empty_query_lists_every_command_shortest_first() {
     // With no query every command is an equal (Fuzzy) match, so the ladder's
     // tiebreak decides: the SHORTER item first (`item_length`), then registry
-    // order. `mcp` (3) precedes `model`/`theme` (5), which keep registry order.
+    // order. `mcp` (3), `plan` (4), then `model`/`theme` (5) in registry order.
     let s = rank("", &no_recent, NOW);
-    assert_eq!(values(&s), vec!["mcp", "model", "theme"]);
+    assert_eq!(values(&s), vec!["mcp", "plan", "model", "theme"]);
 }
 
 #[test]
 fn recency_floats_a_used_command_to_the_top_of_the_empty_query() {
     // "theme" used recently outranks the rest despite being longest: recency
-    // sits ABOVE the length/registry tiebreak. The unused pair keeps the
-    // shortest-first order (`mcp` before `model`).
+    // sits ABOVE the length/registry tiebreak. The unused rest keep the
+    // shortest-first order (`mcp`, `plan`, `model`).
     let recent = |name: &str| {
         (name == "theme").then_some(RecentUse {
             count: 3,
@@ -67,7 +67,11 @@ fn recency_floats_a_used_command_to_the_top_of_the_empty_query() {
         })
     };
     let s = rank("", &recent, NOW);
-    assert_eq!(values(&s), vec!["theme", "mcp", "model"], "recent-first");
+    assert_eq!(
+        values(&s),
+        vec!["theme", "mcp", "plan", "model"],
+        "recent-first"
+    );
 }
 
 // --- the strength ladder (the PRIMARY sort key) ------------------------

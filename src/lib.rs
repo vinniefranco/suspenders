@@ -19,6 +19,7 @@ pub mod notebook;
 pub mod plan;
 pub mod run;
 pub mod session;
+pub mod shell_safety;
 pub mod skills;
 pub mod stop_reason;
 pub mod subagents;

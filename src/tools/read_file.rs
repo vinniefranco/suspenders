@@ -47,6 +47,11 @@ const DESCRIPTION: &str = "Reads and returns the content of a specified file. If
 
 #[async_trait::async_trait]
 impl Tool for ReadFile {
+    // Read-only (qwen read-file.ts:544 `Kind.Read`): allowed in plan mode.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Read
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),

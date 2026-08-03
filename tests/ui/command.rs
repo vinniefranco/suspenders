@@ -2,10 +2,11 @@ use super::*;
 use crate::ui::slash;
 
 #[test]
-fn model_theme_and_mcp_are_handled_and_an_unknown_name_is_not() {
+fn model_theme_mcp_and_plan_are_handled_and_an_unknown_name_is_not() {
     assert!(is_handled("model"));
     assert!(is_handled("theme"));
     assert!(is_handled("mcp"));
+    assert!(is_handled("plan"));
     assert!(!is_handled("compact"));
     assert!(!is_handled(""));
 }

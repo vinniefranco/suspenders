@@ -52,6 +52,12 @@ Plan mode note: In plan mode, use this tool to clarify requirements or choose be
 
 #[async_trait::async_trait]
 impl Tool for AskUserQuestion {
+    // Think (qwen askUserQuestion.ts `Kind.Think`): ALLOWED in plan mode - the
+    // model can still ask the user clarifying questions while planning.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Think
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "ask_user_question".into(),

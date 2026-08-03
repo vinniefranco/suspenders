@@ -8,11 +8,14 @@
 pub mod agent;
 pub mod ask_user_question;
 pub mod edit_file;
+pub mod enter_plan_mode;
+pub mod exit_plan_mode;
 pub mod file_diff;
 pub mod glob;
 pub mod grep;
 pub mod list_files;
 pub mod notebook_edit;
+pub mod plan_lifecycle;
 pub mod read_file;
 pub mod run_command;
 pub mod shaping;
@@ -49,6 +52,11 @@ pub(crate) fn tools() -> Vec<Box<dyn Tool>> {
         Box::new(run_command::RunCommand),
         Box::new(web_fetch::WebFetch),
         Box::new(ask_user_question::AskUserQuestion),
+        // enter_plan_mode is always-visible (qwen `shouldDefer: false`) so an
+        // explicit plan-mode request works; exit_plan_mode is deferred +
+        // always-declared (ADR-0067), revealed by enter_plan_mode.
+        Box::new(enter_plan_mode::EnterPlanMode),
+        Box::new(exit_plan_mode::ExitPlanMode),
         // task_stop trails with tool_search: both are deferred (discovered via
         // `tool_search`), so neither rides the base wire list (P4b, ADR-0063).
         Box::new(task_stop::TaskStop),

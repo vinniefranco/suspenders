@@ -42,7 +42,7 @@ One user request and everything the Agent does to answer it - the model may make
 _Avoid_: iteration, round, turn (the ecosystem's "turn" is one Pass, not the whole request; Suspenders names the request cycle a Run, matching OpenAI's Run - a call that processes across many steps until it needs input again). Renamed from "Turn" (2026-07): the old name reassigned the ecosystem's "turn" to the outer level and misled newcomers.
 
 **Agent**:
-The orchestrator that drives Runs. The loop is a plain ReAct loop (ADR-0045): each Pass builds one request (the static system prompt, the full Conversation, the full Tool registry - no per-Pass narrowing), streams the response, executes any Tool Calls, appends the results, and repeats until the model returns no Tool Calls, bounded by the Run Limit. It injects nothing to steer the model; the only runtime intervention is the passive Loop-detector.
+The orchestrator that drives Runs. The loop is a plain ReAct loop (ADR-0045): each Pass builds one request (the static system prompt, the full Conversation, the full Tool registry - no per-Pass narrowing), streams the response, executes any Tool Calls, appends the results, and repeats until the model returns no Tool Calls, bounded by the Run Limit. It injects nothing to steer the model; the only runtime intervention is the passive Loop-detector. The one exception is **Plan Mode** (ADR-0067): while the user is in that explicit read-only mode, each Pass carries an ephemeral read-only reminder at request-shaping - a standing mode invariant, not reactive steering, and never stored in the Conversation.
 
 **Pass**:
 One model response and the Tool Calls it carries - the unit the loop repeats within a Run. A Run is one or more Passes.
@@ -135,6 +135,18 @@ _Avoid_: confirmation, permission
 The result of an approve-always answer: run_command Tool Calls whose command string is identical to the approved one are auto-approved for the rest of the Session, without a modal. The Transcript still records each auto-approved run.
 _Avoid_: allowlist (implementation term), whitelist
 
+**Approval Mode**:
+The Session-scoped policy the Shift+Tab cycle rotates through - `Plan → Default → AutoEdit → Auto → Yolo → (wrap)` (ADR-0050). It decides what happens to a Tool Call before it runs: `Default` gates as usual, `Yolo` auto-approves every gated Call, `Plan` is read-only (see Plan Mode). Held on the Agent's Approval state as the authoritative value; the Screen mirrors it for the footer, and the Run loop reads a live mirror of it to classify each Tool Call (ADR-0067).
+_Avoid_: permission mode, auto-accept level
+
+**Plan Mode**:
+The read-only Approval Mode: the user tells the model to research and plan without changing anything yet (ADR-0067, ported from qwen v0.21.4). Entered by Shift+Tab or the `enter_plan_mode` Tool; while active, every mutating Tool Call is blocked (edits, writes, mutating shell) while reads, searches, web_fetch, the todo_write record, and read-only shell run freely, and each Pass carries an ephemeral read-only reminder. The model presents its plan through the `exit_plan_mode` Tool, which raises a three-outcome dialog - restore the previous mode, proceed and auto-accept edits, or proceed and manually approve edits - and on approval saves the plan and leaves Plan Mode. Leaving via Shift+Tab instead injects a one-shot notice that Plan Mode is no longer active.
+_Avoid_: planning phase (it is a mode, not a lifecycle stage), dry-run, read-only mode (the read-only posture is a property of the mode, not its name)
+
+**Kind**:
+The self-declared category of a Tool - `Read`, `Edit`, `Delete`, `Move`, `Search`, `Execute`, `Think`, `Fetch`, `Agent`, `Other` (qwen's `Kind`) - stated on the Tool's spec. Its job is to tell the Approval Mode verdict whether a Tool mutates: the mutating Kinds (`Edit`/`Delete`/`Move`/`Execute`) are what Plan Mode blocks. A Tool that declares no Kind is `Other` (never a mutator), so a mis-declared Tool fails safe - blocked in Plan Mode rather than slipping a change through.
+_Avoid_: tool type, category (overloaded), read-only flag (Kind is finer than a boolean)
+
 **Context Budget**:
 The token allowance the Conversation must fit within, derived each Run from the captured Model's context window. Config supplies the window for Models the Catalog does not know, and may cap it globally.
 
@@ -164,7 +176,7 @@ Display-side data a Tool attaches to its Tool Result - a diff, a parsed todo lis
 _Avoid_: Presenter output (the retired role is gone; the Tool owns the Artifact now), attachment (overloaded with model-facing content)
 
 **Voice**:
-Every Suspenders-voiced string the model reads: the system prompt, the compaction prompt, and every marker (run limit, cancellation, Result Cap cuts, malformed input, the run-close markers, and the error answers to a truncated or orphaned Tool Call). The Voice no longer authors any mid-Conversation steering - the nudge, anchor, and endgame apparatus is gone; the loop-detector's run-close marker is the only intervention text and it merely ends the Run. The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Hook produces about its own decisions stay in that Hook. Owned by one module so wording can be tuned per model in one place.
+Every Suspenders-voiced string the model reads: the system prompt, the compaction prompt, the Plan Mode reminders (the standing per-Pass read-only reminder and the one-shot manual-exit notice, ADR-0067), and every marker (run limit, cancellation, Result Cap cuts, malformed input, the run-close markers, and the error answers to a truncated or orphaned Tool Call). The Voice no longer authors any mid-Conversation *reactive* steering - the nudge, anchor, and endgame apparatus is gone; the loop-detector's run-close marker merely ends the Run. The Plan Mode reminder is the one standing injection, and it is ephemeral request-shaping (it rides each Pass while in Plan Mode, never entering the Conversation), not reactive drift-correction. The boundary is voice, not arity: wording may be parameterized, but Suspenders authors it. Strings a Tool produces about its own execution stay in that Tool; strings a Hook produces about its own decisions stay in that Hook. Owned by one module so wording can be tuned per model in one place.
 _Avoid_: prompt strings, constants, "static strings" (parameterized wording still belongs), Steering Vocabulary (legacy name; Steering now means mid-Run user input)
 
 **Steering**:
@@ -199,6 +211,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - Each **Pass** builds one request carrying the full **Tool** registry - there is no per-Pass narrowing; the **Agent** repeats **Passes** until the model returns no **Tool Calls** or the **Run Limit** is reached
 - A **Tool Call** for run_command requires an **Approval** before execution, unless a **Standing Approval** covers its exact command string
 - A **Standing Approval** belongs to the **Session** - it does not survive restart and never widens beyond the identical command string
+- The **Approval Mode** decides every **Tool Call**'s fate through one mode-aware verdict (ADR-0067): allow, open an **Approval**, or block. **Plan Mode** blocks any **Tool Call** whose **Kind** mutates (except read-only shell, which its classifier allows), while reads, searches, web_fetch, and the **todo_write** record run freely
 - **Compaction** is the sole context-reclaim mechanism; when the **Conversation** cannot fit the **Context Budget** even after Compaction, the **Run** fails loudly and an over-budget request is never sent
 - Every **Tool Result** is cut to the **Result Cap** before it enters the **Conversation**; the cap derives from the **Context Budget** the **Run** captured
 - The system prompt, the compaction prompt, and every marker belong to the **Voice**; the **Voice** authors no mid-Conversation steering

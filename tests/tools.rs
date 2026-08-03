@@ -14,6 +14,8 @@ const EXPECTED_NAMES: &[&str] = &[
     "run_shell_command",
     "web_fetch",
     "ask_user_question",
+    "enter_plan_mode",
+    "exit_plan_mode",
     "tool_search",
 ];
 
@@ -31,9 +33,10 @@ fn text_of(result: &ToolResult) -> String {
 
 #[test]
 fn returns_every_tool_in_prompt_order_todo_write_first() {
-    // 13 built-ins: task_stop (P4b, ADR-0063) joined the set, but it is
-    // deferred so it does NOT appear on the base wire list (`specs()`).
-    assert_eq!(tools().len(), 13);
+    // 15 built-ins: task_stop (P4b, ADR-0063) is deferred so it does NOT appear
+    // on the base wire list (`specs()`); enter_plan_mode (always-visible) and
+    // exit_plan_mode (deferred + always_load, so always-declared) DO (ADR-0067).
+    assert_eq!(tools().len(), 15);
     let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
     assert_eq!(names, EXPECTED_NAMES);
 }
@@ -42,6 +45,42 @@ fn returns_every_tool_in_prompt_order_todo_write_first() {
 fn specs_returns_one_spec_per_tool_in_registry_order() {
     let names: Vec<String> = specs().iter().map(|s| s.name.clone()).collect();
     assert_eq!(names, EXPECTED_NAMES);
+}
+
+// Each built-in declares the Kind its qwen v0.21.4 counterpart carries (ADR-0067),
+// so the plan-mode verdict fold reads the same read-only / mutator facts qwen
+// does. A drifted Kind here would silently change plan-mode enforcement.
+#[test]
+fn every_builtin_declares_its_qwen_kind() {
+    use crate::approvals::Kind;
+    let by_name: std::collections::HashMap<String, Kind> = tools()
+        .iter()
+        .map(|t| (t.spec().name, t.kind()))
+        .collect();
+    let expect = [
+        ("todo_write", Kind::Think),
+        ("read_file", Kind::Read),
+        ("list_directory", Kind::Search),
+        ("glob", Kind::Search),
+        ("grep_search", Kind::Search),
+        ("edit", Kind::Edit),
+        ("write_file", Kind::Edit),
+        ("notebook_edit", Kind::Edit),
+        ("run_shell_command", Kind::Execute),
+        ("web_fetch", Kind::Fetch),
+        ("ask_user_question", Kind::Think),
+        ("enter_plan_mode", Kind::Think),
+        ("exit_plan_mode", Kind::Think),
+        ("task_stop", Kind::Other),
+        ("tool_search", Kind::Other),
+    ];
+    for (name, kind) in expect {
+        assert_eq!(
+            by_name.get(name),
+            Some(&kind),
+            "{name} must declare {kind:?}"
+        );
+    }
 }
 
 #[test]

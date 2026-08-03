@@ -303,6 +303,13 @@ contents of your todo list:\n\n{todos_json}. Continue on with the tasks at hand 
 
 #[async_trait::async_trait]
 impl Tool for TodoWriteTool {
+    // Think (qwen todoWrite.ts:559 `Kind.Think`): ALLOWED in plan mode. It
+    // writes, but only to the model's own task record, so qwen keeps it available
+    // while planning.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Think
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "todo_write".into(),

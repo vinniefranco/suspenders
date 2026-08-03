@@ -1,8 +1,11 @@
 use super::*;
+use crate::approvals::ApprovalMode;
 use crate::content::{ContentBlock, Usage};
 use crate::llm::response::{Response, StopReason};
 use crate::run::Outcome;
-use crate::run::fixtures::{deps_for, events, just, run_with, session, text_end};
+use crate::run::fixtures::{
+    deps_for, events, find_tool_result, just, run_with, run_with_mode, session, text_end,
+};
 use crate::test_support::Entry;
 use serde_json::json;
 use tempfile::TempDir;
@@ -74,4 +77,121 @@ fn a_malformed_input_answer_reads_as_a_run() {
         voice::malformed_input("{not json")
     );
     assert!(answer.is_error);
+}
+
+// ---- plan-mode enforcement at the loop gate (ADR-0067) ----
+
+// In PLAN mode a mutating Tool Call (write_file) is BLOCKED at the gate with NO
+// modal: the tool never runs, the result is an error carrying qwen's verbatim
+// "not a read-only tool" reason, and no ApprovalRequest is ever emitted.
+#[tokio::test]
+async fn plan_mode_blocks_a_mutating_tool_call_with_no_modal() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let target = root.path().join("a.rs");
+    let write_pass = Response {
+        content: vec![ContentBlock::tool_use(
+            "w1",
+            "write_file",
+            json!({"file_path": target.to_string_lossy(), "content": "fn main() {}"}),
+        )],
+        stop_reason: StopReason::ToolUse,
+        usage: Usage::default(),
+        error: None,
+    };
+    let deps = deps_for(&session, vec![Entry::just(write_pass), just(text_end("done"))]);
+    let (outcome, deps) = run_with_mode(&session, "write it", ApprovalMode::Plan, deps).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    // No modal opened for the blocked call.
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, Event::ApprovalRequest { .. })),
+        "a plan-mode block opens NO modal"
+    );
+    // The tool result is an error carrying qwen's verbatim block reason.
+    let Some(Event::ToolResult {
+        content, is_error, ..
+    }) = find_tool_result(&evs, "w1")
+    else {
+        panic!("no tool result for w1");
+    };
+    assert!(*is_error, "the blocked call reads as an error");
+    assert!(
+        content.contains("Tool blocked by plan mode: \"write_file\" is not a read-only tool."),
+        "the verbatim block reason reaches the model: {content}"
+    );
+    // No file was written (the tool never ran).
+    assert!(
+        !root.path().join("a.rs").exists(),
+        "the blocked write never touched the filesystem"
+    );
+}
+
+// In PLAN mode a read-only Tool Call (read_file) is ALLOWED: it runs normally,
+// no block, no modal.
+#[tokio::test]
+async fn plan_mode_allows_a_read_only_tool_call() {
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello from disk").unwrap();
+    let session = session(root.path());
+    let read_pass = Response {
+        content: vec![ContentBlock::tool_use(
+            "r1",
+            "read_file",
+            json!({"file_path": root.path().join("a.txt").to_string_lossy()}),
+        )],
+        stop_reason: StopReason::ToolUse,
+        usage: Usage::default(),
+        error: None,
+    };
+    let deps = deps_for(&session, vec![Entry::just(read_pass), just(text_end("done"))]);
+    let (outcome, deps) = run_with_mode(&session, "read it", ApprovalMode::Plan, deps).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let Some(Event::ToolResult {
+        content, is_error, ..
+    }) = find_tool_result(&evs, "r1")
+    else {
+        panic!("no tool result for r1");
+    };
+    assert!(!*is_error, "the read ran fine: {content}");
+    assert!(
+        content.contains("hello from disk"),
+        "the allowed read returned the file content: {content}"
+    );
+}
+
+// In DEFAULT mode the same mutating write is NOT blocked (edits are ungated in
+// suspenders): it runs, proving the block is plan-mode-specific.
+#[tokio::test]
+async fn default_mode_does_not_block_a_mutating_tool_call() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let target = root.path().join("a.rs");
+    let write_pass = Response {
+        content: vec![ContentBlock::tool_use(
+            "w1",
+            "write_file",
+            json!({"file_path": target.to_string_lossy(), "content": "fn main() {}"}),
+        )],
+        stop_reason: StopReason::ToolUse,
+        usage: Usage::default(),
+        error: None,
+    };
+    let deps = deps_for(&session, vec![Entry::just(write_pass), just(text_end("done"))]);
+    let (outcome, deps) = run_with_mode(&session, "write it", ApprovalMode::Default, deps).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let Some(Event::ToolResult { is_error, .. }) = find_tool_result(&evs, "w1") else {
+        panic!("no tool result for w1");
+    };
+    assert!(!*is_error, "default mode runs the write");
+    assert!(
+        root.path().join("a.rs").exists(),
+        "default mode wrote the file"
+    );
 }
