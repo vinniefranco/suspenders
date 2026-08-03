@@ -39,6 +39,34 @@ fn spec_description_lists_the_subagents_and_is_not_deferred() {
 }
 
 #[test]
+fn spec_description_uses_v0_21_4_wording_and_omits_fork_team() {
+    let spec = tool().spec();
+    let d = &spec.description;
+    // v0.21.4 re-ported phrasing that applies to the trimmed surface.
+    assert!(d.contains("If omitted, the general-purpose agent is used."));
+    assert!(d.contains("Delegate only concrete, bounded tasks that can run independently."));
+    assert!(d.contains("Treat the agent's output as evidence, not as automatically correct."));
+    assert!(d.contains("## Writing the prompt"));
+    assert!(d.contains("**Never delegate understanding.**"));
+    // The single test-runner example survives; the v0.16 greeting-responder
+    // second example is gone.
+    assert!(
+        d.contains("\"test-runner\": use this agent after you are done writing code to run tests")
+    );
+    assert!(!d.contains("greeting-responder"));
+    // Fork/team/isolation surface stays OUT (ADR-0061/0063).
+    assert!(!d.contains("fork"));
+    assert!(!d.contains("## When to fork"));
+    assert!(!d.contains("teammate"));
+    assert!(!d.contains("isolation"));
+    // subagent_type keeps suspenders' non-fork wording.
+    assert_eq!(
+        spec.input_schema["properties"]["subagent_type"]["description"],
+        "The type of specialized agent to use for this task"
+    );
+}
+
+#[test]
 fn empty_registry_omits_the_enum_and_shows_the_empty_wording() {
     let t = AgentTool::new(Arc::new(SubagentRegistry::default()));
     let spec = t.spec();

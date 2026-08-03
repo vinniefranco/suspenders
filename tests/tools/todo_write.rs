@@ -29,24 +29,45 @@ fn spec_matches_qwens_wire_schema() {
     assert_eq!(item["properties"]["content"]["type"], "string");
     assert_eq!(item["properties"]["content"]["minLength"], 1);
     assert_eq!(item["properties"]["id"]["type"], "string");
+    // qwen v0.21.4 caps the id at 500 chars.
+    assert_eq!(item["properties"]["id"]["maxLength"], 500);
     assert_eq!(
         item["properties"]["status"]["enum"],
         json!(["pending", "in_progress", "completed"])
     );
-    // qwen's wire item properties carry NO description.
+    // qwen v0.21.4 adds a `blockedBy` array of unique, 500-char-capped Todo IDs.
+    let blocked = &item["properties"]["blockedBy"];
+    assert_eq!(blocked["type"], "array");
+    assert_eq!(blocked["items"]["type"], "string");
+    assert_eq!(blocked["items"]["maxLength"], 500);
+    assert_eq!(blocked["uniqueItems"], json!(true));
+    assert_eq!(
+        blocked["description"],
+        "Todo IDs that must be completed before this item"
+    );
+    // qwen's wire item content/status properties carry NO description.
     assert!(item["properties"]["content"].get("description").is_none());
     assert!(item["properties"]["status"].get("description").is_none());
     assert!(item["properties"]["id"].get("description").is_none());
 }
 
 #[test]
-fn description_is_qwens_long_guide_verbatim() {
+fn description_is_qwens_short_v0_21_4_block_verbatim() {
     let d = TodoWriteTool.spec().description;
+    // qwen v0.21.4 replaced the long guide with a short outcome-oriented block.
+    assert!(d.contains(
+        "Use this tool to create and manage a user-visible task list when explicit progress tracking improves clarity."
+    ));
     assert!(d.contains("## When to Use This Tool"));
-    assert!(d.contains("## When NOT to Use This Tool"));
-    assert!(d.contains("## Task States and Management"));
-    assert!(d.contains("Implement CSS-in-JS styles for dark theme"));
-    assert!(d.contains("Run npm install for me and tell me what happens."));
+    assert!(d.contains("## Planning with Todos"));
+    assert!(d.contains(
+        "Use blockedBy only when the work has real dependencies. Reference Todo IDs from the same list and keep independent work unblocked."
+    ));
+    // The old long-guide scaffolding and worked examples are gone.
+    assert!(!d.contains("## When NOT to Use This Tool"));
+    assert!(!d.contains("## Task States and Management"));
+    assert!(!d.contains("Implement CSS-in-JS styles for dark theme"));
+    assert!(!d.contains("Run npm install for me and tell me what happens."));
     // No suspenders rewrites survive: the "no id field" trailer is gone.
     assert!(!d.contains("there is no id field"));
     assert!(!d.contains("cargo build"));
@@ -94,14 +115,34 @@ async fn a_missing_or_empty_id_is_rejected_with_qwens_message() {
     let missing = run(json!({ "todos": [{ "content": "x", "status": "pending" }] }))
         .await
         .unwrap_err();
-    assert_eq!(missing, r#"Each todo must have a non-empty "id" string."#);
+    assert_eq!(
+        missing,
+        r#"Each todo must have a non-empty "id" string of at most 500 characters."#
+    );
 
     let blank = run(json!({
         "todos": [{ "id": "  ", "content": "x", "status": "pending" }]
     }))
     .await
     .unwrap_err();
-    assert_eq!(blank, r#"Each todo must have a non-empty "id" string."#);
+    assert_eq!(
+        blank,
+        r#"Each todo must have a non-empty "id" string of at most 500 characters."#
+    );
+}
+
+#[tokio::test]
+async fn an_id_over_500_chars_is_rejected_with_qwens_message() {
+    let long_id = "x".repeat(501);
+    let err = run(json!({
+        "todos": [{ "id": long_id, "content": "x", "status": "pending" }]
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        r#"Each todo must have a non-empty "id" string of at most 500 characters."#
+    );
 }
 
 #[tokio::test]
@@ -136,6 +177,91 @@ async fn duplicate_ids_are_rejected_with_qwens_message() {
     .await
     .unwrap_err();
     assert_eq!(err, "Todo IDs must be unique within the array.");
+}
+
+#[tokio::test]
+async fn a_valid_blocked_by_reference_is_accepted() {
+    // qwen v0.21.4: `blockedBy` may reference other Todo IDs in the same list.
+    let out = run(json!({
+        "todos": [
+            { "id": "1", "content": "lay foundation", "status": "completed" },
+            { "id": "2", "content": "build wall", "status": "pending", "blockedBy": ["1"] },
+        ]
+    }))
+    .await
+    .unwrap();
+    assert!(out.starts_with("Todos have been modified successfully."));
+}
+
+#[tokio::test]
+async fn a_blocked_by_unknown_id_is_rejected() {
+    // A dependency on an ID absent from the list is rejected (qwen parity).
+    let err = run(json!({
+        "todos": [
+            { "id": "2", "content": "build wall", "status": "pending", "blockedBy": ["99"] },
+        ]
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(err, r#"Todo "2" references unknown dependency "99"."#);
+}
+
+#[tokio::test]
+async fn a_self_blocked_by_reference_is_rejected() {
+    let err = run(json!({
+        "todos": [
+            { "id": "1", "content": "x", "status": "pending", "blockedBy": ["1"] },
+        ]
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(err, r#"Todo "1" must not depend on itself."#);
+}
+
+#[tokio::test]
+async fn a_duplicate_blocked_by_reference_is_rejected() {
+    let err = run(json!({
+        "todos": [
+            { "id": "1", "content": "a", "status": "completed" },
+            { "id": "2", "content": "b", "status": "pending", "blockedBy": ["1", "1"] },
+        ]
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        r#"Todo "2" must not contain duplicate blockedBy references."#
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_blocked_by_value_is_rejected_with_qwens_message() {
+    // A non-array `blockedBy` is a shape violation.
+    let err = run(json!({
+        "todos": [
+            { "id": "1", "content": "a", "status": "pending", "blockedBy": "nope" },
+        ]
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        r#"Each todo "blockedBy" value must be an array of non-empty Todo IDs of at most 500 characters."#
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_by_dependency_cycle_is_rejected() {
+    // 1 depends on 2, 2 depends on 1: a cycle, rejected (qwen parity).
+    let err = run(json!({
+        "todos": [
+            { "id": "1", "content": "a", "status": "pending", "blockedBy": ["2"] },
+            { "id": "2", "content": "b", "status": "pending", "blockedBy": ["1"] },
+        ]
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(err, "Todo dependencies must not contain a cycle.");
 }
 
 #[tokio::test]

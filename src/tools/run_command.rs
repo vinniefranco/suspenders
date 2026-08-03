@@ -129,6 +129,7 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
   - Any command expected to run indefinitely until manually stopped\n\
 \n\
   - Command is executed as a subprocess that leads its own process group. Command process group can be terminated as `kill -- -PGID` or signaled as `kill -s SIGNAL -- -PGID`.\n\
+  - To stop a background command started by this tool, use `task_stop` when a task id is available. Do not use broad process-name kills such as `kill $(pgrep node)`, `pkill node`, or `killall node`; use a specific PID or process group id where supported.\n\
 - Use foreground execution (is_background: false) for:\n\
   - One-time commands: `ls`, `cat`, `grep`\n\
   - Build commands: `npm run build`, `make`\n\

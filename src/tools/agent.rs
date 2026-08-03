@@ -11,13 +11,24 @@
 //! [`SubagentSpawner`](crate::tool::caps::SubagentSpawner) capability (F4,
 //! ADR-0061), which drives a child Run to settlement and returns its result.
 //!
-//! The description scaffold is ported VERBATIM from qwen v0.16.0's
-//! `tools/agent/agent.ts` `baseDescription`. P4b (4c) restores the ONE
+//! The description scaffold is re-ported from qwen v0.21.4's
+//! `tools/agent/agent.ts` `baseDescription`, faithful to the parts that apply to
+//! Suspenders' trimmed surface: the shared opening, the "When NOT to use the
+//! Agent tool" list, the outcome-oriented usage notes, the "Writing the prompt"
+//! guidance, and the single test-runner example. P4b (4c) keeps the ONE
 //! `run_in_background` usage bullet and the boolean `run_in_background` schema
-//! property; the `isolation`/`worktree` note and schema property stay TRIMMED
-//! (git-worktree isolation is DEFERRED, ADR-0061/ADR-0063) - so the schema
-//! exposes exactly `description`, `prompt`, `subagent_type`, and
-//! `run_in_background`.
+//! property; the schema exposes exactly `description`, `prompt`, `subagent_type`,
+//! and `run_in_background`.
+//!
+//! DELIBERATELY OMITTED (ADR-0061/ADR-0063, not ported): qwen v0.21.4's
+//! fork/team/isolation surface - the `subagent_type: "fork"` context-inheritance
+//! path and its `fork_turns`/`fork_tools`/`fork_profile` params, the
+//! `isolation: "worktree"` note and property, the agent-team `name`/
+//! `plan_mode_required` params and `## When to fork` section, and qwen's
+//! background-by-default posture. Suspenders runs a regular subagent in the
+//! FOREGROUND by default (`run_in_background: true` opts into the background),
+//! so the description and the `run_in_background` param wording describe that
+//! foreground-default behavior rather than qwen's background-default.
 
 use std::sync::Arc;
 
@@ -86,7 +97,7 @@ The Agent tool launches specialized agents (subprocesses) that autonomously hand
 Available agent types and the tools they have access to:
 {}
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
+When using the Agent tool, specify a subagent_type to select which agent type to use. If omitted, the general-purpose agent is used. A regular subagent returns its result inline; set `run_in_background: true` when you have genuinely independent work to do in parallel and want its result to arrive later through a completion notification.
 
 When NOT to use the Agent tool:
 - If you want to read a specific file path, use the read_file tool or the glob tool instead of the agent tool, to find the match more quickly
@@ -94,23 +105,40 @@ When NOT to use the Agent tool:
 - If you are searching for code within a specific file or set of 2-3 files, use the read_file tool instead of the agent tool, to find the match more quickly
 - Other tasks that are not related to the agent descriptions above
 
-
 Usage notes:
 - Always include a short description (3-5 words) summarizing what the agent will do
-- Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
-- When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
+- Delegate only concrete, bounded tasks that can run independently.
+- Keep immediate critical-path work local when your next action depends on it.
+- Do not duplicate work between the parent and subagents.
+- Run agents concurrently only when their tasks are independent. For code changes, give concurrent agents disjoint write scopes; launch them in a single message with multiple tool uses.
+- A background agent reports its result through a completion notification in a later turn. A foreground regular agent returns its result inline. Agent results are not visible to the user, so relay the relevant outcome in your response.
+- While background agents run, continue meaningful non-overlapping work. Wait for an agent only when its result blocks the next required step.
 - Provide clear, detailed prompts so the agent can work autonomously and return exactly the information you need.
-- The agent's outputs should generally be trusted
+- Treat the agent's output as evidence, not as automatically correct. Verify factual claims, review code changes, and run relevant checks before integrating or relaying the result.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
-- If the user specifies that they want you to run agents \"in parallel\", you MUST send a single message with multiple Agent tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
+- If the user asks for agents \"in parallel\", group independent launches in a single message with multiple Agent tool use content blocks. Do not parallelize overlapping code changes.
 - You can optionally set `run_in_background: true` to run the agent in the background. You will be notified when it completes. Use this when you have genuinely independent work to do in parallel and don't need the agent's results before you can proceed.
+
+## Writing the prompt
+
+Brief the agent like a smart colleague: make the delegated task, boundaries, and expected output explicit. Regular subagents have not seen this conversation.
+- Explain what you're trying to accomplish and why.
+- Describe what you've already learned or ruled out.
+- Give enough context about the surrounding problem that the agent can make judgment calls rather than just following a narrow instruction.
+- If you need a short response, say so explicitly.
+- For lookups, provide the exact target. For investigations, provide the actual question rather than an over-prescribed sequence of steps.
+
+Terse command-style prompts produce shallow, generic work.
+
+**Never delegate understanding.** Do not write prompts like \"based on your findings, fix the bug\" or \"based on the research, implement it.\" Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood the task: include relevant file paths, constraints, what specifically needs to be learned or changed, and what is out of scope.
+
+After launching an agent, do not fabricate or predict what it found before it returns. If the user asks a follow-up before the result arrives, provide status rather than guessing.
 
 Example usage:
 
 <example_agent_descriptions>
 \"test-runner\": use this agent after you are done writing code to run tests
-\"greeting-responder\": use this agent to respond to user greetings with a friendly joke
 </example_agent_descriptions>
 
 <example>
@@ -130,14 +158,6 @@ Since a significant piece of code was written and the task was completed, now us
 </commentary>
 assistant: Uses the agent tool to launch the test-runner agent
 </example>
-
-<example>
-user: \"Hello\"
-<commentary>
-Since the user is greeting, use the greeting-responder agent to respond with a friendly joke
-</commentary>
-assistant: \"I'm going to use the agent tool to launch the greeting-responder agent\"
-</example>
 ",
             self.subagent_descriptions()
         );
@@ -147,6 +167,10 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
         // `run_in_background`; the `isolation`/`worktree` property stays TRIMMED,
         // deferred). The `subagent_type` enum is the registry's names when
         // non-empty.
+        // qwen v0.21.4's `subagent_type` description is 'The named agent type to
+        // use, or "fork" to inherit the parent conversation context' - the ONLY
+        // drift from suspenders' wording is the `"fork"` clause, and fork is
+        // DEFERRED (ADR-0061). Suspenders keeps its non-fork wording faithfully.
         let mut subagent_type = json!({
             "type": "string",
             "description": "The type of specialized agent to use for this task",
@@ -171,6 +195,12 @@ assistant: \"I'm going to use the agent tool to launch the greeting-responder ag
                         "description": "The task for the agent to perform",
                     },
                     "subagent_type": subagent_type,
+                    // qwen v0.21.4's `run_in_background` defaults to true (top-level
+                    // subagents background by default) and its description spans
+                    // fork/nested/caller-owned-worktree cases suspenders does not
+                    // have. Suspenders runs FOREGROUND by default and `true` opts
+                    // into the background, so it keeps this behavior-faithful
+                    // wording rather than qwen's background-default text.
                     "run_in_background": {
                         "type": "boolean",
                         "description": "Set to true to run this agent in the background. You will be notified when it completes.",

@@ -67,9 +67,8 @@ const GLOB_DESCRIPTION: &str =
 const PATH_DESCRIPTION: &str =
     "File or directory to search in (rg PATH). Defaults to current working directory.";
 
-/// The verbatim `limit` property description (qwen ripGrep.ts:518-519).
-const LIMIT_DESCRIPTION: &str =
-    "Limit output to first N lines/entries. Optional - shows all matches if not specified.";
+/// The verbatim `limit` property description (qwen ripGrep.ts:707-711).
+const LIMIT_DESCRIPTION: &str = "Limit output to first N lines/entries. Must be a positive integer. Optional - shows all matches if not specified.";
 
 #[async_trait::async_trait]
 impl Tool for Grep {
@@ -99,7 +98,8 @@ impl Tool for Grep {
                         "description": PATH_DESCRIPTION
                     },
                     "limit": {
-                        "type": "number",
+                        "type": "integer",
+                        "minimum": 1,
                         "description": LIMIT_DESCRIPTION
                     }
                 },

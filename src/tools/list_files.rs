@@ -55,15 +55,13 @@ const PATH_DESCRIPTION: &str =
 const IGNORE_DESCRIPTION: &str = "List of glob patterns to ignore";
 
 /// The verbatim `file_filtering_options` property description (qwen ls.ts:332-333).
-const FILE_FILTERING_OPTIONS_DESCRIPTION: &str =
-    "Optional: Whether to respect ignore patterns from .gitignore or .qwenignore";
+const FILE_FILTERING_OPTIONS_DESCRIPTION: &str = "Optional: Whether to respect ignore patterns from .gitignore, .qwenignore, and configured custom Qwen ignore files";
 
 /// The verbatim `respect_git_ignore` property description (qwen ls.ts:337-338).
 const RESPECT_GIT_IGNORE_DESCRIPTION: &str = "Optional: Whether to respect .gitignore patterns when listing files. Only available in git repositories. Defaults to true.";
 
 /// The verbatim `respect_qwen_ignore` property description (qwen ls.ts:342-343).
-const RESPECT_QWEN_IGNORE_DESCRIPTION: &str =
-    "Optional: Whether to respect .qwenignore patterns when listing files. Defaults to true.";
+const RESPECT_QWEN_IGNORE_DESCRIPTION: &str = "Optional: Whether to respect .qwenignore and configured custom Qwen ignore file patterns when listing files. Defaults to true.";
 
 /// A surviving child of the listed directory: its basename and whether it is a
 /// directory (for the `[DIR] ` prefix and the directories-first sort). The

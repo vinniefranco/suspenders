@@ -1,41 +1,71 @@
-//! The Suspenders-authored framing around a Compaction summary (CONTEXT.md:
-//! Voice, Compaction): the mechanical facts appended after the LLM summary, the
-//! summary content block itself, and the flat serialization fed to the
-//! compaction call. Wording Suspenders owns, kept beside the compaction prompt.
+//! The framing around a Compaction summary (CONTEXT.md: Voice, Compaction): the
+//! compression system prompt (a verbatim port of qwen v0.21.4's
+//! `getCompressionPrompt()`), the mechanical facts appended after the LLM
+//! summary, the summary content block itself (carrying qwen's post-compact
+//! resume trailer), and the flat serialization fed to the compaction call.
 
 use crate::content::{ContentBlock, Message, Role};
 
-const COMPACTION_PROMPT: &str = "Summarize the coding session below. Extract only facts from the
-conversation - do not invent or interpret. Fill in this markdown
-skeleton exactly, keeping every section heading:
+/// The compression system prompt, VERBATIM from qwen v0.21.4's
+/// `getCompressionPrompt()`. The model wraps its chain-of-thought in an
+/// `<analysis>` block (stripped by [`crate::compaction`] before the summary
+/// enters history) and then emits a `<state_snapshot>` XML envelope with nine
+/// sub-sections aligned to claude-code's compaction format.
+const COMPACTION_PROMPT: &str = r#"You are the component that summarizes a conversation when its context window is about to overflow. The summary you produce will become the agent's ONLY memory of everything that happened before this point. The agent will resume its work based solely on this summary plus a small number of restored file / image attachments that follow.
 
-## Task
-One sentence describing what the session is trying to accomplish.
+First, wrap your reasoning in an <analysis> block. Inside it, walk through the conversation chronologically and identify, for each section: the user's explicit requests and intent, your approach to those requests, key decisions / technical concepts / code patterns, specific details (file names, code snippets, function signatures, file edits), errors and how they were fixed, and any specific user feedback — especially when the user told you to do something differently. The <analysis> block is stripped before the summary reaches the next agent; it is purely a drafting scratchpad to improve the summary that follows.
 
-## Completed
-- Each finished step or change, one bullet per item.
+Then produce the final summary as the EXACT XML structure below. Be dense. Omit conversational filler.
 
-## In progress
-- Work that is started but not finished, one bullet per item.
+<state_snapshot>
+    <primary_request_and_intent>
+        <!-- Capture all of the user's explicit requests and intents in detail. Quote the user's exact phrasing where intent is at stake. -->
+    </primary_request_and_intent>
 
-## Decisions made
-- Each choice and its reason, one bullet per item.
+    <key_technical_concepts>
+        <!-- List all important technical concepts, technologies, and frameworks discussed. -->
+    </key_technical_concepts>
 
-## Key identifiers
-- Exact file paths, function names, error messages, and commands that
-  appeared. Copy them verbatim - do not paraphrase.
+    <files_and_code_sections>
+        <!-- Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages. Include full code snippets where applicable, and a summary of why this file read or edit is important. -->
+    </files_and_code_sections>
 
-## Next step
-The single most important thing to do next.
+    <errors_and_fixes>
+        <!-- List every error encountered and how it was fixed. Include the verbatim error message when it was quoted to the agent. Pay special attention to specific user feedback on the error, especially if the user told you to do something differently. -->
+    </errors_and_fixes>
 
-Write \"- none\" under any section with nothing to report. Do not add
-sections. Do not wrap the output in code fences.
-";
+    <problem_solving>
+        <!-- Document problems solved and any ongoing troubleshooting efforts. -->
+    </problem_solving>
 
-/// The prompt sent to the LLM for compaction (summarizing old messages).
+    <all_user_messages>
+        <!-- List ALL user messages that are not tool results, in chronological order. These are critical for understanding the user's feedback and shifting intent. Include short messages like "ok" or "continue" — they are signal. -->
+    </all_user_messages>
+
+    <pending_tasks>
+        <!-- Outline any pending tasks that the user has explicitly asked the agent to work on but that are not yet complete. -->
+    </pending_tasks>
+
+    <current_work>
+        <!-- Describe in detail precisely what the agent was working on immediately before this summary was requested, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable. -->
+    </current_work>
+
+    <next_step>
+        <!-- List the single next step the agent will take, related to the most recent work. The step MUST be DIRECTLY in line with the user's most recent explicit request and the task the agent was working on immediately before this summary. If the last task was concluded, list a next step only if it is explicitly in line with the user's request — do NOT start tangential or older work without confirming with the user first. If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. -->
+    </next_step>
+</state_snapshot>"#;
+
+/// The compression system prompt sent to the LLM for compaction (summarizing
+/// old messages), a verbatim port of qwen v0.21.4's `getCompressionPrompt()`.
 pub fn compaction_prompt() -> &'static str {
     COMPACTION_PROMPT
 }
+
+/// The trailer appended to the post-compact summary message, VERBATIM from qwen
+/// v0.21.4's `RESUME_TRAILER` (`postCompactAttachments.ts`). It lives in the
+/// re-injection wrapper (not the compression prompt) so the summary model does
+/// not regenerate it every compaction.
+const RESUME_TRAILER: &str = "Resume the prior task using the summary above. Continue from the last in-flight step; do not acknowledge the summary, do not re-introduce, do not greet the user again.";
 
 /// Accumulated file operations across a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,12 +101,11 @@ fn file_list(label: &str, paths: &[String]) -> String {
 }
 
 /// The content block for a compaction summary: a single text block wrapping
-/// the summary produced by the LLM, carrying a re-read caution.
+/// the summary produced by the LLM, followed by qwen's [`RESUME_TRAILER`] so the
+/// resuming agent continues from the last in-flight step without re-greeting.
 pub fn summary_block(summary: &str) -> ContentBlock {
     ContentBlock::Text {
-        text: format!(
-            "[Session summary from compaction. The narrative is paraphrase, not source - re-read a file before citing or editing its specifics.]\n\n{summary}"
-        ),
+        text: format!("{summary}\n\n{RESUME_TRAILER}"),
     }
 }
 

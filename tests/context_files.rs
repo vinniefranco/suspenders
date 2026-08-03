@@ -65,11 +65,13 @@ fn root(dir: &TempDir) -> String {
 #[test]
 fn returns_the_voice_default_when_no_files_exist() {
     let tmp = temp_dir();
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
 
     // The resolved prompt is the Voice default, then the appended
     // environment grounding; the base leads, and no context source loaded.
-    assert!(result.system_prompt.starts_with(voice::system_prompt()));
+    assert!(result.system_prompt.starts_with(&voice::system_prompt(
+        crate::voice::InteractionMode::Interactive
+    )));
     assert!(result.system_prompt.contains("# Environment"));
     assert_eq!(result.sources, Vec::new());
 }
@@ -81,7 +83,7 @@ fn replaces_the_default_system_prompt() {
     let tmp = temp_dir();
     write(&tmp, ".suspenders/SYSTEM.md", "You are a custom agent.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert!(result.system_prompt.starts_with("You are a custom agent."));
     assert!(result.sources.iter().any(|(t, _)| *t == SourceType::System));
 }
@@ -91,7 +93,7 @@ fn trims_surrounding_whitespace() {
     let tmp = temp_dir();
     write(&tmp, ".suspenders/SYSTEM.md", "\n  Be brief.  \n");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert!(result.system_prompt.starts_with("Be brief."));
 }
 
@@ -100,8 +102,10 @@ fn empty_system_md_is_ignored_falls_back_to_default() {
     let tmp = temp_dir();
     write(&tmp, ".suspenders/SYSTEM.md", "");
 
-    let result = load(&root(&tmp));
-    assert!(result.system_prompt.starts_with(voice::system_prompt()));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
+    assert!(result.system_prompt.starts_with(&voice::system_prompt(
+        crate::voice::InteractionMode::Interactive
+    )));
     assert_eq!(result.sources, Vec::new());
 }
 
@@ -116,8 +120,10 @@ fn appends_to_the_default_system_prompt() {
         "Always use strict typing.",
     );
 
-    let result = load(&root(&tmp));
-    assert!(result.system_prompt.contains(voice::system_prompt()));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
+    assert!(result.system_prompt.contains(&voice::system_prompt(
+        crate::voice::InteractionMode::Interactive
+    )));
     assert!(result.system_prompt.contains("Always use strict typing."));
     assert!(result.sources.iter().any(|(t, _)| *t == SourceType::Append));
 }
@@ -128,7 +134,7 @@ fn appends_after_system_md_when_both_exist() {
     write(&tmp, ".suspenders/SYSTEM.md", "Custom prompt.");
     write(&tmp, ".suspenders/APPEND_SYSTEM.md", "Extra instructions.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert!(
         result
             .system_prompt
@@ -143,7 +149,7 @@ fn loads_baud_agents_md_from_the_project_root() {
     let tmp = temp_dir();
     write(&tmp, ".suspenders/AGENTS.md", "Project conventions.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert!(result.system_prompt.contains("Project conventions."));
     assert!(result.system_prompt.contains("[Context from"));
     assert!(
@@ -159,7 +165,7 @@ fn loads_baud_claude_md_from_the_project_root() {
     let tmp = temp_dir();
     write(&tmp, ".suspenders/CLAUDE.md", "Claude conventions.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert!(result.system_prompt.contains("Claude conventions."));
     assert!(
         result
@@ -175,7 +181,7 @@ fn loads_both_agents_md_and_claude_md() {
     write(&tmp, ".suspenders/AGENTS.md", "Project conventions.");
     write(&tmp, ".suspenders/CLAUDE.md", "Claude conventions.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert!(result.system_prompt.contains("Project conventions."));
     assert!(result.system_prompt.contains("Claude conventions."));
     assert_eq!(result.sources.len(), 2);
@@ -188,7 +194,7 @@ fn loads_from_ancestor_directories() {
     std::fs::create_dir_all(&child).unwrap();
     write(&tmp, "parent/.suspenders/AGENTS.md", "Parent conventions.");
 
-    let result = load(&child);
+    let result = load(&child, crate::voice::InteractionMode::Interactive);
     assert!(result.system_prompt.contains("Parent conventions."));
 }
 
@@ -203,7 +209,7 @@ fn loads_from_root_and_ancestors_root_first() {
     );
     write(&tmp, "parent/.suspenders/AGENTS.md", "Parent-wide rules.");
 
-    let result = load(&child);
+    let result = load(&child, crate::voice::InteractionMode::Interactive);
 
     let child_start = result
         .system_prompt
@@ -339,11 +345,13 @@ fn load_reports_a_present_but_unusable_file_beside_the_loads() {
     let system = path(&tmp, ".suspenders/SYSTEM.md");
     std::fs::write(&system, [0xFF, 0xFE, 0x00]).unwrap();
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
 
     // The unusable SYSTEM.md is skipped exactly as before (fail-open, the
     // default prompt stands), and the healthy file still loads.
-    assert!(result.system_prompt.contains(voice::system_prompt()));
+    assert!(result.system_prompt.contains(&voice::system_prompt(
+        crate::voice::InteractionMode::Interactive
+    )));
     assert!(result.system_prompt.contains("Project conventions."));
     assert_eq!(
         result.skipped,
@@ -357,7 +365,7 @@ fn load_reports_a_present_but_unusable_file_beside_the_loads() {
 #[test]
 fn load_reports_no_skips_for_a_project_with_no_context_files() {
     let tmp = temp_dir();
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
     assert_eq!(result.skipped, Vec::new());
 }
 
@@ -383,7 +391,7 @@ fn system_md_append_system_md_then_context_files() {
     write(&tmp, ".suspenders/APPEND_SYSTEM.md", "Appendix.");
     write(&tmp, ".suspenders/AGENTS.md", "Context.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
 
     let first_line = result.system_prompt.split('\n').next().unwrap();
     assert_eq!(first_line, "Custom prompt.");
@@ -394,8 +402,10 @@ fn system_md_append_system_md_then_context_files() {
 #[test]
 fn default_prompt_when_no_files_exist() {
     let tmp = temp_dir();
-    let result = load(&root(&tmp));
-    assert!(result.system_prompt.starts_with(voice::system_prompt()));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
+    assert!(result.system_prompt.starts_with(&voice::system_prompt(
+        crate::voice::InteractionMode::Interactive
+    )));
 }
 
 // ---- environment grounding is appended last ----
@@ -406,7 +416,7 @@ fn appends_the_environment_block_after_the_resolved_prompt() {
     write(&tmp, ".suspenders/SYSTEM.md", "Custom prompt.");
     write(&tmp, ".suspenders/AGENTS.md", "Project conventions.");
 
-    let result = load(&root(&tmp));
+    let result = load(&root(&tmp), crate::voice::InteractionMode::Interactive);
 
     // The base and context files lead; the grounding block trails them,
     // carrying the cwd and OS so the Run starts grounded.

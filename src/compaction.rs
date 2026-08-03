@@ -35,11 +35,6 @@ use crate::llm::{Llm, LlmRequest};
 use crate::session::log::compose_summary;
 use crate::voice::{self, FileOps};
 
-/// The system prompt for the summarization call, mirroring baud's inline
-/// prompt (the harness owns the wording; the Voice module owns the body).
-const COMPACTION_SYSTEM: &str = "You are a summarization assistant. \
-Extract only facts. Produce the structured sections requested.";
-
 /// Compaction state and execution for semantic Conversation summarization.
 ///
 /// Tracks `previous_summary` and accumulated `file_ops` for subsequent
@@ -138,20 +133,14 @@ impl Compaction {
         let serialized =
             voice::serialize_for_compaction(messages, self.previous_summary.as_deref());
 
-        let prompt = format!(
-            "You are a summarization assistant. Summarize the coding session below. \
-Extract only facts. Produce the structured sections requested.\n\n{}\n\n{}",
-            voice::compaction_prompt(),
-            serialized
-        );
-
-        // A tool-free request over a single user message: no tools offered
-        // (the adapter omits the `tools` key when empty), Thinking left on.
+        // qwen's `getCompressionPrompt()` is the system prompt; the serialized
+        // conversation is the single user message. A tool-free request: no tools
+        // offered (the adapter omits the `tools` key when empty), Thinking left on.
         let messages = vec![crate::content::Message::user(vec![
-            crate::content::ContentBlock::text(prompt),
+            crate::content::ContentBlock::text(serialized),
         ])];
-        let req =
-            LlmRequest::new(COMPACTION_SYSTEM, messages, Vec::new()).with_temperature(temperature);
+        let req = LlmRequest::new(voice::compaction_prompt(), messages, Vec::new())
+            .with_temperature(temperature);
 
         let response = llm.complete(&req, model, &mut |_ev| {}).await;
 
@@ -222,16 +211,48 @@ pub struct SessionLogEntry {
     pub original_task: Option<String>,
 }
 
-// Extracts the summary text from the LLM response content blocks.
+// Extracts the summary text from the LLM response content blocks, stripping the
+// model's `<analysis>` drafting scratchpad (qwen's `stripAnalysis`). The
+// compression prompt asks the model to wrap its chain-of-thought in an
+// `<analysis>...</analysis>` block that is purely for its own benefit; keeping it
+// in history wastes tokens and degrades signal for the resuming agent.
 fn extract_summary(content: &[crate::content::ContentBlock]) -> String {
-    content
+    let joined = content
         .iter()
         .filter_map(|b| match b {
             crate::content::ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    strip_analysis(&joined)
+}
+
+// Removes `<analysis>...</analysis>` blocks (and an unclosed trailing
+// `<analysis>` with no matching close) from a raw summary. If stripping removes
+// everything - the model produced ONLY an analysis block - fall back to the raw
+// text so the caller sees something rather than an empty summary.
+fn strip_analysis(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("<analysis>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</analysis>") {
+            Some(end) => rest = &rest[start + end + "</analysis>".len()..],
+            // Unclosed tag: drop everything from `<analysis>` to the end.
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    let stripped = out.trim();
+    if stripped.is_empty() {
+        raw.trim().to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 // Merges new file ops into current ones, deduplicating and sorting.

@@ -57,6 +57,48 @@ fn spec_embeds_the_available_skills_catalog() {
 }
 
 #[test]
+fn spec_carries_qwen_v0_21_4_instruction_text_and_args_param() {
+    let (mgr, _tmp) = manager_with(&[("pdf", "Work with PDFs", "body")]);
+    let tool = SkillTool::new(mgr);
+    let spec = tool.spec();
+    // qwen v0.21.4 "can help" wording (not the v0.16 "below can help").
+    assert!(spec.description.contains(
+        "check if any of the available skills can help complete the task more effectively"
+    ));
+    assert!(!spec.description.contains("available skills below can help"));
+    // The new model-invocable-command invoke example.
+    assert!(spec.description.contains(
+        "`skill: \"mcp-prompt\", args: \"topic\"` - invoke a model-invocable command with arguments"
+    ));
+    // The Important list points at the <available_skills> catalog spliced into
+    // this description (Suspenders keeps the live catalog rather than qwen's
+    // <system-reminder>-delta surfacing, so the line names what is actually here).
+    assert!(
+        spec.description
+            .contains("Available skills are listed in the <available_skills> section below")
+    );
+    // The v0.16 "Only use skills listed in <available_skills> below" line is gone.
+    assert!(
+        !spec
+            .description
+            .contains("Only use skills listed in <available_skills> below")
+    );
+
+    // Schema: the optional `args` param and the updated `skill` description.
+    assert_eq!(
+        spec.input_schema["properties"]["skill"]["description"],
+        "The skill or command name. E.g., \"pdf\" or \"xlsx\""
+    );
+    assert_eq!(spec.input_schema["properties"]["args"]["type"], "string");
+    assert_eq!(
+        spec.input_schema["properties"]["args"]["description"],
+        "Optional arguments for model-invocable slash commands."
+    );
+    // `args` is optional; only `skill` is required.
+    assert_eq!(spec.input_schema["required"], json!(["skill"]));
+}
+
+#[test]
 fn spec_escapes_xml_in_name_and_description() {
     // A parse-valid name can still contain characters that are XML-special
     // only via the description; use a description with `<`/`&` to prove the

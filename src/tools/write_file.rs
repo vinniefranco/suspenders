@@ -26,12 +26,12 @@ use serde_json::{Value, json};
 
 pub struct WriteFile;
 
-/// VERBATIM from qwen v0.16.0 `tools/write-file.ts` (the description passed to the
+/// VERBATIM from qwen v0.21.4 `tools/write-file.ts` (the description passed to the
 /// `WriteFileTool` constructor), including its exact indentation on the second
-/// line.
-const DESCRIPTION: &str = "Writes content to a specified file in the local filesystem.
+/// paragraph.
+const DESCRIPTION: &str = "Writes content to a specified file in the local filesystem. A request to create or generate a file does not establish that the target path is new. Unless the target's absence or current text contents have already been established in this session, you MUST use the read_file tool first; if the file does not exist, then create it. With prior-read enforcement enabled, blind overwrites are rejected. The file_path argument MUST be an absolute path. Always construct it by combining the project root with the file's relative path (e.g. project root '/path/to/project/' + relative 'foo/bar.txt' = '/path/to/project/foo/bar.txt'). If the user provides a relative path, resolve it against the project root first.
 
-      The user has the ability to modify `content`. If modified, this will be stated in the response.";
+The user has the ability to modify `content`. If modified, this will be stated in the response.";
 
 #[async_trait::async_trait]
 impl Tool for WriteFile {
