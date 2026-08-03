@@ -281,8 +281,21 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         cancel_flag: false,
         settlement: Settlement::new(),
         approvals: Approvals::new(),
+        // The live Approval-mode mirror (ADR-0067), seeded to the fold's default
+        // mode so it agrees with `approvals` at launch. Every mode change writes
+        // both (the fold and this mirror), keeping them in lockstep.
+        approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+        // The one-shot manual-plan-exit notice carrier (ADR-0067): empty at
+        // launch (no manual exit has happened). Written on a Shift+Tab exit,
+        // taken once by the Run's `shape_request`.
+        plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
         approval_replies: HashMap::new(),
         question_replies: HashMap::new(),
+        plan_replies: HashMap::new(),
+        // No prePlanMode at launch (not in Plan); the revision starts at 0, in
+        // lockstep with qwen's `approvalModeRevision = 0` (ADR-0067).
+        pre_plan_mode: None,
+        approval_mode_revision: 0,
         steering: Vec::new(),
         compaction: Compaction::new(),
         self_tx,

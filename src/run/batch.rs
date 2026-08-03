@@ -5,9 +5,11 @@
 //!
 //! [`execute_tools`] runs a Pass's Tool Calls in emission order. Each call goes
 //! through the gates in sequence: the malformed-input sentinel (the LLM layer
-//! tags inputs that never parsed - those are answered, never run), then Approval
-//! (ADR-0005) on the raw tool input for the tools that require it, then execution
-//! with Shaping (the Result Cap). A tool shapes its own model-facing output and
+//! tags inputs that never parsed - those are answered, never run), then the one
+//! mode-aware verdict fold ([`crate::approvals::Approvals::classify`], ADR-0067)
+//! over EVERY call - which Allows, opens an Approval (ADR-0005), or Blocks
+//! (plan mode) - with the Hook permission composition (ADR-0066) ahead of it,
+//! then execution with Shaping (the Result Cap). A tool shapes its own model-facing output and
 //! attaches any display Artifacts (ADR-0007: the diff / todos / exit-code badge
 //! live in the tools now, not a wrapper pipeline). Once the batch finishes the
 //! Conversation is checkpointed with only the answered Tool Calls, so the
@@ -347,7 +349,7 @@ async fn run_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str, input: 
         } => (permission, context),
     };
 
-    let answer = gated_execute(state, name, input, pre_permission).await;
+    let answer = classified_execute(state, name, input, pre_permission).await;
 
     // The Post seam (ADR-0066): a successful result runs PostToolUse (context +
     // stop); a failed result runs PostToolUseFailure (context only). The injected
@@ -356,57 +358,43 @@ async fn run_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str, input: 
     post_process(state, name, answer, pre_context).await
 }
 
-// The Approval seam with the hook permission composition (ADR-0066, ADR-0050
-// revised). Only the gated Tools reach it (`approvals::gate_text`); for those,
-// the PermissionRequest hook composes with the mode: `allow` auto-approves with
-// no modal, `deny` rejects outright (overriding even Yolo) with the hook reason,
-// `ask`/no-decision falls through to the normal `request_approval` gate. The
-// PreToolUse permission decision joins the composition with the same precedence.
-async fn gated_execute<D: RunDeps>(
+// The one mode-aware verdict fold over EVERY Tool Call (ADR-0067), with the hook
+// permission composition (ADR-0066, ADR-0050 revised) layered ahead of it - the
+// two together in qwen's precedence order (coreToolScheduler.ts): a permission
+// `deny` rejects first, a permission `allow` auto-approves next (bypassing the
+// mode, including a plan-mode block, matching qwen's `finalPermission==='allow'`
+// early continue), and only then does the mode's own `classify` decide. Every
+// call folds through this now - the old gated-tools-only short-circuit is gone,
+// so the mode is the single axis every call is evaluated against (ADR-0067).
+//
+// The precedence, in order:
+//  1. Hook `deny` (PreToolUse decision or a PermissionRequest hook) -> reject the
+//     call with the hook reason, overriding even Yolo/Plan (an operator guard).
+//  2. Hook `allow` -> auto-approve with no modal, bypassing the mode - so a
+//     PermissionRequest `allow` runs a call plan mode would otherwise block
+//     (qwen bypasses plan-block on `finalPermission==='allow'`).
+//  3. Otherwise `classify` (the live mode + the tool's Kind) decides:
+//     - `Verdict::Block(reason)` -> the plan-mode block: return an error Answer
+//       with qwen's verbatim reason and NO modal (a mutating Kind in plan mode).
+//     - `Verdict::Ask(text)` -> the normal gate: round-trip `request_approval`.
+//     - `Verdict::Allow` -> execute. A PreToolUse `ask` still FORCES a
+//       confirmation here even on an ungated Allow (qwen `isAsk()`), so an Allow
+//       with a pending `ask` synthesizes the generic confirm gate.
+async fn classified_execute<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     name: &str,
     input: &Value,
     pre_permission: Option<crate::hooks::PermissionDecision>,
 ) -> Answer {
-    let Some(text) = approvals::gate_text(name, input) else {
-        // An ungated Tool: a PreToolUse `deny` was already handled as a universal
-        // Block above (A1), and a bare `allow` is moot (there is no gate to open).
-        // But a PreToolUse `ask` FORCES a confirmation even on an ungated tool
-        // (A1, qwen `isAsk()` -> requires-confirmation regardless of gating), so
-        // synthesize the gate over a generic confirm text and let the mode decide.
-        if pre_permission == Some(crate::hooks::PermissionDecision::Ask) {
-            emit_hook_decision(state, "PreToolUse", "requested confirmation");
-            let id = new_ref();
-            let text = format!("Confirm {name}");
-            return if state.deps.request_approval(id, text).await {
-                execute_tool_call(state, name, input).await
-            } else {
-                Answer::denied()
-            };
-        }
-        return execute_tool_call(state, name, input).await;
-    };
-
-    // Compose the hook verdict with the mode. `None` hooks handle => Ask (the
-    // normal gate); a fired hook may Allow / Deny / Ask.
-    let verdict = match state.hooks {
-        Some(hooks) => hooks.permission_request(name, input, pre_permission).await,
-        None => match pre_permission {
-            // With no PermissionRequest hooks, a PreToolUse permission decision
-            // still composes (ADR-0050 revised): allow auto-approves, deny rejects.
-            Some(crate::hooks::PermissionDecision::Allow) => hooks::PermissionVerdict::Allow,
-            Some(crate::hooks::PermissionDecision::Deny) => hooks::PermissionVerdict::Deny {
-                reason: voice::Marker::CommandDenied.text().to_string(),
-            },
-            _ => hooks::PermissionVerdict::Ask,
-        },
-    };
+    // Compose the hook permission verdict FIRST (deny/allow/ask), spanning the
+    // PreToolUse decision and any PermissionRequest hook, exactly as before. This
+    // now runs for EVERY tool (not just gated ones): with no PermissionRequest
+    // hooks and no pre-decision it folds to `Ask` (fall through to `classify`),
+    // so an ungated tool with no hooks reaches the same `classify` path a gated
+    // one does.
+    let verdict = compose_permission(state, name, input, pre_permission).await;
 
     match verdict {
-        hooks::PermissionVerdict::Allow => {
-            emit_hook_decision(state, "PermissionRequest", "auto-approved a Tool Call");
-            execute_tool_call(state, name, input).await
-        }
         hooks::PermissionVerdict::Deny { reason } => {
             emit_hook_decision(
                 state,
@@ -415,13 +403,90 @@ async fn gated_execute<D: RunDeps>(
             );
             Answer::text(reason, true)
         }
-        hooks::PermissionVerdict::Ask => {
+        hooks::PermissionVerdict::Allow => {
+            // A hook `allow` auto-approves the call with no modal, bypassing the
+            // mode - so plan mode does not block a call an operator hook allowed
+            // (qwen's `finalPermission==='allow'` continue precedes its
+            // plan-mode block). Visible either way.
+            emit_hook_decision(state, "PermissionRequest", "auto-approved a Tool Call");
+            execute_tool_call(state, name, input).await
+        }
+        hooks::PermissionVerdict::Ask => classify_and_run(state, name, input, pre_permission).await,
+    }
+}
+
+// The hook permission composition (deny/allow/ask), factored out of the fold so
+// the mode-aware `classify` reads as one step. Spans the PreToolUse permission
+// decision and any PermissionRequest hook, with `deny` overriding `allow`
+// (ADR-0050 revised). With no hooks wired it folds the bare PreToolUse decision:
+// allow -> Allow, deny -> Deny (generic reason), else Ask.
+async fn compose_permission<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    pre_permission: Option<crate::hooks::PermissionDecision>,
+) -> hooks::PermissionVerdict {
+    match state.hooks {
+        Some(hooks) => hooks.permission_request(name, input, pre_permission).await,
+        None => match pre_permission {
+            Some(crate::hooks::PermissionDecision::Allow) => hooks::PermissionVerdict::Allow,
+            Some(crate::hooks::PermissionDecision::Deny) => hooks::PermissionVerdict::Deny {
+                reason: voice::Marker::CommandDenied.text().to_string(),
+            },
+            _ => hooks::PermissionVerdict::Ask,
+        },
+    }
+}
+
+// The mode-aware `classify` fold + its side effects (ADR-0067), reached when the
+// hook composition did not force allow/deny. Reads the LIVE Approval mode from
+// the shared atomic mirror and the tool's self-declared Kind from the registry,
+// then folds them into a Verdict:
+//  - `Block(reason)` -> the plan-mode block, an error Answer with no modal.
+//  - `Ask(text)` -> the gate: round-trip `request_approval` (the Agent applies
+//    Yolo / any Standing Approval and opens the modal or auto-approves).
+//  - `Allow` -> execute; a pending PreToolUse `ask` still forces a confirmation.
+async fn classify_and_run<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    name: &str,
+    input: &Value,
+    pre_permission: Option<crate::hooks::PermissionDecision>,
+) -> Answer {
+    let mode = state.tool_ctx.caps.approval_mode.load();
+    let kind = state.tool_ctx.registry().kind_of(name);
+
+    match approvals::Approvals::with_mode(mode).classify(name, kind, input) {
+        approvals::Verdict::Block(reason) => {
+            // Plan mode blocked a mutating / non-read-only tool (ADR-0067): the
+            // tool never runs, qwen's verbatim reason is fed to the model as an
+            // error result, and NO modal opens. Surfaced visibly like a hook
+            // decision so the operator reads why the call was blocked.
+            emit_plan_block(state, name);
+            Answer::text(reason, true)
+        }
+        approvals::Verdict::Ask(text) => {
             let id = new_ref();
             if state.deps.request_approval(id, text).await {
                 execute_tool_call(state, name, input).await
             } else {
                 Answer::denied()
             }
+        }
+        approvals::Verdict::Allow => {
+            // A PreToolUse `ask` FORCES a confirmation even on an ungated Allow
+            // (qwen `isAsk()` -> requires-confirmation regardless of gating), so
+            // synthesize the generic confirm gate and let the user decide.
+            if pre_permission == Some(crate::hooks::PermissionDecision::Ask) {
+                emit_hook_decision(state, "PreToolUse", "requested confirmation");
+                let id = new_ref();
+                let text = format!("Confirm {name}");
+                return if state.deps.request_approval(id, text).await {
+                    execute_tool_call(state, name, input).await
+                } else {
+                    Answer::denied()
+                };
+            }
+            execute_tool_call(state, name, input).await
         }
     }
 }
@@ -590,6 +655,19 @@ fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, wha
         format!("hook {event}"),
         crate::event::Stage::Present,
         what.to_string(),
+    ));
+}
+
+// Surfaces a plan-mode block as a visible line (ADR-0067), on the same fail-open
+// report channel the hook decisions use: an `extension_error` labelled `plan
+// mode` with the `Present` mid-Run stage, so the operator reads that plan mode
+// blocked a mutating tool (the model reads qwen's verbatim reason as the result;
+// this is the user-facing notice).
+fn emit_plan_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str) {
+    state.emitter.emit(Event::extension_error(
+        "plan mode".to_string(),
+        crate::event::Stage::Present,
+        format!("blocked a non-read-only Tool Call: {name}"),
     ));
 }
 

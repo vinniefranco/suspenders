@@ -22,6 +22,7 @@ use crate::ui::{AdapterCtx, AdapterState};
 
 use super::mcp_command;
 use super::model_command;
+use super::plan_command;
 use super::screen::Screen;
 use super::theme_command;
 
@@ -35,6 +36,38 @@ enum Handled {
     Theme,
     /// `/mcp` - [`super::mcp_command`] (opens the McpDialog overlay).
     Mcp,
+    /// `/plan` - [`super::plan_command`] (enter/exit Plan mode; may submit a
+    /// trailing prompt).
+    Plan,
+}
+
+/// A committed Slash Command's payload - the three fields that always travel
+/// together from the pure core's
+/// [`Effect::Command`](crate::ui::screen::Effect::Command) to the router (the command
+/// `name`, the raw draft remainder `rest`, and the activation `generation`).
+/// Bundled as one Parameter Object so the router and the effect handler take a
+/// single argument rather than threading three parallel scalars (ADR-0032's
+/// command-agnostic seam - the router still classifies `name`, this only groups
+/// the carried facts). `mcp`'s internal re-entry ([`for_mcp`]) mints one with no
+/// `rest`.
+#[derive(Debug, Clone)]
+pub(super) struct Committed {
+    pub name: String,
+    pub rest: Option<String>,
+    pub generation: u64,
+}
+
+impl Committed {
+    /// The `/mcp` internal re-entry payload (ADR-0065 Phase E): the composer
+    /// already opened the McpDialog, and the `McpCommand` effect re-enters the
+    /// router to kick the fetch. `/mcp` takes no arg, so `rest` is `None`.
+    pub(super) fn for_mcp(generation: u64) -> Self {
+        Committed {
+            name: mcp_command::NAME.to_string(),
+            rest: None,
+            generation,
+        }
+    }
 }
 
 /// The SINGLE name→command mapping, over each module's own minted `NAME`, so
@@ -45,6 +78,7 @@ fn handled(name: &str) -> Option<Handled> {
         n if n == model_command::NAME => Some(Handled::Model),
         n if n == theme_command::NAME => Some(Handled::Theme),
         n if n == mcp_command::NAME => Some(Handled::Mcp),
+        n if n == plan_command::NAME => Some(Handled::Plan),
         _ => None,
     }
 }
@@ -59,27 +93,45 @@ pub fn is_handled(name: &str) -> bool {
 /// Routes a committed Slash Command to its adapter work (ADR-0032/0033). An
 /// unrecognized name is a visible no-op-with-info-line, not a silent drop. The
 /// [`Handled`] match is exhaustive, so a new command is a compile error here
-/// until it is handled. `generation` is the activation counter the effect
-/// carried; a selector-opening handler must echo it on its fill events.
-/// `state` is the run loop's one mutable adapter-state carrier
-/// ([`AdapterState`]); `/theme` reads and swaps its Theme state (ADR-0038).
+/// until it is handled. `cmd` is the committed-command [`Committed`] payload:
+/// its `rest` is the raw draft remainder past the command token (the argument
+/// text `/plan <prompt>` needs), forwarded command-agnostically from the pure
+/// core (ADR-0019), and its `generation` is the activation counter the effect
+/// carried (a selector-opening handler must echo it on its fill events). A
+/// command that takes no arg ignores `rest`. `state` is the run loop's one
+/// mutable adapter-state carrier ([`AdapterState`]); `/theme` reads and swaps
+/// its Theme state (ADR-0038).
+///
+/// RETURNS the Screen plus an OPTIONAL prompt the command asked to submit
+/// (`/plan <prompt>`): the caller feeds it through the run loop's submit path.
+/// Every other command returns `None` (no submit).
 pub(super) async fn run(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
-    name: &str,
-    generation: u64,
-) -> Screen {
-    match handled(name) {
-        Some(Handled::Model) => model_command::run(screen, ctx, generation).await,
-        Some(Handled::Theme) => theme_command::run(screen, ctx, &mut state.themes, generation),
+    cmd: Committed,
+) -> (Screen, Option<String>) {
+    let Committed {
+        name,
+        rest,
+        generation,
+    } = cmd;
+    match handled(&name) {
+        Some(Handled::Model) => (model_command::run(screen, ctx, generation).await, None),
+        Some(Handled::Theme) => (
+            theme_command::run(screen, ctx, &mut state.themes, generation),
+            None,
+        ),
         // `/mcp` opens the McpDialog overlay (ADR-0065 Phase E): the Composer
         // already opened it to a Loading state on commit; this kicks the async
         // `mcp_views()` fetch that fills it.
-        Some(Handled::Mcp) => mcp_command::run(screen, ctx, generation).await,
+        Some(Handled::Mcp) => (mcp_command::run(screen, ctx, generation).await, None),
+        // `/plan` enters/exits Plan mode (ADR-0067) and may return a trailing
+        // prompt to submit - the one command that carries `rest`.
+        Some(Handled::Plan) => plan_command::run(screen, ctx, rest.as_deref()).await,
         // The info line's Commit is re-derived by dispatch's trailing freeze
         // (ADR-0046), so drop it here - this seam returns only the Screen.
-        None => screen.info(format!("/{name}: no handler")).0,
+        None => (screen.info(format!("/{name}: no handler")).0, None),
     }
 }
 
@@ -100,6 +152,9 @@ pub(super) async fn choose(
         // which routes its own actions through `Effect::McpAction`, ADR-0065): a
         // `SelectorChosen` for it can never arise. Leave the Screen untouched.
         Some(Handled::Mcp) => screen,
+        // `/plan` is fire-and-run (it never opens a selector), so a
+        // `SelectorChosen` for it can never arise. Leave the Screen untouched.
+        Some(Handled::Plan) => screen,
         // Info line's Commit re-derived by dispatch's trailing freeze (ADR-0046).
         None => screen.info(format!("/{command}: no handler")).0,
     }

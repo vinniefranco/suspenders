@@ -39,7 +39,7 @@ use crate::session::Session;
 use crate::session::log::StopReason;
 use crate::tool::Tool;
 use crate::tool::caps::{
-    Capabilities, DecliningQuestioner, DenyingApprover, SubagentResult,
+    Capabilities, DecliningQuestioner, DenyingApprover, SubagentPlanMode, SubagentResult,
     UnavailableBackgroundShellSpawner, UnavailableSubagentSpawner,
 };
 
@@ -63,6 +63,14 @@ pub struct Capture {
     /// alongside the Approver. `Arc<dyn Questioner>` is Send+Sync, so the
     /// [`Capture`] stays `Send` for the `tokio::spawn` at the Agent.
     pub questioner: Arc<dyn crate::tool::caps::Questioner>,
+    /// The Plan-Mode effect seam (ADR-0067), built by the host that owns the
+    /// Approval mode (the Agent builds a tx-backed `AgentPlanMode`). The Run
+    /// assembles it into the Tool [`crate::tool::caps::Capabilities`] alongside
+    /// the Questioner. `Arc<dyn PlanMode>` is Send+Sync, so the [`Capture`] stays
+    /// `Send` for the `tokio::spawn` at the Agent. A child Run (spawned by
+    /// `run_child`) carries the degraded [`crate::tool::caps::SubagentPlanMode`]
+    /// here instead - the subagent block.
+    pub plan_mode: Arc<dyn crate::tool::caps::PlanMode>,
     /// The Session-stable tool set the Agent built once (F8, ADR-0056):
     /// built-ins plus any discovered MCP tools. The Run builds its per-Run
     /// [`crate::tool_registry::ToolRegistry`] over this shared `Arc` (fresh
@@ -109,6 +117,22 @@ pub struct Capture {
     /// The Session Log's JSONL path the hook payloads carry (H1, ADR-0066): the
     /// running transcript a hook can tail (`transcript_path`). Empty when no log.
     pub transcript_path: String,
+    /// The live Approval-mode mirror (ADR-0067): the shared
+    /// [`crate::approvals::AtomicApprovalMode`] the Agent writes on every mode
+    /// change and the batch gate reads in `classify`. Threaded through the
+    /// Capture (like the Approver) because the Agent owns the authoritative
+    /// mode; the Run only reads it. A child Run builds a fresh `Default` mirror
+    /// (subagents do not cycle the mode), so it is NOT on the child path.
+    pub approval_mode: Arc<crate::approvals::AtomicApprovalMode>,
+    /// The one-shot manual-plan-exit notice carrier (ADR-0067): the shared
+    /// [`crate::approvals::PendingManualPlanExit`] the Agent writes when the user
+    /// leaves Plan OUTSIDE the approved `exit_plan_mode` flow (a `Shift+Tab`
+    /// cycle), and the loop takes-and-clears in `shape_request` to inject the
+    /// manual-exit reminder once. Threaded through the Capture like the mode
+    /// mirror because the Agent owns the mode change; the Run only reads it. A
+    /// child Run builds a fresh empty carrier (subagents do not cycle the mode),
+    /// so it is NOT on the child path.
+    pub plan_exit_notice: Arc<crate::approvals::PendingManualPlanExit>,
 }
 
 /// Runs the Run: builds the Extension pipeline and Tool ctx and drives
@@ -163,6 +187,10 @@ pub async fn run(
         // The Question seam (P2a, ADR-0057): the Agent's tx-backed handle,
         // threaded through the Capture like the Approver.
         questioner: Arc::clone(&capture.questioner),
+        // The Plan-Mode seam (ADR-0067): the Agent's tx-backed handle, threaded
+        // through the Capture like the Approver/Questioner. A child Run carries the
+        // degraded SubagentPlanMode here instead - the subagent block.
+        plan_mode: Arc::clone(&capture.plan_mode),
         // The Subagent seam (P4/F4, ADR-0061): the Agent's DirectSubagentSpawner,
         // threaded through the Capture like the Approver/Questioner. A child Run
         // carries an UnavailableSubagentSpawner here instead - the recursion
@@ -173,6 +201,16 @@ pub async fn run(
         // Run carries an UnavailableBackgroundShellSpawner here instead - the
         // recursion guard.
         bg_shells: Arc::clone(&capture.bg_shells),
+        // The live Approval-mode mirror (ADR-0067): the Agent's shared atomic,
+        // threaded through the Capture like the Approver. The batch gate reads it
+        // in `classify` so plan mode enforces read-only against the LIVE mode,
+        // even when the operator cycles mid-Run.
+        approval_mode: Arc::clone(&capture.approval_mode),
+        // The manual-exit notice carrier (ADR-0067): the Agent's shared carrier,
+        // threaded through the Capture like the mode mirror. `shape_request` takes
+        // it once on the next Pass after a Shift+Tab exit and injects the
+        // manual-exit reminder into that request only.
+        plan_exit_notice: Arc::clone(&capture.plan_exit_notice),
     };
 
     // The Tool ctx: the Session's Root and timeout, the Result Cap derived from
@@ -296,10 +334,24 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
         approver: Arc::new(DenyingApprover),
         side_query,
         questioner: Arc::new(DecliningQuestioner),
+        // The subagent block (ADR-0061, ADR-0067): a child Run's plan-mode
+        // capability is degraded, so `enter_plan_mode`/`exit_plan_mode` inside a
+        // subagent return the VERBATIM qwen block result rather than mutating the
+        // parent session's Approval mode. Plan mode is owned by the caller.
+        plan_mode: Arc::new(SubagentPlanMode),
         subagents: Arc::new(UnavailableSubagentSpawner),
         // The recursion guard: a subagent's own background-shell capability is
         // degraded, so a subagent cannot background a shell (ADR-0063).
         bg_shells: Arc::new(UnavailableBackgroundShellSpawner),
+        // A fresh `Default` mode mirror (ADR-0067): a subagent does not cycle the
+        // Approval mode, and plan-mode entry inside a subagent is a no-op, so the
+        // child never inherits the parent's live mode. `Default` means its gate
+        // behaves normally (a child has degraded effect seams anyway).
+        approval_mode: Arc::new(crate::approvals::AtomicApprovalMode::default()),
+        // A fresh empty carrier (ADR-0067): a subagent does not cycle the mode, so
+        // it never has a manual plan exit to notice - `shape_request` always takes
+        // `None` here, injecting no manual-exit reminder in a child Run.
+        plan_exit_notice: Arc::new(crate::approvals::PendingManualPlanExit::empty()),
     };
 
     let tool_ctx = session.tool_ctx(&req.model, caps);

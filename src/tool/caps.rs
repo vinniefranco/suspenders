@@ -123,6 +123,31 @@ pub struct Capabilities {
     /// ([`UnavailableBackgroundShellSpawner`]) answers a host with no channel (a
     /// headless run, a test, a child Run - a subagent cannot background a shell).
     pub bg_shells: Arc<dyn BackgroundShellSpawner>,
+    /// The live Approval-mode mirror (ADR-0067): the shared
+    /// [`AtomicApprovalMode`](crate::approvals::AtomicApprovalMode) the Agent
+    /// writes on every mode change (the `Shift+Tab` cycle, later phases'
+    /// enter/exit) and the batch gate reads in `classify`. Concrete like the
+    /// registry (Run-scoped state the loop reads, not an effect it initiates). A
+    /// child Run gets a fresh `Default` mirror - subagents do not cycle the mode.
+    pub approval_mode: Arc<crate::approvals::AtomicApprovalMode>,
+    /// The one-shot manual-plan-exit notice carrier (ADR-0067, qwen's
+    /// `pendingManualPlanExitNotice`): the shared
+    /// [`PendingManualPlanExit`](crate::approvals::PendingManualPlanExit) the
+    /// Agent WRITES with the new mode when the user leaves Plan OUTSIDE the
+    /// approved `exit_plan_mode` flow (a `Shift+Tab` cycle), and the loop
+    /// TAKES-and-clears in `shape_request` to inject the manual-exit reminder into
+    /// exactly one request. Concrete like the mode mirror (Run-scoped shared state
+    /// the loop reads, not an effect it initiates). A child Run gets a fresh empty
+    /// carrier - a subagent does not cycle the mode.
+    pub plan_exit_notice: Arc<crate::approvals::PendingManualPlanExit>,
+    /// The Plan-Mode effect seam (ADR-0067): the two plan-lifecycle tools
+    /// (`enter_plan_mode`, `exit_plan_mode`) reach the Agent-owned Approval mode
+    /// through this. `dyn` and tx-backed like the [`Approver`]/[`Questioner`] (its
+    /// real impl lives in the Agent which owns the mode + the mpsc). A child Run
+    /// (subagent) carries the degraded [`SubagentPlanMode`] here - the subagent
+    /// block, so a plan-lifecycle call inside a subagent is a no-op returning the
+    /// VERBATIM qwen block result rather than mutating the parent's mode.
+    pub plan_mode: Arc<dyn PlanMode>,
 }
 
 impl std::fmt::Debug for Capabilities {
@@ -138,6 +163,9 @@ impl std::fmt::Debug for Capabilities {
             .field("questioner", &"<dyn>")
             .field("subagents", &"<dyn>")
             .field("bg_shells", &"<dyn>")
+            .field("approval_mode", &self.approval_mode)
+            .field("plan_exit_notice", &self.plan_exit_notice)
+            .field("plan_mode", &"<dyn>")
             .finish()
     }
 }
@@ -287,6 +315,108 @@ pub const NON_INTERACTIVE_MESSAGE: &str = "Cannot ask user questions in non-inte
 impl Questioner for DecliningQuestioner {
     async fn ask(&self, _questions: Vec<Question>) -> Result<Vec<(usize, String)>, String> {
         Err(NON_INTERACTIVE_MESSAGE.to_string())
+    }
+}
+
+/// The outcome of an `enter_plan_mode` call (ADR-0067), the state mutation the
+/// Agent resolves and the tool words VERBATIM. The Agent owns the atomic
+/// mode-flip + prePlanMode tracking (single authority, ADR-0017); the tool only
+/// reports the outcome, so this enum carries just the branch, not the state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnterPlanOutcome {
+    /// Plan mode was entered (or was already active - idempotent). The tool
+    /// returns the plan-mode system reminder as its content (qwen's
+    /// `getPlanModeSystemReminder`), so the string rides here, resolved by the
+    /// Agent from the Voice module so the tool needs no Voice dependency.
+    Entered { reminder: String },
+    /// A model-initiated entry from YOLO (`user_requested` falsey): a no-op, the
+    /// VERBATIM qwen guidance to keep planning in the current mode.
+    StayedYolo,
+    /// The plan-lifecycle tool is unavailable inside a subagent (ADR-0061): the
+    /// VERBATIM qwen block result. This is the DEGRADED capability's answer.
+    SubagentBlocked,
+}
+
+/// The outcome of an `exit_plan_mode` round-trip (ADR-0067), the resolution the
+/// Agent computes after the plan-confirmation dialog settles and the tool words
+/// VERBATIM. The Agent owns the atomic mode-flip + plan save + stale-revision
+/// guard (single authority); the tool only reports the branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanExitOutcome {
+    /// The user approved the plan: the Agent flipped the mode to the chosen
+    /// target and saved the plan. The tool returns the VERBATIM "User approved."
+    /// content.
+    Approved,
+    /// The user chose "No, keep planning": stay in plan mode, the VERBATIM
+    /// "Remaining in plan mode." content.
+    Cancel,
+    /// The mode changed out from under the pending exit between raising the
+    /// dialog and resolving it (qwen's `approvalModeRevision` stale-guard): no
+    /// action, the VERBATIM stale content.
+    Stale,
+    /// Not in plan mode (the user manually switched via Shift+Tab before the
+    /// exit resolved): the VERBATIM outside-plan guidance, carrying the current
+    /// mode's wire string so the tool interpolates it exactly as qwen does.
+    NotInPlanMode { current_mode: String },
+    /// The plan-lifecycle tool is unavailable inside a subagent (ADR-0061): the
+    /// VERBATIM qwen block result. The DEGRADED capability's answer.
+    SubagentBlocked,
+}
+
+/// The Plan-Mode effect: the two plan-lifecycle tools (`enter_plan_mode`,
+/// `exit_plan_mode`) reach the Agent-owned Approval mode through this (ADR-0067).
+/// A privilege change is Agent-owned state (the `Approvals` fold + the
+/// prePlanMode/revision bookkeeping, ADR-0017), so a tool cannot flip it - it
+/// asks the Agent to, and reads back the outcome it words verbatim.
+///
+/// Tx-backed like [`Approver`]/[`Questioner`] (its real impl
+/// [`crate::agent::capabilities::AgentPlanMode`] relays over the Agent mpsc):
+/// `enter_plan_mode` is a fire-and-await of the mode-flip logic (YOLO guard,
+/// idempotency, prePlanMode); `request_plan_exit` mints a dialog id, broadcasts
+/// a `PlanRequest`, and parks until the user resolves it. The DEGRADED impl
+/// ([`SubagentPlanMode`]) is the subagent block: a child Run carries it, so both
+/// legs return [`EnterPlanOutcome::SubagentBlocked`] /
+/// [`PlanExitOutcome::SubagentBlocked`] rather than mutating the parent's mode.
+///
+/// Object-safe and `async_trait`-boxed for the same reason as the other `dyn`
+/// seams (RPITIT is not object-safe; see ADR-0055).
+#[async_trait::async_trait]
+pub trait PlanMode: Send + Sync {
+    /// Asks the Agent to enter plan mode. `user_requested` is qwen's
+    /// `userRequested` flag: only an explicit user request (`true`) enters plan
+    /// from Yolo; a model-initiated entry (`false`) in Yolo is the no-op
+    /// [`EnterPlanOutcome::StayedYolo`]. Idempotent - entering when already in
+    /// plan never overwrites the saved prePlanMode.
+    async fn enter(&self, user_requested: bool) -> EnterPlanOutcome;
+
+    /// Asks the Agent to raise the plan-confirmation dialog over `plan` and
+    /// awaits the user's resolution. Blocks until the user answers (there is no
+    /// timeout - the user decides). Outside plan mode it returns
+    /// [`PlanExitOutcome::NotInPlanMode`] without raising a dialog.
+    async fn request_exit(&self, plan: String) -> PlanExitOutcome;
+}
+
+/// The DEGRADED [`PlanMode`]: the subagent block (ADR-0061, ADR-0067). A child
+/// Run's Capabilities carry this, so `enter_plan_mode`/`exit_plan_mode` inside a
+/// subagent are a no-op that returns the VERBATIM qwen block result rather than
+/// mutating the parent session's mode. Plan mode is owned by the caller/main
+/// session; a subagent returns its plan/findings to the caller in its normal
+/// response.
+///
+/// Mirrors [`UnavailableSubagentSpawner`] as the recursion-guard / headless
+/// posture (ADR-0019): the degraded impl returns the safe answer - here the
+/// subagent-blocked outcome the tool words verbatim - rather than reaching a
+/// channel it does not have.
+pub struct SubagentPlanMode;
+
+#[async_trait::async_trait]
+impl PlanMode for SubagentPlanMode {
+    async fn enter(&self, _user_requested: bool) -> EnterPlanOutcome {
+        EnterPlanOutcome::SubagentBlocked
+    }
+
+    async fn request_exit(&self, _plan: String) -> PlanExitOutcome {
+        PlanExitOutcome::SubagentBlocked
     }
 }
 

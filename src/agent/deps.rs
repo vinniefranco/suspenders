@@ -13,7 +13,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::capabilities::{
-    AgentApprover, AgentBackgroundShellSpawner, AgentQuestioner, AgentSubagentSpawner,
+    AgentApprover, AgentBackgroundShellSpawner, AgentPlanMode, AgentQuestioner,
+    AgentSubagentSpawner,
 };
 use crate::agent::{Msg, RunMsg};
 use crate::compaction::Compaction;
@@ -67,6 +68,14 @@ pub(crate) struct RunSpawn {
     /// The Session Log's JSONL path (H1, ADR-0010/0066): the running transcript a
     /// hook payload reports as `transcript_path`. Empty when the Agent opened no log.
     pub(crate) transcript_path: String,
+    /// The live Approval-mode mirror (ADR-0067): the shared atomic the Agent
+    /// writes on a mode change and the Run's batch gate reads. The SAME `Arc` the
+    /// Agent holds, so the in-flight Run sees a mid-Run cycle live.
+    pub(crate) approval_mode: Arc<crate::approvals::AtomicApprovalMode>,
+    /// The one-shot manual-plan-exit notice carrier (ADR-0067): the SAME `Arc` the
+    /// Agent holds, so the Run's `shape_request` takes-and-clears the notice the
+    /// Agent queued on a Shift+Tab exit and injects the manual-exit reminder once.
+    pub(crate) plan_exit_notice: Arc<crate::approvals::PendingManualPlanExit>,
 }
 
 /// The Run shell's [`RunDeps`]: every effect wired to the Agent's mpsc + the
@@ -111,6 +120,13 @@ pub(crate) struct AgentDeps {
     /// [`crate::run::Capture`] so the hook payloads carry `transcript_path` +
     /// `session_id` (the latter derived from this path's file stem).
     transcript_path: String,
+    /// The live Approval-mode mirror (ADR-0067): threaded into each Run's
+    /// [`crate::run::Capture`] so the batch gate's `classify` reads the live mode.
+    approval_mode: Arc<crate::approvals::AtomicApprovalMode>,
+    /// The one-shot manual-plan-exit notice carrier (ADR-0067): threaded into each
+    /// Run's [`crate::run::Capture`] so `shape_request` injects the manual-exit
+    /// reminder once after a Shift+Tab exit.
+    plan_exit_notice: Arc<crate::approvals::PendingManualPlanExit>,
 }
 
 impl AgentDeps {
@@ -130,6 +146,8 @@ impl AgentDeps {
             hooks,
             skills,
             transcript_path,
+            approval_mode,
+            plan_exit_notice,
         } = spawn;
         let subagent_run_limit = session.run_limit as usize;
         AgentDeps {
@@ -145,6 +163,8 @@ impl AgentDeps {
             hooks,
             skills,
             transcript_path,
+            approval_mode,
+            plan_exit_notice,
         }
     }
 
@@ -166,6 +186,14 @@ impl AgentDeps {
             // Standing-Approval / auto path. The Run assembles it into the Tool
             // Capabilities; the Agent owns the channel, so it builds the handle.
             questioner: Arc::new(AgentQuestioner {
+                tx: self.tx.clone(),
+            }),
+            // The Plan-Mode seam (ADR-0067): a tx-backed handle over this Agent's
+            // mpsc, like the Approver/Questioner. `enter_plan_mode`/`exit_plan_mode`
+            // reach the Agent-owned Approval mode through it; the Agent owns the
+            // channel + the mode, so it builds the handle. A child Run carries the
+            // degraded `SubagentPlanMode` instead - the subagent block.
+            plan_mode: Arc::new(AgentPlanMode {
                 tx: self.tx.clone(),
             }),
             // The Session-stable tool set (F8, ADR-0056): the Run's registry
@@ -217,6 +245,13 @@ impl AgentDeps {
             // the Session Log's JSONL path; the session id is derived from its stem.
             transcript_path: self.transcript_path.clone(),
             session_id: crate::run::hooks::session_id_from_log_path(&self.transcript_path),
+            // The live Approval-mode mirror (ADR-0067): the SAME `Arc` the Agent
+            // holds, so the Run's batch gate reads the operator's live mode.
+            approval_mode: Arc::clone(&self.approval_mode),
+            // The manual-exit notice carrier (ADR-0067): the SAME `Arc` the Agent
+            // holds, so the Run's `shape_request` takes the notice the Agent queued
+            // on a Shift+Tab exit and injects the manual-exit reminder once.
+            plan_exit_notice: Arc::clone(&self.plan_exit_notice),
         }
     }
 

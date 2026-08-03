@@ -33,7 +33,7 @@
 //!   `a` is approve-always (Standing Approval); Escape means Cancellation,
 //!   which wins over the Approval.
 
-use crate::approvals::ApprovalMode;
+use crate::approvals::{ApprovalMode, PlanDecision};
 use crate::conversation::compaction_target;
 use crate::event::Event;
 use crate::llm::response::StopReason;
@@ -209,6 +209,57 @@ impl PendingQuestion {
     }
 }
 
+/// The number of outcome rows the plan modal's [`SelectionList`] holds (ADR-0067,
+/// qwen `ToolConfirmationMessage.tsx:465-490`): restore-previous, auto-accept,
+/// manually-approve, keep-planning. Four rows, matching qwen's plan `options`.
+pub const PLAN_OPTION_COUNT: usize = 4;
+
+/// A pending plan-confirmation round-trip (ADR-0067, qwen `exit_plan_mode`): the
+/// id to resolve, the plan text the modal renders (markdown), the mode Plan was
+/// entered from (for the "restore previous mode ({mode})" row), and the radio
+/// over the FOUR outcome rows. Runs parallel to [`PendingQuestion`] - opened by
+/// [`Event::PlanRequest`], cleared when the user picks (or Escape). Like a
+/// question it has NO auto/standing path; the modal always opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlan {
+    pub plan_id: String,
+    /// The plan text (markdown) the modal renders above its outcome rows.
+    pub plan: String,
+    /// The mode Plan was entered from, worded into the restore-previous row's
+    /// `({mode})` (qwen `planProps.prePlanMode`).
+    pub pre_plan_mode: ApprovalMode,
+    /// The radio over the four outcome rows ([`PLAN_OPTION_COUNT`]).
+    pub selection: SelectionList,
+}
+
+impl PendingPlan {
+    /// Builds the modal state for a `plan_request`: the plan text, the entered-
+    /// from mode for the restore row, and a fresh four-row radio.
+    pub fn new(plan_id: String, plan: String, pre_plan_mode: ApprovalMode) -> Self {
+        PendingPlan {
+            plan_id,
+            plan,
+            pre_plan_mode,
+            selection: SelectionList::new(PLAN_OPTION_COUNT),
+        }
+    }
+}
+
+/// Maps a selected plan-modal row index to its [`PlanDecision`] (ADR-0067, qwen
+/// `ToolConfirmationMessage.tsx:465-490`, IN THAT ROW ORDER): row 0 restores the
+/// previous mode, row 1 proceeds auto-accepting edits, row 2 proceeds manually
+/// approving edits, row 3 keeps planning (the Escape/decline outcome). Out of
+/// range is `None` (defensive - the list is length 4).
+fn plan_decision_for_option(index: usize) -> Option<PlanDecision> {
+    match index {
+        0 => Some(PlanDecision::RestorePrevious),
+        1 => Some(PlanDecision::ProceedAlways),
+        2 => Some(PlanDecision::ProceedOnce),
+        3 => Some(PlanDecision::Cancel),
+        _ => None,
+    }
+}
+
 /// Maps a selected Approval option index to its [`Decision`] (ADR-0049): row 0
 /// approves once, row 1 approves-always (session-scoped standing, ADR-0005), row
 /// 2 denies. Out of range is `None` (defensive - the list is length 3).
@@ -321,6 +372,12 @@ pub enum AgentCommand {
     /// picks, `Err(decline)` the VERBATIM decline string. Mirrors
     /// [`AgentCommand::Approve`] but carries the full answer set.
     AnswerQuestion(String, Result<Vec<(usize, String)>, String>),
+    /// Resolve a pending plan-exit dialog (ADR-0067, `exit_plan_mode`): the id and
+    /// the user's [`PlanDecision`]. A plan exit is a THREE-outcome radio picking a
+    /// TARGET mode (restore-previous / auto-accept / manually-approve) plus the
+    /// keep-planning decline, not the two-way approve/deny of an Approval. Mirrors
+    /// [`AgentCommand::AnswerQuestion`] but carries a `PlanDecision`.
+    AnswerPlan(String, PlanDecision),
     Cancel,
 }
 
@@ -353,16 +410,23 @@ pub enum Effect {
     /// Persist a submitted prompt into the on-disk history file.
     HistoryAppend(String),
     /// A committed Slash Command (ADR-0032): the Composer recognized `/name`
-    /// and hands it to the adapter to run. Commands carry no inline arg today -
-    /// a selector-opening command's sub-filter comes from the draft `rest`
-    /// (the Composer's overlay view), not from this payload. The core does not
-    /// know what any command does - this payload is command-agnostic.
-    /// `generation` is the Composer's activation counter: the adapter echoes
-    /// it back on the fill events (SelectorReady/SelectorFailed) so a late
-    /// fill can never land on a later activation's overlay. Meaningful only
-    /// for selector-opening commands; a fire-and-run command has no fill to
-    /// tag.
-    Command { name: String, generation: u64 },
+    /// and hands it to the adapter to run. `rest` is the raw draft remainder
+    /// past the command token (`slash::parse(...).rest`) - the argument text a
+    /// fire-and-run arg-taking command needs (`/plan <prompt>`), carried
+    /// COMMAND-AGNOSTICALLY: the pure core still does not learn what any
+    /// command DOES with it (ADR-0019), it only forwards the remainder. `None`
+    /// when the draft had no remainder; a selector-opening command's sub-filter
+    /// comes from the draft `rest` in the overlay view, not this payload, so its
+    /// commit passes `None` here. `generation` is the Composer's activation
+    /// counter: the adapter echoes it back on the fill events
+    /// (SelectorReady/SelectorFailed) so a late fill can never land on a later
+    /// activation's overlay. Meaningful only for selector-opening commands; a
+    /// fire-and-run command has no fill to tag.
+    Command {
+        name: String,
+        rest: Option<String>,
+        generation: u64,
+    },
     /// A row was chosen from a committed command's selector (ADR-0033): the
     /// opaque command `name` and the selected row's `value`. The adapter
     /// interprets it (e.g. `/model` swaps the Active Model and persists); the
@@ -432,6 +496,12 @@ pub struct Screen {
     /// cleared when the last question is answered (or on Escape/decline). Unlike
     /// an Approval there is NO auto path; every question opens this modal.
     pub pending_question: Option<PendingQuestion>,
+    /// A pending plan-confirmation round-trip (ADR-0067, `exit_plan_mode`): the
+    /// modal state while the user picks a plan-exit outcome. Runs parallel to
+    /// `pending_question` - opened by [`Event::PlanRequest`], cleared when the user
+    /// picks (or Escape declines to keep planning). Like a question there is NO
+    /// auto path; the modal always opens.
+    pub pending_plan: Option<PendingPlan>,
     /// The current Approval mode (ADR-0050), a DISPLAY-ONLY mirror of the
     /// Agent's authoritative `Approvals::mode`, fed by
     /// [`Event::ApprovalModeChanged`]. The Screen never decides the mode - it
@@ -685,6 +755,7 @@ impl Screen {
             status: Status::Idle,
             pending_approval: None,
             pending_question: None,
+            pending_plan: None,
             approval_mode: ApprovalMode::default(),
             token_estimate: None,
             context_budget: opts.context_budget,
@@ -884,6 +955,10 @@ impl Screen {
 
             event @ (Event::QuestionRequest { .. } | Event::QuestionResolved { .. }) => {
                 self.apply_question(event)
+            }
+
+            event @ (Event::PlanRequest { .. } | Event::PlanResolved { .. }) => {
+                self.apply_plan(event)
             }
 
             event @ (Event::SteeringQueued { .. } | Event::SteeringDelivered { .. }) => {
@@ -1118,6 +1193,36 @@ impl Screen {
         }
     }
 
+    // The plan modal (ADR-0067, qwen `exit_plan_mode`): opens the PendingPlan on a
+    // PlanRequest and no-ops on PlanResolved (the modal was cleared on the picking
+    // keypress). Parallel to `apply_question`; a plan exit has NO auto path -
+    // the modal always opens, so the request leg unconditionally raises it.
+    fn apply_plan(mut self, event: Event) -> (Self, Vec<Effect>) {
+        match event {
+            Event::PlanRequest {
+                plan_id,
+                plan,
+                pre_plan_mode,
+            } => {
+                self.pending_plan = Some(PendingPlan::new(plan_id, plan, pre_plan_mode));
+                (
+                    self,
+                    vec![
+                        Effect::FocusModal,
+                        Effect::Notify("A plan is ready for review".to_string()),
+                    ],
+                )
+            }
+
+            // The round-trip settled: the modal was cleared when the user picked
+            // (mirroring how QuestionResolved arrives AFTER the modal is taken). A
+            // stray resolved for an already-cleared modal is a no-op. Display-only.
+            Event::PlanResolved { .. } => (self, vec![]),
+
+            _ => (self, vec![]),
+        }
+    }
+
     // Steering: queued shows a pending line; delivered promotes it to a
     // user line (the text is now in the Conversation). The marker text
     // and the promotion are the store's rule.
@@ -1224,10 +1329,11 @@ impl Screen {
                 self.status = Status::Idle;
                 self.token_estimate = Some(token_estimate);
                 self.context_budget = Some(context_budget);
-                // Robustness: a Run should never finish with the question modal
-                // still open, but if a future finish-with-open-modal path arises,
-                // clear it here so it can't leave a dangling modal.
+                // Robustness: a Run should never finish with the question or plan
+                // modal still open, but if a future finish-with-open-modal path
+                // arises, clear them here so they can't leave a dangling modal.
                 self.pending_question = None;
+                self.pending_plan = None;
                 (self, vec![])
             }
 
@@ -1268,6 +1374,15 @@ impl Screen {
         }
         if self.pending_approval.is_some() {
             return self.handle_approval_key(key);
+        }
+
+        // The plan modal (ADR-0067, `exit_plan_mode`) gates like the Approval
+        // modal: while it is open it holds the keyboard and drives the outcome
+        // radio, so no key leaks to the Composer behind it. Placed in the FIXED
+        // order Approval -> Plan -> Question -> Composer; only one modal is ever
+        // open at a time, but the gate sits here consistently.
+        if self.pending_plan.is_some() {
+            return self.handle_plan_key(key);
         }
 
         // The question modal (ADR-0057) gates like the Approval modal, with one
@@ -1608,6 +1723,55 @@ impl Screen {
         (self, vec![Effect::Agent(command), Effect::FocusComposer])
     }
 
+    // The plan-modal key gate (ADR-0067, qwen `exit_plan_mode` confirmation): the
+    // arrow/Enter keys drive the pure [`SelectionList`] over the four outcome
+    // rows, a digit quick-selects, and Escape picks the keep-planning
+    // [`PlanDecision::Cancel`] (the `(esc)` row - the modal's counterpart of the
+    // Approval's Escape-declines). Selecting a row resolves the round-trip; every
+    // other key is swallowed, so a stray key never leaks to the Composer while the
+    // modal holds the keyboard.
+    fn handle_plan_key(mut self, key: Key) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_plan.as_mut() else {
+            return (self, vec![]);
+        };
+        // Escape anywhere in the modal picks Cancel (keep planning): the plan
+        // radio's `(esc)` row, so it settles the round-trip like a real pick
+        // rather than aborting the Run.
+        if key == Key::Escape {
+            return self.resolve_plan(PlanDecision::Cancel);
+        }
+
+        // The same radio mapping the Approval/question radios use (arrows navigate,
+        // Enter selects, a digit quick-selects). The list has 4 rows, so a digit
+        // resolves immediately and the `now` fed to the fold is irrelevant (0).
+        let Some(sel_key) = plan_selection_key(&key) else {
+            return (self, vec![]);
+        };
+        match pending.selection.handle(sel_key, 0) {
+            SelectionOutcome::Selected(index) => match plan_decision_for_option(index) {
+                Some(decision) => self.resolve_plan(decision),
+                // Out of range (never in practice): swallow.
+                None => (self, vec![]),
+            },
+            // A move redraws the radio; cancel is handled above (Escape).
+            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
+                (self, vec![])
+            }
+        }
+    }
+
+    // A plan outcome was picked: emit the AnswerPlan command with the decision,
+    // clear the modal, and refocus the composer (mirrors `resolve_question` ->
+    // FocusComposer). The Agent flips the mode to the outcome's target and saves
+    // the plan on a proceed; here the Screen only relays the pick.
+    fn resolve_plan(mut self, decision: PlanDecision) -> (Self, Vec<Effect>) {
+        let Some(pending) = self.pending_plan.take() else {
+            return (self, vec![]);
+        };
+        let command = AgentCommand::AnswerPlan(pending.plan_id, decision);
+        (self, vec![Effect::Agent(command), Effect::FocusComposer])
+    }
+
     // The Help-overlay key gate (qwen `Help` `useKeypress`): while the panel is up
     // it holds the keyboard like the Approval modal - `Esc` closes it, and `?`/`q`
     // are the same convenience closers qwen offers; EVERY other key is swallowed
@@ -1864,10 +2028,11 @@ impl Screen {
     fn close_abnormally(mut self, note: String) -> (Self, Vec<Effect>) {
         self.transcript.close(Some(note));
         self.status = Status::Idle;
-        // A cancel/error/agent-down clears any open question modal too (its
-        // reply oneshot dies with the aborted Run, so the tool call unwinds); it
-        // must not linger claiming an answer is still due.
+        // A cancel/error/agent-down clears any open question or plan modal too
+        // (its reply oneshot dies with the aborted Run, so the tool call unwinds);
+        // it must not linger claiming a decision is still due.
         self.pending_question = None;
+        self.pending_plan = None;
         self.clear_approval()
     }
 }
@@ -1905,6 +2070,14 @@ fn approval_selection_key(key: &Key) -> Option<SelectionKey> {
 // radio (ArrowUp/Down navigate, Enter selects, a digit quick-selects); Escape is
 // handled by the caller (decline) before this, so it never reaches here.
 fn question_selection_key(key: &Key) -> Option<SelectionKey> {
+    approval_selection_key(key)
+}
+
+// Maps a Screen [`Key`] to the [`SelectionKey`] the plan radio acts on (ADR-0067),
+// or `None` for a key it ignores. The same mapping as the Approval/question radios
+// (ArrowUp/Down navigate, Enter selects, a digit quick-selects); Escape is handled
+// by the caller (Cancel) before this, so it never reaches here.
+fn plan_selection_key(key: &Key) -> Option<SelectionKey> {
     approval_selection_key(key)
 }
 

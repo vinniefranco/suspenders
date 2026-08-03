@@ -59,6 +59,11 @@ Expectation for required parameters:
 
 #[async_trait::async_trait]
 impl Tool for EditFile {
+    // Mutator (qwen edit.ts:771 `Kind.Edit`): BLOCKED in plan mode.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Edit
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit".into(),

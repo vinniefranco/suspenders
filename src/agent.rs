@@ -48,7 +48,7 @@ use crate::run::loop_::{Outcome as LoopOutcome, RunOpts};
 use crate::run::settlement::{Reason, Rollover, Settlement};
 use crate::session::Session;
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError};
-use crate::tool::caps::SubagentResult;
+use crate::tool::caps::{EnterPlanOutcome, PlanExitOutcome, SubagentResult};
 use crate::voice;
 
 pub mod background;
@@ -188,6 +188,20 @@ impl std::error::Error for StartError {}
 /// same shape (clippy: this Result-of-Vec-of-tuple is otherwise "very complex").
 pub type QuestionAnswers = Result<Vec<(usize, String)>, String>;
 
+/// A parked plan-exit dialog (ADR-0067): the reply oneshot the `exit_plan_mode`
+/// tool call awaits, plus the stale-guard snapshot taken when the dialog was
+/// raised (qwen's `ExitApprovalSnapshot`). `revision` is the
+/// `approval_mode_revision` at raise time and `pre_plan_mode` the mode Plan was
+/// entered from; `answer_plan` compares the live revision against `revision` to
+/// detect a mode change out from under the pending exit, and reads
+/// `pre_plan_mode` to resolve a "restore previous mode" target.
+struct PendingPlanExit {
+    reply: oneshot::Sender<crate::tool::caps::PlanExitOutcome>,
+    plan: String,
+    revision: u64,
+    pre_plan_mode: ApprovalMode,
+}
+
 /// A message the Run task sends back to the Agent (baud's `{:turn_event, ...}`,
 /// `{:turn_checkpoint, ...}`, `{:turn_plan, ...}`, `{:compacted, ...}`, and the
 /// `:drain_steering`/approval reply calls). Routed through the same mpsc as
@@ -217,6 +231,25 @@ pub enum RunMsg {
         id: String,
         questions: Vec<crate::tool::caps::Question>,
         reply: oneshot::Sender<QuestionAnswers>,
+    },
+    /// An `enter_plan_mode` request (ADR-0067): the Agent runs the atomic
+    /// YOLO-guard / idempotent / prePlanMode logic, writes the
+    /// [`AtomicApprovalMode`](crate::approvals::AtomicApprovalMode) mirror + bumps
+    /// the revision, and replies the outcome the tool words verbatim. No modal -
+    /// entering plan is a privilege reduction (qwen's `allow` permission).
+    EnterPlanMode {
+        user_requested: bool,
+        reply: oneshot::Sender<crate::tool::caps::EnterPlanOutcome>,
+    },
+    /// An `exit_plan_mode` request in plan mode (ADR-0067): the Agent mints a
+    /// dialog id, snapshots the current revision + prePlanMode, broadcasts
+    /// `plan_request` (opening the modal), and holds the reply until
+    /// [`Command::AnswerPlan`] arrives - parallel to [`RunMsg::AskQuestion`]. On a
+    /// proceed the Agent flips the mode to the target + saves the plan atomically;
+    /// the reply carries the outcome the tool words verbatim.
+    RequestPlanExit {
+        plan: String,
+        reply: oneshot::Sender<crate::tool::caps::PlanExitOutcome>,
     },
     /// A completed Compaction from the Run task: log the `{:compacted, ...}`
     /// entry and update the accumulated state (ADR-0012).
@@ -314,6 +347,31 @@ pub enum Command {
     /// call's reply oneshot. Mirrors [`Command::Approve`] but with no Standing-
     /// Approval fold - the reply map is the whole mechanic.
     AnswerQuestion(String, QuestionAnswers, oneshot::Sender<()>),
+    /// Resolve a pending plan-exit dialog (ADR-0067): the user's
+    /// [`PlanDecision`](crate::approvals::PlanDecision) - restore-previous /
+    /// proceed-once / proceed-always / keep-planning. The Agent flips the mode to
+    /// the outcome's target + saves the plan on a proceed (guarded by the stale
+    /// revision check), then forwards the outcome to the parked tool call's reply
+    /// oneshot. Mirrors [`Command::AnswerQuestion`] but the resolution picks a
+    /// TARGET mode rather than a yes/no.
+    AnswerPlan(String, crate::approvals::PlanDecision, oneshot::Sender<()>),
+    /// Enter Plan mode as an explicit USER request (ADR-0067, the `/plan`
+    /// command): routes through [`enter_plan_mode`] with `user_requested = true`,
+    /// so it enters Plan even from `Yolo` (the model-initiated YOLO guard does not
+    /// apply to a user ask). Idempotent - a request while already planning keeps
+    /// the original prePlanMode. The reply carries the NEW mode (always `Plan`) so
+    /// the caller sets the Screen mirror directly from the authoritative fold
+    /// result, not the lossy broadcast (the same P0 rationale as
+    /// [`Command::CycleApprovalMode`]).
+    EnterPlanMode(oneshot::Sender<ApprovalMode>),
+    /// Exit Plan mode by restoring the pre-plan mode (ADR-0067, the `/plan exit`
+    /// command): routes through [`set_approval_mode`] with
+    /// `from_approved_plan_exit = false`, so leaving Plan queues the one-shot
+    /// manual-exit reminder exactly as a Shift+Tab cycle out of Plan does (a
+    /// `/plan exit` is a MANUAL exit, not the approved `exit_plan_mode` flow). The
+    /// reply carries the NEW (restored) mode so the caller sets the Screen mirror
+    /// directly, like [`Command::CycleApprovalMode`].
+    ExitPlanMode(oneshot::Sender<ApprovalMode>),
     /// The `/mcp` dialog's read model (ADR-0065 Phase C): a clone of the manager's
     /// per-server [`McpServerView`]s, server-name-sorted. Read-only, so it never
     /// touches the tool set; the dialog polls it after every live op.
@@ -622,6 +680,25 @@ impl AgentHandle {
         let _ = rx.await;
     }
 
+    /// Resolves a pending plan-exit dialog (ADR-0067, `exit_plan_mode`): the
+    /// user's [`PlanDecision`](crate::approvals::PlanDecision). The Agent flips the
+    /// mode to the outcome's target + saves the plan on a proceed (stale-guarded),
+    /// then forwards the outcome to the parked tool call's reply oneshot. Mirrors
+    /// [`AgentHandle::answer_question`]; a dead Agent silently drops it.
+    pub async fn answer_plan(
+        &self,
+        plan_id: impl Into<String>,
+        decision: crate::approvals::PlanDecision,
+    ) {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Msg::Command(Command::AnswerPlan(
+            plan_id.into(),
+            decision,
+            reply,
+        )));
+        let _ = rx.await;
+    }
+
     /// Rotates the Approval mode one step (ADR-0050, the Shift+Tab cycle): the
     /// Agent's pure `Approvals` fold cycles and broadcasts the new mode. Applies
     /// whether or not a Run is in flight (Session-scoped). RETURNS the new mode
@@ -635,6 +712,31 @@ impl AgentHandle {
         let _ = self
             .tx
             .send(Msg::Command(Command::CycleApprovalMode(reply)));
+        rx.await.unwrap_or(ApprovalMode::Default)
+    }
+
+    /// Enters Plan mode as an explicit USER request (ADR-0067, the `/plan`
+    /// command): reuses [`enter_plan_mode`] with `user_requested = true`, so it
+    /// enters Plan even from `Yolo`, and is idempotent while already planning.
+    /// RETURNS the new mode (always `Plan`) so the caller sets the Screen mirror
+    /// directly from the authoritative fold result, like [`cycle_approval_mode`].
+    /// Falls back to `Plan` only if the actor is gone (the intended target).
+    pub async fn enter_plan_mode(&self) -> ApprovalMode {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Msg::Command(Command::EnterPlanMode(reply)));
+        rx.await.unwrap_or(ApprovalMode::Plan)
+    }
+
+    /// Exits Plan mode by restoring the pre-plan mode (ADR-0067, the `/plan exit`
+    /// command): routes through the MANUAL-exit path
+    /// (`set_approval_mode(prePlanMode, from_approved_plan_exit = false)`), so
+    /// leaving Plan queues the one-shot manual-exit reminder exactly as a
+    /// Shift+Tab cycle out of Plan does. RETURNS the restored mode for the Screen
+    /// mirror, like [`cycle_approval_mode`]. Falls back to `Default` only if the
+    /// actor is gone (qwen's `getPrePlanMode` default).
+    pub async fn exit_plan_mode(&self) -> ApprovalMode {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Msg::Command(Command::ExitPlanMode(reply)));
         rx.await.unwrap_or(ApprovalMode::Default)
     }
 
@@ -717,6 +819,22 @@ struct AgentState {
     cancel_flag: bool,
     settlement: Settlement,
     approvals: Approvals,
+    // The live Approval-mode mirror (ADR-0067): the shared atomic the Run loop
+    // reads in `classify` / `shape_request`. This Agent is the single authority
+    // (the `approvals` fold owns the mode); every mode-change path here WRITES
+    // this mirror (today `cycle_approval_mode`; Phase 2's enter/exit tools too),
+    // and the in-flight Run's captured `Arc` sees the write live. A strict
+    // write-from-Agent / read-from-loop mirror, not a second source of truth.
+    approval_mode: Arc<crate::approvals::AtomicApprovalMode>,
+    // The one-shot manual-plan-exit notice carrier (ADR-0067, qwen's
+    // `pendingManualPlanExitNotice`): `set_approval_mode` WRITES it with the new
+    // mode when a mode change LEAVES Plan outside the approved exit flow (a
+    // Shift+Tab cycle - `from_approved_plan_exit == false`), and the in-flight
+    // Run's captured `Arc` takes-and-clears it in `shape_request` to inject the
+    // manual-exit reminder into exactly one request. The approved `exit_plan_mode`
+    // flow (`answer_plan`) passes `from_approved_plan_exit == true`, so it never
+    // queues a notice. A strict write-from-Agent / take-from-loop carrier.
+    plan_exit_notice: Arc<crate::approvals::PendingManualPlanExit>,
     // The per-Run Approval reply channels, keyed by the Loop's ref string: the
     // Run parks awaiting this oneshot; `approve` (or a Standing Approval hit)
     // answers it.
@@ -726,6 +844,24 @@ struct AgentState {
     // removes and answers it. No Standing-Approval analog - every question opens
     // a modal, so there is no auto/fold path, just this map.
     question_replies: HashMap<String, oneshot::Sender<QuestionAnswers>>,
+    // The per-dialog plan-exit reply channels (ADR-0067), keyed by the dialog id
+    // the Agent minted: the `exit_plan_mode` tool call parks awaiting this
+    // oneshot; `answer_plan` removes and answers it. Like `question_replies`,
+    // there is no auto path - a plan exit always opens a modal. Each entry
+    // snapshots the revision + prePlanMode the dialog was raised under (the
+    // stale-guard), carried alongside the reply.
+    plan_replies: HashMap<String, PendingPlanExit>,
+    // The mode Plan was entered FROM (ADR-0067, qwen's `prePlanMode`): recorded
+    // when entering Plan (the mode before the flip), cleared when leaving Plan.
+    // The "restore previous mode" plan-exit target reads it. `None` outside Plan.
+    pre_plan_mode: Option<ApprovalMode>,
+    // The monotonic Approval-mode revision (ADR-0067, qwen's
+    // `approvalModeRevision`): bumped on EVERY mode change (cycle / enter / exit).
+    // A pending plan-exit snapshots it when the dialog is raised; if it has moved
+    // by resolution (the mode changed out from under the exit), the resolution is
+    // stale and takes no action - qwen's concurrent-exit guard, simplified for the
+    // single-owner Agent to one counter.
+    approval_mode_revision: u64,
     steering: Vec<String>,
     compaction: Compaction,
     // A clone of the mpsc sender, handed to the Run's AgentDeps so the Run
@@ -926,6 +1062,16 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
             answer_question(state, id, answers);
             let _ = reply.send(());
         }
+        Command::AnswerPlan(id, decision, reply) => {
+            answer_plan(state, id, decision);
+            let _ = reply.send(());
+        }
+        Command::EnterPlanMode(reply) => {
+            let _ = reply.send(enter_plan_mode_requested(state));
+        }
+        Command::ExitPlanMode(reply) => {
+            let _ = reply.send(exit_plan_mode_restore(state));
+        }
         Command::McpViews(reply) => {
             let _ = reply.send(state.mcp.views());
         }
@@ -1039,6 +1185,16 @@ fn handle_run(state: &mut AgentState, run: RunMsg) {
             reply,
         } => {
             ask_question(state, id, questions, reply);
+        }
+        RunMsg::EnterPlanMode {
+            user_requested,
+            reply,
+        } => {
+            let outcome = enter_plan_mode(state, user_requested);
+            let _ = reply.send(outcome);
+        }
+        RunMsg::RequestPlanExit { plan, reply } => {
+            request_plan_exit(state, plan, reply);
         }
         RunMsg::Compacted {
             new_state,
@@ -1192,12 +1348,228 @@ fn answer_question(state: &mut AgentState, id: String, answers: QuestionAnswers)
 // rotates the mode and the Agent broadcasts the new mode so every subscriber
 // (the Screen mirror, hence the footer indicator) sees it. Session-scoped, so
 // no Run needs to be running - `Yolo` then auto-approves the NEXT gated Call
-// via `request` without a modal.
+// via `request` without a modal. Routes through `set_approval_mode` so the
+// cycle keeps prePlanMode + the revision consistent (ADR-0067): a cycle INTO
+// Plan records the mode it came from, a cycle OUT of Plan clears prePlanMode and
+// (Phase 4) queues the manual-exit reminder.
 fn cycle_approval_mode(state: &mut AgentState) -> ApprovalMode {
-    let (approvals, mode) = std::mem::take(&mut state.approvals).cycle_mode();
-    state.approvals = approvals;
+    let mode = state.approvals.mode.cycle();
+    // A Shift+Tab cycle is NOT the approved exit flow: `from_approved_plan_exit`
+    // is `false`, so a cycle that leaves Plan queues the manual-exit notice.
+    set_approval_mode(state, mode, false);
     broadcast(state, Event::approval_mode_changed(mode));
     mode
+}
+
+// The single Approval-mode write (ADR-0067, qwen's `setApprovalMode`): the one
+// place every mode change (cycle / enter / exit) routes through, so prePlanMode,
+// the revision, the shared mirror, and the manual-exit notice can never disagree.
+//
+// - Entering Plan (fromMode != Plan) records prePlanMode = fromMode (so a later
+//   "restore previous mode" exit knows where to land).
+// - Leaving Plan (fromMode == Plan) clears prePlanMode, AND - when the exit is
+//   NOT the approved `exit_plan_mode` flow (`from_approved_plan_exit == false`,
+//   qwen's `options?.fromApprovedPlanExit`) - queues the one-shot manual-exit
+//   notice carrying the new mode. The approved exit (`answer_plan`) passes `true`
+//   and queues nothing (qwen's `kind: 'clear'`). This is qwen's config.ts
+//   `setApprovalMode` leaving-Plan branch (kind = fromApprovedPlanExit ? 'clear'
+//   : 'manual-exit'), narrowed to suspenders' take-and-clear carrier.
+// - The revision bumps only on an actual change (fromMode != mode), matching
+//   qwen's `if (fromMode !== mode) approvalModeRevision++`.
+// - The shared `AtomicApprovalMode` mirror is written so an in-flight Run's
+//   `classify` / `shape_request` sees the change live.
+//
+// The Agent's `approvals` fold stays authoritative for the mode itself; this is
+// the strict write-from-Agent side of the mirror.
+fn set_approval_mode(state: &mut AgentState, mode: ApprovalMode, from_approved_plan_exit: bool) {
+    let from_mode = state.approvals.mode;
+    if mode == ApprovalMode::Plan && from_mode != ApprovalMode::Plan {
+        state.pre_plan_mode = Some(from_mode);
+    } else if mode != ApprovalMode::Plan && from_mode == ApprovalMode::Plan {
+        state.pre_plan_mode = None;
+        // Leaving Plan outside the approved exit flow: queue the one-shot notice
+        // so the next request carries the manual-exit reminder once (qwen's
+        // 'manual-exit' notice event). An approved `exit_plan_mode` suppresses it.
+        if !from_approved_plan_exit {
+            state.plan_exit_notice.set(mode);
+        }
+    }
+    state.approvals.mode = mode;
+    if from_mode != mode {
+        state.approval_mode_revision += 1;
+    }
+    state.approval_mode.store(mode);
+}
+
+// An `enter_plan_mode` request (ADR-0067, qwen enterPlanMode.ts `execute`): the
+// atomic YOLO-guard / idempotent / prePlanMode logic that must live Agent-side
+// (state mutation is the single owner's, ADR-0017). The tool words the returned
+// outcome verbatim.
+//
+// - A model-initiated entry from YOLO (`user_requested` false) is a no-op
+//   (`StayedYolo`): the user chose YOLO for low-friction execution, so silently
+//   switching to read-only Plan surprises them (qwen #5970). Only an explicit
+//   user request enters Plan from YOLO.
+// - Idempotent: only flip when not already in Plan, so prePlanMode is never
+//   overwritten (a second enter while planning keeps the original prePlanMode).
+// - On entry, reveal the deferred `exit_plan_mode` tool is the TOOL's job (it
+//   holds the registry); here we only own the mode + bookkeeping.
+fn enter_plan_mode(state: &mut AgentState, user_requested: bool) -> EnterPlanOutcome {
+    if state.approvals.mode == ApprovalMode::Yolo && !user_requested {
+        return EnterPlanOutcome::StayedYolo;
+    }
+    // Idempotent: only flip when not already in Plan (never overwrite prePlanMode).
+    if state.approvals.mode != ApprovalMode::Plan {
+        // Entering Plan never leaves Plan, so `from_approved_plan_exit` is moot -
+        // pass `false`; the manual-exit branch only fires when LEAVING Plan.
+        set_approval_mode(state, ApprovalMode::Plan, false);
+        broadcast(state, Event::approval_mode_changed(ApprovalMode::Plan));
+    }
+    EnterPlanOutcome::Entered {
+        reminder: crate::voice::plan_mode_reminder().to_string(),
+    }
+}
+
+// The `/plan` command's ENTER path (ADR-0067, qwen planCommand.ts
+// `setApprovalMode(ApprovalMode.PLAN)`): a user-initiated entry, so it reuses
+// [`enter_plan_mode`] with `user_requested = true` (enters Plan even from Yolo,
+// and stays idempotent while already planning). The `Entered` reminder text is
+// the plan-mode tool's concern (the model reads it on the next Run); this
+// command only needs the resulting mode for the Screen mirror, and Plan is
+// always the result of an enter, so return it directly.
+fn enter_plan_mode_requested(state: &mut AgentState) -> ApprovalMode {
+    enter_plan_mode(state, true);
+    state.approvals.mode
+}
+
+// The `/plan exit` command's EXIT path (ADR-0067, qwen planCommand.ts
+// `setApprovalMode(config.getPrePlanMode())`): restore the mode Plan was entered
+// from, defaulting to `Default` when none was recorded (qwen's `getPrePlanMode`
+// returns `prePlanMode ?? DEFAULT`). Routes through [`set_approval_mode`] with
+// `from_approved_plan_exit = false` so leaving Plan queues the one-shot
+// manual-exit reminder - a `/plan exit` is a MANUAL exit, exactly like a
+// Shift+Tab cycle out of Plan, NOT the approved `exit_plan_mode` flow. Broadcasts
+// the change so any other subscriber sees it; returns the restored mode for the
+// Screen mirror. The caller guards against calling this outside Plan (qwen's
+// `/plan exit` errors when not in Plan), so this always leaves Plan.
+fn exit_plan_mode_restore(state: &mut AgentState) -> ApprovalMode {
+    let restored = state.pre_plan_mode.unwrap_or(ApprovalMode::Default);
+    set_approval_mode(state, restored, false);
+    broadcast(state, Event::approval_mode_changed(restored));
+    state.approvals.mode
+}
+
+// An `exit_plan_mode` request in plan mode (ADR-0067, qwen exitPlanMode.ts
+// `getConfirmationDetails` + `execute`): mint a dialog id, snapshot the revision
+// + prePlanMode (the stale-guard), broadcast `plan_request` to open the modal,
+// and hold the reply until `answer_plan` arrives. Parallel to `ask_question` -
+// no auto path, the modal always opens.
+//
+// Outside plan mode this returns `NotInPlanMode` WITHOUT raising a dialog (qwen's
+// `requiresUserInteraction` returns false outside Plan, and `execute` returns a
+// guidance error): the user may have manually switched modes, so the tool words
+// the guidance rather than opening a modal.
+fn request_plan_exit(
+    state: &mut AgentState,
+    plan: String,
+    reply: oneshot::Sender<crate::tool::caps::PlanExitOutcome>,
+) {
+    if state.approvals.mode != ApprovalMode::Plan {
+        // Not in plan mode: the guidance error, carrying the current mode's wire
+        // string so the tool interpolates it exactly as qwen does. No modal.
+        let _ = reply.send(PlanExitOutcome::NotInPlanMode {
+            current_mode: state.approvals.mode.wire_str().to_string(),
+        });
+        return;
+    }
+    let id = mint_plan_id();
+    let pre_plan_mode = state.pre_plan_mode.unwrap_or(ApprovalMode::Default);
+    state.plan_replies.insert(
+        id.clone(),
+        PendingPlanExit {
+            reply,
+            plan: plan.clone(),
+            revision: state.approval_mode_revision,
+            pre_plan_mode,
+        },
+    );
+    // The Notification seam (Phase 3b, ADR-0066): a plan dialog opening a modal is
+    // the "agent is waiting" moment, like a question, so fire the Notification
+    // hooks with the salient waiting content.
+    fire_notification(state, "Plan ready for review".to_string());
+    broadcast(state, Event::plan_request(id, plan, pre_plan_mode));
+}
+
+// Resolve a pending plan-exit dialog (ADR-0067, qwen exitPlanMode.ts `execute`'s
+// post-confirmation branch): remove the parked reply and resolve the user's
+// decision.
+//
+// - The stale-guard: if the revision moved since the dialog was raised (the mode
+//   changed out from under the pending exit) OR the mode is no longer Plan, take
+//   NO action and return `Stale` (qwen's `approvalModeRevision` concurrent-exit
+//   guard, simplified to one counter for the single-owner Agent).
+// - Cancel ("keep planning"): stay in Plan, return `Cancel`.
+// - A proceed: flip the mode to the target (RestorePrevious -> prePlanMode,
+//   ProceedOnce -> Default, ProceedAlways -> AutoEdit) and save the plan to disk
+//   best-effort, then return `Approved`.
+//
+// A stale/duplicate `answer_plan` (no matching entry) is dropped, mirroring
+// `answer_question`. The Agent (which minted the id) emits `plan_resolved` after
+// the reply is sent, on every resolving path (mirrors `question_resolved`).
+fn answer_plan(state: &mut AgentState, id: String, decision: crate::approvals::PlanDecision) {
+    let Some(pending) = state.plan_replies.remove(&id) else {
+        return; // Stale/duplicate: nothing parked under this id.
+    };
+    let PendingPlanExit {
+        reply,
+        plan,
+        revision,
+        pre_plan_mode,
+    } = pending;
+
+    let outcome =
+        if state.approvals.mode != ApprovalMode::Plan || state.approval_mode_revision != revision {
+            // Stale-guard: the mode changed out from under the pending exit - take no
+            // action.
+            PlanExitOutcome::Stale
+        } else {
+            match decision.target(pre_plan_mode) {
+                // "Keep planning": stay in Plan, no mode change, no save.
+                None => PlanExitOutcome::Cancel,
+                // A proceed: save the plan best-effort, flip to the target mode.
+                Some(target) => {
+                    save_plan_best_effort(state, &plan);
+                    // The APPROVED exit flow: `from_approved_plan_exit == true`
+                    // suppresses the manual-exit notice (qwen's `fromApprovedPlanExit`
+                    // -> 'clear'), so an approved `exit_plan_mode` never injects the
+                    // manual-exit reminder - the plan-mode reminder simply stops.
+                    set_approval_mode(state, target, true);
+                    broadcast(state, Event::approval_mode_changed(target));
+                    PlanExitOutcome::Approved
+                }
+            }
+        };
+    let _ = reply.send(outcome);
+    // The operator-visible settlement marker (mirrors `question_resolved`): the
+    // tool has read the reply, so mark the dialog resolved.
+    broadcast(state, Event::plan_resolved(id));
+}
+
+// Saves the approved plan to the session directory best-effort (ADR-0067, qwen
+// `config.savePlan` behind `savePlanBestEffort`): an IO failure never fails the
+// exit - qwen only logs it. Written to `<session_dir>/plan.md`.
+fn save_plan_best_effort(state: &AgentState, plan: &str) {
+    let path = std::path::Path::new(&state.session.session_dir).join("plan.md");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, plan);
+}
+
+fn mint_plan_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    format!("plan-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 fn broadcast(state: &AgentState, event: Event) {
@@ -1303,6 +1675,13 @@ fn spawn_run(state: &mut AgentState) {
         hooks: Arc::clone(&state.hook_manager),
         skills: Arc::clone(&state.skill_manager),
         transcript_path: transcript_path(state),
+        // The live Approval-mode mirror (ADR-0067): the SAME `Arc` the Agent
+        // writes on a cycle, so the spawned Run reads the operator's live mode.
+        approval_mode: Arc::clone(&state.approval_mode),
+        // The manual-exit notice carrier (ADR-0067): the SAME `Arc` the Agent
+        // writes on a manual (Shift+Tab) exit, so the spawned Run's `shape_request`
+        // injects the manual-exit reminder once on the next Pass.
+        plan_exit_notice: Arc::clone(&state.plan_exit_notice),
     });
     let conversation = state.conversation.clone();
     let session = state.session.clone();
@@ -1324,6 +1703,7 @@ fn reset_run_state(state: &mut AgentState) {
     state.approvals = std::mem::take(&mut state.approvals).reset();
     state.approval_replies.clear();
     state.question_replies.clear();
+    state.plan_replies.clear();
     state.cancel_flag = false;
     state.run_provenance = state.model.provenance();
     // The captured Model's budget figures land at Run start (ADR-0037): the
@@ -1405,6 +1785,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     state.approvals = std::mem::take(&mut state.approvals).reset();
     state.approval_replies.clear();
     state.question_replies.clear();
+    state.plan_replies.clear();
     state.steering.clear();
     state.cancel_flag = false;
 

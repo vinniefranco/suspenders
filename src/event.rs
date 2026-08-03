@@ -155,6 +155,28 @@ pub enum Event {
         question_id: String,
     },
 
+    // ---- Plan mode (ADR-0067, qwen exit_plan_mode) ----
+    /// A tool raised the plan-confirmation dialog (`exit_plan_mode` in plan
+    /// mode): the Screen opens the plan modal (Phase 3's `PendingPlan`). Parallel
+    /// to [`Event::QuestionRequest`] - no auto path, the modal always opens.
+    /// `plan_id` is the per-call reference the Agent holds the reply oneshot
+    /// under; `plan` is the plan text the modal renders; `pre_plan_mode` is the
+    /// mode Plan was entered from, so the modal can word qwen's "restore previous
+    /// mode ({mode})" row. The round-trip resolves via
+    /// [`crate::agent::Command::AnswerPlan`].
+    PlanRequest {
+        plan_id: String,
+        plan: String,
+        pre_plan_mode: ApprovalMode,
+    },
+    /// A plan round-trip settled (approved, cancelled, or stale): the Agent emits
+    /// it after the reply is sent, mirroring [`Event::QuestionResolved`]. The
+    /// Screen has already cleared the modal on the answering keypress; this is
+    /// the operator-visible settlement marker, carrying only the `plan_id`.
+    PlanResolved {
+        plan_id: String,
+    },
+
     // ---- MCP OAuth (ADR-0065 Phase D) ----
     /// A progress line from an in-flight `/mcp` Authenticate op (ADR-0065 Phase D,
     /// qwen's `OauthDisplayMessage` / `OauthAuthUrl`): the operator-visible status
@@ -439,6 +461,24 @@ impl Event {
         Event::QuestionResolved {
             question_id: id.into(),
         }
+    }
+
+    // ---- Plan mode ----
+
+    pub fn plan_request(
+        id: impl Into<String>,
+        plan: impl Into<String>,
+        pre_plan_mode: ApprovalMode,
+    ) -> Self {
+        Event::PlanRequest {
+            plan_id: id.into(),
+            plan: plan.into(),
+            pre_plan_mode,
+        }
+    }
+
+    pub fn plan_resolved(id: impl Into<String>) -> Self {
+        Event::PlanResolved { plan_id: id.into() }
     }
 
     // ---- Slash Command selector ----

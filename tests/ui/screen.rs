@@ -1042,6 +1042,216 @@ fn a_cancel_clears_the_question_modal() {
     assert_eq!(t.pending_question, None, "a cancel clears the modal");
 }
 
+// --- Plan modal (ADR-0067, exit_plan_mode) ------------------------------
+
+fn with_plan(t: Screen, id: &str, plan: &str, pre_plan_mode: ApprovalMode) -> Screen {
+    let (t, _effects) = t.apply_event(Event::plan_request(id, plan, pre_plan_mode));
+    t
+}
+
+#[test]
+fn plan_request_stores_pending_and_focuses_modal() {
+    let (t, effects) = fresh().apply_event(Event::plan_request(
+        "p-1",
+        "# Plan\n\nStep one.",
+        ApprovalMode::Default,
+    ));
+    let pending = t.pending_plan.as_ref().expect("an open plan modal");
+    assert_eq!(pending.plan_id, "p-1");
+    assert_eq!(pending.plan, "# Plan\n\nStep one.");
+    assert_eq!(pending.pre_plan_mode, ApprovalMode::Default);
+    // The radio has the four outcome rows.
+    assert_eq!(pending.selection.len(), 4);
+    assert_eq!(pending.selection.active(), 0);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::FocusModal,
+            Effect::Notify("A plan is ready for review".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn plan_resolved_is_a_no_op_on_an_already_cleared_modal() {
+    // The modal is cleared on the picking keypress; the settlement event that
+    // follows finds nothing to do.
+    let (t, effects) = fresh().apply_event(Event::plan_resolved("p-1"));
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(sans_commit(effects), vec![]);
+}
+
+// Enter on each row emits the matching PlanDecision, clears the modal, and
+// refocuses the composer. The row ORDER is qwen-verbatim: 0 restore-previous,
+// 1 auto-accept (ProceedAlways), 2 manually-approve (ProceedOnce), 3 keep-planning.
+#[test]
+fn selecting_the_restore_row_emits_restore_previous() {
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::AutoEdit);
+    let (t, effects) = t.handle_key(Key::Enter); // row 0 active
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::Agent(AgentCommand::AnswerPlan(
+                "p-1".to_string(),
+                PlanDecision::RestorePrevious
+            )),
+            Effect::FocusComposer,
+        ]
+    );
+}
+
+#[test]
+fn selecting_the_auto_accept_row_emits_proceed_always() {
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    // Digit '2' picks row 1 (auto-accept edits) -> ProceedAlways.
+    let (t, effects) = t.handle_key(Key::Char('2'));
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::Agent(AgentCommand::AnswerPlan(
+                "p-1".to_string(),
+                PlanDecision::ProceedAlways
+            )),
+            Effect::FocusComposer,
+        ]
+    );
+}
+
+#[test]
+fn selecting_the_manual_approve_row_emits_proceed_once() {
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    // Digit '3' picks row 2 (manually approve edits) -> ProceedOnce.
+    let (t, effects) = t.handle_key(Key::Char('3'));
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::Agent(AgentCommand::AnswerPlan(
+                "p-1".to_string(),
+                PlanDecision::ProceedOnce
+            )),
+            Effect::FocusComposer,
+        ]
+    );
+}
+
+#[test]
+fn selecting_the_keep_planning_row_emits_cancel() {
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    // Digit '4' picks row 3 (keep planning) -> Cancel.
+    let (t, effects) = t.handle_key(Key::Char('4'));
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::Agent(AgentCommand::AnswerPlan(
+                "p-1".to_string(),
+                PlanDecision::Cancel
+            )),
+            Effect::FocusComposer,
+        ]
+    );
+}
+
+#[test]
+fn escape_picks_cancel_and_clears_the_plan_modal() {
+    // Escape anywhere in the modal picks the keep-planning Cancel outcome (the
+    // `(esc)` row), settling the round-trip rather than aborting the Run.
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    let (t, effects) = t.handle_key(Key::Escape);
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::Agent(AgentCommand::AnswerPlan(
+                "p-1".to_string(),
+                PlanDecision::Cancel
+            )),
+            Effect::FocusComposer,
+        ]
+    );
+}
+
+#[test]
+fn arrows_move_the_plan_radio_without_resolving() {
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    let (t, effects) = t.handle_key(Key::ArrowDown);
+    assert_eq!(sans_commit(effects), vec![], "a move emits nothing");
+    let pending = t.pending_plan.as_ref().expect("still open");
+    assert_eq!(pending.selection.active(), 1);
+    // Enter now resolves with the moved-to row (auto-accept -> ProceedAlways).
+    let (t, effects) = t.handle_key(Key::Enter);
+    assert_eq!(t.pending_plan, None);
+    assert_eq!(
+        sans_commit(effects),
+        vec![
+            Effect::Agent(AgentCommand::AnswerPlan(
+                "p-1".to_string(),
+                PlanDecision::ProceedAlways
+            )),
+            Effect::FocusComposer,
+        ]
+    );
+}
+
+#[test]
+fn a_stray_char_is_swallowed_while_the_plan_modal_holds_the_keyboard() {
+    // The plan gate captures keys like the approval/question modals: a plain
+    // char never leaks to the composer (no draft edit), and the modal stands.
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    let before = t.pending_plan.clone();
+    let (t, effects) = t.handle_key(Key::Char('x'));
+    assert_eq!(effects, vec![], "no effect");
+    assert_eq!(t.pending_plan, before, "the modal is unchanged");
+    assert!(
+        t.composer().view().draft.is_empty(),
+        "the composer never saw the key"
+    );
+}
+
+#[test]
+fn the_plan_gate_sits_above_the_question_gate_in_the_routing_order() {
+    // Only one modal is ever open at a time, but the routing order is fixed:
+    // Approval -> Plan -> Question -> Composer. With a plan modal open the key
+    // drives the PLAN radio (an Enter emits AnswerPlan, never AnswerQuestion).
+    let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    let (_t, effects) = t.handle_key(Key::Enter);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Agent(AgentCommand::AnswerPlan(_, _)))),
+        "the plan gate drove the key: {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Agent(AgentCommand::AnswerQuestion(_, _)))),
+        "the question gate did not fire"
+    );
+}
+
+#[test]
+fn a_cancel_clears_the_plan_modal() {
+    let mut t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    t.status = Status::Running;
+    let (t, _e) = t.apply_event(Event::RunCancelled);
+    assert_eq!(t.pending_plan, None, "a cancel clears the modal");
+}
+
+#[test]
+fn a_finished_run_clears_a_dangling_plan_modal() {
+    let mut t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
+    t.status = Status::Running;
+    let (t, _e) = t.apply_event(Event::RunFinished {
+        stop_reason: StopReason::EndTurn,
+        token_estimate: 0,
+        context_budget: 0,
+    });
+    assert_eq!(t.pending_plan, None, "finish clears a dangling plan modal");
+}
+
 // --- submit / steer outcomes --------------------------------------------
 //
 // Enter's submit-vs-steer decision lives in the Composer (`ui::composer`,
@@ -1309,7 +1519,11 @@ fn a_selector_fill_is_consumed_by_the_composer_never_this_folds_arms() {
     let (t, effects) = t.handle_key(Key::Enter);
     let effects = sans_commit(effects);
     let generation = match effects.as_slice() {
-        [Effect::Command { name, generation }] if name == "model" => *generation,
+        [
+            Effect::Command {
+                name, generation, ..
+            },
+        ] if name == "model" => *generation,
         other => panic!("expected one Command effect, got {other:?}"),
     };
 

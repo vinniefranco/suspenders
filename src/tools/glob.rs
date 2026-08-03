@@ -73,6 +73,11 @@ pub struct Glob;
 
 #[async_trait::async_trait]
 impl Tool for Glob {
+    // Read-only (qwen glob.ts:395 `Kind.Search`): allowed in plan mode.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Search
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "glob".into(),

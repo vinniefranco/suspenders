@@ -300,7 +300,7 @@ fn standing_approvals_survive_they_are_session_scoped_not_run_scoped() {
     ));
 }
 
-// ---- ApprovalMode + cycle_mode + mode-aware request (ADR-0050) ----
+// ---- ApprovalMode cycle + mode-aware request (ADR-0050) ----
 
 // The Shift+Tab cycle order IS qwen's APPROVAL_MODES order with a hard wrap:
 // plan → default → auto-edit → auto → yolo → plan.
@@ -324,14 +324,6 @@ fn a_fresh_approvals_defaults_to_default_mode() {
     assert_eq!(Approvals::new().mode, ApprovalMode::Default);
 }
 
-// cycle_mode folds the state and reports the mode it landed on, from Default.
-#[test]
-fn cycle_mode_rotates_and_reports_the_new_mode() {
-    let (approvals, mode) = Approvals::new().cycle_mode();
-    assert_eq!(mode, ApprovalMode::AutoEdit);
-    assert_eq!(approvals.mode, ApprovalMode::AutoEdit);
-}
-
 // Yolo mode auto-approves EVERY gated Call, no modal, no standing entry.
 #[test]
 fn yolo_mode_auto_approves_every_request_without_a_modal() {
@@ -350,7 +342,10 @@ fn yolo_mode_auto_approves_every_request_without_a_modal() {
     ));
 }
 
-// Plan/AutoEdit/Auto are behavior-stubbed: they gate exactly like Default.
+// `request` is the Agent-side pending-modal fold (reached only on a `classify`
+// Ask that round-trips): it is mode-agnostic except for Yolo/Standing, so
+// Plan/AutoEdit/Auto all become Pending here exactly like Default. Plan's
+// read-only enforcement lives in `classify` (tested above), NOT in `request`.
 #[test]
 fn plan_auto_edit_and_auto_gate_exactly_like_default() {
     for mode in [
@@ -368,19 +363,406 @@ fn plan_auto_edit_and_auto_gate_exactly_like_default() {
     }
 }
 
-// Cycling the mode while an Approval is pending leaves that Approval whole.
+// ---- classify: the one mode-aware verdict fold (ADR-0067) ----
+
+// A mutating edit/write in DEFAULT mode is not gated and not blocked: it Allows
+// (edits are ungated in suspenders - ADR-0050), so classify runs it straight
+// through outside plan mode.
+#[test]
+fn classify_allows_a_mutating_tool_outside_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Default);
+    assert_eq!(
+        approvals.classify("edit", Kind::Edit, &json!({"path": "a.rs"})),
+        Verdict::Allow
+    );
+    assert_eq!(
+        approvals.classify("write_file", Kind::Edit, &json!({"path": "a.rs"})),
+        Verdict::Allow
+    );
+}
+
+// A read-only tool always Allows outside plan mode (it never gates).
+#[test]
+fn classify_allows_read_only_tools_outside_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Default);
+    for (name, kind) in [
+        ("read_file", Kind::Read),
+        ("grep_search", Kind::Search),
+        ("list_directory", Kind::Search),
+    ] {
+        assert_eq!(
+            approvals.classify(name, kind, &json!({})),
+            Verdict::Allow,
+            "{name} must Allow"
+        );
+    }
+}
+
+// A gated tool with no cover, outside plan mode, Asks over the gate text.
+#[test]
+fn classify_asks_a_gated_tool_with_no_cover() {
+    let approvals = Approvals::with_mode(ApprovalMode::Default);
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "mix test"})
+        ),
+        Verdict::Ask("mix test".to_string())
+    );
+    // web_fetch asks over its DOMAIN.
+    assert_eq!(
+        approvals.classify(
+            "web_fetch",
+            Kind::Fetch,
+            &json!({"url": "https://docs.rs/x"})
+        ),
+        Verdict::Ask("docs.rs".to_string())
+    );
+}
+
+// Yolo mode auto-approves a gated Call: classify Allows it (no modal).
+#[test]
+fn classify_allows_a_gated_tool_under_yolo() {
+    let approvals = Approvals::with_mode(ApprovalMode::Yolo);
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "rm -rf /"})
+        ),
+        Verdict::Allow
+    );
+}
+
+// A covering Standing Approval Allows a gated Call outside plan mode.
+#[test]
+fn classify_allows_a_gated_tool_with_a_covering_standing_approval() {
+    let mut approvals = granted("mix test");
+    approvals.mode = ApprovalMode::Default;
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "mix test"})
+        ),
+        Verdict::Allow
+    );
+    // A different command still Asks.
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "mix other"})
+        ),
+        Verdict::Ask("mix other".to_string())
+    );
+}
+
+// PLAN MODE blocks every mutating / non-read-only Kind with qwen's verbatim
+// message and no modal. `run_shell_command` (also a mutator Kind) is the ONE
+// exception: it routes to the plan-mode shell classifier instead of the wholesale
+// block (see the classify_*_shell_in_plan_mode tests), so it is excluded here.
+#[test]
+fn classify_blocks_mutating_and_other_kinds_in_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    for (name, kind) in [
+        ("edit", Kind::Edit),
+        ("write_file", Kind::Edit),
+        ("notebook_edit", Kind::Edit),
+        ("agent", Kind::Agent),
+        ("task_stop", Kind::Other),
+        ("some_mcp_tool", Kind::Other),
+    ] {
+        let verdict = approvals.classify(name, kind, &json!({}));
+        let Verdict::Block(reason) = verdict else {
+            panic!("{name} ({kind:?}) must Block in plan mode, got {verdict:?}");
+        };
+        // qwen's verbatim message, with the tool name interpolated.
+        assert!(
+            reason.starts_with(&format!(
+                "Tool blocked by plan mode: \"{name}\" is not a read-only tool."
+            )),
+            "block reason must be qwen-verbatim for {name}: {reason}"
+        );
+        assert!(reason.contains("Only read-only tools (read_file, grep_search, glob, list_directory, web_fetch, etc.) are allowed in plan mode."));
+        assert!(reason.contains("Do NOT retry this tool."));
+        assert!(
+            reason.contains("call exit_plan_mode with a plan that covers this tool's purpose.")
+        );
+    }
+}
+
+// PLAN MODE allows read-only Kinds (Read/Search/Fetch/Think): they fold exactly
+// like the non-plan path.
+#[test]
+fn classify_allows_read_only_kinds_in_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    for (name, kind) in [
+        ("read_file", Kind::Read),
+        ("grep_search", Kind::Search),
+        ("list_directory", Kind::Search),
+        ("todo_write", Kind::Think),
+        ("ask_user_question", Kind::Think),
+        ("skill", Kind::Read),
+    ] {
+        assert_eq!(
+            approvals.classify(name, kind, &json!({})),
+            Verdict::Allow,
+            "{name} ({kind:?}) must Allow in plan mode"
+        );
+    }
+}
+
+// PLAN MODE + web_fetch (Kind::Fetch, a gated read-only tool): NOT blocked, still
+// Asks - qwen keeps web_fetch's confirmation in plan mode (its confirmation is
+// `type: 'info'`, which `isPlanModeBlocked` does not block).
+#[test]
+fn classify_web_fetch_in_plan_mode_still_asks_not_blocked() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    assert_eq!(
+        approvals.classify(
+            "web_fetch",
+            Kind::Fetch,
+            &json!({"url": "https://docs.rs/tokio"})
+        ),
+        Verdict::Ask("docs.rs".to_string())
+    );
+}
+
+// PLAN MODE + run_shell_command runs the plan-mode shell classifier (ADR-0067
+// Phase 4b, qwen plan-mode-shell-policy.ts), NOT a wholesale block: a read-only
+// command is Allowed, a state-modifying one is Blocked, an indeterminate one Asks.
+// The classifier itself is pinned in tests/shell_safety.rs; these pin the seam's
+// three-valued -> Verdict mapping through `classify` in Plan mode.
+
+#[test]
+fn classify_allows_read_only_shell_in_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    for command in ["ls -la", "cat f", "git status", "grep -r x ."] {
+        assert_eq!(
+            approvals.classify(
+                "run_shell_command",
+                Kind::Execute,
+                &json!({ "command": command })
+            ),
+            Verdict::Allow,
+            "read-only shell command should be allowed in plan mode: {command}"
+        );
+    }
+}
+
+#[test]
+fn classify_blocks_write_shell_in_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    for command in [
+        "rm f",
+        "git commit -m x",
+        "sed -i s/a/b/ f",
+        "echo x > f",
+        "mv a b",
+        "ls && rm f",
+        "git status; git push",
+        "echo $(rm f)",
+    ] {
+        let verdict = approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({ "command": command }),
+        );
+        assert!(
+            matches!(verdict, Verdict::Block(_)),
+            "state-modifying shell command should be blocked in plan mode: {command} -> {verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn classify_write_shell_block_message_is_qwen_verbatim() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    let verdict = approvals.classify(
+        "run_shell_command",
+        Kind::Execute,
+        &json!({"command": "rm f"}),
+    );
+    // plan-mode-shell-policy.ts:25 WRITE_BLOCK_MESSAGE, byte-verbatim.
+    assert_eq!(
+        verdict,
+        Verdict::Block(
+            "Plan mode blocked this shell command because it was classified as state-modifying. \
+Do not retry it through wrappers or obfuscation; continue read-only investigation and \
+include the action in the plan."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn classify_asks_unknown_shell_in_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    // an unrecognized binary classifies unknown -> Ask over the raw command (the
+    // approval surface qwen decorates for the unknown path).
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "frobnicate --do-thing"})
+        ),
+        Verdict::Ask("frobnicate --do-thing".to_string())
+    );
+}
+
+#[test]
+fn classify_read_only_pipeline_allowed_but_write_pipeline_blocked_in_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "cat a | grep b"})
+        ),
+        Verdict::Allow
+    );
+    assert!(matches!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "cat a | tee b"})
+        ),
+        Verdict::Block(_)
+    ));
+}
+
+// Outside plan mode the shell classifier does NOT run: a shell Call gates
+// normally (Ask over the command) regardless of read-only/write classification.
+#[test]
+fn classify_does_not_run_shell_classifier_outside_plan_mode() {
+    let approvals = Approvals::with_mode(ApprovalMode::Default);
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "ls -la"})
+        ),
+        Verdict::Ask("ls -la".to_string())
+    );
+    assert_eq!(
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "rm f"})
+        ),
+        Verdict::Ask("rm f".to_string())
+    );
+}
+
+// An unknown tool defaults to Kind::Other (the trait default), so plan mode
+// blocks it - the fail-safe: a mis-declared tool is blocked, not slipped through.
+#[test]
+fn classify_blocks_an_other_kind_in_plan_mode_fail_safe() {
+    let approvals = Approvals::with_mode(ApprovalMode::Plan);
+    assert!(matches!(
+        approvals.classify("mystery", Kind::Other, &json!({})),
+        Verdict::Block(_)
+    ));
+}
+
+// ---- AtomicApprovalMode: the shared live-mode mirror (ADR-0067) ----
+
+#[test]
+fn atomic_mode_defaults_to_the_fold_default() {
+    assert_eq!(AtomicApprovalMode::default().load(), ApprovalMode::Default);
+}
+
+#[test]
+fn atomic_mode_round_trips_every_mode() {
+    let mirror = AtomicApprovalMode::default();
+    for mode in [
+        ApprovalMode::Plan,
+        ApprovalMode::Default,
+        ApprovalMode::AutoEdit,
+        ApprovalMode::Auto,
+        ApprovalMode::Yolo,
+    ] {
+        mirror.store(mode);
+        assert_eq!(mirror.load(), mode, "mirror must round-trip {mode:?}");
+    }
+}
+
+// The mirror reflects a store immediately (the loop reads the latest write).
+#[test]
+fn atomic_mode_reflects_the_latest_store() {
+    let mirror = AtomicApprovalMode::new(ApprovalMode::Default);
+    mirror.store(ApprovalMode::Plan);
+    assert_eq!(mirror.load(), ApprovalMode::Plan);
+    mirror.store(ApprovalMode::Yolo);
+    assert_eq!(mirror.load(), ApprovalMode::Yolo);
+}
+
+// Cycling the mode while an Approval is pending leaves that Approval whole. The
+// production cycle (Agent's `set_approval_mode`) mutates `mode` in place via the
+// enum `cycle()` and never touches `pending`/`standing`; this pins that
+// invariant on the pure `Approvals` fold.
 #[test]
 fn cycling_the_mode_does_not_disturb_the_pending_approval() {
     let r = id();
-    let Request::Pending(approvals) = Approvals::new().request(r.clone(), "mix test") else {
+    let Request::Pending(mut approvals) = Approvals::new().request(r.clone(), "mix test") else {
         panic!();
     };
     let pending_before = approvals.pending.clone();
-    let (approvals, _mode) = approvals.cycle_mode();
+    approvals.mode = approvals.mode.cycle();
     assert_eq!(approvals.pending, pending_before);
     // The still-pending decision still forwards to the same waiting Run.
     assert!(matches!(
         approvals.decide(r, Decision::Approve),
         Decide::Forward(true, _)
     ));
+}
+
+// ---- PendingManualPlanExit: the one-shot manual-exit notice carrier (ADR-0067)
+
+// A fresh carrier holds no notice.
+#[test]
+fn pending_manual_exit_starts_empty() {
+    assert_eq!(PendingManualPlanExit::default().take(), None);
+    assert_eq!(PendingManualPlanExit::empty().take(), None);
+}
+
+// A queued notice is delivered on the first take and gone on the next: the
+// one-shot semantics the loop relies on to inject the reminder into exactly one
+// request.
+#[test]
+fn pending_manual_exit_is_one_shot() {
+    let carrier = PendingManualPlanExit::empty();
+    carrier.set(ApprovalMode::Default);
+    assert_eq!(carrier.take(), Some(ApprovalMode::Default));
+    assert_eq!(carrier.take(), None, "a taken notice must not repeat");
+}
+
+// The carrier round-trips the exact mode Plan was left FOR (the reminder
+// interpolates it), for every mode.
+#[test]
+fn pending_manual_exit_round_trips_every_mode() {
+    let carrier = PendingManualPlanExit::empty();
+    for mode in [
+        ApprovalMode::Plan,
+        ApprovalMode::Default,
+        ApprovalMode::AutoEdit,
+        ApprovalMode::Auto,
+        ApprovalMode::Yolo,
+    ] {
+        carrier.set(mode);
+        assert_eq!(carrier.take(), Some(mode), "must carry {mode:?}");
+    }
+}
+
+// A second manual exit before the first is taken overwrites with the newer mode:
+// the reminder always names the CURRENT mode, so the latest exit is correct.
+#[test]
+fn pending_manual_exit_keeps_the_latest_when_reset_before_take() {
+    let carrier = PendingManualPlanExit::empty();
+    carrier.set(ApprovalMode::Default);
+    carrier.set(ApprovalMode::Yolo);
+    assert_eq!(carrier.take(), Some(ApprovalMode::Yolo));
+    assert_eq!(carrier.take(), None);
 }

@@ -97,6 +97,17 @@ pub const COMMANDS: &[SlashCommand] = &[
         alt_names: &[],
         completion_priority: 0,
     },
+    SlashCommand {
+        // `/plan` (ADR-0067, qwen planCommand.ts): enter/exit Plan mode, or with
+        // a trailing prompt enter Plan and submit it. Fire-and-run (no selector);
+        // the help is qwen's verbatim `description`.
+        name: "plan",
+        help: "Switch to plan mode or exit plan mode",
+        opens_selector: false,
+        list_title: "",
+        alt_names: &[],
+        completion_priority: 0,
+    },
 ];
 
 /// One runtime (dynamic-source) command descriptor - the DYNAMIC layer beside

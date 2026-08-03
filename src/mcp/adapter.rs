@@ -131,6 +131,17 @@ pub(crate) fn valid_name(server: &str, tool: &str) -> String {
 
 #[async_trait::async_trait]
 impl Tool for McpTool {
+    // Other (qwen mcp-tool.ts:638: `Kind.Read` only when the server declares
+    // `annotations.readOnlyHint === true`, else `Kind.Other`). Suspenders'
+    // discovery path does not thread the `readOnlyHint` annotation through
+    // `McpToolInfo`, so we take qwen's DEFAULT `Kind.Other` for every MCP tool:
+    // an MCP tool's side effects are opaque to us, so plan mode blocks it -
+    // fail-safe. (Honoring `readOnlyHint` would need the annotation carried onto
+    // `McpToolInfo`, out of scope for this phase.)
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Other
+    }
+
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }

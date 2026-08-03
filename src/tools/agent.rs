@@ -66,6 +66,13 @@ impl AgentTool {
 
 #[async_trait::async_trait]
 impl Tool for AgentTool {
+    // Agent (qwen agent/agent.ts:885 `Kind.Agent`): BLOCKED in plan mode. Agent
+    // is neither a mutator nor read-only; spawning a subagent could mutate, so
+    // plan mode blocks it.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Agent
+    }
+
     fn spec(&self) -> ToolSpec {
         // The description scaffold, VERBATIM from qwen's `tools/agent/agent.ts`
         // `baseDescription`, with the live available-subagents block spliced in.

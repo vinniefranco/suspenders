@@ -25,6 +25,7 @@ pub mod markdown;
 pub mod mcp_command;
 pub mod model_command;
 pub mod picker;
+pub mod plan_command;
 pub mod screen;
 pub mod selection;
 pub mod slash;
@@ -800,8 +801,19 @@ async fn run_effect(
         // A committed Slash Command (ADR-0032/0033): a discovered `/<skill>` is
         // the submit-prompt injection, everything else the `command::run` seam.
         // The classify-and-route logic lives in the handler (IOSP).
-        Effect::Command { name, generation } => {
-            run_command_effect(screen, ctx, state, name, generation).await
+        Effect::Command {
+            name,
+            rest,
+            generation,
+        } => {
+            // The one place the pure core's `Effect::Command` is unpacked into the
+            // router's `Committed` payload (the shapes stay in lock-step).
+            let cmd = command::Committed {
+                name,
+                rest,
+                generation,
+            };
+            run_command_effect(screen, ctx, state, cmd).await
         }
         // A row was chosen from a command's selector (ADR-0033): routed through
         // the same seam as the command itself.
@@ -827,7 +839,11 @@ async fn run_effect(
         // `mcp_views()` fetch that fills it, routed through the command seam like
         // `/model`'s fetch.
         Effect::McpCommand { generation } => {
-            command::run(screen, ctx, state, mcp_command::NAME, generation).await
+            // `/mcp` takes no arg and never returns a prompt to submit, so the
+            // submit half of the seam's return is always `None`.
+            command::run(screen, ctx, state, command::Committed::for_mcp(generation))
+                .await
+                .0
         }
         // A picked `/mcp` dialog action (ADR-0065 Phase E): run it against the
         // Agent off-loop and re-fetch views so the dialog reflects the change.
@@ -986,13 +1002,49 @@ async fn run_command_effect(
     screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
-    name: String,
-    generation: u64,
+    cmd: command::Committed,
 ) -> Screen {
-    if let Some(prompt) = skill_injection(&state.skills, &name) {
-        return run_agent_command(AgentCommand::Submit(prompt), screen, ctx, state).await;
+    // Resolve the command to a Screen plus the OPTIONAL prompt it asks to submit,
+    // uniformly across both routes: a discovered `/<skill>` resolves to its
+    // base-directory-wrapped body (qwen `submit_prompt`); every other name routes
+    // through the `command::run` seam, where `/plan <prompt>` (ADR-0067) yields the
+    // trailing prompt after toggling the mode. Either resolved prompt then flows
+    // through the SAME submit path (the run loop + UserPromptSubmit hooks), so the
+    // two routes converge on one dispatch and this stays call-only.
+    let (screen, submit) = resolve_command(screen, ctx, state, cmd).await;
+    submit_command_prompt(submit, screen, ctx, state).await
+}
+
+/// Resolves a committed command to its Screen plus the OPTIONAL prompt it asks to
+/// submit. A discovered `/<skill>` resolves to its wrapped body with the Screen
+/// untouched (the submit is deferred to the single dispatch in
+/// [`run_command_effect`]); every other name routes through the `command::run`
+/// seam, which already returns the same `(Screen, Option<prompt>)` shape.
+async fn resolve_command(
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    state: &mut AdapterState,
+    cmd: command::Committed,
+) -> (Screen, Option<String>) {
+    match skill_injection(&state.skills, &cmd.name) {
+        Some(prompt) => (screen, Some(prompt)),
+        None => command::run(screen, ctx, state, cmd).await,
     }
-    command::run(screen, ctx, state, &name, generation).await
+}
+
+/// Submits the prompt a command asked to run (a `/<skill>` body or `/plan
+/// <prompt>`), or returns the Screen untouched when the command produced none.
+/// The Null-Object dispatch that keeps [`run_command_effect`] call-only: a `Some`
+/// flows through the run loop's submit path (firing UserPromptSubmit hooks), a
+/// `None` is the message-only/mode-only commands that submit nothing.
+async fn submit_command_prompt(
+    submit: Option<String>,
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    state: &mut AdapterState,
+) -> Screen {
+    let Some(prompt) = submit else { return screen };
+    run_agent_command(AgentCommand::Submit(prompt), screen, ctx, state).await
 }
 
 /// The submit-prompt body a committed `/<name>` injects when `name` is a
@@ -1010,50 +1062,97 @@ fn skill_injection(manager: &crate::skills::SkillManager, name: &str) -> Option<
 /// fire-through calls that leave the screen untouched.
 async fn run_agent_command(
     command: AgentCommand,
-    mut screen: Screen,
+    screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
 ) -> Screen {
-    let agent = ctx.agent;
     match command {
-        AgentCommand::Submit(prompt) => {
-            // The core records the outcome (ok appends the user line; busy
-            // retries as steer) and may emit MORE effects.
-            let outcome = agent.submit(prompt.clone()).await.map_err(|_| Busy);
-            let (core, effects) = screen.submitted(prompt, outcome);
-            Box::pin(run_effects(core, effects, ctx, state)).await
-        }
-        AgentCommand::Steer(text) => {
-            let outcome = agent.steer(text.clone()).await.map_err(|_| Idle);
-            let (core, effects) = screen.steered(text, outcome);
-            Box::pin(run_effects(core, effects, ctx, state)).await
-        }
-        AgentCommand::Approve(id, decision) => {
-            agent.approve(id, to_agent_decision(decision)).await;
-            screen
-        }
-        AgentCommand::CycleApprovalMode => {
-            // Set the Screen mirror DIRECTLY from the authoritative fold result
-            // (P0): the `ApprovalModeChanged` broadcast is lossy (a `Lagged`
-            // in the event loop could drop it and leave the footer indicator
-            // permanently stale, a safety-signal lie). The broadcast still
-            // fires for any other subscribers; this call site no longer depends
-            // on it for the mirror the footer reads.
-            screen.approval_mode = agent.cycle_approval_mode().await;
-            screen
-        }
+        AgentCommand::Submit(prompt) => submit_prompt(prompt, screen, ctx, state).await,
+        AgentCommand::Steer(text) => steer_text(text, screen, ctx, state).await,
+        AgentCommand::Approve(id, decision) => approve(id, decision, screen, ctx).await,
+        AgentCommand::CycleApprovalMode => cycle_approval_mode(screen, ctx).await,
         AgentCommand::AnswerQuestion(id, answers) => {
-            // Forward the user's picks (or the decline) to the parked tool call's
-            // reply oneshot (ADR-0057). Fire-and-forget like Approve; the Agent
-            // emits `question_resolved` once the tool reads the reply.
-            agent.answer_question(id, answers).await;
-            screen
+            answer_question(id, answers, screen, ctx).await
         }
-        AgentCommand::Cancel => {
-            agent.cancel().await;
-            screen
-        }
+        AgentCommand::AnswerPlan(id, decision) => answer_plan(id, decision, screen, ctx).await,
+        AgentCommand::Cancel => cancel(screen, ctx).await,
     }
+}
+
+/// Submits `prompt` as a fresh user turn: the core records the outcome (ok appends
+/// the user line, busy retries as steer) and may emit MORE effects, which recurse
+/// through [`run_effects`].
+async fn submit_prompt(
+    prompt: String,
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    state: &mut AdapterState,
+) -> Screen {
+    let outcome = ctx.agent.submit(prompt.clone()).await.map_err(|_| Busy);
+    let (core, effects) = screen.submitted(prompt, outcome);
+    Box::pin(run_effects(core, effects, ctx, state)).await
+}
+
+/// Steers `text` into the running Run (or falls back to a submit when idle); the
+/// core records the outcome and may emit more effects.
+async fn steer_text(
+    text: String,
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+    state: &mut AdapterState,
+) -> Screen {
+    let outcome = ctx.agent.steer(text.clone()).await.map_err(|_| Idle);
+    let (core, effects) = screen.steered(text, outcome);
+    Box::pin(run_effects(core, effects, ctx, state)).await
+}
+
+/// Resolves a pending run_command Approval (fire-and-forget; the Screen is
+/// untouched - the Agent's `approval_resolved` drives the next frame).
+async fn approve(id: String, decision: Decision, screen: Screen, ctx: &AdapterCtx<'_>) -> Screen {
+    ctx.agent.approve(id, to_agent_decision(decision)).await;
+    screen
+}
+
+/// Rotates the Approval mode one step (Shift+Tab) and writes the Screen mirror
+/// DIRECTLY from the authoritative fold result (P0): the `ApprovalModeChanged`
+/// broadcast is lossy (a `Lagged` could leave the footer indicator permanently
+/// stale, a safety-signal lie), so the mirror the footer reads no longer depends
+/// on it. The broadcast still fires for any other subscribers.
+async fn cycle_approval_mode(mut screen: Screen, ctx: &AdapterCtx<'_>) -> Screen {
+    screen.approval_mode = ctx.agent.cycle_approval_mode().await;
+    screen
+}
+
+/// Forwards the user's question picks (or decline) to the parked tool call's reply
+/// oneshot (ADR-0057). Fire-and-forget; the Agent emits `question_resolved` once
+/// the tool reads the reply.
+async fn answer_question(
+    id: String,
+    answers: crate::agent::QuestionAnswers,
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+) -> Screen {
+    ctx.agent.answer_question(id, answers).await;
+    screen
+}
+
+/// Forwards the user's plan-exit outcome to the parked `exit_plan_mode` reply
+/// oneshot (ADR-0067). The Agent flips the mode to the outcome's target and saves
+/// the plan on a proceed, then emits `plan_resolved`. Fire-and-forget.
+async fn answer_plan(
+    id: String,
+    decision: crate::approvals::PlanDecision,
+    screen: Screen,
+    ctx: &AdapterCtx<'_>,
+) -> Screen {
+    ctx.agent.answer_plan(id, decision).await;
+    screen
+}
+
+/// Cancels the running Run (no-op when idle); the Screen is untouched.
+async fn cancel(screen: Screen, ctx: &AdapterCtx<'_>) -> Screen {
+    ctx.agent.cancel().await;
+    screen
 }
 
 /// Persists a submitted prompt to the on-disk history ring and returns the

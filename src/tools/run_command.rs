@@ -139,6 +139,14 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
 
 #[async_trait::async_trait]
 impl Tool for RunCommand {
+    // Mutator (qwen shell.ts:5026 `Kind.Execute` for run_shell_command): BLOCKED
+    // in plan mode this phase. Phase 4's plan-mode shell classifier (ADR-0067)
+    // will let a read-only command through in `classify`; the Kind stays
+    // `Execute` regardless (the classifier special-cases it, not this Kind).
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Execute
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_shell_command".into(),

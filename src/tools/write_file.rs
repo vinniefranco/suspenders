@@ -35,6 +35,11 @@ const DESCRIPTION: &str = "Writes content to a specified file in the local files
 
 #[async_trait::async_trait]
 impl Tool for WriteFile {
+    // Mutator (qwen write-file.ts:781 `Kind.Edit`): BLOCKED in plan mode.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Edit
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),

@@ -10,7 +10,7 @@ use crate::ui::theme::Theme;
 
 use super::composer_input::{COMPOSER_CHROME_ROWS, render_composer};
 use super::footer::{FooterCtx, render_footer};
-use super::overlay::{question_modal_lines, render_help_overlay};
+use super::overlay::{plan_modal_lines, question_modal_lines, render_help_overlay};
 use super::popup::render_composer_popup;
 use super::render_cache::RenderCache;
 use super::scroll::{ScrollIntent, draw_overflow_marker, scrolled_clip};
@@ -216,16 +216,17 @@ pub(super) fn pending_layout<'a>(
     // (`Constraint::Min(1)`) and top-clip the "Apply this change?" question out of
     // view. A visible approval takes priority over the sticky list, so we reserve
     // NO sticky zone while `pending_approval.is_some()`.
-    let sticky_items = (t.pending_approval.is_none() && t.pending_question.is_none())
-        .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
-        .flatten()
-        .filter(|items| {
-            sticky_fits(
-                area.height as usize,
-                sticky_todos_height(items.len()),
-                composer_height,
-            )
-        });
+    let sticky_items =
+        (t.pending_approval.is_none() && t.pending_question.is_none() && t.pending_plan.is_none())
+            .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
+            .flatten()
+            .filter(|items| {
+                sticky_fits(
+                    area.height as usize,
+                    sticky_todos_height(items.len()),
+                    composer_height,
+                )
+            });
     let sticky_height = sticky_items.map_or(0, |items| sticky_todos_height(items.len()));
     let chunks = frame_chunks(area, sticky_height, composer_height);
     PendingLayout {
@@ -427,6 +428,16 @@ pub(super) fn pending_body_lines(
     // byte-identical to the committed blit (which never carries it).
     if let Some(pending) = t.pending_question.as_ref() {
         append_live(&mut lines, &question_modal_lines(pending, width, theme));
+    }
+
+    // The plan modal (ADR-0067, qwen `exit_plan_mode`): a standalone bordered box
+    // appended BOTTOM-MOST, same as the question modal - the Run is waiting on the
+    // USER, so the plan + its outcome rows are the salient content the top-clip
+    // must never eat. Not tied to a transcript ToolCall, so it draws as its own
+    // box. `None` when no plan is pending, so the pending body stays byte-identical
+    // to the committed blit (which never carries it).
+    if let Some(pending) = t.pending_plan.as_ref() {
+        append_live(&mut lines, &plan_modal_lines(pending, width, theme));
     }
     lines
 }

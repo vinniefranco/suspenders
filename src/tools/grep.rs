@@ -73,6 +73,12 @@ const LIMIT_DESCRIPTION: &str =
 
 #[async_trait::async_trait]
 impl Tool for Grep {
+    // Read-only (qwen ripGrep.ts:689 `Kind.Search` for grep_search): allowed in
+    // plan mode.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Search
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep_search".into(),

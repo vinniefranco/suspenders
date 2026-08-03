@@ -5,12 +5,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use crate::ui::screen::{OTHER_OPTION_LABEL, PendingQuestion};
+use crate::approvals::ApprovalMode;
+use crate::ui::screen::{OTHER_OPTION_LABEL, PendingPlan, PendingQuestion};
 use crate::ui::slash;
 use crate::ui::theme::Theme;
 
 use super::approval::selection_rows;
 use super::box_draw::{box_bottom, box_row, box_top};
+use super::markdown_render::markdown_lines;
 use super::scroll::{anchor_clip, draw_overflow_marker};
 use super::style::{accent_style, border_style, primary_style, secondary_style, success_style};
 use super::text::{push_cols, truncate_cols};
@@ -373,6 +375,73 @@ pub(super) fn question_modal_lines(
             body.extend(selection_rows(&labels, active, true, inner_u16, theme));
         }
     }
+
+    // Frame the body in a rounded box, every row exactly `inner + 2` columns.
+    let mut lines = vec![box_top(inner, border)];
+    lines.extend(body.iter().map(|line| box_row(&line.spans, inner, border)));
+    lines.push(box_bottom(inner, border));
+    lines
+}
+
+/// The plan-modal title (ADR-0067, qwen `exitPlanMode.ts:176` confirmation
+/// `title`, VERBATIM).
+const PLAN_MODAL_TITLE: &str = "Would you like to proceed?";
+
+/// The plan modal's four outcome rows (ADR-0067, qwen
+/// `ToolConfirmationMessage.tsx:465-490`, IN THAT ROW ORDER). `pre_plan_mode` is
+/// worded into the restore row's `({mode})` with the mode's qwen wire string
+/// (`ApprovalMode::wire_str`), matching qwen's `t('...({{mode}})', {mode:
+/// planProps.prePlanMode ?? 'default'})` interpolation (the enum VALUE string,
+/// e.g. `default`/`auto-edit`, not the footer's `plan mode` label).
+fn plan_outcome_labels(pre_plan_mode: ApprovalMode) -> [String; 4] {
+    [
+        format!("Yes, restore previous mode ({})", pre_plan_mode.wire_str()),
+        "Yes, and auto-accept edits".to_string(),
+        "Yes, and manually approve edits".to_string(),
+        "No, keep planning (esc)".to_string(),
+    ]
+}
+
+/// The plan-confirmation modal as a standalone bordered box (ADR-0067, qwen
+/// `exit_plan_mode`): a rounded box with the title, the plan text rendered as
+/// markdown (the same [`markdown_lines`] the transcript uses), then the four
+/// outcome rows via a numbered radio. The active row (the modal's own
+/// [`SelectionList`]) is highlighted. Every content row is `<= inner` columns and
+/// boxed to exactly `inner + 2` (measure==draw, ADR-0029). Rendered bottom-most
+/// in the pending body so the top-clip never eats it.
+pub(super) fn plan_modal_lines(
+    pending: &PendingPlan,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let inner = (width as usize).saturating_sub(2);
+    let inner_u16 = inner as u16;
+    let border = border_style(theme);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+
+    // Title row (qwen `planProps.title`).
+    let mut title_spans = Vec::new();
+    let _ = push_cols(
+        &mut title_spans,
+        PLAN_MODAL_TITLE,
+        primary_style(theme).add_modifier(Modifier::BOLD),
+        0,
+        inner,
+    );
+    body.push(Line::from(title_spans));
+
+    // A blank gap, then the plan text rendered as markdown (qwen renders the plan
+    // via `MarkdownDisplay`); `box_row` truncates each rendered line to `inner`.
+    body.push(Line::from(Vec::<Span<'static>>::new()));
+    body.extend(markdown_lines(&pending.plan, theme));
+
+    // A blank gap before the outcome radio (qwen `marginBottom:1`).
+    body.push(Line::from(Vec::<Span<'static>>::new()));
+    let labels = plan_outcome_labels(pending.pre_plan_mode);
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let active = pending.selection.active();
+    body.extend(selection_rows(&label_refs, active, true, inner_u16, theme));
 
     // Frame the body in a rounded box, every row exactly `inner + 2` columns.
     let mut lines = vec![box_top(inner, border)];

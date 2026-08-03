@@ -76,6 +76,12 @@ struct Entry {
 
 #[async_trait::async_trait]
 impl Tool for ListFiles {
+    // Read-only (qwen ls.ts:316 `Kind.Search` for list_directory): allowed in
+    // plan mode. qwen kinds `list_directory` as Search, not Read.
+    fn kind(&self) -> crate::approvals::Kind {
+        crate::approvals::Kind::Search
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_directory".into(),

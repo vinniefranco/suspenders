@@ -1625,8 +1625,11 @@ impl Composer {
             let filter_mode = filter_mode_for(&row.value);
             self.selector
                 .open(row.value.clone(), self.selector_generation, filter_mode);
+            // A selector-opening command's sub-filter rides the overlay view, not
+            // the effect payload: pass `None` for `rest`.
             consumed(vec![Effect::Command {
                 name: row.value,
+                rest: None,
                 generation: self.selector_generation,
             }])
         } else if row.value == mcp_command::NAME {
@@ -1644,10 +1647,16 @@ impl Composer {
             consumed(vec![mcp_command::open_effect(generation)])
         } else {
             // Fire-and-run: no fill will echo this generation, so the current
-            // counter is carried unbumped (the payload field is uniform).
+            // counter is carried unbumped (the payload field is uniform). Carry
+            // the draft remainder past the command token (`/plan <prompt>`) to the
+            // adapter BEFORE clearing - the pure core stays command-agnostic
+            // (ADR-0019), it forwards the raw `rest` without knowing what any
+            // command does with it.
+            let rest = slash::parse(&self.value).rest;
             self.clear();
             consumed(vec![Effect::Command {
                 name: row.value,
+                rest,
                 generation: self.selector_generation,
             }])
         }

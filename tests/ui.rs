@@ -814,6 +814,7 @@ async fn run_effect_routes_unhandled_commands_and_choices_to_visible_info_lines(
         screen,
         Effect::Command {
             name: "compact".into(),
+            rest: None,
             generation: 0,
         },
         &ctx,
@@ -858,6 +859,7 @@ async fn run_effect_theme_command_posts_the_rows_through_the_selector_channel() 
         Screen::new(ScreenOpts::default()),
         Effect::Command {
             name: "theme".into(),
+            rest: None,
             generation: 7,
         },
         &ctx,
@@ -996,6 +998,7 @@ async fn run_effect_theme_choice_of_a_file_broken_after_open_refuses_and_persist
         Screen::new(ScreenOpts::default()),
         Effect::Command {
             name: "theme".into(),
+            rest: None,
             generation: 1,
         },
         &ctx,

@@ -116,8 +116,8 @@ fn a_leading_slash_opens_the_palette_showing_every_command() {
                     .map(|s| s.value.clone())
                     .collect::<Vec<_>>(),
                 // Shortest-first on the empty query (the ladder tiebreak):
-                // `mcp` (3) leads `model`/`theme` (5), which keep registry order.
-                vec!["mcp", "model", "theme"]
+                // `mcp` (3), `plan` (4), then `model`/`theme` (5) in registry order.
+                vec!["mcp", "plan", "model", "theme"]
             );
             assert_eq!(active, 0);
         }
@@ -144,16 +144,18 @@ fn typing_ranks_the_palette_by_the_command_token() {
 
 #[test]
 fn up_down_move_the_palette_highlight_wrapping() {
-    // Three commands: the arrows move between them and WRAP (System B nav).
+    // Four commands: the arrows move between them and WRAP (System B nav).
     let mut c = slashing("/");
     assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
     assert_eq!(menu_highlight(&c), 1);
     assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
     assert_eq!(menu_highlight(&c), 2);
     assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
+    assert_eq!(menu_highlight(&c), 3);
+    assert_eq!(fold_consumed(&mut c, Key::ArrowDown), vec![]);
     assert_eq!(menu_highlight(&c), 0, "wraps to the first");
     assert_eq!(fold_consumed(&mut c, Key::ArrowUp), vec![]);
-    assert_eq!(menu_highlight(&c), 2, "wraps to the last");
+    assert_eq!(menu_highlight(&c), 3, "wraps to the last");
 
     // Typing narrows the palette to one row: the highlight clamps onto it.
     let mut c = slashing("/");
@@ -184,6 +186,7 @@ fn enter_commits_the_highlighted_command() {
         effects,
         vec![Effect::Command {
             name: "model".into(),
+            rest: None,
             generation: 1,
         }]
     );
@@ -207,6 +210,7 @@ fn committing_a_partial_token_uses_the_highlighted_full_command_name() {
         fold_consumed(&mut c, Key::Enter),
         vec![Effect::Command {
             name: "model".into(),
+            rest: None,
             generation: 1,
         }]
     );
@@ -282,6 +286,7 @@ fn a_slash_draft_never_submits_or_steers_even_while_running() {
             effects,
             vec![Effect::Command {
                 name: "model".into(),
+                rest: None,
                 generation: 1,
             }]
         ),
@@ -361,6 +366,7 @@ fn committing_a_skill_command_fires_and_runs_an_effect_command() {
         fold_consumed(&mut c, Key::Enter),
         vec![Effect::Command {
             name: "commit".into(),
+            rest: None,
             generation: 0,
         }]
     );
@@ -370,6 +376,37 @@ fn committing_a_skill_command_fires_and_runs_an_effect_command() {
         "the draft clears after a fire-and-run skill"
     );
     assert_eq!(overlay(&c), None);
+}
+
+#[test]
+fn a_fire_and_run_command_carries_the_draft_remainder_as_rest() {
+    // `/plan refactor the parser` is fire-and-run: the Composer carries the raw
+    // remainder past the command token to the adapter as `rest` (the pure core
+    // stays command-agnostic, ADR-0019), and clears the draft.
+    let mut c = slashing("/plan refactor the parser");
+    assert_eq!(
+        fold_consumed(&mut c, Key::Enter),
+        vec![Effect::Command {
+            name: "plan".into(),
+            rest: Some("refactor the parser".into()),
+            generation: 0,
+        }]
+    );
+    assert_eq!(c.view().draft, "", "the draft clears after a fire-and-run");
+}
+
+#[test]
+fn a_fire_and_run_command_with_no_remainder_carries_none() {
+    // `/plan` alone: no remainder, so `rest` is `None`.
+    let mut c = slashing("/plan");
+    assert_eq!(
+        fold_consumed(&mut c, Key::Enter),
+        vec![Effect::Command {
+            name: "plan".into(),
+            rest: None,
+            generation: 0,
+        }]
+    );
 }
 
 #[test]
@@ -465,6 +502,7 @@ fn committing_a_selector_command_by_enter_loads_normalizes_and_fetches_once() {
         fold_consumed(&mut c, Key::Enter),
         vec![Effect::Command {
             name: "model".into(),
+            rest: None,
             generation: 1,
         }]
     );
@@ -488,6 +526,7 @@ fn committing_a_selector_command_by_typing_a_space_loads_and_fetches_once() {
         fold_consumed(&mut c, Key::Char(' ')),
         vec![Effect::Command {
             name: "model".into(),
+            rest: None,
             generation: 1,
         }]
     );
@@ -846,6 +885,7 @@ fn backspacing_the_space_returns_to_the_menu_and_reactivation_refetches() {
         fold_consumed(&mut c, Key::Enter),
         vec![Effect::Command {
             name: "model".into(),
+            rest: None,
             generation: 2,
         }]
     );

@@ -104,6 +104,15 @@ function, never a line number; fix the code under test, not the tests; grow new
 work in verified increments; run commands whole with quiet flags) are folded in.
 The Voice no longer authors any mid-Conversation steering.
 
+One narrow, later exception: **Plan mode** (ADR-0067) injects a standing
+read-only reminder into every request while the user is in that explicit mode.
+That is not a return of the retired reactive nudge apparatus - it is not
+corrective text injected INTO the Conversation in response to model drift; it is
+a mode invariant injected at request-shaping, ephemeral (never stored), and gated
+on a mode the user deliberately entered. qwen re-injects it every turn for the
+same reason a small model needs the standing rule to hold; suspenders matches
+that.
+
 ### The only runtime intervention is a passive loop-detector
 
 A circuit breaker terminates the Run when the model emits the byte-identical
