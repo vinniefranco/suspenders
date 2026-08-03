@@ -383,7 +383,10 @@ impl ApprovalMode {
     /// `as_u8`, so this is defensive - a torn/foreign value fails safe to the
     /// gating `Default`, never a permissive mode).
     fn from_u8(v: u8) -> ApprovalMode {
-        CYCLE.get(v as usize).copied().unwrap_or(ApprovalMode::Default)
+        CYCLE
+            .get(v as usize)
+            .copied()
+            .unwrap_or(ApprovalMode::Default)
     }
 }
 

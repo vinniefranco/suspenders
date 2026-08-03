@@ -1071,7 +1071,9 @@ async fn run_agent_command(
         AgentCommand::Steer(text) => steer_text(text, screen, ctx, state).await,
         AgentCommand::Approve(id, decision) => approve(id, decision, screen, ctx).await,
         AgentCommand::CycleApprovalMode => cycle_approval_mode(screen, ctx).await,
-        AgentCommand::AnswerQuestion(id, answers) => answer_question(id, answers, screen, ctx).await,
+        AgentCommand::AnswerQuestion(id, answers) => {
+            answer_question(id, answers, screen, ctx).await
+        }
         AgentCommand::AnswerPlan(id, decision) => answer_plan(id, decision, screen, ctx).await,
         AgentCommand::Cancel => cancel(screen, ctx).await,
     }

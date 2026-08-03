@@ -87,7 +87,9 @@ async fn approved_returns_the_verbatim_content() {
     let pm = ScriptedPlanMode::new(PlanExitOutcome::Approved);
     let ctx = ctx_with(pm.clone());
 
-    let out = run(json!({ "plan": "1. do the thing" }), &ctx).await.unwrap();
+    let out = run(json!({ "plan": "1. do the thing" }), &ctx)
+        .await
+        .unwrap();
     assert_eq!(
         out,
         "User approved. You can now start coding. Start with updating your todo list if applicable."
@@ -103,7 +105,10 @@ async fn cancel_returns_the_verbatim_remaining_in_plan_mode() {
     let pm = ScriptedPlanMode::new(PlanExitOutcome::Cancel);
     let ctx = ctx_with(pm);
     let out = run(json!({ "plan": "the plan" }), &ctx).await.unwrap();
-    assert_eq!(out, "Plan execution was not approved. Remaining in plan mode.");
+    assert_eq!(
+        out,
+        "Plan execution was not approved. Remaining in plan mode."
+    );
 }
 
 #[tokio::test]

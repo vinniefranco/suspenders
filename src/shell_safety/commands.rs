@@ -18,7 +18,6 @@ use super::sets::{
 };
 use ShellCommandSafety::{ReadOnly, Unknown, Write};
 
-
 /// The command-name dispatch (shellAstParser.ts:984-1025): pick the per-command
 /// evaluator for `root` over its `args`. An unrecognized root falls to
 /// [`evaluate_other_root`] (the READ_ONLY_ROOT_COMMANDS membership test).
@@ -69,11 +68,15 @@ fn evaluate_tee(args: &[String]) -> ShellCommandSafety {
 /// preprocessor flags (can exec) -> unknown; otherwise the READ_ONLY_ROOT_COMMANDS
 /// membership test decides.
 fn evaluate_other_root(root: &str, args: &[String]) -> ShellCommandSafety {
-    let printf_v =
-        root == "printf" && before_terminator(args).iter().any(|a| re::PRINTF_V.is_match(a));
+    let printf_v = root == "printf"
+        && before_terminator(args)
+            .iter()
+            .any(|a| re::PRINTF_V.is_match(a));
     let pager = root == "less" || root == "more";
     let rg_exec = (root == "rg" || root == "ripgrep")
-        && before_terminator(args).iter().any(|a| re::RG_EXEC.is_match(a));
+        && before_terminator(args)
+            .iter()
+            .any(|a| re::RG_EXEC.is_match(a));
     if printf_v || pager || rg_exec {
         return Unknown;
     }
@@ -99,7 +102,6 @@ fn evaluate_sort_or_tree(root: &str, args: &[String]) -> ShellCommandSafety {
     result
 }
 
-
 // --- git ----------------------------------------------------------------------
 
 fn evaluate_git_safety(args: &[String]) -> ShellCommandSafety {
@@ -118,7 +120,9 @@ fn evaluate_git_safety(args: &[String]) -> ShellCommandSafety {
     let subcommand = first.to_lowercase();
     let rest = &args[1..];
     let options = before_terminator(rest);
-    let invokes_helper = options.iter().any(|arg| re::GIT_EXTERNAL_HELPER_OPTION.is_match(arg))
+    let invokes_helper = options
+        .iter()
+        .any(|arg| re::GIT_EXTERNAL_HELPER_OPTION.is_match(arg))
         || (subcommand == "grep" && options.iter().any(|arg| arg.starts_with("-O")))
         || ((subcommand == "log" || subcommand == "show")
             && options.iter().any(|arg| percent_g_signature(arg)));
@@ -180,8 +184,14 @@ fn evaluate_git_remote(rest: &[String], invokes_helper: bool) -> ShellCommandSaf
         return if invokes_helper { Unknown } else { ReadOnly };
     };
     if action == "show" || action == "get-url" {
-        let mutates = rest.iter().any(|arg| re::GIT_REMOTE_MUTATING_ARG.is_match(arg));
-        return if mutates || invokes_helper { Unknown } else { ReadOnly };
+        let mutates = rest
+            .iter()
+            .any(|arg| re::GIT_REMOTE_MUTATING_ARG.is_match(arg));
+        return if mutates || invokes_helper {
+            Unknown
+        } else {
+            ReadOnly
+        };
     }
     if re::WRITE_GIT_REMOTE_ACTION.is_match(&action) {
         return Write;
@@ -205,8 +215,14 @@ fn evaluate_git_branch(rest: &[String], invokes_helper: bool) -> ShellCommandSaf
     if has_help(&actions, &[]) {
         return Unknown;
     }
-    if actions.iter().any(|arg| re::WRITE_GIT_BRANCH_FLAG.is_match(arg)) {
-        return if action_options.iter().any(|arg| re::WRITE_GIT_BRANCH_FLAG.is_match(arg)) {
+    if actions
+        .iter()
+        .any(|arg| re::WRITE_GIT_BRANCH_FLAG.is_match(arg))
+    {
+        return if action_options
+            .iter()
+            .any(|arg| re::WRITE_GIT_BRANCH_FLAG.is_match(arg))
+        {
             Write
         } else {
             Unknown
@@ -215,7 +231,10 @@ fn evaluate_git_branch(rest: &[String], invokes_helper: bool) -> ShellCommandSaf
     if actions.len() != rest.len() {
         return Unknown;
     }
-    if action_options.iter().any(|arg| re::GIT_BRANCH_LIST_FLAG.is_match(arg)) {
+    if action_options
+        .iter()
+        .any(|arg| re::GIT_BRANCH_LIST_FLAG.is_match(arg))
+    {
         return ReadOnly;
     }
     if rest.iter().any(|arg| !arg.starts_with('-')) {
@@ -308,7 +327,11 @@ fn find_exec_safety(args: &[String], i: usize) -> (ShellCommandSafety, usize) {
     let invoked_args: Vec<String> = args[(i + 2).min(invoked_end)..invoked_end].to_vec();
     let nested = match invoked.as_deref() {
         Some(inv) if re::WRITE_ROOT_COMMAND.is_match(inv) => {
-            if has_help(&invoked_args, &[]) { Unknown } else { Write }
+            if has_help(&invoked_args, &[]) {
+                Unknown
+            } else {
+                Write
+            }
         }
         Some(inv @ ("kill" | "killall" | "pkill")) => process_safety(inv, &invoked_args),
         _ => Unknown,
@@ -326,7 +349,11 @@ fn evaluate_uniq_safety(args: &[String]) -> ShellCommandSafety {
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" {
-            return if args.len() - i + positional > 2 { Write } else { ReadOnly };
+            return if args.len() - i + positional > 2 {
+                Write
+            } else {
+                ReadOnly
+            };
         } else if UNIQ_VALUE_OPTIONS.contains(&arg.as_str()) {
             i += 1;
             if args.get(i).is_none() {
@@ -358,7 +385,9 @@ fn process_safety(root: &str, args: &[String]) -> ShellCommandSafety {
 
     if args.is_empty()
         || has_help(args, &[])
-        || options.iter().any(|arg| ["-h", "-V", "-help", "-version"].contains(&arg.as_str()))
+        || options
+            .iter()
+            .any(|arg| ["-h", "-V", "-help", "-version"].contains(&arg.as_str()))
     {
         return Unknown;
     }

@@ -28,15 +28,25 @@ use ShellCommandSafety::{ReadOnly, Unknown, Write};
 /// shellAstParser.ts:82). Verbatim membership.
 pub const READ_ONLY_ROOT_COMMANDS: &[&str] = &[
     "awk", "basename", "cat", "cd", "column", "cut", "df", "dirname", "du", "echo", "find", "git",
-    "grep", "head", "less", "ls", "more", "printenv", "printf", "ps", "pwd", "rg", "ripgrep", "sed",
-    "sort", "stat", "tail", "tree", "uniq", "wc", "which", "where", "whoami",
+    "grep", "head", "less", "ls", "more", "printenv", "printf", "ps", "pwd", "rg", "ripgrep",
+    "sed", "sort", "stat", "tail", "tree", "uniq", "wc", "which", "where", "whoami",
 ];
 
 /// Git sub-commands considered read-only (qwen `READ_ONLY_GIT_SUBCOMMANDS`,
 /// shellAstParser.ts:121). Verbatim membership.
 pub const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
-    "blame", "branch", "cat-file", "diff", "grep", "log", "ls-files", "remote", "rev-parse", "show",
-    "status", "describe",
+    "blame",
+    "branch",
+    "cat-file",
+    "diff",
+    "grep",
+    "log",
+    "ls-files",
+    "remote",
+    "rev-parse",
+    "show",
+    "status",
+    "describe",
 ];
 
 /// Write-redirection operators (qwen `WRITE_REDIRECT_OPERATORS`,
@@ -226,7 +236,11 @@ pub fn evaluate_output_option(
             break;
         }
         if (short && arg == "-o") || (long && arg == "--output") {
-            return Some(if args.get(i + 1).is_some() { Write } else { Unknown });
+            return Some(if args.get(i + 1).is_some() {
+                Write
+            } else {
+                Unknown
+            });
         }
         if short && arg.starts_with("-o") && arg.len() > 2 {
             return Some(Write);

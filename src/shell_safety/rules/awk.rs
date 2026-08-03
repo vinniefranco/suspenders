@@ -71,7 +71,8 @@ impl AwkContext {
             self.in_string = true;
             return true;
         }
-        if ch == '/' && (previous_significant == '\0' || "({[=,:;!~?&|".contains(previous_significant))
+        if ch == '/'
+            && (previous_significant == '\0' || "({[=,:;!~?&|".contains(previous_significant))
         {
             self.in_regex = true;
             return true;
@@ -115,7 +116,10 @@ fn split_awk_statements(script: &str) -> AwkSplit {
         if ch == '#' {
             statements.push(slice(start, i));
             // `script.indexOf('\n', i + 1)`
-            let newline = chars[i + 1..].iter().position(|c| *c == '\n').map(|p| i + 1 + p);
+            let newline = chars[i + 1..]
+                .iter()
+                .position(|c| *c == '\n')
+                .map(|p| i + 1 + p);
             match newline {
                 None => {
                     push_trailing = false;
@@ -157,9 +161,15 @@ fn split_awk_statements(script: &str) -> AwkSplit {
 /// `AWK_STATIC_WRITE` regex (shell-safety-rules.ts:22).
 fn awk_print_body(statement: &str) -> Option<&str> {
     let s = statement.trim_start();
-    let rest = s.strip_prefix("printf").or_else(|| s.strip_prefix("print"))?;
+    let rest = s
+        .strip_prefix("printf")
+        .or_else(|| s.strip_prefix("print"))?;
     // `\b` after print/printf: next char must not be a word char.
-    if rest.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
         return None;
     }
     // `(?!\s*\()` - not a function-call form `print(...)`.
@@ -299,4 +309,3 @@ pub fn classify_awk_command_safety(args: &[String]) -> Safety {
         Safety::Unknown
     }
 }
-

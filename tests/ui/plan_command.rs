@@ -35,7 +35,10 @@ fn exit_in_plan_restores_the_previous_mode() {
 fn no_args_outside_plan_enters_plan_mode() {
     assert_eq!(decide(ApprovalMode::Default, None), PlanAction::Enter);
     // A trailing-space-only remainder is still "no args" (qwen's args.trim()).
-    assert_eq!(decide(ApprovalMode::Default, Some("   ")), PlanAction::Enter);
+    assert_eq!(
+        decide(ApprovalMode::Default, Some("   ")),
+        PlanAction::Enter
+    );
     assert_eq!(
         ENABLED_PLAN_MODE,
         "Enabled plan mode. The agent will analyze and plan without executing tools."

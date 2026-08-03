@@ -412,7 +412,11 @@ fn classify_asks_a_gated_tool_with_no_cover() {
     );
     // web_fetch asks over its DOMAIN.
     assert_eq!(
-        approvals.classify("web_fetch", Kind::Fetch, &json!({"url": "https://docs.rs/x"})),
+        approvals.classify(
+            "web_fetch",
+            Kind::Fetch,
+            &json!({"url": "https://docs.rs/x"})
+        ),
         Verdict::Ask("docs.rs".to_string())
     );
 }
@@ -422,7 +426,11 @@ fn classify_asks_a_gated_tool_with_no_cover() {
 fn classify_allows_a_gated_tool_under_yolo() {
     let approvals = Approvals::with_mode(ApprovalMode::Yolo);
     assert_eq!(
-        approvals.classify("run_shell_command", Kind::Execute, &json!({"command": "rm -rf /"})),
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "rm -rf /"})
+        ),
         Verdict::Allow
     );
 }
@@ -433,12 +441,20 @@ fn classify_allows_a_gated_tool_with_a_covering_standing_approval() {
     let mut approvals = granted("mix test");
     approvals.mode = ApprovalMode::Default;
     assert_eq!(
-        approvals.classify("run_shell_command", Kind::Execute, &json!({"command": "mix test"})),
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "mix test"})
+        ),
         Verdict::Allow
     );
     // A different command still Asks.
     assert_eq!(
-        approvals.classify("run_shell_command", Kind::Execute, &json!({"command": "mix other"})),
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "mix other"})
+        ),
         Verdict::Ask("mix other".to_string())
     );
 }
@@ -471,7 +487,9 @@ fn classify_blocks_mutating_and_other_kinds_in_plan_mode() {
         );
         assert!(reason.contains("Only read-only tools (read_file, grep_search, glob, list_directory, web_fetch, etc.) are allowed in plan mode."));
         assert!(reason.contains("Do NOT retry this tool."));
-        assert!(reason.contains("call exit_plan_mode with a plan that covers this tool's purpose."));
+        assert!(
+            reason.contains("call exit_plan_mode with a plan that covers this tool's purpose.")
+        );
     }
 }
 
@@ -523,7 +541,11 @@ fn classify_allows_read_only_shell_in_plan_mode() {
     let approvals = Approvals::with_mode(ApprovalMode::Plan);
     for command in ["ls -la", "cat f", "git status", "grep -r x ."] {
         assert_eq!(
-            approvals.classify("run_shell_command", Kind::Execute, &json!({ "command": command })),
+            approvals.classify(
+                "run_shell_command",
+                Kind::Execute,
+                &json!({ "command": command })
+            ),
             Verdict::Allow,
             "read-only shell command should be allowed in plan mode: {command}"
         );
@@ -558,7 +580,11 @@ fn classify_blocks_write_shell_in_plan_mode() {
 #[test]
 fn classify_write_shell_block_message_is_qwen_verbatim() {
     let approvals = Approvals::with_mode(ApprovalMode::Plan);
-    let verdict = approvals.classify("run_shell_command", Kind::Execute, &json!({"command": "rm f"}));
+    let verdict = approvals.classify(
+        "run_shell_command",
+        Kind::Execute,
+        &json!({"command": "rm f"}),
+    );
     // plan-mode-shell-policy.ts:25 WRITE_BLOCK_MESSAGE, byte-verbatim.
     assert_eq!(
         verdict,
@@ -613,11 +639,19 @@ fn classify_read_only_pipeline_allowed_but_write_pipeline_blocked_in_plan_mode()
 fn classify_does_not_run_shell_classifier_outside_plan_mode() {
     let approvals = Approvals::with_mode(ApprovalMode::Default);
     assert_eq!(
-        approvals.classify("run_shell_command", Kind::Execute, &json!({"command": "ls -la"})),
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "ls -la"})
+        ),
         Verdict::Ask("ls -la".to_string())
     );
     assert_eq!(
-        approvals.classify("run_shell_command", Kind::Execute, &json!({"command": "rm f"})),
+        approvals.classify(
+            "run_shell_command",
+            Kind::Execute,
+            &json!({"command": "rm f"})
+        ),
         Verdict::Ask("rm f".to_string())
     );
 }

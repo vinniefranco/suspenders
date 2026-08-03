@@ -1219,17 +1219,15 @@ fn the_plan_gate_sits_above_the_question_gate_in_the_routing_order() {
     let t = with_plan(fresh(), "p-1", "plan", ApprovalMode::Default);
     let (_t, effects) = t.handle_key(Key::Enter);
     assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Agent(AgentCommand::AnswerPlan(_, _))
-        )),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Agent(AgentCommand::AnswerPlan(_, _)))),
         "the plan gate drove the key: {effects:?}"
     );
     assert!(
-        !effects.iter().any(|e| matches!(
-            e,
-            Effect::Agent(AgentCommand::AnswerQuestion(_, _))
-        )),
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Agent(AgentCommand::AnswerQuestion(_, _)))),
         "the question gate did not fire"
     );
 }
@@ -1521,9 +1519,11 @@ fn a_selector_fill_is_consumed_by_the_composer_never_this_folds_arms() {
     let (t, effects) = t.handle_key(Key::Enter);
     let effects = sans_commit(effects);
     let generation = match effects.as_slice() {
-        [Effect::Command {
-            name, generation, ..
-        }] if name == "model" => *generation,
+        [
+            Effect::Command {
+                name, generation, ..
+            },
+        ] if name == "model" => *generation,
         other => panic!("expected one Command effect, got {other:?}"),
     };
 

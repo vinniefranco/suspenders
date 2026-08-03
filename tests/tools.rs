@@ -53,10 +53,8 @@ fn specs_returns_one_spec_per_tool_in_registry_order() {
 #[test]
 fn every_builtin_declares_its_qwen_kind() {
     use crate::approvals::Kind;
-    let by_name: std::collections::HashMap<String, Kind> = tools()
-        .iter()
-        .map(|t| (t.spec().name, t.kind()))
-        .collect();
+    let by_name: std::collections::HashMap<String, Kind> =
+        tools().iter().map(|t| (t.spec().name, t.kind())).collect();
     let expect = [
         ("todo_write", Kind::Think),
         ("read_file", Kind::Read),

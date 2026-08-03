@@ -99,7 +99,10 @@ async fn plan_mode_blocks_a_mutating_tool_call_with_no_modal() {
         usage: Usage::default(),
         error: None,
     };
-    let deps = deps_for(&session, vec![Entry::just(write_pass), just(text_end("done"))]);
+    let deps = deps_for(
+        &session,
+        vec![Entry::just(write_pass), just(text_end("done"))],
+    );
     let (outcome, deps) = run_with_mode(&session, "write it", ApprovalMode::Plan, deps).await;
     assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
 
@@ -146,7 +149,10 @@ async fn plan_mode_allows_a_read_only_tool_call() {
         usage: Usage::default(),
         error: None,
     };
-    let deps = deps_for(&session, vec![Entry::just(read_pass), just(text_end("done"))]);
+    let deps = deps_for(
+        &session,
+        vec![Entry::just(read_pass), just(text_end("done"))],
+    );
     let (outcome, deps) = run_with_mode(&session, "read it", ApprovalMode::Plan, deps).await;
     assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
 
@@ -181,7 +187,10 @@ async fn default_mode_does_not_block_a_mutating_tool_call() {
         usage: Usage::default(),
         error: None,
     };
-    let deps = deps_for(&session, vec![Entry::just(write_pass), just(text_end("done"))]);
+    let deps = deps_for(
+        &session,
+        vec![Entry::just(write_pass), just(text_end("done"))],
+    );
     let (outcome, deps) = run_with_mode(&session, "write it", ApprovalMode::Default, deps).await;
     assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
 

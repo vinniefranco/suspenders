@@ -8,9 +8,7 @@ use super::*;
 fn plan_mode_reminder_carries_qwens_read_only_invariant() {
     let r = plan_mode_reminder();
     assert!(r.starts_with("<system-reminder>\nPlan mode is active."));
-    assert!(r.contains(
-        "you MUST NOT make any edits, run tools classified as state-modifying"
-    ));
+    assert!(r.contains("you MUST NOT make any edits, run tools classified as state-modifying"));
     // The planOnly=false convergence line names the exit_plan_mode tool.
     assert!(r.contains(
         "Present your plan by calling the exit_plan_mode tool, which will prompt the user to confirm the plan."

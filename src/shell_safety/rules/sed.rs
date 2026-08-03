@@ -18,22 +18,18 @@ static SED_ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:(?:\d+|\$)(?:\s*,\s*(?:\d+|\$))?|/(?:\\[\s\S]|[^/\\])*/)?\s*").unwrap()
 });
 // shell-safety-rules.ts:14 - a single safe sed command letter.
-static SAFE_SED_COMMAND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[dDgGhHlnNpPqQxz=]$").unwrap());
+static SAFE_SED_COMMAND: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[dDgGhHlnNpPqQxz=]$").unwrap());
 // shell-safety-rules.ts:15 - substitution flags that keep it read-only.
-static SAFE_SUBSTITUTION_FLAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9gIpM]*$").unwrap());
+static SAFE_SUBSTITUTION_FLAGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9gIpM]*$").unwrap());
 // shell-safety-rules.ts:16 - sed options that keep it read-only.
-static SAFE_SED_OPTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:-[nElrsuz]|--(?:quiet|silent|line-length(?:=.*)?))$").unwrap());
+static SAFE_SED_OPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:-[nElrsuz]|--(?:quiet|silent|line-length(?:=.*)?))$").unwrap()
+});
 
 // shell-safety-rules.ts:18 - value-bearing sed options (their argument is consumed).
-const SED_VALUE_OPTIONS: &[&str] = &[
-    "-f",
-    "--file",
-    "-e",
-    "--expression",
-    "-l",
-    "--line-length",
-];
+const SED_VALUE_OPTIONS: &[&str] = &["-f", "--file", "-e", "--expression", "-l", "--line-length"];
 
 // --- generic helper regexes used at call sites below ---
 static HELP_OR_VERSION: LazyLock<Regex> =
@@ -64,10 +60,7 @@ fn classify_single_sed_command_safety(script: &str) -> Safety {
     // GNU-vs-POSIX compatibility hazard -> unknown.
     let compatibility_unknown = compat_unknown(script);
     let bytes = script.as_bytes();
-    let command_offset = SED_ADDRESS
-        .find(script)
-        .map(|m| m.end())
-        .unwrap_or(0);
+    let command_offset = SED_ADDRESS.find(script).map(|m| m.end()).unwrap_or(0);
     if command_offset == bytes.len() {
         return Safety::ReadOnly;
     }
@@ -273,7 +266,11 @@ enum SedStep {
     Terminate { script: Option<(String, usize)> },
     /// Record `(script, index)` and advance by `consumed` tokens (1 for a
     /// positional / `-e<script>`, 2 for `-e VALUE`).
-    Script { script: String, index: usize, consumed: usize },
+    Script {
+        script: String,
+        index: usize,
+        consumed: usize,
+    },
 }
 
 /// Classify one sed argument at index `i` into a [`SedStep`] (the per-token body of
@@ -312,7 +309,8 @@ fn sed_scan_arg(args: &[String], i: usize, have_script: bool) -> SedStep {
             return SedStep::Malformed;
         }
         (script.to_string(), i)
-    } else if long_non_line_length(arg) || (arg.starts_with('-') && !SAFE_SED_OPTION.is_match(arg)) {
+    } else if long_non_line_length(arg) || (arg.starts_with('-') && !SAFE_SED_OPTION.is_match(arg))
+    {
         // qwen's two `else if`s (a long option that is not --line-length; an
         // unrecognized short option) both -> unknown.
         return SedStep::Malformed;
@@ -322,7 +320,11 @@ fn sed_scan_arg(args: &[String], i: usize, have_script: bool) -> SedStep {
         return SedStep::Skip;
     };
     let (script, index) = found;
-    SedStep::Script { script, consumed: index + 1 - i, index }
+    SedStep::Script {
+        script,
+        consumed: index + 1 - i,
+        index,
+    }
 }
 
 /// The sed SCRIPTS (positional or `-e`/`--expression`) with their arg indices, or
@@ -350,7 +352,11 @@ fn collect_sed_scripts(args: &[String]) -> Result<(Vec<String>, Vec<usize>), Saf
                 }
                 break;
             }
-            SedStep::Script { script, index, consumed } => {
+            SedStep::Script {
+                script,
+                index,
+                consumed,
+            } => {
                 scripts.push(script);
                 indices.push(index);
                 i += consumed;
@@ -437,4 +443,3 @@ fn long_non_line_length(arg: &str) -> bool {
         false
     }
 }
-

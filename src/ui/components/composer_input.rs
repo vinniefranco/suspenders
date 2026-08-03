@@ -89,8 +89,7 @@ fn composer_chrome(area: Rect, t: &Screen, theme: &Theme) -> Option<ComposerChro
         .is_some_and(|q| q.collecting_other.is_none());
     // A pending plan modal (ADR-0067) takes focus like an approval/question - it
     // holds the keyboard while the user picks a plan-exit outcome.
-    let focused =
-        t.pending_approval.is_none() && !question_holds_focus && t.pending_plan.is_none();
+    let focused = t.pending_approval.is_none() && !question_holds_focus && t.pending_plan.is_none();
     fits.then(|| ComposerChrome {
         border: composer_border_style(focused, theme),
         bottom: Rect {

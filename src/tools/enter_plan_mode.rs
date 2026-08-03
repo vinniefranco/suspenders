@@ -105,11 +105,9 @@ impl Tool for EnterPlanMode {
             // The VERBATIM YOLO no-op guidance (enterPlanMode.ts).
             EnterPlanOutcome::StayedYolo => Ok(STAYED_YOLO_MESSAGE.to_string()),
             // The VERBATIM subagent block result (subagent-plan-tool-policy.ts).
-            EnterPlanOutcome::SubagentBlocked => {
-                Ok(crate::tools::plan_lifecycle::subagent_block_message(
-                    "enter_plan_mode",
-                ))
-            }
+            EnterPlanOutcome::SubagentBlocked => Ok(
+                crate::tools::plan_lifecycle::subagent_block_message("enter_plan_mode"),
+            ),
         }
     }
 }

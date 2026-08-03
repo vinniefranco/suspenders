@@ -53,12 +53,10 @@ use tree_sitter::{Node, Parser, Tree};
 // The public verdict enum lives in `sets` (the classifier's shared vocabulary),
 // re-exported here so `crate::shell_safety::ShellCommandSafety` stays the public
 // path the approvals fold and tests import.
+use ShellCommandSafety::{ReadOnly, Unknown, Write};
 #[doc(inline)]
 pub use sets::ShellCommandSafety;
-use sets::{
-    WRITE_REDIRECT_OPERATORS, has_help, merge, merge2, merge_with, re, strip_outer_quotes,
-};
-use ShellCommandSafety::{ReadOnly, Unknown, Write};
+use sets::{WRITE_REDIRECT_OPERATORS, has_help, merge, merge_with, merge2, re, strip_outer_quotes};
 
 // ---------------------------------------------------------------------------
 // The AST walk (shellAstParser.ts:961-1116)
@@ -117,17 +115,12 @@ mod node {
     }
 }
 
-const SHELL_EXPANSION_TYPES: &[&str] =
-    &["simple_expansion", "expansion", "arithmetic_expansion"];
+const SHELL_EXPANSION_TYPES: &[&str] = &["simple_expansion", "expansion", "arithmetic_expansion"];
 
 /// shellAstParser.ts:678 `collectDescendants` - all descendants of `node` (incl.
 /// itself) whose kind is in `types`. `outermost_only` stops descending into a
 /// matched node (used for substitutions).
-fn collect_descendants<'a>(
-    node: Node<'a>,
-    types: &[&str],
-    outermost_only: bool,
-) -> Vec<Node<'a>> {
+fn collect_descendants<'a>(node: Node<'a>, types: &[&str], outermost_only: bool) -> Vec<Node<'a>> {
     let mut result = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
@@ -168,8 +161,11 @@ fn has_shell_expansion(node: Node, src: &[u8]) -> bool {
 /// [`evaluate_substitutions`]): each command-/process-substitution's named
 /// children, classified. Split out so the caller stays pure integration.
 fn substitution_body_safeties(node: Node, src: &[u8]) -> Vec<ShellCommandSafety> {
-    let substitutions =
-        collect_descendants(node, &["command_substitution", "process_substitution"], true);
+    let substitutions = collect_descendants(
+        node,
+        &["command_substitution", "process_substitution"],
+        true,
+    );
     substitutions
         .into_iter()
         .flat_map(|sub| node::named_children(sub))
@@ -288,7 +284,6 @@ fn evaluate_command_safety(command: Node, src: &[u8]) -> ShellCommandSafety {
     merge(&merge_with(own, &merge_with(redirects, &substitutions)))
 }
 
-
 /// The safety of ONE `_redirect` child (the operation half of
 /// [`evaluate_redirection_safety`]): its substitutions merged with the write/
 /// unknown escalation for a `file_redirect`'s operator and `>&` destination.
@@ -377,10 +372,7 @@ fn redirected_statement_safety(node: Node, src: &[u8]) -> ShellCommandSafety {
         .filter(|child| !child.kind().ends_with("_redirect"))
         .map(|child| evaluate_statement_safety(child, src))
         .collect();
-    merge(&merge_with(
-        evaluate_redirection_safety(node, src),
-        &bodies,
-    ))
+    merge(&merge_with(evaluate_redirection_safety(node, src), &bodies))
 }
 
 /// A bare `variable_assignment(s)` (shellAstParser.ts:1092): read-only iff it is

@@ -411,9 +411,7 @@ async fn classified_execute<D: RunDeps>(
             emit_hook_decision(state, "PermissionRequest", "auto-approved a Tool Call");
             execute_tool_call(state, name, input).await
         }
-        hooks::PermissionVerdict::Ask => {
-            classify_and_run(state, name, input, pre_permission).await
-        }
+        hooks::PermissionVerdict::Ask => classify_and_run(state, name, input, pre_permission).await,
     }
 }
 

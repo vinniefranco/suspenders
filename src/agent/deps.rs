@@ -13,7 +13,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::capabilities::{
-    AgentApprover, AgentBackgroundShellSpawner, AgentPlanMode, AgentQuestioner, AgentSubagentSpawner,
+    AgentApprover, AgentBackgroundShellSpawner, AgentPlanMode, AgentQuestioner,
+    AgentSubagentSpawner,
 };
 use crate::agent::{Msg, RunMsg};
 use crate::compaction::Compaction;

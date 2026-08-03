@@ -801,7 +801,10 @@ async fn exit_plan_mode_cancel_stays_in_plan() {
 
     let result = recv_tool_ok(&mut rx, "tu_exit").await;
     if let Event::ToolResult { content, .. } = result {
-        assert_eq!(content, "Plan execution was not approved. Remaining in plan mode.");
+        assert_eq!(
+            content,
+            "Plan execution was not approved. Remaining in plan mode."
+        );
     }
     recv_match(&mut rx, is_run_finished).await;
 }
@@ -1920,8 +1923,16 @@ async fn enter_plan_mode_records_pre_plan_mode_and_bumps_revision() {
 
     assert!(matches!(outcome, EnterPlanOutcome::Entered { .. }));
     assert_eq!(state.approvals.mode, ApprovalMode::Plan);
-    assert_eq!(state.approval_mode.load(), ApprovalMode::Plan, "mirror written");
-    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::Default), "prePlanMode recorded");
+    assert_eq!(
+        state.approval_mode.load(),
+        ApprovalMode::Plan,
+        "mirror written"
+    );
+    assert_eq!(
+        state.pre_plan_mode,
+        Some(ApprovalMode::Default),
+        "prePlanMode recorded"
+    );
     assert_eq!(state.approval_mode_revision, rev0 + 1, "revision bumped");
 }
 
@@ -1953,7 +1964,11 @@ async fn enter_plan_mode_from_yolo_with_user_request_enters_plan() {
 
     assert!(matches!(outcome, EnterPlanOutcome::Entered { .. }));
     assert_eq!(state.approvals.mode, ApprovalMode::Plan);
-    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::Yolo), "prePlanMode is YOLO");
+    assert_eq!(
+        state.pre_plan_mode,
+        Some(ApprovalMode::Yolo),
+        "prePlanMode is YOLO"
+    );
 }
 
 // Idempotent: entering plan while already in plan never overwrites prePlanMode
@@ -1973,7 +1988,11 @@ async fn enter_plan_mode_is_idempotent_and_preserves_pre_plan_mode() {
 
     assert!(matches!(outcome, EnterPlanOutcome::Entered { .. }));
     assert_eq!(state.approvals.mode, ApprovalMode::Plan);
-    assert_eq!(state.pre_plan_mode, Some(ApprovalMode::AutoEdit), "prePlanMode preserved");
+    assert_eq!(
+        state.pre_plan_mode,
+        Some(ApprovalMode::AutoEdit),
+        "prePlanMode preserved"
+    );
     assert_eq!(state.approval_mode_revision, rev, "no extra revision bump");
 }
 
@@ -1987,7 +2006,10 @@ async fn leaving_plan_clears_pre_plan_mode() {
     assert_eq!(state.pre_plan_mode, Some(ApprovalMode::Default));
 
     super::set_approval_mode(&mut state, ApprovalMode::Default, false);
-    assert_eq!(state.pre_plan_mode, None, "prePlanMode cleared on leaving Plan");
+    assert_eq!(
+        state.pre_plan_mode, None,
+        "prePlanMode cleared on leaving Plan"
+    );
 }
 
 // A MANUAL exit (from_approved_plan_exit == false, the Shift+Tab path) queues the
@@ -1998,7 +2020,11 @@ async fn manual_leave_of_plan_queues_the_exit_notice() {
     let dir = TempDir::new().unwrap();
     let mut state = fresh_state(&dir);
     super::enter_plan_mode(&mut state, true);
-    assert_eq!(state.plan_exit_notice.take(), None, "nothing queued while in Plan");
+    assert_eq!(
+        state.plan_exit_notice.take(),
+        None,
+        "nothing queued while in Plan"
+    );
 
     // The Shift+Tab cycle path leaves Plan with from_approved_plan_exit == false.
     super::set_approval_mode(&mut state, ApprovalMode::Default, false);
@@ -2008,7 +2034,11 @@ async fn manual_leave_of_plan_queues_the_exit_notice() {
         Some(ApprovalMode::Default),
         "a manual exit queues the notice carrying the new mode"
     );
-    assert_eq!(state.plan_exit_notice.take(), None, "one-shot: gone after the take");
+    assert_eq!(
+        state.plan_exit_notice.take(),
+        None,
+        "one-shot: gone after the take"
+    );
 }
 
 // The Shift+Tab cycle helper itself queues the notice when it leaves Plan (it
@@ -2041,11 +2071,20 @@ async fn approved_exit_does_not_queue_the_exit_notice() {
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     super::request_plan_exit(&mut state, "the plan".into(), reply);
-    let id = state.plan_replies.keys().next().cloned().expect("one parked exit");
+    let id = state
+        .plan_replies
+        .keys()
+        .next()
+        .cloned()
+        .expect("one parked exit");
 
     super::answer_plan(&mut state, id, PlanDecision::ProceedOnce);
     assert_eq!(rx.await.unwrap(), PlanExitOutcome::Approved);
-    assert_ne!(state.approvals.mode, ApprovalMode::Plan, "left Plan on approval");
+    assert_ne!(
+        state.approvals.mode,
+        ApprovalMode::Plan,
+        "left Plan on approval"
+    );
 
     assert_eq!(
         state.plan_exit_notice.take(),
@@ -2088,9 +2127,16 @@ async fn plan_command_exit_restores_pre_plan_mode_and_queues_the_manual_exit_not
 
     let restored = super::exit_plan_mode_restore(&mut state);
 
-    assert_eq!(restored, ApprovalMode::AutoEdit, "restored the pre-plan mode");
+    assert_eq!(
+        restored,
+        ApprovalMode::AutoEdit,
+        "restored the pre-plan mode"
+    );
     assert_eq!(state.approvals.mode, ApprovalMode::AutoEdit);
-    assert_eq!(state.pre_plan_mode, None, "prePlanMode cleared on leaving Plan");
+    assert_eq!(
+        state.pre_plan_mode, None,
+        "prePlanMode cleared on leaving Plan"
+    );
     assert_eq!(
         state.plan_exit_notice.take(),
         Some(ApprovalMode::AutoEdit),
@@ -2144,17 +2190,28 @@ async fn answer_plan_restore_previous_flips_to_pre_plan_mode() {
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     super::request_plan_exit(&mut state, "the plan".into(), reply);
-    let id = state.plan_replies.keys().next().cloned().expect("one parked exit");
+    let id = state
+        .plan_replies
+        .keys()
+        .next()
+        .cloned()
+        .expect("one parked exit");
 
     super::answer_plan(&mut state, id, PlanDecision::RestorePrevious);
 
     assert_eq!(rx.await.unwrap(), PlanExitOutcome::Approved);
-    assert_eq!(state.approvals.mode, ApprovalMode::AutoEdit, "restored to prePlanMode");
-    assert!(state.pre_plan_mode.is_none(), "prePlanMode cleared on leaving Plan");
-    let saved = std::fs::read_to_string(
-        std::path::Path::new(&state.session.session_dir).join("plan.md"),
-    )
-    .expect("plan saved");
+    assert_eq!(
+        state.approvals.mode,
+        ApprovalMode::AutoEdit,
+        "restored to prePlanMode"
+    );
+    assert!(
+        state.pre_plan_mode.is_none(),
+        "prePlanMode cleared on leaving Plan"
+    );
+    let saved =
+        std::fs::read_to_string(std::path::Path::new(&state.session.session_dir).join("plan.md"))
+            .expect("plan saved");
     assert_eq!(saved, "the plan");
 }
 
@@ -2168,7 +2225,12 @@ async fn answer_plan_is_stale_when_the_revision_moved() {
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     super::request_plan_exit(&mut state, "the plan".into(), reply);
-    let id = state.plan_replies.keys().next().cloned().expect("one parked exit");
+    let id = state
+        .plan_replies
+        .keys()
+        .next()
+        .cloned()
+        .expect("one parked exit");
 
     // The mode changes out from under the pending exit (a Shift+Tab cycle),
     // bumping the revision. The exit's snapshot is now stale. (The cycle out of
@@ -2176,14 +2238,24 @@ async fn answer_plan_is_stale_when_the_revision_moved() {
     // so we test the REVISION arm specifically, not the mode arm.)
     super::set_approval_mode(&mut state, ApprovalMode::Default, false); // rev++ (leaves Plan)
     super::set_approval_mode(&mut state, ApprovalMode::Plan, false); // rev++ (re-enters Plan)
-    assert_eq!(state.approvals.mode, ApprovalMode::Plan, "back in Plan, but revision moved");
+    assert_eq!(
+        state.approvals.mode,
+        ApprovalMode::Plan,
+        "back in Plan, but revision moved"
+    );
 
     super::answer_plan(&mut state, id, PlanDecision::ProceedOnce);
 
     assert_eq!(rx.await.unwrap(), PlanExitOutcome::Stale);
-    assert_eq!(state.approvals.mode, ApprovalMode::Plan, "no action taken, still in Plan");
+    assert_eq!(
+        state.approvals.mode,
+        ApprovalMode::Plan,
+        "no action taken, still in Plan"
+    );
     assert!(
-        !std::path::Path::new(&state.session.session_dir).join("plan.md").exists(),
+        !std::path::Path::new(&state.session.session_dir)
+            .join("plan.md")
+            .exists(),
         "no plan saved on a stale resolution"
     );
 }

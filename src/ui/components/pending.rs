@@ -216,18 +216,17 @@ pub(super) fn pending_layout<'a>(
     // (`Constraint::Min(1)`) and top-clip the "Apply this change?" question out of
     // view. A visible approval takes priority over the sticky list, so we reserve
     // NO sticky zone while `pending_approval.is_some()`.
-    let sticky_items = (t.pending_approval.is_none()
-        && t.pending_question.is_none()
-        && t.pending_plan.is_none())
-    .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
-        .flatten()
-        .filter(|items| {
-            sticky_fits(
-                area.height as usize,
-                sticky_todos_height(items.len()),
-                composer_height,
-            )
-        });
+    let sticky_items =
+        (t.pending_approval.is_none() && t.pending_question.is_none() && t.pending_plan.is_none())
+            .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
+            .flatten()
+            .filter(|items| {
+                sticky_fits(
+                    area.height as usize,
+                    sticky_todos_height(items.len()),
+                    composer_height,
+                )
+            });
     let sticky_height = sticky_items.map_or(0, |items| sticky_todos_height(items.len()));
     let chunks = frame_chunks(area, sticky_height, composer_height);
     PendingLayout {

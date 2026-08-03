@@ -1527,29 +1527,28 @@ fn answer_plan(state: &mut AgentState, id: String, decision: crate::approvals::P
         pre_plan_mode,
     } = pending;
 
-    let outcome = if state.approvals.mode != ApprovalMode::Plan
-        || state.approval_mode_revision != revision
-    {
-        // Stale-guard: the mode changed out from under the pending exit - take no
-        // action.
-        PlanExitOutcome::Stale
-    } else {
-        match decision.target(pre_plan_mode) {
-            // "Keep planning": stay in Plan, no mode change, no save.
-            None => PlanExitOutcome::Cancel,
-            // A proceed: save the plan best-effort, flip to the target mode.
-            Some(target) => {
-                save_plan_best_effort(state, &plan);
-                // The APPROVED exit flow: `from_approved_plan_exit == true`
-                // suppresses the manual-exit notice (qwen's `fromApprovedPlanExit`
-                // -> 'clear'), so an approved `exit_plan_mode` never injects the
-                // manual-exit reminder - the plan-mode reminder simply stops.
-                set_approval_mode(state, target, true);
-                broadcast(state, Event::approval_mode_changed(target));
-                PlanExitOutcome::Approved
+    let outcome =
+        if state.approvals.mode != ApprovalMode::Plan || state.approval_mode_revision != revision {
+            // Stale-guard: the mode changed out from under the pending exit - take no
+            // action.
+            PlanExitOutcome::Stale
+        } else {
+            match decision.target(pre_plan_mode) {
+                // "Keep planning": stay in Plan, no mode change, no save.
+                None => PlanExitOutcome::Cancel,
+                // A proceed: save the plan best-effort, flip to the target mode.
+                Some(target) => {
+                    save_plan_best_effort(state, &plan);
+                    // The APPROVED exit flow: `from_approved_plan_exit == true`
+                    // suppresses the manual-exit notice (qwen's `fromApprovedPlanExit`
+                    // -> 'clear'), so an approved `exit_plan_mode` never injects the
+                    // manual-exit reminder - the plan-mode reminder simply stops.
+                    set_approval_mode(state, target, true);
+                    broadcast(state, Event::approval_mode_changed(target));
+                    PlanExitOutcome::Approved
+                }
             }
-        }
-    };
+        };
     let _ = reply.send(outcome);
     // The operator-visible settlement marker (mirrors `question_resolved`): the
     // tool has read the reply, so mark the dialog resolved.

@@ -1628,7 +1628,8 @@ use crate::run::fixtures::{run_with_mode, run_with_pending_exit_notice};
 // reminder (the manual-exit text mentions "Plan mode is active" when it says it
 // is no longer active, so that phrase is not distinctive).
 const PLAN_REMINDER_MARK: &str = "The user indicated that they do not want you to execute yet";
-const MANUAL_EXIT_MARK: &str = "The approval mode changed outside the approved exit_plan_mode flow.";
+const MANUAL_EXIT_MARK: &str =
+    "The approval mode changed outside the approved exit_plan_mode flow.";
 
 // While the live mode is Plan, the standing plan-mode reminder rides EVERY
 // request's system text (qwen re-injects getPlanModeSystemReminder into every
@@ -1642,7 +1643,11 @@ async fn plan_mode_injects_the_standing_reminder_into_every_request() {
     let deps = deps_for(
         &session,
         vec![
-            just(tool_use_result("tu_1", "list_directory", json!({"path": dir}))),
+            just(tool_use_result(
+                "tu_1",
+                "list_directory",
+                json!({"path": dir}),
+            )),
             just(text_end("done planning")),
         ],
     );
@@ -1674,8 +1679,14 @@ async fn outside_plan_mode_injects_no_plan_reminder() {
 
     let requests = deps.requests.lock().unwrap();
     let sys = &requests[0].system;
-    assert!(!sys.contains(PLAN_REMINDER_MARK), "no plan reminder outside Plan");
-    assert!(!sys.contains(MANUAL_EXIT_MARK), "no manual-exit reminder with none pending");
+    assert!(
+        !sys.contains(PLAN_REMINDER_MARK),
+        "no plan reminder outside Plan"
+    );
+    assert!(
+        !sys.contains(MANUAL_EXIT_MARK),
+        "no manual-exit reminder with none pending"
+    );
 }
 
 // The standing plan reminder is EPHEMERAL: it rides the request's system text but
@@ -1713,7 +1724,11 @@ async fn manual_exit_injects_the_one_shot_reminder_exactly_once() {
     let deps = deps_for(
         &session,
         vec![
-            just(tool_use_result("tu_1", "list_directory", json!({"path": dir}))),
+            just(tool_use_result(
+                "tu_1",
+                "list_directory",
+                json!({"path": dir}),
+            )),
             just(text_end("done")),
         ],
     );
@@ -1729,7 +1744,11 @@ async fn manual_exit_injects_the_one_shot_reminder_exactly_once() {
         "the first request after a manual exit carries the one-shot reminder"
     );
     // And it names the current mode's wire string (default), verbatim.
-    assert!(requests[0].system.contains("The current approval mode is: default."));
+    assert!(
+        requests[0]
+            .system
+            .contains("The current approval mode is: default.")
+    );
     assert!(
         !requests[1].system.contains(MANUAL_EXIT_MARK),
         "the one-shot reminder must not repeat on the next request"

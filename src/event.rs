@@ -478,9 +478,7 @@ impl Event {
     }
 
     pub fn plan_resolved(id: impl Into<String>) -> Self {
-        Event::PlanResolved {
-            plan_id: id.into(),
-        }
+        Event::PlanResolved { plan_id: id.into() }
     }
 
     // ---- Slash Command selector ----

@@ -4817,7 +4817,9 @@ fn plan_modal_renders_title_plan_markdown_and_the_four_outcome_rows() {
         "the plan markdown heading renders: {rendered:?}"
     );
     assert!(
-        rendered.iter().any(|row| row.contains("Refactor the widget.")),
+        rendered
+            .iter()
+            .any(|row| row.contains("Refactor the widget.")),
         "the plan markdown body renders: {rendered:?}"
     );
 }
