@@ -450,6 +450,168 @@ fn plain_prose_that_only_mentions_markup_stays_text() {
     assert_eq!(r.stop_reason, StopReason::EndTurn);
 }
 
+// --- Anthropic/Claude XML `<invoke>` fallback (third tier, qwen parity) ---
+
+#[test]
+fn invoke_markup_finalizes_to_a_tool_use_when_hermes_misses() {
+    // No Hermes markup, no structured call: the third tier recovers the
+    // Claude-style `<invoke>` block. finish_reason "stop" is overridden.
+    let r = fold(vec![
+        delta(json!({
+            "content": "<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+        })),
+        finish("stop"),
+    ]);
+    assert_eq!(
+        r.content,
+        vec![ContentBlock::tool_use(
+            "text-call-0",
+            "read_file",
+            json!({ "file_path": "a.ts" })
+        )]
+    );
+    assert_eq!(r.stop_reason, StopReason::ToolUse);
+}
+
+#[test]
+fn invoke_markup_emits_surrounding_prose_as_a_leading_text_block() {
+    // The invoke branch keeps qwen's remaining_text (surrounding prose minus
+    // the stripped block), unlike the Hermes branch's preamble-only.
+    let r = fold(vec![
+        delta(json!({
+            "content": "Sure.\n<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+        })),
+        finish("stop"),
+    ]);
+    assert_eq!(
+        r.content,
+        vec![
+            ContentBlock::text("Sure."),
+            ContentBlock::tool_use("text-call-0", "read_file", json!({ "file_path": "a.ts" })),
+        ]
+    );
+    assert_eq!(r.stop_reason, StopReason::ToolUse);
+}
+
+#[test]
+fn invoke_fallback_fires_under_text_style() {
+    let r = fold_styled(
+        ToolCallStyle::Text,
+        vec![
+            delta(json!({
+                "content": "<invoke name=\"run_shell_command\"><parameter name=\"command\">ls</parameter></invoke>"
+            })),
+            finish("stop"),
+        ],
+    );
+    assert_eq!(
+        r.content,
+        vec![ContentBlock::tool_use(
+            "text-call-0",
+            "run_shell_command",
+            json!({ "command": "ls" })
+        )]
+    );
+    assert_eq!(r.stop_reason, StopReason::ToolUse);
+}
+
+#[test]
+fn structured_style_never_recovers_invoke_markup() {
+    let r = fold_styled(
+        ToolCallStyle::Structured,
+        vec![
+            delta(json!({
+                "content": "<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+            })),
+            finish("stop"),
+        ],
+    );
+    assert_eq!(r.content.len(), 1);
+    assert!(matches!(&r.content[0], ContentBlock::Text { .. }));
+    assert_eq!(r.stop_reason, StopReason::EndTurn);
+}
+
+#[test]
+fn a_structured_tool_call_wins_over_coincident_invoke_markup() {
+    let r = fold(vec![
+        delta(json!({
+            "content": "<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+        })),
+        tool_fragment(json!({
+            "index": 0, "id": "call_1", "type": "function",
+            "function": { "name": "list_directory", "arguments": "{\"path\": \".\"}" }
+        })),
+        finish("tool_calls"),
+    ]);
+    // Structured wins: the invoke markup stays plain text, never recovered.
+    assert_eq!(
+        r.content,
+        vec![
+            ContentBlock::text(
+                "<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+            ),
+            ContentBlock::tool_use("call_1", "list_directory", json!({ "path": "." })),
+        ]
+    );
+    assert_eq!(r.stop_reason, StopReason::ToolUse);
+}
+
+#[test]
+fn hermes_markup_wins_over_coincident_invoke_markup() {
+    // Both text dialects present: the Hermes tier hits first, so the invoke
+    // tier never runs. The Hermes preamble discipline (leading text only) is
+    // what surfaces, not the invoke remaining_text.
+    let r = fold(vec![
+        delta(json!({
+            "content": "<tool_call>\n<function=run_shell_command>\n<parameter=command>\nmix test\n</parameter>\n</function>\n</tool_call>\n<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+        })),
+        finish("stop"),
+    ]);
+    // Exactly one recovered call (Hermes), and the trailing invoke markup rides
+    // along inside the Hermes preamble computation as text-before-first-call is
+    // empty, so only the Hermes call surfaces.
+    assert_eq!(r.content.len(), 1);
+    assert_eq!(
+        r.content[0],
+        ContentBlock::tool_use(
+            "text-call-0",
+            "run_shell_command",
+            json!({ "command": "mix test" })
+        )
+    );
+    assert_eq!(r.stop_reason, StopReason::ToolUse);
+}
+
+#[test]
+fn invoke_fallback_declines_when_prose_dominates() {
+    let prose = "Here is how you use the tool. First you open the file, then you read it. \
+        The invoke block below shows the format. Remember to always check the path. \
+        This is a documentation example for the read_file tool call format. \
+        You should never execute these examples directly. They are for illustration \
+        purposes only. The actual tool calls are made through the structured API.";
+    let content = format!(
+        "{prose}\n<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+    );
+    let r = fold(vec![delta(json!({ "content": content })), finish("stop")]);
+    // Prose dominates: no recovery, the whole content stays a text block.
+    assert_eq!(r.content.len(), 1);
+    assert!(matches!(&r.content[0], ContentBlock::Text { .. }));
+    assert_eq!(r.stop_reason, StopReason::EndTurn);
+}
+
+#[test]
+fn invoke_fallback_does_not_fire_without_a_finish_reason() {
+    // A truncated stream (no finish_reason) does not trigger the invoke tier:
+    // the guard requires a finish reason to be present.
+    let mut s = StreamState::new();
+    s.handle_event(&delta(json!({
+        "content": "<invoke name=\"read_file\"><parameter name=\"file_path\">a.ts</parameter></invoke>"
+    })));
+    let r = s.finalize();
+    assert_eq!(r.content.len(), 1);
+    assert!(matches!(&r.content[0], ContentBlock::Text { .. }));
+}
+
 // --- chunk shape leniency ---
 
 #[test]

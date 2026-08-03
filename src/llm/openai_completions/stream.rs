@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::text_tool_call::{ParsedCall, extract_tool_calls};
+use super::xml_tool_call::{contains_xml_tool_calls, try_recover_xml_tool_calls};
 use crate::content::{ContentBlock, Usage};
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{ToolCallStyle, decode_tool_input, malformed_input_marker};
@@ -198,25 +199,54 @@ impl StreamState {
     ///
     /// When the structured `delta.tool_calls[]` channel came back EMPTY and the
     /// style admits it ([`ToolCallStyle::Auto`]/[`ToolCallStyle::Text`], not
-    /// [`ToolCallStyle::Structured`]), the accumulated content text is parsed
-    /// for Hermes/Qwen-coder markup ([`extract_tool_calls`]). A hit replaces the
-    /// text block with the parsed preamble (only when non-empty) followed by one
-    /// `ToolUse` per recovered call, and forces `stop_reason` to `ToolUse` - a
-    /// text-emitted call means the model wants a tool even if `finish_reason`
-    /// was "stop". Structured Tool Calls ALWAYS win: this path runs only when
-    /// none arrived, and never touches the structured decode above.
+    /// [`ToolCallStyle::Structured`]), the accumulated content text is mined for
+    /// a text-emitted call in three tiers of decreasing precedence:
+    ///
+    /// 1. **Structured** `delta.tool_calls[]` ALWAYS win: the two text tiers run
+    ///    only when none arrived, and never touch the structured decode.
+    /// 2. **Hermes/Qwen-coder** markup ([`extract_tool_calls`]): a hit replaces
+    ///    the text block with the parsed preamble (only when non-empty) followed
+    ///    by one `ToolUse` per recovered call.
+    /// 3. **Anthropic/Claude XML** `<invoke>` markup
+    ///    ([`try_recover_xml_tool_calls`]): tried ONLY when the Hermes path did
+    ///    not hit, and only when there is no stream error, a finish reason is
+    ///    present, the text is non-empty, and [`contains_xml_tool_calls`] sees
+    ///    the dialect. A recovery emits the recovered `remaining_text` (the
+    ///    surrounding prose minus the stripped invoke blocks) when non-empty,
+    ///    then one `ToolUse` per recovered call. Unlike the Hermes branch (which
+    ///    keeps only the leading preamble), the invoke branch keeps qwen's
+    ///    `remaining_text`; this divergence is intentional and faithful to each
+    ///    dialect's origin.
+    ///
+    /// Either text tier forces `stop_reason` to `ToolUse` - a text-emitted call
+    /// means the model wants a tool even if `finish_reason` was "stop".
     pub fn finalize(self) -> Response {
         let mut content = Vec::new();
         let mut text_call_stop = None;
 
-        if self.tool_calls.is_empty()
-            && self.style != ToolCallStyle::Structured
-            && let Some(parse) = extract_tool_calls(&self.text)
-        {
+        let text_style = self.tool_calls.is_empty() && self.style != ToolCallStyle::Structured;
+
+        if text_style && let Some(parse) = extract_tool_calls(&self.text) {
             if !parse.preamble.is_empty() {
                 content.push(ContentBlock::text(parse.preamble));
             }
             for (n, call) in parse.calls.into_iter().enumerate() {
+                content.push(text_call_block(n, call));
+            }
+            // A text-emitted call is a tool request regardless of finish_reason.
+            text_call_stop = Some(StopReason::ToolUse);
+        } else if text_style
+            && self.error.is_none()
+            && self.finish_reason.is_some()
+            && !self.text.is_empty()
+            && contains_xml_tool_calls(&self.text)
+            && let recovery = try_recover_xml_tool_calls(&self.text)
+            && recovery.recovered
+        {
+            if !recovery.remaining_text.is_empty() {
+                content.push(ContentBlock::text(recovery.remaining_text));
+            }
+            for (n, call) in recovery.calls.into_iter().enumerate() {
                 content.push(text_call_block(n, call));
             }
             // A text-emitted call is a tool request regardless of finish_reason.
