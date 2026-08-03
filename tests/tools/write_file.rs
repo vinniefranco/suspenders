@@ -34,11 +34,10 @@ fn description_is_the_verbatim_qwen_string() {
     let desc = spec.description;
     assert_eq!(
         desc,
-        "Writes content to a specified file in the local filesystem.\n\n      The user has the ability to modify `content`. If modified, this will be stated in the response."
+        "Writes content to a specified file in the local filesystem. A request to create or generate a file does not establish that the target path is new. Unless the target's absence or current text contents have already been established in this session, you MUST use the read_file tool first; if the file does not exist, then create it. With prior-read enforcement enabled, blind overwrites are rejected. The file_path argument MUST be an absolute path. Always construct it by combining the project root with the file's relative path (e.g. project root '/path/to/project/' + relative 'foo/bar.txt' = '/path/to/project/foo/bar.txt'). If the user provides a relative path, resolve it against the project root first.\n\nThe user has the ability to modify `content`. If modified, this will be stated in the response."
     );
     // No suspenders-only additions.
     assert!(!desc.contains("Usage:"));
-    assert!(!desc.contains("relative to the project root"));
     assert!(!desc.contains("only creates new files"));
 }
 

@@ -48,187 +48,36 @@ pub struct TodoArtifact {
     pub items: Vec<TodoItem>,
 }
 
-/// qwen's `todoWriteToolDescription` (tools/todoWrite.ts:64-240), verbatim. The
-/// `${...}` interpolations in qwen's source resolve to literal tool names in the
-/// runtime string; there are none in this description (the examples name tools
-/// like "Edit tool" / "grep" as prose, not via interpolation).
+/// qwen's `todoWriteToolDescription` (tools/todoWrite.ts:77-92), verbatim. qwen
+/// v0.21.4 REPLACED the long v0.16 "When to Use This Tool" guide (numbered
+/// scenarios + worked examples) with this short, outcome-oriented block; there
+/// are no `${...}` interpolations in it.
 const DESCRIPTION: &str = r#"
-Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
-It also helps the user understand the progress of the task and overall progress of their requests.
+Use this tool to create and manage a user-visible task list when explicit progress tracking improves clarity.
 
 ## When to Use This Tool
-Use this tool proactively in these scenarios:
+Use this tool for work that is complex, ambiguous, or multi-phase; has multiple independent outcomes or important dependencies; benefits from checkpoints; or when the user explicitly asks for a todo list.
 
-1. Complex multi-step tasks - When a task requires 3 or more distinct steps or actions
-2. Non-trivial and complex tasks - Tasks that require careful planning or multiple operations
-3. User explicitly requests todo list - When the user directly asks you to use the todo list
-4. User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated)
-5. After receiving new instructions - Immediately capture user requirements as todos
-6. When you start working on a task - Mark it as in_progress BEFORE beginning work. Ideally you should only have one todo as in_progress at a time
-7. After completing a task - Mark it as completed and add any new follow-up tasks discovered during implementation
+Do not use it for simple or single-step work, purely conversational or informational requests, or tasks that can be answered or completed directly unless the user explicitly requests a todo list.
 
-## When NOT to Use This Tool
+## Planning with Todos
 
-Skip using this tool when:
-1. There is only a single, straightforward task
-2. The task is trivial and tracking it provides no organizational benefit
-3. The task can be completed in less than 3 trivial steps
-4. The task is purely conversational or informational
+Keep the list short and outcome-oriented. Use a small number of meaningful, logically ordered, verifiable steps. Do not create a separate todo for every error, file, command, or minor edit.
 
-NOTE that you should not use this tool if there is only one trivial task to do. In this case you are better off just doing the task directly.
+Use blockedBy only when the work has real dependencies. Reference Todo IDs from the same list and keep independent work unblocked.
 
-## Examples of When to Use the Todo List
-
-<example>
-User: I want to add a dark mode toggle to the application settings. Make sure you run the tests and build when you're done!
-Assistant: I'll help add a dark mode toggle to your application settings. Let me create a todo list to track this implementation.
-*Creates todo list with the following items:*
-1. Create dark mode toggle component in Settings page
-2. Add dark mode state management (context/store)
-3. Implement CSS-in-JS styles for dark theme
-4. Update existing components to support theme switching
-5. Run tests and build process, addressing any failures or errors that occur
-*Begins working on the first task*
-
-<reasoning>
-The assistant used the todo list because:
-1. Adding dark mode is a multi-step feature requiring UI, state management, and styling changes
-2. The user explicitly requested tests and build be run afterward
-3. The assistant inferred that tests and build need to pass by adding "Ensure tests and build succeed" as the final task
-</reasoning>
-</example>
-
-<example>
-User: Help me rename the function getCwd to getCurrentWorkingDirectory across my project
-Assistant: Let me first search through your codebase to find all occurrences of 'getCwd'.
-*Uses grep or search tools to locate all instances of getCwd in the codebase*
-Assistant: I've found 15 instances of 'getCwd' across 8 different files. Let me create a todo list to track these changes.
-*Creates todo list with specific items for each file that needs updating*
-
-<reasoning>
-The assistant used the todo list because:
-1. First, the assistant searched to understand the scope of the task
-2. Upon finding multiple occurrences across different files, it determined this was a complex task with multiple steps
-3. The todo list helps ensure every instance is tracked and updated systematically
-4. This approach prevents missing any occurrences and maintains code consistency
-</reasoning>
-</example>
-
-
-<example>
-User: I need to implement these features for my e-commerce site: user registration, product catalog, shopping cart, and checkout flow.
-Assistant: I'll help implement these features. First, let's add all the features to the todo list.
-*Creates a todo list breaking down each feature into specific tasks based on the project architecture*
-Assistant: Let's start with user registration. This will involve creating database models, API endpoints, and frontend forms that integrate with your existing authentication system.
-
-<reasoning>
-The assistant used the todo list because:
-1. The user provided multiple complex features to implement in a comma separated list
-2. The todo list helps organize these large features into manageable tasks
-3. This approach allows for tracking progress across the entire implementation
-</reasoning>
-</example>
-
-<example>
-User: Can you help optimize my React application? It's rendering slowly and has performance issues.</user>
-Assistant: I'll help optimize your React application. First, let me examine your codebase to identify potential performance bottlenecks.
-*Reviews component structure, render patterns, state management, and data fetching*
-Assistant: After analyzing your codebase, I've identified several performance issues. Let me create a todo list to track our optimization efforts.
-*Creates todo list with items like: 1) Implement memoization for expensive calculations in ProductList, 2) Add virtualization for long lists in Dashboard, 3) Optimize image loading in Gallery component, 4) Fix state update loops in ShoppingCart, 5) Review bundle size and implement code splitting*
-Let's start by implementing memoization for the expensive calculations in your ProductList component.</assistant>
-
-<reasoning>
-The assistant used the todo list because:
-1. First, the assistant examined the codebase to identify specific performance issues
-2. Based on this analysis, it identified multiple optimization opportunities
-3. Performance optimization is a non-trivial task requiring multiple steps
-4. The todo list helps methodically track improvements across different components
-5. This systematic approach ensures all performance bottlenecks are addressed
-</reasoning>
-</example>
-
-## Examples of When NOT to Use the Todo List
-
-<example>
-User: How do I print 'Hello World' in Python?
-Assistant: In Python, you can print "Hello World" with this simple code:
-
-python
-print("Hello World")
-
-This will output the text "Hello World" to the console when executed.</assistant>
-
-<reasoning>
-The assistant did not use the todo list because this is a single, trivial task that can be completed in one step. There's no need to track multiple tasks or steps for such a straightforward request.
-</reasoning>
-</example>
-
-<example>
-User: What does the git status command do?
-Assistant: The git status command shows the current state of your working directory and staging area. It displays which changes have been staged, which haven't, and which files aren't being tracked by Git. This is a fundamental command for understanding the current state of your repository before making commits.
-
-<reasoning>
-The assistant did not use the todo list because this is an informational request with no actual coding task to complete. The user is simply asking for an explanation, not for the assistant to perform multiple steps or tasks.
-</reasoning>
-</example>
-
-<example>
-User: Can you add a comment to the calculateTotal function to explain what it does?
-Assistant: Sure, let me add a comment to the calculateTotal function to explain what it does.
-* Uses the Edit tool to add a comment to the calculateTotal function *
-
-<reasoning>
-The assistant did not use the todo list because this is a single, straightforward task confined to one location in the code. Adding a comment doesn't require tracking multiple steps or systematic organization.
-</reasoning>
-</example>
-
-<example>
-User: Run npm install for me and tell me what happens.
-Assistant: I'll run the npm install command for you.
-
-*Executes: npm install*
-
-The command completed successfully. Here's the output:
-[Output of npm install command]
-
-All dependencies have been installed according to your package.json file.
-
-<reasoning>
-The assistant did not use the todo list because this is a single command execution with immediate results. There are no multiple steps to track or organize, making the todo list unnecessary for this straightforward task.
-</reasoning>
-</example>
-
-## Task States and Management
-
-1. **Task States**: Use these states to track progress:
-   - pending: Task not yet started
-   - in_progress: Currently working on (limit to ONE task at a time)
-   - completed: Task finished successfully
-
-2. **Task Management**:
-   - Update task status in real-time as you work
-   - Mark tasks complete IMMEDIATELY after finishing (don't batch completions)
-   - Only have ONE task in_progress at any time
-   - Complete current tasks before starting new ones
-   - Remove tasks that are no longer relevant from the list entirely
-
-3. **Task Completion Requirements**:
-   - ONLY mark a task as completed when you have FULLY accomplished it
-   - If you encounter errors, blockers, or cannot finish, keep the task as in_progress
-   - When blocked, create a new task describing what needs to be resolved
-   - Never mark a task as completed if:
-     - Tests are failing
-     - Implementation is partial
-     - You encountered unresolved errors
-     - You couldn't find necessary files or dependencies
-
-4. **Task Breakdown**:
-   - Create specific, actionable items
-   - Break complex tasks into smaller, manageable steps
-   - Use clear, descriptive task names
-
-When in doubt, use this tool. Being proactive with task management demonstrates attentiveness and ensures you complete all requirements successfully.
+Keep at most one task in_progress. When a plan exists, keep its statuses current, mark finished work completed, revise the plan when the scope or approach changes, and remove items that are no longer relevant. Do not mark incomplete or blocked work completed.
 "#;
+
+/// qwen's `todoWriteToolSchemaData.description` (tools/todoWrite.ts:37-38): the
+/// short schema-level summary. suspenders' [`ToolSpec`] carries a single
+/// `description` slot (wired to the long [`DESCRIPTION`] above, matching qwen's
+/// `todoWriteToolDescription` which is what qwen actually passes to the model),
+/// so this schema-level string has no distinct slot on the wire; it is kept here
+/// for parity documentation only.
+#[allow(dead_code)]
+const SCHEMA_DESCRIPTION: &str =
+    "Creates and manages a concise, user-visible task list for complex or multi-step work.";
 
 /// One validated todo item's fields, in the order qwen validates them.
 struct ItemFields<'a> {
@@ -245,15 +94,43 @@ fn item_fields(item: &Value) -> ItemFields<'_> {
     }
 }
 
-/// qwen's `validateToolParams` (tools/todoWrite.ts:565-595), returning the
-/// verbatim first failing message or `Ok(())`. The wire `validate` only checks
-/// that `todos` is present, so the array-shape and per-item checks live here.
+/// qwen caps ids and `blockedBy` entries at 500 characters
+/// (tools/todoWrite.ts:57,61,167,188).
+const MAX_ID_LEN: usize = 500;
+
+/// The `blockedBy` dependency IDs of a todo item, in wire order, or `None` when
+/// the field is absent. `Some(Err(_))` is a shape violation qwen rejects: a
+/// non-array `blockedBy`, or an entry that is not a non-empty string of at most
+/// 500 characters (tools/todoWrite.ts:181-192).
+fn blocked_by(item: &Value) -> Option<Result<Vec<&str>, ()>> {
+    let value = item.get("blockedBy")?;
+    let Value::Array(entries) = value else {
+        return Some(Err(()));
+    };
+    let mut ids = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() && s.len() <= MAX_ID_LEN => ids.push(s),
+            _ => return Some(Err(())),
+        }
+    }
+    Some(Ok(ids))
+}
+
+/// qwen's `validateTodos` (tools/todoWrite.ts:153-242), returning the verbatim
+/// first failing message or `Ok(())`. The wire `validate` only checks that
+/// `todos` is present, so the array-shape and per-item checks live here.
 fn validate(todos: &[Value]) -> Result<(), String> {
     for item in todos {
         let fields = item_fields(item);
         match fields.id {
-            Some(id) if !id.trim().is_empty() => {}
-            _ => return Err(r#"Each todo must have a non-empty "id" string."#.to_string()),
+            Some(id) if !id.trim().is_empty() && id.len() <= MAX_ID_LEN => {}
+            _ => {
+                return Err(
+                    r#"Each todo must have a non-empty "id" string of at most 500 characters."#
+                        .to_string(),
+                );
+            }
         }
         match fields.content {
             Some(content) if !content.trim().is_empty() => {}
@@ -268,6 +145,12 @@ fn validate(todos: &[Value]) -> Result<(), String> {
                 );
             }
         }
+        if let Some(Err(())) = blocked_by(item) {
+            return Err(
+                r#"Each todo "blockedBy" value must be an array of non-empty Todo IDs of at most 500 characters."#
+                    .to_string(),
+            );
+        }
     }
 
     let ids: Vec<&str> = todos.iter().filter_map(|t| t.get("id")?.as_str()).collect();
@@ -276,7 +159,86 @@ fn validate(todos: &[Value]) -> Result<(), String> {
         return Err("Todo IDs must be unique within the array.".to_string());
     }
 
+    // Per-item dependency checks: no duplicate/self references, and every
+    // referenced ID must exist (tools/todoWrite.ts:201-215). Every item here has
+    // a valid, present id and a well-formed `blockedBy` (checked above).
+    for item in todos {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        let deps: Vec<&str> = match blocked_by(item) {
+            Some(Ok(deps)) => deps,
+            _ => Vec::new(),
+        };
+        let distinct: std::collections::HashSet<&str> = deps.iter().copied().collect();
+        if distinct.len() != deps.len() {
+            return Err(format!(
+                r#"Todo "{id}" must not contain duplicate blockedBy references."#
+            ));
+        }
+        if deps.contains(&id) {
+            return Err(format!(r#"Todo "{id}" must not depend on itself."#));
+        }
+        if let Some(missing) = deps.iter().find(|d| !unique.contains(*d)) {
+            return Err(format!(
+                r#"Todo "{id}" references unknown dependency "{missing}"."#
+            ));
+        }
+    }
+
+    // Cycle detection via Kahn's algorithm (tools/todoWrite.ts:217-239): if a
+    // topological sort cannot place every node, a dependency cycle exists.
+    if has_dependency_cycle(todos) {
+        return Err("Todo dependencies must not contain a cycle.".to_string());
+    }
+
     Ok(())
+}
+
+/// `true` when the todos' `blockedBy` edges contain a cycle, decided by Kahn's
+/// topological sort (tools/todoWrite.ts:217-239): count how many nodes can be
+/// ordered when a node is ready only once all its dependencies are placed; a
+/// leftover means a cycle. Assumes each item has a valid, present id and
+/// well-formed dependencies (already checked by `validate`).
+fn has_dependency_cycle(todos: &[Value]) -> bool {
+    use std::collections::HashMap;
+
+    let dep_count = |item: &Value| match blocked_by(item) {
+        Some(Ok(deps)) => deps.len(),
+        _ => 0,
+    };
+
+    let mut remaining: HashMap<&str, usize> = HashMap::new();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for item in todos {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        remaining.insert(id, dep_count(item));
+        if let Some(Ok(deps)) = blocked_by(item) {
+            for dep in deps {
+                dependents.entry(dep).or_default().push(id);
+            }
+        }
+    }
+
+    let mut queue: Vec<&str> = todos
+        .iter()
+        .map(|t| t.get("id").and_then(Value::as_str).unwrap_or_default())
+        .filter(|id| remaining.get(id).copied() == Some(0))
+        .collect();
+    let mut index = 0;
+    while index < queue.len() {
+        let node = queue[index];
+        index += 1;
+        if let Some(children) = dependents.get(node) {
+            for &child in children {
+                let left = remaining.get(child).copied().unwrap_or(1).saturating_sub(1);
+                remaining.insert(child, left);
+                if left == 0 {
+                    queue.push(child);
+                }
+            }
+        }
+    }
+
+    queue.len() != todos.len()
 }
 
 /// Renders qwen's `llmContent` for a written list (tools/todoWrite.ts:477-492):
@@ -315,8 +277,10 @@ impl Tool for TodoWriteTool {
             name: "todo_write".into(),
             description: DESCRIPTION.into(),
             // qwen's `todoWriteToolSchemaData.parametersJsonSchema`
-            // (tools/todoWrite.ts:33-61), verbatim: item properties carry no
-            // description, `todos` is "The updated todo list", the item is
+            // (tools/todoWrite.ts:39-74), verbatim: item content/status carry no
+            // description, `id` is capped at `maxLength: 500`, each item may
+            // carry a `blockedBy` array of unique `maxLength: 500` Todo IDs,
+            // `todos` is "The updated todo list", the item is
             // `additionalProperties: false`, and item required is
             // ["content","status","id"].
             input_schema: json!({
@@ -336,7 +300,14 @@ impl Tool for TodoWriteTool {
                                     "enum": ["pending", "in_progress", "completed"]
                                 },
                                 "id": {
-                                    "type": "string"
+                                    "type": "string",
+                                    "maxLength": 500
+                                },
+                                "blockedBy": {
+                                    "type": "array",
+                                    "items": { "type": "string", "maxLength": 500 },
+                                    "uniqueItems": true,
+                                    "description": "Todo IDs that must be completed before this item"
                                 }
                             },
                             "required": ["content", "status", "id"],

@@ -180,6 +180,47 @@ async fn returns_ok_compacted_new_state_with_a_scripted_llm() {
 }
 
 #[tokio::test]
+async fn strips_the_analysis_scratchpad_from_the_stored_summary() {
+    // qwen's compression prompt asks the model to wrap its chain-of-thought in
+    // an <analysis> block; it must be stripped before the summary enters history.
+    let fake = FakeLlm::script(vec![Entry::just(ok_response(
+        "<analysis>secret drafting scratchpad</analysis>\n<state_snapshot>real summary</state_snapshot>",
+    ))]);
+    let conv = conversation_with_runs(5);
+    let (compacted, new_state) = Compaction::new()
+        .run(&conv, &fake, &test_model(), None)
+        .await
+        .unwrap();
+
+    let narrative = new_state.previous_summary.as_deref().unwrap();
+    assert!(!narrative.contains("scratchpad"), "analysis block leaked");
+    assert!(narrative.contains("<state_snapshot>real summary</state_snapshot>"));
+    // The re-injected message also excludes the scratchpad.
+    assert!(!message_text(&compacted.messages[0]).contains("scratchpad"));
+}
+
+#[tokio::test]
+async fn falls_back_to_raw_when_the_model_returns_only_an_analysis_block() {
+    let fake = FakeLlm::script(vec![Entry::just(ok_response(
+        "<analysis>only scratchpad, no summary</analysis>",
+    ))]);
+    let conv = conversation_with_runs(5);
+    let (_compacted, new_state) = Compaction::new()
+        .run(&conv, &fake, &test_model(), None)
+        .await
+        .unwrap();
+
+    // Stripping everything would lose the whole response; fall back to raw.
+    assert!(
+        new_state
+            .previous_summary
+            .as_deref()
+            .unwrap()
+            .contains("only scratchpad")
+    );
+}
+
+#[tokio::test]
 async fn returns_error_when_llm_fails() {
     let fake = FakeLlm::script(vec![Entry::error("server_busy")]);
     let conv = conversation_with_runs(5);

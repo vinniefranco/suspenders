@@ -17,13 +17,27 @@
 //! distinct path-gated message, and the not-found list is the model-facing catalog
 //! only, never leaking hidden/inactive names.
 //!
-//! The description scaffold (`Execute a skill within the main conversation` +
-//! `<skills_instructions>` + `<available_skills>`) is ported VERBATIM from qwen
-//! v0.16.0's `tools/skill.ts`; the empty-catalog wording points at Suspenders'
-//! project `.suspenders/skills/` and user `~/.config/suspenders/skills/` (the XDG
-//! config home, per [`crate::session::default_user_skills_dir`]) conventions (not
-//! qwen's `.qwen/skills/`). The validate-empty and not-found messages are
-//! qwen-verbatim.
+//! The `<skills_instructions>` body is ported from qwen v0.21.4's
+//! `tools/skill.ts` `SKILL_TOOL_DESCRIPTION` (the "can help" wording and the
+//! `mcp-prompt`/`args` invoke example are verbatim). One line deviates from
+//! qwen: qwen's "Available skills are listed in `<system-reminder>` messages"
+//! is rewritten to point at the `<available_skills>` catalog Suspenders splices
+//! into this description, because Suspenders does not surface skills via
+//! `<system-reminder>` deltas (see the architectural divergence note below);
+//! naming `<system-reminder>` here would misdirect the model to a channel that
+//! carries nothing. The empty-catalog wording points at Suspenders' project
+//! `.suspenders/skills/` and user `~/.config/suspenders/skills/` (the XDG config
+//! home, per [`crate::session::default_user_skills_dir`]) conventions (not qwen's
+//! `.qwen/skills/`). The validate-empty and not-found messages are qwen-verbatim.
+//!
+//! ARCHITECTURAL DIVERGENCE (deliberately retained this pass): qwen v0.21.4 made
+//! `SKILL_TOOL_DESCRIPTION` STATIC - the live skill catalog reaches the model via
+//! `<available_skills>` startup-prelude snapshots and per-turn `<system-reminder>`
+//! deltas, NOT the tool description, so skill changes never mutate the
+//! prompt-cache-prefixing tools block. Suspenders still splices a live
+//! `<available_skills>` XML block into this description (the surfacing mechanism,
+//! ADR-0058). Migrating to qwen's static-description + system-reminder delta model
+//! is a separate architectural change and is out of scope here.
 
 use std::sync::Arc;
 
@@ -111,7 +125,7 @@ impl Tool for SkillTool {
             "Execute a skill within the main conversation
 
 <skills_instructions>
-When users ask you to perform tasks, check if any of the available skills below can help complete the task more effectively. Skills provide specialized capabilities and domain knowledge.
+When users ask you to perform tasks, check if any of the available skills can help complete the task more effectively. Skills provide specialized capabilities and domain knowledge.
 
 How to invoke:
 - Use this tool with the skill name only (no arguments)
@@ -119,12 +133,13 @@ How to invoke:
   - `skill: \"pdf\"` - invoke the pdf skill
   - `skill: \"xlsx\"` - invoke the xlsx skill
   - `skill: \"ms-office-suite:pdf\"` - invoke using fully qualified name
+  - `skill: \"mcp-prompt\", args: \"topic\"` - invoke a model-invocable command with arguments
 
 Important:
+- Available skills are listed in the <available_skills> section below; only use skills listed there.
 - When a skill is relevant, you must invoke this tool IMMEDIATELY as your first action
 - NEVER just announce or mention a skill in your text response without actually calling this tool
 - This is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task
-- Only use skills listed in <available_skills> below
 - Do not invoke a skill that is already running
 - Do not use this tool for built-in CLI commands (like /help, /clear, etc.)
 - When executing scripts or loading referenced files, ALWAYS resolve absolute paths from skill's base directory. Examples:
@@ -142,14 +157,19 @@ Important:
         ToolSpec {
             name: "skill".to_string(),
             description,
-            // qwen's initial schema: a single required `skill` string, no
-            // additional properties.
+            // qwen's initial schema (tools/skill.ts:110-125): a required `skill`
+            // string plus an optional `args` string (for model-invocable slash
+            // commands), no additional properties.
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "skill": {
                         "type": "string",
-                        "description": "The skill name (no arguments). E.g., \"pdf\" or \"xlsx\"",
+                        "description": "The skill or command name. E.g., \"pdf\" or \"xlsx\"",
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": "Optional arguments for model-invocable slash commands.",
                     },
                 },
                 "required": ["skill"],

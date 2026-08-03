@@ -31,7 +31,7 @@ pub use marker::{
     Marker, malformed_input, omitted_middle, please_continue, truncated_file, truncated_output,
 };
 pub use plan::{manual_plan_exit_reminder, plan_mode_reminder};
-pub use prompt::system_prompt;
+pub use prompt::{InteractionMode, system_prompt};
 
 #[cfg(test)]
 #[path = "../tests/voice.rs"]

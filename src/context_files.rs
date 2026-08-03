@@ -105,11 +105,11 @@ pub struct ContextFiles {
 /// Loads context files from the Project Root and its ancestors, plus the global
 /// config directory. Always succeeds: a missing file is silently normal, and a
 /// present-but-unusable file is skipped and reported in `skipped`.
-/// `system_prompt` falls back to the Voice default when no SYSTEM.md and no
-/// context files exist.
-pub fn load(root: &str) -> ContextFiles {
+/// `system_prompt` falls back to the Voice default (built for `mode`) when no
+/// SYSTEM.md and no context files exist.
+pub fn load(root: &str, mode: voice::InteractionMode) -> ContextFiles {
     let mut acc = Acc {
-        system_prompt: voice::system_prompt().to_string(),
+        system_prompt: voice::system_prompt(mode),
         sources: Vec::new(),
         skipped: Vec::new(),
     };

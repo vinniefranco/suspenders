@@ -61,7 +61,8 @@ async fn start_and_run(
     themes: ActiveTheme,
     theme_notice: Option<String>,
 ) -> anyhow::Result<()> {
-    let context = crate::context_files::load(&session.root);
+    let context =
+        crate::context_files::load(&session.root, crate::voice::InteractionMode::Interactive);
     let mut launch_notices: Vec<String> = context.skipped.iter().map(|s| s.info_line()).collect();
     launch_notices.extend(theme_notice);
     let (session, llm) = boundary_and_enriched_session(session).await;
@@ -142,7 +143,7 @@ pub async fn run_headless(
 // Same load as the TUI; headless has no Transcript, so a skip prints as a
 // plain line in the event stream instead.
 fn headless_context(root: &str) -> String {
-    let context = crate::context_files::load(root);
+    let context = crate::context_files::load(root, crate::voice::InteractionMode::Headless);
     for skip in &context.skipped {
         println!("!! {}", skip.info_line());
     }

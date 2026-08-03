@@ -73,10 +73,10 @@ pub(crate) use mcp_ops::rebuild_session_tools;
 #[path = "../tests/agent.rs"]
 mod tests;
 
-/// The default system prompt (baud's `Baud.Agent.system_prompt/0`). Public for
-/// the UI and tests.
-pub fn system_prompt() -> &'static str {
-    voice::system_prompt()
+/// The default system prompt (baud's `Baud.Agent.system_prompt/0`) for the given
+/// interaction mode. Public for the UI and tests.
+pub fn system_prompt(mode: voice::InteractionMode) -> String {
+    voice::system_prompt(mode)
 }
 
 /// The Agent's running status (baud's `:idle | :running`).
@@ -137,7 +137,7 @@ impl StartOpts {
         StartOpts {
             session,
             llm,
-            system_prompt: system_prompt().to_string(),
+            system_prompt: system_prompt(voice::InteractionMode::Interactive),
             resume: None,
         }
     }
