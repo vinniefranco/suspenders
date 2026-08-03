@@ -19,6 +19,7 @@
 pub mod request;
 pub mod stream;
 pub mod text_tool_call;
+pub mod xml_tool_call;
 
 use serde_json::Value;
 
