@@ -13,6 +13,10 @@
       "context_window": 1000000,
       "max_tokens": 128000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 10.0,
         "output": 50.0,
@@ -26,6 +30,10 @@
       "context_window": 200000,
       "max_tokens": 64000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 1.0,
         "output": 5.0,
@@ -39,6 +47,10 @@
       "context_window": 200000,
       "max_tokens": 64000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 1.0,
         "output": 5.0,
@@ -52,6 +64,10 @@
       "context_window": 200000,
       "max_tokens": 32000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 15.0,
         "output": 75.0,
@@ -65,6 +81,10 @@
       "context_window": 200000,
       "max_tokens": 32000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 15.0,
         "output": 75.0,
@@ -78,6 +98,10 @@
       "context_window": 200000,
       "max_tokens": 64000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 5.0,
         "output": 25.0,
@@ -91,6 +115,10 @@
       "context_window": 200000,
       "max_tokens": 64000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 5.0,
         "output": 25.0,
@@ -104,6 +132,10 @@
       "context_window": 1000000,
       "max_tokens": 128000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 5.0,
         "output": 25.0,
@@ -117,6 +149,10 @@
       "context_window": 1000000,
       "max_tokens": 128000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 5.0,
         "output": 25.0,
@@ -130,6 +166,27 @@
       "context_window": 1000000,
       "max_tokens": 128000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
+      "cost": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25
+      }
+    },
+    {
+      "id": "claude-opus-5",
+      "name": "Claude Opus 5",
+      "context_window": 1000000,
+      "max_tokens": 128000,
+      "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 5.0,
         "output": 25.0,
@@ -143,6 +200,10 @@
       "context_window": 1000000,
       "max_tokens": 64000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 3.0,
         "output": 15.0,
@@ -156,6 +217,10 @@
       "context_window": 1000000,
       "max_tokens": 64000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 3.0,
         "output": 15.0,
@@ -169,6 +234,10 @@
       "context_window": 1000000,
       "max_tokens": 128000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 3.0,
         "output": 15.0,
@@ -182,6 +251,10 @@
       "context_window": 1000000,
       "max_tokens": 128000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": true
+      },
       "cost": {
         "input": 2.0,
         "output": 10.0,
