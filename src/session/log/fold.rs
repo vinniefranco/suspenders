@@ -55,6 +55,10 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             flush(messages, batch.take());
             messages.push(user_message(vec![text_block(text)]));
         }
+        Entry::UserContent(blocks) => {
+            flush(messages, batch.take());
+            messages.push(user_message(blocks.clone()));
+        }
         Entry::Message(message) => {
             flush(messages, batch.take());
             messages.push(message.clone());

@@ -326,7 +326,23 @@ pub enum Key {
     /// modal too (the body renders behind it). Named (not `Char`) so the intent
     /// reads at the mapping and routing seams.
     ShowMore,
+    /// Ctrl-V (ADR-0068 P5, qwen's `InputPrompt` Ctrl+V handler): capture an
+    /// image on the system clipboard into a staged temp file and insert an
+    /// `@<temppath>` At Mention. Named (not `Char('v')`) so the intent reads at
+    /// the mapping and routing seams, and so the capture (subprocess + fs) runs
+    /// off the event loop via [`Effect::CaptureClipboardImage`], never inline. A
+    /// clipboard WITHOUT an image (the common case - Ctrl+V is also plain paste on
+    /// some terminals, but bracketed paste delivers text as `Key::Paste`) is a
+    /// no-op: nothing is staged, nothing inserted.
+    CaptureClipboardImage,
     Char(char),
+    /// A bracketed paste (ADR-0068, P4): the terminal delivered a chunk of text
+    /// as ONE event rather than a burst of `Char`s. The payload is the text to
+    /// insert at the cursor VERBATIM (newlines included) - any `@path` rewrite of
+    /// a dragged/pasted file path already happened at the IO edge (`ui::map_paste`),
+    /// so the pure core only splices the string in. Named (not a `Char` burst) so
+    /// the whole paste pays for one fold and multi-line text lands atomically.
+    Paste(String),
     /// A key the core does not act on (function keys, etc.).
     Other,
     /// A named key that only matters while an Approval modal is open (`y`,
@@ -473,6 +489,18 @@ pub enum Effect {
     /// whether the write reached a TTY so the pure core can set the copy-feedback
     /// hint. The pure core neither encodes nor writes (ADR-0019).
     ClipboardOsc52(String),
+    /// Capture a system-clipboard image into a staged temp file and insert its
+    /// `@<temppath>` At Mention (ADR-0068 P5, the Attachment flow). Emitted by
+    /// [`Key::CaptureClipboardImage`] (Ctrl+V). The adapter checks the clipboard,
+    /// writes the bytes to `<global-temp-dir>/clipboard/clipboard-<ts>-<uuid>.png`
+    /// (via `wl-paste`/`xclip`, OFF the loop - subprocess + fs IO, ADR-0011), and
+    /// posts an [`Event::ClipboardImageReady`](crate::event::Event::ClipboardImageReady)
+    /// carrying the absolute temp path back through `ctx.selector_tx`; the Composer
+    /// splices `@<abs-path> ` into the draft. On no-image / failure the adapter
+    /// posts nothing (a silent no-op) - never blocks, never panics. The pure core
+    /// neither probes the clipboard nor spawns the tools (ADR-0019); it only asks
+    /// for the capture and later folds the mention.
+    CaptureClipboardImage,
 }
 
 /// The pure Screen state (ADR-0034; the renamed fold root of baud's
@@ -992,6 +1020,7 @@ impl Screen {
             Event::SelectorReady { .. }
             | Event::SelectorFailed { .. }
             | Event::FileSearchReady { .. }
+            | Event::ClipboardImageReady { .. }
             | Event::McpDialogReady { .. }
             | Event::McpCopyResult { .. } => (self, vec![]),
         };
@@ -1483,6 +1512,13 @@ impl Screen {
             // scoped) and with no Approval open (the gate above already returned
             // when one was).
             Key::CycleApprovalMode => (self, vec![Effect::Agent(AgentCommand::CycleApprovalMode)]),
+
+            // Ctrl-V (ADR-0068 P5): stage a clipboard image. Fire-through to the
+            // adapter, which does the IO off the loop and posts back a
+            // `ClipboardImageReady` the Composer folds into an `@<temppath>`
+            // mention. The pure core does no IO (ADR-0019); a no-image clipboard
+            // is a silent no-op (the adapter simply posts nothing).
+            Key::CaptureClipboardImage => (self, vec![Effect::CaptureClipboardImage]),
 
             _ => (self, vec![]),
         };

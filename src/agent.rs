@@ -39,7 +39,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::approvals::{ApprovalId, ApprovalMode, Approvals, Decide, Decision, Request};
 use crate::compaction::Compaction;
-use crate::content::{ContentBlock, Provenance};
+use crate::content::{ContentBlock, Provenance, UserPrompt};
 use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::model::Model;
@@ -313,8 +313,8 @@ pub enum RunMsg {
 /// A public API Command (baud's `handle_call`s). Queries carry a `oneshot` reply
 /// (ADR-0017).
 pub enum Command {
-    Submit(String, oneshot::Sender<Result<(), Busy>>),
-    Steer(String, oneshot::Sender<Result<(), Idle>>),
+    Submit(UserPrompt, oneshot::Sender<Result<(), Busy>>),
+    Steer(UserPrompt, oneshot::Sender<Result<(), Idle>>),
     /// Swap the Active Model to a scoped `provider/model-id` (ADR-0033
     /// amendment): resolved against the Session's fixed Provider set, so an
     /// unknown Provider is an `Err` the caller surfaces. Takes effect on the
@@ -524,7 +524,7 @@ impl AgentHandle {
 
     /// Submits a user prompt, starting a Run (baud's `submit/2`). `Err(Busy)`
     /// while a Run runs.
-    pub async fn submit(&self, prompt: impl Into<String>) -> Result<(), Busy> {
+    pub async fn submit(&self, prompt: impl Into<UserPrompt>) -> Result<(), Busy> {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
@@ -538,7 +538,7 @@ impl AgentHandle {
 
     /// Queues Steering for the running Run (baud's `steer/2`). `Err(Idle)` when
     /// no Run is running.
-    pub async fn steer(&self, text: impl Into<String>) -> Result<(), Idle> {
+    pub async fn steer(&self, text: impl Into<UserPrompt>) -> Result<(), Idle> {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
@@ -1107,7 +1107,11 @@ fn handle_command(state: &mut AgentState, cmd: Command) {
 }
 
 // Submit starts a Run when idle; a running Run is Busy (baud's submit guard).
-fn handle_submit(state: &mut AgentState, prompt: String, reply: oneshot::Sender<Result<(), Busy>>) {
+fn handle_submit(
+    state: &mut AgentState,
+    prompt: UserPrompt,
+    reply: oneshot::Sender<Result<(), Busy>>,
+) {
     if state.task.is_some() {
         let _ = reply.send(Err(Busy));
     } else {
@@ -1116,11 +1120,23 @@ fn handle_submit(state: &mut AgentState, prompt: String, reply: oneshot::Sender<
     }
 }
 
-// Steer queues text onto the running Run; no Run is Idle (baud's steer guard).
-fn handle_steer(state: &mut AgentState, text: String, reply: oneshot::Sender<Result<(), Idle>>) {
+// Steer queues the prompt onto the running Run; no Run is Idle (baud's steer
+// guard). Steering is delivered as trailing user-text blocks on the Pass's Tool
+// Result message (ADR-0009), so the queue holds the prompt's text projection
+// (ADR-0068); a mid-Run media prompt (P3) will widen this queue.
+fn handle_steer(
+    state: &mut AgentState,
+    prompt: UserPrompt,
+    reply: oneshot::Sender<Result<(), Idle>>,
+) {
     if state.task.is_some() {
-        state.steering.push(text.clone());
-        broadcast(state, Event::steering_queued(text));
+        // The WIRE steering queue keeps the full text projection (media rides as
+        // its `[image: <mime>]` placeholder on the trailing user-text of the Tool
+        // Result, ADR-0009 - unchanged). The DISPLAY broadcast uses the CLEAN typed
+        // text (BUG 4): the transcript's queued-steering line shows what the user
+        // typed, never the raw `[image: <mime>]` media projection.
+        state.steering.push(prompt.text());
+        broadcast(state, Event::steering_queued(prompt.display_text()));
         let _ = reply.send(Ok(()));
     } else {
         let _ = reply.send(Err(Idle));
@@ -1643,10 +1659,19 @@ fn log_event(state: &mut AgentState, event: &Event) {
 
 // ---- Run start (submit + Rollover) -----------------------------------------
 
-// One Run start for submit and Rollover alike (baud's start_run).
-fn start_run(state: &mut AgentState, prompt: String) {
-    log_entry(state, LogEntry::UserText(prompt.clone()));
-    state.conversation.add_user_text(prompt);
+// One Run start for submit and Rollover alike (baud's start_run). The prompt's
+// blocks enter the Conversation as one user Message (ADR-0068). A pure-text
+// prompt persists as the byte-identical `UserText` Session Log entry; a media
+// prompt persists the full block list as `UserContent`, so Resume rebuilds the
+// same user turn either way.
+fn start_run(state: &mut AgentState, prompt: UserPrompt) {
+    let blocks = prompt.into_blocks();
+    let entry = match blocks.as_slice() {
+        [ContentBlock::Text { text }] => LogEntry::UserText(text.clone()),
+        _ => LogEntry::UserContent(blocks.clone()),
+    };
+    log_entry(state, entry);
+    state.conversation.add_user_content(blocks);
     spawn_run(state);
 }
 
@@ -1802,7 +1827,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     // Rolled-over Steering is the user's voice continuing the same request:
     // start a fresh Run over it.
     match resolution.rollover {
-        Rollover::Submit(prompt) => start_run(state, prompt),
+        Rollover::Submit(prompt) => start_run(state, UserPrompt::from(prompt)),
         Rollover::None => {}
     }
 }

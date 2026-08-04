@@ -7,9 +7,9 @@ use base64::Engine;
 
 use super::params::Window;
 use super::pdf;
-use crate::content::{ResultBlock, unsupported_modality_placeholder};
+use crate::content::{Modalities, ResultBlock, unsupported_modality_placeholder};
+use crate::tool::ToolOutput;
 use crate::tool::path::{FileError, file_error};
-use crate::tool::{ToolCtx, ToolOutput};
 
 /// The base64-after-encoding size guard (qwen's `9.9` MB, margin under 10MB).
 const MAX_BASE64_MB: f64 = 9.9;
@@ -142,9 +142,9 @@ pub(super) fn read_image(
     abs: &std::path::Path,
     path: &str,
     display_name: &str,
-    ctx: &ToolCtx,
+    modalities: Modalities,
 ) -> Result<ToolOutput, String> {
-    if !ctx.input_modalities.image {
+    if !modalities.image {
         return Ok(ToolOutput::text(unsupported_modality_placeholder(
             "image",
             display_name,
@@ -178,9 +178,9 @@ pub(super) async fn read_pdf(
     path: &str,
     display_name: &str,
     pages: Option<&str>,
-    ctx: &ToolCtx,
+    modalities: Modalities,
 ) -> Result<ToolOutput, String> {
-    let native = pages.is_none() && ctx.input_modalities.pdf;
+    let native = pages.is_none() && modalities.pdf;
 
     if native {
         let bytes =

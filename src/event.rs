@@ -320,6 +320,17 @@ pub enum Event {
         query: String,
         suggestions: Vec<FileSuggestion>,
     },
+    /// A clipboard image was staged (ADR-0068 P5, the Attachment flow): the
+    /// adapter captured a system-clipboard image into a temp PNG under the global
+    /// clipboard temp dir and posts the At Mention text to splice into the draft.
+    /// The Composer inserts `mention` at the cursor - it is the ready-to-insert
+    /// form (`@<abs-temp-path> `, trailing space), already relativized/escaped at
+    /// the IO edge (`ui::map_clipboard_mention`), so the pure core only splices.
+    /// Posted ONLY on a successful capture; a no-image / failed capture posts
+    /// nothing (the Ctrl+V is a silent no-op).
+    ClipboardImageReady {
+        mention: String,
+    },
 
     // ---- Background subagents (P4b, ADR-0063) ----
     /// A background subagent settled (or was cancelled) and its
@@ -505,6 +516,12 @@ impl Event {
             generation,
             query: query.into(),
             suggestions,
+        }
+    }
+
+    pub fn clipboard_image_ready(mention: impl Into<String>) -> Self {
+        Event::ClipboardImageReady {
+            mention: mention.into(),
         }
     }
 

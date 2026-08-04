@@ -127,6 +127,14 @@ fn wire_block(block: &ContentBlock) -> Value {
             "is_error": is_error,
             "content": wire_tool_result_content(content),
         }),
+        // First-class user-message media (ADR-0068, At Expansion): the same
+        // `source.base64` shape a media Tool Result uses, built through the
+        // shared [`base64_media`] visitor. The wire-build-time degrade pass
+        // ([`crate::llm::transform`]) has already replaced media the target
+        // Model cannot accept with a Text placeholder, so a block reaching here
+        // is one the Model supports.
+        ContentBlock::Image { mime, data } => base64_media("image", mime, data),
+        ContentBlock::Document { mime, data } => base64_media("document", mime, data),
     }
 }
 

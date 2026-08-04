@@ -164,6 +164,85 @@ fn an_all_unanswered_batch_collapses_to_the_empty_response_marker() {
     );
 }
 
+// ---- user media prompt (ADR-0068) ----
+
+fn image(mime: &str, data: &str) -> ContentBlock {
+    ContentBlock::image(mime, data)
+}
+
+#[test]
+fn user_content_rides_the_wire_as_a_tagged_block_list_and_round_trips() {
+    // A media prompt (ADR-0068) persists as `user_content{blocks}`, the blocks
+    // in their tagged serde shape, and decodes back to the same entry.
+    let entry = Entry::UserContent(vec![text("look at "), image("image/png", "AAAA")]);
+    let value = entry.to_json();
+    assert_eq!(value["e"], "user_content");
+    assert_eq!(
+        value["blocks"],
+        json!([
+            { "type": "text", "text": "look at " },
+            { "type": "image", "mime": "image/png", "data": "AAAA" },
+        ])
+    );
+    assert_eq!(Entry::from_json(&value), Some(entry));
+}
+
+#[test]
+fn a_user_content_prompt_folds_back_into_one_media_user_message() {
+    // Resume must rebuild the media user turn: the block list becomes ONE user
+    // Message, order preserved (the Image survives to reach the model).
+    let (_tmp, session, mut log) = open_log();
+
+    log.append(Entry::UserContent(vec![
+        text("what is in "),
+        image("image/png", "AAAA"),
+    ]));
+    log.append(Entry::assistant_blocks(vec![text("a cat")]));
+    log.append(Entry::Settled {
+        outcome: Settled::Completed,
+        stop_reason: StopReason::EndTurn,
+        reason: None,
+    });
+
+    let (messages, drift) = resume(&log.path, &session).unwrap();
+    assert_eq!(drift, Vec::new());
+    assert_eq!(
+        messages,
+        vec![
+            user_message(vec![text("what is in "), image("image/png", "AAAA")]),
+            Message::assistant(vec![text("a cat")]),
+        ]
+    );
+}
+
+#[test]
+fn an_old_user_text_log_line_still_resumes_as_a_single_text_block() {
+    // Backward compat (ADR-0068): the pre-P2 `user_text` entry is kept readable
+    // and folds into a single Text user message, identical to before - an old
+    // log resumes unchanged alongside the new `user_content` variant.
+    let raw = r#"{"e":"user_text","text":"do the thing"}"#;
+    let entry = Entry::from_json(&decode_line(raw).unwrap()).unwrap();
+    assert_eq!(entry, Entry::UserText("do the thing".into()));
+
+    let (_tmp, session, mut log) = open_log();
+    log.append(Entry::UserText("do the thing".into()));
+    log.append(Entry::assistant_blocks(vec![text("done")]));
+    log.append(Entry::Settled {
+        outcome: Settled::Completed,
+        stop_reason: StopReason::EndTurn,
+        reason: None,
+    });
+
+    let (messages, _) = resume(&log.path, &session).unwrap();
+    assert_eq!(
+        messages,
+        vec![
+            user_message(vec![text("do the thing")]),
+            Message::assistant(vec![text("done")]),
+        ]
+    );
+}
+
 // ---- Plan survives Resume ----
 
 #[test]

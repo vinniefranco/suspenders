@@ -10,7 +10,9 @@
 //! message grows as results land, so message-granular appends would rewrite
 //! history):
 //!
-//!   * `user_text` - submit and Rollover alike
+//!   * `user_text` - submit and Rollover alike, for a pure-text prompt
+//!   * `user_content{blocks}` - a submitted prompt carrying media (ADR-0068);
+//!     a pure-text prompt still logs as `user_text`, byte-identical to before
 //!   * `assistant_blocks{blocks, provider, model}` - each message-end,
 //!     tool_use included, stamped with the producing Model's Provenance
 //!     (ADR-0037); the fold repairs a dangling batch
@@ -118,6 +120,13 @@ impl SettledEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     UserText(String),
+    /// A submitted user prompt's full content-block list (ADR-0068): the
+    /// media-capable sibling of [`Entry::UserText`], written when the prompt
+    /// carries more than a single Text block (an At Expansion image/PDF). A
+    /// pure-text prompt still persists as the byte-identical `UserText`, so an
+    /// old log and a text-only new log read identically. The fold folds this
+    /// into one user [`Message`] over the blocks.
+    UserContent(Vec<ContentBlock>),
     /// One message-end's content blocks, stamped with the Provenance of the
     /// Model that produced them (ADR-0037). `None` decodes from a line
     /// missing the provenance fields: unknown Provenance, which the

@@ -20,6 +20,7 @@ impl Entry {
         use serde_json::json;
         match self {
             Entry::UserText(text) => json!({"e": "user_text", "text": text}),
+            Entry::UserContent(blocks) => json!({"e": "user_content", "blocks": blocks}),
             Entry::Steering(text) => json!({"e": "steering", "text": text}),
             Entry::Plan(text) => json!({"e": "plan", "text": text}),
             Entry::AssistantBlocks { blocks, provenance } => {
@@ -81,6 +82,7 @@ impl Entry {
         let e = m.get("e")?.as_str()?;
         match e {
             "user_text" => Some(Entry::UserText(string_field(m, "text")?)),
+            "user_content" => Some(Entry::UserContent(decode_blocks(m.get("blocks")?)?)),
             "steering" => Some(Entry::Steering(string_field(m, "text")?)),
             "plan" => Some(Entry::Plan(string_field(m, "text")?)),
             "assistant_blocks" => parse_assistant_blocks(m),

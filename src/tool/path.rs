@@ -264,6 +264,16 @@ pub fn resolve_path(path: &str, root: &Path) -> Result<PathBuf, String> {
     resolve_path_in(path, root, None)
 }
 
+/// Lexically normalizes an already-absolute path (`.`/`..` collapse, NO
+/// filesystem touch, symlinks NOT resolved) WITHOUT confining it to any root.
+/// Used by At Expansion (ADR-0068, BUG 1) to honor a user's own absolute `@path`
+/// as-is: an At Mention is USER input, not a model tool call, so the Project-Root
+/// confinement does not apply. Callers that DO need confinement use
+/// [`resolve_path_in`] / [`resolve_absolute_in`] instead.
+pub fn normalize_lexical(path: &Path) -> PathBuf {
+    normalize(path)
+}
+
 /// Why [`resolve_absolute_in`] refused a model-supplied path. Typed - rather
 /// than a single error string - because qwen's tools each phrase the
 /// absolute-path requirement differently (read_file, edit, write_file,

@@ -1192,6 +1192,27 @@ fn a_typed_char_inserts_at_the_cursor_mid_draft() {
     assert_eq!(c.view().cursor, 2);
 }
 
+// Bracketed paste (ADR-0068 P4): with paste ON the whole chunk arrives as ONE
+// `Key::Paste`, spliced into the draft at the cursor. The `@path` rewrite of a
+// dragged file path happens at the IO edge (`ui::map_paste`); here the Composer
+// only inserts the already-final text - the common case must not regress.
+#[test]
+fn a_paste_inserts_its_text_at_the_cursor() {
+    let mut c = with_draft("see  here", 4);
+    press(&mut c, vec![Key::Paste("@shot.png ".to_string())]);
+    assert_eq!(c.view().draft, "see @shot.png  here");
+    // Cursor advances by the pasted char count (10).
+    assert_eq!(c.view().cursor, 14);
+}
+
+#[test]
+fn a_multiline_paste_lands_atomically() {
+    let mut c = with_draft("", 0);
+    press(&mut c, vec![Key::Paste("one\ntwo\nthree".to_string())]);
+    assert_eq!(c.view().draft, "one\ntwo\nthree");
+    assert_eq!(c.view().cursor, 13);
+}
+
 #[test]
 fn backspace_deletes_the_char_before_the_cursor() {
     let mut c = with_draft("hello", 3);

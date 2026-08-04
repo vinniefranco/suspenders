@@ -100,6 +100,19 @@ fn add_user_text_appends_user_message_with_single_text_block() {
 }
 
 #[test]
+fn add_user_content_appends_one_user_message_over_the_block_list() {
+    // The media-capable sibling of add_user_text (ADR-0068): the prompt's
+    // Text/Image/Document blocks enter as ONE user Message, order preserved.
+    let mut conv = Conversation::new("sys", ConversationOpts::new(1000, 0));
+    let blocks = vec![
+        ContentBlock::text("look at "),
+        ContentBlock::image("image/png", "AAAA"),
+    ];
+    conv.add_user_content(blocks.clone());
+    assert_eq!(conv.messages, vec![Message::user(blocks)]);
+}
+
+#[test]
 fn add_assistant_blocks_appends_one_message_with_blocks_as_given() {
     let blocks = vec![
         ContentBlock::text("reading"),

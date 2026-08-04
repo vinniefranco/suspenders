@@ -112,6 +112,11 @@ pub fn wire_tool(spec: &ToolSpec) -> Value {
 pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    // First-class user-message media (ADR-0068, At Expansion): image/document
+    // parts collected here promote the message content from a plain string to
+    // the OpenAI content-parts array. Empty on the common (text-only) path, so
+    // that message still emits a plain-string `content`.
+    let mut media_parts: Vec<Value> = Vec::new();
     for block in &message.content {
         match block {
             ContentBlock::Text { text: t } => text.push_str(t),
@@ -129,6 +134,8 @@ pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
                 // `content` is a `&Vec<ResultBlock>` (ADR-0059).
             })),
             ContentBlock::Thinking { .. } => {}
+            ContentBlock::Image { mime, data } => media_parts.push(image_url_part(mime, data)),
+            ContentBlock::Document { mime, data } => media_parts.push(file_part(mime, data)),
         }
     }
 
@@ -136,21 +143,63 @@ pub fn wire_messages(message: &Message, out: &mut Vec<Value>) {
         Role::User => "user",
         Role::Assistant => "assistant",
     };
+    let has_media = !media_parts.is_empty();
     let mut wire = Map::new();
     wire.insert("role".into(), json!(role));
-    // Content is omitted (not sent empty) when tool_calls carry the message.
-    if !text.is_empty() || tool_calls.is_empty() {
+    if has_media {
+        // Media present: this dialect carries media as content parts, so the
+        // string content is promoted to the parts array (ADR-0068) - a leading
+        // `text` part when any text rides, then each media part in order.
+        wire.insert("content".into(), content_parts(&text, media_parts));
+    } else if !text.is_empty() || tool_calls.is_empty() {
+        // Content is omitted (not sent empty) when tool_calls carry the message.
         wire.insert("content".into(), json!(text));
     }
     if !tool_calls.is_empty() {
         wire.insert("tool_calls".into(), Value::Array(tool_calls));
     }
     // An assistant message always emits - its text and tool_calls are one
-    // wire unit. A user message emits only when text remains: its Tool
+    // wire unit. A user message emits only when text OR media remains: its Tool
     // Results have already fanned out as role:"tool" messages above.
-    if message.role == Role::Assistant || !text.is_empty() {
+    if message.role == Role::Assistant || !text.is_empty() || has_media {
         out.push(Value::Object(wire));
     }
+}
+
+/// The OpenAI content-parts array (ADR-0068): a leading `text` part when text
+/// rides, then the media parts in order. The shape a message takes once it
+/// carries first-class user media.
+fn content_parts(text: &str, media_parts: Vec<Value>) -> Value {
+    let mut parts = Vec::with_capacity(media_parts.len() + 1);
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    parts.extend(media_parts);
+    Value::Array(parts)
+}
+
+/// One image content part (ADR-0068): qwen's openai converter emits an image as
+/// `{type:"image_url", image_url:{url:"data:<mime>;base64,<data>"}}`
+/// (`converter.ts` `createMediaContentPart`), matched verbatim here.
+fn image_url_part(mime: &str, data: &str) -> Value {
+    json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:{mime};base64,{data}") },
+    })
+}
+
+/// One document (PDF) content part (ADR-0068): qwen's openai converter emits a
+/// PDF as `{type:"file", file:{filename, file_data:"data:<mime>;base64,<data>"}}`
+/// (`converter.ts` `createMediaContentPart`), matched here. The wire has no
+/// source filename, so the mime stands in as the display filename.
+fn file_part(mime: &str, data: &str) -> Value {
+    json!({
+        "type": "file",
+        "file": {
+            "filename": mime,
+            "file_data": format!("data:{mime};base64,{data}"),
+        },
+    })
 }
 
 // The tool message's content: this dialect carries no media on a `role:"tool"`

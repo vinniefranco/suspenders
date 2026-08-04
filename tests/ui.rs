@@ -155,6 +155,48 @@ fn wheel_maps_to_wheel_keys_other_mouse_kinds_are_ignored() {
     assert_eq!(map_mouse(&mouse(MouseEventKind::Moved)), None);
 }
 
+// Bracketed paste (ADR-0068 P4): the adapter edge rewrites a dragged/pasted
+// valid file path to `@<path> ` (the IO existence check lives here, not in the
+// pure core), and carries every other paste verbatim - both as one `Key::Paste`.
+
+#[test]
+fn paste_of_a_dragged_image_path_maps_to_an_at_mention() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("shot.png"), b"x").unwrap();
+    let abs = dir.path().join("shot.png");
+    // A dragged image drops its absolute path; inside the project root it becomes
+    // the root-relative `@shot.png ` (with qwen's trailing space) that At
+    // Expansion resolves into an Image block at submit.
+    assert_eq!(
+        map_paste(abs.to_string_lossy().into_owned(), dir.path()),
+        Key::Paste("@shot.png ".to_string())
+    );
+}
+
+#[test]
+fn paste_of_ordinary_text_is_carried_verbatim() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Prose is not a path: the payload is inserted literally (no rewrite).
+    let text = "just some pasted prose".to_string();
+    assert_eq!(map_paste(text.clone(), dir.path()), Key::Paste(text));
+}
+
+#[test]
+fn paste_of_multiline_text_is_carried_verbatim() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // A multi-line paste is never inferred as a single dropped path.
+    let text = "line one\nline two".to_string();
+    assert_eq!(map_paste(text.clone(), dir.path()), Key::Paste(text));
+}
+
+#[test]
+fn paste_of_a_nonexistent_path_is_carried_verbatim() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let abs = dir.path().join("nope.png");
+    let text = abs.to_string_lossy().into_owned();
+    assert_eq!(map_paste(text.clone(), dir.path()), Key::Paste(text));
+}
+
 // next_if_ready must return without suspending in ALL three stream states -
 // a ready item, an ended stream, and (the one that matters) a stream with
 // nothing buffered. Suspending on the empty case would stall the input
@@ -542,6 +584,8 @@ fn adapter_ctx(agent: &AgentHandle) -> AdapterCtx<'_> {
         selector_tx,
         root: std::path::PathBuf::from("/nonexistent/root"),
         walk_cache: file_search::WalkCache::new(),
+        global_temp_dir: std::path::PathBuf::from("/nonexistent/tmp"),
+        clipboard_temp_dir: std::path::PathBuf::from("/nonexistent/tmp/clipboard"),
     }
 }
 
@@ -853,6 +897,8 @@ async fn run_effect_theme_command_posts_the_rows_through_the_selector_channel() 
         selector_tx,
         root: std::path::PathBuf::from("/nonexistent/root"),
         walk_cache: file_search::WalkCache::new(),
+        global_temp_dir: std::path::PathBuf::from("/nonexistent/tmp"),
+        clipboard_temp_dir: std::path::PathBuf::from("/nonexistent/tmp/clipboard"),
     };
 
     let _ = run_effect(
@@ -897,6 +943,8 @@ async fn run_effect_theme_choice_swaps_the_active_theme_and_persists_it() {
         selector_tx,
         root: std::path::PathBuf::from("/nonexistent/root"),
         walk_cache: file_search::WalkCache::new(),
+        global_temp_dir: std::path::PathBuf::from("/nonexistent/tmp"),
+        clipboard_temp_dir: std::path::PathBuf::from("/nonexistent/tmp/clipboard"),
     };
     let mut state = test_state();
 
@@ -939,6 +987,8 @@ async fn run_effect_re_choosing_the_current_theme_is_a_silent_no_op() {
         selector_tx,
         root: std::path::PathBuf::from("/nonexistent/root"),
         walk_cache: file_search::WalkCache::new(),
+        global_temp_dir: std::path::PathBuf::from("/nonexistent/tmp"),
+        clipboard_temp_dir: std::path::PathBuf::from("/nonexistent/tmp/clipboard"),
     };
     let mut state = test_state();
 
@@ -980,6 +1030,8 @@ async fn run_effect_theme_choice_of_a_file_broken_after_open_refuses_and_persist
         selector_tx,
         root: std::path::PathBuf::from("/nonexistent/root"),
         walk_cache: file_search::WalkCache::new(),
+        global_temp_dir: std::path::PathBuf::from("/nonexistent/tmp"),
+        clipboard_temp_dir: std::path::PathBuf::from("/nonexistent/tmp/clipboard"),
     };
 
     // A valid theme at open time, broken before the pick lands: Enter
@@ -1327,4 +1379,29 @@ fn notification_bytes_render_the_expected_sequences() {
         notification_bytes(NotifyKind::BelOnly, "Suspenders", "hi"),
         "\x07"
     );
+}
+
+// ---- At Expansion read display (ADR-0068) ----------------------------------
+
+// The read display renders honest info lines (a Read File / Read Directory line,
+// a skip line with the reason, an error line) - never a fabricated Tool Call.
+#[test]
+fn read_display_lines_render_reads_skips_and_errors() {
+    use crate::tools::at_expansion::{IgnoreReason, ReadDisplay, Skip};
+    let display = ReadDisplay {
+        read: vec![("shot.png".into(), false), ("src".into(), true)],
+        skipped: vec![
+            ("secret.txt".into(), Skip::Ignored(IgnoreReason::Git)),
+            ("gone.txt".into(), Skip::NotFound),
+            ("/etc/hosts".into(), Skip::OutsideWorkspace),
+        ],
+        errors: vec![("bad.bin".into(), "read error".into())],
+    };
+    let lines = read_display_lines(&display);
+    assert_eq!(lines[0], "Read file shot.png");
+    assert_eq!(lines[1], "Read directory src");
+    assert_eq!(lines[2], "Skipped @secret.txt (git-ignored)");
+    assert_eq!(lines[3], "Skipped @gone.txt (not found)");
+    assert_eq!(lines[4], "Skipped @/etc/hosts (outside project root)");
+    assert_eq!(lines[5], "Failed to read bad.bin: read error");
 }

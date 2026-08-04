@@ -1291,6 +1291,19 @@ impl Composer {
                 self.cursor += 1;
                 consumed(vec![])
             }
+            // Bracketed paste (ADR-0068 P4, qwen text-buffer's `insert(ch, {paste})`):
+            // with bracketed paste ON the terminal delivers a whole chunk (ordinary
+            // text OR a dragged/pasted file path) as ONE event. `text` is already
+            // final - the `@path` rewrite of a valid dragged path happened at the IO
+            // edge (`ui::map_paste`), so here the Composer only splices it in at the
+            // cursor, newlines included. The AT re-detection wrapping `handle_key`
+            // then re-derives any `@` completion context from the post-paste draft.
+            Key::Paste(text) => {
+                let count = text.chars().count();
+                self.value = insert_str(&self.value, self.cursor, &text);
+                self.cursor += count;
+                consumed(vec![])
+            }
             Key::Backspace => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -1362,6 +1375,21 @@ impl Composer {
                 suggestions,
             } => {
                 self.fill_file_search(generation, query, suggestions);
+                EventOutcome::Consumed(vec![])
+            }
+            // A staged clipboard image's At Mention (ADR-0068 P5, the Attachment
+            // flow): the adapter captured the image off the loop and posts the
+            // ready-to-insert `@<temppath> ` text (trailing space). Splice it into
+            // the draft at the cursor exactly like a bracketed paste
+            // (`Key::Paste`) - the mention is already final (the absolute temp
+            // path, resolved at submit via the temp-dir confinement exception), so
+            // the Composer only inserts. The trailing space leaves the cursor
+            // OUTSIDE any AT context, so close any open `@` picker (the same tidy
+            // the cursor-left-AT path does), keeping the popup consistent.
+            Event::ClipboardImageReady { mention } => {
+                self.value = insert_str(&self.value, self.cursor, &mention);
+                self.cursor += mention.chars().count();
+                self.at_files.close();
                 EventOutcome::Consumed(vec![])
             }
             // The `/mcp` dialog fills (ADR-0065 Phase E), the McpDialog analog of
@@ -1739,7 +1767,7 @@ const NOW_UNUSED: Millis = 0;
 // Whether `key` inserts or removes draft TEXT (so a `Frozen` theme dialog can
 // swallow it while still letting Backspace-out and cursor moves through).
 fn is_text_edit(key: &Key) -> bool {
-    matches!(key, Key::Char(_) | Key::InsertNewline)
+    matches!(key, Key::Char(_) | Key::InsertNewline | Key::Paste(_))
 }
 
 // -- AT file completion detection (Phase C2, qwen `useCommandCompletion`) --
@@ -1926,6 +1954,15 @@ fn active_label_is_long(suggestions: &[Suggestion], active: usize) -> bool {
 fn insert_char(value: &str, cursor: usize, c: char) -> String {
     let mut out = value.to_string();
     out.insert(draft::byte_of(value, cursor), c);
+    out
+}
+
+/// `value` with `text` spliced in at char index `cursor` (the multi-char analog
+/// of [`insert_char`], for a bracketed paste - ADR-0068 P4). One insert, not a
+/// char loop, so a multi-line paste lands atomically.
+fn insert_str(value: &str, cursor: usize, text: &str) -> String {
+    let mut out = value.to_string();
+    out.insert_str(draft::byte_of(value, cursor), text);
     out
 }
 

@@ -80,12 +80,17 @@ fn list_entry(dir: &str, name: &str) -> Option<SessionEntry> {
     })
 }
 
-// The first user_text entry's text as a one-line label; "(empty session)" when
-// the log holds none. A torn line stops the scan, like resume's fold.
+// The first user prompt's text as a one-line label; "(empty session)" when
+// the log holds none. A torn line stops the scan, like resume's fold. A media
+// prompt (`user_content`, ADR-0068) labels off its text projection - the Text
+// blocks with each media block as its `[image: …]` placeholder.
 fn first_user_label<'a>(lines: impl Iterator<Item = &'a str>) -> String {
     for line in lines {
         match codec::decode_line(line).and_then(|v| Entry::from_json(&v)) {
             Some(Entry::UserText(text)) => return label_from(&text),
+            Some(Entry::UserContent(blocks)) => {
+                return label_from(&crate::content::UserPrompt::from_blocks(blocks).text());
+            }
             Some(_) => continue,
             None => break,
         }

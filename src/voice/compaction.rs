@@ -144,7 +144,12 @@ fn serialize_message(message: &Message) -> String {
                     let text = crate::content::result_blocks_text(content);
                     Some(format!("{label}: {}", truncate_for_serialization(&text)))
                 }
-                _ => None,
+                // First-class user media (ADR-0068): summarize its short
+                // `[image: mime]`/`[document: mime]` placeholder, not the
+                // multi-MB base64 - the summary reasons over what was attached.
+                other => other
+                    .media_placeholder()
+                    .map(|placeholder| format!("User: {placeholder}")),
             })
             .collect(),
         Role::Assistant => message
