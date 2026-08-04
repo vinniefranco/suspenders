@@ -36,6 +36,7 @@ mod media;
 mod notebook;
 mod params;
 mod pdf;
+pub(crate) mod reader;
 
 use detect::FileType;
 
@@ -141,34 +142,23 @@ impl Tool for ReadFile {
             return Ok(out);
         }
 
-        // Each branch produces its output and whether the read was FULL (the
-        // whole current content, not windowed or internally truncated). After a
-        // successful read we record into the Run's read cache (F6, ADR-0060):
-        // `cacheable` is whether the result is a single Text block (a media /
-        // native-PDF block is not text-cacheable), `full` is per-branch.
-        let (output, full) = match file_type {
-            FileType::Text => {
-                let (text, truncated) = media::read_from(&abs, &path, window)?;
-                (ToolOutput::text(text), window.is_full() && !truncated)
-            }
-            FileType::Svg => (
-                ToolOutput::text(media::read_svg(&abs, &path, &display_name)?),
-                true,
-            ),
-            FileType::Notebook => {
-                let raw = media::read_text(&abs, &path)?;
-                let read = notebook::read_with_meta(&raw)?;
-                // A notebook whose rendered cell listing was truncated is NOT a
-                // full read: notebook_edit refuses to cell-edit it (qwen's
-                // `lastReadWasFull = !isTruncated`).
-                (ToolOutput::text(read.content), !read.is_truncated)
-            }
-            FileType::Image => (media::read_image(&abs, &path, &display_name, ctx)?, true),
-            FileType::Pdf => (
-                media::read_pdf(&abs, &path, &display_name, pages.as_deref(), ctx).await?,
-                true,
-            ),
-        };
+        // The per-kind reader switch is shared with read_many_files (ADR-0068):
+        // it produces the output and whether the read was FULL (the whole current
+        // content, not windowed or internally truncated), gating media on the
+        // captured Model's modalities. After a successful read we record into the
+        // Run's read cache (F6, ADR-0060): `cacheable` is whether the result is a
+        // single Text block (a media / native-PDF block is not text-cacheable),
+        // `full` is per-branch (read_many_files ignores it - it holds no cache).
+        let (output, full) = reader::read_blocks(
+            file_type,
+            &abs,
+            &path,
+            &display_name,
+            window,
+            pages.as_deref(),
+            ctx.input_modalities,
+        )
+        .await?;
 
         let cacheable = cache::is_single_text_block(&output);
         cache::record_read(ctx, &abs, full, cacheable);

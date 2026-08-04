@@ -100,6 +100,15 @@ impl Conversation {
         self
     }
 
+    /// Appends the user's prompt as a user message over its content-block list
+    /// (ADR-0068): the media-capable sibling of [`Conversation::add_user_text`],
+    /// carrying the Text/Image/Document blocks a submit or Steer brought from the
+    /// Composer. A pure-text prompt is exactly `add_user_text`.
+    pub fn add_user_content(&mut self, blocks: Vec<ContentBlock>) -> &mut Self {
+        self.messages.push(Message::user(blocks));
+        self
+    }
+
     /// Appends Voice-authored blocks (closing markers) as one assistant
     /// message, unknown Provenance. Response content goes through
     /// [`Conversation::add_assistant_response`] instead.
@@ -415,6 +424,13 @@ fn block_chars(block: &ContentBlock) -> usize {
                     .count()
         }
         ContentBlock::Thinking { .. } => 0,
+        // First-class user media (ADR-0068): the real wire payload is the
+        // multi-MB base64 `data`, so count its length - counting the short
+        // `[image: mime]` projection would wildly under-estimate context, the
+        // same reasoning [`result_block_chars`] applies to Tool Result media.
+        ContentBlock::Image { data, .. } | ContentBlock::Document { data, .. } => {
+            data.chars().count()
+        }
     }
 }
 

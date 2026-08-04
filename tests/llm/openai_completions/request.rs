@@ -308,3 +308,66 @@ fn no_think_carries_kwargs_false_byte_identical_to_absent() {
             .is_none()
     );
 }
+
+#[test]
+fn user_image_promotes_content_to_the_image_url_parts_array() {
+    // First-class user media (ADR-0068): an Image block promotes the message
+    // content from a plain string to the content-parts array, matching qwen's
+    // openai converter shape `{type:"image_url", image_url:{url:"data:..."}}`.
+    let mut out = Vec::new();
+    wire_messages(
+        &Message::user(vec![
+            ContentBlock::text("look"),
+            ContentBlock::image("image/png", "AAAA"),
+        ]),
+        &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0],
+        json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "look" },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,AAAA" }
+                }
+            ]
+        })
+    );
+}
+
+#[test]
+fn user_document_promotes_content_to_the_file_parts_array() {
+    // A PDF matches qwen's `{type:"file", file:{filename, file_data:"data:..."}}`
+    // shape; with no text riding, the parts array holds only the file part.
+    let mut out = Vec::new();
+    wire_messages(
+        &Message::user(vec![ContentBlock::document("application/pdf", "BBBB")]),
+        &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0],
+        json!({
+            "role": "user",
+            "content": [{
+                "type": "file",
+                "file": {
+                    "filename": "application/pdf",
+                    "file_data": "data:application/pdf;base64,BBBB"
+                }
+            }]
+        })
+    );
+}
+
+#[test]
+fn a_text_only_user_message_still_emits_a_plain_string_content() {
+    // No media: the common path is unchanged - content stays a plain string,
+    // not the parts array.
+    let mut out = Vec::new();
+    wire_messages(&Message::user(vec![ContentBlock::text("hi")]), &mut out);
+    assert_eq!(out[0], json!({ "role": "user", "content": "hi" }));
+}

@@ -61,10 +61,19 @@ pub fn normalize_request(request: &LlmRequest, target: &Model) -> LlmRequest {
 
 /// The media-degrade pass (ADR-0059): replaces every Tool Result media block the
 /// target Model cannot accept with the VERBATIM unsupported-modality placeholder
-/// (a Text block). The cross-Model-history safety net - a request may carry media
-/// a previous, capable Model produced, so this fires at wire-build time for the
-/// Model actually receiving the request. A Model that supports the modality keeps
-/// its media untouched. Pure; runs after [`normalize_request`] in the Dispatcher.
+/// (a Text block). This is the cross-Model-history safety net for AUTONOMOUS Tool
+/// Result media (a `read_file` that produced an image on a prior capable Model):
+/// a request may carry media a previous, capable Model produced, so this fires at
+/// wire-build time for the Model actually receiving the request.
+///
+/// First-class USER-message media (At Expansion's `Image`/`Document` blocks,
+/// ADR-0068) is DELIBERATELY NOT degraded here: the user EXPLICITLY attached that
+/// image, so their intent is authoritative and the media rides to the wire
+/// unconditionally - the model/API answers honestly rather than the client
+/// preemptively stripping the attachment and lying "this model does not support
+/// image input". Only autonomous Tool Result media degrades. A Model that
+/// supports the modality keeps its Tool Result media untouched too. Pure; runs
+/// after [`normalize_request`] in the Dispatcher.
 pub fn degrade_unsupported_media(mut request: LlmRequest, model: &Model) -> LlmRequest {
     for message in &mut request.messages {
         for block in &mut message.content {

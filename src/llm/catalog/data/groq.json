@@ -13,6 +13,10 @@
       "context_window": 131072,
       "max_tokens": 131072,
       "reasoning": false,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.05,
         "output": 0.08
@@ -24,6 +28,10 @@
       "context_window": 131072,
       "max_tokens": 32768,
       "reasoning": false,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.59,
         "output": 0.79
@@ -35,6 +43,10 @@
       "context_window": 131072,
       "max_tokens": 8192,
       "reasoning": false,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 0.11,
         "output": 0.34
@@ -46,6 +58,10 @@
       "context_window": 131072,
       "max_tokens": 65536,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.15,
         "output": 0.6,
@@ -58,6 +74,10 @@
       "context_window": 131072,
       "max_tokens": 65536,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.075,
         "output": 0.3,
@@ -70,6 +90,10 @@
       "context_window": 131072,
       "max_tokens": 65536,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.075,
         "output": 0.3
@@ -81,6 +105,10 @@
       "context_window": 131072,
       "max_tokens": 40960,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.29,
         "output": 0.59

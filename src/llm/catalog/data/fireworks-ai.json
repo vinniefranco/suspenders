@@ -13,6 +13,26 @@
       "context_window": 1000000,
       "max_tokens": 384000,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
+      "cost": {
+        "input": 0.14,
+        "output": 0.28,
+        "cache_read": 0.028
+      }
+    },
+    {
+      "id": "accounts/fireworks/models/deepseek-v4-flash-0731",
+      "name": "DeepSeek V4 Flash 0731",
+      "context_window": 1000000,
+      "max_tokens": 384000,
+      "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.14,
         "output": 0.28,
@@ -25,22 +45,14 @@
       "context_window": 1000000,
       "max_tokens": 384000,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 1.74,
         "output": 3.48,
         "cache_read": 0.145
-      }
-    },
-    {
-      "id": "accounts/fireworks/models/glm-5p1",
-      "name": "GLM 5.1",
-      "context_window": 202800,
-      "max_tokens": 131072,
-      "reasoning": true,
-      "cost": {
-        "input": 1.4,
-        "output": 4.4,
-        "cache_read": 0.26
       }
     },
     {
@@ -49,6 +61,10 @@
       "context_window": 1048575,
       "max_tokens": 131072,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 1.4,
         "output": 4.4,
@@ -61,6 +77,10 @@
       "context_window": 131072,
       "max_tokens": 32768,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.15,
         "output": 0.6,
@@ -73,6 +93,10 @@
       "context_window": 131072,
       "max_tokens": 32768,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.07,
         "output": 0.3,
@@ -85,6 +109,10 @@
       "context_window": 262000,
       "max_tokens": 262000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 0.95,
         "output": 4.0,
@@ -97,10 +125,30 @@
       "context_window": 262000,
       "max_tokens": 262000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 0.95,
         "output": 4.0,
         "cache_read": 0.19
+      }
+    },
+    {
+      "id": "accounts/fireworks/models/kimi-k3",
+      "name": "Kimi K3",
+      "context_window": 1048576,
+      "max_tokens": 131072,
+      "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
+      "cost": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.3
       }
     },
     {
@@ -109,6 +157,10 @@
       "context_window": 196608,
       "max_tokens": 196608,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.3,
         "output": 1.2,
@@ -121,6 +173,10 @@
       "context_window": 512000,
       "max_tokens": 512000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 0.3,
         "output": 1.2,
@@ -133,22 +189,14 @@
       "context_window": 262144,
       "max_tokens": 65536,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 0.4,
         "output": 1.6,
         "cache_read": 0.08
-      }
-    },
-    {
-      "id": "accounts/fireworks/routers/glm-5p1-fast",
-      "name": "GLM 5.1 Fast",
-      "context_window": 202800,
-      "max_tokens": 131072,
-      "reasoning": true,
-      "cost": {
-        "input": 2.8,
-        "output": 8.8,
-        "cache_read": 0.52
       }
     },
     {
@@ -157,6 +205,10 @@
       "context_window": 1048575,
       "max_tokens": 131072,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 2.1,
         "output": 6.6,
@@ -169,6 +221,10 @@
       "context_window": 262000,
       "max_tokens": 262000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 2.0,
         "output": 8.0,
@@ -181,6 +237,10 @@
       "context_window": 262000,
       "max_tokens": 262000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 2.0,
         "output": 8.0,
@@ -193,10 +253,30 @@
       "context_window": 262000,
       "max_tokens": 262000,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 1.9,
         "output": 8.0,
         "cache_read": 0.38
+      }
+    },
+    {
+      "id": "accounts/fireworks/routers/kimi-k3-fast",
+      "name": "Kimi K3 Fast",
+      "context_window": 1048576,
+      "max_tokens": 131072,
+      "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
+      "cost": {
+        "input": 4.5,
+        "output": 22.5,
+        "cache_read": 0.45
       }
     }
   ]

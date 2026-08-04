@@ -103,11 +103,20 @@ pub struct Modalities {
 
 /// A content block. `#[serde(tag = "type")]` mirrors baud's `:type`
 /// discriminator; `rename_all = "snake_case"` matches the atom names
-/// (`text`, `tool_use`, `tool_result`, `thinking`).
+/// (`text`, `tool_use`, `tool_result`, `thinking`, `image`, `document`).
 ///
 /// A Tool Result's `content` is a [`ResultBlock`] list (ADR-0059): the common
 /// case is a single Text block, media reaches the wire when the Model supports
 /// it. Read its text projection through [`result_blocks_text`].
+///
+/// `Image`/`Document` are first-class USER-message media (ADR-0068, At
+/// Expansion): a `@path` mention that resolves to an image or PDF becomes one of
+/// these base64 blocks on the user turn, emitted directly by both wire adapters
+/// (Anthropic `image`/`document` `source.base64`; OpenAI `image_url`/`file`
+/// data-URL) - never a synthesized Tool Call and never a fabricated Tool Result.
+/// The wire-build-time degrade pass ([`crate::llm::transform`], ADR-0059)
+/// replaces media a captured Model cannot accept with the unsupported-modality
+/// placeholder, so At Expansion emits media unconditionally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -126,6 +135,14 @@ pub enum ContentBlock {
     },
     Thinking {
         text: String,
+    },
+    Image {
+        mime: String,
+        data: String,
+    },
+    Document {
+        mime: String,
+        data: String,
     },
 }
 
@@ -176,11 +193,45 @@ impl ContentBlock {
         }
     }
 
+    /// A first-class user-message image block (ADR-0068): base64 `data` of the
+    /// given `mime`. The image path of At Expansion.
+    pub fn image(mime: impl Into<String>, data: impl Into<String>) -> Self {
+        ContentBlock::Image {
+            mime: mime.into(),
+            data: data.into(),
+        }
+    }
+
+    /// A first-class user-message document (PDF) block (ADR-0068): base64 `data`
+    /// of the given `mime`. The document path of At Expansion.
+    pub fn document(mime: impl Into<String>, data: impl Into<String>) -> Self {
+        ContentBlock::Document {
+            mime: mime.into(),
+            data: data.into(),
+        }
+    }
+
     /// Is this block a Tool Call (`tool_use`)? A property of the content
     /// itself - shared by the Run loop's dispatch and the loop-detector's
     /// tool-signature.
     pub fn is_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ToolUse { .. })
+    }
+
+    /// The short text projection of a media block (ADR-0068, ADR-0059): an
+    /// [`ContentBlock::Image`] renders as `[image: <mime>]` and a
+    /// [`ContentBlock::Document`] as `[document: <mime>]`, mirroring the
+    /// [`result_blocks_text`] convention exactly. `None` for every non-media
+    /// block, so a text-projection `filter_map` reads a media block as its
+    /// placeholder without special-casing each call site. Text/ToolUse/
+    /// ToolResult/Thinking each carry their own projection rule where they are
+    /// projected and are not this helper's concern.
+    pub fn media_placeholder(&self) -> Option<String> {
+        match self {
+            ContentBlock::Image { mime, .. } => Some(format!("[image: {mime}]")),
+            ContentBlock::Document { mime, .. } => Some(format!("[document: {mime}]")),
+            _ => None,
+        }
     }
 }
 
@@ -253,6 +304,97 @@ impl Message {
             content,
             provenance: Some(provenance),
         }
+    }
+}
+
+/// A submitted user prompt (ADR-0068): the ordered content-block list a submit
+/// or Steer carries from the Composer to the Conversation. Text-only today (a
+/// single [`ContentBlock::Text`]); At Expansion (P3) fills it with the
+/// `Image`/`Document` blocks a `@path` mention resolves to. Restricted in
+/// spirit to user content - Text/Image/Document - so a Tool Call or Tool Result
+/// never rides a prompt.
+///
+/// [`From<String>`]/[`From<&str>`] wrap a bare string as a single Text block, so
+/// existing ergonomic call sites (`agent.submit("foo")`, the Composer's draft)
+/// widen the pipe unchanged. [`UserPrompt::text`] is the projection the places
+/// that still need a display string read: the transcript user line, the history
+/// ring, and the `user_prompt_submit` hook (`&str`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserPrompt {
+    blocks: Vec<ContentBlock>,
+}
+
+impl UserPrompt {
+    /// A prompt over an explicit block list - the At Expansion path (P3), where
+    /// a `@path` mention has produced text + media blocks.
+    pub fn from_blocks(blocks: Vec<ContentBlock>) -> Self {
+        UserPrompt { blocks }
+    }
+
+    /// The prompt's content blocks, consumed as they enter the Conversation as
+    /// a user [`Message`].
+    pub fn into_blocks(self) -> Vec<ContentBlock> {
+        self.blocks
+    }
+
+    /// The prompt's content blocks, borrowed.
+    pub fn blocks(&self) -> &[ContentBlock] {
+        &self.blocks
+    }
+
+    /// The text projection (ADR-0068): Text blocks concatenated, each media
+    /// block rendered as its `[image: <mime>]` / `[document: <mime>]`
+    /// placeholder (the [`ContentBlock::media_placeholder`] convention). The one
+    /// display-string read - the transcript user line, the history ring, and the
+    /// `user_prompt_submit` hook. A pure-text prompt projects to exactly its
+    /// text, so a text-only submit is byte-identical to today.
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                other => other.media_placeholder(),
+            })
+            .collect()
+    }
+
+    /// The USER-FACING display text (ADR-0068, BUG 4): the Text blocks
+    /// concatenated, with media blocks OMITTED entirely (no `[image: <mime>]`
+    /// placeholder). This is the text the user actually typed - the `@path`
+    /// mention residual - so a transcript / steering line shows clean typed text,
+    /// not the wire media projection [`UserPrompt::text`] leaks. A pure-text prompt
+    /// is byte-identical to [`UserPrompt::text`]; the two diverge only when media
+    /// is present, where display drops it and the wire projection keeps a
+    /// `[image: <mime>]` marker.
+    pub fn display_text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Is this a plain single-Text prompt (no media)? The text-only case the
+    /// Session Log persists as the byte-identical `user_text` entry; a media
+    /// prompt persists the full block list instead.
+    pub fn is_plain_text(&self) -> bool {
+        matches!(self.blocks.as_slice(), [ContentBlock::Text { .. }])
+    }
+}
+
+impl From<String> for UserPrompt {
+    fn from(text: String) -> Self {
+        UserPrompt {
+            blocks: vec![ContentBlock::Text { text }],
+        }
+    }
+}
+
+impl From<&str> for UserPrompt {
+    fn from(text: &str) -> Self {
+        UserPrompt::from(text.to_string())
     }
 }
 

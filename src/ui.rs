@@ -34,8 +34,9 @@ pub mod theme_command;
 pub mod transcript;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
 };
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
@@ -44,6 +45,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::agent::AgentHandle;
 use crate::approvals::Decision as AgentDecision;
+use crate::content::UserPrompt;
 use crate::event::Event;
 use crate::session::log::SessionEntry;
 use crate::session::{Session, default_config_path};
@@ -89,14 +91,24 @@ pub async fn run(
     // manual raw-mode/hook plumbing is needed. Mouse capture is enabled like the
     // picker (best-effort: no mouse still means a working UI).
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Mouse capture AND bracketed paste (ADR-0068 P4) are enabled together and
+    // best-effort, exactly like the picker: bracketed paste is what makes a
+    // dragged image work - the terminal delivers a file drop as a pasted (often
+    // quoted/escaped) path, `Event::Paste`, not a mouse event.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
 
     let result = run_loop(&mut terminal, agent, session, launch_notices, themes).await;
 
-    // Teardown: release mouse capture and restore the terminal (leave the
-    // alt-screen + raw mode). The panic hook `ratatui::init` set covers the
-    // abnormal path; this covers the normal and `?`-propagated ones.
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    // Teardown: release mouse capture + bracketed paste and restore the terminal
+    // (leave the alt-screen + raw mode). The panic hook `ratatui::init` set covers
+    // the abnormal path; this covers the normal and `?`-propagated ones. Both
+    // modes are disabled in the same execute! the enable used, so raw-mode
+    // restoration stays correct on every exit path.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -115,9 +127,17 @@ pub async fn pick_session(
 ) -> anyhow::Result<PickerOutcome> {
     let mut terminal = ratatui::init();
     // Best-effort, like `run`: no mouse support still means a working picker.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Bracketed paste is enabled here too (ADR-0068 P4) purely to keep the
+    // enable/disable SYMMETRIC with `run` across every terminal-owning site - the
+    // picker itself ignores a paste event, but disabling a mode that was never
+    // enabled (or leaving one enabled) must never happen on any exit path.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = pick_loop(&mut terminal, EventStream::new(), entries, theme).await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -188,6 +208,19 @@ pub(crate) struct AdapterCtx<'a> {
     /// A short-TTL cache of the walked project tree (Phase C2), shared across the
     /// spawned `@path` search tasks so a keystroke burst walks the tree once.
     pub(crate) walk_cache: file_search::WalkCache,
+    /// The global temp dir (ADR-0068 P5; `<data-base>/tmp`): the base
+    /// `save_clipboard_image` joins `clipboard/` ONTO (qwen's `saveClipboardImage`
+    /// joins `clipboard` onto the global temp dir). Handed to each spawned
+    /// clipboard-capture task. Kept SEPARATE from [`Self::clipboard_temp_dir`] so
+    /// the staging join happens exactly once (BUG 3: passing the already-joined
+    /// `<global>/clipboard` here produced a doubled `clipboard/clipboard/`).
+    pub(crate) global_temp_dir: std::path::PathBuf,
+    /// The clipboard Attachment landing dir (ADR-0068 P5;
+    /// `<global-temp-dir>/clipboard`): the dir a staged image actually lands in,
+    /// and the dir the At-Expansion confinement exception admits so the staged
+    /// temp file's `@path` resolves at submit. Resolved once at launch (the pure
+    /// core stays IO-free, ADR-0019); handed to `at_expand`.
+    pub(crate) clipboard_temp_dir: std::path::PathBuf,
 }
 
 /// The adapter-side MUTABLE state the [`Effect`] handlers act on - the
@@ -262,6 +295,12 @@ async fn run_loop(
         // The `@path` file search walks the Session's project root (Phase C2).
         root: std::path::PathBuf::from(&session.root),
         walk_cache: file_search::WalkCache::new(),
+        // The clipboard staging dirs (ADR-0068 P5), resolved once at launch off
+        // the same XDG data base the Session Logs / memory store use. The GLOBAL
+        // temp dir is the base `save_clipboard_image` joins `clipboard/` onto; the
+        // landing dir (`<global>/clipboard`) is what the confinement admits.
+        global_temp_dir: std::path::PathBuf::from(crate::session::default_global_temp_dir()),
+        clipboard_temp_dir: std::path::PathBuf::from(crate::session::default_clipboard_temp_dir()),
     };
 
     // Persistent prompt history (up/down recall ACROSS Sessions). The store
@@ -453,6 +492,28 @@ async fn run_loop(
                                     .await?,
                                 );
                             }
+                            dirty = true;
+                        }
+                        // Bracketed paste (ADR-0068 P4): the terminal delivered a
+                        // whole chunk as ONE event. A dragged/pasted valid file path
+                        // is rewritten to `@<path> ` here at the IO edge (the exists
+                        // check is `std::fs`, kept out of the pure core, ADR-0019);
+                        // any other paste inserts VERBATIM. Either way it folds as a
+                        // single `Key::Paste`, so a multi-line paste lands atomically.
+                        Some(Ok(CtEvent::Paste(payload))) => {
+                            note_body_height(terminal, screen.as_mut().unwrap());
+                            let core = screen.take().unwrap();
+                            let (core, effects) =
+                                core.handle_key(map_paste(payload, &ctx.root));
+                            screen = Some(
+                                dispatch(
+                                    terminal,
+                                    core,
+                                    effects,
+                                    &mut Adapter { ctx: &ctx, state: &mut state },
+                                )
+                                .await?,
+                            );
                             dirty = true;
                         }
                         Some(Ok(_)) => dirty = true, // resize/etc.
@@ -714,6 +775,15 @@ fn map_key(key: &KeyEvent) -> Key {
         // transcript scroll (ADR-0046, Stage 2). BEFORE the generic Ctrl-chord/Char
         // arms so it is named intent, not a typed 's'.
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => Key::ShowMore,
+        // Ctrl-V (qwen's `InputPrompt` Ctrl+V handler, ADR-0068 P5): capture a
+        // system-clipboard IMAGE into a staged temp file and insert its
+        // `@<temppath>` At Mention. BEFORE the generic Ctrl-chord arm so it is
+        // named intent, not a typed 'v'. A clipboard with TEXT (not an image)
+        // arrives via bracketed paste as `Event::Paste`, not here, so this handler
+        // is image-specific; a text-only clipboard makes it a silent no-op.
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CaptureClipboardImage
+        }
         // Shift+Tab cycles the Approval mode (ADR-0050). Crossterm reports it as
         // `BackTab`, or as `Tab` + SHIFT on terminals that do not synthesize
         // BackTab - both map to the same intent (qwen's win32 fallback is plain
@@ -729,6 +799,22 @@ fn map_key(key: &KeyEvent) -> Key {
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => Key::Other,
         KeyCode::Char(c) => Key::Char(c),
         _ => Key::Other,
+    }
+}
+
+/// Maps a bracketed-paste payload to the pure core's [`Key::Paste`] (ADR-0068
+/// P4), doing the ONE IO the pure core cannot: qwen's `isValidPath` existence
+/// check. A dragged/pasted single valid file path is rewritten to `@<path> `
+/// ([`at_expansion::rewrite_paste`], relative to the Session's project root);
+/// every other paste is carried VERBATIM. The rewrite is factored in
+/// `at_expansion` (shared with At Expansion's `unescape`/relativize/escape helpers,
+/// not duplicated); this edge only supplies the real `fs` predicate and the root,
+/// mirroring how qwen injects `isValidPath` into its text-buffer.
+fn map_paste(payload: String, root: &std::path::Path) -> Key {
+    let is_file = |p: &std::path::Path| p.is_file();
+    match crate::tools::at_expansion::rewrite_paste(&payload, root, is_file) {
+        Some(rewritten) => Key::Paste(rewritten),
+        None => Key::Paste(payload),
     }
 }
 
@@ -861,7 +947,56 @@ async fn run_effect(
             let _ = ctx.selector_tx.send(Event::mcp_copy_result(copied));
             screen
         }
+        // Ctrl+V clipboard-image capture (ADR-0068 P5, the Attachment flow): the
+        // check + save are subprocess + fs IO, so they run OFF the loop (ADR-0011)
+        // - the same fire-and-forget spawn-then-post shape the file search uses. A
+        // successful capture posts `ClipboardImageReady` (the `@<temppath> ` the
+        // Composer splices); no image / a failure posts nothing (a silent no-op).
+        Effect::CaptureClipboardImage => {
+            // Pass the GLOBAL temp dir: `save_clipboard_image` joins `clipboard/`
+            // once (BUG 3), so the staged file lands at `<global>/clipboard/...`,
+            // exactly the landing dir the confinement admits.
+            spawn_clipboard_capture(ctx.global_temp_dir.clone(), ctx.selector_tx.clone());
+            screen
+        }
     }
+}
+
+/// Spawns the clipboard-image capture off the event loop (ADR-0068 P5), posting
+/// [`Event::ClipboardImageReady`] with the `@<temppath> ` mention on success and
+/// NOTHING on no-image / failure - a silent no-op, never blocking, never a panic.
+/// Mirrors `file_search::spawn`'s spawn-then-post shape: the capture is
+/// subprocess + fs IO the select loop must not sit on.
+fn spawn_clipboard_capture(
+    global_temp_dir: std::path::PathBuf,
+    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+) {
+    use crate::tools::clipboard_image;
+    tokio::spawn(async move {
+        // Only stage when the clipboard actually holds an image (qwen checks
+        // `clipboardHasImage()` before `saveClipboardImage`). A save with no image
+        // returns `None` anyway, but the pre-check avoids a needless write.
+        if !clipboard_image::clipboard_has_image().await {
+            return;
+        }
+        let Some(path) = clipboard_image::save_clipboard_image(&global_temp_dir).await else {
+            return;
+        };
+        let _ = tx.send(Event::clipboard_image_ready(map_clipboard_mention(&path)));
+    });
+}
+
+/// The ready-to-insert At Mention for a staged clipboard image (ADR-0068 P5). The
+/// temp file lives OUTSIDE the Project Root (under the global clipboard temp
+/// dir), so unlike a dragged path it cannot be relativized: the mention is the
+/// ABSOLUTE temp path, which At Expansion resolves via the temp-dir confinement
+/// exception. Spaces are backslash-escaped so the AT scan round-trips (the same
+/// `escape_path` narrowing `@path` completion and paste rewriting apply), and a
+/// trailing space follows (qwen inserts `@<path> `) so the cursor lands clear of
+/// the mention.
+fn map_clipboard_mention(path: &std::path::Path) -> String {
+    let escaped = path.to_string_lossy().replace(' ', "\\ ");
+    format!("@{escaped} ")
 }
 
 /// Makes an ask's text safe to carry inside an OSC 777 notification: strips the
@@ -1081,29 +1216,137 @@ async fn run_agent_command(
 
 /// Submits `prompt` as a fresh user turn: the core records the outcome (ok appends
 /// the user line, busy retries as steer) and may emit MORE effects, which recurse
-/// through [`run_effects`].
+/// through [`run_effects`]. At Expansion (P3, ADR-0068) runs FIRST off the runtime
+/// worker path (a `@path` mention does file IO): a draft with no At Mention takes
+/// the zero-IO fast path (`UserPrompt::from(text)`, byte-identical to before), a
+/// draft with one is expanded into a media-carrying [`UserPrompt`] and the read
+/// display is injected into the transcript. The ORIGINAL draft is what the core
+/// records (the transcript user line + history ring), matching qwen's
+/// `userText: query`; the expanded prompt is what reaches the Agent.
 async fn submit_prompt(
     prompt: String,
     screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
 ) -> Screen {
-    let outcome = ctx.agent.submit(prompt.clone()).await.map_err(|_| Busy);
+    let (user_prompt, display) = at_expand(&prompt, ctx).await;
+    let outcome = ctx.agent.submit(user_prompt).await.map_err(|_| Busy);
     let (core, effects) = screen.submitted(prompt, outcome);
+    let core = inject_read_display(core, display);
     Box::pin(run_effects(core, effects, ctx, state)).await
 }
 
 /// Steers `text` into the running Run (or falls back to a submit when idle); the
-/// core records the outcome and may emit more effects.
+/// core records the outcome and may emit more effects. At Expansion runs on the
+/// steered draft too (P3, ADR-0068): verbatim qwen expands EVERY query, so a
+/// mid-Run `@image` steer inlines its media. The ORIGINAL draft is recorded; the
+/// expanded prompt reaches the Agent.
 async fn steer_text(
     text: String,
     screen: Screen,
     ctx: &AdapterCtx<'_>,
     state: &mut AdapterState,
 ) -> Screen {
-    let outcome = ctx.agent.steer(text.clone()).await.map_err(|_| Idle);
+    let (user_prompt, display) = at_expand(&text, ctx).await;
+    let outcome = ctx.agent.steer(user_prompt).await.map_err(|_| Idle);
     let (core, effects) = screen.steered(text, outcome);
+    let core = inject_read_display(core, display);
     Box::pin(run_effects(core, effects, ctx, state)).await
+}
+
+/// Runs At Expansion for a draft (ADR-0068), off the runtime worker path. A draft
+/// with no At Mention returns the plain-text [`UserPrompt`] with ZERO IO (the fast
+/// path preserves exact text-only behavior); a draft with a mention runs the
+/// parse -> resolve -> read pipeline on the BLOCKING pool via `spawn_blocking`
+/// (the file IO is `std::fs`, so it must not sit on a runtime worker - ADR-0011),
+/// awaiting the result so the submit ordering (transcript line, then Agent submit)
+/// holds. This differs from `file_search`'s fire-and-forget post-back only in that
+/// submit must await the result to submit it; the blocking IO is off the worker
+/// path the same way. Media rides UNCONDITIONALLY (all-modalities-true): the
+/// wire-build degrade (`llm::transform`, ADR-0059) drops what an image-blind Model
+/// cannot accept, so At Expansion need not know the active Model here.
+async fn at_expand(
+    draft: &str,
+    ctx: &AdapterCtx<'_>,
+) -> (UserPrompt, crate::tools::at_expansion::ReadDisplay) {
+    use crate::content::Modalities;
+    use crate::tools::at_expansion::{ReadDisplay, has_at_mention};
+
+    // Fast path: no At Mention -> plain text, no IO (byte-identical to before).
+    if !has_at_mention(draft) {
+        return (UserPrompt::from(draft.to_string()), ReadDisplay::default());
+    }
+
+    let draft = draft.to_string();
+    let root = ctx.root.clone();
+    // The global clipboard temp dir the P5 confinement exception admits, so a
+    // staged clipboard image (`@<abs-temp-path>`, outside the Project Root)
+    // resolves at submit (ADR-0068 P5). Cloned into the blocking closure.
+    let temp_dir = ctx.clipboard_temp_dir.clone();
+    // At Expansion's IO (stat / walk / read) is blocking `std::fs`; run it on the
+    // blocking pool so the runtime worker is never stalled (ADR-0011). The
+    // `expand` future itself only awaits the (async) PDF-extraction edge, which is
+    // rare; a `Runtime::block_on` inside `spawn_blocking` drives it to completion.
+    tokio::task::spawn_blocking(move || {
+        let modalities = Modalities {
+            image: true,
+            pdf: true,
+        };
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(crate::tools::at_expansion::expand(
+            &draft,
+            &root,
+            None,
+            Some(temp_dir.as_path()),
+            modalities,
+        ))
+    })
+    .await
+    .unwrap_or_else(|_| (UserPrompt::from(String::new()), ReadDisplay::default()))
+}
+
+/// Injects At Expansion's read display into the transcript (ADR-0068): an honest
+/// info line per file/directory read, per skipped mention, and per read error -
+/// suspenders' existing transcript vocabulary (an info line), NOT a fabricated
+/// Tool Call / Tool Result (At Expansion produces USER content). qwen renders a
+/// "Read File" / "Read Directory" card here; suspenders has no synthetic
+/// tool-call path that would not fight the architecture, so the faithful display
+/// is an info line naming what was pulled in.
+fn inject_read_display(screen: Screen, display: crate::tools::at_expansion::ReadDisplay) -> Screen {
+    if display.is_empty() {
+        return screen;
+    }
+    let mut screen = screen;
+    for line in read_display_lines(&display) {
+        screen = screen.info(line).0;
+    }
+    screen
+}
+
+/// The info lines At Expansion's read display renders to (ADR-0068): one per read
+/// (naming the file / directory), one summarizing skipped mentions with their
+/// reasons, and one per read error. Pure, so the wording is unit-testable.
+fn read_display_lines(display: &crate::tools::at_expansion::ReadDisplay) -> Vec<String> {
+    use crate::tools::at_expansion::{IgnoreReason, Skip};
+    let mut lines = Vec::new();
+    for (label, is_dir) in &display.read {
+        let kind = if *is_dir { "directory" } else { "file" };
+        lines.push(format!("Read {kind} {label}"));
+    }
+    for (label, skip) in &display.skipped {
+        let reason = match skip {
+            Skip::OutsideWorkspace => "outside project root".to_string(),
+            Skip::NotFound => "not found".to_string(),
+            Skip::Ignored(IgnoreReason::Git) => "git-ignored".to_string(),
+            Skip::Ignored(IgnoreReason::Qwen) => "qwen-ignored".to_string(),
+            Skip::Ignored(IgnoreReason::Both) => "ignored by git and qwen".to_string(),
+        };
+        lines.push(format!("Skipped @{label} ({reason})"));
+    }
+    for (label, err) in &display.errors {
+        lines.push(format!("Failed to read {label}: {err}"));
+    }
+    lines
 }
 
 /// Resolves a pending run_command Approval (fire-and-forget; the Screen is

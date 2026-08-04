@@ -13,6 +13,10 @@
       "context_window": 131072,
       "max_tokens": 40960,
       "reasoning": true,
+      "input_modalities": {
+        "image": true,
+        "pdf": false
+      },
       "cost": {
         "input": 0.99,
         "output": 1.49
@@ -24,6 +28,10 @@
       "context_window": 131072,
       "max_tokens": 40960,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 0.35,
         "output": 0.75
@@ -35,6 +43,10 @@
       "context_window": 131072,
       "max_tokens": 40960,
       "reasoning": true,
+      "input_modalities": {
+        "image": false,
+        "pdf": false
+      },
       "cost": {
         "input": 2.25,
         "output": 2.75,

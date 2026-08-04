@@ -11,7 +11,7 @@
 use super::background::BackgroundStatus;
 use super::*;
 use crate::approvals::ApprovalMode;
-use crate::content::{ContentBlock, Message, Role, Usage};
+use crate::content::{ContentBlock, Message, Role, Usage, UserPrompt};
 use crate::llm::model::Api;
 
 impl AgentState {
@@ -368,6 +368,90 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
             Message::assistant_from(vec![ContentBlock::text("Hello")], provenance),
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_submitted_media_prompt_reaches_the_conversation_as_one_user_message() {
+    // ADR-0068 P2: a UserPrompt carrying Text + an Image block enters the
+    // Conversation as ONE user Message, blocks in order - the media survives
+    // the submit pipe (Composer -> Agent -> start_run -> add_user_content).
+    let dir = TempDir::new().unwrap();
+    let fake = FakeLlm::script(vec![Entry::response(
+        vec![Delta::Text("a cat".into())],
+        text_end("a cat"),
+    )]);
+    let session = session_in(&dir);
+    let agent = start(session, fake);
+    let mut rx = agent.subscribe();
+
+    agent
+        .submit(UserPrompt::from_blocks(vec![
+            ContentBlock::text("what is in "),
+            ContentBlock::image("image/png", "AAAA"),
+        ]))
+        .await
+        .unwrap();
+
+    recv_match(&mut rx, is_run_finished).await;
+
+    let conv = agent.conversation().await;
+    assert_eq!(
+        conv.messages.first(),
+        Some(&Message::user(vec![
+            ContentBlock::text("what is in "),
+            ContentBlock::image("image/png", "AAAA"),
+        ]))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steered_media_prompt_delivers_its_text_projection_to_the_run() {
+    // ADR-0068 P2: Steering is delivered as trailing user-text on the Pass's
+    // Tool Result message, so a steered media prompt contributes its TEXT
+    // projection today (the queue is text; a mid-Run media turn is P3). The
+    // projection rides the next request's tool-result user message, unadorned.
+    let Steering {
+        agent,
+        mut rx,
+        mut req_rx,
+        release,
+        ..
+    } = steering_harness("look around", "done").await;
+
+    agent
+        .steer(UserPrompt::from_blocks(vec![
+            ContentBlock::text("also see "),
+            ContentBlock::image("image/png", "AAAA"),
+        ]))
+        .await
+        .unwrap();
+    // BUG 4: the QUEUED (display) event shows the CLEAN typed text, never the raw
+    // `[image: <mime>]` media projection - that placeholder only rides the WIRE
+    // (asserted below via SteeringDelivered + the request message).
+    recv_steering_queued(&mut rx, "also see ").await;
+
+    release
+        .send(Release {
+            deltas: vec![],
+            response: tool_use_result("t1", "list_directory", json!({ "path": "." })),
+        })
+        .ok();
+
+    recv_match(
+        &mut rx,
+        |e| matches!(e, Event::SteeringDelivered { text } if text == "also see [image: image/png]"),
+    )
+    .await;
+
+    let request = req_rx.recv().await.expect("second request");
+    let last = request.messages.last().unwrap();
+    assert_eq!(last.role, Role::User);
+    assert_eq!(
+        last.content[1],
+        ContentBlock::text("also see [image: image/png]")
+    );
+
+    recv_match(&mut rx, is_run_finished).await;
 }
 
 // ---- session cost metering (ADR-0037 Stage F) --------------------------

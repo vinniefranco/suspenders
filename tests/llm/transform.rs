@@ -391,3 +391,69 @@ fn normalize_request_rewrites_messages_and_keeps_the_rest() {
     assert_eq!(use_ids(&out.messages[0]), vec!["t_1"]);
     assert_eq!(result_ids(&out.messages[1]), vec!["t_1"]);
 }
+
+// ---- user-message media is NEVER degraded (ADR-0068 / BUG 2) ----
+
+#[test]
+fn a_user_image_survives_on_an_image_blind_model() {
+    // A user EXPLICITLY attached this image (At Expansion), so their intent is
+    // authoritative: it rides to the wire unconditionally even on a Model whose
+    // catalog says it accepts text only. The client never preemptively strips the
+    // attachment and lies "this model does not support image input" - the
+    // model/API answers honestly. Only autonomous Tool Result media degrades.
+    let model = target(Api::AnthropicMessages);
+    assert!(
+        !model.input_modalities.image,
+        "default Model is image-blind"
+    );
+    let request = LlmRequest::new(
+        "s",
+        vec![Message::user(vec![ContentBlock::image(
+            "image/png",
+            "AAAA",
+        )])],
+        vec![],
+    );
+    let out = degrade_unsupported_media(request, &model);
+    assert!(matches!(
+        &out.messages[0].content[0],
+        ContentBlock::Image { mime, data } if mime == "image/png" && data == "AAAA"
+    ));
+}
+
+#[test]
+fn a_user_pdf_survives_on_a_pdf_blind_model() {
+    let doc = || Message::user(vec![ContentBlock::document("application/pdf", "BBBB")]);
+    let text_only = target(Api::AnthropicMessages);
+    assert!(
+        !text_only.input_modalities.pdf,
+        "default Model is pdf-blind"
+    );
+    let out = degrade_unsupported_media(LlmRequest::new("s", vec![doc()], vec![]), &text_only);
+    assert!(matches!(
+        &out.messages[0].content[0],
+        ContentBlock::Document { mime, data } if mime == "application/pdf" && data == "BBBB"
+    ));
+}
+
+#[test]
+fn a_supported_user_image_also_survives_untouched() {
+    let mut model = target(Api::AnthropicMessages);
+    model.input_modalities = crate::content::Modalities {
+        image: true,
+        pdf: false,
+    };
+    let request = LlmRequest::new(
+        "s",
+        vec![Message::user(vec![ContentBlock::image(
+            "image/png",
+            "AAAA",
+        )])],
+        vec![],
+    );
+    let out = degrade_unsupported_media(request, &model);
+    assert!(matches!(
+        &out.messages[0].content[0],
+        ContentBlock::Image { .. }
+    ));
+}

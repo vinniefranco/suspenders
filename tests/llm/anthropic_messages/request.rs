@@ -265,3 +265,35 @@ fn provenance_never_rides_the_wire() {
         })
     );
 }
+
+#[test]
+fn user_image_block_becomes_the_source_base64_shape() {
+    // First-class user media (ADR-0068): an Image ContentBlock emits the same
+    // `image`/`source.base64` shape a media Tool Result uses.
+    let msg = Message::user(vec![ContentBlock::image("image/png", "AAAA")]);
+    assert_eq!(
+        wire_message(&msg),
+        json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" }
+            }]
+        })
+    );
+}
+
+#[test]
+fn user_document_block_becomes_the_document_source_base64_shape() {
+    let msg = Message::user(vec![ContentBlock::document("application/pdf", "BBBB")]);
+    assert_eq!(
+        wire_message(&msg),
+        json!({
+            "role": "user",
+            "content": [{
+                "type": "document",
+                "source": { "type": "base64", "media_type": "application/pdf", "data": "BBBB" }
+            }]
+        })
+    );
+}

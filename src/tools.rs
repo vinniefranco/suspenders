@@ -7,6 +7,8 @@
 
 pub mod agent;
 pub mod ask_user_question;
+pub mod at_expansion;
+pub mod clipboard_image;
 pub mod edit_file;
 pub mod enter_plan_mode;
 pub mod exit_plan_mode;
@@ -17,6 +19,7 @@ pub mod list_files;
 pub mod notebook_edit;
 pub mod plan_lifecycle;
 pub mod read_file;
+pub mod read_many_files;
 pub mod run_command;
 pub mod shaping;
 pub mod skill;

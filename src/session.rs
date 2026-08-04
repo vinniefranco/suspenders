@@ -1431,6 +1431,29 @@ pub fn default_user_skills_dir() -> String {
     format!("{}/suspenders/skills", xdg_config_base())
 }
 
+/// The GLOBAL (cross-session) temp dir for transient staging (ADR-0068 P5; qwen
+/// `Storage.getGlobalTempDir` -> `<globalQwenDir>/tmp`): a `tmp/` under the same
+/// XDG data base the Session Logs (`default_session_dir` -> `.../suspenders/sessions`)
+/// and the memory store (`memory_base` -> `.../suspenders`) hang off, so it shares
+/// the repo's dir-resolution scheme rather than inventing a divergent one. The
+/// clipboard Attachment staging (`saveClipboardImage`) writes its `clipboard/`
+/// subdir here, and the At-Expansion confinement exception admits a `@path` under
+/// it (that is how a clipboard temp file rejoins the At Mention spine). Resolved
+/// once at the launch edge like the dirs above; `SUSPENDERS_MEMORY_BASE_DIR`
+/// (the shared data-base test seam `memory_base` already honors) redirects it so
+/// tests never touch the real data home.
+pub fn default_global_temp_dir() -> String {
+    format!("{}/tmp", memory_base())
+}
+
+/// The clipboard Attachment staging directory (ADR-0068 P5; qwen writes
+/// `<globalTempDir>/clipboard/clipboard-<ts>-<uuid>.png`): the `clipboard/` subdir
+/// of [`default_global_temp_dir`]. The one place the subdir name lives, so the
+/// staging writer and the confinement exception agree on the path by construction.
+pub fn default_clipboard_temp_dir() -> String {
+    format!("{}/clipboard", default_global_temp_dir())
+}
+
 /// The managed-auto-memory root for `project_root` (P5, ADR-0062; qwen
 /// `getAutoMemoryRoot`): where the model's `MEMORY.md` index and topic files
 /// live. Two shapes, both resolved once at the launch edge like the dirs above:
