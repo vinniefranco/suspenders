@@ -508,10 +508,9 @@ async fn drain_input_an_ended_stream_quits() {
     assert!(drain(&mut terminal, vec![]).await.is_ok());
 }
 
-// After the Agent is gone the pending region still draws its tail (native
-// scrollback owns history, ADR-0046), and inert keys/resize/read-errors just
-// repaint until a quit. The transcript no longer scrolls - there is no scroll
-// state to move.
+// After the Agent is gone the Pending tail still draws (the whole Transcript
+// renders each frame, ADR-0046), and inert keys/resize/read-errors just
+// repaint until a quit.
 #[tokio::test]
 async fn drain_input_repaints_the_tail_and_survives_noise_until_quit() {
     let mut terminal = test_terminal(40, 12);
@@ -526,7 +525,7 @@ async fn drain_input_repaints_the_tail_and_survives_noise_until_quit() {
     )
     .await
     .unwrap();
-    // The pending region bottom-anchors and top-clips, so the NEWEST notice
+    // The Pending tail bottom-anchors and top-clips, so the NEWEST notice
     // is on screen even after the Agent is gone.
     assert!(buffer_text(&terminal).contains("notice-40"));
 }
@@ -765,7 +764,7 @@ async fn cycle_updates_the_mirror_even_when_the_broadcast_is_dropped() {
 
     // Fresh Screen starts at Default; no event subscriber exists here.
     let mut screen = Screen::new(ScreenOpts::default());
-    assert_eq!(screen.approval_mode, ApprovalMode::Default);
+    assert_eq!(screen.approval_mode(), ApprovalMode::Default);
 
     // One cycle through the real dispatch path lands on AutoEdit (qwen order:
     // plan → default → auto-edit → …) purely from the returned mode.
@@ -780,7 +779,7 @@ async fn cycle_updates_the_mirror_even_when_the_broadcast_is_dropped() {
     )
     .await
     .expect("cycle returns");
-    assert_eq!(screen.approval_mode, ApprovalMode::AutoEdit);
+    assert_eq!(screen.approval_mode(), ApprovalMode::AutoEdit);
 
     // A second cycle advances to Auto - again with no broadcast consumed.
     screen = run_effect(
@@ -790,7 +789,7 @@ async fn cycle_updates_the_mirror_even_when_the_broadcast_is_dropped() {
         &mut state,
     )
     .await;
-    assert_eq!(screen.approval_mode, ApprovalMode::Auto);
+    assert_eq!(screen.approval_mode(), ApprovalMode::Auto);
 }
 
 // (The old scroll-effect executor test is retired: native scrollback owns

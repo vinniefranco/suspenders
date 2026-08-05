@@ -44,8 +44,8 @@ use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::model::Model;
 use crate::llm::{Llm, ProviderModels};
-use crate::run::loop_::{Outcome as LoopOutcome, RunOpts};
-use crate::run::settlement::{Reason, Rollover, Settlement};
+use crate::run::loop_::RunOpts;
+use crate::run::settlement::{Outcome, Reason, Rollover, Settlement};
 use crate::session::Session;
 use crate::session::log::{self, Entry as LogEntry, Log, ResumeError};
 use crate::tool::caps::{EnterPlanOutcome, PlanExitOutcome, SubagentResult};
@@ -58,13 +58,11 @@ mod deps;
 mod init;
 mod mcp_ops;
 mod model_ops;
-mod settle;
 use background::BackgroundTask;
 use background_shell::{BackgroundShell, ShellOutcome};
 use deps::{AgentDeps, RequestSettings, RunSpawn};
 use mcp_ops::{mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_set_enabled};
 use model_ops::{apply_enriched_model, spawn_list_models, swap_active_model};
-use settle::{LoopOrDown, settle_event_to_event, to_settlement_outcome};
 // The Session-stable tool-set rebuild lives with the live MCP ops that share it;
 // `init_agent` reaches it as `crate::agent::rebuild_session_tools`.
 pub(crate) use mcp_ops::rebuild_session_tools;
@@ -420,7 +418,7 @@ pub enum Msg {
     Command(Command),
     Run(RunMsg),
     /// The awaited Run task yielded (baud's `{ref, outcome}` / `{:DOWN, ...}`).
-    Settle(LoopOutcome),
+    Settle(Outcome),
     /// The Run task panicked or was aborted (baud's `:DOWN` with no reply).
     RunDown(Reason),
     /// The off-actor window enrichment for a `/model` swap finished (ADR-0037):
@@ -476,7 +474,7 @@ impl AgentHandle {
         let (events, _rx0) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Session cost metering (ADR-0037): every model call this Session
-        // makes - Run Passes, Scouts, Compaction - flows through this one
+        // makes - Run Passes, subagent Runs, Compaction - flows through this one
         // Arc, so a single decorator prices them all against
         // each call's captured Model. The running total rides the Agent's own
         // mpsc like every Run event, so Event order stays the single owner's;
@@ -868,10 +866,9 @@ struct AgentState {
     // talks back over the same channel, and used to post the Run's outcome.
     self_tx: mpsc::UnboundedSender<Msg>,
     // The attached MCP servers (F8, ADR-0056): connected once in `init_agent`,
-    // held for the Session's lifetime so the transports stay alive. Read only
-    // for `failures()` (a startup notice); the tools themselves live on
-    // `session_tools`.
-    #[allow(dead_code)]
+    // held for the Session's lifetime so the transports stay alive. The live
+    // `/mcp` ops (ADR-0065) read it - views, reconnect, enable/disable,
+    // disconnect, failures; the tools themselves live on `session_tools`.
     mcp: crate::mcp::manager::McpManager,
     // The Session-stable tool set (F8, ADR-0056): built-ins plus discovered MCP
     // tools, built once in `init_agent` and REBUILT by the live `/mcp` ops
@@ -950,8 +947,10 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
             }
             Msg::Command(cmd) => handle_command(&mut state, cmd),
             Msg::Run(run) => handle_run(&mut state, run),
-            Msg::Settle(outcome) => settle(&mut state, LoopOrDown::Loop(outcome)),
-            Msg::RunDown(reason) => settle(&mut state, LoopOrDown::Down(reason)),
+            Msg::Settle(outcome) => settle(&mut state, outcome),
+            // The watcher's Down (the task panicked or was aborted) is the one
+            // outcome the Loop never returns; it joins the vocabulary here.
+            Msg::RunDown(reason) => settle(&mut state, Outcome::Down(reason)),
             Msg::EnrichedModel(model) => apply_enriched_model(&mut state, model),
         }
     }
@@ -976,16 +975,29 @@ async fn run_agent(mut state: AgentState, mut rx: mpsc::UnboundedReceiver<Msg>) 
 // without threading hook plumbing into the UI. Built on demand (it borrows the
 // state), never held, so it never outlives an `&AgentState` borrow.
 fn agent_hooks(state: &AgentState) -> crate::run::hooks::Hooks<'_> {
-    let transcript = transcript_path(state);
-    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    let identity = crate::run::hooks::HookIdentity::from_log_path(
+        state.session.root.clone(),
+        transcript_path(state),
+    );
     crate::run::hooks::Hooks::new(
         state.hook_manager.as_ref(),
         state.llm.as_ref(),
         &state.model,
-        state.session.root.clone(),
-        session_id,
-        transcript,
+        identity,
+        Some(broadcast_reporter(&state.events)),
     )
+}
+
+/// An [`Emitter`](crate::run::deps::Emitter) over the Agent's broadcast channel:
+/// the visible fail-open reporter (ADR-0018) the Agent-side hook facades carry,
+/// so a hook firing failure at a session/notification event surfaces on the same
+/// event channel a Run's reports take. A lagged/closed receiver is dropped
+/// silently (the broadcast contract).
+pub(crate) fn broadcast_reporter(events: &broadcast::Sender<Event>) -> crate::run::deps::Emitter {
+    let tx = events.clone();
+    crate::run::deps::Emitter::new(move |event| {
+        let _ = tx.send(event);
+    })
 }
 
 // The Session Log's JSONL path (H1, ADR-0010/0066): the running transcript the hook
@@ -1016,17 +1028,18 @@ fn fire_notification(state: &AgentState, message: String) {
     let manager = Arc::clone(&state.hook_manager);
     let llm = Arc::clone(&state.llm);
     let model = state.model.clone();
-    let root = state.session.root.clone();
-    let transcript = transcript_path(state);
-    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    let identity = crate::run::hooks::HookIdentity::from_log_path(
+        state.session.root.clone(),
+        transcript_path(state),
+    );
+    let reporter = broadcast_reporter(&state.events);
     tokio::spawn(async move {
         let hooks = crate::run::hooks::Hooks::new(
             manager.as_ref(),
             llm.as_ref(),
             &model,
-            root,
-            session_id,
-            transcript,
+            identity,
+            Some(reporter),
         );
         hooks.notification(&message).await;
     });
@@ -1753,7 +1766,7 @@ fn run_opts(state: &AgentState, original_task: Option<String>) -> RunOpts {
 // outcome back through the mpsc (baud's `{ref, outcome}` / `:DOWN`). This lets
 // the Agent both abort (cancel) and observe the outcome without co-owning one
 // handle.
-fn watch_run(state: &mut AgentState, run: tokio::task::JoinHandle<LoopOutcome>) {
+fn watch_run(state: &mut AgentState, run: tokio::task::JoinHandle<Outcome>) {
     let reference = mint_run_ref();
     let abort = run.abort_handle();
     let out_tx = state.self_tx.clone();
@@ -1770,7 +1783,7 @@ fn watch_run(state: &mut AgentState, run: tokio::task::JoinHandle<LoopOutcome>) 
                 } else {
                     // A panic; close with the failure marker (baud's run_error
                     // + "[turn failed]").
-                    Reason::tuple("turn_panic")
+                    Reason::verbatim("turn_panic")
                 };
                 let _ = out_tx.send(Msg::RunDown(reason));
             }
@@ -1789,7 +1802,7 @@ fn mint_run_ref() -> String {
 
 // ---- Settlement ------------------------------------------------------------
 
-fn settle(state: &mut AgentState, outcome: LoopOrDown) {
+fn settle(state: &mut AgentState, outcome: Outcome) {
     // If there is no running Run, this is a stale outcome (e.g. the watcher for
     // an already-settled Run); ignore it.
     if state.task.is_none() {
@@ -1797,12 +1810,10 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
     }
 
     // The cancel flag rides the Settlement (note_cancelled was called on
-    // `cancel`); the outcome only needs mapping into the settlement vocabulary.
-    let settle_outcome = to_settlement_outcome(outcome);
-
+    // `cancel`); the outcome is already the settlement's own vocabulary.
     let resolution = state
         .settlement
-        .settle(settle_outcome, &state.conversation, &state.steering);
+        .settle(outcome, &state.conversation, &state.steering);
 
     state.task = None;
     state.conversation = resolution.conversation;
@@ -1822,7 +1833,7 @@ fn settle(state: &mut AgentState, outcome: LoopOrDown) {
             reason: resolution.log_entry.reason,
         },
     );
-    broadcast(state, settle_event_to_event(&resolution.event));
+    broadcast(state, resolution.event);
 
     // Rolled-over Steering is the user's voice continuing the same request:
     // start a fresh Run over it.

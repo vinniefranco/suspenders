@@ -352,7 +352,7 @@ async fn relays_deltas_in_order_updates_the_conversation_returns_to_idle() {
         context_budget,
     } = finished
     {
-        assert_eq!(stop_reason, RStop::EndTurn);
+        assert_eq!(stop_reason, crate::stop_reason::StopReason::EndTurn);
         assert!(context_budget > 0);
         let _ = token_estimate; // >= 0 always for u64
     }

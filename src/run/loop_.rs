@@ -24,42 +24,11 @@ use crate::llm::response::Response;
 use crate::llm::{LlmRequest, StreamEvent};
 use crate::plan::Plan;
 use crate::run::deps::{Emitter, RunDeps};
+use crate::run::settlement::{Outcome, Reason};
 use crate::run::{dispatch, finish};
 use crate::session::Session;
-use crate::session::log;
 use crate::tool::ToolCtx;
 use crate::voice;
-
-/// The Run loop's outcome.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Outcome {
-    /// The Run completed; carries the final Conversation and terminal stop
-    /// reason.
-    Ok(Conversation, OutcomeStop),
-    /// The response errored; carries the LLM error reason and the Conversation
-    /// (with the partial text and the failed marker).
-    Failed(String, Conversation),
-    /// The Context Budget was exhausted and Compaction could not recover it: no
-    /// request was ever sent.
-    Error,
-}
-
-/// The terminal stop reason of an `Ok` outcome. Spans the enumerable reasons
-/// ([`log::StopReason`]: `end_turn`, `max_tokens`, `turn_limit`, ...) and the
-/// arbitrary atom an after-Pass `Stop` hook may name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutcomeStop {
-    Reason(log::StopReason),
-    Custom(String),
-}
-
-impl OutcomeStop {
-    // Used only by the test module's assertions, not by non-test builds.
-    #[allow(dead_code)]
-    fn end_turn() -> Self {
-        OutcomeStop::Reason(log::StopReason::EndTurn)
-    }
-}
 
 /// Options for [`run`]: the restored Plan content and the durable original
 /// task copy from the Compaction state.
@@ -285,16 +254,20 @@ fn last_user_text(conversation: &Conversation) -> Option<String> {
     })
 }
 
-// Surfaces a deciding lifecycle-hook fire as a visible line (ADR-0018, ADR-0066),
-// the same fail-open report seam `batch` uses for the tool events: an
-// `extension_error` labelled `hook <event>` with the `Present` mid-Run stage, so a
-// veto / inject / force-continue is never a silent decision.
-fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, what: &str) {
-    state.emitter.emit(Event::extension_error(
-        format!("hook {event}"),
-        crate::event::Stage::Present,
-        what.to_string(),
-    ));
+// Surfaces a deciding hook fire as a visible line (ADR-0018 fail-open-with-
+// visibility, ADR-0066): a block / auto-approve / deny / stop / inject /
+// force-continue is never a silent decision. Reuses the fail-open report seam
+// skills/MCP use (a `fail_open_report` labelled `hook <event>`), so the
+// operator reads what a hook did on the same channel a launch notice takes.
+// Shared with `batch`, which surfaces the tool-event fires through it.
+pub(super) fn emit_hook_decision<D: RunDeps>(
+    state: &mut LoopState<'_, D>,
+    event: &str,
+    what: &str,
+) {
+    state
+        .emitter
+        .emit(Event::fail_open_report(format!("hook {event}"), what));
 }
 
 // Run-start notification drain (P4b, ADR-0063): a background child can settle
@@ -374,15 +347,15 @@ async fn run_loop<D: RunDeps>(
     mut conversation: Conversation,
 ) -> Outcome {
     loop {
-        // The turn bound (replaces the Endgame Run-Limit close): once the turn
-        // counter passes the bound, close the Run on the run-limit marker,
-        // stop calling the model, and keep roles alternating.
+        // The Run Limit (CONTEXT.md): once the turn counter passes the bound,
+        // close the Run on the run-limit marker, stop calling the model, and
+        // keep roles alternating.
         if state.turn > state.max_turns {
             return finish::close(
                 state,
                 conversation,
                 voice::Marker::RunLimit.text(),
-                log::StopReason::RunLimit,
+                crate::stop_reason::StopReason::RunLimit,
             );
         }
 
@@ -416,7 +389,9 @@ async fn run_pass<D: RunDeps>(
 ) -> PassStep {
     let (request, mut conversation) = match build_request(state, conversation).await {
         Ok(pair) => pair,
-        Err(()) => return PassStep::Done(Outcome::Error),
+        // Even Compaction could not fit the request: the Loop names the one
+        // reason it can produce this outcome for.
+        Err(()) => return PassStep::Done(Outcome::Error(Reason::atom("context_budget_exhausted"))),
     };
 
     state.emitter.emit(Event::message_start(state.turn as u32));

@@ -125,13 +125,13 @@ pub(super) fn approval_block_rows(
 ) -> Vec<Line<'static>> {
     let width = inner_width as usize;
     let mut rows = vec![Line::from(Vec::<Span<'static>>::new())];
-    let question = approval_question(pending.kind, &pending.command);
+    let question = approval_question(pending.kind(), pending.command());
     let mut spans = Vec::new();
     let _ = push_cols(&mut spans, &question, primary_style(theme), 0, width);
     rows.push(Line::from(spans));
     rows.extend(selection_rows(
         &APPROVAL_OPTIONS,
-        pending.selection.active(),
+        pending.active_row(),
         true,
         inner_width,
         theme,

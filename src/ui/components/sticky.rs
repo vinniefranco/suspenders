@@ -70,7 +70,7 @@ pub(super) fn sticky_todos_height(count: usize) -> usize {
     2 + 1 + visible + overflow
 }
 
-/// The minimum body height the pending region keeps when the sticky box shows:
+/// The minimum body height the Pending tail keeps when the sticky box shows:
 /// one row (`Constraint::Min(1)`) so the live tail never fully collapses.
 const STICKY_MIN_BODY_ROWS: usize = 1;
 

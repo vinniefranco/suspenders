@@ -28,7 +28,7 @@ pub enum Api {
 /// The facts of one model at one Provider (CONTEXT.md: Model). Read from the
 /// Catalog for built-in Providers; synthesized from config for custom ones.
 /// Each Run captures a Model when it begins (ADR-0033 amendment), and the
-/// Context Budget, the Eviction reserve, and the Result Cap derive from that
+/// Context Budget, the reply reserve, and the Result Cap derive from that
 /// capture at Run start (ADR-0037).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {

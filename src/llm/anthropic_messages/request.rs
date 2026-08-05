@@ -16,6 +16,7 @@ use crate::content::ToolSpec;
 use crate::content::{ContentBlock, ResultBlock};
 use crate::llm::LlmRequest;
 use crate::llm::model::Model;
+use crate::llm::request_knobs::{self, Thinking};
 
 /// Builds the complete Anthropic Messages API payload as JSON.
 ///
@@ -26,7 +27,9 @@ use crate::llm::model::Model;
 /// Keys the server should default are omitted, not sent empty:
 /// no `"tools"` when `tools` is empty (a Compaction request offers none),
 /// no `"temperature"` when the request carries `None` (sampling stays with the
-/// server).
+/// server). WHEN each conditional knob applies is the shared `request_knobs`
+/// decision spine (one place, both dialects); this builder keeps only the
+/// dialect grammar - here, the `thinking` param's shape.
 pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
     let mut obj = Map::new();
     obj.insert("model".into(), json!(model.id));
@@ -38,37 +41,26 @@ pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
         Value::Array(request.messages.iter().map(wire_message).collect()),
     );
 
-    if !request.tools.is_empty() {
-        obj.insert(
-            "tools".into(),
-            Value::Array(request.tools.iter().map(wire_tool).collect()),
-        );
-    }
+    request_knobs::insert_tools(&mut obj, &request.tools, wire_tool);
+    request_knobs::insert_temperature(&mut obj, request);
 
-    if let Some(temp) = request.temperature {
-        obj.insert("temperature".into(), json!(temp));
-    }
-
-    // no_think and the thinking budget are mutually exclusive: no_think means
-    // "answer directly, no reasoning" (the checkNextSpeaker side-query), so it
-    // suppresses the thinking param. Otherwise a Some budget arms extended
-    // thinking, which keeps the local reasoning model producing a Thinking
-    // block THEN a Tool Call every turn (qwen-code parity).
-    //
-    // NB: qwen-code sends budget_tokens (32000) larger than max_tokens (8000)
-    // and llama.cpp accepts it - so no max_tokens>budget guard here. A real
-    // Claude endpoint would reject budget>max_tokens, but the target here is
-    // the local reasoning model.
-    if request.no_think {
-        obj.insert(
-            "chat_template_kwargs".into(),
-            json!({ "enable_thinking": false }),
-        );
-    } else if let Some(budget) = request.thinking_budget {
-        obj.insert(
-            "thinking".into(),
-            json!({ "type": "enabled", "budget_tokens": budget }),
-        );
+    match request_knobs::thinking(request) {
+        Thinking::Suppress => request_knobs::insert_no_think(&mut obj),
+        // A Some budget arms extended thinking, which keeps the local
+        // reasoning model producing a Thinking block THEN a Tool Call every
+        // turn (qwen-code parity).
+        //
+        // NB: qwen-code sends budget_tokens (32000) larger than max_tokens
+        // (8000) and llama.cpp accepts it - so no max_tokens>budget guard
+        // here. A real Claude endpoint would reject budget>max_tokens, but
+        // the target here is the local reasoning model.
+        Thinking::Budget(budget) => {
+            obj.insert(
+                "thinking".into(),
+                json!({ "type": "enabled", "budget_tokens": budget }),
+            );
+        }
+        Thinking::Server => {}
     }
 
     Value::Object(obj)

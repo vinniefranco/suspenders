@@ -2,14 +2,16 @@
 //!
 //! Registry order is prompt order: the order the model sees the tool specs.
 //! [`execute`] runs every outcome into a `{content, is_error}` Tool Result, so
-//! a tool can never crash the Run. [`run`] adds Shaping on top - the
-//! extension-free dispatch path.
+//! a tool can never crash the Run. [`run`] adds Shaping on top. Tool behaviors
+//! (diff, todo, exit-code badge) live inside their Tools; Hooks are the only
+//! lifecycle-interception layer, and they fire in the Run loop, not here.
 
 pub mod agent;
 pub mod ask_user_question;
 pub mod at_expansion;
 pub mod clipboard_image;
 pub mod edit_file;
+pub mod edit_match;
 pub mod enter_plan_mode;
 pub mod exit_plan_mode;
 pub mod file_diff;
@@ -97,11 +99,14 @@ pub fn deferred_summary() -> Vec<(String, String)> {
 }
 
 /// Runs the named tool with the raw decoded input and the ctx, then Shapes the
-/// result to the Result Cap: the extension-free dispatch path. Delegates
-/// validation + dispatch to the Run's [`ToolRegistry`] (on the ctx).
+/// result to the Result Cap under the [`CutPolicy`](crate::tool::CutPolicy) the
+/// tool declared on its spec. Delegates validation + dispatch to the Run's
+/// [`ToolRegistry`] (on the ctx); an unknown name cuts under the default Head
+/// policy.
 pub async fn run(name: &str, input: &Value, ctx: &ToolCtx) -> ToolResult {
     let mut result = execute(name, input, ctx).await;
-    result.content = shaping::shape(name, input, result.content, ctx.result_cap);
+    let policy = ctx.registry().cut_policy_of(name);
+    result.content = shaping::shape(policy, input, result.content, ctx.result_cap);
     result
 }
 

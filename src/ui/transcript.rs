@@ -7,7 +7,7 @@
 //! Pure like the rest of the core (ADR-0001/0019): no terminal, no async, no
 //! IO, no ratatui types.
 //!
-//! ## Tool Result display swaps (ADR-0007)
+//! ## Tool Result display swaps (CONTEXT.md: Presentment)
 //!
 //! A tool that shapes its own transcript display attaches a display Artifact to
 //! its Tool Result (CONTEXT.md: Artifact), which rides the `:tool_result` event
@@ -40,8 +40,8 @@
 //!   verb must be added to it and its expected-bumps guard revisited - the
 //!   test cannot notice a verb it was never told about.
 //!
-//! Voice strings stay with the Screen (the startup Header, stop reasons, wave
-//! lines, nudges - recorded through [`Transcript::header`]/[`Transcript::info`]);
+//! Voice strings stay with the Screen (the startup Header, stop reasons, launch
+//! notices - recorded through [`Transcript::header`]/[`Transcript::info`]);
 //! the store authors only the two lines its own invariants require verbatim: the
 //! pending Steering marker and the tooling-failure line.
 
@@ -53,7 +53,6 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::content::ContentBlock;
-use crate::event::Stage;
 use crate::tools::{file_diff, run_command, todo_write};
 use crate::view_model::{Tone, TranscriptItem};
 use streaming::Streaming;
@@ -281,14 +280,15 @@ impl Transcript {
         });
     }
 
-    /// Records a fail-open tooling-failure report line (ADR-0007) from the Run's
-    /// `extension_error` event - today the MCP init / ops failures the Agent
-    /// reports (ADR-0056), the fail-open-with-visibility principle the Hook
-    /// subsystem (ADR-0066) also governs. A plain append; it is not a Tool Result
-    /// and carries no display swap.
-    pub fn extension_failure(&mut self, extension: &str, stage: Stage, message: &str) {
+    /// Records a fail-open report line from the Run's `fail_open_report`
+    /// event: Hook failures and decisions (ADR-0066), MCP connect failures
+    /// (ADR-0056), broken-Skill notices (ADR-0058), and the plan-mode block
+    /// (ADR-0067), all under the fail-open-with-visibility principle
+    /// (ADR-0018). A plain append; it is not a Tool Result and carries no
+    /// display swap.
+    pub fn fail_open_report(&mut self, source: &str, message: &str) {
         self.items.push(TranscriptItem::Info {
-            text: extension_failure_line(extension, stage, message),
+            text: fail_open_line(source, message),
         });
     }
 
@@ -422,10 +422,14 @@ fn pending_steering_line(text: &str) -> String {
     format!("↳ queued: {text}")
 }
 
-// The fail-open tooling-failure report (ADR-0007) - sourced once, so every
-// `extension_error` event the Run reports reads identically.
-fn extension_failure_line(extension: &str, stage: Stage, message: &str) -> String {
-    format!("plugin {extension} failed in {}: {message}", stage.as_str())
+// The fail-open report line (fail-open-with-visibility, ADR-0018) - sourced
+// once, so every `fail_open_report` event reads identically. The source label
+// names its own subsystem ("hook Stop", "mcp server foo", "skill bar", "plan
+// mode") and the message narrates what happened, so the line adds no noun or
+// verb of its own (the retired "failed in <stage>" phrasing named the retired
+// extension-pipeline stages, and read wrong for a Hook Decision).
+fn fail_open_line(source: &str, message: &str) -> String {
+    format!("{source}: {message}")
 }
 
 // Swaps a Tool Result item for its first-class display when the tool attached a
@@ -484,8 +488,9 @@ fn swap_for_display(item: TranscriptItem, artifacts: &HashMap<String, Value>) ->
 
 // The exit-code / timeout badge for a run_shell_command result's Artifacts, or
 // `None` when neither marker is present (the summary passes through). A timeout
-// wins over an exit code (a timed-out command has no meaningful code). Byte-
-// identical to the old run_command extension's `badge`.
+// wins over an exit code (a timed-out command has no meaningful code). The tool
+// attaches the Artifacts; this store renders them (ADR-0007: tool behaviors
+// live in their Tools, and Presentment is role-less).
 fn run_command_badge(artifacts: &HashMap<String, Value>) -> Option<String> {
     if artifacts
         .get(run_command::keys::TIMED_OUT)

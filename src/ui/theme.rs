@@ -168,8 +168,6 @@ theme_slots! {
     context,
     /// Dimmed secondary text: info lines, hints, quiet chrome.
     muted,
-    /// Tool-call/result machinery lines.
-    machinery,
     /// Error lines and failure notices.
     error,
     /// qwen `text.primary` (Foreground `#bfbdb6`, Phase 7, ADR-0008): body/info
@@ -186,29 +184,14 @@ theme_slots! {
     warning,
     /// Settled/streaming thinking lines (grey; hidden under compact mode, Ctrl+O).
     thinking,
-    /// The live `✦ Thinking` header over the streaming reasoning tail
-    /// (ADR-0040): the animated brain, where motion sits during a Run.
+    /// The live `✦ Thinking` header over the streaming reasoning tail:
+    /// the animated brain, where motion sits during a Run.
     thinking_header,
     /// The lull "waiting" animation + its elapsed timer (the spellcast scenes):
     /// quiet chrome under the running lane, so it reads muted by default. Named
     /// for the lull it fills - a quiet stretch WITHIN a running Run, distinct
     /// from the Agent being Idle.
     lull,
-    /// The `>` gutter marking the user's own prompts.
-    prompt_gutter,
-    /// The dim `│` run-lane spine the agent's whole Run hangs off (ADR-0040):
-    /// background chrome, so it recedes like the machinery plane.
-    lane_spine,
-    /// The Housekeeping marker plane (ADR-0040): Compaction, Result-Cap cuts.
-    /// Neutral gray - routine tidying, not a judgment.
-    marker_housekeeping,
-    /// The Aid marker plane (ADR-0040): a marker that helps the model. Warm
-    /// amber, kept clear of error-red. Reserved - no producer emits it since
-    /// the nudge apparatus was removed.
-    marker_aid,
-    /// The Constrain marker plane (ADR-0040): a guard limiting the model - the
-    /// loop-detector's run-close. Cool blue, clear of green.
-    marker_constrain,
     /// Assistant markdown headings.
     heading,
     /// Assistant markdown list bullets.

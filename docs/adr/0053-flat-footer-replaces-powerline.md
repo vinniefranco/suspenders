@@ -1,7 +1,7 @@
 # Flat footer replaces the powerline status bar
 
-The qwen-code UI port (ADR-0046 and its Phase siblings) reached the status line
-last. Suspenders drew a bespoke POWERLINE bar: block-background segments joined
+The qwen-code UI port (ADR-0046) reached the status line last. Suspenders drew
+a bespoke POWERLINE bar: block-background segments joined
 by `` triangles (`SEP_RIGHT`/`SEP_LEFT`), a run-state mode dot, and a
 per-`PressureLevel` token block. qwen-code's `Footer.tsx` is nothing like it: a
 single flat row, `justifyContent:"space-between"`, `paddingX:2`, no triangles,
@@ -12,15 +12,15 @@ the qwen look the powerline had to go, because the look is the segment machinery
 
 Replace the powerline `status_bar` with a flat `footer` (qwen `Footer.tsx`): ONE
 row, hand-rolled space-between with a 2-cell inset on each side, NO background
-fill. This reverses ADR-0046's `status_bar` naming and the ADR-0008/0040 segment
-palette. The names move with the shape: `status_bar`→`footer`,
+fill. This retires the `status_bar` name and the ADR-0008 segment palette. The
+names move with the shape: `status_bar`→`footer`,
 `render_status_bar`→`render_footer`, `StatusBar`→`Footer`,
 `StatusBarView`→`FooterView`; the eleven-variant `StatusSegment` collapses to a
 small `FooterItem` {Model, Context, Cost} plus a left `FooterLeft`
 {AutoAccept(mode), Shortcuts}. The pure `footer()` assembly returns a `Footer`
 value tested WITHOUT a frame; only `render_footer` touches ratatui (ADR-0019).
 
-### Footer content — Option B (faithful FORM, load-bearing facts kept)
+### Footer content - Option B (faithful FORM, load-bearing facts kept)
 
 qwen's footer, mapped to the facts suspenders actually has (no worktree, sandbox,
 debug, statusline, or goal producers), reduces the right side to just the context
@@ -28,7 +28,7 @@ figure. Two readings were on the table:
 
 - **Option A** (faithful-strict): right = `N% context used` only.
 - **Option B** (CHOSEN): match qwen's flat FORM exactly, but keep the
-  load-bearing suspenders facts as the ` | `-joined right group —
+  load-bearing suspenders facts as the ` | `-joined right group -
   `model <id>` · context% · cost. A local-first, multi-provider tool genuinely
   benefits from an always-visible Active Model and Session cost; dropping them to
   chase strict fidelity would lose information the operator steers by. Dropped as
@@ -38,7 +38,7 @@ figure. Two readings were on the table:
 
 Right group order, each item emitted only when its fact exists, ` | ` separator
 in `text.secondary` with NO leading separator: `model <id>` (secondary),
-context% (secondary normal / `error` over-limit — qwen's INNER
+context% (secondary normal / `error` over-limit - qwen's INNER
 `ContextUsageDisplay` colour, not an outer accent wrapper), cost (secondary, only
 when the Session total is positive). The left content is qwen's
 `leftBottomContent` ladder trimmed to the producers suspenders has: the
@@ -58,7 +58,7 @@ items show at a given width is a SEMANTIC decision, so it lives in the pure
 
 Deleted outright: `SEP_RIGHT`/`SEP_LEFT`, the powerline draw loop,
 `segment_style`/`segment_bg`, `SegmentKind`, `StatusSegment`, and `pressure_style`
-(confirmed to have no consumer besides the retired bar — `PressureLevel` itself
+(confirmed to have no consumer besides the retired bar - `PressureLevel` itself
 stays on `Screen`, since context over-limit is now read straight off the
 token/budget ratio, not a pressure block). The `TokenView` carrier's `level`
 field died with the pressure block, so `FigureView.tokens` is now a plain
@@ -78,9 +78,9 @@ COLOUR slots were dead.)
   shed policy, and the fact-presence rules are all unit-tested without a frame.
 - The colour roles the footer paints (`success`/`warning`/`error`/`secondary`,
   and the per-mode AutoAccept label colour) come from the ADR-0008 semantic slots
-  reconciled in this same phase — see the ADR-0008 amendment.
+  reconciled in this same phase - see the ADR-0008 amendment.
 - The narrow behaviour diverges from qwen (shed vs. stack). Accepted: a one-row
-  footer is the ADR-0046 layout contract; the shed keeps context% — qwen's sole
-  figure — visible longest.
+  footer is the ADR-0046 layout contract; the shed keeps context% - qwen's sole
+  figure - visible longest.
 - `ConnectionFacts.base_url` stays on the struct (a Session fact other code may
   want) even though the footer no longer shows it.

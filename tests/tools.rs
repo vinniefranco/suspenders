@@ -81,6 +81,29 @@ fn every_builtin_declares_its_qwen_kind() {
     }
 }
 
+// Each built-in declares the CutPolicy Shaping applies to its oversized Tool
+// Result. run_shell_command keeps its head AND tail (the exit code and last
+// errors live at the end); read_file cuts at a line boundary with a
+// file-absolute resume offset; every other tool takes the default Head. A
+// drifted declaration here would silently change a tool's cut markers.
+#[test]
+fn every_builtin_declares_its_cut_policy() {
+    use crate::tool::CutPolicy;
+    for tool in tools() {
+        let expect = match tool.spec().name.as_str() {
+            "read_file" => CutPolicy::HeadWithResume,
+            "run_shell_command" => CutPolicy::HeadTail,
+            _ => CutPolicy::Head,
+        };
+        assert_eq!(
+            tool.cut_policy(),
+            expect,
+            "{} must declare {expect:?}",
+            tool.spec().name
+        );
+    }
+}
+
 #[test]
 fn task_stop_is_the_deferred_builtin() {
     // task_stop (P4b, ADR-0063) is the first deferred built-in: it appears in

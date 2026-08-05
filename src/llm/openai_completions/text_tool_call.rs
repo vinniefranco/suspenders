@@ -6,7 +6,7 @@
 //! markup INSIDE `delta.content`. This module's line-anchored pre-check spots
 //! that markup with a self-contained scan of the accumulated content. The
 //! structured fold in
-//! [`super::stream`] drops that text on the floor, so a perfectly good tool
+//! `super::stream` drops that text on the floor, so a perfectly good tool
 //! call vanishes into prose. This module recovers it: a pure parse over the
 //! accumulated content string, no I/O, no transport reference.
 //!
@@ -35,7 +35,7 @@
 //!
 //! Text parsing is a FALLBACK the caller reaches only when the structured
 //! channel came back empty (structured always wins - see
-//! [`super::stream::StreamState::finalize`]). Before parsing anything, a cheap
+//! `super::stream::StreamState::finalize`). Before parsing anything, a cheap
 //! line-anchored pre-check guards
 //! against prose that merely mentions the markup inline: a line must actually
 //! START with `<tool_call` or `<function=` for the parse to run, so

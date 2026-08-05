@@ -1,6 +1,5 @@
 use super::*;
 use crate::content::ContentBlock;
-use crate::event::Stage;
 use crate::view_model::Tone;
 use crate::view_model::TranscriptItem;
 use std::collections::HashMap;
@@ -331,6 +330,32 @@ fn normal_stop_reason_adds_no_info_abnormal_one_does() {
     assert_eq!(items(&abnormal), vec![info("turn stopped: :max_tokens")]);
 }
 
+#[test]
+fn a_run_limit_stop_reaches_the_note_truthfully() {
+    // The settlement event carries the canonical reason (ADR-0069), so a
+    // Run-Limit stop notes itself - it no longer degrades to `:unknown`.
+    let t = fold(
+        fresh(),
+        vec![Event::RunFinished {
+            stop_reason: StopReason::RunLimit,
+            token_estimate: 0,
+            context_budget: 0,
+        }],
+    );
+    assert_eq!(items(&t), vec![info("turn stopped: :turn_limit")]);
+
+    // A Hook's custom atom notes itself the same way.
+    let t = fold(
+        fresh(),
+        vec![Event::RunFinished {
+            stop_reason: StopReason::Custom("budget_hook".into()),
+            token_estimate: 0,
+            context_budget: 0,
+        }],
+    );
+    assert_eq!(items(&t), vec![info("turn stopped: :budget_hook")]);
+}
+
 // --- context pressure --------------------------------------------------
 
 fn pressurized(estimate: u64) -> Screen {
@@ -641,7 +666,7 @@ fn expire_approval_with_no_pending_is_inert() {
 #[test]
 fn approval_mode_changed_mirrors_the_mode_silently() {
     let (t, effects) = fresh().apply_event(Event::approval_mode_changed(ApprovalMode::Yolo));
-    assert_eq!(t.approval_mode, ApprovalMode::Yolo);
+    assert_eq!(t.approval_mode(), ApprovalMode::Yolo);
     assert_eq!(sans_commit(effects), vec![]);
     assert_eq!(items(&t), vec![], "the mirror is never a Transcript item");
 }
@@ -1380,17 +1405,13 @@ fn session_log_error_becomes_info_line() {
 }
 
 #[test]
-fn extension_error_events_become_info_lines() {
-    let t = fold(
-        fresh(),
-        vec![Event::extension_error("diff", Stage::PreRun, "boom")],
-    );
+fn fail_open_report_events_become_info_lines() {
+    let t = fold(fresh(), vec![Event::fail_open_report("hook Stop", "boom")]);
     let items = items(&t);
     assert_eq!(items.len(), 1);
     match &items[0] {
         TranscriptItem::Info { text } => {
-            assert!(text.contains("diff"));
-            assert!(text.contains("pre_run"));
+            assert!(text.contains("hook Stop"));
             assert!(text.contains("boom"));
         }
         other => panic!("expected info, got {other:?}"),
@@ -1773,7 +1794,10 @@ fn toggle_compact_flips_with_a_thinking_item_on_screen() {
             text: "a thought".into(),
         }],
     ));
-    let (screen, _) = screen.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+    let (screen, _) = screen.apply_event(Event::message_end(
+        vec![],
+        crate::llm::response::StopReason::EndTurn,
+    ));
 
     let (screen, effects) = screen.handle_key(Key::ToggleCompact);
     assert!(screen.compact_mode);
@@ -1927,7 +1951,10 @@ fn appended_content_does_not_move_a_detached_view() {
             text: "more output".into(),
         }],
     ));
-    let (t, _) = t.apply_event(Event::message_end(vec![], StopReason::EndTurn));
+    let (t, _) = t.apply_event(Event::message_end(
+        vec![],
+        crate::llm::response::StopReason::EndTurn,
+    ));
 
     assert!(
         !t.follow_tail,
@@ -2078,4 +2105,264 @@ fn typed_chars_do_not_edit_the_composer_while_modal_open() {
     assert_eq!(t.composer().view().draft, "draft");
     assert_eq!(t.composer().view().cursor, 5);
     assert_eq!(t.pending_approval, pending_before);
+}
+
+// --- the modal state machines, standalone (no Screen) --------------------
+//
+// Each Pending* modal is a real state machine (private fields, transition
+// methods), constructible without a Screen: these pin every transition at the
+// machine's own interface - the fast feedback loop for a new question type or
+// plan outcome. The Screen-level tests above stay the choreography proof
+// (routing order, effects, focus); these prove the machines alone.
+
+fn machine_approval() -> PendingApproval {
+    PendingApproval::new("a-1".into(), "cargo test".into(), ConfirmKind::Exec)
+}
+
+#[test]
+fn approval_machine_enter_selects_the_active_row_approve_once() {
+    let mut a = machine_approval();
+    assert_eq!(a.active_row(), 0);
+    assert_eq!(a.fold_key(&Key::Enter), Some(Decision::Approve));
+}
+
+#[test]
+fn approval_machine_arrows_move_without_resolving() {
+    let mut a = machine_approval();
+    assert_eq!(a.fold_key(&Key::ArrowDown), None);
+    assert_eq!(a.active_row(), 1);
+    assert_eq!(a.fold_key(&Key::Enter), Some(Decision::ApproveAlways));
+}
+
+#[test]
+fn approval_machine_digits_quick_select_each_row() {
+    assert_eq!(
+        machine_approval().fold_key(&Key::Char('1')),
+        Some(Decision::Approve)
+    );
+    assert_eq!(
+        machine_approval().fold_key(&Key::Char('2')),
+        Some(Decision::ApproveAlways)
+    );
+    assert_eq!(
+        machine_approval().fold_key(&Key::Char('3')),
+        Some(Decision::Deny)
+    );
+}
+
+#[test]
+fn approval_machine_quick_keys_stay_a_superset() {
+    assert_eq!(
+        machine_approval().fold_key(&Key::Char('y')),
+        Some(Decision::Approve)
+    );
+    assert_eq!(
+        machine_approval().fold_key(&Key::Char('n')),
+        Some(Decision::Deny)
+    );
+    assert_eq!(
+        machine_approval().fold_key(&Key::Char('a')),
+        Some(Decision::ApproveAlways)
+    );
+}
+
+#[test]
+fn approval_machine_escape_denies_this_tool() {
+    assert_eq!(
+        machine_approval().fold_key(&Key::Escape),
+        Some(Decision::Deny)
+    );
+}
+
+#[test]
+fn approval_machine_swallows_a_stray_key_without_moving() {
+    let mut a = machine_approval();
+    assert_eq!(a.fold_key(&Key::Char('x')), None);
+    assert_eq!(a.fold_key(&Key::Tab), None);
+    assert_eq!(a.active_row(), 0);
+}
+
+#[test]
+fn approval_machine_expire_is_inert_for_the_three_row_radio() {
+    // Every digit on a 3-row list selects immediately, so nothing ever buffers
+    // and the host-tick expiry has nothing to fire.
+    let mut a = machine_approval();
+    assert_eq!(a.expire(10_000), None);
+}
+
+#[test]
+fn approval_machine_matches_only_its_own_id() {
+    let a = machine_approval();
+    assert!(a.matches("a-1"));
+    assert!(!a.matches("a-2"));
+    assert_eq!(a.approval_id(), "a-1");
+    assert_eq!(a.command(), "cargo test");
+    assert_eq!(a.kind(), ConfirmKind::Exec);
+}
+
+fn machine_question(headers: &[&str]) -> PendingQuestion {
+    let questions = headers
+        .iter()
+        .map(|h| question(h, &["first", "second"]))
+        .collect();
+    PendingQuestion::new("q-1".into(), questions)
+}
+
+#[test]
+fn question_machine_enter_records_the_active_option_and_completes() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.fold_key(&Key::Enter), QuestionFold::Complete);
+    assert_eq!(q.answer(0), Some("first"));
+    assert_eq!(
+        q.resolution(),
+        AgentCommand::AnswerQuestion("q-1".into(), Ok(vec![(0, "first".into())]))
+    );
+}
+
+#[test]
+fn question_machine_advances_across_questions_before_completing() {
+    let mut q = machine_question(&["One", "Two"]);
+    assert_eq!(q.fold_key(&Key::Enter), QuestionFold::Advanced);
+    // The second question's radio is now the one driven.
+    assert_eq!(q.fold_key(&Key::ArrowDown), QuestionFold::Swallow);
+    assert_eq!(q.active_row(1), 1);
+    assert_eq!(q.fold_key(&Key::Enter), QuestionFold::Complete);
+    assert_eq!(
+        q.resolution(),
+        AgentCommand::AnswerQuestion(
+            "q-1".into(),
+            Ok(vec![(0, "first".into()), (1, "second".into())])
+        )
+    );
+}
+
+#[test]
+fn question_machine_digit_quick_selects_an_option() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.fold_key(&Key::Char('2')), QuestionFold::Complete);
+    assert_eq!(q.answer(0), Some("second"));
+}
+
+#[test]
+fn question_machine_other_row_arms_free_form_capture() {
+    let mut q = machine_question(&["One"]);
+    // Row 2 is the auto-"Other" row (two real options + 1): digit 3 lands on it.
+    assert_eq!(q.fold_key(&Key::Char('3')), QuestionFold::CaptureOther);
+    assert_eq!(q.collecting_other(), Some(0));
+    assert_eq!(q.answer(0), None, "no answer recorded yet");
+}
+
+#[test]
+fn question_machine_submit_other_records_the_free_form_answer() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.fold_key(&Key::Char('3')), QuestionFold::CaptureOther);
+    assert_eq!(q.submit_other("hand-typed".into()), QuestionFold::Complete);
+    assert_eq!(q.collecting_other(), None);
+    assert_eq!(
+        q.resolution(),
+        AgentCommand::AnswerQuestion("q-1".into(), Ok(vec![(0, "hand-typed".into())]))
+    );
+}
+
+#[test]
+fn question_machine_cancel_other_returns_to_the_radio() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.fold_key(&Key::Char('3')), QuestionFold::CaptureOther);
+    q.cancel_other();
+    assert_eq!(q.collecting_other(), None);
+    assert_eq!(q.answer(0), None, "backing out records nothing");
+    // The radio kept its position (the "Other" row the digit landed on), so the
+    // user can pick again: wrap down to the first real option and resolve.
+    assert_eq!(q.fold_key(&Key::ArrowDown), QuestionFold::Swallow);
+    assert_eq!(q.active_row(0), 0);
+    assert_eq!(q.fold_key(&Key::Enter), QuestionFold::Complete);
+    assert_eq!(q.answer(0), Some("first"));
+}
+
+#[test]
+fn question_machine_submit_other_with_no_capture_armed_swallows() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.submit_other("stray".into()), QuestionFold::Swallow);
+    assert_eq!(q.answer(0), None);
+}
+
+#[test]
+fn question_machine_escape_declines_with_the_verbatim_string() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.fold_key(&Key::Escape), QuestionFold::Decline);
+    assert_eq!(
+        q.declination(),
+        AgentCommand::AnswerQuestion(
+            "q-1".into(),
+            Err("User declined to answer the questions.".into())
+        )
+    );
+}
+
+#[test]
+fn question_machine_arrows_move_the_current_radio_without_resolving() {
+    let mut q = machine_question(&["One"]);
+    assert_eq!(q.fold_key(&Key::ArrowDown), QuestionFold::Swallow);
+    assert_eq!(q.active_row(0), 1);
+    assert_eq!(q.fold_key(&Key::Char('x')), QuestionFold::Swallow);
+    assert_eq!(q.active_row(0), 1, "a stray key does not move the radio");
+}
+
+fn machine_plan() -> PendingPlan {
+    PendingPlan::new("p-1".into(), "# The Plan".into(), ApprovalMode::Default)
+}
+
+#[test]
+fn plan_machine_enter_picks_the_active_restore_row() {
+    let mut p = machine_plan();
+    assert_eq!(p.active_row(), 0);
+    assert_eq!(p.fold_key(&Key::Enter), Some(PlanDecision::RestorePrevious));
+}
+
+#[test]
+fn plan_machine_digits_map_each_outcome_row() {
+    assert_eq!(
+        machine_plan().fold_key(&Key::Char('1')),
+        Some(PlanDecision::RestorePrevious)
+    );
+    assert_eq!(
+        machine_plan().fold_key(&Key::Char('2')),
+        Some(PlanDecision::ProceedAlways)
+    );
+    assert_eq!(
+        machine_plan().fold_key(&Key::Char('3')),
+        Some(PlanDecision::ProceedOnce)
+    );
+    assert_eq!(
+        machine_plan().fold_key(&Key::Char('4')),
+        Some(PlanDecision::Cancel)
+    );
+}
+
+#[test]
+fn plan_machine_escape_keeps_planning() {
+    assert_eq!(
+        machine_plan().fold_key(&Key::Escape),
+        Some(PlanDecision::Cancel)
+    );
+}
+
+#[test]
+fn plan_machine_arrows_move_without_resolving() {
+    let mut p = machine_plan();
+    assert_eq!(p.fold_key(&Key::ArrowDown), None);
+    assert_eq!(p.active_row(), 1);
+    assert_eq!(p.fold_key(&Key::Char('x')), None);
+    assert_eq!(p.active_row(), 1, "a stray key does not move the radio");
+}
+
+#[test]
+fn plan_machine_resolution_carries_id_and_decision() {
+    let p = machine_plan();
+    assert_eq!(p.plan(), "# The Plan");
+    assert_eq!(p.pre_plan_mode(), ApprovalMode::Default);
+    assert_eq!(
+        p.resolution(PlanDecision::ProceedOnce),
+        AgentCommand::AnswerPlan("p-1".into(), PlanDecision::ProceedOnce)
+    );
 }

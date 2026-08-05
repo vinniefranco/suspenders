@@ -17,7 +17,9 @@
 //! * **Failed file operations are worded by [`file_error`]**, which formats the
 //!   POSIX reason and appends closest-match suggestions on ENOENT.
 //! * **Errors return, never raise.**
-//! * **Size is not a tool concern** - `tools::shaping` cuts every result.
+//! * **Size is not a tool concern** - `tools::shaping` cuts every result. A
+//!   tool only DECLARES how its result cuts ([`CutPolicy`], like
+//!   [`Tool::kind`]); the applier stays tool-name-free.
 
 use std::path::PathBuf;
 
@@ -126,6 +128,28 @@ impl From<String> for ToolOutput {
     }
 }
 
+/// How Shaping cuts this Tool's oversized Tool Result to the Result Cap - the
+/// per-Tool declaration `tools::shaping` applies, mirroring [`Tool::kind`]: the
+/// Tool states the fact about itself, the deep module folds it with zero
+/// knowledge of tool names. The DEFAULT is [`CutPolicy::Head`] - keep the
+/// start, append the truncated-output marker - which is right for every tool
+/// whose output reads front-to-back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CutPolicy {
+    /// Keep the first `cap` chars and append the truncated-output marker.
+    #[default]
+    Head,
+    /// Keep the start AND the end, with an omitted-middle marker between: for a
+    /// tool whose signal lives at the end (run_shell_command's exit code and
+    /// last errors).
+    HeadTail,
+    /// Cut at a line boundary and name the file-absolute 0-based `offset` that
+    /// continues the read (read_file): Shaping reads the Tool Call input's
+    /// `offset` so the resume marker is file-absolute. A first line wider than
+    /// the whole cap falls back to [`CutPolicy::Head`].
+    HeadWithResume,
+}
+
 /// The authoring contract a Suspenders tool implements (baud's `Baud.Tool`
 /// behaviour). `spec` is the Anthropic tool format; `run` gets the decoded
 /// input (an open edge - a `serde_json::Value`) plus the [`ToolCtx`].
@@ -149,6 +173,16 @@ pub trait Tool: Send + Sync {
     /// `Kind::Other` (its side effects are opaque to us).
     fn kind(&self) -> crate::approvals::Kind {
         crate::approvals::Kind::Other
+    }
+
+    /// How Shaping cuts this tool's oversized Tool Result ([`CutPolicy`]),
+    /// declared the way [`kind`](Tool::kind) is: a per-Tool self-description the
+    /// deep applier (`tools::shaping`) folds without knowing any tool's name.
+    /// The default is [`CutPolicy::Head`]; only a tool whose output reads
+    /// differently (run_shell_command's tail-heavy output, read_file's resumable
+    /// line window) overrides it.
+    fn cut_policy(&self) -> CutPolicy {
+        CutPolicy::Head
     }
 
     async fn run(&self, input: &serde_json::Value, ctx: &ToolCtx) -> Result<String, String>;

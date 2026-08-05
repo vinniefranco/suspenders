@@ -1,12 +1,9 @@
 # The Lull: a whimsical waiting animation for the quiet of a running Run
 
-ADR-0040 made a running Run a visual object: live reasoning streams as a
-`✦ Thinking` tail under the lane spine, and the running spinner moved from the
-status bar to that brain. But a Run is not always streaming. Against a slow
-local model there are long stretches where the Run is running yet nothing
-streams - waiting on the first token, or a tool executing. ADR-0040's screen
-shows only a still lane and a motionless status dot: indistinguishable, at a
-glance, from a hung process. This ADR records the Lull - the animation that
+A Run is not always streaming. Against a slow local model there are long
+stretches where the Run is running yet nothing streams - waiting on the first
+token, or a tool executing - and a screen with no motion is indistinguishable,
+at a glance, from a hung process. This ADR records the Lull - the animation that
 fills that silence - and the decisions that keep it cheap, safe, and deterministic.
 
 ## Decision
@@ -17,16 +14,16 @@ bar has an idle segment. The Lull is the opposite - the Run *is* running, it is
 just momentarily silent. The naming is pinned in CONTEXT.md so the distinction
 does not erode.
 
-**The Lull row is a third live entry, hanging off the lane.** Like the reasoning
-tail and the streaming answer, it is appended at render time under the running
-Run's `│` spine, indented two columns as a sub-block. It draws only when the Run
-is Running AND neither a reasoning tail nor a streaming answer is on screen. That
-gate is exactly `!has_live_stream()` - one predicate on the Screen (reasoning OR
-answer text streaming) that BOTH the render gate and the adapter's lull clock read,
-so the two can never disagree about whether a Lull is happening.
+**The Lull draws on the spinner line, not as a row of its own.** The fullscreen
+transcript body (ADR-0046) shows one spinner line while the Agent is Running;
+the current Lull scene is that line's phrase content, displaced by the thought
+subject when Thinking streams. The lull clock resets whenever output streams -
+the gate is `Screen::has_live_stream()`, one predicate (reasoning OR answer text
+streaming) - so the phrase and the clock can never disagree about whether a Lull
+is happening.
 
 **The clock is tick-counted, never wall-clock.** The adapter already ticks ~10fps
-and repaints while a Run runs (ADR-0040's spinner). The Lull rides that same tick:
+and repaints while a Run runs (the spinner). The Lull rides that same tick:
 a `quiet_ticks` counter resets whenever output streams and increments on every
 quiet tick; a `lull_seq` counter bumps on each 0→1 edge (a new Lull begins). No
 `Instant`, no timer thread - the codebase bans `Date::now`/`rand`-style
@@ -72,8 +69,8 @@ so the whimsy is themed independently and can be brighter than the muted chrome.
 - **A real RNG (`rand`, or seeding from the clock).** Rejected: nondeterministic
   and untestable, and the repo bans `Date::now`/`Math.random`-class calls. Hashing
   a per-Lull counter gives the same variety with a fixed, provable map.
-- **Multi-row ASCII scenes.** Rejected: a width wobble on any row can desync the
-  lane spine (ADR-0040's measure==draw hazard). Single-row + truncate is the safe
+- **Multi-row ASCII scenes.** Rejected: a width wobble on any row breaks the
+  measure==draw contract (ADR-0029). Single-row + truncate is the safe
   envelope; richer art is not worth reintroducing the emoji-width bug.
 - **A separate animation timer/thread.** Unnecessary: the adapter's existing
   running tick already repaints ~10fps, and the Lull clock is just two counters
@@ -84,16 +81,14 @@ so the whimsy is themed independently and can be brighter than the muted chrome.
 
 ## Consequences
 
-The Lull is entirely adapter-local and cheap to reverse: a new pure `ui::lull`
-module (no ratatui, ADR-0019), a `live_lull_lines` sibling of `live_thinking_lines`
-in `components.rs`, and the lull-clock maintenance in the one existing tick arm.
-The store is untouched - like the lane and the tail, the Lull is a render-time
-projection, nothing persisted. Two crate-visible ripples: `TICK_MS` becomes
-`pub(crate)` (the display side turns ticks into seconds at the same cadence the
-adapter ticks), and the loose `spinner: u64` render parameter becomes the `Anim`
-value object across `render`/`render_viewport` and the draw path. One new theme
-slot (`lull`) lands at ADR-0008's vocabulary chokepoint; both built-in themes carry
-it (light is total, ADR-0038). The measure==draw hazard is the same one the tail
-already lives with: the Lull row is measured and drawn at `content_area.width` and
-truncated to one visual row, so `wrapped_count` cannot desync from the drawn row
-and slide the gutter off its content (ADR-0029).
+The Lull is entirely adapter-local and cheap to reverse: a pure `ui::lull`
+module (no ratatui, ADR-0019) that maps the clock to the glyph to draw, the
+spinner line reading it for its phrase, and the lull-clock maintenance in the
+one existing tick arm. The store is untouched - the Lull is a render-time
+projection, nothing persisted. The animation state travels as the `Anim`
+value object through the render path, and `TICK_MS` is `pub(crate)` so the
+display side turns ticks into seconds at the same cadence the adapter ticks.
+One theme slot (`lull`) sits at ADR-0008's vocabulary chokepoint; both built-in
+themes carry it (light is total, ADR-0038). The spinner line is measured and
+drawn at `content_area.width` and truncated to one visual row, so measure and
+draw cannot desync (ADR-0029).

@@ -1,71 +1,53 @@
 # Tool Calls reach the host through a Capability Context on the ToolCtx
 
-A handful of Tool Calls need to reach BACK to the host for a live decision the model cannot make alone: ask the user to approve a gated command, put a question to the user, run a bounded side-query against the model, spawn a subagent. Those are *effects*, and a tool cannot own the channel they travel over (the Agent owns the mpsc). Yet the tool is where the effect originates, mid-run, not at a loop control point.
+A handful of Tool Calls need to reach BACK to the host for a live decision the model cannot make alone: ask the user to approve a gated command, put a question to the user, run a bounded side-query against the model, spawn a subagent, background a shell, change the Approval Mode. Those are *effects*, and a tool cannot own the channel they travel over (the Agent owns the mpsc). Yet the tool is where the effect originates, mid-run, not at a loop control point.
 
-We carry those effect handles onto the `ToolCtx` as a Parameter Object, `Capabilities`, holding `Arc<dyn Trait>` seams (F1):
+Those effect handles ride the `ToolCtx` as a Parameter Object, `Capabilities`: `Arc<dyn Trait>` seams for the effects, concrete `Arc`s for Run-scoped state. The carrier holds:
 
-```rust
-pub struct Capabilities {
-    pub registry: Arc<ToolRegistry>,      // concrete - Run-scoped state, not an effect
-    pub read_cache: Arc<FileReadCache>,   // concrete - Run-scoped state, not an effect (F6, ADR-0060)
-    pub approver: Arc<dyn Approver>,      // dyn - the tool-initiated effect seam (P1b)
-    pub side_query: Arc<dyn SideQuery>,   // dyn - the bounded-model side-query seam (P2b)
-    pub questioner: Arc<dyn Questioner>,  // dyn - the ask_user_question seam (P2a)
-    // P4: subagents (deferred, see below)
-}
-```
+- `registry: Arc<ToolRegistry>` - concrete Run-scoped state; `tool_search` reveals deferred tools through it (ADR-0054).
+- `read_cache: Arc<FileReadCache>` - concrete Run-scoped state (ADR-0060); `read_file` records a successful read, `notebook_edit` checks for a prior FULL read before mutating.
+- `approver: Arc<dyn Approver>` - the tool-initiated Approval seam. The batch gate drives Approval through `RunDeps::request_approval`; the capability shares the exact same request path (`AgentApprover` is a near-verbatim twin of `AgentDeps::request_approval`).
+- `side_query: Arc<dyn SideQuery>` - a bounded model prompt off the main Conversation; `web_fetch` runs its prompt-guided extraction through it.
+- `questioner: Arc<dyn Questioner>` - `ask_user_question`'s modal round-trip (ADR-0057).
+- `subagents: Arc<dyn SubagentSpawner>` - the `agent` tool spawns a child Run and awaits its settlement (ADR-0061).
+- `bg_shells: Arc<dyn BackgroundShellSpawner>` - `run_command` with `is_background: true` hands the process to the Agent, which owns the detached lifecycle (ADR-0064).
+- `approval_mode: Arc<AtomicApprovalMode>` and `plan_exit_notice: Arc<PendingManualPlanExit>` - concrete shared state for the live Approval Mode mirror and the one-shot manual-plan-exit notice (ADR-0067).
+- `plan_mode: Arc<dyn PlanMode>` - the plan-lifecycle tools (`enter_plan_mode`/`exit_plan_mode`) reach the Agent-owned mode through it (ADR-0067).
 
-The `ToolCtx` swaps its bare `registry` field for a `caps: Capabilities` and gains a `registry()` accessor, so the three registry-reading sites (`tool_search`, the Tools dispatch, the Loop's wire list) read through one method and the field path stays internal to the carrier.
+The `ToolCtx` carries `caps: Capabilities` with accessors (`registry()`, `read_cache()`, ...), so the field paths stay internal to the carrier.
 
 ## Two effect channels, one terminus
 
-Suspenders now has two distinct channels a Run reaches its host through, and they are deliberately different shapes:
+Suspenders has two distinct channels a Run reaches its host through, and they are deliberately different shapes:
 
 - **`RunDeps` (ADR-0011)** is the *loop-owned* channel: a `&mut D` static-dispatch bundle for the effects the Loop itself drives at control points (`complete`, `compact`, `checkpoint`, `drain_steering`, and `request_approval` as the batch gate calls it). Static dispatch because the Loop is `async fn run<D: RunDeps>` and monomorphises per caller; its async methods use RPITIT (edition 2024), no boxing, no `async_trait`.
 - **`Capabilities` (this ADR)** is the *tool-owned* channel: an `Arc<dyn>` bundle for effects a Tool Call initiates while it runs, deep inside a `dyn Tool::run` where no `&mut D` reaches. Dynamic dispatch because the seam is `dyn` (its real impl lives in the Agent while the Run and its tools do not depend on the Agent), so its async methods MUST use `async_trait` - RPITIT is not object-safe. This is the opposite tradeoff from `RunDeps`, and it is correct for each: do not "fix" `Capabilities` to RPITIT (it cannot be `dyn`), and do not "fix" `RunDeps` to `async_trait` (it does not need boxing).
 
-Both channels terminate at the SAME Agent mpsc. A Capability's real impl sends the same `RunMsg` a `RunDeps` method would; the Agent is still the single owner of Event order (ADR-0017).
+Both channels terminate at the SAME Agent mpsc when the effect is Agent-owned; the Agent is still the single owner of Event order (ADR-0017).
 
-## Concrete registry, dynamic effects
+## Concrete state, dynamic effects
 
-The `ToolRegistry` rides `Capabilities` as a concrete `Arc`, not a `dyn` seam, because it is not an effect - it is Run-scoped state the tools READ (`tool_search` reveals deferred tools through it; every other tool ignores it). Only the things that reach back to the host for a decision are `dyn`.
-
-The `FileReadCache` (F6, ADR-0060) is the SECOND concrete Run-scoped state carried here, and it proves the pattern generalises past the registry: read_file records a successful read into it, notebook_edit checks it for a prior FULL read before mutating a notebook, every other tool ignores it. It is not an effect (nothing about it reaches back to the host for a decision), so like the registry it stays a concrete `Arc<FileReadCache>`, and `run::run` builds a fresh, empty one per Run and threads it on alongside the registry it builds itself. `ToolCtx` gains a `read_cache()` accessor beside `registry()`. See ADR-0060 for the cache's own design (path-keyed fingerprint, enforcement-only, the deferred fast-path).
+Only the things that reach back to the host for a decision are `dyn`. The `ToolRegistry`, the `FileReadCache`, and the ADR-0067 mode carriers are Run-scoped state the tools and the loop READ, not effects - they stay concrete `Arc`s, built fresh per Run by `run::run` (a child Run gets fresh, default carriers - a subagent does not cycle the mode).
 
 ## The degraded / real duality (headless posture)
 
 Every effect capability has two impls:
 
-- a **real** impl the Agent builds, tx-backed over its mpsc (`AgentApprover`);
-- a **degraded** impl for a host with no channel to answer it - a headless run (ADR-0019) or a test (`DenyingApprover`).
+- a **real** impl the Agent builds, tx-backed over its mpsc (`AgentApprover`, `AgentQuestioner`) or wired direct to the captured Llm (below);
+- a **degraded** impl for a host with no channel to answer it - a headless run (ADR-0019), a test, or a child Run (`DenyingApprover`, `DecliningQuestioner`, `DenyingSideQuery`, `UnavailableSubagentSpawner`, `UnavailableBackgroundShellSpawner`, `SubagentPlanMode`).
 
-The degraded posture never silently does the risky thing: `DenyingApprover::approve` returns `false`. A headless run with no approval channel must not execute a gated command; the safe answer is to deny, not to panic. This is the headless seam (ADR-0019) applied to tool-initiated effects: the degraded impl IS the headless posture for this class of effect.
+The degraded posture never silently does the risky thing: `DenyingApprover::approve` returns `false` - a headless run with no approval channel must not execute a gated command; the safe answer is to deny, not to panic. `DecliningQuestioner` returns the VERBATIM qwen non-interactive string. `UnavailableSubagentSpawner` doubles as the RECURSION GUARD: a child Run's own `subagents` capability is degraded, so a subagent cannot spawn a subagent (ADR-0061). This is the headless seam (ADR-0019) applied to tool-initiated effects.
 
-## The Approver proves the seam with a live wire
+## Tx-backed or direct-to-Llm, by who owns the effect
 
-`Approver` is the one capability P1b lands, because its wire already exists: `RunMsg::RequestApproval` is already a variant, so `AgentApprover::approve` is a live effect (a near-verbatim lift of `AgentDeps::request_approval`), and it proves the whole DI mechanism end to end. It is threaded from the Agent to the Run through the `Capture` snapshot (the Agent owns the tx, so it builds the handle; the Run assembles it into `Capabilities` alongside the registry it builds itself).
+A capability's real impl wires to whichever boundary OWNS the effect:
 
-P1b is *seam only, no behavior change*: no tool consumes `Capabilities.approver` yet - the batch gate still drives approval through `RunDeps::request_approval`. The `AgentApprover` and the gate share the exact request path; a later phase collapses that transient duplication once a tool initiates its own Approval. The seam is proven by unit tests, and every existing approval / batch / tool test passes unchanged.
+- **Agent-relayed** (tx-backed over the mpsc): `Approver` and `Questioner` - approval and questions are Agent/user-owned decisions (Standing Approvals, modals, forwarded replies); `BackgroundShellSpawner` and `PlanMode` - the Agent owns the detached-process registry and the Approval Mode.
+- **Direct to the captured Llm** (no mpsc round-trip, no `RunMsg` variant): `SideQuery` (`LlmSideQuery` in `run::side_query`) and `SubagentSpawner` (`DirectSubagentSpawner` in `run::subagent`) - a side-query or a foreground child Run is just completions over the `Arc<dyn Llm>` and `Model` the Run already captured, mutating no Agent/Conversation state (no checkpoint, no next-speaker, no Conversation edit on the parent).
 
-## SideQuery lands wired DIRECT to the Llm, not the Agent (P2b)
+This keeps `caps.rs` free of any `agent`/`run` import. One structural consequence: `SideQueryRequest.model` is `Option<Model>` (a `None` defers to the captured main model), so the `tool` capability layer names `llm::model::Model`; to keep `tool <-> llm` acyclic, `ToolSpec` lives in the `content` leaf (the shared wire-shapes home) and `tool` re-exports it, so the tool authoring contract still reads `crate::tool::ToolSpec` with no `llm -> tool` edge.
 
-`SideQuery` is the second capability to land (P2b, web_fetch's prompt-guided extraction), and it lands DIFFERENTLY from the Approver - a distinction that sharpens what "two channels, one terminus" means. The Approver's real impl (`AgentApprover`) relays over the Agent mpsc because approval is an Agent-OWNED decision: the Agent consults the Standing Approvals, opens the modal, and forwards the reply. A side-query owns none of that. Its only effect is a completion the Run ALREADY captured (the `Arc<dyn Llm>` and the `Model` on the `Capture`), and it mutates no Agent/Conversation state - it checkpoints nothing, logs nothing, and never touches the next-speaker fold. So its real impl, `LlmSideQuery`, is just that captured Llm boundary called with a transient `LlmRequest` (Thinking off, no tools, a no-op stream sink), off the main Conversation - exactly the shape `run::next_speaker` already uses for the other genuine side-query.
-
-Because the effect terminates at the Llm boundary rather than the Agent mpsc, `LlmSideQuery` lives at that boundary (`run::side_query`), built by `run::run` from the `Capture`'s own `llm`/`model` - no new `Capture` field, no `RunMsg` variant, and crucially no Agent round-trip. This keeps `caps.rs` free of any `agent`/`run` import (it names only `Model`), and it means the degraded posture is a plain `DenyingSideQuery` (a host with no model channel returns an `Err` the tool folds into its own error result), symmetric with `DenyingApprover`.
-
-One structural consequence: `SideQueryRequest.model` is `Option<Model>`, so the `tool` capability layer now names `llm::model::Model`. Paired with the pre-existing `LlmRequest.tools: Vec<ToolSpec>`, that would close a `tool <-> llm` cycle. `ToolSpec` therefore moved to the `content` leaf (the shared wire-shapes home, alongside `ContentBlock`'s `ToolUse`/`ToolResult`) and `tool` re-exports it, so the boundary carries `ToolSpec` with no `llm -> tool` edge while the tool authoring contract still reads `crate::tool::ToolSpec`. The `tool -> llm` edge (naming `Model`) is now one-directional and acyclic.
-
-web_fetch consumes it live: it fetches, caps the content at 100 000 chars, wraps it in qwen's verbatim fallback prompt, and runs the extraction through `caps.side_query` with `model: None` (defer to the captured MAIN model, faithful to qwen) and `max_attempts: 1`. web_fetch does NOT call the Approver - its Approval is upstream in the batch gate (now domain-scoped, ADR-0024).
-
-## Questioner LANDED tx-backed like the Approver (P2a, ADR-0057)
-
-`Questioner` is the third capability to land (P2a, `ask_user_question`), and it lands like the Approver, NOT like SideQuery - the CONTRAST that completes the picture. A question is an Agent-relayed, USER-owned decision: the Agent broadcasts the request (opening the modal) and forwards the reply the user gives. So its real impl, `AgentQuestioner`, is tx-backed over the Agent mpsc (a `RunMsg::AskQuestion` and a reply oneshot), a near-twin of `AgentApprover` - where SideQuery, an Llm-owned effect, bypassed the mpsc entirely. The one place it DIVERGES from the Approver is that there is no auto/standing path: `ask_question` is unconditionally the pending leg (every question opens a modal), so the Agent holds a plain `question_replies` map with none of the `Approvals` fold beside it (see ADR-0057). Its degraded impl is `DecliningQuestioner`, which returns the VERBATIM qwen non-interactive string - symmetric with `DenyingApprover`/`DenyingSideQuery` as the headless posture. Threaded from the Agent to the Run through the `Capture` snapshot, exactly like the Approver.
-
-## SubagentSpawner LANDED, DIRECT like SideQuery (P4/F4, ADR-0061)
-
-`SubagentSpawner` is the FOURTH and final capability, landed in P4/F4 (the `agent` tool). It lands like `SideQuery`, NOT like the Approver: a foreground subagent is a child Run driven INLINE off the captured Llm (a self-contained re-entrant driver, `run_child`), and it touches no Agent/Conversation state - no checkpoint, no next-speaker, no Conversation mutation on the parent. So there is no round-trip and no `RunMsg` variant: its real impl, `DirectSubagentSpawner` (`crate::run::subagent`), resolves a subagent definition and drives the child Run to settlement over the captured `Arc<dyn Llm>`, exactly as `LlmSideQuery` calls the boundary directly. Its degraded impl, `UnavailableSubagentSpawner`, is symmetric with `DenyingApprover`/`DenyingSideQuery`/`DecliningQuestioner` as the headless posture AND doubles as the RECURSION GUARD: a child Run's own `subagents` capability is this degraded impl, so a subagent cannot spawn a subagent (see ADR-0061). Threaded from the Agent to the Run through the `Capture` snapshot, like the Approver/Questioner.
-
-One contract amendment over the recorded signature: `SubagentRequest` gains a `subagent_type: String` field. qwen's `agent` tool routes by a `subagent_type` param among the available subagent definitions, so the spawner resolves a def by name rather than running one fixed child; `model: Option<Model>` stays as the F4 per-subagent seam (Opus-main / Qwen-scout), now paired with the def's own `SubagentModel` (Inherit / Scoped). The landed trait:
+The subagent contract:
 
 ```rust
 struct SubagentRequest { subagent_type: String, prompt: String, model: Option<Model> }
@@ -76,15 +58,12 @@ trait SubagentSpawner: Send + Sync {
 }
 ```
 
-## Deferral policy (discharged)
-
-The carrier plus `Approver` land in P1b; `SideQuery` lands in P2b; `Questioner` lands in P2a; `SubagentSpawner` lands in P4/F4 (above). Every capability has now landed with its consumer, so the deferral policy this ADR opened with is fully discharged - nothing remains recorded-as-contract-only.
+qwen's `agent` tool routes by `subagent_type` among the available subagent definitions, so the spawner resolves a def by name; `model: Option<Model>` is the per-subagent model seam, paired with the def's own `SubagentModel` (Inherit / Scoped).
 
 Considered and rejected:
 
-- **Adding all four capabilities up front with stub degraded impls.** A capability with no consumer yet (SubagentSpawner, before P4) would have been dead code (no consumer), and a stub that only ever returns the degraded answer is untested behavior against the quality floor. Each landed with its consumer instead: `Approver` in P1b (its wire already existed), `SideQuery` in P2b (web_fetch consumes it), `Questioner` in P2a (`ask_user_question` consumes it), and `SubagentSpawner` in P4/F4 (the `agent` tool consumes it) - the recorded signature gave P4 its contract without the interim dead code.
-- **Routing `SideQuery` through the Agent like `Approver`.** A side-query touches no Agent-owned state (no Standing Approvals, no modal, no Conversation mutation), so an mpsc round-trip and a `RunMsg` variant would be ceremony around a completion the Run already captured. `LlmSideQuery` calls the captured Llm boundary directly instead - the effect terminates at the Llm, not the Agent (see the P2b section).
+- **Routing `SideQuery` through the Agent like `Approver`.** A side-query touches no Agent-owned state (no Standing Approvals, no modal, no Conversation mutation), so an mpsc round-trip and a `RunMsg` variant would be ceremony around a completion the Run already captured.
 - **A second `dyn RunDeps` instead of a separate `Capabilities` carrier.** `RunDeps` is loop-owned `&mut D` at control points; a Tool Call has neither the `&mut D` nor a control point. The two channels are genuinely different shapes; merging them would force `RunDeps` to be `dyn` (losing its RPITIT static dispatch) for no gain.
 - **A `dyn` registry on `Capabilities`.** The registry is state, not an effect; making it `dyn` would hide a concrete type behind a seam that buys nothing.
 
-Consequence: the `ToolCtx` is the single place a Tool Call reads BOTH its Run-scoped state and its tool-initiated effect seams. The DI mechanism is proven live in P1b by the `Approver` (whose wire already existed) and consumed for the first time in P2b by `SideQuery` (web_fetch's extraction), which also shows the seam is not Agent-bound: a capability whose effect terminates at the Llm boundary wires there directly.
+Consequence: the `ToolCtx` is the single place a Tool Call reads BOTH its Run-scoped state and its tool-initiated effect seams, and the seam is not Agent-bound - a capability whose effect terminates at the Llm boundary wires there directly.

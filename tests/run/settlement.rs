@@ -85,6 +85,31 @@ fn the_loops_stop_reason_rides_through_verbatim() {
 }
 
 #[test]
+fn a_hook_custom_stop_rides_the_event_and_the_log_verbatim() {
+    // A Hook's `continue:false` atom (ADR-0066) is a first-class stop reason:
+    // it reaches the broadcast event AND the Session Log entry as itself,
+    // never degraded to `unknown`.
+    let mut final_conv = base();
+    final_conv.add_assistant_blocks(vec![ContentBlock::text("stopped by hook")]);
+    let custom = StopReason::Custom("budget_hook".to_string());
+
+    let resolution = Settlement::new().settle(
+        Outcome::Ok(final_conv.clone(), custom.clone()),
+        &base(),
+        &[],
+    );
+
+    assert!(matches!(
+        &resolution.event,
+        Event::RunFinished { stop_reason, .. } if *stop_reason == custom
+    ));
+    assert_eq!(
+        resolution.log_entry,
+        SettledEntry::new(Settled::Completed, custom, None)
+    );
+}
+
+#[test]
 fn ignores_the_checkpoint_the_tasks_conversation_is_already_complete() {
     let mut final_conv = base();
     final_conv.add_assistant_blocks(vec![ContentBlock::text("done")]);
@@ -120,7 +145,12 @@ fn adopts_the_loop_closed_conversation_as_is() {
     );
 
     assert_eq!(resolution.conversation, closed);
-    assert_eq!(resolution.event, Event::RunError(Reason::atom("boom")));
+    assert_eq!(
+        resolution.event,
+        Event::RunError {
+            reason: ":boom".to_string()
+        }
+    );
 }
 
 // ---- failed ----
@@ -130,7 +160,12 @@ fn in_run_error_with_no_checkpoint_closes_the_pre_run_conversation() {
     let resolution =
         Settlement::new().settle(Outcome::Error(Reason::atom("timeout")), &base(), &[]);
 
-    assert_eq!(resolution.event, Event::RunError(Reason::atom("timeout")));
+    assert_eq!(
+        resolution.event,
+        Event::RunError {
+            reason: ":timeout".to_string()
+        }
+    );
     assert_closed_with(
         &resolution.conversation,
         &base(),
@@ -151,7 +186,9 @@ fn in_run_error_with_a_checkpoint_the_partial_run_survives() {
 
     assert_eq!(
         resolution.event,
-        Event::RunError(Reason::atom("context_budget_exhausted"))
+        Event::RunError {
+            reason: ":context_budget_exhausted".to_string()
+        }
     );
     assert_closed_with(
         &resolution.conversation,
@@ -182,11 +219,17 @@ fn the_latest_checkpoint_wins() {
 fn a_crash_settles_as_a_failure() {
     let settlement = Settlement::new().note_checkpoint(checkpoint(base()));
 
-    let resolution = settlement.settle(Outcome::Down(Reason::tuple("{:badarg, []}")), &base(), &[]);
+    let resolution = settlement.settle(
+        Outcome::Down(Reason::verbatim("{:badarg, []}")),
+        &base(),
+        &[],
+    );
 
     assert_eq!(
         resolution.event,
-        Event::RunError(Reason::tuple("{:badarg, []}"))
+        Event::RunError {
+            reason: "{:badarg, []}".to_string()
+        }
     );
     assert_closed_with(
         &resolution.conversation,
@@ -200,7 +243,12 @@ fn a_shutdown_nobody_asked_for_settles_as_a_failure() {
     let resolution =
         Settlement::new().settle(Outcome::Down(Reason::atom("shutdown")), &base(), &[]);
 
-    assert_eq!(resolution.event, Event::RunError(Reason::atom("shutdown")));
+    assert_eq!(
+        resolution.event,
+        Event::RunError {
+            reason: ":shutdown".to_string()
+        }
+    );
     assert_closed_with(
         &resolution.conversation,
         &base(),
@@ -214,7 +262,12 @@ fn a_crash_that_races_a_cancel_settles_as_a_failure_never_a_cancellation() {
 
     let resolution = settlement.settle(Outcome::Down(Reason::atom("killed")), &base(), &[]);
 
-    assert_eq!(resolution.event, Event::RunError(Reason::atom("killed")));
+    assert_eq!(
+        resolution.event,
+        Event::RunError {
+            reason: ":killed".to_string()
+        }
+    );
     assert_closed_with(
         &resolution.conversation,
         &base(),
@@ -240,8 +293,11 @@ fn completed_carries_the_stop_reason_no_failure_string() {
 
 #[test]
 fn failed_carries_the_reason_inspected_to_a_string() {
-    let resolution =
-        Settlement::new().settle(Outcome::Down(Reason::tuple("{:badarg, []}")), &base(), &[]);
+    let resolution = Settlement::new().settle(
+        Outcome::Down(Reason::verbatim("{:badarg, []}")),
+        &base(),
+        &[],
+    );
 
     assert_eq!(
         resolution.log_entry,

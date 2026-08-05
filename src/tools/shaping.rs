@@ -3,12 +3,16 @@
 //! Session.
 //!
 //! `Tools::run` shapes every Tool Result through here; individual tools carry
-//! no size logic. Callers pass the raw Tool Call input; Shaping owns the
-//! read_file resume-marker rule (reading `offset` from the input so a cut's
-//! resume point is file-absolute). run_command keeps its start AND end (the exit
-//! code and last errors live at the end); read_file cuts at a line boundary and
-//! its marker names the exact 0-based `offset` that continues the read (qwen's
-//! read_file param, ADR-0060); every other tool keeps the start.
+//! no size logic - each DECLARES its [`CutPolicy`] on its spec (like
+//! [`Kind`](crate::approvals::Kind)), and this module applies the declared
+//! policy with zero knowledge of tool names. Callers pass the raw Tool Call
+//! input alongside the policy; a [`CutPolicy::HeadWithResume`] cut reads the
+//! input's `offset` so its resume point is file-absolute. [`CutPolicy::HeadTail`]
+//! keeps the start AND end (run_shell_command: the exit code and last errors
+//! live at the end); [`CutPolicy::HeadWithResume`] cuts at a line boundary and
+//! its marker names the exact 0-based `offset` that continues the read
+//! (read_file - qwen's param, ADR-0060); the default [`CutPolicy::Head`] keeps
+//! the start.
 //!
 //! This Result-Cap fold is a suspenders concern with no qwen equivalent (qwen
 //! truncates by a per-line char limit inside the tool). The marker only needs to
@@ -16,13 +20,14 @@
 //! plus `limit` to page a bounded window.
 
 use crate::content::ResultBlock;
+use crate::tool::CutPolicy;
 use crate::voice;
 use serde_json::Value;
 
 /// Even a tiny Context Budget gets a usable file read (~1.1k tokens).
 const FLOOR_CHARS: usize = 4_000;
 
-/// run_command's head:tail split. The tail carries the signal.
+/// The [`CutPolicy::HeadTail`] head:tail split. The tail carries the signal.
 const HEAD_QUARTER: usize = 4;
 
 /// The Result Cap numerator: `3.5 chars/token * 1/16 of the window` expressed as
@@ -44,20 +49,21 @@ pub fn cap_for(context_budget: u64, max_tokens_reserve: u64) -> usize {
 /// Shapes one Tool Result's block list to the Result Cap (ADR-0059). The cap
 /// applies to the TEXT blocks only - the Text blocks are concatenated, cut as
 /// before, and returned as one Text block; media blocks (image, PDF document)
-/// pass through uncapped, keeping their position relative to the text. `input`
-/// is the raw Tool Call input: for read_file Shaping reads its `start_line` so a
-/// cut's resume marker is file-absolute; every other tool's input is ignored.
+/// pass through uncapped, keeping their position relative to the text. `policy`
+/// is the [`CutPolicy`] the tool declared on its spec; `input` is the raw Tool
+/// Call input: a [`CutPolicy::HeadWithResume`] cut reads its `offset` so the
+/// resume marker is file-absolute, every other policy ignores it.
 ///
 /// The common case is a single Text block in, a single (possibly cut) Text block
 /// out - byte-identical to the old `&str` shaping.
 pub fn shape(
-    tool_name: &str,
+    policy: CutPolicy,
     input: &Value,
     blocks: Vec<ResultBlock>,
     cap: usize,
 ) -> Vec<ResultBlock> {
     let (text, media, text_first) = split_text_and_media(blocks);
-    let shaped_text = shape_text(tool_name, input, &text, cap);
+    let shaped_text = shape_text(policy, input, &text, cap);
 
     // A text-only result (the common case) is one Text block. When media rides,
     // keep the text ahead of the media unless the media led the original list.
@@ -96,35 +102,29 @@ fn split_text_and_media(blocks: Vec<ResultBlock>) -> (String, Vec<ResultBlock>, 
 
 /// Cuts the concatenated text to the cap (the original `&str` shaping). Text
 /// within the cap passes through untouched.
-fn shape_text(tool_name: &str, input: &Value, content: &str, cap: usize) -> String {
+fn shape_text(policy: CutPolicy, input: &Value, content: &str, cap: usize) -> String {
     let total = content.chars().count();
     if total <= cap {
         content.to_string()
     } else {
-        cut(
-            tool_name,
-            content,
-            cap,
-            total,
-            read_offset(tool_name, input),
-        )
+        cut(policy, content, cap, total, read_offset(policy, input))
     }
 }
 
-// Only read_file's cut resumes at an absolute line; every other tool's input
-// carries nothing Shaping needs. read_file's window param is `offset` (0-based,
+// Only a HeadWithResume cut resumes at an absolute line; every other policy's
+// input carries nothing Shaping needs. The window param is `offset` (0-based,
 // qwen's read_file param); a missing / non-integer offset is treated as 0.
-fn read_offset(tool_name: &str, input: &Value) -> Option<i64> {
-    if tool_name == "read_file" {
+fn read_offset(policy: CutPolicy, input: &Value) -> Option<i64> {
+    if policy == CutPolicy::HeadWithResume {
         input.get("offset").and_then(|v| v.as_i64())
     } else {
         None
     }
 }
 
-fn cut(tool_name: &str, content: &str, cap: usize, total: usize, offset: Option<i64>) -> String {
-    match tool_name {
-        "run_shell_command" => {
+fn cut(policy: CutPolicy, content: &str, cap: usize, total: usize, offset: Option<i64>) -> String {
+    match policy {
+        CutPolicy::HeadTail => {
             let head = cap / HEAD_QUARTER;
             let tail = cap - head;
             format!(
@@ -134,16 +134,17 @@ fn cut(tool_name: &str, content: &str, cap: usize, total: usize, offset: Option<
                 char_slice(content, total - tail, tail),
             )
         }
-        "read_file" => cut_read_file(content, cap, total, offset),
-        _ => head_cut(content, cap, total),
+        CutPolicy::HeadWithResume => resume_cut(content, cap, total, offset),
+        CutPolicy::Head => head_cut(content, cap, total),
     }
 }
 
-// Cut at a line boundary and name the absolute 0-based resume offset. A first
-// line wider than the whole cap falls back to the generic head cut. `offset` is
-// the read_file call's 0-based offset (qwen param); the shaped content's first
-// line is file-absolute line `offset + 1`.
-fn cut_read_file(content: &str, cap: usize, total: usize, offset: Option<i64>) -> String {
+// The HeadWithResume cut: cut at a line boundary and name the absolute 0-based
+// resume offset. A first line wider than the whole cap falls back to the
+// generic head cut. `offset` is the Tool Call's 0-based offset (qwen's
+// read_file param); the shaped content's first line is file-absolute line
+// `offset + 1`.
+fn resume_cut(content: &str, cap: usize, total: usize, offset: Option<i64>) -> String {
     let lines: Vec<&str> = content.split('\n').collect();
     let kept = whole_lines_within(&lines, cap);
 
@@ -196,7 +197,7 @@ fn line_count(content: &str, lines: &[&str]) -> usize {
     }
 }
 
-// The read_file call's 0-based `offset`, clamped to a non-negative usize. A
+// The Tool Call's 0-based `offset`, clamped to a non-negative usize. A
 // missing / negative / non-integer offset is a full read from the top (0).
 fn resolve_offset(offset: Option<i64>) -> usize {
     match offset {

@@ -381,7 +381,7 @@ pub(super) fn marker_prefix_and_style(
             tone: Tone::Steering,
             ..
         } => ("●", accent_style(theme)),
-        // Housekeeping/Aid/Plain all read the quiet `●` info glyph, secondary.
+        // Housekeeping/Plain both read the quiet `●` info glyph, secondary.
         _ => ("●", secondary_style(theme)),
     }
 }

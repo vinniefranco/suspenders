@@ -57,16 +57,14 @@ pub(super) fn diff_chrome_style(theme: &Theme) -> Style {
 // role onto a suspenders Theme slot behind ONE helper apiece, so a theme
 // reconcile is a single edit per role rather than a hunt through the render
 // body. Phase 7 (ADR-0008/0053) carved the four qwen roles that used to borrow
-// a neighbouring slot into real slots: `text.primary`→`foreground` (was the
-// terminal default), `text.accent`→`accent` (was cyan `prompt_gutter`),
-// `status.success`→`success` (was diff `added`), `status.warning`→`warning`
-// (was warm amber `marker_aid`). `text.secondary`/`ui.symbol`/`border.default`
+// a neighbouring slot into real slots: `text.primary`→`foreground`,
+// `text.accent`→`accent`, `status.success`→`success`,
+// `status.warning`→`warning`. `text.secondary`/`ui.symbol`/`border.default`
 // still share the neutral gray `muted` slot by design.
 // ---------------------------------------------------------------------------
 
 /// qwen `text.accent` (AccentPurple `#D2A6FF`): the user `>` caret + the
-/// assistant `✦` marker. Reads the dedicated `accent` slot (Phase 7, ADR-0008),
-/// a distinct role rather than the cyan `prompt_gutter` it once borrowed.
+/// assistant `✦` marker. Reads the dedicated `accent` slot (Phase 7, ADR-0008).
 pub(super) fn accent_style(theme: &Theme) -> Style {
     Style::default().fg(tui_color(theme.accent))
 }
@@ -86,8 +84,7 @@ pub(super) fn success_style(theme: &Theme) -> Style {
 
 /// qwen `status.warning` (AccentYellow `#FFD700`): the `△` warning prefix + a
 /// pending tool-group border. Reads the dedicated `warning` slot (Phase 7,
-/// ADR-0008), a distinct role rather than the warm amber `marker_aid` it once
-/// borrowed.
+/// ADR-0008).
 pub(super) fn warning_style(theme: &Theme) -> Style {
     Style::default().fg(tui_color(theme.warning))
 }

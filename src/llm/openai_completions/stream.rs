@@ -1,9 +1,12 @@
 //! Pure SSE chunk stream state machine for the OpenAI Chat Completions API.
 //!
 //! A deterministic fold over parsed SSE chunks. No I/O, no transport
-//! dependency, no throttling. The transport layer parses each `data:` frame
-//! into an [`SseEvent`] and folds the sequence with [`fold_sse`], or drives it
-//! incrementally through [`StreamState`].
+//! dependency, no throttling. The shared transport driver parses each `data:`
+//! frame into an [`SseEvent`] through the adapter's `SseProtocol` strategy
+//! and drives [`StreamState`] incrementally. The module is private to the
+//! adapter, so nothing else can fold: the never-Err error algebra below is
+//! sealed by visibility. The in-module tests fold canned event vectors
+//! against the same state.
 //!
 //! ## Dialect differences from `anthropic_messages::stream`
 //!
@@ -81,7 +84,7 @@ impl StreamState {
     pub fn with_style(style: ToolCallStyle) -> Self {
         StreamState {
             style,
-            ..StreamState::default()
+            ..StreamState::new()
         }
     }
 

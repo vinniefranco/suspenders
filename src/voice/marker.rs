@@ -81,7 +81,7 @@ impl Marker {
     /// message: the Run Limit and loop-stall stops name themselves; every other
     /// completion closes as an after-Pass stop. The one authoritative
     /// stop-reason-to-close-marker mapping (was rewritten at each Run-close site).
-    pub fn completing(stop_reason: StopReason) -> Marker {
+    pub fn completing(stop_reason: &StopReason) -> Marker {
         match stop_reason {
             StopReason::RunLimit => Marker::RunLimit,
             StopReason::RunLimitStuck => Marker::LoopStall,

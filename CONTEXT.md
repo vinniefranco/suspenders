@@ -57,7 +57,7 @@ The one runtime intervention: a passive circuit breaker that ends the Run when t
 _Avoid_: nudge, governor (it judges nothing and injects nothing; it counts identical batches and stops), guard rail
 
 **Tool**:
-A named capability with a JSON schema that the model can invoke: read_file, write_file, edit_file, run_command, grep, glob, list_files, web_fetch, and todo_write. Named and shaped to match qwen-code's tools so a small local model calls them without translation (ADR-0045). Every request offers the full registry - there is no per-Pass narrowing. The built-ins may be joined by MCP tools: capabilities discovered from external Model Context Protocol servers the user attaches over one of three transports - stdio, streamable-HTTP, or legacy HTTP+SSE - authored with the `suspenders mcp add/remove/list` CLI and viewed through the `/mcp` dialog (ADR-0056, ADR-0065). MCP tools are deferred, surfaced on demand rather than riding the wire list at Run start.
+A named capability with a JSON schema that the model can invoke: read_file, write_file, edit, notebook_edit, list_directory, glob, grep_search, run_shell_command, web_fetch, todo_write, ask_user_question, skill, agent, tool_search, and the Plan Mode pair (enter_plan_mode, exit_plan_mode). Named and shaped to match qwen-code's tools so a small local model calls them without translation (ADR-0045). Every request offers the full registry - there is no per-Pass narrowing. The built-ins may be joined by MCP tools: capabilities discovered from external Model Context Protocol servers the user attaches over one of three transports - stdio, streamable-HTTP, or legacy HTTP+SSE - authored with the `suspenders mcp add/remove/list` CLI and viewed through the `/mcp` dialog (ADR-0056, ADR-0065). MCP tools are deferred, surfaced on demand rather than riding the wire list at Run start.
 
 **Tool Call**:
 A structured `tool_use` block emitted by the model requesting one Tool execution.
@@ -136,15 +136,15 @@ A named coloring of the semantic display vocabulary - which colors the Transcrip
 _Avoid_: color scheme (narrower; a Theme also names the code-highlighting look), skin, style (overloaded with the terminal's style type)
 
 **Project Root**:
-The directory Suspenders was launched from, captured once per Session as a value. Every Tool Call is confined to it: paths must not escape it, and run_command executes in it.
+The directory Suspenders was launched from, captured once per Session as a value. Every Tool Call is confined to it: paths must not escape it, and run_shell_command executes in it.
 _Avoid_: cwd (that's ambient process state; the Project Root is captured once and passed explicitly)
 
 **Approval**:
-The user's explicit gate on a run_command Tool Call before it executes: approve, deny, or approve-always.
+The user's explicit gate on a gated Tool Call before it executes - run_shell_command (showing its command) and web_fetch (showing its URL, ADR-0024): approve, deny, or approve-always.
 _Avoid_: confirmation, permission
 
 **Standing Approval**:
-The result of an approve-always answer: run_command Tool Calls whose command string is identical to the approved one are auto-approved for the rest of the Session, without a modal. The Transcript still records each auto-approved run.
+The result of an approve-always answer: run_shell_command Tool Calls whose command string is identical to the approved one are auto-approved for the rest of the Session, without a modal. The Transcript still records each auto-approved run.
 _Avoid_: allowlist (implementation term), whitelist
 
 **Approval Mode**:
@@ -163,7 +163,7 @@ _Avoid_: tool type, category (overloaded), read-only flag (Kind is finer than a 
 The token allowance the Conversation must fit within, derived each Run from the captured Model's context window. Config supplies the window for Models the Catalog does not know, and may cap it globally.
 
 **Result Cap**:
-The size ceiling one Tool Result may occupy in the Conversation, derived from the Context Budget the Run captured. Oversized Tool Results are cut before they enter the Conversation: run_command keeps its start and end (the exit code lives at the end), every other Tool keeps its start.
+The size ceiling one Tool Result may occupy in the Conversation, derived from the Context Budget the Run captured. Oversized Tool Results are cut before they enter the Conversation: run_shell_command keeps its start and end (the exit code lives at the end), every other Tool keeps its start.
 _Avoid_: output limit, truncation (reserved for the server's failure mode)
 
 **Cancellation**:
@@ -221,7 +221,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - A **Run** is one or more **Passes**; the **Run Limit** bounds the **Passes**
 - A **Run** contains zero or more **Tool Calls**, each producing exactly one **Tool Result**
 - Each **Pass** builds one request carrying the full **Tool** registry - there is no per-Pass narrowing; the **Agent** repeats **Passes** until the model returns no **Tool Calls** or the **Run Limit** is reached
-- A **Tool Call** for run_command requires an **Approval** before execution, unless a **Standing Approval** covers its exact command string
+- A **Tool Call** for run_shell_command (or web_fetch) requires an **Approval** before execution, unless a **Standing Approval** covers its exact command string
 - A **Standing Approval** belongs to the **Session** - it does not survive restart and never widens beyond the identical command string
 - The **Approval Mode** decides every **Tool Call**'s fate through one mode-aware verdict (ADR-0067): allow, open an **Approval**, or block. **Plan Mode** blocks any **Tool Call** whose **Kind** mutates (except read-only shell, which its classifier allows), while reads, searches, web_fetch, and the **todo_write** record run freely
 - **Compaction** is the sole context-reclaim mechanism; when the **Conversation** cannot fit the **Context Budget** even after Compaction, the **Run** fails loudly and an over-budget request is never sent
@@ -250,12 +250,12 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 > **Dev:** "When the model hits the **Context Budget** mid-**Run**, do we drop old **Runs**?"
 > **Domain expert:** "No - **Compaction** replaces old finished **Runs** with one LLM summary of what was accomplished, so the user's instructions survive as summary and the working tail stays verbatim. It is the only reclaim mechanism; there is no mechanical eviction."
 >
-> **Dev:** "And if the user cancels while a run_command **Approval** modal is open?"
+> **Dev:** "And if the user cancels while a run_shell_command **Approval** modal is open?"
 > **Domain expert:** "**Cancellation** wins: the **Tool Call** is recorded as cancelled, no **Tool Result** is fabricated, and the **Run** ends."
 
 ## Flagged ambiguities
 
-- "Turn" was the outer request cycle, but the ecosystem (pi, Anthropic, OpenAI) calls one **Pass** a "turn" - a standard word reassigned to the opposite level, a false friend for newcomers - resolved 2026-07: the outer cycle is now a **Run** (matching OpenAI's Run), and **Pass** keeps its coined name. This was a half rename by design: it removes the collision one-way without reassigning "turn". Adopting "turn" for a **Pass** (the full alignment) is a possible later step, deferred because it is a two-way rename sharing the token. "Run" brushes against run_command and the informal "run of the TUI" (now a **Session**); context disambiguates.
+- "Turn" was the outer request cycle, but the ecosystem (pi, Anthropic, OpenAI) calls one **Pass** a "turn" - a standard word reassigned to the opposite level, a false friend for newcomers - resolved 2026-07: the outer cycle is now a **Run** (matching OpenAI's Run), and **Pass** keeps its coined name. This was a half rename by design: it removes the collision one-way without reassigning "turn". Adopting "turn" for a **Pass** (the full alignment) is a possible later step, deferred because it is a two-way rename sharing the token. "Run" brushes against run_shell_command and the informal "run of the TUI" (now a **Session**); context disambiguates.
 
 - The whole steering apparatus (Governor, Nudge, Anchor, Endgame, Recovery Run, Scout, and mechanical Eviction/Dead Mass/Supersession) was removed 2026-07 in favor of a plain ReAct loop, a strong static system prompt, and a passive **Loop-detector** (ADR-0045). The wager: a clean, predictable context keeps a small local model on task more often than corrective text pulled it back. Those terms are retired from the language; git history holds their design.
 
@@ -264,7 +264,7 @@ Reconstructing a Conversation from a Session Log so a new Session can continue w
 - "toggling thinking" was read as enabling/disabling the model's **Thinking** when it once meant expanding/collapsing settled Thinking items - resolved 2026-07-29 by the qwen-code port (ADR-0046) and verified against qwen-code v0.16.0: there is no Ctrl-T and no per-item expand/collapse. Thinking persists as a dimmed `✦` history item (markdown body) AND shows a transient subject on the spinner line; a single global compact toggle hides Thinking and Tool output together. Whether the model thinks at all remains a request-level knob (today fixed: on for the main Conversation) with no user-facing toggle.
 - the **Compaction Keep** is configured and validated in token-space (a fraction of the live window), but the cutoff walk accumulates raw chars, so the executed keep is ~3.5x smaller than the configured fraction - discovered 2026-07-21, dates to the original port. Deliberately preserved and pinned by test for now; whether to fix the units (and retune the default) is an open tuning decision.
 
-- the **Middleware**/**Presenter** abstraction was a suspenders invention with no qwen counterpart - retired 2026-08-02 in favor of qwen's model, where tool behaviors (diff, todo, run_command output) live inside their Tools and services and **Hook**s are the sole lifecycle-interception layer. Supersedes ADR-0007's plugin pipeline and ADR-0042's Middleware/Presenter vocabulary; the retired glossary entries are kept as one-line redirects so references in old code still resolve.
+- the **Middleware**/**Presenter** abstraction was a suspenders invention with no qwen counterpart - retired 2026-08-02 in favor of qwen's model, where tool behaviors (diff, todo, run_shell_command output) live inside their Tools and services and **Hook**s are the sole lifecycle-interception layer (ADR-0066); the retired glossary entries above are kept as one-line redirects.
 
 ## Compaction
 

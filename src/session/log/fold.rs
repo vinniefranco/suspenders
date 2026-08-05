@@ -111,10 +111,10 @@ fn fold_entry(entry: &Entry, messages: &mut Vec<Message>, batch: &mut Option<Bat
             ..
         } => {
             if let Some(open) = batch.take() {
-                let stop = settle_stop(*outcome, *stop_reason);
+                let stop = settle_stop(*outcome, stop_reason);
                 flush_batch(messages, open, stop);
             }
-            close_settled(messages, *outcome, *stop_reason);
+            close_settled(messages, *outcome, stop_reason);
         }
     }
 }
@@ -129,9 +129,9 @@ pub fn compose_summary(narrative: &str, original_task: Option<&str>, file_ops: &
     )
 }
 
-fn settle_stop(outcome: Settled, stop_reason: StopReason) -> StopReason {
+fn settle_stop(outcome: Settled, stop_reason: &StopReason) -> StopReason {
     match outcome {
-        Settled::Completed => stop_reason,
+        Settled::Completed => stop_reason.clone(),
         _ => StopReason::Error, // stand-in for baud's `:failed` batch-close marker path
     }
 }
@@ -192,7 +192,7 @@ fn flush_batch(messages: &mut Vec<Message>, batch: Batch, stop: StopReason) {
 
 // A settled Run that ended on a user-role message (Run Limit, stop hook)
 // closed with a marker live; restore it so roles keep alternating.
-fn close_settled(messages: &mut Vec<Message>, outcome: Settled, stop_reason: StopReason) {
+fn close_settled(messages: &mut Vec<Message>, outcome: Settled, stop_reason: &StopReason) {
     match outcome {
         // A completed Run that ended on a user-role message (Run Limit, stop
         // hook) needs a fresh assistant marker so roles keep alternating; one

@@ -535,7 +535,7 @@ impl SubagentSpawner for UnavailableSubagentSpawner {
 /// child, owns its wait+stream+capture-file, and settles a parallel background
 /// shell registry (Phase 9, ADR-0063). The Agent owns the process lifecycle, NOT
 /// the tool - a background shell is Agent-owned mutable state (ADR-0017) that must
-/// OUTLIVE the launching turn, so it cannot ride the tool's turn-scoped machinery.
+/// OUTLIVE the launching Run, so it cannot ride the tool's Run-scoped machinery.
 ///
 /// Tx-backed like [`Approver`] (the real impl relays over the Agent's mpsc);
 /// `stop_background` is the leg `task_stop` reaches when the id names a shell

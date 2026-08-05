@@ -126,24 +126,27 @@ pub(super) async fn run(
     ctx: &AdapterCtx<'_>,
     rest: Option<&str>,
 ) -> (Screen, Option<String>) {
-    match decide(screen.approval_mode, rest) {
+    match decide(screen.approval_mode(), rest) {
         PlanAction::Message { text, .. } => (screen.info(text).0, None),
         PlanAction::Exit => {
             // The MANUAL-exit path (`from_approved_plan_exit = false`): leaving
             // Plan queues the one-shot manual-exit reminder, exactly like Shift+Tab
             // out of Plan (ADR-0067). Update the mirror from the restored mode.
             let mut screen = screen;
-            screen.approval_mode = ctx.agent.exit_plan_mode().await;
+            let mode = ctx.agent.exit_plan_mode().await;
+            screen.mirror_approval_mode(mode);
             (screen.info(EXITED_PLAN_MODE).0, None)
         }
         PlanAction::Enter => {
             let mut screen = screen;
-            screen.approval_mode = ctx.agent.enter_plan_mode().await;
+            let mode = ctx.agent.enter_plan_mode().await;
+            screen.mirror_approval_mode(mode);
             (screen.info(ENABLED_PLAN_MODE).0, None)
         }
         PlanAction::EnterThenSubmit(prompt) => {
             let mut screen = screen;
-            screen.approval_mode = ctx.agent.enter_plan_mode().await;
+            let mode = ctx.agent.enter_plan_mode().await;
+            screen.mirror_approval_mode(mode);
             (screen, Some(prompt))
         }
         PlanAction::Submit(prompt) => (screen, Some(prompt)),

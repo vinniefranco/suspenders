@@ -31,30 +31,6 @@ use crate::mcp::McpServerView;
 use crate::tool::caps::Question;
 use crate::view_model::SelectorRow;
 
-/// A label on the generic fail-open `extension_error` report channel: which
-/// point an extension subsystem crashed (fail-open, ADR-0007). These are just
-/// labels on the report line, not a Middleware pipeline stage - the pipeline is
-/// retired (Hooks are the lifecycle-interception layer, ADR-0066). MCP connect,
-/// Hook discovery/firing, and skill discovery report through this channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
-    PreRun,
-    PostRun,
-    Present,
-}
-
-impl Stage {
-    /// The atom-name baud uses on the wire (`:pre_run`, `:post_run`,
-    /// `:present`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Stage::PreRun => "pre_run",
-            Stage::PostRun => "post_run",
-            Stage::Present => "present",
-        }
-    }
-}
-
 /// One AT file-picker suggestion (qwen `useAtCompletion`'s `{label, value}`):
 /// the repo-relative `label` shown in the popup (and highlighted against the
 /// query) and the `value` INSERTED on accept - the same path with its spaces
@@ -234,10 +210,17 @@ pub enum Event {
         copied: bool,
     },
 
-    // ---- Extensions / Session Log / Context ----
-    ExtensionError {
-        extension: String,
-        stage: Stage,
+    // ---- Fail-open reports / Session Log / Context ----
+    /// A fail-open subsystem's visible report (ADR-0018): a subsystem failure
+    /// that never fails the Run (a broken MCP server, SKILL.md, hook entry, or
+    /// hook firing), or a deciding intervention surfaced on the same channel (a
+    /// Hook Decision, the plan-mode block). `source` names the reporter in
+    /// words ("hook Stop", "mcp server foo", "skill bar", "memory", "plan
+    /// mode") - the routing semantics live in that label. Display-side only:
+    /// it renders as a Transcript info line and is never persisted to the
+    /// Session Log (the Log records the Conversation, not the Transcript).
+    FailOpenReport {
+        source: String,
         message: String,
     },
     ContextPressure {
@@ -251,7 +234,7 @@ pub enum Event {
     /// The Session's cumulative dollar cost after a priced Response (ADR-0037:
     /// pricing rides the Catalog Model; surfacing is display-side only).
     /// Emitted by the metered boundary for every priced call - main Run,
-    /// Scout, and Compaction alike - and never for an unpriced (local/custom)
+    /// subagent, and Compaction alike - and never for an unpriced (local/custom)
     /// Model, so a local-only Session sees none of these. Never logged: cost
     /// enters neither the Conversation nor the Session Log.
     SessionCost {
@@ -351,8 +334,12 @@ pub enum Event {
     },
 
     // ---- Settlement ----
+    /// A Run settled completed. `stop_reason` is the canonical run-stop
+    /// vocabulary ([`crate::stop_reason::StopReason`]) - NOT the wire
+    /// [`StopReason`] a [`Event::MessageEnd`] carries - so a Run-Limit,
+    /// loop-stall, or Hook-custom stop reaches the display unlossy.
     RunFinished {
-        stop_reason: StopReason,
+        stop_reason: crate::stop_reason::StopReason,
         token_estimate: u64,
         context_budget: u64,
     },
@@ -586,17 +573,14 @@ impl Event {
 
     // ---- The rest ----
 
-    /// Constructs an `extension_error` from a tool-side subsystem failure's
-    /// parts: the source name, the stage that crashed, and the message. Used by
-    /// the Agent's MCP init / ops fail-open reporting (ADR-0056).
-    pub fn extension_error(
-        extension: impl Into<String>,
-        stage: Stage,
-        message: impl Into<String>,
-    ) -> Self {
-        Event::ExtensionError {
-            extension: extension.into(),
-            stage,
+    /// Constructs a [`Event::FailOpenReport`] from a fail-open report's parts:
+    /// the source label and the message. Used by the Agent's launch notices
+    /// (MCP connect ADR-0056, Skill/Hook/memory load ADR-0058/0066/0062) and
+    /// the Run's Hook decision/failure visibility plus the plan-mode block
+    /// (ADR-0066, ADR-0067), all under fail-open-with-visibility (ADR-0018).
+    pub fn fail_open_report(source: impl Into<String>, message: impl Into<String>) -> Self {
+        Event::FailOpenReport {
+            source: source.into(),
             message: message.into(),
         }
     }

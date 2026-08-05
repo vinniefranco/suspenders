@@ -20,12 +20,11 @@ use super::tool_group::{CONTENT_MARGIN, content_width};
 
 // ---------------------------------------------------------------------------
 // The keyboard-shortcuts Help overlay (qwen `Help.tsx`, the `?` affordance the
-// footer's `? for shortcuts` promises). A single bordered panel - suspenders has
-// only two built-in commands and none of qwen's custom-command/MCP/skill/plugin
-// ecosystem, so qwen's THREE-tab chrome (general / commands / custom-commands)
-// would be two empty tabs of vaporware; we port the CONTENT (shortcuts + the
-// built-in COMMANDS registry) into one panel and drop the tab chrome. The
-// Screen's `help_open` flag gates it and [`Screen::handle_help_key`] closes it.
+// footer's `? for shortcuts` promises). A single bordered panel: qwen spreads
+// its help over THREE tabs (general / commands / custom-commands); suspenders
+// ports the CONTENT (shortcuts + the built-in COMMANDS registry) into one
+// panel and drops the tab chrome. The Screen's `help_open` flag gates it and
+// [`Screen::handle_help_key`] closes it.
 // ---------------------------------------------------------------------------
 
 /// The width of the accent key column in a shortcut row (qwen `KEY_COL_WIDTH`,
@@ -318,7 +317,7 @@ pub(super) fn question_modal_lines(
     );
     body.push(Line::from(title_spans));
 
-    for (i, question) in pending.questions.iter().enumerate() {
+    for (i, question) in pending.questions().iter().enumerate() {
         // A blank gap before each question (qwen `marginBottom:1`).
         body.push(Line::from(Vec::<Span<'static>>::new()));
 
@@ -342,7 +341,7 @@ pub(super) fn question_modal_lines(
 
         // The per-question rows: the recorded answer, the free-form hint, or the
         // interactive radio - one branch per state.
-        if let Some(Some(answer)) = pending.answers.get(i) {
+        if let Some(answer) = pending.answer(i) {
             // Answered: a success-green `✓ answer` line.
             let mut a_spans = Vec::new();
             let _ = push_cols(
@@ -353,7 +352,7 @@ pub(super) fn question_modal_lines(
                 inner,
             );
             body.push(Line::from(a_spans));
-        } else if pending.collecting_other == Some(i) {
+        } else if pending.collecting_other() == Some(i) {
             // Collecting a free-form "Other" answer: the hint (the composer draws
             // below this box).
             let mut h_spans = Vec::new();
@@ -371,7 +370,7 @@ pub(super) fn question_modal_lines(
             // SelectionList; only the CURRENT question (cursor) is highlighted.
             let mut labels: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
             labels.push(OTHER_OPTION_LABEL);
-            let active = pending.per_question.get(i).map(|s| s.active()).unwrap_or(0);
+            let active = pending.active_row(i);
             body.extend(selection_rows(&labels, active, true, inner_u16, theme));
         }
     }
@@ -434,13 +433,13 @@ pub(super) fn plan_modal_lines(
     // A blank gap, then the plan text rendered as markdown (qwen renders the plan
     // via `MarkdownDisplay`); `box_row` truncates each rendered line to `inner`.
     body.push(Line::from(Vec::<Span<'static>>::new()));
-    body.extend(markdown_lines(&pending.plan, theme));
+    body.extend(markdown_lines(pending.plan(), theme));
 
     // A blank gap before the outcome radio (qwen `marginBottom:1`).
     body.push(Line::from(Vec::<Span<'static>>::new()));
-    let labels = plan_outcome_labels(pending.pre_plan_mode);
+    let labels = plan_outcome_labels(pending.pre_plan_mode());
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let active = pending.selection.active();
+    let active = pending.active_row();
     body.extend(selection_rows(&label_refs, active, true, inner_u16, theme));
 
     // Frame the body in a rounded box, every row exactly `inner + 2` columns.

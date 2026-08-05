@@ -410,6 +410,38 @@ fn a_failed_settlement_carries_its_reason_string_forensically_the_fold_ignores_i
     );
 }
 
+#[test]
+fn a_pre_unification_settled_line_still_parses_with_its_wire_names() {
+    // Backward compat (ADR-0069): the settled entry's stop_reason names
+    // predate the one-vocabulary unification, so a log written before it must
+    // still Resume. This line is byte-for-byte what the old code wrote for a
+    // Run-Limit stop.
+    let raw = r#"{"e":"settled","outcome":"completed","stop_reason":"turn_limit","reason":null}"#;
+    let entry = Entry::from_json(&decode_line(raw).unwrap()).unwrap();
+    assert_eq!(
+        entry,
+        Entry::Settled {
+            outcome: Settled::Completed,
+            stop_reason: StopReason::RunLimit,
+            reason: None,
+        }
+    );
+}
+
+#[test]
+fn a_hook_custom_stop_reason_round_trips_the_settled_entry_verbatim() {
+    // The Hook's atom (ADR-0066) is a first-class stop reason (ADR-0069): it
+    // serializes as itself and parses back as itself, never as `unknown`.
+    let entry = Entry::Settled {
+        outcome: Settled::Completed,
+        stop_reason: StopReason::Custom("budget_hook".into()),
+        reason: None,
+    };
+    let value = entry.to_json();
+    assert_eq!(value["stop_reason"], "budget_hook");
+    assert_eq!(Entry::from_json(&value), Some(entry));
+}
+
 // ---- crash modes ----
 
 #[test]

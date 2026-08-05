@@ -1,1 +1,0 @@
-Implement glob_match in src/lib.rs so that all tests in tests/oracle.rs pass. The pattern language is documented in the doc comment on glob_match. Do not modify the tests. Run the test suite to verify your work.

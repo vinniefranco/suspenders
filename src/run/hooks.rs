@@ -46,6 +46,7 @@ use crate::hooks::{
 };
 use crate::llm::Llm;
 use crate::llm::model::Model;
+use crate::run::deps::Emitter;
 
 /// qwen's `DEFAULT_STOP_HOOK_BLOCK_CAP` (stopHookCap.ts): a Stop hook may force at
 /// most this many consecutive continuations before the Run ends regardless (A2).
@@ -276,19 +277,51 @@ pub struct Hooks<'a> {
     http: Box<dyn HttpPost>,
     llm: &'a dyn Llm,
     model: &'a Model,
+    /// The Session identity every payload is stamped with (H1).
+    identity: HookIdentity,
+    /// The visible fail-open reporter (ADR-0018): a hook FIRING failure (a
+    /// command spawn failure / timeout, an http transport failure) fails open to
+    /// a steers-nothing outcome AND is surfaced through this as a
+    /// [`crate::event::Event::fail_open_report`], so a broken hook is never a
+    /// silent skip. Behind a `Mutex` because the facade fires through `&self`
+    /// while [`Emitter`] emits through `&mut`. `None` surfaces nothing (a test
+    /// that does not wire it).
+    reporter: Option<std::sync::Mutex<Emitter>>,
+}
+
+/// The Session identity every hook payload is stamped with (H1, qwen's
+/// `createBaseInput` session facts): the three fields travel together from the
+/// wiring layer into every [`BaseInput`], so the firing handle takes them as
+/// one value.
+pub struct HookIdentity {
     /// The working directory the payload reports and a command hook runs in (the
     /// Session's Project Root).
-    cwd: String,
+    pub cwd: String,
     /// The Session identifier every payload carries (H1, qwen's
     /// `createBaseInput.session_id` from `config.getSessionId()`). Sourced from the
     /// Session Log's per-session file stem (ADR-0010) - the unique token that names
     /// this Session's JSONL - so a hook keys the same identity across events. Empty
     /// when no log opened (a test Run, or a log-open failure).
-    session_id: String,
+    pub session_id: String,
     /// The Session Log's JSONL path every payload carries (H1, qwen's
     /// `createBaseInput.transcript_path` from `config.getTranscriptPath()`), so a
     /// hook can tail the running transcript (ADR-0010). Empty when no log opened.
-    transcript_path: String,
+    pub transcript_path: String,
+}
+
+impl HookIdentity {
+    /// The production assembly (the ritual every Agent-side wiring site shared):
+    /// the session id IS the transcript's file stem (ADR-0010,
+    /// [`session_id_from_log_path`]), so the identity derives whole from the
+    /// Project Root + the Session Log path.
+    pub fn from_log_path(cwd: String, transcript_path: String) -> Self {
+        let session_id = session_id_from_log_path(&transcript_path);
+        HookIdentity {
+            cwd,
+            session_id,
+            transcript_path,
+        }
+    }
 }
 
 /// The five base fields every hook payload carries (H1, qwen's `createBaseInput`):
@@ -391,14 +424,15 @@ pub enum StopDecision {
 
 impl<'a> Hooks<'a> {
     /// Builds the Run's firing handle from the manager + the captured Llm/Model +
-    /// the Session's Project Root, wiring the production shell/http capabilities.
+    /// the Session identity, wiring the production shell/http capabilities.
+    /// `reporter` is the visible fail-open reporter (ADR-0018) a firing failure
+    /// is surfaced through; every production caller wires one.
     pub fn new(
         manager: &'a HookManager,
         llm: &'a dyn Llm,
         model: &'a Model,
-        cwd: String,
-        session_id: String,
-        transcript_path: String,
+        identity: HookIdentity,
+        reporter: Option<Emitter>,
     ) -> Self {
         Hooks {
             manager,
@@ -406,9 +440,8 @@ impl<'a> Hooks<'a> {
             http: Box::new(ReqwestHttp),
             llm,
             model,
-            cwd,
-            session_id,
-            transcript_path,
+            identity,
+            reporter: reporter.map(std::sync::Mutex::new),
         }
     }
 
@@ -431,20 +464,32 @@ impl<'a> Hooks<'a> {
             http,
             llm,
             model,
-            cwd,
             // A test Run carries synthetic base identity so a payload assertion has
             // stable values to check (H1); production sources these from the log.
-            session_id: "test-session".to_string(),
-            transcript_path: "/tmp/test-session.jsonl".to_string(),
+            identity: HookIdentity {
+                cwd,
+                session_id: "test-session".to_string(),
+                transcript_path: "/tmp/test-session.jsonl".to_string(),
+            },
+            reporter: None,
         }
+    }
+
+    /// Wires the visible fail-open reporter onto a test handle (the seam
+    /// [`Hooks::new`] wires in production), so a test can assert a firing
+    /// failure surfaces as a `fail_open_report` event.
+    #[cfg(test)]
+    pub fn reporting(mut self, reporter: Emitter) -> Self {
+        self.reporter = Some(std::sync::Mutex::new(reporter));
+        self
     }
 
     // The five base fields (H1) this handle stamps on every payload for `event`.
     fn base(&self, event: HookEvent) -> BaseInput<'_> {
         BaseInput {
-            session_id: &self.session_id,
-            transcript_path: &self.transcript_path,
-            cwd: &self.cwd,
+            session_id: &self.identity.session_id,
+            transcript_path: &self.identity.transcript_path,
+            cwd: &self.identity.cwd,
             event,
         }
     }
@@ -463,7 +508,8 @@ impl<'a> Hooks<'a> {
     // `(outcome, skill_root)` so a caller can fold them. The payload is the qwen
     // event JSON. A firing that resolves to the default (steers-nothing) outcome
     // is fail-open (the runner already turns a spawn/timeout/parse failure into
-    // one), so this never errs.
+    // one), so this never errs; a spawn/transport failure is additionally
+    // surfaced through the reporter (ADR-0018: recorded visibly).
     async fn fire(
         &self,
         event: HookEvent,
@@ -475,12 +521,36 @@ impl<'a> Hooks<'a> {
         let mut outcomes = Vec::with_capacity(selected.len());
         for sel in &selected {
             let ctx = HookRunContext {
-                cwd: &self.cwd,
+                cwd: &self.identity.cwd,
                 skill_root: sel.skill_root.as_deref(),
             };
-            outcomes.push(run_hook(&sel.hook, payload, &ctx, &caps).await);
+            let outcome = run_hook(&sel.hook, payload, &ctx, &caps).await;
+            self.surface_firing_error(event, &outcome);
+            outcomes.push(outcome);
         }
         outcomes
+    }
+
+    // Surfaces a hook FIRING failure visibly (ADR-0018 fail-open-with-
+    // visibility): the runner failed open to a steers-nothing outcome carrying
+    // `firing_error` (a spawn failure / timeout / transport failure), and this
+    // reports it on the same fail-open channel a launch notice takes, so a
+    // broken hook never disappears silently. A `None` reporter or an error-free
+    // outcome is a no-op.
+    fn surface_firing_error(&self, event: HookEvent, outcome: &crate::hooks::HookOutcome) {
+        let (Some(reporter), Some(err)) = (&self.reporter, outcome.firing_error.as_deref()) else {
+            return;
+        };
+        // Fail-open all the way down (ADR-0018): a poisoned reporter lock (an
+        // emit that panicked elsewhere) drops this report - the reporting
+        // machinery itself must never fail the Run.
+        let Ok(mut reporter) = reporter.lock() else {
+            return;
+        };
+        reporter.emit(crate::event::Event::fail_open_report(
+            format!("hook {}", event.wire_name()),
+            format!("failed open - {err}"),
+        ));
     }
 
     /// Registers a skill's session-scoped hooks into the manager (Phase 4c,
@@ -662,10 +732,12 @@ impl<'a> Hooks<'a> {
         let mut outcomes = Vec::with_capacity(selected.len());
         for sel in &selected {
             let ctx = HookRunContext {
-                cwd: &self.cwd,
+                cwd: &self.identity.cwd,
                 skill_root: sel.skill_root.as_deref(),
             };
-            outcomes.push(run_hook(&sel.hook, payload, &ctx, &caps).await);
+            let outcome = run_hook(&sel.hook, payload, &ctx, &caps).await;
+            self.surface_firing_error(event, &outcome);
+            outcomes.push(outcome);
         }
         outcomes
     }

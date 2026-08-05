@@ -309,17 +309,17 @@ fn every_fixed_marker_is_bracketed_and_dash_free() {
 
 #[test]
 fn completing_maps_each_stop_reason_to_its_close_marker() {
-    use crate::session::log::StopReason;
+    use crate::stop_reason::StopReason;
     // The Run Limit and loop-stall stops name themselves.
-    assert_eq!(Marker::completing(StopReason::RunLimit), Marker::RunLimit);
+    assert_eq!(Marker::completing(&StopReason::RunLimit), Marker::RunLimit);
     assert_eq!(
-        Marker::completing(StopReason::RunLimitStuck),
+        Marker::completing(&StopReason::RunLimitStuck),
         Marker::LoopStall
     );
     // Every other completion closes as an after-Pass stop.
-    assert_eq!(Marker::completing(StopReason::EndTurn), Marker::RunStopped);
+    assert_eq!(Marker::completing(&StopReason::EndTurn), Marker::RunStopped);
     assert_eq!(
-        Marker::completing(StopReason::MaxTokens),
+        Marker::completing(&StopReason::MaxTokens),
         Marker::RunStopped
     );
 }

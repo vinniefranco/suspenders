@@ -18,7 +18,7 @@ pub(super) async fn spawn_and_wait(
     timeout_ms: u64,
 ) -> Result<String, String> {
     // bash with pipefail: a piped command must report the producer's failure,
-    // not the consumer's success - the Verify and failure Governors key on the
+    // not the consumer's success - the model and the exit badge key on the
     // exit code, and `cargo test | head` must not launder a red suite into
     // is_error=false.
     let mut cmd = tokio::process::Command::new("bash");
@@ -143,9 +143,9 @@ pub(super) async fn run_background(
     ))
 }
 
-/// Attach the `[exit code: N]` tail to a command's merged output. The single source
-/// for the tail the run_command extension's `present` keys on (its inverse is
-/// [`super::parse_exit_code`]).
+/// Attach the `[exit code: N]` tail to a command's merged output. The single
+/// source for the tail the Tool's own badge-Artifact attachment keys on (its
+/// inverse is [`super::parse_exit_code`], read by `attach_badge`).
 pub(super) fn report(output: &str, exit_code: i32) -> String {
     if output.is_empty() {
         format!("[exit code: {exit_code}]")

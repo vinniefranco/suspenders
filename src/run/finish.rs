@@ -16,21 +16,24 @@ use crate::conversation::Conversation;
 use crate::llm::response::{Response, StopReason};
 use crate::run::deps::RunDeps;
 use crate::run::dispatch::Flow;
-use crate::run::loop_::{LoopState, Outcome, OutcomeStop};
-use crate::session::log;
+use crate::run::loop_::LoopState;
+use crate::run::settlement::{Outcome, Reason};
 use crate::voice;
 
 pub(super) fn close<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
     marker: &str,
-    stop_reason: log::StopReason,
+    stop_reason: crate::stop_reason::StopReason,
 ) -> Outcome {
     conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
     state.deps.checkpoint(&conversation);
-    Outcome::Ok(conversation, OutcomeStop::Reason(stop_reason))
+    Outcome::Ok(conversation, stop_reason)
 }
 
+// A Hook's `continue:false` stop (ADR-0066): the hook's atom closes the Run as
+// the canonical `StopReason::Custom`, riding the settlement and the Session
+// Log verbatim.
 pub(super) fn close_custom<D: RunDeps>(
     state: &mut LoopState<'_, D>,
     mut conversation: Conversation,
@@ -39,7 +42,10 @@ pub(super) fn close_custom<D: RunDeps>(
 ) -> Outcome {
     conversation.add_assistant_blocks(vec![ContentBlock::text(marker)]);
     state.deps.checkpoint(&conversation);
-    Outcome::Ok(conversation, OutcomeStop::Custom(stop_reason))
+    Outcome::Ok(
+        conversation,
+        crate::stop_reason::StopReason::Custom(stop_reason),
+    )
 }
 
 // The LLM error algebra: text survives; unanswered tool_use blocks are dropped;
@@ -60,7 +66,9 @@ pub(super) fn fail<D: RunDeps>(
     // (the appended marker rides the same message, as the fold's does).
     conversation.add_assistant_response(blocks, state.deps.provenance());
     state.deps.checkpoint(&conversation);
-    let reason = response.error.unwrap_or_default();
+    // The LLM error string rides verbatim (baud renders it as-is, not as an
+    // atom), so it enters the settlement as an already-rendered term.
+    let reason = Reason::verbatim(response.error.unwrap_or_default());
     Outcome::Failed(reason, conversation)
 }
 
@@ -77,7 +85,9 @@ pub(super) fn finish<D: RunDeps>(
     let closed = close_stop_reason(&stop_reason);
     let provenance = state.deps.provenance();
     conversation.add_assistant_response(close_blocks(&blocks, &stop_reason), provenance);
-    Flow::Done(Outcome::Ok(conversation, outcome_stop_of(&closed)))
+    // The one wire-to-canonical seam (the `From` beside the wire type): the
+    // already-closed reason embeds name-for-name.
+    Flow::Done(Outcome::Ok(conversation, closed.into()))
 }
 
 fn close_blocks(blocks: &[ContentBlock], stop_reason: &StopReason) -> Vec<ContentBlock> {
@@ -104,16 +114,4 @@ fn close_stop_reason(stop_reason: &StopReason) -> StopReason {
         StopReason::ToolUse => StopReason::EndTurn,
         other => other.clone(),
     }
-}
-
-// Maps a (closed) LLM stop reason to the outcome's terminal reason.
-fn outcome_stop_of(stop_reason: &StopReason) -> OutcomeStop {
-    let reason = match stop_reason {
-        StopReason::EndTurn | StopReason::ToolUse => log::StopReason::EndTurn,
-        StopReason::MaxTokens => log::StopReason::MaxTokens,
-        StopReason::StopSequence => log::StopReason::StopSequence,
-        StopReason::Error => log::StopReason::Error,
-        StopReason::Unknown => log::StopReason::Unknown,
-    };
-    OutcomeStop::Reason(reason)
 }

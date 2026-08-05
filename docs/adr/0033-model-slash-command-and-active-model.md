@@ -59,13 +59,13 @@ Re-selecting the current model is a no-op - no swap, no write, no warning.
   re-derivation and re-validation mid-Session. Swapping only the identifier keeps
   the change cheap and total.
 - **An endpoint-pinned cache of the model list** (`{ endpoint, ids }` under
-  `$XDG_CACHE_HOME`, invalidated when `base_url` changes) - built, then dropped
-  on review. `base_url` is a *fixed* Session fact, so the endpoint-switch
-  invalidation can never fire mid-Session (it is dead code), and with no refresh
-  affordance the cache goes stale across Sessions whenever the server's model set
-  changes - the exact local-server workflow this feature serves. It guarded only
-  a ~50ms localhost call. The correct version, if instant cross-Session paint is
-  ever wanted, is stale-while-revalidate (show cached rows, always re-fetch,
+  `$XDG_CACHE_HOME`, invalidated when `base_url` changes) - rejected. `base_url`
+  is a *fixed* Session fact, so the endpoint-switch invalidation can never fire
+  mid-Session (dead code), and with no refresh affordance the cache goes stale
+  across Sessions whenever the server's model set changes - the exact
+  local-server workflow this feature serves. It would guard only a ~50ms
+  localhost call. The correct version, if instant cross-Session paint is ever
+  wanted, is stale-while-revalidate (show cached rows, always re-fetch,
   reconcile with a request-generation token) - a deliberate future add, not a
   bare cache.
 
@@ -82,8 +82,8 @@ Re-selecting the current model is a no-op - no swap, no write, no warning.
   keeping decisions out of the untested adapter. A registry-coverage test asserts
   every `slash::COMMANDS` entry has an adapter handler, so adding a command
   without wiring it fails loudly.
-- The Active Model shows in the status bar beside the endpoint - the mutable
-  connection fact is surfaced, not just the fixed one.
+- The Active Model shows in the footer (ADR-0053) - the mutable fact is
+  surfaced, not just the fixed Session facts.
 
 ## Amendment (ADR-0037): the single-connection premise is reversed
 
@@ -107,7 +107,7 @@ fixed Session facts, change-on-next-Run semantics, no mid-stream swap, the
 no-op on re-selection, and the sticky sparse write of the `model` key (now
 scoped) with its env-shadow warning.
 
-## Amendment (ADR-0051, Phase 5): the `/model` DIALOG is System A + a filter
+## Amendment (ADR-0051): the `/model` DIALOG is System A + a filter
 
 The one-widget convergence with `/theme` is superseded: `/model` is now a
 System-A numbered `›` DIALOG (`ui::selection::SelectionList`), not the retired

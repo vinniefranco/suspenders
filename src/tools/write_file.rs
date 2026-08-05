@@ -75,8 +75,8 @@ impl Tool for WriteFile {
         ctx: &ToolCtx,
     ) -> Result<crate::tool::ToolOutput, String> {
         // write_file knows the before-content (an overwrite) and the written
-        // content, so it computes its own diff (ADR-0007's diff behavior,
-        // relocated here) and attaches the `diff` display Artifact, which the
+        // content, so it computes its own diff (ADR-0007: diff rendering lives
+        // in the tool) and attaches the `diff` display Artifact, which the
         // Transcript store swaps for a first-class Diff item.
         let outcome = write_file(input, ctx)?;
         let output = crate::tool::ToolOutput::text(outcome.message);

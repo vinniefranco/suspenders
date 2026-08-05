@@ -69,16 +69,6 @@ Use blockedBy only when the work has real dependencies. Reference Todo IDs from 
 Keep at most one task in_progress. When a plan exists, keep its statuses current, mark finished work completed, revise the plan when the scope or approach changes, and remove items that are no longer relevant. Do not mark incomplete or blocked work completed.
 "#;
 
-/// qwen's `todoWriteToolSchemaData.description` (tools/todoWrite.ts:37-38): the
-/// short schema-level summary. suspenders' [`ToolSpec`] carries a single
-/// `description` slot (wired to the long [`DESCRIPTION`] above, matching qwen's
-/// `todoWriteToolDescription` which is what qwen actually passes to the model),
-/// so this schema-level string has no distinct slot on the wire; it is kept here
-/// for parity documentation only.
-#[allow(dead_code)]
-const SCHEMA_DESCRIPTION: &str =
-    "Creates and manages a concise, user-visible task list for complex or multi-step work.";
-
 /// One validated todo item's fields, in the order qwen validates them.
 struct ItemFields<'a> {
     id: Option<&'a str>,
@@ -343,7 +333,7 @@ impl Tool for TodoWriteTool {
         let output = ToolOutput::text(self.run(input, ctx).await?);
         Ok(match plan::parse_todos(input) {
             Some(items) if !items.is_empty() => {
-                // Fail-open (ADR-0007): a Todo Artifact always serializes, but
+                // Fail-open (ADR-0018): a Todo Artifact always serializes, but
                 // should that ever break, attach nothing rather than panic - the
                 // Transcript store reads `None` and simply shows no todo box.
                 match serde_json::to_value(TodoArtifact { items }) {

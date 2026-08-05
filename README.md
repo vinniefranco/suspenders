@@ -8,9 +8,9 @@ It ports an earlier Elixir project (Baud/Breeze); this is the Rust rewrite.
 
 ## What it does
 
-Launch it in a project, describe a task, and the model reads code, greps, edits files, and runs commands until the work settles. The TUI streams the model's thinking, collapses tool results into summaries, shows diffs instead of prose for writes, and gates `run_command` behind an approval prompt. Every session is written to an append-only JSONL log you can resume from.
+Launch it in a project, describe a task, and the model reads code, greps, edits files, and runs commands until the work settles. The TUI streams the model's thinking, collapses tool results into summaries, shows diffs instead of prose for writes, and gates `run_shell_command` behind an approval prompt. Every session is written to an append-only JSONL log you can resume from.
 
-Tools: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`, `web_fetch`, `todo_write`.
+Tools (named to match qwen-code, so a small local model calls them without translation): `read_file`, `write_file`, `edit`, `notebook_edit`, `list_directory`, `glob`, `grep_search`, `run_shell_command`, `web_fetch`, `todo_write`, `ask_user_question`, `skill`, `agent`, plan-mode tools, and `tool_search` for on-demand discovery - plus any MCP tools you attach (`suspenders mcp add`, the `/mcp` dialog).
 
 ## The unit of work
 
@@ -39,7 +39,7 @@ suspenders                          # TUI in the current directory
 suspenders --root path/to/project   # elsewhere
 suspenders --resume latest          # continue the last session
 suspenders --resume                 # pick a session from the log
-suspenders --headless "do the task" "then this one"   # no TUI, events to stdout, run_command auto-approved
+suspenders --headless "do the task" "then this one"   # no TUI, events to stdout, run_shell_command auto-approved
 ```
 
 `--headless` runs each prompt as a sequential run in one session. It's the diagnostic harness: use it to watch the agent work without the TUI in the way.
@@ -50,7 +50,7 @@ The LLM boundary is a set of **providers**, each speaking one wire **Api** throu
 
 ## Configure
 
-Config resolves once at launch, in precedence order: built-in defaults, then `config.json`, then the `SUSPENDERS_*` environment.
+Config resolves once at launch, in precedence order: built-in defaults, then the user `config.json`, then the workspace `.suspenders/config.json`, then the `SUSPENDERS_*` environment.
 
 Write the default template and edit it:
 
@@ -75,14 +75,16 @@ The setpoints that encode small-model tuning (`compaction_slack`, `compaction_ke
 ## Layout
 
 ```
-src/main.rs        CLI parsing
+src/main.rs        CLI parsing (plus the `suspenders mcp` subcommands)
 src/app.rs         composition root: run_tui / run_headless
 src/agent.rs       orchestrator: runs runs, spawned over channels (ADR-0017)
-src/run/           the pass loop, batch execution, settlement
+src/run/           the pass loop, batch execution, hook firing, settlement
 src/llm/           Api adapters (anthropic-messages, openai-completions), providers, the Catalog (ADR-0037)
 src/tools/         the tools
+src/hooks/         the Hook subsystem: config-driven lifecycle interception (ADR-0066)
+src/skills/        Skill discovery for the `skill` tool's catalog (ADR-0058)
+src/mcp/           the MCP client: transports, adapters, the manager (ADR-0056)
 src/conversation.rs / compaction.rs   history + the summary that shrinks it
-src/middleware.rs / src/presenter.rs / src/extensions/   the extension pipeline: diff, run_command, condense
-src/ui/            ratatui TUI: viewport, composer, transcript, streaming, slash menu
+src/ui/            ratatui fullscreen TUI: screen, transcript, composer, themes (ADR-0046)
 src/voice.rs       every Suspenders-authored string, in one place to tune per model
 ```

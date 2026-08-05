@@ -53,6 +53,13 @@ impl Tool for ReadFile {
         crate::approvals::Kind::Read
     }
 
+    // A cut names the file-absolute 0-based `offset` that continues the read
+    // (Shaping reads this Call's `offset` input so the marker's line numbers
+    // stay file-absolute).
+    fn cut_policy(&self) -> crate::tool::CutPolicy {
+        crate::tool::CutPolicy::HeadWithResume
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),

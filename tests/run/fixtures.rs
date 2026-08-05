@@ -18,7 +18,8 @@ use crate::llm::model::Model;
 use crate::llm::response::{Response, StopReason};
 use crate::llm::{Llm, LlmRequest, StreamEvent};
 use crate::run::deps::{AfterPass, CompactError, Emitter, RunDeps};
-use crate::run::loop_::{Outcome, OutcomeStop, RunEnv, RunOpts, run};
+use crate::run::loop_::{RunEnv, RunOpts, run};
+use crate::run::settlement::Outcome;
 use crate::session::{Session, SessionConfig, SessionOpts};
 use crate::test_support::{Entry, FakeLlm};
 use crate::tool::ToolCtx;
@@ -314,7 +315,7 @@ pub(super) fn last_message(conv: &Conversation) -> &Message {
     conv.messages.last().expect("has a message")
 }
 
-pub(super) fn ok(outcome: &Outcome) -> (&Conversation, &OutcomeStop) {
+pub(super) fn ok(outcome: &Outcome) -> (&Conversation, &crate::stop_reason::StopReason) {
     match outcome {
         Outcome::Ok(c, s) => (c, s),
         other => panic!("expected Ok, got {other:?}"),

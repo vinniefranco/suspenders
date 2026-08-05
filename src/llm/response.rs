@@ -41,6 +41,25 @@ impl std::fmt::Display for StopReason {
     }
 }
 
+/// The ONE seam where a wire stop reason enters the canonical run-stop
+/// vocabulary ([`crate::stop_reason::StopReason`]): a total, name-for-name
+/// embedding. The wire type stays the LLM boundary's fact about a response;
+/// everything past the Run's finish speaks the canonical type, and no other
+/// mapping exists anywhere.
+impl From<StopReason> for crate::stop_reason::StopReason {
+    fn from(wire: StopReason) -> Self {
+        use crate::stop_reason::StopReason as Stop;
+        match wire {
+            StopReason::EndTurn => Stop::EndTurn,
+            StopReason::ToolUse => Stop::ToolUse,
+            StopReason::MaxTokens => Stop::MaxTokens,
+            StopReason::StopSequence => Stop::StopSequence,
+            StopReason::Error => Stop::Error,
+            StopReason::Unknown => Stop::Unknown,
+        }
+    }
+}
+
 /// One model response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {

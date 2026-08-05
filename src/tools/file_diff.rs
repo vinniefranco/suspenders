@@ -1,5 +1,5 @@
-//! File-edit diffs for `edit_file` and `write_file` (ADR-0007's diff behavior,
-//! relocated into the tools that own it).
+//! File-edit diffs for `edit_file` and `write_file` (ADR-0007: diff rendering
+//! lives in the tools that own it).
 //!
 //! A file-editing tool knows the before-content (what it read/replaced) and the
 //! after-content (what it wrote), so it computes its own diff and attaches the
@@ -45,7 +45,7 @@ pub const EDIT_TOOLS: [&str; 2] = ["edit", "write_file"];
 /// the model-supplied path, echoed in the diff title. The returned `Value` is
 /// the serialized [`DiffArtifact`], ready to attach to the Tool Result.
 ///
-/// Fail-open (ADR-0007): a Diff artifact is a plain struct that always
+/// Fail-open (ADR-0018): a Diff artifact is a plain struct that always
 /// serializes, but should that ever break, attach nothing rather than panic -
 /// the Transcript store reads `None` and simply shows no diff.
 pub fn artifact(before: Option<&str>, after: &str, path: &str) -> Option<Value> {

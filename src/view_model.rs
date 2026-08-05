@@ -7,25 +7,20 @@
 //! them (an [`crate::event::Event`] carries a Tone or a row list) and the `ui`
 //! render them without the core ever depending on the rendering layer.
 
-/// The semantic TONE of a harness-authored marker (ADR-0040): names WHO acted
-/// and in what spirit, so the adapter tints the marker plane without ever
-/// sniffing the line's text. Like a diff's [`DiffSide`], the tone is the
-/// semantic fact; the terminal color mapping lives in
-/// `ui/components` (a Theme slot per tone). Stamped at the firing site (the
-/// Event that voiced the marker), carried into
-/// [`crate::ui::transcript::Transcript::marker`]; the store never classifies
-/// it.
+/// The semantic TONE of a harness-authored marker: names WHO acted and in
+/// what spirit, so the adapter styles the marker without ever sniffing the
+/// line's text. Like a diff's [`DiffSide`], the tone is the semantic fact;
+/// the glyph/style mapping lives in `ui/components` (qwen's status-message
+/// roles). Stamped at the firing site (the Event that voiced the marker),
+/// carried into [`crate::ui::transcript::Transcript::marker`]; the store
+/// never classifies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
     /// A budget mechanic tidying the Conversation: Compaction, Result-Cap
     /// cuts. Routine tidying, not a judgment - neutral gray.
     Housekeeping,
-    /// A marker that helps the model along. Warm amber (chosen away from
-    /// error-red). Reserved: no producer emits it since the nudge apparatus
-    /// was removed, but the plane is kept for a future aiding marker.
-    Aid,
-    /// A guard limiting the model: the loop-detector's run-close. Cool blue
-    /// (chosen away from success-green).
+    /// A guard limiting the model: the loop-detector's run-close. Drawn as
+    /// the `△` warning status.
     Constrain,
     /// The user's own voice reaching a running Run (the pending-Steering
     /// marker): the prompt color, never the harness plane.
@@ -209,11 +204,10 @@ pub struct DiffHunk {
 ///   the core carries only the facts. Recorded ONCE, as the first item a fresh
 ///   Screen opens with.
 /// * `Info { text }` - `{:info, text}`: adapter-authored news with no marker
-///   plane (launch notices, the extension-failure line).
-/// * `Marker { text, tone }` - a harness-authored line in the tinted marker
-///   plane (ADR-0040): compaction, result-cap cuts, the loop-detector close,
-///   Steering. The [`Tone`] tints it in the adapter; the store only carries
-///   the fact.
+///   plane (launch notices, the fail-open report line).
+/// * `Marker { text, tone }` - a harness-authored status line: compaction,
+///   result-cap cuts, the loop-detector close, Steering. The [`Tone`] picks
+///   its glyph and style in the adapter; the store only carries the fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User {

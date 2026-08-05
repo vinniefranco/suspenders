@@ -35,7 +35,7 @@ Invoking the tool with `{skill: "<name>"}` returns that skill's body wrapped by 
 
 `SkillManager::discover(project_root, user_root)` is a LEAF (it imports only `std` + `serde_json`, never agent/run/ui/session), the fail-open front the way `McpManager::connect` is for MCP. It walks each root's immediate subdirectories (sorted, so discovery order is stable), parses each `SKILL.md`, and records a `(skill <name>, reason)` failure for any manifest that fails to parse or validate - the skill is skipped, discovery carries on. An unreadable/absent root (the common no-`.suspenders/skills/` case) is a silent no-op. Project skills are walked before user skills, so on a name collision the project skill wins (qwen's project-over-user precedence); the shadowed user skill is dropped silently, not recorded as a failure.
 
-The Agent runs discovery once in `init_agent` (beside the MCP attach) and surfaces each `failures()` entry as one `Event::extension_error("skill <name>", PreRun, reason)` launch notice - the same fail-open report line an MCP connect failure and an Extension crash take (ADR-0007). A broken `SKILL.md` is a visible skip, never a fatal.
+The Agent runs discovery once in `init_agent` (beside the MCP attach) and surfaces each `failures()` entry as one `Event::fail_open_report("skill <name>", SkillLoad, reason)` launch notice - the same fail-open report line an MCP connect failure and a broken hook entry take (ADR-0018). A broken `SKILL.md` is a visible skip, never a fatal.
 
 ## `paths:` conditional activation, hidden until a file is touched
 

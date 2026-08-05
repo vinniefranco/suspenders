@@ -8,15 +8,18 @@
 //!
 //! - Request building (wire-format conversion) lives in [`request`] - pure, no
 //!   transport reference; it produces the complete payload this module sends.
-//! - SSE event decoding (the streaming state machine) lives in [`stream`] - a
-//!   pure fold, testable with canned event lists.
+//! - SSE event decoding (the streaming state machine) lives in `stream` - a
+//!   pure fold, testable with canned event lists. The module is private to
+//!   this adapter, so only its `SseProtocol` strategy (and the fold's
+//!   in-module tests) can drive the state: the never-Err error algebra is
+//!   enforced by visibility, not convention.
 //!
-//! [`complete`] wires them together: reqwest for HTTP, `eventsource-stream`
-//! for SSE framing, [`stream::StreamState`] for decoding, and
+//! `complete` wires them together: reqwest for HTTP, `eventsource-stream`
+//! for SSE framing, `stream::StreamState` for decoding, and
 //! [`crate::llm::throttle`] to pace the `on_event` callback.
 
 pub mod request;
-pub mod stream;
+mod stream;
 
 use serde_json::Value;
 
