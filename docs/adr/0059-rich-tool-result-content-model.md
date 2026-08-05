@@ -85,12 +85,11 @@ pulled in.
 
 ## Shaping caps Text only
 
-`tools::shaping::shape` now takes and returns `Vec<ResultBlock>`: it folds the
-Text blocks, cuts them with the existing char-slice logic (the resume-marker
-rules for read_file and run_command unchanged), and passes media through
-uncapped. A text-only result is byte-identical to the old `&str` shaping. The
-text-editing Middleware (condense, diff, run_command) read and rewrite the text
-through `TokenResult::text_of`/`set_text`, and media rides the fold untouched.
+`tools::shaping::shape` takes and returns `Vec<ResultBlock>`: it folds the
+Text blocks, cuts them with the char-slice logic under the `CutPolicy` each
+Tool declares on its spec (default head; head+tail for run_shell_command;
+head-with-resume for read_file), and passes media through uncapped. A text-only
+result shapes exactly as a plain string would; media rides the fold untouched.
 
 ## Two degrade points, one verbatim placeholder
 

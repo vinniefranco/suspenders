@@ -36,7 +36,7 @@
 use crate::approvals::{ApprovalMode, PlanDecision};
 use crate::conversation::compaction_target;
 use crate::event::Event;
-use crate::llm::response::StopReason;
+use crate::stop_reason::StopReason;
 use crate::tool::caps::Question;
 use crate::ui::composer::{Composer, EventOutcome, KeyOutcome};
 use crate::ui::selection::{SelectionKey, SelectionList, SelectionOutcome};
@@ -75,9 +75,9 @@ fn pick_startup_tip(seed: usize) -> &'static str {
 const INITIAL_SESSION_COST: f64 = 0.0;
 
 /// The semantic pressure level (ADR-0008): how full the live context window is,
-/// computed against the Eviction marks. `Ok` below the low-water mark,
-/// `Elevated` between it and the target, `Critical` above the target. The view
-/// maps it to color/emphasis; the core only names the level.
+/// computed against the budget marks. `Ok` below the Compaction Target,
+/// `Elevated` between it and the live window, `Critical` above the window. The
+/// view maps it to color/emphasis; the core only names the level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PressureLevel {
     #[default]
@@ -126,13 +126,93 @@ impl ConfirmKind {
 /// confirmation shape, and the pure [`SelectionList`] the radio rows drive. The
 /// three options are fixed (`Yes, allow once` / `Always allow in this project` /
 /// `No, suggest changes (esc)`), so the list is always length 3.
+///
+/// A real state machine, not a data bag: the fields are private and every
+/// transition the block owns - the key fold to a [`Decision`], the radio
+/// movement, the digit quick-select timeout - is a method, so the Screen fold
+/// arm is pure delegation and the render layer reads through the accessors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
-    pub approval_id: String,
-    pub command: String,
-    pub kind: ConfirmKind,
+    approval_id: String,
+    command: String,
+    kind: ConfirmKind,
     /// The radio selection state (active row, digit quick-select buffer).
-    pub selection: SelectionList,
+    selection: SelectionList,
+}
+
+impl PendingApproval {
+    /// Builds the modal state for an `approval_request`: the id to resolve, the
+    /// command shown, the confirmation shape, and a fresh three-row radio.
+    pub fn new(approval_id: String, command: String, kind: ConfirmKind) -> Self {
+        PendingApproval {
+            approval_id,
+            command,
+            kind,
+            selection: SelectionList::new(APPROVAL_OPTION_COUNT),
+        }
+    }
+
+    /// The id the resolving [`AgentCommand::Approve`] must carry.
+    pub fn approval_id(&self) -> &str {
+        &self.approval_id
+    }
+
+    /// The gated command (or URL) the block's question line words in.
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The confirmation shape (ADR-0049): drives the question wording.
+    pub fn kind(&self) -> ConfirmKind {
+        self.kind
+    }
+
+    /// The active radio row (the render's `›` highlight).
+    pub fn active_row(&self) -> usize {
+        self.selection.active()
+    }
+
+    /// Whether `id` resolves THIS Approval (the `ApprovalResolved` match).
+    pub fn matches(&self, id: &str) -> bool {
+        self.approval_id == id
+    }
+
+    /// Folds one key while the block holds the keyboard (ADR-0049): Escape
+    /// denies THIS tool (the `No, suggest changes (esc)` row - the Run
+    /// continues), the legacy `y`/`n`/`a` quick-keys stay a superset, and every
+    /// other key drives the radio (arrows navigate, Enter selects the active
+    /// row, a digit quick-selects; with 3 rows a digit always resolves
+    /// immediately, so the buffered `now` is irrelevant - passed as 0).
+    /// `Some(decision)` resolves the Approval; `None` means the key moved the
+    /// radio or was swallowed - either way the block stays open.
+    pub fn fold_key(&mut self, key: &Key) -> Option<Decision> {
+        match key {
+            Key::Escape => return Some(Decision::Deny),
+            Key::Char('y') => return Some(Decision::Approve),
+            Key::Char('n') => return Some(Decision::Deny),
+            Key::Char('a') => return Some(Decision::ApproveAlways),
+            _ => {}
+        }
+        let sel_key = approval_selection_key(key)?;
+        match self.selection.handle(sel_key, 0) {
+            SelectionOutcome::Selected(i) => decision_for_option(i),
+            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
+                None
+            }
+        }
+    }
+
+    /// Drives the digit quick-select timeout at host time `now` (ADR-0049, the
+    /// host-driven `expire` seam): `Some(decision)` when a buffered digit
+    /// reached its deadline and auto-selected its row. With the 3-row radio
+    /// every digit selects immediately, so this is a no-op today - the seam is
+    /// live for longer dialogs.
+    pub fn expire(&mut self, now: u64) -> Option<Decision> {
+        match self.selection.expire(now) {
+            SelectionOutcome::Selected(i) => decision_for_option(i),
+            _ => None,
+        }
+    }
 }
 
 /// The number of Approval options (`Yes, allow once` / `Always allow in this
@@ -157,19 +237,69 @@ pub const OTHER_OPTION_LABEL: &str = "Other";
 /// `collecting_other` is `Some(i)` while the composer is capturing a free-form
 /// answer for question `i` (the user picked "Other"); the next composer submit
 /// fills `answers[i]` and advances the cursor.
+/// A real state machine like [`PendingApproval`]: private fields, every
+/// transition a method ([`PendingQuestion::fold_key`], the "Other" capture
+/// legs, the answer assembly), so the Screen fold arms delegate and the render
+/// layer reads through the accessors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingQuestion {
-    pub question_id: String,
-    pub questions: Vec<Question>,
+    question_id: String,
+    questions: Vec<Question>,
     /// The current question index (`0..questions.len()`); when it reaches
     /// `questions.len()` every question is answered and the modal resolves.
-    pub cursor: usize,
+    cursor: usize,
     /// Per-question radios, each `options.len() + 1` rows (the trailing "Other").
-    pub per_question: Vec<SelectionList>,
+    per_question: Vec<SelectionList>,
     /// `Some(i)` while the composer captures a free-form answer for question `i`.
-    pub collecting_other: Option<usize>,
+    collecting_other: Option<usize>,
     /// The recorded answer per question (`None` until answered).
-    pub answers: Vec<Option<String>>,
+    answers: Vec<Option<String>>,
+}
+
+/// What folding one key (or one "Other" submit) into the question modal
+/// produced (ADR-0057) - the machine states the transition, the Screen carries
+/// out its effects (decline/resolve wires, composer focus/clear).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionFold {
+    /// Escape: the whole round-trip is declined (qwen's `Cancel` outcome).
+    Decline,
+    /// The auto-"Other" row was picked: free-form capture is armed
+    /// (`collecting_other` set); the composer collects the answer next.
+    CaptureOther,
+    /// An answer was recorded and the cursor advanced; questions remain.
+    Advanced,
+    /// The last answer was recorded; the round-trip resolves.
+    Complete,
+    /// The key moved the radio or did nothing; the modal stays as is.
+    Swallow,
+}
+
+/// The verbatim decline content (qwen `askUserQuestion`): what the tool returns
+/// when the user Escapes the question modal.
+const QUESTION_DECLINED: &str = "User declined to answer the questions.";
+
+/// What a picked radio row of one question IS - the pure decision half of the
+/// pick ([`PendingQuestion::pick`] carries it out): a REAL option (its label,
+/// recorded as the answer), the auto-appended "Other" row (the last row, qwen
+/// ALWAYS appends it), or out of range (defensive; never in practice).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickedRow {
+    Option(String),
+    Other,
+    OutOfRange,
+}
+
+impl PickedRow {
+    /// Classifies row `index` of `question` - the ONE statement of the radio's
+    /// row layout (`options` rows first, the trailing "Other" at
+    /// `options.len()`).
+    fn of(question: &Question, index: usize) -> PickedRow {
+        match question.options.get(index) {
+            Some(opt) => PickedRow::Option(opt.label.clone()),
+            None if index == question.options.len() => PickedRow::Other,
+            None => PickedRow::OutOfRange,
+        }
+    }
 }
 
 impl PendingQuestion {
@@ -193,19 +323,134 @@ impl PendingQuestion {
         }
     }
 
-    /// The label for row `index` of question `q`: a real option's label, or the
-    /// auto-appended "Other" row (the last row, `options.len()`).
-    fn option_label(question: &Question, index: usize) -> Option<String> {
-        match question.options.get(index) {
-            Some(opt) => Some(opt.label.clone()),
-            None if index == question.options.len() => Some(OTHER_OPTION_LABEL.to_string()),
-            None => None,
+    /// The questions the modal renders, in order.
+    pub fn questions(&self) -> &[Question] {
+        &self.questions
+    }
+
+    /// The recorded answer for question `index` (`None` until answered).
+    pub fn answer(&self, index: usize) -> Option<&str> {
+        self.answers.get(index).and_then(|a| a.as_deref())
+    }
+
+    /// `Some(i)` while the composer is capturing a free-form "Other" answer for
+    /// question `i` - the render's hint row and the Screen's capture gate both
+    /// read it.
+    pub fn collecting_other(&self) -> Option<usize> {
+        self.collecting_other
+    }
+
+    /// The active radio row of question `index` (the render's `›` highlight);
+    /// `0` for an unknown index (defensive, matching the render's old fallback).
+    pub fn active_row(&self, index: usize) -> usize {
+        self.per_question
+            .get(index)
+            .map(|s| s.active())
+            .unwrap_or(0)
+    }
+
+    /// Folds one key while the modal holds the keyboard (ADR-0057): Escape
+    /// declines the whole round-trip; otherwise the CURRENT question's radio is
+    /// driven (arrows navigate, Enter selects, a digit quick-selects - the
+    /// approval mechanic, unchanged; a digit always resolves immediately on
+    /// these short lists, so the buffered `now` is irrelevant - passed as 0).
+    /// Selecting a real option records its label and advances the cursor;
+    /// selecting the auto-"Other" row arms free-form capture instead.
+    pub fn fold_key(&mut self, key: &Key) -> QuestionFold {
+        if *key == Key::Escape {
+            return QuestionFold::Decline;
+        }
+        let cursor = self.cursor;
+        // Defensive: a cursor past the last question means the modal should have
+        // resolved already; swallow rather than index out of range.
+        let Some(sel_key) = question_selection_key(key) else {
+            return QuestionFold::Swallow;
+        };
+        let Some(selection) = self.per_question.get_mut(cursor) else {
+            return QuestionFold::Swallow;
+        };
+        match selection.handle(sel_key, 0) {
+            SelectionOutcome::Selected(index) => self.pick(cursor, index),
+            // A move redraws the radio; cancel is Escape's, handled above.
+            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
+                QuestionFold::Swallow
+            }
         }
     }
 
-    /// Whether row `index` of question `q` is the auto-"Other" row.
-    fn is_other_row(question: &Question, index: usize) -> bool {
-        index == question.options.len()
+    // Row `index` of question `cursor` was selected: [`PickedRow::of`] states
+    // what the row IS (the pure decision), this dispatch carries it out - a
+    // REAL option records its label and advances, the auto-"Other" row arms
+    // free-form capture so the composer collects the answer.
+    fn pick(&mut self, cursor: usize, index: usize) -> QuestionFold {
+        let Some(question) = self.questions.get(cursor) else {
+            return QuestionFold::Swallow;
+        };
+        match PickedRow::of(question, index) {
+            PickedRow::Option(label) => self.record(cursor, label),
+            PickedRow::Other => self.arm_other(cursor),
+            PickedRow::OutOfRange => QuestionFold::Swallow,
+        }
+    }
+
+    // The auto-"Other" row's transition: arms free-form capture for question
+    // `cursor` ([`Self::collecting_other`]); the composer collects the answer,
+    // [`Self::submit_other`] records it.
+    fn arm_other(&mut self, cursor: usize) -> QuestionFold {
+        self.collecting_other = Some(cursor);
+        QuestionFold::CaptureOther
+    }
+
+    /// Records a captured free-form "Other" `answer` for the collecting
+    /// question and advances - the submit leg of the capture the "Other" row
+    /// armed. Swallows when no capture is armed (defensive; the Screen's gate
+    /// only routes here while one is).
+    pub fn submit_other(&mut self, answer: String) -> QuestionFold {
+        match self.collecting_other {
+            Some(cursor) => self.record(cursor, answer),
+            None => QuestionFold::Swallow,
+        }
+    }
+
+    /// Backs out of the free-form "Other" capture (Escape while collecting):
+    /// the radio takes the keyboard back, no answer recorded.
+    pub fn cancel_other(&mut self) {
+        self.collecting_other = None;
+    }
+
+    // Records `answer` for question `cursor` and advances the cursor; the
+    // transition states whether questions remain (`Advanced`) or the round-trip
+    // resolves (`Complete`).
+    fn record(&mut self, cursor: usize, answer: String) -> QuestionFold {
+        if let Some(slot) = self.answers.get_mut(cursor) {
+            *slot = Some(answer);
+        }
+        self.collecting_other = None;
+        self.cursor = cursor + 1;
+        if self.cursor >= self.questions.len() {
+            QuestionFold::Complete
+        } else {
+            QuestionFold::Advanced
+        }
+    }
+
+    /// The resolving wire (every question answered): the `(index, value)`
+    /// answer set as one [`AgentCommand::AnswerQuestion`]. Consumes the modal -
+    /// resolution IS its end.
+    pub fn resolution(self) -> AgentCommand {
+        let answers: Vec<(usize, String)> = self
+            .answers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.map(|value| (i, value)))
+            .collect();
+        AgentCommand::AnswerQuestion(self.question_id, Ok(answers))
+    }
+
+    /// The declining wire (Escape): the verbatim qwen decline string as one
+    /// [`AgentCommand::AnswerQuestion`]. Consumes the modal.
+    pub fn declination(self) -> AgentCommand {
+        AgentCommand::AnswerQuestion(self.question_id, Err(QUESTION_DECLINED.to_string()))
     }
 }
 
@@ -220,16 +465,19 @@ pub const PLAN_OPTION_COUNT: usize = 4;
 /// over the FOUR outcome rows. Runs parallel to [`PendingQuestion`] - opened by
 /// [`Event::PlanRequest`], cleared when the user picks (or Escape). Like a
 /// question it has NO auto/standing path; the modal always opens.
+/// A real state machine like [`PendingApproval`]: private fields, the key fold
+/// to a [`PlanDecision`] a method, so the Screen fold arm delegates and the
+/// render layer reads through the accessors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPlan {
-    pub plan_id: String,
+    plan_id: String,
     /// The plan text (markdown) the modal renders above its outcome rows.
-    pub plan: String,
+    plan: String,
     /// The mode Plan was entered from, worded into the restore-previous row's
     /// `({mode})` (qwen `planProps.prePlanMode`).
-    pub pre_plan_mode: ApprovalMode,
+    pre_plan_mode: ApprovalMode,
     /// The radio over the four outcome rows ([`PLAN_OPTION_COUNT`]).
-    pub selection: SelectionList,
+    selection: SelectionList,
 }
 
 impl PendingPlan {
@@ -242,6 +490,48 @@ impl PendingPlan {
             pre_plan_mode,
             selection: SelectionList::new(PLAN_OPTION_COUNT),
         }
+    }
+
+    /// The plan text (markdown) the modal renders above its outcome rows.
+    pub fn plan(&self) -> &str {
+        &self.plan
+    }
+
+    /// The mode Plan was entered from (the restore row's `({mode})`).
+    pub fn pre_plan_mode(&self) -> ApprovalMode {
+        self.pre_plan_mode
+    }
+
+    /// The active radio row (the render's `›` highlight).
+    pub fn active_row(&self) -> usize {
+        self.selection.active()
+    }
+
+    /// Folds one key while the modal holds the keyboard (ADR-0067): Escape
+    /// picks the keep-planning [`PlanDecision::Cancel`] (the `(esc)` row - a
+    /// real pick, not a Run abort); otherwise the radio is driven (arrows
+    /// navigate, Enter selects, a digit quick-selects; the list has 4 rows, so
+    /// a digit resolves immediately and the buffered `now` is irrelevant -
+    /// passed as 0). `Some(decision)` resolves the round-trip; `None` means the
+    /// key moved the radio or was swallowed.
+    pub fn fold_key(&mut self, key: &Key) -> Option<PlanDecision> {
+        if *key == Key::Escape {
+            return Some(PlanDecision::Cancel);
+        }
+        let sel_key = plan_selection_key(key)?;
+        match self.selection.handle(sel_key, 0) {
+            SelectionOutcome::Selected(index) => plan_decision_for_option(index),
+            // A move redraws the radio; cancel is Escape's, handled above.
+            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
+                None
+            }
+        }
+    }
+
+    /// The resolving wire: the picked `decision` as one
+    /// [`AgentCommand::AnswerPlan`]. Consumes the modal - resolution IS its end.
+    pub fn resolution(self, decision: PlanDecision) -> AgentCommand {
+        AgentCommand::AnswerPlan(self.plan_id, decision)
     }
 }
 
@@ -517,25 +807,34 @@ pub struct Screen {
     /// submitted/steered outcome hooks.
     transcript: Transcript,
     pub status: Status,
-    pub pending_approval: Option<PendingApproval>,
+    /// The pending Approval modal (ADR-0049). Private on purpose - the render
+    /// layer reads through [`Screen::pending_approval`], and every transition
+    /// is a [`PendingApproval`] method the fold arms delegate to.
+    pending_approval: Option<PendingApproval>,
     /// A pending question round-trip (ADR-0057, `ask_user_question`): the modal
     /// state while the user answers one or more structured questions. Runs
     /// parallel to `pending_approval` - opened by [`Event::QuestionRequest`],
     /// cleared when the last question is answered (or on Escape/decline). Unlike
     /// an Approval there is NO auto path; every question opens this modal.
-    pub pending_question: Option<PendingQuestion>,
+    /// Private like `pending_approval`; reads go through
+    /// [`Screen::pending_question`].
+    pending_question: Option<PendingQuestion>,
     /// A pending plan-confirmation round-trip (ADR-0067, `exit_plan_mode`): the
     /// modal state while the user picks a plan-exit outcome. Runs parallel to
     /// `pending_question` - opened by [`Event::PlanRequest`], cleared when the user
     /// picks (or Escape declines to keep planning). Like a question there is NO
-    /// auto path; the modal always opens.
-    pub pending_plan: Option<PendingPlan>,
+    /// auto path; the modal always opens. Private like `pending_approval`;
+    /// reads go through [`Screen::pending_plan`].
+    pending_plan: Option<PendingPlan>,
     /// The current Approval mode (ADR-0050), a DISPLAY-ONLY mirror of the
-    /// Agent's authoritative `Approvals::mode`, fed by
-    /// [`Event::ApprovalModeChanged`]. The Screen never decides the mode - it
-    /// only reflects it, so the footer AutoAcceptIndicator (and, in a later
-    /// phase, the composer chrome) can render it. `Default` shows nothing.
-    pub approval_mode: ApprovalMode,
+    /// Agent's authoritative `Approvals::mode`. The Screen never decides the
+    /// mode - it only reflects it, so the footer AutoAcceptIndicator (and, in a
+    /// later phase, the composer chrome) can render it. `Default` shows
+    /// nothing. Private on purpose, like the modal machines above - reads go
+    /// through [`Screen::approval_mode`]; every WRITE funnels through the one
+    /// [`Screen::mirror_approval_mode`] method, which documents why two write
+    /// moments feed it.
+    approval_mode: ApprovalMode,
     pub token_estimate: Option<u64>,
     pub context_budget: Option<u64>,
     pub compaction_slack: f64,
@@ -568,7 +867,7 @@ pub struct Screen {
     pub compact_mode: bool,
     /// The keyboard-shortcuts Help overlay (qwen `Help`, the `?` affordance the
     /// footer's `? for shortcuts` hint promises). When `true` the bordered panel
-    /// draws in the pending region and holds the keyboard like the Approval modal:
+    /// draws in the Pending tail and holds the keyboard like the Approval modal:
     /// [`Screen::handle_help_key`] swallows every key with no effect except the
     /// closers (`Esc`, `?`, `q`). Opened by `?` on an EMPTY draft (a non-empty
     /// draft keeps `?` typeable) - the interception sits above the Composer's
@@ -800,12 +1099,14 @@ impl Screen {
         }
     }
 
-    /// A representative populated Screen for eyeballing the render (the `--demo`
-    /// harness and the render tests): one user request whose run interleaves
-    /// several Thinking passes, tool machinery, harness markers, and an answer
-    /// with a code fence - the exact shape that exposed the fold / separator /
+    /// A representative populated Screen the render snapshot tests
+    /// (`ui::components`) pin: one user request whose run interleaves several
+    /// Thinking passes, tool machinery, harness markers, and an answer with a
+    /// code fence - the exact shape that exposed the fold / separator /
     /// blank-line bugs. No IO, no events; the transcript is authored directly.
-    // qual:test_helper - called only from render tests in ui::components
+    /// Test-only ([`Screen::demo_diffs`] is the one the live `diff-demo`
+    /// binary renders).
+    #[cfg(test)]
     pub fn demo() -> Self {
         let mut screen = Screen::new(ScreenOpts::default());
         let t = &mut screen.transcript;
@@ -860,7 +1161,7 @@ impl Screen {
             "adr/ (+2 more lines)",
             false,
         ));
-        t.marker("» [reading file after file fills your context - grep for the symbol you actually need first instead; then read only what you will change]", Tone::Aid);
+        t.marker("⟨ compaction: 61k tokens → summary ⟩", Tone::Housekeeping);
         t.push(thought("Let me explore more of the project structure to understand the codebase depth, test coverage, and ADRs."));
         t.push(tool(
             "list_directory",
@@ -870,16 +1171,19 @@ impl Screen {
         ));
         t.push(tool(
             "list_directory",
-            "src/turn",
-            "governor/ (+7 more lines)",
+            "src/run",
+            "batch.rs (+10 more lines)",
             false,
         ));
-        t.marker("⚑ plan refreshed", Tone::Aid);
-        t.push(thought("Let me set up a plan for this evaluation, then continue gathering information to form a comprehensive assessment."));
+        t.marker(
+            "loop detected - stopped after 5 identical tool batches",
+            Tone::Constrain,
+        );
+        t.push(thought("Let me set up a task list for this evaluation, then continue gathering information to form a comprehensive assessment."));
         t.push(tool(
-            "plan",
-            "GOAL: Evaluate the Suspenders project - a Rust terminal cod…",
-            "[plan recorded]",
+            "todo_write",
+            "3 tasks",
+            "Todos have been modified successfully.",
             false,
         ));
         t.push(thought("Let me check the build health and test coverage."));
@@ -974,7 +1278,7 @@ impl Screen {
 
             event @ (Event::ToolCall { .. }
             | Event::ToolResult { .. }
-            | Event::ExtensionError { .. }) => self.apply_tooling(event),
+            | Event::FailOpenReport { .. }) => self.apply_tooling(event),
 
             event @ (Event::ApprovalRequest { .. }
             | Event::ApprovalResolved { .. }
@@ -1065,8 +1369,8 @@ impl Screen {
         }
     }
 
-    // Context pressure / Eviction / Compaction (ADR-0008; CONTEXT.md: Eviction):
-    // the status-bar figures and the receded machinery lines.
+    // Context pressure / Compaction (ADR-0008; CONTEXT.md: Compaction): the
+    // status-bar figures and the Housekeeping marker lines.
     fn apply_pressure(mut self, event: Event) -> (Self, Vec<Effect>) {
         match event {
             // Live context-pressure indication: refresh the status bar's token
@@ -1128,15 +1432,14 @@ impl Screen {
                 (self, vec![])
             }
 
-            // A tool-side subsystem (MCP init/ops today) failed and was skipped
-            // fail-open (ADR-0007) - recorded as one visible report line.
-            Event::ExtensionError {
-                extension,
-                stage,
-                message,
-            } => {
-                self.transcript
-                    .extension_failure(&extension, stage, &message);
+            // A fail-open subsystem reported (ADR-0018): a failure that never
+            // fails the Run (MCP connect, Skill/Hook load, a hook firing) or a
+            // deciding intervention (a Hook Decision, the plan-mode block) -
+            // recorded as one visible report line. The `source` label names
+            // the reporting site in words, so the line renders from source +
+            // message alone.
+            Event::FailOpenReport { source, message } => {
+                self.transcript.fail_open_report(&source, &message);
                 (self, vec![])
             }
 
@@ -1162,17 +1465,12 @@ impl Screen {
                     .map(ConfirmKind::from_tool_name)
                     .unwrap_or(ConfirmKind::Info);
                 let body = format!("Approval needed: {command}");
-                self.pending_approval = Some(PendingApproval {
-                    approval_id,
-                    command,
-                    kind,
-                    selection: SelectionList::new(APPROVAL_OPTION_COUNT),
-                });
+                self.pending_approval = Some(PendingApproval::new(approval_id, command, kind));
                 (self, vec![Effect::FocusModal, Effect::Notify(body)])
             }
 
             Event::ApprovalResolved { approval_id, .. } => match &self.pending_approval {
-                Some(pending) if pending.approval_id == approval_id => self.clear_approval(),
+                Some(pending) if pending.matches(&approval_id) => self.clear_approval(),
                 _ => (self, vec![]),
             },
 
@@ -1186,7 +1484,7 @@ impl Screen {
             // The Agent rotated its Approval mode (ADR-0050): mirror it for the
             // footer indicator. Display-only - the Screen never decides the mode.
             Event::ApprovalModeChanged { mode } => {
-                self.approval_mode = mode;
+                self.mirror_approval_mode(mode);
                 (self, vec![])
             }
 
@@ -1259,8 +1557,8 @@ impl Screen {
         match event {
             Event::SteeringQueued { text } => {
                 self.transcript.steering_queued(&text);
-                // No PinBottom (ADR-0046): the inline pending region follows the
-                // tail; the queued marker shows at the bottom by construction.
+                // No PinBottom (ADR-0046): the Pending tail is bottom-anchored,
+                // so the queued marker shows at the bottom by construction.
                 (self, vec![])
             }
 
@@ -1421,7 +1719,7 @@ impl Screen {
         // ([`Screen::handle_other_capture_key`]). Otherwise the modal holds the
         // keyboard and drives the current question's radio.
         if let Some(pending) = &self.pending_question {
-            if pending.collecting_other.is_some() {
+            if pending.collecting_other().is_some() {
                 return self.handle_other_capture_key(key);
             }
             return self.handle_question_key(key);
@@ -1525,17 +1823,14 @@ impl Screen {
         (screen, effects)
     }
 
-    // The Approval-block key gate (ADR-0049): the arrow/Enter keys drive the
-    // pure [`SelectionList`], the numbered digits quick-select, and `y`/`n`/`a`
-    // stay as a legacy superset. Escape DENIES THIS TOOL and lets the Run
-    // CONTINUE (qwen `ToolConfirmationMessage.tsx:106-114`: Escape →
-    // `ToolConfirmationOutcome.Cancel` = deny the call, not abort the Run) -
-    // matching the `No, suggest changes (esc)` option label. (Escape only
-    // cancels the whole Run when NO approval is open and a Run is streaming; that
-    // arm lives in `handle_key`.) A digit here always resolves immediately (the
-    // radio has 3 rows, so the buffered path in `SelectionList` never arises),
-    // so the `now` fed to the fold is irrelevant - passed as 0. Every other key
-    // is swallowed with no effect, so a stray key can never leak to the Composer.
+    // The Approval-block key gate (ADR-0049): pure delegation to the
+    // [`PendingApproval`] state machine, which owns the whole key fold (the
+    // Escape-denies-THIS-tool rule, the `y`/`n`/`a` legacy superset, the radio
+    // + digit quick-select - see [`PendingApproval::fold_key`]). A resolving
+    // key clears the block and emits the Approve command; anything else is
+    // swallowed here, so a stray key can never leak to the Composer. (Escape
+    // only cancels the whole Run when NO approval is open and a Run is
+    // streaming; that arm lives in `handle_key`.)
     fn handle_approval_key(mut self, key: Key) -> (Self, Vec<Effect>) {
         // Bind the pending Approval once (the caller only enters here when one is
         // open); a defensive `None` swallows the key with no effect, so no
@@ -1543,111 +1838,44 @@ impl Screen {
         let Some(pending) = self.pending_approval.as_mut() else {
             return (self, vec![]);
         };
-        // Escape denies THIS tool and the Run continues: route it through the
-        // widget's `Cancelled` outcome to the `No, suggest changes (esc)` option
-        // (`Decision::Deny`), matching qwen and the label. The Run is NOT
-        // cancelled here.
-        if key == Key::Escape {
-            let id = pending.approval_id.clone();
-            return self.resolve_approval(AgentCommand::Approve(id, Decision::Deny));
-        }
-        // The legacy quick-keys stay a superset of the radio.
-        let quick = match key {
-            Key::Char('y') => Some(Decision::Approve),
-            Key::Char('n') => Some(Decision::Deny),
-            Key::Char('a') => Some(Decision::ApproveAlways),
-            _ => None,
-        };
-        if let Some(decision) = quick {
-            let id = pending.approval_id.clone();
-            return self.resolve_approval(AgentCommand::Approve(id, decision));
-        }
-
-        // Otherwise drive the SelectionList with the mapped key.
-        let Some(sel_key) = approval_selection_key(&key) else {
-            // A key the radio does not act on: swallowed, no effect.
-            return (self, vec![]);
-        };
-        match pending.selection.handle(sel_key, 0) {
-            SelectionOutcome::Selected(i) => match decision_for_option(i) {
-                Some(decision) => {
-                    let id = pending.approval_id.clone();
-                    self.resolve_approval(AgentCommand::Approve(id, decision))
-                }
-                // Out of range (never, the list is length 3): swallow.
-                None => (self, vec![]),
-            },
-            // A move redraws the radio; the cancel/ignore paths (Escape is
-            // handled above) leave the block open.
-            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
-                (self, vec![])
+        match pending.fold_key(&key) {
+            Some(decision) => {
+                let id = pending.approval_id().to_string();
+                self.resolve_approval(AgentCommand::Approve(id, decision))
             }
+            // A move redraws the radio; a swallowed key leaves the block open.
+            None => (self, vec![]),
         }
     }
 
-    // The question-modal key gate (ADR-0057): the arrow/Enter keys drive the
-    // CURRENT question's [`SelectionList`], the numbered digits quick-select, and
-    // Escape DECLINES the whole round-trip (the qwen `Cancel` outcome = "User
-    // declined to answer the questions."). Selecting a real option records its
-    // label and advances the cursor; selecting the auto-"Other" row focuses the
-    // composer to capture a free-form answer (handled by
-    // [`Screen::handle_other_capture_key`] once `collecting_other` is set). Every
-    // other key is swallowed, so a stray key never leaks to the Composer while
-    // the modal holds the keyboard.
+    // The question-modal key gate (ADR-0057): pure delegation to the
+    // [`PendingQuestion`] state machine, which owns the whole key fold (Escape
+    // declines the round-trip, the CURRENT question's radio + digit
+    // quick-select, the record-and-advance choreography, the auto-"Other" arm -
+    // see [`PendingQuestion::fold_key`]). This arm carries out the effects each
+    // transition asks for; every unacted key is swallowed, so a stray key never
+    // leaks to the Composer while the modal holds the keyboard.
     fn handle_question_key(mut self, key: Key) -> (Self, Vec<Effect>) {
         let Some(pending) = self.pending_question.as_mut() else {
             return (self, vec![]);
         };
-        // Escape declines the whole round-trip - the modal's counterpart of the
-        // Approval's `No, suggest changes (esc)`, but here it ends the questions
-        // (qwen returns "User declined to answer the questions.").
-        if key == Key::Escape {
-            return self.decline_question();
-        }
-
-        let cursor = pending.cursor;
-        // Defensive: a cursor past the last question means the modal should have
-        // resolved already; swallow rather than index out of range.
-        let Some(sel_key) = question_selection_key(&key) else {
-            return (self, vec![]);
-        };
-        let Some(selection) = pending.per_question.get_mut(cursor) else {
-            return (self, vec![]);
-        };
-        match selection.handle(sel_key, 0) {
-            SelectionOutcome::Selected(index) => self.answer_option(cursor, index),
-            // A move redraws the radio; cancel is handled above (Escape).
-            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
-                (self, vec![])
+        match pending.fold_key(&key) {
+            QuestionFold::Decline => self.decline_question(),
+            QuestionFold::CaptureOther => {
+                // Focus the composer to capture the free-form answer; the next
+                // submit fills it (handled by `handle_other_capture_key`).
+                // Clear any pre-existing draft FIRST (M2): a stale in-progress
+                // message the user had typed before the modal opened must NOT
+                // leak into - or be committed as - the "Other" answer.
+                // `steered_ok` resets the whole composer (draft + menu +
+                // overlay) without recording it as a prompt.
+                self.composer.steered_ok();
+                (self, vec![Effect::FocusComposer])
             }
-        }
-    }
-
-    // Row `index` of question `cursor` was selected. A REAL option records its
-    // label and advances; the auto-"Other" row instead arms free-form capture
-    // (focus the composer, set `collecting_other`) so the user types the answer.
-    fn answer_option(mut self, cursor: usize, index: usize) -> (Self, Vec<Effect>) {
-        let Some(pending) = self.pending_question.as_mut() else {
-            return (self, vec![]);
-        };
-        let Some(question) = pending.questions.get(cursor).cloned() else {
-            return (self, vec![]);
-        };
-        if PendingQuestion::is_other_row(&question, index) {
-            // Focus the composer to capture the free-form answer; the next submit
-            // fills it (handled by `handle_other_capture_key`).
-            pending.collecting_other = Some(cursor);
-            // Clear any pre-existing draft FIRST (M2): a stale in-progress message
-            // the user had typed before the modal opened must NOT leak into - or be
-            // committed as - the "Other" answer. `steered_ok` resets the whole
-            // composer (draft + menu + overlay) without recording it as a prompt.
-            self.composer.steered_ok();
-            return (self, vec![Effect::FocusComposer]);
-        }
-        match PendingQuestion::option_label(&question, index) {
-            Some(label) => self.record_answer(cursor, label),
-            // Out of range (never in practice): swallow.
-            None => (self, vec![]),
+            QuestionFold::Complete => self.resolve_question(),
+            // An advance redraws next frame; a move/swallowed key changes
+            // nothing observable - either way the modal stays open.
+            QuestionFold::Advanced | QuestionFold::Swallow => (self, vec![]),
         }
     }
 
@@ -1657,11 +1885,12 @@ impl Screen {
     // sending a prompt/steer. Escape here cancels the capture and returns to the
     // radio (the answer is not yet given), not the whole round-trip.
     fn handle_other_capture_key(mut self, key: Key) -> (Self, Vec<Effect>) {
-        // Escape backs out of the free-form capture: drop `collecting_other` and
-        // hand the keyboard back to the radio (the user can pick again).
+        // Escape backs out of the free-form capture: the machine drops
+        // `collecting_other` and the keyboard goes back to the radio (the user
+        // can pick again).
         if key == Key::Escape {
             if let Some(pending) = self.pending_question.as_mut() {
-                pending.collecting_other = None;
+                pending.cancel_other();
             }
             return (self, vec![]);
         }
@@ -1669,18 +1898,16 @@ impl Screen {
         // Offer the key to the composer (the free-form answer is a draft). A
         // Submit/Steer effect is the "answer is ready" signal: intercept it and
         // fill the answer from the draft instead of prompting/steering.
-        let cursor = self
+        let collecting = self
             .pending_question
             .as_ref()
-            .and_then(|p| p.collecting_other);
+            .is_some_and(|p| p.collecting_other().is_some());
         let key = match self.composer.handle_key(UngatedKey(key), self.status) {
             KeyOutcome::Consumed { effects, notice } => {
                 if let Some(text) = notice {
                     self.transcript.info(text);
                 }
-                if let Some(cursor) = cursor
-                    && effects.iter().any(is_submit_or_steer)
-                {
+                if collecting && effects.iter().any(is_submit_or_steer) {
                     // The composer would have submitted/steered: capture the draft
                     // as the free-form answer instead. Read then clear the draft
                     // (steered_ok clears without recording it as a prompt).
@@ -1690,7 +1917,15 @@ impl Screen {
                         return (self, vec![]);
                     }
                     self.composer.steered_ok();
-                    return self.record_answer(cursor, answer);
+                    let Some(pending) = self.pending_question.as_mut() else {
+                        return (self, vec![]);
+                    };
+                    return match pending.submit_other(answer) {
+                        QuestionFold::Complete => self.resolve_question(),
+                        // More questions (or a defensive swallow): the modal
+                        // stays open, the radio takes the keyboard back.
+                        _ => (self, vec![]),
+                    };
                 }
                 // ONLY Submit/Steer (the answer-ready signal above) and pure text
                 // entry act during "Other" capture. Any OTHER composer effect - a
@@ -1712,100 +1947,65 @@ impl Screen {
         (self, vec![])
     }
 
-    // Records `answer` for question `cursor`, advances the cursor, and - if every
-    // question is now answered - resolves the round-trip (emit the answers, clear
-    // the modal, refocus the composer). Mirrors `resolve_approval`.
-    fn record_answer(mut self, cursor: usize, answer: String) -> (Self, Vec<Effect>) {
-        let Some(pending) = self.pending_question.as_mut() else {
-            return (self, vec![]);
-        };
-        if let Some(slot) = pending.answers.get_mut(cursor) {
-            *slot = Some(answer);
-        }
-        pending.collecting_other = None;
-        pending.cursor = cursor + 1;
-        if pending.cursor >= pending.questions.len() {
-            return self.resolve_question();
-        }
-        (self, vec![])
-    }
-
-    // Every question answered: build the `(index, value)` answer set, emit the
-    // AnswerQuestion command, clear the modal, and refocus the composer (mirrors
-    // `resolve_approval` -> `clear_approval` -> FocusComposer).
+    // Every question answered: the machine assembles the answer wire
+    // ([`PendingQuestion::resolution`]); this arm clears the modal and refocuses
+    // the composer (mirrors `resolve_approval` -> `clear_approval` ->
+    // FocusComposer).
     fn resolve_question(mut self) -> (Self, Vec<Effect>) {
         let Some(pending) = self.pending_question.take() else {
             return (self, vec![]);
         };
-        let answers: Vec<(usize, String)> = pending
-            .answers
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, a)| a.map(|value| (i, value)))
-            .collect();
-        let command = AgentCommand::AnswerQuestion(pending.question_id, Ok(answers));
-        (self, vec![Effect::Agent(command), Effect::FocusComposer])
+        (
+            self,
+            vec![Effect::Agent(pending.resolution()), Effect::FocusComposer],
+        )
     }
 
-    // Escape declined the whole round-trip: emit the decline and clear the modal.
+    // Escape declined the whole round-trip: emit the machine's decline wire
+    // ([`PendingQuestion::declination`]) and clear the modal.
     fn decline_question(mut self) -> (Self, Vec<Effect>) {
         let Some(pending) = self.pending_question.take() else {
             return (self, vec![]);
         };
-        let command = AgentCommand::AnswerQuestion(
-            pending.question_id,
-            Err("User declined to answer the questions.".to_string()),
-        );
-        (self, vec![Effect::Agent(command), Effect::FocusComposer])
+        (
+            self,
+            vec![Effect::Agent(pending.declination()), Effect::FocusComposer],
+        )
     }
 
-    // The plan-modal key gate (ADR-0067, qwen `exit_plan_mode` confirmation): the
-    // arrow/Enter keys drive the pure [`SelectionList`] over the four outcome
-    // rows, a digit quick-selects, and Escape picks the keep-planning
-    // [`PlanDecision::Cancel`] (the `(esc)` row - the modal's counterpart of the
-    // Approval's Escape-declines). Selecting a row resolves the round-trip; every
-    // other key is swallowed, so a stray key never leaks to the Composer while the
-    // modal holds the keyboard.
+    // The plan-modal key gate (ADR-0067, qwen `exit_plan_mode` confirmation):
+    // pure delegation to the [`PendingPlan`] state machine, which owns the key
+    // fold (Escape picks the keep-planning Cancel row, the four-row radio +
+    // digit quick-select - see [`PendingPlan::fold_key`]). A picked outcome
+    // resolves the round-trip; every other key is swallowed, so a stray key
+    // never leaks to the Composer while the modal holds the keyboard.
     fn handle_plan_key(mut self, key: Key) -> (Self, Vec<Effect>) {
         let Some(pending) = self.pending_plan.as_mut() else {
             return (self, vec![]);
         };
-        // Escape anywhere in the modal picks Cancel (keep planning): the plan
-        // radio's `(esc)` row, so it settles the round-trip like a real pick
-        // rather than aborting the Run.
-        if key == Key::Escape {
-            return self.resolve_plan(PlanDecision::Cancel);
-        }
-
-        // The same radio mapping the Approval/question radios use (arrows navigate,
-        // Enter selects, a digit quick-selects). The list has 4 rows, so a digit
-        // resolves immediately and the `now` fed to the fold is irrelevant (0).
-        let Some(sel_key) = plan_selection_key(&key) else {
-            return (self, vec![]);
-        };
-        match pending.selection.handle(sel_key, 0) {
-            SelectionOutcome::Selected(index) => match plan_decision_for_option(index) {
-                Some(decision) => self.resolve_plan(decision),
-                // Out of range (never in practice): swallow.
-                None => (self, vec![]),
-            },
-            // A move redraws the radio; cancel is handled above (Escape).
-            SelectionOutcome::Moved | SelectionOutcome::Cancelled | SelectionOutcome::Ignored => {
-                (self, vec![])
-            }
+        match pending.fold_key(&key) {
+            Some(decision) => self.resolve_plan(decision),
+            // A move redraws the radio; a swallowed key leaves the modal open.
+            None => (self, vec![]),
         }
     }
 
-    // A plan outcome was picked: emit the AnswerPlan command with the decision,
-    // clear the modal, and refocus the composer (mirrors `resolve_question` ->
-    // FocusComposer). The Agent flips the mode to the outcome's target and saves
-    // the plan on a proceed; here the Screen only relays the pick.
+    // A plan outcome was picked: emit the machine's resolving wire
+    // ([`PendingPlan::resolution`]), clear the modal, and refocus the composer
+    // (mirrors `resolve_question` -> FocusComposer). The Agent flips the mode to
+    // the outcome's target and saves the plan on a proceed; here the Screen only
+    // relays the pick.
     fn resolve_plan(mut self, decision: PlanDecision) -> (Self, Vec<Effect>) {
         let Some(pending) = self.pending_plan.take() else {
             return (self, vec![]);
         };
-        let command = AgentCommand::AnswerPlan(pending.plan_id, decision);
-        (self, vec![Effect::Agent(command), Effect::FocusComposer])
+        (
+            self,
+            vec![
+                Effect::Agent(pending.resolution(decision)),
+                Effect::FocusComposer,
+            ],
+        )
     }
 
     // The Help-overlay key gate (qwen `Help` `useKeypress`): while the panel is up
@@ -1838,15 +2038,12 @@ impl Screen {
         let Some(pending) = self.pending_approval.as_mut() else {
             return (self, vec![]);
         };
-        match pending.selection.expire(now) {
-            SelectionOutcome::Selected(i) => match decision_for_option(i) {
-                Some(decision) => {
-                    let id = pending.approval_id.clone();
-                    self.resolve_approval(AgentCommand::Approve(id, decision))
-                }
-                None => (self, vec![]),
-            },
-            _ => (self, vec![]),
+        match pending.expire(now) {
+            Some(decision) => {
+                let id = pending.approval_id().to_string();
+                self.resolve_approval(AgentCommand::Approve(id, decision))
+            }
+            None => (self, vec![]),
         }
     }
 
@@ -1959,6 +2156,52 @@ impl Screen {
     /// submitted/steered hooks, so the TEA invariant holds.
     pub fn composer(&self) -> &Composer {
         &self.composer
+    }
+
+    /// The pending Approval, read-only - the render adapter's window (ADR-0049),
+    /// like [`Screen::transcript`]. No `&mut` counterpart on purpose: the modal
+    /// mutates only through its own state-machine methods inside the folds.
+    pub fn pending_approval(&self) -> Option<&PendingApproval> {
+        self.pending_approval.as_ref()
+    }
+
+    /// The pending question modal, read-only (ADR-0057) - the render adapter's
+    /// window, like [`Screen::pending_approval`].
+    pub fn pending_question(&self) -> Option<&PendingQuestion> {
+        self.pending_question.as_ref()
+    }
+
+    /// The pending plan modal, read-only (ADR-0067) - the render adapter's
+    /// window, like [`Screen::pending_approval`].
+    pub fn pending_plan(&self) -> Option<&PendingPlan> {
+        self.pending_plan.as_ref()
+    }
+
+    /// The Approval-mode mirror, read-only (ADR-0050) - the footer's and
+    /// `/plan`'s window, like [`Screen::pending_approval`]. Writes funnel
+    /// through [`Screen::mirror_approval_mode`], the field's sole write path.
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.approval_mode
+    }
+
+    /// The ONE writer of the `approval_mode` mirror (ADR-0050). Two moments
+    /// genuinely feed it, and both funnel here so the invariant lives in one
+    /// place - the value written is ALWAYS the Agent's authoritative fold
+    /// result, never a Screen-side decision:
+    ///
+    /// * the [`Event::ApprovalModeChanged`] fold arm - the only path a
+    ///   model/Agent-driven change (the `enter_plan_mode`/`exit_plan_mode`
+    ///   tools, an approved plan exit) reaches the Screen at all;
+    /// * the adapter's set from an AWAITED fold result (the Shift+Tab cycle,
+    ///   `/plan` enter/exit) - required because the broadcast channel is lossy
+    ///   (a `Lagged` could drop the event and leave the footer indicator
+    ///   permanently stale, a safety-signal lie).
+    ///
+    /// The field is private; reads go through [`Screen::approval_mode`] (the
+    /// footer, `/plan`'s branch table, and the integration tests), and this
+    /// method is its sole write path - compiler-enforced, not convention.
+    pub(crate) fn mirror_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval_mode = mode;
     }
 
     // ---- Transcript scrolling (ADR-0046, Stage 2) --------------------------
@@ -2139,8 +2382,9 @@ fn is_composer_edit(effect: &Effect) -> bool {
 }
 
 // The closing note a stop reason earns: nothing for the two normal ends, a
-// terse `turn stopped: :{reason}` otherwise. This fold's Voice - the store
-// records what it is handed.
+// terse `turn stopped: :{reason}` otherwise. The canonical reason arrives
+// unlossy (a Run-Limit stop reads `:turn_limit`, a Hook stop its own atom -
+// never `:unknown`). This fold's Voice - the store records what it is handed.
 fn stop_reason_note(stop_reason: StopReason) -> Option<String> {
     match stop_reason {
         StopReason::EndTurn | StopReason::ToolUse => None,
@@ -2149,7 +2393,7 @@ fn stop_reason_note(stop_reason: StopReason) -> Option<String> {
 }
 
 // The semantic pressure level (ADR-0008) against the live window: the target is
-// the live window (budget - reserve), the mark Eviction fires at; the low-water
+// the live window (budget - reserve), the fit-check's ceiling; the low-water
 // mark is the Compaction Target. Above the target is Critical, between the marks
 // Elevated, at/below the low-water mark Ok. The bounds are inclusive on the
 // lower side.
@@ -2166,9 +2410,8 @@ fn pressure_level(estimate: u64, budget: u64, reserve: u64, slack: f64) -> Press
 }
 
 // One Compaction-progress marker line (CONTEXT.md: Compaction). The `⟨ … ⟩`
-// glyph pair marks it as a summary fold in the Housekeeping tone,
-// distinct from the `✂` eviction glyph; the tint comes from the tone, never
-// from this text.
+// glyph pair marks it as a summary fold in the Housekeeping tone; the tint
+// comes from the tone, never from this text.
 fn compaction_line(status: &str) -> String {
     format!("⟨ compaction: {status} → summary ⟩")
 }

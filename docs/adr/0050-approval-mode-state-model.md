@@ -2,10 +2,10 @@
 
 qwen-code lets the operator cycle an APPROVAL MODE with Shift+Tab (win32: Tab),
 rotating `plan → default → auto-edit → auto → yolo → (wrap)`, and shows the
-current non-default mode above the composer as the `AutoAcceptIndicator`. Phase 4
-of the qwen UI port adds this cycle + the footer indicator to suspenders.
+current non-default mode above the composer as the `AutoAcceptIndicator`.
+suspenders carries the same cycle and footer indicator.
 
-suspenders' Approval state already lives as a pure fold (`approvals::Approvals`,
+suspenders' Approval state lives as a pure fold (`approvals::Approvals`,
 ADR-0005) hosted by the Agent actor. The questions: where does the mode live, how
 does the UI see it, and which modes actually change behavior.
 
@@ -21,28 +21,33 @@ when a Standing Approval covers the command; otherwise it becomes pending.
 
 **The Agent owns the transition + broadcast.** A new `Command::CycleApprovalMode`
 folds `cycle_mode` and broadcasts `Event::ApprovalModeChanged { mode }`. The Screen
-holds a DISPLAY-ONLY mirror (`Screen::approval_mode`) fed by that event - it never
-decides the mode, only reflects it. Shift+Tab flows ui.rs `BackTab`/`Tab+SHIFT` →
+holds a DISPLAY-ONLY mirror (`Screen::approval_mode`) - it never decides the mode,
+only reflects it. The mirror has ONE writer, `Screen::mirror_approval_mode`, fed
+from two moments: the `ApprovalModeChanged` event fold (the only path a
+model/Agent-driven change reaches the Screen), and the adapter's set from an
+awaited authoritative fold result (the cycle and `/plan` enter/exit) - required
+because the broadcast channel is lossy (a `Lagged` could leave the footer
+indicator permanently stale). Both write the Agent's fold result, never a
+Screen-side decision. Shift+Tab flows ui.rs `BackTab`/`Tab+SHIFT` →
 `Key::CycleApprovalMode` → `AgentCommand::CycleApprovalMode` → the Agent. The
 cycle is Session-scoped: it works whether or not a Run is in flight, and while an
 Approval is open the key is swallowed by the block (the pending Approval is left
 untouched - no double-meaning).
 
 **Default, Yolo, and Plan change BEHAVIOR; AutoEdit/Auto are DISPLAY-COMPLETE
-but behavior-STUBBED.**
-- `Default` gates exactly as before.
+but behavior-STUBBED.** Every Tool Call passes through the single mode-aware
+`Approvals::classify(name, kind, input) -> Verdict` fold (ADR-0067), so the mode
+is consulted for every call, not just the gated ones.
+- `Default` gates run_shell_command and web_fetch as usual.
 - `Yolo` auto-approves EVERY gated Call - `request` returns `Auto` with no modal
   and no Standing entry (dropping out of Yolo re-gates the command).
-- `Plan` is now REAL (ADR-0067): a read-only planning mode with `enter_plan_mode`
-  / `exit_plan_mode` tools, a per-Tool-Call read-only verdict fold, the plan-mode
-  shell classifier, and a per-Pass reminder. The gate machinery this ADR describes
-  (the two-tool `gate_text` + `request` pair) was superseded by ADR-0067's single
-  `Approvals::classify(name, kind, input) -> Verdict` fold every Tool Call passes
-  through, so the mode is consulted for every call rather than the gated two.
-- `AutoEdit`, `Auto` gate EXACTLY like `Default` this phase. suspenders does not
-  gate edits (so `AutoEdit` is vacuous) and has no Auto classifier. The footer
-  still NAMES them so the cycle is whole and forward-compatible, but they carry no
-  behavior yet. This is documented, not hidden.
+- `Plan` is read-only (ADR-0067): `enter_plan_mode` / `exit_plan_mode` tools,
+  a per-Tool-Call read-only verdict on the Tool's `Kind`, the plan-mode shell
+  classifier, and a per-Pass reminder.
+- `AutoEdit`, `Auto` gate EXACTLY like `Default`. suspenders does not gate edits
+  (so `AutoEdit` is vacuous) and has no Auto classifier. The footer still NAMES
+  them so the cycle is whole and forward-compatible, but they carry no behavior.
+  This is documented, not hidden.
 
 **A PermissionRequest hook decides ahead of the mode.** A Hook (ADR-0066) firing
 at the PermissionRequest event may return a permission decision, and it is
@@ -70,14 +75,11 @@ signal the operator must keep seeing). Labels are qwen-verbatim: `plan mode`(gre
 - The two always-variants of qwen's exec/mcp confirmations collapse onto
   suspenders' single session-scoped `ApproveAlways` (ADR-0005): no cross-session
   persistence, no per-user scope. Deliberate.
-- **Risk (discharged for Plan):** the stubbed modes were MISLEADING - the footer
-  could say `plan mode` while files were still modified, because only Yolo/Default
-  altered behavior. ADR-0067 makes Plan real (read-only enforcement, enter/exit
-  tools, shell classifier, per-Pass reminder), so this risk is discharged for Plan.
-  AutoEdit/Auto remain stubbed as described above until their own behavior lands.
+- **Risk:** the stubbed AutoEdit/Auto are display-only - the footer names a mode
+  that changes nothing. Accepted and documented until their own behavior lands;
+  Plan and Yolo carry real behavior, so the safety-relevant labels are honest.
 - The `expire(now)` timeout hook on `SelectionList` (ADR-0049) is host-driven and
-  never fires for the 3-row approval; the tick wiring lands with Phase 5's longer
-  dialogs.
+  never fires for the 3-row approval.
 
 ## Revision (P5, ADR-0062): memory-dir writes/edits auto-approved
 

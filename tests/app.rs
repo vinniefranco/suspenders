@@ -141,7 +141,7 @@ fn approval_request_prints_the_command_being_auto_approved() {
 #[test]
 fn run_finished_prints_the_stop_reason_and_the_estimates() {
     let event = Event::RunFinished {
-        stop_reason: StopReason::EndTurn,
+        stop_reason: crate::stop_reason::StopReason::EndTurn,
         token_estimate: 123,
         context_budget: 456,
     };

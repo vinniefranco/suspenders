@@ -5,10 +5,12 @@ use crate::content::ContentBlock;
 use crate::llm::LlmRequest;
 use crate::llm::model::Api;
 use crate::llm::response::{Response, StopReason as RespStop};
+use crate::run::settlement::Reason;
 use crate::session::{SessionConfig, SessionOpts};
 use crate::subagents::{ToolSelector, subagent_tools};
 use crate::test_support::{Entry, FakeLlm};
-// `super::*` already brings the `log::StopReason` the outcome mapping uses.
+// `super::*` already brings the canonical `crate::stop_reason::StopReason` the
+// outcome mapping uses.
 
 fn session() -> Session {
     let opts = SessionOpts {
@@ -193,7 +195,7 @@ fn outcome_run_limit_maps_to_max_turns() {
     conv.add_assistant_blocks(vec![ContentBlock::text(
         crate::voice::Marker::RunLimit.text(),
     )]);
-    let out = outcome_to_result(Outcome::Ok(conv, OutcomeStop::Reason(StopReason::RunLimit)));
+    let out = outcome_to_result(Outcome::Ok(conv, StopReason::RunLimit));
     assert_eq!(out.terminate_reason, "MAX_TURNS");
     // The trailing pure-marker message is skipped; the real text is the answer.
     assert_eq!(out.result, "real work so far");
@@ -206,14 +208,14 @@ fn outcome_failed_maps_to_error_with_partial_text() {
     conv.add_assistant_blocks(vec![ContentBlock::text(
         crate::voice::Marker::RunFailed.text(),
     )]);
-    let out = outcome_to_result(Outcome::Failed("boom".to_string(), conv));
+    let out = outcome_to_result(Outcome::Failed(Reason::verbatim("boom"), conv));
     assert_eq!(out.terminate_reason, "ERROR");
     assert_eq!(out.result, "partial");
 }
 
 #[test]
 fn outcome_budget_error_maps_to_error_with_no_text() {
-    let out = outcome_to_result(Outcome::Error);
+    let out = outcome_to_result(Outcome::Error(Reason::atom("context_budget_exhausted")));
     assert_eq!(out.terminate_reason, "ERROR");
     assert_eq!(out.result, "");
 }
@@ -224,9 +226,6 @@ fn outcome_stuck_loop_maps_to_error() {
     conv.add_assistant_blocks(vec![ContentBlock::text(
         crate::voice::Marker::LoopStall.text(),
     )]);
-    let out = outcome_to_result(Outcome::Ok(
-        conv,
-        OutcomeStop::Reason(StopReason::RunLimitStuck),
-    ));
+    let out = outcome_to_result(Outcome::Ok(conv, StopReason::RunLimitStuck));
     assert_eq!(out.terminate_reason, "ERROR");
 }

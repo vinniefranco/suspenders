@@ -63,7 +63,7 @@ the same next-launch warning as the model key.
   (sparse themes keep working), renaming or removing one is a break - and the
   strict parser makes it a loud one.
 
-## Amendment (ADR-0051, Phase 5): the `/theme` DIALOG is filter-less System A
+## Amendment (ADR-0051): the `/theme` DIALOG is filter-less System A
 
 `/theme` is now a System-A numbered `›` DIALOG (`ui::selection::SelectionList`),
 qwen-faithful: no free-text filter (few themes), so the dialog is `Frozen` - it
@@ -79,7 +79,7 @@ active row (`Composer::selector_highlight`). Moving the highlight still previews
 that theme live, Enter keeps + persists it, Escape reverts - the revert still
 falls out of the per-frame derivation, not a new state machine.
 
-## Amendment (ADR-0053, Phase 7): four qwen roles added, powerline slots removed
+## Amendment (ADR-0053): four qwen roles added, powerline slots removed
 
 The flat-footer port carved four qwen semantic roles that used to BORROW a
 neighbouring slot into slots of their own, entering as designed HEX (QwenDark

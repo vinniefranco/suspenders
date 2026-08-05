@@ -9,7 +9,7 @@
 //! request when the char estimate fits under `context_budget -
 //! max_tokens_reserve`, or `Err(ContextBudgetExhausted)` when it does not.
 //! Reclaiming context is Compaction's job alone (the request path recovers by
-//! summarizing on `Err`); there is no bespoke mechanical Eviction.
+//! summarizing on `Err`); there is no mechanical elision path beside it.
 
 mod run_boundary;
 
@@ -207,8 +207,8 @@ impl Conversation {
     /// the char estimate does not fit under `context_budget -
     /// max_tokens_reserve`. A pure fit-check: reclaiming context is
     /// Compaction's job (the request path recovers by summarizing on `Err`).
-    /// The fit check uses the char estimate, not `token_estimate` - the same
-    /// final-fit threshold the retired Eviction path used.
+    /// The fit check uses the char estimate, not `token_estimate` - chars are
+    /// the final-fit threshold (baud's rule, pinned by test).
     pub fn for_request(&self) -> Result<Request, ContextBudgetExhausted> {
         let target = self.context_budget.saturating_sub(self.max_tokens_reserve);
         if self.char_estimate() <= target {

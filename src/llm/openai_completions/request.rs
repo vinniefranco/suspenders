@@ -24,6 +24,7 @@ use crate::content::ToolSpec;
 use crate::content::{ContentBlock, Message, ResultBlock, Role};
 use crate::llm::LlmRequest;
 use crate::llm::model::Model;
+use crate::llm::request_knobs::{self, Thinking};
 
 /// The wire name of the output-cap field. Newer OpenAI models want
 /// `max_completion_tokens`; models.dev records no such compat fact, so the
@@ -41,7 +42,9 @@ const MAX_TOKENS_FIELD: &str = "max_tokens";
 /// (`temperature`, `top_p`, `top_k`) and the no-think field. Keys the server
 /// should default are omitted, not sent empty: no `"tools"` when `tools` is
 /// empty, no `"temperature"`/`"top_p"`/`"top_k"` when the request carries
-/// `None`.
+/// `None`. WHEN each dialect-shared knob applies is the shared
+/// `request_knobs` decision spine (one place, both dialects); `top_p` and
+/// `top_k` stay here because only this wire emits them.
 pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
     let mut obj = Map::new();
     obj.insert("model".into(), json!(model.id));
@@ -55,19 +58,13 @@ pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
     }
     obj.insert("messages".into(), Value::Array(messages));
 
-    if !request.tools.is_empty() {
-        obj.insert(
-            "tools".into(),
-            Value::Array(request.tools.iter().map(wire_tool).collect()),
-        );
-    }
-
-    if let Some(temp) = request.temperature {
-        obj.insert("temperature".into(), json!(temp));
-    }
+    request_knobs::insert_tools(&mut obj, &request.tools, wire_tool);
+    request_knobs::insert_temperature(&mut obj, request);
 
     // Sampling cutoffs (Qwen3-Coder tuning): each omitted, not sent empty,
     // when the request carries `None` - the same discipline as temperature.
+    // Dialect-local by decision (LlmRequest documents them as this wire's
+    // knobs), so they stay out of the shared spine.
     if let Some(top_p) = request.top_p {
         obj.insert("top_p".into(), json!(top_p));
     }
@@ -76,11 +73,12 @@ pub fn build_request(request: &LlmRequest, model: &Model) -> Value {
         obj.insert("top_k".into(), json!(top_k));
     }
 
-    if request.no_think {
-        obj.insert(
-            "chat_template_kwargs".into(),
-            json!({ "enable_thinking": false }),
-        );
+    match request_knobs::thinking(request) {
+        Thinking::Suppress => request_knobs::insert_no_think(&mut obj),
+        // This dialect has no thinking param to arm: reasoning rides back as
+        // `reasoning_content` unprompted, so a budget is simply not part of
+        // this wire (pinned by `thinking_budget_is_ignored_on_the_openai_wire`).
+        Thinking::Budget(_) | Thinking::Server => {}
     }
 
     Value::Object(obj)

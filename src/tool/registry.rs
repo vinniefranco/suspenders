@@ -108,6 +108,20 @@ impl ToolRegistry {
             .unwrap_or(crate::approvals::Kind::Other)
     }
 
+    /// The [`CutPolicy`](crate::tool::CutPolicy) of a tool by exact wire name,
+    /// for the Shaping fold (`tools::run`): the one place a Tool Call's name
+    /// resolves to the cut behavior the tool declared, mirroring
+    /// [`kind_of`](ToolRegistry::kind_of). An UNKNOWN name answers the default
+    /// [`Head`](crate::tool::CutPolicy::Head) - the same answer the trait
+    /// default gives, so an unknown-tool error result cuts like any plain text.
+    pub fn cut_policy_of(&self, name: &str) -> crate::tool::CutPolicy {
+        self.tools
+            .iter()
+            .find(|t| t.spec().name == name)
+            .map(|t| t.cut_policy())
+            .unwrap_or_default()
+    }
+
     /// The spec of a tool by exact (canonical) name, or `None`. `tool_search`
     /// uses this to render a resolved tool's schema block.
     pub fn spec_of(&self, canonical: &str) -> Option<ToolSpec> {

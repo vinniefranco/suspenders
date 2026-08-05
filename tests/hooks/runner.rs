@@ -278,8 +278,9 @@ async fn command_no_output_is_default() {
     assert_eq!(out, HookOutcome::default());
 }
 
-/// A shell spawn error fails open to the default outcome (a present hook never
-/// fails the Run).
+/// A shell spawn error fails open to a steers-nothing outcome (a present hook
+/// never fails the Run) that carries the error as `firing_error`, so the firing
+/// layer can surface it visibly (ADR-0018).
 #[tokio::test]
 async fn command_shell_error_fails_open() {
     let shell = FakeShell::err("spawn failed");
@@ -296,7 +297,15 @@ async fn command_shell_error_fails_open() {
         skill_root: None,
     };
     let out = run_hook(&command_hook("x"), "{}", &ctx, &caps).await;
-    assert_eq!(out, HookOutcome::default());
+    assert_eq!(
+        out,
+        HookOutcome {
+            firing_error: Some("spawn failed".to_string()),
+            ..HookOutcome::default()
+        }
+    );
+    // Steers nothing: no block, no stop, no decision.
+    assert!(!out.is_blocking() && !out.should_stop() && out.decision.is_none());
 }
 
 /// Helper: run a command hook against a scripted ShellResult.
@@ -391,7 +400,8 @@ async fn http_plaintext_body_is_system_message_continue() {
     assert_eq!(out.system_message.as_deref(), Some("just a note"));
 }
 
-/// A transport error fails open to the default outcome.
+/// A transport error fails open to a steers-nothing outcome carrying the error
+/// as `firing_error` (surfaced visibly by the firing layer, ADR-0018).
 #[tokio::test]
 async fn http_transport_error_fails_open() {
     let http = FakeHttp::err("connection refused");
@@ -408,7 +418,15 @@ async fn http_transport_error_fails_open() {
         skill_root: None,
     };
     let out = run_hook(&http_hook("https://x"), "{}", &ctx, &caps).await;
-    assert_eq!(out, HookOutcome::default());
+    assert_eq!(
+        out,
+        HookOutcome {
+            firing_error: Some("connection refused".to_string()),
+            ..HookOutcome::default()
+        }
+    );
+    // Steers nothing: no block, no stop, no decision.
+    assert!(!out.is_blocking() && !out.should_stop() && out.decision.is_none());
 }
 
 // --- prompt hook --------------------------------------------------------------
@@ -549,10 +567,13 @@ async fn prompt_non_ok_reply_defaults_to_explicit_allow() {
     );
 }
 
-/// An LLM error (empty content) defaults to an explicit allow (L2), like an
-/// unparseable reply - the prompt hook is fail-open to allow, not steers-nothing.
+/// An LLM FAILURE (the boundary folds it into a Response with `stop_reason:
+/// Error`, ADR-0002) fails open to a steers-nothing outcome that carries the
+/// error as `firing_error`, exactly like a command spawn failure or an http
+/// transport failure, so the firing layer surfaces it visibly (ADR-0018) -
+/// never a silent skip, never a block.
 #[tokio::test]
-async fn prompt_llm_error_defaults_to_explicit_allow() {
+async fn prompt_llm_error_fails_open() {
     let llm = FakeLlm::script([Entry::error("model down")]);
     let model = test_model();
     let caps = HookCaps {
@@ -566,8 +587,15 @@ async fn prompt_llm_error_defaults_to_explicit_allow() {
         skill_root: None,
     };
     let out = run_hook(&prompt_hook("go"), "{}", &ctx, &caps).await;
-    assert_eq!(out.continue_, Some(true));
-    assert_eq!(out.decision, Some(Decision::Allow));
+    assert_eq!(
+        out,
+        HookOutcome {
+            firing_error: Some("model down".to_string()),
+            ..HookOutcome::default()
+        }
+    );
+    // Steers nothing: no block, no stop, no decision.
+    assert!(!out.is_blocking() && !out.should_stop() && out.decision.is_none());
 }
 
 /// A prompt hook reply wrapped in a ```json ... ``` markdown fence is unwrapped

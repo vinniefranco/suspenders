@@ -1,14 +1,18 @@
 //! Run Settlement (CONTEXT.md): how an ended Run enters the Conversation, as
 //! one pure fold.
 //!
-//! `crate::agent` accumulates the facts here while the Run task runs - the
-//! latest checkpoint, the reported stop reason, whether the user cancelled -
-//! and calls [`settle`] exactly once when the task ends. The fold returns the
-//! complete resolution: the settled Conversation, the settlement event to
-//! broadcast, the Session Log entry, and the Rollover decision over the queued
-//! Steering. The Agent only interprets - it updates its state, logs,
+//! This module owns the Run-outcome vocabulary end to end: [`Outcome`] is what
+//! the Run task returns (the Loop constructs `Ok`/`Failed`/`Error` directly;
+//! the Agent's watcher mints `Down` when the task died without replying), and
+//! [`settle`](Settlement::settle) folds it - with the accumulated facts and
+//! the queued Steering - into the complete [`Resolution`]: the settled
+//! Conversation, the broadcast [`Event`], the Session Log entry, and the
+//! Rollover decision. The Agent only interprets - it updates its state, logs,
 //! broadcasts, and maybe starts the next Run (the same pure-core/process-shell
-//! split ADR-0011 gave the Run loop).
+//! split ADR-0011 gave the Run loop). There is no translation layer between
+//! the Loop's outcome and this fold: they are the same type, and the stop
+//! reason (the canonical [`StopReason`], Hook atoms included) rides through
+//! to the event and the log unmapped.
 //!
 //! Every Run settles exactly one way: completed, failed, or cancelled; a crash
 //! settles as a failure, and so does a `Shutdown` nobody asked for.
@@ -29,20 +33,24 @@
 
 use crate::content::ContentBlock;
 use crate::conversation::Conversation;
-use crate::session::log::{Settled, SettledEntry, StopReason};
+use crate::event::Event;
+use crate::session::log::{Settled, SettledEntry};
+use crate::stop_reason::StopReason;
 use crate::voice;
 
 /// A Run failure/exit reason, an arbitrary term at baud's boundary: it rides
-/// the settlement event verbatim, and is debug-formatted (baud's `inspect/1`)
-/// into the Session Log entry. Only the shapes the Run produces are modelled;
-/// [`Reason::inspect`] reproduces baud's inspect rendering for the log.
+/// the settlement event (via [`Reason::inspect`]) and the Session Log entry.
+/// Only the shapes the Run produces are modelled; [`Reason::inspect`]
+/// reproduces baud's inspect rendering for both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
-    /// A bare atom reason (`:timeout`, `:boom`, `:killed`, `:shutdown`, ...).
+    /// A bare atom reason (`:timeout`, `:boom`, `:killed`, `:shutdown`, ...):
+    /// [`Reason::inspect`] prefixes the colon.
     Atom(String),
-    /// A tagged tuple reason (`{:badarg, []}` and friends), carrying its inspect
-    /// rendering verbatim.
-    Tuple(String),
+    /// A pre-rendered reason carried verbatim - no colon prefix, no reshaping.
+    /// Production wraps a raw LLM error string (the error algebra's
+    /// already-rendered term) and the bare word `turn_panic`.
+    Verbatim(String),
 }
 
 impl Reason {
@@ -51,25 +59,27 @@ impl Reason {
         Reason::Atom(name.into())
     }
 
-    /// A tagged-tuple reason carrying its already-rendered inspect form, e.g.
-    /// `Reason::tuple("{:badarg, []}")`.
-    pub fn tuple(rendered: impl Into<String>) -> Self {
-        Reason::Tuple(rendered.into())
+    /// A pre-rendered reason carried verbatim, e.g.
+    /// `Reason::verbatim("connection refused")`.
+    pub fn verbatim(rendered: impl Into<String>) -> Self {
+        Reason::Verbatim(rendered.into())
     }
 
-    /// Baud's `inspect/1` rendering of the reason, as it enters the Session Log.
+    /// Baud's `inspect/1` rendering of the reason, as it enters the Session Log
+    /// and the settlement event.
     pub fn inspect(&self) -> String {
         match self {
             Reason::Atom(name) => format!(":{name}"),
-            Reason::Tuple(rendered) => rendered.clone(),
+            Reason::Verbatim(rendered) => rendered.clone(),
         }
     }
 }
 
-/// How the Run task ended, as seen from the Agent's mailbox (baud's
-/// `outcome`): the async reply - [`Outcome::Ok`], [`Outcome::Failed`] (the Loop
-/// already closed the Conversation with the failure marker), or
-/// [`Outcome::Error`] (no Conversation came back, e.g. budget exhaustion) - or
+/// How the Run task ended (baud's `outcome`) - the ONE Run-outcome type: the
+/// Loop returns [`Outcome::Ok`] (carrying the canonical [`StopReason`], a
+/// Hook's custom atom included), [`Outcome::Failed`] (the Loop already closed
+/// the Conversation with the failure marker), or [`Outcome::Error`] (no
+/// Conversation came back, e.g. budget exhaustion); the Agent's watcher mints
 /// [`Outcome::Down`] when the task died without replying.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -77,18 +87,6 @@ pub enum Outcome {
     Failed(Reason, Conversation),
     Error(Reason),
     Down(Reason),
-}
-
-/// The settlement event to broadcast (baud's `event`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Event {
-    RunFinished {
-        stop_reason: StopReason,
-        token_estimate: u64,
-        context_budget: u64,
-    },
-    RunError(Reason),
-    RunCancelled,
 }
 
 /// The Rollover decision over the queued Steering (CONTEXT.md): `Submit` the
@@ -101,8 +99,9 @@ pub enum Rollover {
 }
 
 /// The complete resolution of one ended Run: the settled Conversation, the
-/// settlement event, the `{:settled, ...}` Session Log entry, and the Rollover
-/// decision.
+/// broadcast settlement event ([`Event::RunFinished`] / [`Event::RunError`] /
+/// [`Event::RunCancelled`]), the `{:settled, ...}` Session Log entry, and the
+/// Rollover decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolution {
     pub conversation: Conversation,
@@ -138,47 +137,25 @@ impl Settlement {
 
     /// Folds the outcome, the accumulated facts, and the queued Steering into
     /// the Run's complete [`Resolution`]. `base` is the Conversation from
-    /// before the Run, the fallback when no checkpoint arrived.
+    /// before the Run, the fallback when no checkpoint arrived. One match,
+    /// each arm naming the one way its outcome settles ([`completed`] /
+    /// [`errored`] / [`cancelled`], the module's three settlement shapes) - no
+    /// event-to-entry re-derivation.
     pub fn settle(&self, outcome: Outcome, base: &Conversation, steering: &[String]) -> Resolution {
-        let (conversation, event) = self.resolve(outcome, base);
-        let log_entry = log_entry(&event);
-        let rollover = rollover(&event, steering);
-        Resolution {
-            conversation,
-            event,
-            log_entry,
-            rollover,
-        }
-    }
-
-    fn resolve(&self, outcome: Outcome, base: &Conversation) -> (Conversation, Event) {
         match outcome {
             Outcome::Ok(conversation, stop_reason) => {
-                let token_estimate = conversation.token_estimate();
-                let context_budget = conversation.context_budget;
-                (
-                    conversation,
-                    Event::RunFinished {
-                        stop_reason,
-                        token_estimate,
-                        context_budget,
-                    },
-                )
+                completed(conversation, stop_reason, steering)
             }
             // The Loop already closed this Conversation with the failure marker
             // and kept the errored response's partial text (the LLM error
             // algebra).
-            Outcome::Failed(reason, conversation) => (conversation, Event::RunError(reason)),
-            Outcome::Error(reason) => (failed(self.latest(base)), Event::RunError(reason)),
+            Outcome::Failed(reason, conversation) => errored(reason, conversation, steering),
+            Outcome::Error(reason) => errored(reason, failed(self.latest(base)), steering),
             // Cancellation needs both the flag and reason Shutdown.
             Outcome::Down(reason) if self.cancelled && reason == Reason::atom("shutdown") => {
-                let mut conversation = self.latest(base);
-                conversation.add_assistant_blocks(vec![ContentBlock::text(
-                    voice::Marker::RunCancelled.text(),
-                )]);
-                (conversation, Event::RunCancelled)
+                cancelled(self.latest(base))
             }
-            Outcome::Down(reason) => (failed(self.latest(base)), Event::RunError(reason)),
+            Outcome::Down(reason) => errored(reason, failed(self.latest(base)), steering),
         }
     }
 
@@ -189,31 +166,68 @@ impl Settlement {
     }
 }
 
+// The completed settlement: the RunFinished event over the settled
+// Conversation's estimates, the completed log entry carrying the stop reason,
+// and the ordinary Rollover.
+fn completed(
+    conversation: Conversation,
+    stop_reason: StopReason,
+    steering: &[String],
+) -> Resolution {
+    Resolution {
+        event: Event::RunFinished {
+            stop_reason: stop_reason.clone(),
+            token_estimate: conversation.token_estimate(),
+            context_budget: conversation.context_budget,
+        },
+        log_entry: SettledEntry::new(Settled::Completed, stop_reason, None),
+        rollover: rollover(steering),
+        conversation,
+    }
+}
+
+// A failed settlement over an already-closed Conversation: the RunError
+// event, the failed log entry carrying the inspected reason, and the
+// ordinary Rollover.
+fn errored(reason: Reason, conversation: Conversation, steering: &[String]) -> Resolution {
+    Resolution {
+        event: Event::RunError {
+            reason: reason.inspect(),
+        },
+        log_entry: SettledEntry::new(Settled::Failed, StopReason::Error, Some(reason.inspect())),
+        rollover: rollover(steering),
+        conversation,
+    }
+}
+
+// The cancelled settlement: the Conversation closed with the cancellation
+// marker (roles keep alternating), the RunCancelled event, the cancelled log
+// entry, and a DISCARDED queue - cancel means stop everything (the text stays
+// in the UI's input history).
+fn cancelled(mut conversation: Conversation) -> Resolution {
+    conversation.add_assistant_blocks(vec![ContentBlock::text(voice::Marker::RunCancelled.text())]);
+    Resolution {
+        event: Event::RunCancelled,
+        log_entry: SettledEntry::new(Settled::Cancelled, StopReason::Unknown, None),
+        rollover: Rollover::None,
+        conversation,
+    }
+}
+
 // Close a failed Run with an assistant marker so roles keep alternating.
 fn failed(mut conversation: Conversation) -> Conversation {
     conversation.add_assistant_blocks(vec![ContentBlock::text(voice::Marker::RunFailed.text())]);
     conversation
 }
 
-fn log_entry(event: &Event) -> SettledEntry {
-    match event {
-        Event::RunFinished { stop_reason, .. } => {
-            SettledEntry::new(Settled::Completed, *stop_reason, None)
-        }
-        Event::RunError(reason) => {
-            SettledEntry::new(Settled::Failed, StopReason::Error, Some(reason.inspect()))
-        }
-        Event::RunCancelled => SettledEntry::new(Settled::Cancelled, StopReason::Unknown, None),
-    }
-}
-
-// Rollover (CONTEXT.md): Cancellation discards the queue; any other settlement
-// auto-submits it, joined, as the next Run's prompt.
-fn rollover(event: &Event, steering: &[String]) -> Rollover {
-    match event {
-        Event::RunCancelled => Rollover::None,
-        _ if steering.is_empty() => Rollover::None,
-        _ => Rollover::Submit(steering.join("\n")),
+// Rollover (CONTEXT.md): a completed or failed settlement auto-submits the
+// queue, joined, as the next Run's prompt; the cancellation arm discards it
+// inline (cancel means stop everything).
+fn rollover(steering: &[String]) -> Rollover {
+    if steering.is_empty() {
+        Rollover::None
+    } else {
+        Rollover::Submit(steering.join("\n"))
     }
 }
 

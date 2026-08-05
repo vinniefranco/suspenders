@@ -182,25 +182,6 @@ fn suppress_output_parses() {
     assert_eq!(out.suppress_output, Some(true));
 }
 
-/// PostToolUse allow-by-default: no explicit decision defaults to allow with the
-/// "No reason provided" reason (qwen's PostToolUseHookOutput).
-#[test]
-fn post_tool_use_defaults_to_allow() {
-    let out = HookOutcome::parse("{}").unwrap();
-    let (decision, reason) = out.post_tool_use_decision();
-    assert_eq!(decision, Decision::Allow);
-    assert_eq!(reason, "No reason provided");
-}
-
-/// PostToolUse honors an explicit decision + reason when present.
-#[test]
-fn post_tool_use_honors_explicit() {
-    let out = HookOutcome::parse(r#"{"decision":"deny","reason":"lint failed"}"#).unwrap();
-    let (decision, reason) = out.post_tool_use_decision();
-    assert_eq!(decision, Decision::Deny);
-    assert_eq!(reason, "lint failed");
-}
-
 /// A double-encoded JSON string is unwrapped once (qwen's JSON.parse(JSON.parse)).
 #[test]
 fn double_encoded_json_string_unwrapped() {

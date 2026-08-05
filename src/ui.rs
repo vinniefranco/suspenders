@@ -1360,9 +1360,11 @@ async fn approve(id: String, decision: Decision, screen: Screen, ctx: &AdapterCt
 /// DIRECTLY from the authoritative fold result (P0): the `ApprovalModeChanged`
 /// broadcast is lossy (a `Lagged` could leave the footer indicator permanently
 /// stale, a safety-signal lie), so the mirror the footer reads no longer depends
-/// on it. The broadcast still fires for any other subscribers.
+/// on it. The broadcast still fires for any other subscribers. The write goes
+/// through the mirror's one writer, [`Screen::mirror_approval_mode`].
 async fn cycle_approval_mode(mut screen: Screen, ctx: &AdapterCtx<'_>) -> Screen {
-    screen.approval_mode = ctx.agent.cycle_approval_mode().await;
+    let mode = ctx.agent.cycle_approval_mode().await;
+    screen.mirror_approval_mode(mode);
     screen
 }
 

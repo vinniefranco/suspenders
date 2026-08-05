@@ -34,9 +34,10 @@ use crate::llm::ToolCallStyle;
 use crate::llm::model::Model;
 use crate::run::child::{ChildDeps, ChildSink};
 use crate::run::deps::RunDeps;
-use crate::run::loop_::{Outcome, OutcomeStop, RunEnv, RunOpts};
+use crate::run::loop_::{RunEnv, RunOpts};
+use crate::run::settlement::Outcome;
 use crate::session::Session;
-use crate::session::log::StopReason;
+use crate::stop_reason::StopReason;
 use crate::tool::Tool;
 use crate::tool::caps::{
     Capabilities, DecliningQuestioner, DenyingApprover, SubagentPlanMode, SubagentResult,
@@ -135,7 +136,7 @@ pub struct Capture {
     pub plan_exit_notice: Arc<crate::approvals::PendingManualPlanExit>,
 }
 
-/// Runs the Run: builds the Extension pipeline and Tool ctx and drives
+/// Runs the Run: builds the Tool registry and Tool ctx and drives
 /// [`loop_::run`]. Returns the Loop outcome.
 pub async fn run(
     conversation: Conversation,
@@ -222,14 +223,19 @@ pub async fn run(
     // manager the Agent resolved, the captured Llm boundary + Model as the prompt
     // capability, and the Session's Project Root as the payload cwd. The
     // production shell/http capabilities are wired inside `Hooks::new`. It borrows
-    // `capture`, which outlives the loop below.
+    // `capture`, which outlives the loop below. The reporter is an own emission
+    // handle off the deps (ADR-0025), so a hook firing failure surfaces as a
+    // visible fail-open report (ADR-0018).
     let hooks = crate::run::hooks::Hooks::new(
         capture.hooks.as_ref(),
         capture.llm.as_ref(),
         &capture.model,
-        session.root.clone(),
-        capture.session_id.clone(),
-        capture.transcript_path.clone(),
+        crate::run::hooks::HookIdentity {
+            cwd: session.root.clone(),
+            session_id: capture.session_id.clone(),
+            transcript_path: capture.transcript_path.clone(),
+        },
+        Some(deps.emitter()),
     );
 
     // The conditional-skill activation seam (ADR-0058): the shared skill manager
@@ -410,7 +416,7 @@ pub async fn run_child(req: ChildRunRequest) -> SubagentResult {
 /// Maps a child Run's [`Outcome`] to a [`SubagentResult`] (qwen's
 /// `AgentTerminateMode`, ADR-0061). `EndTurn`/`MaxTokens` -> `"GOAL"` with the
 /// last assistant text; `RunLimit` -> `"MAX_TURNS"`; every other stop (a stuck
-/// loop, a custom after-Pass stop, a failed Run, an exhausted budget) -> `"ERROR"`.
+/// loop, a custom Hook stop, a failed Run, an exhausted budget) -> `"ERROR"`.
 /// The `result` is the child's last assistant text with any trailing Voice close
 /// marker stripped, so the parent never reads Suspenders' internal marker as the
 /// subagent's answer. TIMEOUT/CANCELLED are DEFERRED with the background path.
@@ -419,15 +425,18 @@ fn outcome_to_result(outcome: Outcome) -> SubagentResult {
         Outcome::Ok(conversation, stop) => {
             let result = last_assistant_text(&conversation);
             let terminate_reason = match stop {
-                OutcomeStop::Reason(StopReason::EndTurn)
-                | OutcomeStop::Reason(StopReason::MaxTokens)
-                | OutcomeStop::Reason(StopReason::ToolUse)
-                | OutcomeStop::Reason(StopReason::StopSequence) => "GOAL",
-                OutcomeStop::Reason(StopReason::RunLimit) => "MAX_TURNS",
-                // A stuck loop, a failed/unknown stop, or any after-Pass custom
-                // Stop all read as ERROR (qwen collapses these to a non-GOAL
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::ToolUse
+                | StopReason::StopSequence => "GOAL",
+                StopReason::RunLimit => "MAX_TURNS",
+                // A stuck loop, a failed/unknown stop, or any custom Hook stop
+                // all read as ERROR (qwen collapses these to a non-GOAL
                 // terminate mode the parent treats as a failure).
-                OutcomeStop::Reason(_) | OutcomeStop::Custom(_) => "ERROR",
+                StopReason::RunLimitStuck
+                | StopReason::Error
+                | StopReason::Unknown
+                | StopReason::Custom(_) => "ERROR",
             };
             SubagentResult {
                 terminate_reason: terminate_reason.to_string(),
@@ -441,8 +450,10 @@ fn outcome_to_result(outcome: Outcome) -> SubagentResult {
             terminate_reason: "ERROR".to_string(),
             result: last_assistant_text(&conversation),
         },
-        // Eviction + Compaction could not fit the request: no text was produced.
-        Outcome::Error => SubagentResult {
+        // No Conversation came back: an exhausted budget (`Error`); `Down` is
+        // the watcher's word and never the awaited Loop's return, but a total
+        // match reads it as the failure it is.
+        Outcome::Error(_) | Outcome::Down(_) => SubagentResult {
             terminate_reason: "ERROR".to_string(),
             result: String::new(),
         },

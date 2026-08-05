@@ -164,7 +164,6 @@ fn dark_is_total_and_reproduces_todays_palette() {
     assert_eq!(theme.removed_bg, Color::Rgb(51, 26, 29));
     assert_eq!(theme.context, Color::DarkGray);
     assert_eq!(theme.muted, Color::DarkGray);
-    assert_eq!(theme.machinery, Color::DarkGray);
     assert_eq!(theme.error, Color::Red);
     // The Phase 7 qwen roles (ADR-0008): the designed QwenDark hexes.
     assert_eq!(theme.foreground, Color::Rgb(0xbf, 0xbd, 0xb6));
@@ -173,11 +172,6 @@ fn dark_is_total_and_reproduces_todays_palette() {
     assert_eq!(theme.warning, Color::Rgb(0xFF, 0xD7, 0x00));
     assert_eq!(theme.thinking, Color::DarkGray);
     assert_eq!(theme.thinking_header, Color::DarkGray);
-    assert_eq!(theme.prompt_gutter, Color::Cyan);
-    assert_eq!(theme.lane_spine, Color::DarkGray);
-    assert_eq!(theme.marker_housekeeping, Color::DarkGray);
-    assert_eq!(theme.marker_aid, Color::Rgb(215, 167, 95));
-    assert_eq!(theme.marker_constrain, Color::Rgb(106, 159, 212));
     assert_eq!(theme.heading, Color::Cyan);
     assert_eq!(theme.bullet, Color::Cyan);
     assert_eq!(theme.quote, Color::DarkGray);

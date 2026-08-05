@@ -2,9 +2,8 @@
 
 qwen-code confirms a gated Tool Call INLINE: `ToolConfirmationMessage` renders the
 question + a radio list INSIDE the confirming tool's group box, and the box turns
-`status.warning` while pending. suspenders (through Phase 3) showed the Approval as
-a centered MODAL overlay (`render_approval_modal`) with `[y]es / [n]o / [a]lways`
-keys. Phase 4 of the qwen UI port replaces the modal with qwen's inline block.
+`status.warning` while pending. suspenders matches: the Approval is an inline
+block in the confirming tool's group box, not a centered modal.
 
 The wire event carries only what the Run Loop mints: `ApprovalRequest {
 approval_id, command }` - no `tool_use` id. So the render has to answer "which
@@ -40,10 +39,10 @@ approval rows are built at render time from `Screen::pending_approval` (a pure
 cached lines. The confirming group is re-rendered specially: `?` (warning) marker
 on the confirming call in place of `⊷`, a `warning` box border, and the approval
 block (gap row + question + numbered radio) appended after the call's header. The
-`RenderCache` and the committed blit (`render_committed_slice`) never see the
-approval, so committed and pending stay byte-identical.
+`RenderCache` never sees the approval, so a settled group's cached lines carry no
+approval trace.
 
-**Border precedence** (qwen `ToolGroupMessage.tsx:325`, with the Phase-4 branch):
+**Border precedence** (qwen `ToolGroupMessage.tsx:325`):
 shell → `ui.symbol` (grey) > confirming → `status.warning` > `border.default`. A
 `run_shell_command` group keeps its grey shell border even mid-approval (shell wins);
 the confirming marker still flips to `?`.
@@ -59,20 +58,19 @@ Run cancel. Escape only cancels the whole Run when NO approval is open and a Run
 is streaming (qwen's `esc to cancel` spinner + suspenders' global cancel).
 
 **The radio mechanic is a shared pure `SelectionList`** (`src/ui/selection.rs`, no
-ratatui), so Phase 5's model/theme dialogs reuse it unchanged (qwen shares
+ratatui), reused unchanged by the model/theme dialogs (ADR-0051; qwen shares
 `BaseSelectionList` across approval + dialogs). Up/Down wrap; Enter selects; digit
 quick-select is 1-indexed with qwen's `NUMBER_INPUT_TIMEOUT_MS=1000` immediate-vs-
 buffered rule; a host-driven `expire(now)` stands in for qwen's `setTimeout` (no
 background timer crosses the pure seam). With the 3-row approval every digit
-resolves immediately, so the buffered/expire path is never exercised in Phase 4;
-it is tested in `selection.rs` and awaits Phase 5's longer lists to wire the tick.
+resolves immediately, so the buffered/expire path is never exercised here; it is
+tested in `selection.rs`.
 
 ## Consequences
 
-- The committed==pending identity (ADR-0046) is PRESERVED and strengthened: the
-  confirming Tool Call has no result, so it is non-terminal and BLOCKS the commit;
-  the approval rows can therefore never freeze into scrollback. On resolve the call
-  supersedes to a `ToolResult` and commits with NO approval trace. A screen
+- The approval rows are render-time only (ADR-0046): the confirming Tool Call
+  has no result, so it is still in the Pending tail; on resolve the call
+  supersedes to a `ToolResult` with NO approval trace in the history. A screen
   seam-identity test and a components render test both prove it.
 - Rigidity (ADR-0029) holds: the question + radio rows go through `box_row`, so
   every row is exactly the box inner width. A render test asserts the borders align.

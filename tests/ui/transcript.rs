@@ -423,12 +423,12 @@ fn only_a_delivered_steering_removal_bumps_the_revision() {
     assert_eq!(t.revision(), 1);
 }
 
-// --- tool-display swaps (ADR-0007) -----------------------------------------
+// --- tool-display swaps (CONTEXT.md: Presentment) ---------------------------
 //
 // A tool attaches a display Artifact to its Tool Result; `tool_result` reads it
 // and swaps the one-line summary for a first-class item. Real Artifacts (not
-// mock presenters) so the store's swap is exercised against the same shapes the
-// tools produce.
+// hand-mocked shapes) so the store's swap is exercised against the same shapes
+// the tools produce.
 
 use crate::tools::file_diff::{self, DiffArtifact};
 use crate::tools::run_command;
@@ -649,8 +649,8 @@ fn every_verb_preserves_the_items_prefix_or_bumps_the_revision() {
             Box::new(|t| t.tool_result("t1", "grep_search".into(), "hit", false, &HashMap::new())),
         ),
         (
-            "extension_failure",
-            Box::new(|t| t.extension_failure("P", Stage::Present, "boom")),
+            "fail_open_report",
+            Box::new(|t| t.fail_open_report("P", "boom")),
         ),
         ("message_start (again)", Box::new(|t| t.message_start())),
         (
@@ -696,12 +696,18 @@ fn every_verb_preserves_the_items_prefix_or_bumps_the_revision() {
 fn marker_appends_with_its_tone_and_does_not_bump() {
     let mut t = fresh();
     t.marker("⟨ compacted 41 messages → summary ⟩", Tone::Housekeeping);
-    t.marker("⚑ plan refreshed", Tone::Aid);
+    t.marker(
+        "loop detected - stopped after 5 identical tool batches",
+        Tone::Constrain,
+    );
     assert_eq!(
         t.items(),
         vec![
             marker("⟨ compacted 41 messages → summary ⟩", Tone::Housekeeping),
-            marker("⚑ plan refreshed", Tone::Aid),
+            marker(
+                "loop detected - stopped after 5 identical tool batches",
+                Tone::Constrain
+            ),
         ]
     );
     assert_eq!(t.revision(), 0);

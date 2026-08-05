@@ -123,6 +123,20 @@ fn the_cursor_marks_the_active_server_across_group_boundaries() {
 }
 
 #[test]
+fn up_wraps_the_server_cursor_to_the_bottom() {
+    // qwen `useSelectionList` wraps at the ends (ADR-0051 System A); the flat
+    // cursor crosses group boundaries in both directions.
+    let mut d = dialog(vec![
+        server("usr", McpSource::User, McpServerStatus::Connected),
+        server("proj", McpSource::Workspace, McpServerStatus::Connected),
+    ]);
+    assert_eq!(d.fold_key(McpKey::Up), McpFold::None);
+    let rows = content_text(&d.view());
+    assert!(rows[1].starts_with("  usr"));
+    assert!(rows[4].starts_with("❯ proj"), "Up from the top wraps");
+}
+
+#[test]
 fn a_server_row_shows_the_status_icon_and_word() {
     let d = dialog(vec![
         server("ok", McpSource::User, McpServerStatus::Connected),
@@ -200,6 +214,105 @@ fn root_escape_closes_the_dialog() {
         McpServerStatus::Connected,
     )]);
     assert_eq!(d.fold_key(McpKey::Escape), McpFold::Close);
+}
+
+#[test]
+fn enter_on_a_loading_or_empty_server_list_is_a_no_op() {
+    // While the first fetch is outstanding the list has no rows: Enter cannot
+    // push a detail (the select_server bounds guard), and the view stays at
+    // the loading root.
+    let mut d = McpDialog::open(1);
+    assert_eq!(d.fold_key(McpKey::Enter), McpFold::None);
+    assert_eq!(content_text(&d.view()), vec!["Loading…"]);
+    // Same for a delivered-but-empty list (the no-servers state).
+    let mut d = dialog(vec![]);
+    assert_eq!(d.fold_key(McpKey::Enter), McpFold::None);
+    assert_eq!(text(&d.view().header[0]), "Manage MCP servers");
+}
+
+#[test]
+fn escape_pops_the_full_stack_one_step_at_a_time() {
+    // The deepest walk - SERVER_LIST -> SERVER_DETAIL -> TOOL_LIST ->
+    // TOOL_DETAIL - unwinds one frame per Escape, closing only at the root.
+    let mut s = server("srv", McpSource::User, McpServerStatus::Connected);
+    s.tools = vec![tool("t", "d")];
+    let mut d = dialog(vec![s]);
+    let _ = d.fold_key(McpKey::Enter); // -> detail
+    let _ = d.fold_key(McpKey::Enter); // View tools -> tool list
+    let _ = d.fold_key(McpKey::Enter); // -> tool detail
+    assert_eq!(text(&d.view().header[0]), "t");
+    assert_eq!(d.fold_key(McpKey::Escape), McpFold::None);
+    assert_eq!(text(&d.view().header[0]), "Tools for srv");
+    assert_eq!(d.fold_key(McpKey::Escape), McpFold::None);
+    assert_eq!(text(&d.view().header[0]), "srv");
+    assert_eq!(d.fold_key(McpKey::Escape), McpFold::None);
+    assert_eq!(text(&d.view().header[0]), "Manage MCP servers");
+    assert_eq!(d.fold_key(McpKey::Escape), McpFold::Close);
+}
+
+#[test]
+fn picking_enable_on_a_disabled_server_emits_an_enable_act() {
+    // A disabled server offers ONLY Enable (qwen hides every other action on
+    // `isDisabled`), so Enter on the detail fires it straight away.
+    let mut s = server("off", McpSource::User, McpServerStatus::Disconnected);
+    s.is_disabled = true;
+    let mut d = dialog(vec![s]);
+    let _ = d.fold_key(McpKey::Enter); // -> detail; actions: [Enable]
+    assert_eq!(
+        d.fold_key(McpKey::Enter),
+        McpFold::Act(McpAction::Enable, "off".to_string())
+    );
+}
+
+#[test]
+fn picking_clear_authentication_emits_a_clear_auth_act() {
+    // Tokens on file add Clear Authentication after Re-authenticate (qwen's
+    // `hasOAuthTokens` arm): actions are [Disable, Re-authenticate, Clear].
+    let mut s = server("srv", McpSource::User, McpServerStatus::Connected);
+    s.has_oauth_tokens = true;
+    let mut d = dialog(vec![s]);
+    let _ = d.fold_key(McpKey::Enter); // -> detail
+    let _ = d.fold_key(McpKey::Down); // active: Re-authenticate
+    let _ = d.fold_key(McpKey::Down); // active: Clear Authentication
+    assert_eq!(
+        d.fold_key(McpKey::Enter),
+        McpFold::Act(McpAction::ClearAuth, "srv".to_string())
+    );
+}
+
+#[test]
+fn nav_and_enter_on_the_tool_detail_step_are_swallowed_no_ops() {
+    // TOOL_DETAIL is cursor-less (Escape is its only key): Up/Down/Enter are
+    // consumed by the overlay but change nothing.
+    let mut s = server("srv", McpSource::User, McpServerStatus::Connected);
+    s.tools = vec![tool("t", "d")];
+    let mut d = dialog(vec![s]);
+    let _ = d.fold_key(McpKey::Enter); // -> detail
+    let _ = d.fold_key(McpKey::Enter); // View tools -> tool list
+    let _ = d.fold_key(McpKey::Enter); // -> tool detail
+    let before = d.view();
+    assert_eq!(d.fold_key(McpKey::Up), McpFold::None);
+    assert_eq!(d.fold_key(McpKey::Down), McpFold::None);
+    assert_eq!(d.fold_key(McpKey::Enter), McpFold::None);
+    assert_eq!(d.view(), before, "the step neither moved nor navigated");
+}
+
+#[test]
+fn nav_and_enter_on_the_authenticate_step_are_swallowed_no_ops() {
+    // AUTHENTICATE is cursor-less too: only Escape (back) and `c` (copy) act.
+    let mut d = dialog(vec![server(
+        "srv",
+        McpSource::User,
+        McpServerStatus::Connected,
+    )]);
+    let _ = d.fold_key(McpKey::Enter); // -> detail; actions: [Disable, Authenticate]
+    let _ = d.fold_key(McpKey::Down); // active: Authenticate
+    let _ = d.fold_key(McpKey::Enter); // -> AUTHENTICATE
+    let before = d.view();
+    assert_eq!(d.fold_key(McpKey::Up), McpFold::None);
+    assert_eq!(d.fold_key(McpKey::Down), McpFold::None);
+    assert_eq!(d.fold_key(McpKey::Enter), McpFold::None);
+    assert_eq!(d.view(), before, "the step neither moved nor navigated");
 }
 
 #[test]
@@ -387,6 +500,20 @@ fn the_copy_hint_reads_idle_then_copied_or_unsupported() {
             .iter()
             .any(|r| r == "Cannot write to terminal - copy the URL above manually.")
     );
+}
+
+#[test]
+fn a_copy_result_landing_after_the_step_was_left_is_a_no_op() {
+    // The OSC52 report can land after the user popped away (the fold stays
+    // total): off the AUTHENTICATE step it changes nothing.
+    let mut d = dialog(vec![server(
+        "srv",
+        McpSource::User,
+        McpServerStatus::Connected,
+    )]);
+    let before = d.view();
+    d.fold_copy_result(true);
+    assert_eq!(d.view(), before, "no copy hint outside AUTHENTICATE");
 }
 
 // ---- Generation guard (stale fills dropped) ---------------------------

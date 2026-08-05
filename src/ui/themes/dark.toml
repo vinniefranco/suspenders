@@ -16,7 +16,6 @@ added_bg = "#12291b"
 removed_bg = "#331a1d"
 context = "dark_gray"
 muted = "dark_gray"
-machinery = "dark_gray"
 error = "red"
 # The qwen QwenDark text + status roles (Phase 7, ADR-0008): body foreground,
 # the purple accent (user `>` / assistant `✦`), the green success, the gold
@@ -28,15 +27,6 @@ warning = "#FFD700"
 thinking = "dark_gray"
 thinking_header = "dark_gray"
 lull = "#cba6f7"
-prompt_gutter = "cyan"
-lane_spine = "dark_gray"
-
-# The tinted marker plane (ADR-0040): the harness voice, one tint per tone.
-# Housekeeping is the muted gray; Aid is a warm amber (clear of error-red),
-# Constrain a calm blue (clear of success-green).
-marker_housekeeping = "dark_gray"
-marker_aid = "#d7a75f"
-marker_constrain = "#6a9fd4"
 
 # Assistant markdown.
 heading = "cyan"

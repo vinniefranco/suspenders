@@ -15,7 +15,6 @@ added_bg = "#e6ffec"
 removed_bg = "#ffebe9"
 context = "#6e7781"
 muted = "#6e7781"
-machinery = "#8c959f"
 error = "#cf222e"
 # The qwen text + status roles (Phase 7, ADR-0008), light-polarity: a dark
 # foreground, a deep purple accent, a dark green success, a dark gold warning -
@@ -27,15 +26,6 @@ warning = "#9a6700"
 thinking = "#6e7781"
 thinking_header = "#6e7781"
 lull = "#8839ef"
-prompt_gutter = "#0969da"
-lane_spine = "#8c959f"
-
-# The tinted marker plane (ADR-0040): the harness voice, one tint per tone.
-# Housekeeping is the muted gray; Aid a warm amber (clear of error-red),
-# Constrain a calm blue (clear of success-green) - designed for a light ground.
-marker_housekeeping = "#6e7781"
-marker_aid = "#9a6700"
-marker_constrain = "#1f6feb"
 
 # Assistant markdown.
 heading = "#0550ae"

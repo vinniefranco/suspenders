@@ -18,7 +18,7 @@ use crate::hooks::{HttpPost, ShellExec, ShellResult};
 use crate::llm::response::{Response, StopReason};
 use crate::run::Outcome;
 use crate::run::fixtures::{
-    deps_for, events, just, run_with_hooks, run_with_hooks_and_skills, session, text_end,
+    deps_for, events, just, ok, run_with_hooks, run_with_hooks_and_skills, session, text_end,
 };
 use crate::run::hooks::Hooks;
 use crate::skills::SkillManager;
@@ -154,12 +154,12 @@ fn tool_result<'a>(evs: &'a [Event], id: &str) -> &'a Event {
 }
 
 /// Whether a hook-decision line was surfaced for `event` (the fail-open-with-
-/// visibility seam, ADR-0018): an `ExtensionError` labelled `hook <event>`.
+/// visibility seam, ADR-0018): a `FailOpenReport` labelled `hook <event>`.
 fn hook_line_for(evs: &[Event], event: &str) -> Option<String> {
     evs.iter().find_map(|e| match e {
-        Event::ExtensionError {
-            extension, message, ..
-        } if extension == &format!("hook {event}") => Some(message.clone()),
+        Event::FailOpenReport {
+            source, message, ..
+        } if source == &format!("hook {event}") => Some(message.clone()),
         _ => None,
     })
 }
@@ -667,8 +667,8 @@ async fn stop_hook_forces_continuations_up_to_the_cap_then_ends() {
     assert!(
         evs.iter().any(|e| matches!(
             e,
-            Event::ExtensionError { extension, message, .. }
-                if extension == "hook Stop" && message.contains("overriding and ending the turn")
+            Event::FailOpenReport { source, message, .. }
+                if source == "hook Stop" && message.contains("overriding and ending the turn")
         )),
         "the cap warning is surfaced when the Stop hook is overridden"
     );
@@ -905,14 +905,145 @@ async fn notification_fires_the_command_hook() {
 
 // ---- fail-open ---------------------------------------------------------------
 
-/// A hook runner ERROR (a spawn failure) is fail-open: the tool proceeds as if no
-/// hook fired, and the result carries no injected block/context (ADR-0018).
+/// A hook runner ERROR (a spawn failure) is fail-open: the tool proceeds as if
+/// no hook fired and the Run settles normally, AND the failure is surfaced
+/// visibly as a `FailOpenReport` (ADR-0018: a Hook failure never fails the Run
+/// and is recorded visibly in the Transcript) - never a silent skip, never a
+/// block.
 #[tokio::test]
-async fn hook_runner_error_is_fail_open() {
+async fn hook_runner_error_is_fail_open_and_visibly_reported() {
     let root = TempDir::new().unwrap();
     let session = session(root.path());
     let manager = manager_for("PreToolUse");
     let shell = ErringShell::new();
+    let llm = FakeLlm::script([]);
+
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    // The visible fail-open reporter (the seam production wires in
+    // `Hooks::new`), sharing the FakeDeps event log so the report lands in the
+    // same ordered stream the run's own events take.
+    let sink = std::sync::Arc::clone(&deps.events);
+    let reporter = crate::run::deps::Emitter::new(move |e| sink.lock().unwrap().push(e));
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    )
+    .reporting(reporter);
+
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+    assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
+
+    let evs = events(&deps);
+    let Event::ToolResult { is_error, .. } = tool_result(&evs, "t1") else {
+        unreachable!()
+    };
+    // The tool ran normally: a failed hook never blocks the call (fail-open).
+    assert!(!*is_error, "a hook error must not block the tool");
+    // The failure is recorded visibly on the fail-open channel (ADR-0018).
+    let message = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::FailOpenReport { source, message } if source == "hook PreToolUse" => {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .expect("the firing failure is surfaced visibly");
+    assert!(
+        message.contains("failed open") && message.contains("could not spawn hook"),
+        "the report names the failure: {message}"
+    );
+}
+
+// ---- continue:false reaches settlement as StopReason::Custom -----------------
+
+/// A PreToolUse hook's `continue:false` + `stopReason` atom is batch-granular
+/// (ADR-0066): the tool still runs and its result is answered, then the Run
+/// closes at the batch boundary and the atom reaches settlement as the
+/// canonical `StopReason::Custom` - never degraded to `Unknown`.
+#[tokio::test]
+async fn pre_tool_use_continue_false_settles_the_run_as_custom_stop() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PreToolUse");
+    let shell = ScriptedShell::new(r#"{"continue":false,"stopReason":"lint_failed"}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // A safety-net second reply that must never be consumed: the stop lands at
+    // the batch boundary, so there is no second Pass.
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "list_directory",
+                json!({ "path": root.path().to_string_lossy() }),
+            )),
+            just(text_end("must not be consumed")),
+        ],
+    );
+    let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    let (conv, stop) = ok(&outcome);
+    assert_eq!(
+        *stop,
+        crate::stop_reason::StopReason::Custom("lint_failed".to_string())
+    );
+    // The batch was answered first (no unanswered tool_use), then the stopped
+    // marker closed the Run.
+    let evs = events(&deps);
+    let Event::ToolResult { is_error, .. } = tool_result(&evs, "t1") else {
+        unreachable!()
+    };
+    assert!(!*is_error, "the tool still ran; the stop is batch-granular");
+    let lm = conv.messages.last().expect("has a message");
+    assert!(
+        matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn stopped - reply to continue]"),
+        "the Run closed on the stopped marker: {:?}",
+        lm.content
+    );
+    // Exactly one Pass: the stop prevented a second model call.
+    let starts = evs
+        .iter()
+        .filter(|e| matches!(e, Event::MessageStart { .. }))
+        .count();
+    assert_eq!(starts, 1, "no Pass follows a hook stop");
+    // The stop request is visible, never silent (ADR-0018).
+    let line = hook_line_for(&evs, "PreToolUse").expect("a stop line was surfaced");
+    assert!(line.contains("requested stop"), "{line}");
+}
+
+/// A PostToolUse hook's `continue:false` + `stopReason` atom takes the same
+/// batch-granular path: the successful result stands, and the Run settles as
+/// `StopReason::Custom(atom)`.
+#[tokio::test]
+async fn post_tool_use_continue_false_settles_the_run_as_custom_stop() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("PostToolUse");
+    let shell = ScriptedShell::new(r#"{"continue":false,"stopReason":"audit_done"}"#);
     let llm = FakeLlm::script([]);
     let hooks = Hooks::with_caps(
         &manager,
@@ -931,22 +1062,178 @@ async fn hook_runner_error_is_fail_open() {
                 "list_directory",
                 json!({ "path": root.path().to_string_lossy() }),
             )),
-            just(text_end("done")),
+            just(text_end("must not be consumed")),
         ],
     );
     let (outcome, deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    let (_conv, stop) = ok(&outcome);
+    assert_eq!(
+        *stop,
+        crate::stop_reason::StopReason::Custom("audit_done".to_string())
+    );
+    let evs = events(&deps);
+    let starts = evs
+        .iter()
+        .filter(|e| matches!(e, Event::MessageStart { .. }))
+        .count();
+    assert_eq!(starts, 1, "no Pass follows a hook stop");
+    let line = hook_line_for(&evs, "PostToolUse").expect("a stop line was surfaced");
+    assert!(line.contains("requested stop"), "{line}");
+}
+
+// ---- StopFailure / SessionEnd (Phase 3b) -------------------------------------
+
+/// The StopFailure fire reaches the command hook when a Run ends on an API
+/// error (a non-retryable `StopReason::Error` end): observational, fired before
+/// the loud fail closes the Run - the Run still fails.
+#[tokio::test]
+async fn stop_failure_fires_when_the_run_ends_on_an_api_error() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("StopFailure");
+    let shell = std::sync::Arc::new(ScriptedShell::new(r#"{}"#));
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    // A non-retryable API error end (not the malformed-tool-call class).
+    let deps = deps_for(
+        &session,
+        vec![Entry::just(Response {
+            content: vec![],
+            stop_reason: StopReason::Error,
+            usage: Usage::default(),
+            error: Some("api exploded".to_string()),
+        })],
+    );
+    let (outcome, _deps) = run_with_hooks(&session, "go", deps, &hooks).await;
+
+    assert!(
+        matches!(outcome, Outcome::Failed(..)),
+        "the Run still fails loudly: {outcome:?}"
+    );
+    assert_eq!(
+        *shell.calls.lock().unwrap(),
+        1,
+        "the StopFailure hook fired once"
+    );
+}
+
+/// The SessionEnd fire reaches the command hook, exercised through the facade
+/// the Agent builds at shutdown (the same seam the Notification test drives;
+/// the Agent's actor-shutdown path itself is outside the Run-loop harness).
+#[tokio::test]
+async fn session_end_fires_the_command_hook() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    let manager = manager_for("SessionEnd");
+    let shell = std::sync::Arc::new(ScriptedShell::new(r#"{}"#));
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(SharedShell(std::sync::Arc::clone(&shell))),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    hooks.session_end("exit").await;
+    assert_eq!(*shell.calls.lock().unwrap(), 1, "the SessionEnd hook fired");
+}
+
+// ---- Conditional Skill activation through the Run loop (ADR-0058) ------------
+
+/// A Tool Call that SUCCEEDS on a `paths:`-matching file activates a
+/// Conditional Skill for the rest of the Session: hidden from the `skill`
+/// tool's `<available_skills>` catalog on the first request, present on the
+/// NEXT Pass's request (the catalog rebuilds per description read), and sticky
+/// on the shared manager.
+#[tokio::test]
+async fn a_matching_tool_call_activates_a_conditional_skill_for_the_session() {
+    let root = TempDir::new().unwrap();
+    let session = session(root.path());
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("lib.rs"), "pub fn x() {}\n").unwrap();
+
+    // A conditional skill gated on `src/**`, discovered from its own skills root.
+    let skill_md = "---\nname: rusty\ndescription: rust guidance\npaths:\n  - src/**\n---\nbody\n";
+    let (skills, _dir) = skill_manager_with(&root.path().join("skillroot"), "rusty", skill_md);
+
+    // No hooks in play: the empty manager fires nothing; the harness just needs
+    // a Hooks handle to thread the skill-activation seam.
+    let manager = empty_manager();
+    let shell = ScriptedShell::new(r#"{}"#);
+    let llm = FakeLlm::script([]);
+    let hooks = Hooks::with_caps(
+        &manager,
+        Box::new(shell),
+        Box::new(UnusedHttp),
+        &llm,
+        &session.model,
+        session.root.clone(),
+    );
+
+    let file = root.path().join("src").join("lib.rs");
+    let deps = deps_for(
+        &session,
+        vec![
+            Entry::just(tool_pass(
+                "t1",
+                "read_file",
+                json!({ "file_path": file.to_string_lossy() }),
+            )),
+            just(text_end("done")),
+        ],
+    );
+    let (outcome, deps) = run_with_hooks_and_skills(
+        &session,
+        "go",
+        deps,
+        &hooks,
+        Arc::clone(&skills),
+        root.path().to_path_buf(),
+    )
+    .await;
     assert!(matches!(outcome, Outcome::Ok(..)), "{outcome:?}");
 
+    // The touch succeeded (activation keys off tool SUCCESS, not attempt).
     let evs = events(&deps);
     let Event::ToolResult { is_error, .. } = tool_result(&evs, "t1") else {
         unreachable!()
     };
-    // The tool ran normally: a failed hook never blocks the call (fail-open).
-    assert!(!*is_error, "a hook error must not block the tool");
-    // A fail-open (default) outcome decides nothing, so no deciding line fires.
+    assert!(!*is_error, "the matching read must succeed");
+
+    // Hidden on the first request; in the catalog on the next Pass's request.
+    let requests = deps.requests.lock().unwrap();
+    let skill_desc = |req: &crate::llm::LlmRequest| {
+        req.tools
+            .iter()
+            .find(|t| t.name == "skill")
+            .expect("the skill tool rides every request")
+            .description
+            .clone()
+    };
     assert!(
-        hook_line_for(&evs, "PreToolUse").is_none(),
-        "a fail-open hook surfaces no deciding line"
+        !skill_desc(&requests[0]).contains("rusty"),
+        "a conditional skill stays out of the catalog before a matching touch"
+    );
+    assert!(
+        skill_desc(&requests[1]).contains("rusty"),
+        "the activated skill joins the catalog on the next Pass"
+    );
+
+    // Sticky for the rest of the Session on the shared manager.
+    assert!(
+        skills.catalog().iter().any(|s| s.name == "rusty"),
+        "activation persists on the shared SkillManager"
     );
 }
 
@@ -1324,9 +1611,9 @@ async fn pre_tool_use_system_message_is_surfaced() {
         hook_line_for(&evs, "PreToolUse")
             .into_iter()
             .chain(evs.iter().filter_map(|e| match e {
-                Event::ExtensionError {
-                    extension, message, ..
-                } if extension == "hook PreToolUse" => Some(message.clone()),
+                Event::FailOpenReport {
+                    source, message, ..
+                } if source == "hook PreToolUse" => Some(message.clone()),
                 _ => None,
             }))
             .any(|l| l.contains("heads up: slow disk")),
@@ -1371,7 +1658,7 @@ async fn system_message_is_suppressed_when_suppress_output_is_set() {
     assert!(
         !evs.iter().any(|e| matches!(
             e,
-            Event::ExtensionError { message, .. } if message.contains("hidden note")
+            Event::FailOpenReport { message, .. } if message.contains("hidden note")
         )),
         "a suppressed systemMessage is never surfaced"
     );

@@ -59,13 +59,13 @@ fn refresh_session_tools(state: &mut AgentState) {
 // the next Run.
 pub(super) async fn mcp_reconnect(state: &mut AgentState, name: String) {
     state.mcp.reconnect(&name).await;
-    // Surface a fresh connect failure the same way `init_agent` does (ADR-0007's
-    // fail-open report seam): a reconnect that fails again is a visible skip.
+    // Surface a fresh connect failure the same way `init_agent` does (the
+    // fail-open report seam, ADR-0018): a reconnect that fails again is a
+    // visible skip.
     for (server, reason) in state.mcp.failures() {
         if server == name {
-            let _ = state.events.send(Event::extension_error(
+            let _ = state.events.send(Event::fail_open_report(
                 format!("mcp server {server}"),
-                crate::event::Stage::PreRun,
                 format!("could not connect - {reason}"),
             ));
         }

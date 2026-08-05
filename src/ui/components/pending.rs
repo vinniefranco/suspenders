@@ -171,7 +171,7 @@ pub fn render_pending(frame: &mut Frame, t: &Screen, cache: &mut RenderCache, ct
     // No modal overlay.
 }
 
-/// The pending region's whole geometry (the compute-plan / parameter object
+/// The Pending tail's whole geometry (the compute-plan / parameter object
 /// behind [`render_pending`]): the four zone Rects, the pre-wrapped composer
 /// [`ComposerLayout`] the composer + cursor draw from, the resolved sticky
 /// box Rect + its items (`None` when the box is dropped), and the status
@@ -188,7 +188,7 @@ pub(super) struct PendingLayout<'a> {
     pub(super) popup_top: u16,
 }
 
-/// Operation (IOSP): the pending region's geometry for this frame. Wraps the
+/// Operation (IOSP): the Pending tail's geometry for this frame. Wraps the
 /// draft, caps the composer zone, decides the sticky "Current tasks" box
 /// (ADR-0048) - reserved only when it fits alongside the status row, composer,
 /// and one body row (ADR-0029 measure == draw) - and splits `area` into the
@@ -216,17 +216,18 @@ pub(super) fn pending_layout<'a>(
     // (`Constraint::Min(1)`) and top-clip the "Apply this change?" question out of
     // view. A visible approval takes priority over the sticky list, so we reserve
     // NO sticky zone while `pending_approval.is_some()`.
-    let sticky_items =
-        (t.pending_approval.is_none() && t.pending_question.is_none() && t.pending_plan.is_none())
-            .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
-            .flatten()
-            .filter(|items| {
-                sticky_fits(
-                    area.height as usize,
-                    sticky_todos_height(items.len()),
-                    composer_height,
-                )
-            });
+    let sticky_items = (t.pending_approval().is_none()
+        && t.pending_question().is_none()
+        && t.pending_plan().is_none())
+    .then(|| sticky_todos(t.transcript().latest_todo(), t.transcript().items().len()))
+    .flatten()
+    .filter(|items| {
+        sticky_fits(
+            area.height as usize,
+            sticky_todos_height(items.len()),
+            composer_height,
+        )
+    });
     let sticky_height = sticky_items.map_or(0, |items| sticky_todos_height(items.len()));
     let chunks = frame_chunks(area, sticky_height, composer_height);
     PendingLayout {
@@ -344,7 +345,7 @@ pub(super) fn pending_body_lines(
     // batch runs sequentially). Its group renders with the `?` marker, warning
     // border, and the approval block appended. `None` otherwise, so the pending
     // body is byte-identical to the committed blit (which never carries it).
-    let approving = t.pending_approval.as_ref().and_then(|pending| {
+    let approving = t.pending_approval().and_then(|pending| {
         newest_live_tool_index(items).map(|call_index| Approving {
             pending,
             call_index,
@@ -426,7 +427,7 @@ pub(super) fn pending_body_lines(
     // transcript ToolCall, so it draws as its own box rather than inside a tool
     // group. `None` when no question is pending, so the pending body stays
     // byte-identical to the committed blit (which never carries it).
-    if let Some(pending) = t.pending_question.as_ref() {
+    if let Some(pending) = t.pending_question() {
         append_live(&mut lines, &question_modal_lines(pending, width, theme));
     }
 
@@ -436,7 +437,7 @@ pub(super) fn pending_body_lines(
     // must never eat. Not tied to a transcript ToolCall, so it draws as its own
     // box. `None` when no plan is pending, so the pending body stays byte-identical
     // to the committed blit (which never carries it).
-    if let Some(pending) = t.pending_plan.as_ref() {
+    if let Some(pending) = t.pending_plan() {
         append_live(&mut lines, &plan_modal_lines(pending, width, theme));
     }
     lines

@@ -74,6 +74,13 @@ pub struct HookOutcome {
     /// `permissionDecisionReason`, and any future per-event field.
     #[serde(rename = "hookSpecificOutput")]
     pub hook_specific_output: Option<Value>,
+    /// NOT part of qwen's wire shape (never parsed): the runner's own note that
+    /// the hook could not fire at all - a command spawn failure / timeout, or an
+    /// http transport failure - and failed open to this steers-nothing outcome.
+    /// The firing layer surfaces it visibly (ADR-0018: a Hook failure never
+    /// fails the Run and is recorded visibly in the Transcript).
+    #[serde(skip)]
+    pub firing_error: Option<String>,
 }
 
 impl HookOutcome {
@@ -194,19 +201,6 @@ impl HookOutcome {
         self.stop_reason
             .as_ref()
             .map(|r| format!("Stop hook feedback:\n{r}"))
-    }
-
-    /// The PostToolUse allow-by-default projection (qwen's `PostToolUseHookOutput`
-    /// constructor): a PostToolUse hook that returns no explicit `decision`
-    /// defaults to `allow` with the `"No reason provided"` reason (ADR-0066).
-    /// Returns the effective `(decision, reason)` this event applies.
-    pub fn post_tool_use_decision(&self) -> (Decision, String) {
-        let decision = self.decision.unwrap_or(Decision::Allow);
-        let reason = self
-            .reason
-            .clone()
-            .unwrap_or_else(|| "No reason provided".to_string());
-        (decision, reason)
     }
 }
 

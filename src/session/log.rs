@@ -58,12 +58,12 @@ pub use resume::{Drift, ResumeError, plan, resume};
 // ------------------------------------------------------------------
 // Terminal stop reason + settled outcome (shared with Run Settlement).
 // `Settled`/`SettledEntry` are BUILT ON here; `StopReason` is the leaf
-// run-lifecycle vocabulary [`crate::stop_reason`], re-exported so the
-// Session Log's historical `session::log::StopReason` path keeps resolving
-// without importing it into any cycle (Voice reads the leaf directly).
+// run-lifecycle vocabulary [`crate::stop_reason`], imported (not re-exported)
+// for the entry shapes below - every consumer spells the canonical
+// `crate::stop_reason::StopReason` path directly.
 // ------------------------------------------------------------------
 
-pub(crate) use crate::stop_reason::StopReason;
+use crate::stop_reason::StopReason;
 
 /// How a settled Run resolved (baud's `:completed | :failed | :cancelled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -69,3 +69,22 @@ fn stop_reason_serde_parity() {
     let r: StopReason = serde_json::from_str("\"something_new\"").unwrap();
     assert_eq!(r, StopReason::Unknown);
 }
+
+#[test]
+fn every_wire_stop_reason_embeds_into_the_canonical_vocabulary_name_for_name() {
+    // The ONE wire-to-canonical seam (ADR-0069): total over the wire enum,
+    // and name-preserving, so no reason changes spelling crossing it.
+    let wire = [
+        StopReason::EndTurn,
+        StopReason::ToolUse,
+        StopReason::MaxTokens,
+        StopReason::StopSequence,
+        StopReason::Error,
+        StopReason::Unknown,
+    ];
+    for w in wire {
+        let name = w.to_string();
+        let canonical: crate::stop_reason::StopReason = w.into();
+        assert_eq!(canonical.as_str(), name);
+    }
+}

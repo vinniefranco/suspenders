@@ -246,14 +246,14 @@ pub(crate) enum IgnoreReason {
 /// resolved spec label for the query rebuild, and the skipped mentions (with
 /// reasons) for the display.
 #[derive(Debug, Clone, Default)]
-struct Resolution {
+struct ResolvedMentions {
     specs: Vec<Spec>,
     /// `(original_at_path, resolved_spec_label)` for the query rebuild.
     resolved: Vec<(String, String)>,
     skipped: Vec<(String, Skip)>,
 }
 
-impl Resolution {
+impl ResolvedMentions {
     /// The resolved spec label for an original `@path`, if it resolved.
     fn resolved_spec(&self, original: &str) -> Option<&str> {
         self.resolved
@@ -342,8 +342,8 @@ fn resolve(
     root: &Path,
     memory: Option<&Path>,
     temp_dir: Option<&Path>,
-) -> Resolution {
-    let mut out = Resolution::default();
+) -> ResolvedMentions {
+    let mut out = ResolvedMentions::default();
     for part in parts {
         let Part::AtPath(original) = part else {
             continue;
@@ -411,7 +411,7 @@ fn ignore_reason(root: &Path, abs: &Path) -> Option<IgnoreReason> {
 /// verbatim, a resolved `@path` re-emitted as `@resolvedSpec` and an unresolved
 /// one put back verbatim, with qwen's spacing rules, then trimmed. `resolution`
 /// supplies the resolved-spec lookup.
-fn rebuild_query(parts: &[Part], resolution: &Resolution) -> String {
+fn rebuild_query(parts: &[Part], resolution: &ResolvedMentions) -> String {
     let mut text = String::new();
     for (i, part) in parts.iter().enumerate() {
         match part {
@@ -514,7 +514,7 @@ pub(crate) async fn expand(
 /// Build the read display from the resolution and the batch outcome (qwen's
 /// per-file cards + ignored-paths report): the specs read (label + is_directory),
 /// the skipped mentions (with reasons), and the per-spec read errors.
-fn build_display(resolution: &Resolution, batch: &read_many_files::BatchRead) -> ReadDisplay {
+fn build_display(resolution: &ResolvedMentions, batch: &read_many_files::BatchRead) -> ReadDisplay {
     let read = batch
         .reads
         .iter()

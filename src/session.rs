@@ -237,7 +237,7 @@ const DEFAULT_COMPACTION_KEEP: f64 = 0.5;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 
 /// The default Run Limit (maximum Passes / turns per user request). Sized for a
-/// real multi-step task under the Governor-free ReAct loop: qwen-code completed
+/// real multi-step task under the plain ReAct loop (ADR-0045): qwen-code completed
 /// a task in ~41 turns and its own session-turn ceiling is ~100, so 100 leaves
 /// a legitimate task uncut while still bounding a runaway. A config knob - the
 /// loop-detector (`loop_stall_limit`) catches a stuck model well before this.

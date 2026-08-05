@@ -7,7 +7,7 @@
 //! serialize a call as an `<invoke name="NAME">` block whose arguments are
 //! `<parameter name="KEY">VALUE</parameter>` pairs, dropped into `delta.content`
 //! instead of the structured channel. When the structured fold in
-//! [`super::stream`] comes back empty and the Hermes recovery does not hit, this
+//! `super::stream` comes back empty and the Hermes recovery does not hit, this
 //! module is the last resort: a pure parse over the accumulated content string,
 //! no I/O, no transport reference.
 //!

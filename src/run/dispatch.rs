@@ -14,10 +14,10 @@ use crate::conversation::Conversation;
 use crate::event::Event;
 use crate::llm::response::{Response, StopReason};
 use crate::run::deps::{AfterPass, RunDeps};
-use crate::run::loop_::{LoopState, Outcome};
+use crate::run::loop_::LoopState;
 use crate::run::next_speaker::{self, NextSpeaker};
+use crate::run::settlement::Outcome;
 use crate::run::{batch, finish};
-use crate::session::log;
 use crate::voice;
 
 // The result of a stop-reason dispatch: either the loop continues with an
@@ -134,16 +134,13 @@ async fn finish_or_stop_hook<D: RunDeps>(
             state.stop_hook_count += 1;
             if state.stop_hook_count >= state.stop_hook_cap {
                 let warning = crate::run::hooks::format_stop_hook_cap_warning(state.stop_hook_cap);
-                state.emitter.emit(Event::extension_error(
-                    "hook Stop".to_string(),
-                    crate::event::Stage::Present,
-                    warning,
-                ));
+                state
+                    .emitter
+                    .emit(Event::fail_open_report("hook Stop".to_string(), warning));
                 return finish::finish(state, conversation, content, response.stop_reason);
             }
-            state.emitter.emit(Event::extension_error(
+            state.emitter.emit(Event::fail_open_report(
                 "hook Stop".to_string(),
-                crate::event::Stage::Present,
                 "forced the Run to continue".to_string(),
             ));
             let blocks: Vec<ContentBlock> = content
@@ -247,7 +244,7 @@ async fn continue_tools<D: RunDeps>(
             state,
             conversation,
             voice::Marker::LoopStall.text(),
-            log::StopReason::RunLimitStuck,
+            crate::stop_reason::StopReason::RunLimitStuck,
         ));
     }
     let (results, conversation) =
@@ -283,9 +280,8 @@ async fn continue_tools<D: RunDeps>(
 // meaning the model has emitted the SAME batch that many Passes in a row and is
 // stuck. It NEVER mutates the Conversation and NEVER injects steering text; the
 // caller terminates the Run on a `true`, appending only the close marker (the
-// whole point of the passive design - contrast the deleted duplicate/failure
-// nudges). With `identical_cap == 0` the detector is inert (a fresh count of 1
-// never reaches 0).
+// whole point of the passive design, ADR-0045). With `identical_cap == 0` the
+// detector is inert (a fresh count of 1 never reaches 0).
 fn loop_break<D: RunDeps>(state: &mut LoopState<'_, D>, response: &Response) -> bool {
     let signature = tool_signature(&response.content);
 

@@ -3,7 +3,8 @@ use crate::ui::transcript::Transcript;
 use crate::view_model::DiffLine;
 
 // A first-class `Diff` item (ADR-0008) with one all-added hunk of raw
-// (marker-free) code lines - the shape the Diff extension's Presenter emits.
+// (marker-free) code lines - the shape edit_file / write_file's diff
+// Artifact swap produces.
 // `lang` is `None` so tests exercise the no-highlight fallback unless they
 // pass a real language explicitly.
 fn diff_item(title: &str, lines: Vec<DiffLine>) -> TranscriptItem {
@@ -1075,8 +1076,8 @@ fn a_merged_result_renders_name_arg_dot_result() {
 
 #[test]
 fn an_unpaired_result_shows_only_the_summary() {
-    // No key_arg (governor-injected result): the description is the bare
-    // summary (no arg to set off).
+    // No key_arg (an unpaired result, e.g. a Voice answer to an orphaned
+    // call): the description is the bare summary (no arg to set off).
     let item = TranscriptItem::ToolResult {
         name: "run_shell_command".to_string(),
         summary: "injected".to_string(),
@@ -1330,7 +1331,6 @@ fn a_marker_tints_by_its_tone_not_its_text() {
     let theme = theme::dark();
     for (tone, glyph, expected) in [
         (Tone::Housekeeping, "● ", theme.muted),
-        (Tone::Aid, "● ", theme.muted),
         (Tone::Constrain, "△ ", theme.warning),
         (Tone::Steering, "● ", theme.accent),
         (Tone::Plain, "● ", theme.muted),
@@ -1973,7 +1973,7 @@ fn pending_body_height(
     // hw = 0: measure the WHOLE settled transcript (the test helper draws it
     // all top-aligned) through the SAME grouped fold the body draws (ADR-0046),
     // including the inline approval block when one is open (ADR-0049).
-    let approving = screen.pending_approval.as_ref().and_then(|pending| {
+    let approving = screen.pending_approval().and_then(|pending| {
         newest_live_tool_index(items).map(|call_index| Approving {
             pending,
             call_index,
@@ -2642,9 +2642,7 @@ fn the_phase_7_role_helpers_read_their_dedicated_slots() {
     assert_eq!(success_style(theme).fg, Some(Color::Rgb(0xAA, 0xD9, 0x4C)));
     assert_eq!(warning_style(theme).fg, Some(Color::Rgb(0xFF, 0xD7, 0x00)));
     assert_eq!(primary_style(theme).fg, Some(Color::Rgb(0xbf, 0xbd, 0xb6)));
-    assert_ne!(accent_style(theme).fg, Some(tui_color(theme.prompt_gutter)));
     assert_ne!(success_style(theme).fg, Some(tui_color(theme.added)));
-    assert_ne!(warning_style(theme).fg, Some(tui_color(theme.marker_aid)));
 }
 
 // --- render_pending (ADR-0046): bottom-anchor + top-clip -----------------
@@ -4553,7 +4551,7 @@ fn an_open_approval_suppresses_the_spinner_row_that_a_bare_run_keeps() {
     let running = Screen::new(ScreenOpts::default());
     let (running, _) = running.apply_event(Event::run_started("r1"));
     assert_eq!(running.status, Status::Running);
-    assert!(running.pending_approval.is_none());
+    assert!(running.pending_approval().is_none());
     let mut cache = RenderCache::new();
     let mut params = PendingBodyParams {
         screen: &running,
@@ -4728,7 +4726,7 @@ fn question_modal_renders_title_question_options_and_the_other_row() {
 
     // ...and the VERBATIM title is the box's first content row (checked on the
     // pure line set so the top-clip does not hide it).
-    let pending = screen.pending_question.as_ref().unwrap();
+    let pending = screen.pending_question().unwrap();
     let lines = question_modal_lines(pending, 58, theme::dark());
     let rendered: Vec<String> = lines
         .iter()
@@ -4800,7 +4798,7 @@ fn plan_modal_renders_title_plan_markdown_and_the_four_outcome_rows() {
 
     // ...and the VERBATIM title + the plan markdown are the box's top content
     // rows (checked on the pure line set so the top-clip does not hide them).
-    let pending = screen.pending_plan.as_ref().unwrap();
+    let pending = screen.pending_plan().unwrap();
     let lines = plan_modal_lines(pending, 68, theme::dark());
     let rendered: Vec<String> = lines
         .iter()
@@ -4970,7 +4968,7 @@ fn a_resolved_approval_commits_with_no_approval_rows() {
         false,
         std::collections::HashMap::new(),
     ));
-    assert_eq!(screen.pending_approval, None);
+    assert_eq!(screen.pending_approval(), None);
     let terminal = draw_viewport(60, 24, &screen);
     let text = buffer_text(&terminal);
     assert!(!text.contains("Do you want to proceed?"), "{text}");

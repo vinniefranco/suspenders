@@ -133,7 +133,8 @@ exactly like `/model`: opening emits an effect that calls `Agent::mcp_views()`
 off-loop and posts an `Event::McpDialogReady { generation, servers }` the
 Composer folds (generation-tagged so a stale fetch is dropped). Each step is a
 pure `(view-model) -> rows + header + footer` builder over the Phase A/C read
-model, reusing `SelectionList` + `SelectorRow`.
+model, reusing `SelectionList` for the cursor; the rows are the dialog's own
+styled-span vocabulary (`McpRow`/`McpSpan`), not `SelectorRow`.
 
 Steps: SERVER_LIST -> SERVER_DETAIL -> {TOOL_LIST -> TOOL_DETAIL | AUTHENTICATE}.
 Actions (View tools, Reconnect, Enable/Disable, Authenticate, Clear

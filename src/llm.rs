@@ -32,6 +32,7 @@ pub mod metered;
 pub mod model;
 pub mod openai_completions;
 pub mod provider;
+pub(crate) mod request_knobs;
 pub mod response;
 pub mod throttle;
 pub mod transform;

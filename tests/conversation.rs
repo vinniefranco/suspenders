@@ -317,9 +317,9 @@ fn for_request_returns_system_and_messages_wire_ready() {
 
 #[test]
 fn for_request_errs_when_char_estimate_exceeds_the_live_window() {
-    // Pure fit-check on the char estimate against `budget - reserve` - the
-    // same final-fit threshold the retired Eviction path used, so the
-    // Compaction trigger point (loop_ recovers on this Err) is unchanged.
+    // Pure fit-check on the char estimate against `budget - reserve` - chars
+    // are the final-fit threshold the Compaction recovery keys on (loop_
+    // recovers on this Err).
     let mut conv = Conversation::new("sys", ConversationOpts::new(50, 5));
     conv.add_user_text("x".repeat(400));
     assert!(conv.char_estimate() > 50 - 5);

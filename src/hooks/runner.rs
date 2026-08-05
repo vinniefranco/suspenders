@@ -157,8 +157,10 @@ Do NOT output anything other than the JSON response. No explanations, no markdow
 /// qwen's 60s default.
 ///
 /// Fail-open (ADR-0066): a spawn failure, a timeout, an unparseable output, or a
-/// transport failure yields `Ok(HookOutcome::default())` (a `continue`-by-default,
-/// steers-nothing outcome), NOT an `Err` - a present hook never fails the Run.
+/// transport failure yields the default (`continue`-by-default, steers-nothing)
+/// outcome, NOT an `Err` - a present hook never fails the Run. A spawn/transport
+/// failure additionally stamps [`HookOutcome::firing_error`] so the firing layer
+/// can surface the failure visibly (ADR-0018).
 pub async fn run_hook(
     hook: &Hook,
     payload: &str,
@@ -198,8 +200,15 @@ async fn run_command_hook(
         .await
     {
         Ok(result) => result,
-        // Spawn failure / timeout: fail open (a present hook never fails the Run).
-        Err(_) => return HookOutcome::default(),
+        // Spawn failure / timeout: fail open to the steers-nothing outcome (a
+        // present hook never fails the Run), carrying the error so the firing
+        // layer can surface it visibly (ADR-0018).
+        Err(err) => {
+            return HookOutcome {
+                firing_error: Some(err),
+                ..HookOutcome::default()
+            };
+        }
     };
 
     outcome_from_shell(&result)
@@ -282,8 +291,14 @@ async fn run_http_hook(
 ) -> HookOutcome {
     let (status, body) = match http.post(url, payload, timeout_secs).await {
         Ok(pair) => pair,
-        // Transport failure: fail open.
-        Err(_) => return HookOutcome::default(),
+        // Transport failure: fail open, carrying the error so the firing layer
+        // can surface it visibly (ADR-0018).
+        Err(err) => {
+            return HookOutcome {
+                firing_error: Some(err),
+                ..HookOutcome::default()
+            };
+        }
     };
 
     // A non-2xx status is a non-blocking continue (qwen), not a decision.
@@ -327,8 +342,13 @@ fn continue_outcome() -> HookOutcome {
 /// - `ok: true` -> an allow (`continue: true`, `decision: allow`, optional
 ///   `reason` / `additionalContext`).
 ///
-/// An LLM error, an empty reply, or a reply that is not the `{ok}` shape fails
-/// open to the default (non-blocking) outcome (qwen's non-blocking-error branch).
+/// An empty reply or a reply that is not the `{ok}` shape fails open to qwen's
+/// explicit defaulting-to-allow outcome (the non-blocking-error branch). An LLM
+/// FAILURE (the boundary never Errs - ADR-0002 folds it into a Response with
+/// `stop_reason: Error`) fails open to the steers-nothing default outcome
+/// carrying [`HookOutcome::firing_error`], exactly like a command spawn failure
+/// or an http transport failure, so the firing layer surfaces it visibly
+/// (ADR-0018).
 async fn run_prompt_hook(
     prompt: &str,
     payload: &str,
@@ -357,12 +377,26 @@ async fn run_prompt_hook(
     );
 
     // The single-turn completion; the boundary never Errs (ADR-0002), so a
-    // failure rides in the Response's stop_reason and folds into fail-open below.
+    // failure rides in the Response's stop_reason and folds into fail-open here.
     let mut sink = |_event: &crate::llm::StreamEvent| {};
     let response = caps
         .llm
         .complete(&request, caps.prompt_model, &mut sink)
         .await;
+
+    // A failed eval: fail open to the steers-nothing outcome (a present hook
+    // never fails the Run), carrying the error so the firing layer can surface
+    // it visibly (ADR-0018) - the same shape as a command spawn failure or an
+    // http transport failure.
+    if response.stop_reason == crate::llm::response::StopReason::Error {
+        let err = response
+            .error
+            .unwrap_or_else(|| "LLM eval failed".to_string());
+        return HookOutcome {
+            firing_error: Some(err),
+            ..HookOutcome::default()
+        };
+    }
 
     // The model's reply text (Text blocks concatenated).
     let reply = response

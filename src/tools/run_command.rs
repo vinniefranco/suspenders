@@ -148,6 +148,12 @@ impl Tool for RunCommand {
         crate::approvals::Kind::Execute
     }
 
+    // A cut keeps the start AND the end: the exit code and last errors live at
+    // the end of a command's output.
+    fn cut_policy(&self) -> crate::tool::CutPolicy {
+        crate::tool::CutPolicy::HeadTail
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_shell_command".into(),

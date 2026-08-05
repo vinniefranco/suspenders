@@ -1,1 +1,0 @@
-Study this codebase and write ANALYSIS.md in the repo root covering: (1) the program's purpose, (2) each module's responsibility, (3) a trace of what happens when a user runs the `add` command, from main to disk, naming the actual functions called in order, (4) where task sorting is implemented. Do not modify any source files.

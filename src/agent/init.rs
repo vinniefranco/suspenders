@@ -77,15 +77,14 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     let (mcp, adapters) =
         crate::mcp::manager::McpManager::connect(&plans, Some(oauth_tokens_path)).await;
 
-    // Surface each fail-open connect skip as a launch notice (ADR-0007's
-    // fail-open report seam, the same line an Extension crash takes): a broken
+    // Surface each fail-open connect skip as a launch notice (the fail-open
+    // report seam, fail-open-with-visibility ADR-0018): a broken
     // MCP server is a visible skip, not a silent one. Server-name-sorted, so the
     // notices are stable across runs. This is the only production reader of
     // `mcp.failures()`.
     for (server, reason) in mcp.failures() {
-        let _ = events.send(Event::extension_error(
+        let _ = events.send(Event::fail_open_report(
             format!("mcp server {server}"),
-            crate::event::Stage::PreRun,
             format!("could not connect - {reason}"),
         ));
     }
@@ -107,12 +106,11 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     ));
 
     // Surface each fail-open skill parse skip as a launch notice, exactly like an
-    // MCP connect failure (ADR-0007's fail-open report seam): a broken SKILL.md is
-    // a visible skip, not a silent one.
+    // MCP connect failure (the fail-open report seam, ADR-0018): a broken
+    // SKILL.md is a visible skip, not a silent one.
     for (name, reason) in skill_manager.failures() {
-        let _ = events.send(Event::extension_error(
+        let _ = events.send(Event::fail_open_report(
             format!("skill {name}"),
-            crate::event::Stage::PreRun,
             reason.clone(),
         ));
     }
@@ -128,13 +126,12 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     ));
 
     // Surface each fail-open hook parse skip as a launch notice, exactly like an
-    // MCP connect or skill parse failure (ADR-0007's fail-open report seam, the
+    // MCP connect or skill parse failure (the fail-open report seam, the
     // fail-open-with-visibility ethos of ADR-0018): a malformed hook is a visible
     // skip, not a silent one.
     for (context, reason) in hook_manager.failures() {
-        let _ = events.send(Event::extension_error(
+        let _ = events.send(Event::fail_open_report(
             format!("hook {context}"),
-            crate::event::Stage::PreRun,
             reason.clone(),
         ));
     }
@@ -163,7 +160,7 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
         crate::tool_registry::ToolRegistry::with_shared(Arc::clone(&session_tools));
 
     // The tool specs ride with every request but live outside the messages; the
-    // estimate has to count them or Eviction fires late (baud's
+    // estimate has to count them or Compaction fires late (baud's
     // `String.length(JSON.encode!(Baud.Tools.specs()))`). Sourced from the live
     // registry's `specs()` - the BASE (non-revealed) wire list. MCP tools are
     // all deferred, so they are excluded here: overhead is unchanged and
@@ -200,9 +197,8 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     // write to is exactly the dir confinement permits - one resolution, no drift.
     let memory = crate::memory::MemoryStore::load_at(std::path::Path::new(&session.memory_root));
     if let Err(reason) = memory.ensure_scaffold() {
-        let _ = events.send(Event::extension_error(
+        let _ = events.send(Event::fail_open_report(
             "memory".to_string(),
-            crate::event::Stage::PreRun,
             format!(
                 "could not scaffold memory dir {} - {reason}",
                 memory.memory_dir
@@ -226,21 +222,21 @@ pub(super) async fn init_agent(init: AgentInit) -> AgentState {
     } else {
         "startup"
     };
-    let transcript = log.as_ref().map(|l| l.path.clone()).unwrap_or_default();
-    let session_id = crate::run::hooks::session_id_from_log_path(&transcript);
+    let identity = crate::run::hooks::HookIdentity::from_log_path(
+        session.root.clone(),
+        log.as_ref().map(|l| l.path.clone()).unwrap_or_default(),
+    );
     let session_start_hooks = crate::run::hooks::Hooks::new(
         &hook_manager,
         llm.as_ref(),
         &model,
-        session.root.clone(),
-        session_id,
-        transcript,
+        identity,
+        Some(crate::agent::broadcast_reporter(&events)),
     );
     let system_prompt = match session_start_hooks.session_start(source).await {
         Some(context) => {
-            let _ = events.send(Event::extension_error(
+            let _ = events.send(Event::fail_open_report(
                 "hook SessionStart".to_string(),
-                crate::event::Stage::PreRun,
                 "injected initial context".to_string(),
             ));
             format!("{system_prompt}\n\n---\n\n{context}")

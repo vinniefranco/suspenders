@@ -4,9 +4,9 @@
 //!
 //! When the Conversation's token estimate approaches the Context Budget, old
 //! Runs are summarized by the LLM and replaced with a structured markdown
-//! summary. Unlike Eviction (which mechanically hollows out Tool Results),
-//! compaction is semantic - it extracts what was accomplished, what decisions
-//! were made, and what files were touched.
+//! summary. Compaction is semantic, not mechanical - it extracts what was
+//! accomplished, what decisions were made, and what files were touched; there
+//! is no mechanical elision path beside it.
 //!
 //! ## An effect, not part of the pure loop
 //!
@@ -64,8 +64,8 @@ impl Compaction {
     }
 
     /// Checks whether the Conversation's token estimate exceeds the Compaction
-    /// Target (the same low-water mark Eviction settles to), meaning Proactive
-    /// Compaction should fire before the Run's first Pass. The single
+    /// Target, meaning Proactive Compaction should fire before the Run's first
+    /// Pass. The single
     /// definition of the trigger (baud's `Baud.Compaction.proactive?/1`):
     /// callers consult this rather than restating the comparison.
     pub fn proactive(conv: &Conversation) -> bool {

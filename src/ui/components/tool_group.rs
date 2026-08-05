@@ -14,7 +14,7 @@ use super::tool_body::{confirming_inner_lines, is_shell_tool, is_tool_item};
 /// The content side margin (columns): qwen `HistoryItemDisplay` wraps every item
 /// in `marginLeft:2, marginRight:2` (HistoryItemDisplay.tsx:64), so content is
 /// the frame width minus a 2-col left AND 2-col right margin. `pub(crate)` so the
-/// adapter shares the same margin the pending region uses.
+/// adapter shares the same margin the Pending-tail render uses.
 pub(crate) const CONTENT_MARGIN: u16 = 2;
 
 /// The widest readable content is drawn (columns), matching qwen's

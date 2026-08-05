@@ -11,7 +11,7 @@
 //! (plan mode) - with the Hook permission composition (ADR-0066) ahead of it,
 //! then execution with Shaping (the Result Cap). A tool shapes its own model-facing output and
 //! attaches any display Artifacts (ADR-0007: the diff / todos / exit-code badge
-//! live in the tools now, not a wrapper pipeline). Once the batch finishes the
+//! live in the tools, not a wrapper layer). Once the batch finishes the
 //! Conversation is checkpointed with only the answered Tool Calls, so the
 //! checkpoint never persists an unanswered tool_use block.
 //!
@@ -30,7 +30,7 @@ use crate::llm::malformed_tool_input;
 use crate::plan::Update;
 use crate::run::deps::RunDeps;
 use crate::run::hooks;
-use crate::run::loop_::LoopState;
+use crate::run::loop_::{LoopState, emit_hook_decision};
 use crate::tools;
 use crate::voice;
 
@@ -324,7 +324,7 @@ impl Answer {
     }
 }
 
-// The Tool Call lifecycle (ADR-0007, pipeline retired): the LLM layer tags
+// The Tool Call lifecycle (ADR-0007): the LLM layer tags
 // malformed inputs - never run those. Otherwise the hook-fire seam (Phase 3a,
 // ADR-0066) wraps the Approval + execution: PreToolUse may block the call or feed
 // a permission decision, PermissionRequest composes with the Approval, and
@@ -645,28 +645,13 @@ fn append_context(reason: String, context: Option<String>) -> String {
     }
 }
 
-// Surfaces a deciding hook fire as a visible line (ADR-0018 fail-open-with-
-// visibility, ADR-0066): a block / auto-approve / deny / stop / inject is never
-// silent. Reuses the fail-open report seam skills/MCP use (an `extension_error`
-// with a `hook <event>` label + the `Present` mid-Run stage), so the operator
-// reads what a hook did on the same channel a launch notice takes.
-fn emit_hook_decision<D: RunDeps>(state: &mut LoopState<'_, D>, event: &str, what: &str) {
-    state.emitter.emit(Event::extension_error(
-        format!("hook {event}"),
-        crate::event::Stage::Present,
-        what.to_string(),
-    ));
-}
-
 // Surfaces a plan-mode block as a visible line (ADR-0067), on the same fail-open
-// report channel the hook decisions use: an `extension_error` labelled `plan
-// mode` with the `Present` mid-Run stage, so the operator reads that plan mode
-// blocked a mutating tool (the model reads qwen's verbatim reason as the result;
-// this is the user-facing notice).
+// report channel the hook decisions use: a `fail_open_report` labelled `plan
+// mode`, so the operator reads that plan mode blocked a mutating tool (the model
+// reads qwen's verbatim reason as the result; this is the user-facing notice).
 fn emit_plan_block<D: RunDeps>(state: &mut LoopState<'_, D>, name: &str) {
-    state.emitter.emit(Event::extension_error(
+    state.emitter.emit(Event::fail_open_report(
         "plan mode".to_string(),
-        crate::event::Stage::Present,
         format!("blocked a non-read-only Tool Call: {name}"),
     ));
 }

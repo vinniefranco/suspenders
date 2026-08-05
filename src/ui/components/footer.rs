@@ -354,7 +354,7 @@ pub(crate) fn render_footer(frame: &mut Frame, area: Rect, ctx: FooterCtx<'_>, t
                 session_cost: t.session_cost,
                 context_budget: t.context_budget,
             },
-            approval_mode: t.approval_mode,
+            approval_mode: t.approval_mode(),
         },
     );
 

@@ -42,7 +42,7 @@ async fn runs_the_tool_emits_events_checkpoints_and_feeds_result_back() {
 
     let (outcome, deps) = run_with(&session, "list the files", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
 
     let evs = events(&deps);
     // tool_call for tu_1
@@ -525,7 +525,10 @@ async fn after_pass_stop_closes_the_run_with_the_stopped_marker() {
 
     let (outcome, _deps) = run_with(&session, "look", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Custom("budget_hook".to_string()));
+    assert_eq!(
+        *stop,
+        crate::stop_reason::StopReason::Custom("budget_hook".to_string())
+    );
     let lm = last_message(conv);
     assert!(
         matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn stopped - reply to continue]")
@@ -585,7 +588,8 @@ async fn errored_response_settles_failed_keeping_partial_text() {
     let (outcome, deps) = run_with(&session, "go", deps).await;
     let conv = match &outcome {
         Outcome::Failed(reason, conv) => {
-            assert_eq!(reason, "request_failed: closed");
+            // The LLM error string rides the Reason verbatim.
+            assert_eq!(reason.inspect(), "request_failed: closed");
             conv
         }
         other => panic!("expected Failed, got {other:?}"),
@@ -627,7 +631,7 @@ async fn a_retryable_error_re_draws_in_band_and_the_run_completes() {
 
     let (outcome, deps) = run_with(&session, "go", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
 
     // The Conversation ends on the re-drawn reply; the failed draw left
     // nothing behind (no [run failed] marker).
@@ -681,7 +685,11 @@ async fn an_exhausted_budget_falls_to_finish_fail_as_before() {
     let (outcome, deps) = run_with(&session, "go", deps).await;
     match &outcome {
         Outcome::Failed(reason, _) => {
-            assert!(reason.contains("Failed to generate a valid tool call"));
+            assert!(
+                reason
+                    .inspect()
+                    .contains("Failed to generate a valid tool call")
+            );
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -728,7 +736,7 @@ async fn a_non_retryable_error_fails_immediately_without_re_drawing() {
     let (outcome, deps) = run_with(&session, "go", deps).await;
     match &outcome {
         Outcome::Failed(reason, _) => {
-            assert!(reason.contains("Context size has been exceeded"));
+            assert!(reason.inspect().contains("Context size has been exceeded"));
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -755,7 +763,7 @@ async fn tool_use_stop_with_zero_blocks_ends_as_end_turn() {
     );
     let (outcome, _deps) = run_with(&session, "hi", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
     let lm = last_message(conv);
     assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "hmm"));
 }
@@ -850,7 +858,7 @@ async fn max_tokens_with_no_tool_use_closes_with_text() {
     );
     let (outcome, _deps) = run_with(&session, "go", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::MaxTokens));
+    assert_eq!(*stop, crate::stop_reason::StopReason::MaxTokens);
     let lm = last_message(conv);
     assert!(matches!(&lm.content[0], ContentBlock::Text { text } if text == "partial answer"));
 }
@@ -862,7 +870,7 @@ async fn max_tokens_with_no_content_closes_with_truncation_marker() {
     let deps = deps_for(&session, vec![just(empty(StopReason::MaxTokens))]);
     let (outcome, _deps) = run_with(&session, "go", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::MaxTokens));
+    assert_eq!(*stop, crate::stop_reason::StopReason::MaxTokens);
     let lm = last_message(conv);
     assert!(
         matches!(&lm.content[0], ContentBlock::Text { text } if text == "[response truncated by max_tokens]")
@@ -890,7 +898,7 @@ async fn run_limit_stops_the_loop_after_n_passes() {
     );
     let (outcome, _deps) = run_with(&session, "explore", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
+    assert_eq!(*stop, crate::stop_reason::StopReason::RunLimit);
     let lm = last_message(conv);
     assert!(
         matches!(&lm.content[0], ContentBlock::Text { text } if text == "[turn limit reached - reply to continue]")
@@ -934,7 +942,7 @@ async fn turn_counter_bounds_the_run_at_max_turns() {
     );
     let (outcome, deps) = run_with(&session, "list forever", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
+    assert_eq!(*stop, crate::stop_reason::StopReason::RunLimit);
     // Exactly three requests: one per answered Pass, none for the bound.
     assert_eq!(deps.requests.lock().unwrap().len(), 3);
     let lm = last_message(conv);
@@ -980,7 +988,7 @@ async fn a_stuck_identical_batch_trips_the_loop_detector_without_injecting_text(
     );
     let (outcome, deps) = run_with(&session, "loop forever", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimitStuck));
+    assert_eq!(*stop, crate::stop_reason::StopReason::RunLimitStuck);
 
     // Exactly three model calls: the detector closed on the third identical
     // batch before a fourth request could be built.
@@ -995,8 +1003,8 @@ async fn a_stuck_identical_batch_trips_the_loop_detector_without_injecting_text(
     // The passive invariant: NO loop-detector steering text entered the
     // Conversation. Every unstamped (Voice-authored, no Provenance)
     // assistant text block must be exactly the close marker - the detector
-    // appends that one marker and nothing else, in contrast to the deleted
-    // duplicate/failure nudges which fed corrective text back to the model.
+    // appends that one marker and nothing else (the passive design,
+    // ADR-0045).
     let voice_texts: Vec<&str> = conv
         .messages
         .iter()
@@ -1064,7 +1072,7 @@ async fn distinct_batches_each_pass_never_trip_the_detector() {
     let (outcome, deps) = run_with(&session, "explore around", deps).await;
     let (conv, stop) = ok(&outcome);
     // A clean end_turn - the detector never fired.
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
     let evs = events(&deps);
     assert!(!evs.iter().any(|e| matches!(e, Event::LoopStall { .. })));
     let lm = last_message(conv);
@@ -1072,7 +1080,7 @@ async fn distinct_batches_each_pass_never_trip_the_detector() {
 }
 
 // Every request offers the FULL Tool registry - there is no per-Pass
-// narrowing (the Endgame narrowing was torn out with the Governors).
+// narrowing (ADR-0045).
 #[tokio::test]
 async fn every_request_offers_the_full_tool_registry() {
     let root = root();
@@ -1136,7 +1144,7 @@ async fn a_thinking_only_reply_auto_continues_via_the_short_circuit() {
     );
     let (outcome, deps) = run_with(&session, "think then answer", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
 
     // A "Please continue." user message was injected between the two Passes,
     // and announced as a delivered-steering event.
@@ -1170,7 +1178,7 @@ async fn a_model_verdict_continues_and_appends_the_reply_then_the_nudge() {
     );
     let (outcome, _deps) = run_with(&session, "go", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
 
     // The announced-but-not-executed reply enters stamped with the Model's
     // Provenance; the nudge follows as an unstamped user message.
@@ -1213,7 +1221,7 @@ async fn a_user_verdict_finishes_the_run_with_no_nudge() {
     );
     let (outcome, deps) = run_with(&session, "finish up", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
 
     // No "Please continue." was injected.
     assert!(!conv.messages.iter().any(|m| {
@@ -1261,7 +1269,7 @@ async fn the_continuation_is_bounded_by_max_turns() {
     );
     let (outcome, deps) = run_with(&session, "loop on empties", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::Reason(log::StopReason::RunLimit));
+    assert_eq!(*stop, crate::stop_reason::StopReason::RunLimit);
 
     // Exactly three model calls (no side-query fires on the empty
     // short-circuit): the fourth was never requested.
@@ -1283,7 +1291,7 @@ async fn skip_next_speaker_finishes_without_the_check() {
     let deps = deps_for(&session, vec![just(text_end("done"))]);
     let (outcome, deps) = run_with(&session, "go", deps).await;
     let (conv, stop) = ok(&outcome);
-    assert_eq!(*stop, OutcomeStop::end_turn());
+    assert_eq!(*stop, crate::stop_reason::StopReason::EndTurn);
     // No side-query: exactly one model call.
     assert_eq!(deps.requests.lock().unwrap().len(), 1);
     let lm = last_message(conv);
@@ -1369,7 +1377,12 @@ async fn context_budget_exhaustion_fails_before_any_request() {
     let deps = deps_for(&session, vec![]);
     let prompt = "pad ".repeat(50);
     let (outcome, _deps) = run_with(&session, &prompt, deps).await;
-    assert_eq!(outcome, Outcome::Error);
+    assert_eq!(
+        outcome,
+        Outcome::Error(crate::run::settlement::Reason::atom(
+            "context_budget_exhausted"
+        ))
+    );
 }
 
 // ---- malformed tool input ---------------------------------------------
