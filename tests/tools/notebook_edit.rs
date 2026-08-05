@@ -46,15 +46,8 @@ fn write_fixture(dir: &TempDir) -> std::path::PathBuf {
 }
 
 // Stat the file for its current (mtime, size) fingerprint.
-fn fingerprint(abs: &std::path::Path) -> (u128, u64) {
-    let meta = std::fs::metadata(abs).unwrap();
-    let mtime = meta
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    (mtime, meta.len())
+fn fingerprint(abs: &std::path::Path) -> Fingerprint {
+    Fingerprint::stat(abs).unwrap()
 }
 
 async fn run(input: Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -121,7 +114,15 @@ async fn editing_a_stale_notebook_is_the_verbatim_rejection() {
     let abs = write_fixture(&tmp);
     let cache = Arc::new(FileReadCache::new());
     // Record a FULL read at a DIFFERENT fingerprint than the file now has.
-    cache.record_read(abs.clone(), 1, 1, true, true);
+    cache.record_read(
+        abs.clone(),
+        Fingerprint {
+            mtime_ms: 1,
+            size_bytes: 1,
+        },
+        true,
+        true,
+    );
     let err = run(
             json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx_with_cache(tmp.path(), cache),
@@ -143,10 +144,10 @@ async fn editing_a_truncated_read_notebook_is_the_verbatim_rejection() {
     let tmp = TempDir::new().unwrap();
     let abs = write_fixture(&tmp);
     let cache = Arc::new(FileReadCache::new());
-    let (mtime, size) = fingerprint(&abs);
+    let fp = fingerprint(&abs);
     // A read at the CURRENT fingerprint but NOT full (rendered output was
     // truncated when read).
-    cache.record_read(abs.clone(), mtime, size, false, true);
+    cache.record_read(abs.clone(), fp, false, true);
     let err = run(
             json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "print('bye')\n"}),
             &ctx_with_cache(tmp.path(), cache),
@@ -169,8 +170,8 @@ async fn a_full_fresh_read_lets_the_edit_apply_and_records_the_write() {
     let tmp = TempDir::new().unwrap();
     let abs = write_fixture(&tmp);
     let cache = Arc::new(FileReadCache::new());
-    let (mtime, size) = fingerprint(&abs);
-    cache.record_read(abs.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs);
+    cache.record_read(abs.clone(), fp, true, true);
 
     let ctx = ctx_with_cache(tmp.path(), Arc::clone(&cache));
     let msg = run(
@@ -189,8 +190,8 @@ async fn a_full_fresh_read_lets_the_edit_apply_and_records_the_write() {
 
     // The write was recorded: a follow-up edit sees a Fresh, full read
     // (the tool's own write is not a stale external change).
-    let (mtime2, size2) = fingerprint(&abs);
-    assert_eq!(cache.check(&abs, mtime2, size2), ReadState::Fresh);
+    let fp2 = fingerprint(&abs);
+    assert_eq!(cache.check(&abs, fp2), ReadState::Fresh);
     assert!(cache.entry(&abs).unwrap().last_read_was_full);
 }
 
@@ -242,8 +243,8 @@ async fn delete_summary_omits_the_updated_source() {
     let tmp = TempDir::new().unwrap();
     let abs = write_fixture(&tmp);
     let cache = Arc::new(FileReadCache::new());
-    let (mtime, size) = fingerprint(&abs);
-    cache.record_read(abs.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs);
+    cache.record_read(abs.clone(), fp, true, true);
     let ctx = ctx_with_cache(tmp.path(), cache);
     let msg = run(
         json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "edit_mode": "delete"}),
@@ -280,8 +281,8 @@ async fn an_insert_that_loses_stable_ids_invalidates_the_cache() {
     let abs = tmp.path().join("nb.ipynb");
     std::fs::write(&abs, NO_STABLE_IDS).unwrap();
     let cache = Arc::new(FileReadCache::new());
-    let (mtime, size) = fingerprint(&abs);
-    cache.record_read(abs.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs);
+    cache.record_read(abs.clone(), fp, true, true);
     let ctx = ctx_with_cache(tmp.path(), Arc::clone(&cache));
 
     // First edit: insert after cell-0.
@@ -294,8 +295,8 @@ async fn an_insert_that_loses_stable_ids_invalidates_the_cache() {
 
     // The cache entry was invalidated (not recorded as a fresh write): the
     // path now reads Unknown, so a second edit is rejected pending a re-read.
-    let (mtime2, size2) = fingerprint(&abs);
-    assert_eq!(cache.check(&abs, mtime2, size2), ReadState::Unknown);
+    let fp2 = fingerprint(&abs);
+    assert_eq!(cache.check(&abs, fp2), ReadState::Unknown);
     let err = run(
             json!({"notebook_path": abs.to_string_lossy(), "cell_id": "cell-0", "new_source": "again\n"}),
             &ctx,
@@ -314,8 +315,8 @@ async fn an_insert_that_keeps_stable_ids_records_the_write() {
     let tmp = TempDir::new().unwrap();
     let abs = write_fixture(&tmp);
     let cache = Arc::new(FileReadCache::new());
-    let (mtime, size) = fingerprint(&abs);
-    cache.record_read(abs.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs);
+    cache.record_read(abs.clone(), fp, true, true);
     let ctx = ctx_with_cache(tmp.path(), Arc::clone(&cache));
 
     run(
@@ -326,8 +327,8 @@ async fn an_insert_that_keeps_stable_ids_records_the_write() {
         .unwrap();
 
     // The write was recorded (Fresh), so a follow-up edit applies.
-    let (mtime2, size2) = fingerprint(&abs);
-    assert_eq!(cache.check(&abs, mtime2, size2), ReadState::Fresh);
+    let fp2 = fingerprint(&abs);
+    assert_eq!(cache.check(&abs, fp2), ReadState::Fresh);
     run(
         json!({"notebook_path": abs.to_string_lossy(), "cell_id": "run", "new_source": "y\n"}),
         &ctx,
@@ -374,8 +375,8 @@ async fn a_padded_notebook_path_is_trimmed_before_resolution() {
     let tmp = TempDir::new().unwrap();
     let abs = write_fixture(&tmp);
     let cache = Arc::new(FileReadCache::new());
-    let (mtime, size) = fingerprint(&abs);
-    cache.record_read(abs.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs);
+    cache.record_read(abs.clone(), fp, true, true);
     let ctx = ctx_with_cache(tmp.path(), cache);
 
     let padded = format!("  {}  ", abs.to_string_lossy());

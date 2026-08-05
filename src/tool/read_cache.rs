@@ -39,16 +39,54 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// The `(mtime, size)` snapshot of a file at one moment - the staleness
+/// fingerprint every cache operation keys on (qwen `stats.mtimeMs` +
+/// `stats.size`). One value, built by [`Fingerprint::of`] from a stat the
+/// CALLER performs (the cache itself never touches the filesystem), so the
+/// pairing can never be transposed or half-updated across the record/check
+/// sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// mtime in ms since the epoch (`0` when the platform reports none -
+    /// qwen's `stats.mtimeMs` fallback).
+    pub mtime_ms: u128,
+    /// Size in bytes.
+    pub size_bytes: u64,
+}
+
+impl Fingerprint {
+    /// The fingerprint of an already-stat'd file. The mtime falls back to `0`
+    /// when the platform cannot report a modified time (matching every prior
+    /// per-tool copy of this conversion).
+    pub fn of(meta: &std::fs::Metadata) -> Fingerprint {
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        Fingerprint {
+            mtime_ms,
+            size_bytes: meta.len(),
+        }
+    }
+
+    /// Stat `path` and fingerprint it - the one stat-to-fingerprint conversion
+    /// (previously copy-pasted per tool). Callers own the error wording: a
+    /// read tolerates a miss, a mutating tool refuses on one.
+    pub fn stat(path: &std::path::Path) -> std::io::Result<Fingerprint> {
+        std::fs::metadata(path).map(|meta| Fingerprint::of(&meta))
+    }
+}
+
 /// A single tracked file (qwen `FileReadEntry`, narrowed to the enforcement
-/// fields). `mtime_ms`/`size_bytes` are the fingerprint [`FileReadCache::check`]
-/// compares against the current on-disk stat; the `last_*` flags describe the
-/// most recent record so `notebook_edit` can require a FULL read.
+/// fields). `fingerprint` is what [`FileReadCache::check`] compares against the
+/// current on-disk stat; the `last_*` flags describe the most recent record so
+/// `notebook_edit` can require a FULL read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileReadEntry {
-    /// mtime in ms at the time of the most recent record.
-    pub mtime_ms: u128,
-    /// Size in bytes at the time of the most recent record.
-    pub size_bytes: u64,
+    /// The `(mtime, size)` snapshot at the time of the most recent record.
+    pub fingerprint: Fingerprint,
     /// ms epoch of the last successful Read. `None` if never read (a write-only
     /// entry). qwen's `lastReadAt` - `notebook_edit` requires it to be `Some`.
     pub last_read_at: Option<u128>,
@@ -69,13 +107,12 @@ pub struct FileReadEntry {
 }
 
 impl FileReadEntry {
-    /// A fresh entry at `(mtime_ms, size)` with no read/write stamped yet - the
+    /// A fresh entry at `fingerprint` with no read/write stamped yet - the
     /// seed both `record_read` and `record_write` insert before overwriting the
     /// operation-specific fields.
-    fn seed(mtime_ms: u128, size: u64) -> FileReadEntry {
+    fn seed(fingerprint: Fingerprint) -> FileReadEntry {
         FileReadEntry {
-            mtime_ms,
-            size_bytes: size,
+            fingerprint,
             last_read_at: None,
             last_write_at: None,
             last_read_was_full: false,
@@ -125,7 +162,7 @@ impl FileReadCache {
     ///   `edit_file`/`write_file` adoption (DEFERRED); `notebook_edit` ignores
     ///   it.
     ///
-    /// The fingerprint is refreshed to `(mtime_ms, size)`, `last_read_at` is
+    /// The fingerprint is refreshed to `fingerprint`, `last_read_at` is
     /// stamped, and the two flags are set to exactly what THIS read produced.
     /// The qwen sticky-on-true-across-same-fingerprint subtlety only matters to
     /// the fast-path (a `Read full -> Read partial` sequence keeping read-
@@ -134,17 +171,15 @@ impl FileReadCache {
     pub fn record_read(
         &self,
         path: PathBuf,
-        mtime_ms: u128,
-        size: u64,
+        fingerprint: Fingerprint,
         full: bool,
         cacheable: bool,
     ) {
         let mut by_path = self.lock();
         let entry = by_path
             .entry(path)
-            .or_insert_with(|| FileReadEntry::seed(mtime_ms, size));
-        entry.mtime_ms = mtime_ms;
-        entry.size_bytes = size;
+            .or_insert_with(|| FileReadEntry::seed(fingerprint));
+        entry.fingerprint = fingerprint;
         entry.last_read_at = Some(now_ms());
         entry.last_read_was_full = full;
         entry.last_read_cacheable = cacheable;
@@ -163,37 +198,34 @@ impl FileReadCache {
     /// writer passes `false` because it produces a structured payload the model
     /// must re-materialize, matching `notebook-edit.ts recordWrite({ cacheable:
     /// false })`.
-    pub fn record_write(&self, path: PathBuf, mtime_ms: u128, size: u64, cacheable: bool) {
+    pub fn record_write(&self, path: PathBuf, fingerprint: Fingerprint, cacheable: bool) {
         let mut by_path = self.lock();
         let now = now_ms();
         let entry = by_path
             .entry(path)
-            .or_insert_with(|| FileReadEntry::seed(mtime_ms, size));
-        entry.mtime_ms = mtime_ms;
-        entry.size_bytes = size;
+            .or_insert_with(|| FileReadEntry::seed(fingerprint));
+        entry.fingerprint = fingerprint;
         entry.last_write_at = Some(now);
         entry.last_read_at = Some(now);
         entry.last_read_was_full = true;
         entry.last_read_cacheable = cacheable;
     }
 
-    /// Compare the cached fingerprint for `path` against the current
-    /// `(mtime_ms, size)` (qwen `check`):
+    /// Compare the cached fingerprint for `path` against the current one
+    /// (qwen `check`):
     ///
     /// - [`ReadState::Unknown`] - no entry (never Read or written this Run).
     /// - [`ReadState::Stale`] - an entry exists but mtime or size drifted.
-    /// - [`ReadState::Fresh`] - an entry exists AND both match.
+    /// - [`ReadState::Fresh`] - an entry exists AND the fingerprint matches.
     ///
     /// Like qwen's, mtime + size is a best-effort fingerprint, not a hash: a
     /// rewrite with identical mtime AND size reads `Fresh`. The mutating tool's
     /// own `0 occurrences` / apply failure is the safety net there.
-    pub fn check(&self, path: &std::path::Path, mtime_ms: u128, size: u64) -> ReadState {
+    pub fn check(&self, path: &std::path::Path, fingerprint: Fingerprint) -> ReadState {
         let by_path = self.lock();
         match by_path.get(path) {
             None => ReadState::Unknown,
-            Some(entry) if entry.mtime_ms == mtime_ms && entry.size_bytes == size => {
-                ReadState::Fresh
-            }
+            Some(entry) if entry.fingerprint == fingerprint => ReadState::Fresh,
             Some(_) => ReadState::Stale,
         }
     }
@@ -211,7 +243,7 @@ impl FileReadCache {
         self.lock().remove(path);
     }
 
-    /// Whether a repeat full Read of `path` at the current `(mtime_ms, size)`
+    /// Whether a repeat full Read of `path` at the current `fingerprint`
     /// can be served from cache with qwen's `file_unchanged` placeholder instead
     /// of re-reading the bytes (qwen `read-file.ts`'s fast-path predicate,
     /// narrowed). All must hold:
@@ -233,16 +265,10 @@ impl FileReadCache {
     /// (e.g. after compaction), so omitting the flag is safe here (ADR-0060).
     ///
     /// [`Fresh`]: ReadState::Fresh
-    pub fn is_unchanged_full_read(
-        &self,
-        path: &std::path::Path,
-        mtime_ms: u128,
-        size: u64,
-    ) -> bool {
+    pub fn is_unchanged_full_read(&self, path: &std::path::Path, fingerprint: Fingerprint) -> bool {
         let by_path = self.lock();
         by_path.get(path).is_some_and(|entry| {
-            entry.mtime_ms == mtime_ms
-                && entry.size_bytes == size
+            entry.fingerprint == fingerprint
                 && entry.last_read_was_full
                 && entry.last_read_cacheable
                 && entry.last_read_at.is_some()

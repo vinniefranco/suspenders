@@ -71,16 +71,15 @@ fn missing_frontmatter_fences_is_an_error() {
 
 #[test]
 fn inert_and_honored_fields_load_together() {
-    // A real qwen SKILL.md with the inert `model`/`allowedTools` alongside the
-    // honored `priority` + `paths` must still load off name + description; the
-    // inert fields are dropped, the honored ones are parsed.
+    // A real qwen SKILL.md with the unread `model`/`allowedTools`/`priority`
+    // alongside the honored `paths` must still load off name + description; the
+    // unread fields are skipped, the honored ones are parsed.
     let text = "---\nname: office\ndescription: Office suite\nmodel: fast\npriority: 5\nallowedTools:\n  - read_file\n  - grep\npaths:\n  - src/**\n---\nbody";
     let (fm, body) = parse_skill_content(text).unwrap();
     assert_eq!(fm.name, "office");
     assert_eq!(fm.description, "Office suite");
     assert_eq!(body, "body");
     // The honored fields ARE parsed (not ignored).
-    assert_eq!(fm.priority, 5);
     assert_eq!(fm.paths, vec!["src/**".to_string()]);
 }
 
@@ -269,33 +268,30 @@ fn escape_xml_covers_all_five_metacharacters() {
     );
 }
 
-// ---- priority ----
+// ---- priority (accepted but unread) ----
 
 #[test]
-fn priority_parses_as_an_integer() {
-    let text = "---\nname: p\ndescription: d\npriority: 7\n---\nb";
-    let (fm, _) = parse_skill_content(text).unwrap();
-    assert_eq!(fm.priority, 7);
-}
-
-#[test]
-fn a_missing_or_invalid_priority_normalizes_to_zero() {
-    // Missing.
-    let (fm, _) = parse_skill_content("---\nname: p\ndescription: d\n---\nb").unwrap();
-    assert_eq!(fm.priority, 0);
-    // Non-integer: the skill still loads (priority is a non-fatal ordering hint).
-    let (fm, _) =
-        parse_skill_content("---\nname: p\ndescription: d\npriority: high\n---\nb").unwrap();
-    assert_eq!(fm.priority, 0);
-    // Empty.
-    let (fm, _) = parse_skill_content("---\nname: p\ndescription: d\npriority:\n---\nb").unwrap();
-    assert_eq!(fm.priority, 0);
+fn a_priority_field_is_accepted_but_unread() {
+    // qwen's `priority:` is not stored (nothing in Suspenders reads it - the
+    // catalog is name-sorted, and there is no `/skills` display layer). A
+    // manifest carrying it, in any state, must still load: an integer, a
+    // non-integer, and an empty value are all skipped like any unknown key,
+    // never a parse failure.
+    for text in [
+        "---\nname: p\ndescription: d\npriority: 7\n---\nb",
+        "---\nname: p\ndescription: d\npriority: high\n---\nb",
+        "---\nname: p\ndescription: d\npriority:\n---\nb",
+    ] {
+        let (fm, body) = parse_skill_content(text).unwrap();
+        assert_eq!(fm.name, "p");
+        assert_eq!(body, "b");
+    }
 }
 
 #[test]
 fn the_catalog_is_alphabetical_regardless_of_priority() {
     // [M1] qwen's `listSkills` (skill-manager.ts:238-243) is stable ALPHABETICAL;
-    // `priority:` is parsed and stored but does NOT reorder the model-facing
+    // `priority:` is accepted but unread and does NOT reorder the model-facing
     // catalog. Give the alphabetically-earliest skill the LOWEST priority and the
     // latest the HIGHEST: if priority sorted, `high` (priority 9) would lead; since
     // it does not, the order is purely by name.
@@ -316,8 +312,8 @@ fn the_catalog_is_alphabetical_regardless_of_priority() {
         "---\nname: mid\ndescription: d\npriority: 5\n---\nb",
     );
     let mgr = SkillManager::discover(tmp.path(), None);
-    // Priority is still PARSED (a `priority:` manifest loads) and stored.
-    assert_eq!(mgr.find("high").unwrap().priority, 9);
+    // A `priority:` manifest still loads...
+    assert!(mgr.find("high").is_some());
     // ...but the order is alphabetical: high, low, mid (NOT priority 9,5,1).
     let order: Vec<&str> = disk_skills(&mgr).iter().map(|s| s.name.as_str()).collect();
     assert_eq!(order, vec!["high", "low", "mid"]);
@@ -602,7 +598,6 @@ fn malformed_new_fields_still_load_the_skill() {
     assert_eq!(fm.name, "survivor");
     assert_eq!(fm.description, "still here");
     assert_eq!(body, "body");
-    assert_eq!(fm.priority, 0);
     assert!(fm.paths.is_empty());
     assert_eq!(fm.hooks, None);
 }

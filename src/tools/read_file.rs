@@ -101,17 +101,17 @@ impl Tool for ReadFile {
         let abs = resolve(&path, ctx)?;
         reject_qwenignored(&abs, ctx)?;
 
-        let display_name = params::basename(&path);
+        let source = reader::SourceFile::new(&abs, &path);
         // The file_unchanged fast-path (qwen read-file.ts): a repeat FULL read of
         // an unchanged file quotes the prior read back rather than re-emitting.
         if window.is_full()
-            && let Some(out) = cache::unchanged_placeholder(ctx, &abs, &display_name)
+            && let Some(out) = cache::unchanged_placeholder(ctx, &source)
             && let [crate::content::ResultBlock::Text { text }] = out.blocks.as_slice()
         {
             return Ok(text.clone());
         }
 
-        let (content, truncated) = media::read_from(&abs, &path, window)?;
+        let (content, truncated) = media::read_from(&source, window)?;
         // A text read is cacheable; it is FULL when the whole file was returned
         // (no windowing AND not truncated). The result_cap truncation the Tools
         // dispatch applies after this return is not visible here - matching qwen,
@@ -135,8 +135,8 @@ impl Tool for ReadFile {
         reject_qwenignored(&abs, ctx)?;
         params::validate_media_params(&path, &abs, window, pages.as_deref())?;
 
-        let file_type = params::detect_file_type(&abs, &path)?;
-        let display_name = params::basename(&path);
+        let source = reader::SourceFile::new(&abs, &path);
+        let file_type = source.detect()?;
 
         // A FULL text read of an unchanged file short-circuits to the placeholder
         // (qwen's fast-path fires for the text arm only - media / notebook reads
@@ -144,7 +144,7 @@ impl Tool for ReadFile {
         if window.is_full()
             && pages.is_none()
             && matches!(file_type, FileType::Text | FileType::Svg)
-            && let Some(out) = cache::unchanged_placeholder(ctx, &abs, &display_name)
+            && let Some(out) = cache::unchanged_placeholder(ctx, &source)
         {
             return Ok(out);
         }
@@ -158,9 +158,7 @@ impl Tool for ReadFile {
         // `full` is per-branch (read_many_files ignores it - it holds no cache).
         let (output, full) = reader::read_blocks(
             file_type,
-            &abs,
-            &path,
-            &display_name,
+            &source,
             window,
             pages.as_deref(),
             ctx.input_modalities,

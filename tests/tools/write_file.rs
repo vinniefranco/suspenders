@@ -234,14 +234,9 @@ async fn a_successful_write_records_into_the_read_cache() {
 
     let path = std::path::Path::new(&target);
     let meta = std::fs::metadata(path).unwrap();
-    let mtime_ms = meta
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
     assert_eq!(
-        c.read_cache().check(path, mtime_ms, meta.len()),
+        c.read_cache()
+            .check(path, crate::tool::read_cache::Fingerprint::of(&meta)),
         ReadState::Fresh
     );
     assert!(c.read_cache().entry(path).unwrap().last_read_was_full);

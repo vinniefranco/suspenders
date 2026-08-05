@@ -3,7 +3,7 @@
 //! A skill is a directory under `<root>/.suspenders/skills/<name>/` (project) or
 //! `~/.suspenders/skills/<name>/` (user) containing a `SKILL.md` manifest: YAML
 //! frontmatter between `---` fences (a required `name` + `description`, an
-//! optional `when_to_use`, plus the honored fields `priority`, `argument-hint`,
+//! optional `when_to_use`, plus the honored fields `argument-hint`,
 //! `disable-model-invocation`, `paths`, and a nested `hooks:` block) followed by
 //! a markdown body. The body is the instruction text the model reads when it
 //! invokes the skill. Beneath project and user sits a third source, bundled
@@ -39,11 +39,16 @@
 //! `skills/types.ts`, `tools/skill-utils.ts`): the frontmatter fence split, the
 //! required-field rejection, the `SKILL_NAME_PATTERN` charset, the XML escape,
 //! the LLM content wrapper ([`build_skill_llm_content`]), the honored fields
-//! above, alphabetical (name) ordering with `priority:` parsed-but-not-a-sort-key,
+//! above, alphabetical (name) ordering,
 //! project-over-user-over-bundled precedence, and conditional activation. `disable-model-invocation` and the
 //! `hooks` block are PARSED into [`Skill`] here for Phases 4b/4c to consume but
 //! carry no behavior yet. Deferred as OUT (ADR-0058): `model` override,
 //! `allowedTools` gating, extension skills, and the change-listener refresh.
+//! qwen's `priority:` key is accepted but UNREAD (a manifest carrying it still
+//! loads; the flat parser skips unknown keys): qwen reserves it for its
+//! `/skills` display listing, which Suspenders does not have, and the
+//! model-facing catalog is name-sorted either way (skill-manager.ts:238-243) -
+//! nothing here would ever read the value, so it is not stored.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -97,12 +102,6 @@ pub struct Skill {
     pub body: String,
     /// Which source this skill was discovered from.
     pub level: SkillLevel,
-    /// The `priority:` hint, PARSED AND STORED but with no current display
-    /// surface: qwen reserves it for its `/skills` listing (which Suspenders does
-    /// not have) and keeps the model-facing catalog name-sorted, so priority does
-    /// NOT reorder the catalog here (skill-manager.ts:238-243). A missing/invalid
-    /// `priority` normalizes to `0`.
-    pub priority: i64,
     /// The `argument-hint` string shown after the slash command name in the
     /// `/`-menu completion (Phase 4b consumer). Display-only.
     pub argument_hint: Option<String>,
@@ -122,14 +121,13 @@ pub struct Skill {
 
 /// The frontmatter fields a manifest parse yields (ADR-0058): the required
 /// `name` + `description`, the optional `when_to_use`, and the honored
-/// `priority`/`argument-hint`/`disable-model-invocation`/`paths`/`hooks`. Public
+/// `argument-hint`/`disable-model-invocation`/`paths`/`hooks`. Public
 /// because it is the return shape of the public [`parse_skill_content`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frontmatter {
     pub name: String,
     pub description: String,
     pub when_to_use: Option<String>,
-    pub priority: i64,
     pub argument_hint: Option<String>,
     pub disable_model_invocation: bool,
     pub paths: Vec<String>,
@@ -191,39 +189,30 @@ impl SkillManager {
     /// `(skill <name>, reason)` failure and skipped. Sources are walked in
     /// precedence order project > user > bundled, so on a name collision the
     /// higher-precedence skill wins and the shadowed one is dropped silently.
-    /// Discovered skills are name-sorted (`priority:` is parsed and stored but
-    /// is not a sort key).
+    /// Discovered skills are name-sorted (a manifest's `priority:` is accepted
+    /// but unread - it is not a sort key).
     pub fn discover(project_root: &Path, user_root: Option<&Path>) -> SkillManager {
-        let mut skills: Vec<Skill> = Vec::new();
-        let mut failures: Vec<(String, String)> = Vec::new();
-
         // Precedence project > user > bundled: the first-loaded skill wins a name
         // collision, so a project skill shadows a same-named user skill, and a
-        // disk skill shadows a same-named bundled skill (qwen precedence).
-        let mut seen: HashSet<String> = HashSet::new();
-        load_root(
-            project_root,
-            SkillLevel::Project,
-            &mut seen,
-            &mut skills,
-            &mut failures,
-        );
+        // disk skill shadows a same-named bundled skill (qwen precedence). The
+        // walk order IS the precedence; the Discovery's dedup set enforces it.
+        let mut discovery = Discovery::default();
+        load_root(project_root, SkillLevel::Project, &mut discovery);
         if let Some(user_root) = user_root {
-            load_root(
-                user_root,
-                SkillLevel::User,
-                &mut seen,
-                &mut skills,
-                &mut failures,
-            );
+            load_root(user_root, SkillLevel::User, &mut discovery);
         }
-        load_bundled(&mut seen, &mut skills, &mut failures);
+        load_bundled(&mut discovery);
+        let Discovery {
+            mut skills,
+            failures,
+            ..
+        } = discovery;
 
         // Stable ALPHABETICAL by name (qwen's `listSkills`, skill-manager.ts:238):
-        // `priority:` is parsed and stored but does NOT reorder the model-facing
-        // catalog. qwen applies its priority sort only at the `/skills` display
-        // layer, which Suspenders does not have; the programmatic consumer here
-        // (the `skill` tool's `<available_skills>` block) stays name-sorted.
+        // a manifest's `priority:` does NOT reorder the model-facing catalog.
+        // qwen applies its priority sort only at the `/skills` display layer,
+        // which Suspenders does not have; the programmatic consumer here (the
+        // `skill` tool's `<available_skills>` block) stays name-sorted.
         sort_skills(&mut skills);
 
         SkillManager {
@@ -329,7 +318,7 @@ impl SkillManager {
 /// Sorts skills ALPHABETICALLY by name (qwen's `listSkills`,
 /// skill-manager.ts:243: `skills.sort((a, b) => a.name.localeCompare(b.name))`).
 /// `priority:` is deliberately NOT a sort key: a qwen manifest with `priority:`
-/// still loads and the field is parsed-and-stored, but it does not reorder the
+/// still loads (the flat parser skips unknown keys), but it does not reorder the
 /// model-facing catalog (qwen reserves priority for its `/skills` display layer,
 /// which Suspenders has no equivalent of). Deterministic: names are unique after
 /// dedup, so the name comparison fully orders the set.
@@ -369,19 +358,68 @@ fn path_matches(glob: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The accumulating result of the skill walks (project, then user, then
+/// bundled): the loaded skills, the per-directory failures, and the name-dedup
+/// set that enforces precedence. ONE value threads through the walks, so the
+/// shadow rule (first loader wins a name, silently) lives in
+/// [`Discovery::push_parsed`] - not as a three-`&mut`-parameter convention every
+/// walk re-states.
+#[derive(Default)]
+struct Discovery {
+    /// Names already loaded from a higher-precedence source (the dedup set).
+    seen: HashSet<String>,
+    /// The skills loaded so far, in walk order (sorted by the caller).
+    skills: Vec<Skill>,
+    /// `(dir_name, reason)` for each manifest that failed to parse/validate.
+    failures: Vec<(String, String)>,
+}
+
+impl Discovery {
+    /// Parses one manifest `content` and, on success, pushes the resulting
+    /// [`Skill`] unless its name was already loaded from a higher-precedence
+    /// source (a silent shadow, not a failure). A parse/validate error is
+    /// recorded under `dir_name` (the source directory, since the manifest may
+    /// fail before yielding a name). Shared by the disk-root and bundled walks
+    /// so precedence + failure handling stay identical.
+    fn push_parsed(&mut self, content: &str, base_dir: PathBuf, level: SkillLevel, dir_name: &str) {
+        match parse_skill_content(content) {
+            Ok((fm, body)) => {
+                // A lower-precedence same-named skill loses to the earlier one;
+                // record nothing - it is a silent shadow, not a failure.
+                if self.seen.contains(&fm.name) {
+                    return;
+                }
+                self.seen.insert(fm.name.clone());
+                self.skills.push(Skill {
+                    name: fm.name,
+                    description: fm.description,
+                    when_to_use: fm.when_to_use,
+                    base_dir,
+                    body,
+                    level,
+                    argument_hint: fm.argument_hint,
+                    disable_model_invocation: fm.disable_model_invocation,
+                    paths: fm.paths,
+                    hooks: fm.hooks,
+                });
+            }
+            Err(reason) => self.fail(dir_name, reason),
+        }
+    }
+
+    /// Record a failure for the skill directory `dir_name`.
+    fn fail(&mut self, dir_name: &str, reason: String) {
+        self.failures.push((dir_name.to_string(), reason));
+    }
+}
+
 /// Walks one disk skill root's immediate subdirectories for `SKILL.md`
 /// manifests. A non-directory entry, a directory without a manifest, or a name
 /// already loaded from a higher-precedence source is skipped; a manifest that
-/// fails to parse/validate is recorded on `failures`. An unreadable root (it
-/// does not exist yet) is a silent no-op - the common case where a project has
-/// no `.suspenders/skills/` dir.
-fn load_root(
-    root: &Path,
-    level: SkillLevel,
-    seen: &mut HashSet<String>,
-    skills: &mut Vec<Skill>,
-    failures: &mut Vec<(String, String)>,
-) {
+/// fails to parse/validate is recorded on the [`Discovery`]. An unreadable root
+/// (it does not exist yet) is a silent no-op - the common case where a project
+/// has no `.suspenders/skills/` dir.
+fn load_root(root: &Path, level: SkillLevel, discovery: &mut Discovery) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         // The root does not exist / cannot be read: no skills here, not an error.
@@ -412,20 +450,12 @@ fn load_root(
         let content = match std::fs::read_to_string(&manifest) {
             Ok(content) => content,
             Err(e) => {
-                failures.push((dir_name, format!("could not read SKILL.md - {e}")));
+                discovery.fail(&dir_name, format!("could not read SKILL.md - {e}"));
                 continue;
             }
         };
 
-        push_parsed(
-            &content,
-            dir.clone(),
-            level,
-            &dir_name,
-            seen,
-            skills,
-            failures,
-        );
+        discovery.push_parsed(&content, dir.clone(), level, &dir_name);
     }
 }
 
@@ -435,22 +465,10 @@ fn load_root(
 /// from project/user shadows the bundled one silently. The `base_dir` is a
 /// synthetic `<bundled>/<name>` marker (there is no real directory), which the
 /// LLM content wrapper still renders faithfully.
-fn load_bundled(
-    seen: &mut HashSet<String>,
-    skills: &mut Vec<Skill>,
-    failures: &mut Vec<(String, String)>,
-) {
+fn load_bundled(discovery: &mut Discovery) {
     for (dir_name, content) in BUNDLED_SKILLS {
         let base_dir = Path::new("<bundled>").join(dir_name);
-        push_parsed(
-            content,
-            base_dir,
-            SkillLevel::Bundled,
-            dir_name,
-            seen,
-            skills,
-            failures,
-        );
+        discovery.push_parsed(content, base_dir, SkillLevel::Bundled, dir_name);
     }
 }
 
@@ -465,52 +483,12 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
     ("stuck", include_str!("bundled/stuck/SKILL.md")),
 ];
 
-/// Parses one manifest `content` and, on success, pushes the resulting [`Skill`]
-/// unless its name was already loaded from a higher-precedence source (dedup).
-/// A parse/validate error is recorded on `failures` under `dir_name` (the source
-/// directory, since the manifest may fail before yielding a name). Shared by the
-/// disk-root and bundled walks so precedence + failure handling stay identical.
-fn push_parsed(
-    content: &str,
-    base_dir: PathBuf,
-    level: SkillLevel,
-    dir_name: &str,
-    seen: &mut HashSet<String>,
-    skills: &mut Vec<Skill>,
-    failures: &mut Vec<(String, String)>,
-) {
-    match parse_skill_content(content) {
-        Ok((fm, body)) => {
-            // A lower-precedence same-named skill loses to the earlier one; record
-            // nothing - it is a silent shadow, not a failure.
-            if seen.contains(&fm.name) {
-                return;
-            }
-            seen.insert(fm.name.clone());
-            skills.push(Skill {
-                name: fm.name,
-                description: fm.description,
-                when_to_use: fm.when_to_use,
-                base_dir,
-                body,
-                level,
-                priority: fm.priority,
-                argument_hint: fm.argument_hint,
-                disable_model_invocation: fm.disable_model_invocation,
-                paths: fm.paths,
-                hooks: fm.hooks,
-            });
-        }
-        Err(reason) => failures.push((dir_name.to_string(), reason)),
-    }
-}
-
 /// Splits a `SKILL.md` into its frontmatter fields and trimmed body (pure).
 /// Ports qwen's `parseSkillContent` regex
 /// `^---\n([\s\S]*?)\n---(?:\n|$)([\s\S]*)$` as a manual line scan (no regex):
 /// the frontmatter is the block between the leading `---` fence and the next
 /// `---` line; the body is everything after, trimmed. Flat `key: value` scalars
-/// (`name`, `description`, `when_to_use`, `priority`, `argument-hint`,
+/// (`name`, `description`, `when_to_use`, `argument-hint`,
 /// `disable-model-invocation`) are hand-parsed; the nested `paths:` list and
 /// `hooks:` map are carved out and handed to `serde_yaml_ng` (the same YAML path
 /// [`crate::hooks::config::hooks_value_from_yaml`] uses), so the hand parser
@@ -535,7 +513,6 @@ pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> 
     validate_skill_name(&name)?;
     let description = required_field(&fields, "description")?;
     let when_to_use = scalar_field(&fields, "when_to_use");
-    let priority = parse_priority(&fields);
     let argument_hint = scalar_field(&fields, "argument-hint");
     let disable_model_invocation = parse_bool_field(&fields, "disable-model-invocation");
     let paths = parse_paths_block(frontmatter);
@@ -546,7 +523,6 @@ pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> 
             name,
             description,
             when_to_use,
-            priority,
             argument_hint,
             disable_model_invocation,
             paths,
@@ -726,15 +702,6 @@ fn parse_hooks_block(frontmatter: &str) -> Option<Value> {
     let value = crate::hooks::config::hooks_value_from_yaml(&block).ok()?;
     // The block re-includes the `hooks:` key, so pull the mapping back out.
     value.get("hooks").cloned()
-}
-
-/// Parses the flat `priority:` scalar to an `i64`, normalizing a missing, empty,
-/// or non-integer value to `0` (ADR-0058, qwen's `parsePriorityField`: a
-/// cosmetic ordering hint must never make a valid skill disappear).
-fn parse_priority(fields: &[(String, String)]) -> i64 {
-    scalar_field(fields, "priority")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
 }
 
 /// Parses a flat boolean scalar (`disable-model-invocation`): `true` only for the

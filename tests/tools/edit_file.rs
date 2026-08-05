@@ -20,15 +20,8 @@ fn ctx_with_cache(root: &std::path::Path, cache: Arc<FileReadCache>) -> ToolCtx 
 }
 
 // Stat the file for its current (mtime, size) fingerprint.
-fn fingerprint(abs: &std::path::Path) -> (u128, u64) {
-    let meta = std::fs::metadata(abs).unwrap();
-    let mtime = meta
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    (mtime, meta.len())
+fn fingerprint(abs: &std::path::Path) -> Fingerprint {
+    Fingerprint::stat(abs).unwrap()
 }
 
 // Write `body` to `name` under `root` and record a prior read of it in
@@ -41,8 +34,8 @@ fn seed_read(
 ) -> std::path::PathBuf {
     let abs = root.join(name);
     std::fs::write(&abs, body).unwrap();
-    let (mtime, size) = fingerprint(&abs);
-    cache.record_read(abs.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs);
+    cache.record_read(abs.clone(), fp, true, true);
     abs
 }
 
@@ -495,7 +488,15 @@ async fn editing_a_stale_file_is_the_verbatim_modified_since_rejection() {
     std::fs::write(&abs_path, "foo bar baz").unwrap();
     let cache = Arc::new(FileReadCache::new());
     // Record a read at a DIFFERENT fingerprint than the file now has.
-    cache.record_read(abs_path.clone(), 1, 1, true, true);
+    cache.record_read(
+        abs_path.clone(),
+        Fingerprint {
+            mtime_ms: 1,
+            size_bytes: 1,
+        },
+        true,
+        true,
+    );
     let ctx = ctx_with_cache(tmp.path(), cache);
 
     let file_path = abs(tmp.path(), "a.txt");
@@ -556,8 +557,8 @@ async fn a_successful_edit_records_the_write_so_a_second_edit_passes() {
 
     // The write was recorded: the path reads Fresh at its new fingerprint, so
     // a second edit (which the model authored) passes without a re-read.
-    let (mtime2, size2) = fingerprint(&abs_path);
-    assert_eq!(cache.check(&abs_path, mtime2, size2), ReadState::Fresh);
+    let fp2 = fingerprint(&abs_path);
+    assert_eq!(cache.check(&abs_path, fp2), ReadState::Fresh);
     run(
         json!({"file_path": abs(tmp.path(), "a.txt"), "old_string": "qux", "new_string": "zzz"}),
         &ctx,
@@ -634,8 +635,8 @@ async fn edits_a_file_inside_the_trusted_memory_root() {
 
     let abs_path = mem.path().join("user.md");
     std::fs::write(&abs_path, "type: user\nold body").unwrap();
-    let (mtime, size) = fingerprint(&abs_path);
-    cache.record_read(abs_path.clone(), mtime, size, true, true);
+    let fp = fingerprint(&abs_path);
+    cache.record_read(abs_path.clone(), fp, true, true);
 
     run(
             json!({"file_path": abs_path.to_str().unwrap(), "old_string": "old body", "new_string": "new body"}),

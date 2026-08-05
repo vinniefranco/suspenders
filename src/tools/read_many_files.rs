@@ -150,9 +150,7 @@ async fn read_path(
     display: &str,
     modalities: Modalities,
 ) -> Result<Vec<ContentBlock>, String> {
-    let display_name = basename(display);
-    let output =
-        crate::tools::read_file::reader::read_full(abs, display, &display_name, modalities).await?;
+    let output = crate::tools::read_file::reader::read_full(abs, display, modalities).await?;
     Ok(output.blocks.into_iter().map(result_to_content).collect())
 }
 
@@ -168,11 +166,6 @@ fn result_to_content(block: crate::content::ResultBlock) -> ContentBlock {
             ContentBlock::Document { mime, data }
         }
     }
-}
-
-/// The basename of a `/`-or-`\`-separated display path (qwen's `path.basename`).
-fn basename(path: &str) -> String {
-    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
 /// A walked file's path RELATIVE to the directory spec it came from, `/`-joined
