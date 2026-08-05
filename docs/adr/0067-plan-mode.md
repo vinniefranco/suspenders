@@ -66,10 +66,12 @@ evaluated against, matching qwen's single permission evaluation.
 
 ### `Kind` on the Tool trait
 
-The fold needs to know whether a tool mutates. Port qwen's `Kind`
-(`Read`, `Edit`, `Delete`, `Move`, `Search`, `Execute`, `Think`, `Fetch`,
-`Agent`, `Other`) as a method on the `Tool` trait's spec. The mutating set
-(`MUTATOR_KINDS = {Edit, Delete, Move, Execute}`) is what `Plan` blocks. This is
+The fold needs to know whether a tool mutates. Port qwen's `Kind` as a method
+on the `Tool` trait's spec (`Read`, `Edit`, `Search`, `Execute`, `Think`,
+`Fetch`, `Agent`, `Other` - qwen's `Delete`/`Move` are not carried: no
+Suspenders tool deletes or moves files, and an undeclared tool's `Other`
+default already blocks in plan mode). The mutating set (`Edit`, `Execute` -
+qwen's `MUTATOR_KINDS` minus the uncarried pair) is what `Plan` blocks. This is
 a per-tool self-description, so the enforcement fact lives with the tool, not in
 a hardcoded set the fold reaches around - the choice ADR-0050's revision hinted
 at and this ADR makes real. `run_shell_command` is `Execute` but is special-cased

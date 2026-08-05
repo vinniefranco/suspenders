@@ -3,7 +3,7 @@
 //! A skill is a directory under `<root>/.suspenders/skills/<name>/` (project) or
 //! `~/.suspenders/skills/<name>/` (user) containing a `SKILL.md` manifest: YAML
 //! frontmatter between `---` fences (a required `name` + `description`, an
-//! optional `when_to_use`, plus the honored fields `priority`, `argument-hint`,
+//! optional `when_to_use`, plus the honored fields `argument-hint`,
 //! `disable-model-invocation`, `paths`, and a nested `hooks:` block) followed by
 //! a markdown body. The body is the instruction text the model reads when it
 //! invokes the skill. Beneath project and user sits a third source, bundled
@@ -39,11 +39,16 @@
 //! `skills/types.ts`, `tools/skill-utils.ts`): the frontmatter fence split, the
 //! required-field rejection, the `SKILL_NAME_PATTERN` charset, the XML escape,
 //! the LLM content wrapper ([`build_skill_llm_content`]), the honored fields
-//! above, alphabetical (name) ordering with `priority:` parsed-but-not-a-sort-key,
+//! above, alphabetical (name) ordering,
 //! project-over-user-over-bundled precedence, and conditional activation. `disable-model-invocation` and the
 //! `hooks` block are PARSED into [`Skill`] here for Phases 4b/4c to consume but
 //! carry no behavior yet. Deferred as OUT (ADR-0058): `model` override,
 //! `allowedTools` gating, extension skills, and the change-listener refresh.
+//! qwen's `priority:` key is accepted but UNREAD (a manifest carrying it still
+//! loads; the flat parser skips unknown keys): qwen reserves it for its
+//! `/skills` display listing, which Suspenders does not have, and the
+//! model-facing catalog is name-sorted either way (skill-manager.ts:238-243) -
+//! nothing here would ever read the value, so it is not stored.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -97,12 +102,6 @@ pub struct Skill {
     pub body: String,
     /// Which source this skill was discovered from.
     pub level: SkillLevel,
-    /// The `priority:` hint, PARSED AND STORED but with no current display
-    /// surface: qwen reserves it for its `/skills` listing (which Suspenders does
-    /// not have) and keeps the model-facing catalog name-sorted, so priority does
-    /// NOT reorder the catalog here (skill-manager.ts:238-243). A missing/invalid
-    /// `priority` normalizes to `0`.
-    pub priority: i64,
     /// The `argument-hint` string shown after the slash command name in the
     /// `/`-menu completion (Phase 4b consumer). Display-only.
     pub argument_hint: Option<String>,
@@ -122,14 +121,13 @@ pub struct Skill {
 
 /// The frontmatter fields a manifest parse yields (ADR-0058): the required
 /// `name` + `description`, the optional `when_to_use`, and the honored
-/// `priority`/`argument-hint`/`disable-model-invocation`/`paths`/`hooks`. Public
+/// `argument-hint`/`disable-model-invocation`/`paths`/`hooks`. Public
 /// because it is the return shape of the public [`parse_skill_content`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frontmatter {
     pub name: String,
     pub description: String,
     pub when_to_use: Option<String>,
-    pub priority: i64,
     pub argument_hint: Option<String>,
     pub disable_model_invocation: bool,
     pub paths: Vec<String>,
@@ -191,8 +189,8 @@ impl SkillManager {
     /// `(skill <name>, reason)` failure and skipped. Sources are walked in
     /// precedence order project > user > bundled, so on a name collision the
     /// higher-precedence skill wins and the shadowed one is dropped silently.
-    /// Discovered skills are name-sorted (`priority:` is parsed and stored but
-    /// is not a sort key).
+    /// Discovered skills are name-sorted (a manifest's `priority:` is accepted
+    /// but unread - it is not a sort key).
     pub fn discover(project_root: &Path, user_root: Option<&Path>) -> SkillManager {
         // Precedence project > user > bundled: the first-loaded skill wins a name
         // collision, so a project skill shadows a same-named user skill, and a
@@ -211,10 +209,10 @@ impl SkillManager {
         } = discovery;
 
         // Stable ALPHABETICAL by name (qwen's `listSkills`, skill-manager.ts:238):
-        // `priority:` is parsed and stored but does NOT reorder the model-facing
-        // catalog. qwen applies its priority sort only at the `/skills` display
-        // layer, which Suspenders does not have; the programmatic consumer here
-        // (the `skill` tool's `<available_skills>` block) stays name-sorted.
+        // a manifest's `priority:` does NOT reorder the model-facing catalog.
+        // qwen applies its priority sort only at the `/skills` display layer,
+        // which Suspenders does not have; the programmatic consumer here (the
+        // `skill` tool's `<available_skills>` block) stays name-sorted.
         sort_skills(&mut skills);
 
         SkillManager {
@@ -320,7 +318,7 @@ impl SkillManager {
 /// Sorts skills ALPHABETICALLY by name (qwen's `listSkills`,
 /// skill-manager.ts:243: `skills.sort((a, b) => a.name.localeCompare(b.name))`).
 /// `priority:` is deliberately NOT a sort key: a qwen manifest with `priority:`
-/// still loads and the field is parsed-and-stored, but it does not reorder the
+/// still loads (the flat parser skips unknown keys), but it does not reorder the
 /// model-facing catalog (qwen reserves priority for its `/skills` display layer,
 /// which Suspenders has no equivalent of). Deterministic: names are unique after
 /// dedup, so the name comparison fully orders the set.
@@ -399,7 +397,6 @@ impl Discovery {
                     base_dir,
                     body,
                     level,
-                    priority: fm.priority,
                     argument_hint: fm.argument_hint,
                     disable_model_invocation: fm.disable_model_invocation,
                     paths: fm.paths,
@@ -491,7 +488,7 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
 /// `^---\n([\s\S]*?)\n---(?:\n|$)([\s\S]*)$` as a manual line scan (no regex):
 /// the frontmatter is the block between the leading `---` fence and the next
 /// `---` line; the body is everything after, trimmed. Flat `key: value` scalars
-/// (`name`, `description`, `when_to_use`, `priority`, `argument-hint`,
+/// (`name`, `description`, `when_to_use`, `argument-hint`,
 /// `disable-model-invocation`) are hand-parsed; the nested `paths:` list and
 /// `hooks:` map are carved out and handed to `serde_yaml_ng` (the same YAML path
 /// [`crate::hooks::config::hooks_value_from_yaml`] uses), so the hand parser
@@ -516,7 +513,6 @@ pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> 
     validate_skill_name(&name)?;
     let description = required_field(&fields, "description")?;
     let when_to_use = scalar_field(&fields, "when_to_use");
-    let priority = parse_priority(&fields);
     let argument_hint = scalar_field(&fields, "argument-hint");
     let disable_model_invocation = parse_bool_field(&fields, "disable-model-invocation");
     let paths = parse_paths_block(frontmatter);
@@ -527,7 +523,6 @@ pub fn parse_skill_content(text: &str) -> Result<(Frontmatter, String), String> 
             name,
             description,
             when_to_use,
-            priority,
             argument_hint,
             disable_model_invocation,
             paths,
@@ -707,15 +702,6 @@ fn parse_hooks_block(frontmatter: &str) -> Option<Value> {
     let value = crate::hooks::config::hooks_value_from_yaml(&block).ok()?;
     // The block re-includes the `hooks:` key, so pull the mapping back out.
     value.get("hooks").cloned()
-}
-
-/// Parses the flat `priority:` scalar to an `i64`, normalizing a missing, empty,
-/// or non-integer value to `0` (ADR-0058, qwen's `parsePriorityField`: a
-/// cosmetic ordering hint must never make a valid skill disappear).
-fn parse_priority(fields: &[(String, String)]) -> i64 {
-    scalar_field(fields, "priority")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
 }
 
 /// Parses a flat boolean scalar (`disable-model-invocation`): `true` only for the

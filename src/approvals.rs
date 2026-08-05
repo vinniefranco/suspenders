@@ -36,18 +36,22 @@ const GATED: &[(&str, &str)] = &[("run_shell_command", "command"), ("web_fetch",
 /// consumes it is the sole reader, and both `tool` and each tool depend one-way
 /// on this leaf - no `tool <-> approvals` cycle.
 ///
-/// The mutating set is qwen's `MUTATOR_KINDS` (`Edit`, `Delete`, `Move`,
-/// `Execute`); the read-only set that Plan mode allows is `Read`/`Search`/
-/// `Fetch`/`Think` (see [`Kind::is_plan_allowed`]). `Other` and `Agent` are
-/// neither - they are BLOCKED in plan mode (fail-safe: an undeclared tool
-/// defaults to `Other`, so a mis-declared tool is blocked rather than slipping a
-/// mutation through).
+/// The mutating set is `Edit`/`Execute`; the read-only set that Plan mode
+/// allows is `Read`/`Search`/`Fetch`/`Think` (see [`Kind::is_plan_allowed`]).
+/// `Other` and `Agent` are neither - they are BLOCKED in plan mode (fail-safe:
+/// an undeclared tool defaults to `Other`, so a mis-declared tool is blocked
+/// rather than slipping a mutation through).
+///
+/// qwen's `Kind` additionally carries `Delete` and `Move` in its
+/// `MUTATOR_KINDS`; Suspenders has no tool that deletes or moves files (every
+/// filesystem mutation is an `Edit`-kind rewrite or an `Execute`-kind shell
+/// command), so the two variants are not carried - a future deleting/moving
+/// tool re-adds its variant with itself, and until then the `Other` default
+/// keeps any such tool blocked in plan mode anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Read,
     Edit,
-    Delete,
-    Move,
     Search,
     Execute,
     Think,
@@ -61,8 +65,8 @@ impl Kind {
     /// Kinds - `Read`, `Search`, `Fetch`, `Think` - are safe to run while
     /// planning (they gather information or write only to the model's own record
     /// / trusted subtrees, as qwen's `todo_write`/`save_memory` do). Every other
-    /// Kind (the mutators `Edit`/`Delete`/`Move`/`Execute`, plus `Agent` and the
-    /// fail-safe `Other`) is blocked. This mirrors qwen's read-only carve-out:
+    /// Kind (the mutators `Edit`/`Execute`, plus `Agent` and the fail-safe
+    /// `Other`) is blocked. This mirrors qwen's read-only carve-out:
     /// its scheduler blocks any call in `PLAN` whose confirmation is not `info`,
     /// and the tools whose confirmation is `info` / who need no confirmation at
     /// all are exactly the read-only Kinds here.

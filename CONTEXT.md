@@ -156,7 +156,7 @@ The read-only Approval Mode: the user tells the model to research and plan witho
 _Avoid_: planning phase (it is a mode, not a lifecycle stage), dry-run, read-only mode (the read-only posture is a property of the mode, not its name)
 
 **Kind**:
-The self-declared category of a Tool - `Read`, `Edit`, `Delete`, `Move`, `Search`, `Execute`, `Think`, `Fetch`, `Agent`, `Other` (qwen's `Kind`) - stated on the Tool's spec. Its job is to tell the Approval Mode verdict whether a Tool mutates: the mutating Kinds (`Edit`/`Delete`/`Move`/`Execute`) are what Plan Mode blocks. A Tool that declares no Kind is `Other` (never a mutator), so a mis-declared Tool fails safe - blocked in Plan Mode rather than slipping a change through.
+The self-declared category of a Tool - `Read`, `Edit`, `Search`, `Execute`, `Think`, `Fetch`, `Agent`, `Other` (qwen's `Kind`, minus its `Delete`/`Move`: no Suspenders Tool deletes or moves files, so those variants are not carried) - stated on the Tool's spec. Its job is to tell the Approval Mode verdict whether a Tool mutates: the mutating Kinds (`Edit`/`Execute`) are what Plan Mode blocks. A Tool that declares no Kind is `Other` (never a mutator), so a mis-declared Tool fails safe - blocked in Plan Mode rather than slipping a change through.
 _Avoid_: tool type, category (overloaded), read-only flag (Kind is finer than a boolean)
 
 **Context Budget**:
