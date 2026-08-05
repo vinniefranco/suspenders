@@ -7,18 +7,19 @@
 //! plumbing inline.
 
 use crate::content::ResultBlock;
+use crate::tool::read_cache::Fingerprint;
 use crate::tool::{ToolCtx, ToolOutput};
 
 /// Record a successful read of `abs` into the Run's file-read cache. Stats the
-/// file for the `(mtime, size)` fingerprint; a stat failure here is silently
-/// dropped (the read already succeeded, and a later check simply reads
-/// `Unknown` / `Stale` and asks the model to re-read - never a false pass).
-/// `full` is whether the read saw the whole current content; `cacheable` is
-/// whether the result is a single Text block.
+/// file for its [`Fingerprint`]; a stat failure here is silently dropped (the
+/// read already succeeded, and a later check simply reads `Unknown` / `Stale`
+/// and asks the model to re-read - never a false pass). `full` is whether the
+/// read saw the whole current content; `cacheable` is whether the result is a
+/// single Text block.
 pub(super) fn record_read(ctx: &ToolCtx, abs: &std::path::Path, full: bool, cacheable: bool) {
-    if let Some((mtime_ms, size)) = stat_fingerprint(abs) {
+    if let Ok(fingerprint) = Fingerprint::stat(abs) {
         ctx.read_cache()
-            .record_read(abs.to_path_buf(), mtime_ms, size, full, cacheable);
+            .record_read(abs.to_path_buf(), fingerprint, full, cacheable);
     }
 }
 
@@ -34,12 +35,14 @@ pub(super) fn record_read(ctx: &ToolCtx, abs: &std::path::Path, full: bool, cach
 /// content (e.g. after compaction) or suspects an out-of-band mutation.
 pub(super) fn unchanged_placeholder(
     ctx: &ToolCtx,
-    abs: &std::path::Path,
-    display_name: &str,
+    source: &super::reader::SourceFile<'_>,
 ) -> Option<ToolOutput> {
-    let (mtime_ms, size) = stat_fingerprint(abs)?;
-    if ctx.read_cache().is_unchanged_full_read(abs, mtime_ms, size) {
-        Some(ToolOutput::text(unchanged_message(display_name)))
+    let fingerprint = Fingerprint::stat(source.abs).ok()?;
+    if ctx
+        .read_cache()
+        .is_unchanged_full_read(source.abs, fingerprint)
+    {
+        Some(ToolOutput::text(unchanged_message(source.display_name())))
     } else {
         None
     }
@@ -60,19 +63,6 @@ compaction) or you suspect the file was modified outside the read/edit \
 tools (shell command, MCP tool, another process), re-read with \
 explicit offset/limit to fetch current content.]"
     )
-}
-
-/// The `(mtime_ms, size)` fingerprint of `abs`, or `None` if it cannot be
-/// stat'd. mtime is milliseconds since the epoch (qwen `stats.mtimeMs`).
-fn stat_fingerprint(abs: &std::path::Path) -> Option<(u128, u64)> {
-    let meta = std::fs::metadata(abs).ok()?;
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    Some((mtime_ms, meta.len()))
 }
 
 /// Whether the output is a single Text block - qwen's `cacheable` (plain text

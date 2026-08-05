@@ -7,6 +7,7 @@ use base64::Engine;
 
 use super::params::Window;
 use super::pdf;
+use super::reader::SourceFile;
 use crate::content::{Modalities, ResultBlock, unsupported_modality_placeholder};
 use crate::tool::ToolOutput;
 use crate::tool::path::{FileError, file_error};
@@ -27,14 +28,10 @@ const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
 /// whole file, prepend qwen's `"Showing lines X-Y of Z total lines."` notice
 /// (read-file.ts), so a partial read is self-describing. Returns the windowed
 /// content and whether it was a truncated (partial) read.
-pub(super) fn read_from(
-    abs: &std::path::Path,
-    path: &str,
-    window: Window,
-) -> Result<(String, bool), String> {
-    match std::fs::read_to_string(abs) {
+pub(super) fn read_from(source: &SourceFile<'_>, window: Window) -> Result<(String, bool), String> {
+    match std::fs::read_to_string(source.abs) {
         Ok(content) => Ok(slice_window(&content, window)),
-        Err(err) => Err(file_error("read", path, FileError::from_io(&err))),
+        Err(err) => Err(file_error("read", source.path, FileError::from_io(&err))),
     }
 }
 
@@ -106,8 +103,9 @@ fn slice_window(content: &str, window: Window) -> (String, bool) {
     }
 }
 
-pub(super) fn read_text(abs: &std::path::Path, path: &str) -> Result<String, String> {
-    std::fs::read_to_string(abs).map_err(|err| file_error("read", path, FileError::from_io(&err)))
+pub(super) fn read_text(source: &SourceFile<'_>) -> Result<String, String> {
+    std::fs::read_to_string(source.abs)
+        .map_err(|err| file_error("read", source.path, FileError::from_io(&err)))
 }
 
 // ---- svg branch (Text, 1MB cap) ---------------------------------------------
@@ -116,20 +114,17 @@ pub(super) fn read_text(abs: &std::path::Path, path: &str) -> Result<String, Str
 /// capped at 1MB (qwen `SVG_MAX_SIZE_BYTES`) with the verbatim skip message. The
 /// skip message names the `display_name` (basename), matching qwen's
 /// display-path wording without leaking the absolute path.
-pub(super) fn read_svg(
-    abs: &std::path::Path,
-    path: &str,
-    display_name: &str,
-) -> Result<String, String> {
-    let size = std::fs::metadata(abs)
+pub(super) fn read_svg(source: &SourceFile<'_>) -> Result<String, String> {
+    let size = std::fs::metadata(source.abs)
         .map(|m| m.len())
-        .map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
+        .map_err(|err| file_error("read", source.path, FileError::from_io(&err)))?;
     if size > SVG_MAX_SIZE_BYTES {
         return Ok(format!(
-            "Cannot display content of SVG file larger than 1MB: {display_name}"
+            "Cannot display content of SVG file larger than 1MB: {}",
+            source.display_name()
         ));
     }
-    read_text(abs, path)
+    read_text(source)
 }
 
 // ---- image branch (media block or read-time degrade) ------------------------
@@ -139,27 +134,25 @@ pub(super) fn read_svg(
 /// time (P3 3b). A base64 payload past 9.9MB is a hard error (qwen's data-URI
 /// guard).
 pub(super) fn read_image(
-    abs: &std::path::Path,
-    path: &str,
-    display_name: &str,
+    source: &SourceFile<'_>,
     modalities: Modalities,
 ) -> Result<ToolOutput, String> {
     if !modalities.image {
         return Ok(ToolOutput::text(unsupported_modality_placeholder(
             "image",
-            display_name,
+            source.display_name(),
         )));
     }
 
-    let bytes =
-        std::fs::read(abs).map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
+    let bytes = std::fs::read(source.abs)
+        .map_err(|err| file_error("read", source.path, FileError::from_io(&err)))?;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    if let Some(err) = base64_too_large(&data, path) {
+    if let Some(err) = base64_too_large(&data, source.path) {
         return Err(err);
     }
     Ok(ToolOutput {
         blocks: vec![ResultBlock::Image {
-            mime: super::detect::image_mime(path).to_string(),
+            mime: super::detect::image_mime(source.path).to_string(),
             data,
         }],
         is_error: false,
@@ -174,19 +167,17 @@ pub(super) fn read_image(
 /// to text via pdftotext. The oversized-for-extraction guard and the base64
 /// guard mirror qwen's `processSingleFileContent` PDF arm.
 pub(super) async fn read_pdf(
-    abs: &std::path::Path,
-    path: &str,
-    display_name: &str,
+    source: &SourceFile<'_>,
     pages: Option<&str>,
     modalities: Modalities,
 ) -> Result<ToolOutput, String> {
     let native = pages.is_none() && modalities.pdf;
 
     if native {
-        let bytes =
-            std::fs::read(abs).map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
+        let bytes = std::fs::read(source.abs)
+            .map_err(|err| file_error("read", source.path, FileError::from_io(&err)))?;
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        if let Some(err) = base64_too_large(&data, path) {
+        if let Some(err) = base64_too_large(&data, source.path) {
             return Err(err);
         }
         return Ok(ToolOutput {
@@ -200,9 +191,9 @@ pub(super) async fn read_pdf(
     }
 
     // Text-extraction path: guard the on-disk size first (qwen PDF_EXTRACTION_MAX_MB).
-    let size = std::fs::metadata(abs)
+    let size = std::fs::metadata(source.abs)
         .map(|m| m.len())
-        .map_err(|err| file_error("read", path, FileError::from_io(&err)))?;
+        .map_err(|err| file_error("read", source.path, FileError::from_io(&err)))?;
     let size_mb = size as f64 / BYTES_PER_MB;
     if size_mb > pdf::PDF_EXTRACTION_MAX_MB {
         return Err(format!(
@@ -213,10 +204,11 @@ limit. Use the 'pages' parameter to read a narrower range, or split the document
     }
 
     let range = pages.and_then(pdf::parse_page_range);
-    match pdf::extract_text(abs, range).await {
+    match pdf::extract_text(source.abs, range).await {
         pdf::PdfText::Ok(text) => Ok(ToolOutput::text(text)),
         pdf::PdfText::Failed(error) => Err(format!(
-            "[Cannot extract text from PDF: \"{display_name}\". {error}]"
+            "[Cannot extract text from PDF: \"{}\". {error}]",
+            source.display_name()
         )),
     }
 }

@@ -210,23 +210,19 @@ fn result_message(abs: &std::path::Path, existed: bool) -> String {
 }
 
 /// Record the write into the Run's read cache (F6, qwen `recordWrite`). Stats the
-/// file for the `(mtime, size)` fingerprint; a stat miss is dropped - the write
-/// already succeeded, and the next read re-stats.
+/// file for its [`Fingerprint`]; a stat miss is dropped - the write already
+/// succeeded, and the next read re-stats.
+///
+/// [`Fingerprint`]: crate::tool::read_cache::Fingerprint
 fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
-    let Ok(meta) = std::fs::metadata(abs) else {
+    let Ok(fingerprint) = crate::tool::read_cache::Fingerprint::stat(abs) else {
         return;
     };
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
     // `cacheable = true`: write_file authored plain-text bytes, so a following
     // full read_file can serve qwen's `file_unchanged` placeholder (qwen's
     // `recordWrite` default). Only the notebook writer passes `false`.
     ctx.read_cache()
-        .record_write(abs.to_path_buf(), mtime_ms, meta.len(), true);
+        .record_write(abs.to_path_buf(), fingerprint, true);
 }
 
 #[cfg(test)]

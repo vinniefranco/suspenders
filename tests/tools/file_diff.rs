@@ -22,14 +22,12 @@ fn seed_read(ctx: &ToolCtx, rel: &str, body: &str) {
     let abs = ctx.root.join(rel);
     std::fs::write(&abs, body).unwrap();
     let meta = std::fs::metadata(&abs).unwrap();
-    let mtime = meta
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    ctx.read_cache()
-        .record_read(abs, mtime, meta.len(), true, true);
+    ctx.read_cache().record_read(
+        abs,
+        crate::tool::read_cache::Fingerprint::of(&meta),
+        true,
+        true,
+    );
 }
 
 // The `diff` Artifact off a tool's rich output, decoded back into a DiffArtifact.

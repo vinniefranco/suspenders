@@ -33,7 +33,7 @@
 use crate::tool::path::{
     FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim,
 };
-use crate::tool::read_cache::ReadState;
+use crate::tool::read_cache::{Fingerprint, ReadState};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use serde_json::{Value, json};
 
@@ -190,9 +190,9 @@ fn string_field(input: &Value, key: &str) -> Option<String> {
 /// notebook must be a Fresh cache entry whose last read was FULL. Returns the
 /// VERBATIM qwen rejection otherwise.
 fn enforce_prior_read(ctx: &ToolCtx, abs: &std::path::Path, path: &str) -> Result<(), String> {
-    let (mtime_ms, size) = stat_fingerprint(abs)?;
+    let fingerprint = stat_fingerprint(abs)?;
     let cache = ctx.read_cache();
-    let state = cache.check(abs, mtime_ms, size);
+    let state = cache.check(abs, fingerprint);
     let entry = cache.entry(abs);
 
     // Fresh AND read this session (not a write-only entry): a full read passes;
@@ -229,17 +229,12 @@ without offset or limit, before editing cells."
 
 /// The read cache needs a live `stat` for the current fingerprint. Unlike a
 /// read (which tolerates a stat miss), a missing stat here means we cannot
-/// verify the prior read, so the edit is refused - never silently allowed.
-fn stat_fingerprint(abs: &std::path::Path) -> Result<(u128, u64), String> {
-    let meta = std::fs::metadata(abs)
-        .map_err(|err| file_error("read", &abs.to_string_lossy(), FileError::from_io(&err)))?;
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    Ok((mtime_ms, meta.len()))
+/// verify the prior read, so the edit is refused - never silently allowed. The
+/// refusal wording stays this tool's (the Voice rule: a tool's strings live in
+/// the tool); the conversion itself is [`Fingerprint::stat`]'s.
+fn stat_fingerprint(abs: &std::path::Path) -> Result<Fingerprint, String> {
+    Fingerprint::stat(abs)
+        .map_err(|err| file_error("read", &abs.to_string_lossy(), FileError::from_io(&err)))
 }
 
 // ---- I/O --------------------------------------------------------------------
@@ -259,13 +254,13 @@ fn write_notebook(abs: &std::path::Path, path: &str, content: &str) -> Result<()
 /// than its own write as a stale external change. A stat miss here is dropped -
 /// the write already succeeded, and the next read re-stats.
 fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
-    if let Ok((mtime_ms, size)) = stat_fingerprint(abs) {
+    if let Ok(fingerprint) = stat_fingerprint(abs) {
         // `cacheable = false`: the notebook writer produced a structured payload
         // the model must re-materialize before it can target a cell, so a repeat
         // read must NOT be short-circuited to the unchanged placeholder (qwen
         // `notebook-edit.ts recordWrite({ cacheable: false })`).
         ctx.read_cache()
-            .record_write(abs.to_path_buf(), mtime_ms, size, false);
+            .record_write(abs.to_path_buf(), fingerprint, false);
     }
 }
 

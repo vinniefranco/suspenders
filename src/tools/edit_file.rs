@@ -37,7 +37,7 @@
 use crate::tool::path::{
     FileError, PathReject, file_error, resolve_absolute_in, unescape_and_trim,
 };
-use crate::tool::read_cache::ReadState;
+use crate::tool::read_cache::{Fingerprint, ReadState};
 use crate::tool::{Tool, ToolCtx, ToolSpec};
 use crate::tools::edit_match;
 use serde_json::{Value, json};
@@ -382,9 +382,9 @@ fn success_message(
 /// clears it, matching qwen's `checkPriorRead` for `editing`); the mtime/size
 /// drift check is the safety net. Returns the VERBATIM qwen rejection otherwise.
 fn enforce_prior_read(ctx: &ToolCtx, abs: &std::path::Path, file_path: &str) -> Result<(), String> {
-    let (mtime_ms, size) = stat_fingerprint(abs, file_path)?;
+    let fingerprint = stat_fingerprint(abs, file_path)?;
     let cache = ctx.read_cache();
-    let state = cache.check(abs, mtime_ms, size);
+    let state = cache.check(abs, fingerprint);
     let read_this_session = cache
         .entry(abs)
         .is_some_and(|entry| entry.last_read_at.is_some());
@@ -410,19 +410,12 @@ fn enforce_prior_read(ctx: &ToolCtx, abs: &std::path::Path, file_path: &str) -> 
     ))
 }
 
-/// Stat the file for its current `(mtime_ms, size)` fingerprint. A missing stat
-/// here means we cannot verify the prior read, so the edit is refused - never
-/// silently allowed.
-fn stat_fingerprint(abs: &std::path::Path, file_path: &str) -> Result<(u128, u64), String> {
-    let meta = std::fs::metadata(abs)
-        .map_err(|err| file_error("read", file_path, FileError::from_io(&err)))?;
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    Ok((mtime_ms, meta.len()))
+/// Stat the file for its current [`Fingerprint`]. A missing stat here means we
+/// cannot verify the prior read, so the edit is refused - never silently
+/// allowed. The refusal wording stays this tool's; the conversion itself is
+/// [`Fingerprint::stat`]'s.
+fn stat_fingerprint(abs: &std::path::Path, file_path: &str) -> Result<Fingerprint, String> {
+    Fingerprint::stat(abs).map_err(|err| file_error("read", file_path, FileError::from_io(&err)))
 }
 
 /// Record the write back into the read cache (qwen `recordWrite`, `cacheable =
@@ -431,9 +424,9 @@ fn stat_fingerprint(abs: &std::path::Path, file_path: &str) -> Result<(u128, u64
 /// external change. A stat miss is dropped - the write already succeeded, and
 /// the next read re-stats.
 fn record_write(ctx: &ToolCtx, abs: &std::path::Path) {
-    if let Ok((mtime_ms, size)) = stat_fingerprint(abs, &abs.to_string_lossy()) {
+    if let Ok(fingerprint) = stat_fingerprint(abs, &abs.to_string_lossy()) {
         ctx.read_cache()
-            .record_write(abs.to_path_buf(), mtime_ms, size, true);
+            .record_write(abs.to_path_buf(), fingerprint, true);
     }
 }
 

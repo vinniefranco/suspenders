@@ -194,30 +194,21 @@ impl SkillManager {
     /// Discovered skills are name-sorted (`priority:` is parsed and stored but
     /// is not a sort key).
     pub fn discover(project_root: &Path, user_root: Option<&Path>) -> SkillManager {
-        let mut skills: Vec<Skill> = Vec::new();
-        let mut failures: Vec<(String, String)> = Vec::new();
-
         // Precedence project > user > bundled: the first-loaded skill wins a name
         // collision, so a project skill shadows a same-named user skill, and a
-        // disk skill shadows a same-named bundled skill (qwen precedence).
-        let mut seen: HashSet<String> = HashSet::new();
-        load_root(
-            project_root,
-            SkillLevel::Project,
-            &mut seen,
-            &mut skills,
-            &mut failures,
-        );
+        // disk skill shadows a same-named bundled skill (qwen precedence). The
+        // walk order IS the precedence; the Discovery's dedup set enforces it.
+        let mut discovery = Discovery::default();
+        load_root(project_root, SkillLevel::Project, &mut discovery);
         if let Some(user_root) = user_root {
-            load_root(
-                user_root,
-                SkillLevel::User,
-                &mut seen,
-                &mut skills,
-                &mut failures,
-            );
+            load_root(user_root, SkillLevel::User, &mut discovery);
         }
-        load_bundled(&mut seen, &mut skills, &mut failures);
+        load_bundled(&mut discovery);
+        let Discovery {
+            mut skills,
+            failures,
+            ..
+        } = discovery;
 
         // Stable ALPHABETICAL by name (qwen's `listSkills`, skill-manager.ts:238):
         // `priority:` is parsed and stored but does NOT reorder the model-facing
@@ -369,19 +360,69 @@ fn path_matches(glob: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The accumulating result of the skill walks (project, then user, then
+/// bundled): the loaded skills, the per-directory failures, and the name-dedup
+/// set that enforces precedence. ONE value threads through the walks, so the
+/// shadow rule (first loader wins a name, silently) lives in
+/// [`Discovery::push_parsed`] - not as a three-`&mut`-parameter convention every
+/// walk re-states.
+#[derive(Default)]
+struct Discovery {
+    /// Names already loaded from a higher-precedence source (the dedup set).
+    seen: HashSet<String>,
+    /// The skills loaded so far, in walk order (sorted by the caller).
+    skills: Vec<Skill>,
+    /// `(dir_name, reason)` for each manifest that failed to parse/validate.
+    failures: Vec<(String, String)>,
+}
+
+impl Discovery {
+    /// Parses one manifest `content` and, on success, pushes the resulting
+    /// [`Skill`] unless its name was already loaded from a higher-precedence
+    /// source (a silent shadow, not a failure). A parse/validate error is
+    /// recorded under `dir_name` (the source directory, since the manifest may
+    /// fail before yielding a name). Shared by the disk-root and bundled walks
+    /// so precedence + failure handling stay identical.
+    fn push_parsed(&mut self, content: &str, base_dir: PathBuf, level: SkillLevel, dir_name: &str) {
+        match parse_skill_content(content) {
+            Ok((fm, body)) => {
+                // A lower-precedence same-named skill loses to the earlier one;
+                // record nothing - it is a silent shadow, not a failure.
+                if self.seen.contains(&fm.name) {
+                    return;
+                }
+                self.seen.insert(fm.name.clone());
+                self.skills.push(Skill {
+                    name: fm.name,
+                    description: fm.description,
+                    when_to_use: fm.when_to_use,
+                    base_dir,
+                    body,
+                    level,
+                    priority: fm.priority,
+                    argument_hint: fm.argument_hint,
+                    disable_model_invocation: fm.disable_model_invocation,
+                    paths: fm.paths,
+                    hooks: fm.hooks,
+                });
+            }
+            Err(reason) => self.fail(dir_name, reason),
+        }
+    }
+
+    /// Record a failure for the skill directory `dir_name`.
+    fn fail(&mut self, dir_name: &str, reason: String) {
+        self.failures.push((dir_name.to_string(), reason));
+    }
+}
+
 /// Walks one disk skill root's immediate subdirectories for `SKILL.md`
 /// manifests. A non-directory entry, a directory without a manifest, or a name
 /// already loaded from a higher-precedence source is skipped; a manifest that
-/// fails to parse/validate is recorded on `failures`. An unreadable root (it
-/// does not exist yet) is a silent no-op - the common case where a project has
-/// no `.suspenders/skills/` dir.
-fn load_root(
-    root: &Path,
-    level: SkillLevel,
-    seen: &mut HashSet<String>,
-    skills: &mut Vec<Skill>,
-    failures: &mut Vec<(String, String)>,
-) {
+/// fails to parse/validate is recorded on the [`Discovery`]. An unreadable root
+/// (it does not exist yet) is a silent no-op - the common case where a project
+/// has no `.suspenders/skills/` dir.
+fn load_root(root: &Path, level: SkillLevel, discovery: &mut Discovery) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         // The root does not exist / cannot be read: no skills here, not an error.
@@ -412,20 +453,12 @@ fn load_root(
         let content = match std::fs::read_to_string(&manifest) {
             Ok(content) => content,
             Err(e) => {
-                failures.push((dir_name, format!("could not read SKILL.md - {e}")));
+                discovery.fail(&dir_name, format!("could not read SKILL.md - {e}"));
                 continue;
             }
         };
 
-        push_parsed(
-            &content,
-            dir.clone(),
-            level,
-            &dir_name,
-            seen,
-            skills,
-            failures,
-        );
+        discovery.push_parsed(&content, dir.clone(), level, &dir_name);
     }
 }
 
@@ -435,22 +468,10 @@ fn load_root(
 /// from project/user shadows the bundled one silently. The `base_dir` is a
 /// synthetic `<bundled>/<name>` marker (there is no real directory), which the
 /// LLM content wrapper still renders faithfully.
-fn load_bundled(
-    seen: &mut HashSet<String>,
-    skills: &mut Vec<Skill>,
-    failures: &mut Vec<(String, String)>,
-) {
+fn load_bundled(discovery: &mut Discovery) {
     for (dir_name, content) in BUNDLED_SKILLS {
         let base_dir = Path::new("<bundled>").join(dir_name);
-        push_parsed(
-            content,
-            base_dir,
-            SkillLevel::Bundled,
-            dir_name,
-            seen,
-            skills,
-            failures,
-        );
+        discovery.push_parsed(content, base_dir, SkillLevel::Bundled, dir_name);
     }
 }
 
@@ -464,46 +485,6 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
     ("batch", include_str!("bundled/batch/SKILL.md")),
     ("stuck", include_str!("bundled/stuck/SKILL.md")),
 ];
-
-/// Parses one manifest `content` and, on success, pushes the resulting [`Skill`]
-/// unless its name was already loaded from a higher-precedence source (dedup).
-/// A parse/validate error is recorded on `failures` under `dir_name` (the source
-/// directory, since the manifest may fail before yielding a name). Shared by the
-/// disk-root and bundled walks so precedence + failure handling stay identical.
-fn push_parsed(
-    content: &str,
-    base_dir: PathBuf,
-    level: SkillLevel,
-    dir_name: &str,
-    seen: &mut HashSet<String>,
-    skills: &mut Vec<Skill>,
-    failures: &mut Vec<(String, String)>,
-) {
-    match parse_skill_content(content) {
-        Ok((fm, body)) => {
-            // A lower-precedence same-named skill loses to the earlier one; record
-            // nothing - it is a silent shadow, not a failure.
-            if seen.contains(&fm.name) {
-                return;
-            }
-            seen.insert(fm.name.clone());
-            skills.push(Skill {
-                name: fm.name,
-                description: fm.description,
-                when_to_use: fm.when_to_use,
-                base_dir,
-                body,
-                level,
-                priority: fm.priority,
-                argument_hint: fm.argument_hint,
-                disable_model_invocation: fm.disable_model_invocation,
-                paths: fm.paths,
-                hooks: fm.hooks,
-            });
-        }
-        Err(reason) => failures.push((dir_name.to_string(), reason)),
-    }
-}
 
 /// Splits a `SKILL.md` into its frontmatter fields and trimmed body (pure).
 /// Ports qwen's `parseSkillContent` regex
